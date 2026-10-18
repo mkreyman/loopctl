@@ -155,33 +155,19 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
     end
 
-    test "an implement dispatch binds the mode it was placed under and its base branch; a retry keeps both (US-45.4)",
+    test "an implement dispatch binds its base branch; a triage dispatch records none",
          %{runner: runner} do
       {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
       base_branch = dispatch.base_branch
       assert is_binary(base_branch)
 
-      assert {:ok, %{mode: "thread", base_branch: ^base_branch}} =
-               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, mode: "thread")
+      assert {:ok, %{base_branch: ^base_branch}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
 
-      # A retry carrying a different mode (the source changed since): the first send's stands.
-      assert {:ok, %{mode: "thread", base_branch: ^base_branch}} =
-               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, mode: "pr")
-    end
+      {:ok, triage} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
 
-    test "a triage dispatch records no route, and an implement one given no mode records none",
-         %{runner: runner} do
-      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
-
-      assert {:ok, %{mode: nil, base_branch: nil}} =
-               DispatchLedger.record_sent(
-                 runner.tenant_id,
-                 runner.id,
-                 %{dispatch | kind: "triage"},
-                 mode: "thread"
-               )
-
-      assert %{mode: nil} = sent(runner, %{})
+      assert {:ok, %{base_branch: nil}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, %{triage | kind: "triage"})
     end
 
     test "the same dispatch_id twice finds the first row instead of writing a second",
@@ -659,12 +645,12 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   # Finding 6 of US-44.5 review round 2: only the reply that WRITES the story may take it
   # `FOR NO KEY UPDATE`; every other reply shares it, as a trace does. Observed on the SQL the
   # reply issues, in this process, because a row lock leaves no trace in `pg_locks`.
-  # US-45.3: a review dispatch carries the IMPLEMENTER's story and claim epoch, so the fences
-  # on epoch and story alone cannot tell it from the implementer's session.
-  describe "a review dispatch is not the implementer's session" do
+  # A triage dispatch can carry the story and its claim epoch, so the fences on epoch and
+  # story alone cannot tell it from the implementer's session.
+  describe "a triage dispatch is not the implementer's session" do
     test "its acceptance neither moves the implementer's capped lease nor locks it for write",
          %{runner: runner} do
-      record = sent(runner, %{}, %{kind: "review"})
+      record = sent(runner, %{}, %{kind: "triage"})
       provisional = DateTime.add(DateTime.utc_now(), 60, :second)
       set_lease(runner.tenant_id, record.story_id, provisional, provisional)
 
@@ -674,101 +660,28 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert lease(runner.tenant_id, record.story_id) == {provisional, provisional}
     end
 
-    test "each session-end WRITE refuses the other kind under its own row lock",
+    test "the implement session-end WRITE refuses it under its own row lock",
          %{runner: runner} do
       implement = accepted(runner)
-      review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})
-      {:ok, review} = reply(runner, review)
-
-      message = fn record ->
-        %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, reason: "crashed"}
-      end
+      triage = sent(runner, %{"story_id" => implement.story_id}, %{kind: "triage"})
+      {:ok, triage} = reply(runner, triage)
 
       assert {:error, :wrong_dispatch_kind} =
-               DispatchLedger.record_review_session_end(
-                 runner.tenant_id,
-                 runner.id,
-                 message.(implement),
-                 "d1"
-               )
-
-      assert {:error, :wrong_dispatch_kind} =
-               DispatchLedger.record_session_end(runner.tenant_id, runner.id, message.(review), %{
-                 reason: "crashed",
-                 digest: "d2",
-                 counts_toward_retry_ceiling: true,
-                 story_id: review.story_id
-               })
-    end
-
-    test "a review session end naming another epoch than its dispatch's is claim_epoch_mismatch",
-         %{runner: runner} do
-      implement = accepted(runner)
-      review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})
-      {:ok, review} = reply(runner, review)
-
-      assert {:error, :claim_epoch_mismatch} =
-               DispatchLedger.record_review_session_end(
-                 runner.tenant_id,
-                 runner.id,
-                 %{
-                   dispatch_id: review.dispatch_id,
-                   claim_epoch: review.claim_epoch + 1,
-                   reason: "completed"
-                 },
-                 "review-digest"
-               )
-    end
-
-    test "its budget kill is not read as the implementer's session end", %{runner: runner} do
-      implement = accepted(runner)
-      review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})
-      {:ok, review} = reply(runner, review)
-
-      ended = fn record, reason ->
-        %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, reason: reason}
-      end
-
-      assert {:ok, {:recorded, _}} =
-               DispatchLedger.record_review_session_end(
-                 runner.tenant_id,
-                 runner.id,
-                 ended.(review, "wall_clock_exceeded"),
-                 "review-digest"
-               )
-
-      reasons = ["wall_clock_exceeded", "max_turns_exceeded", "usage_exhausted"]
-
-      assert nil ==
-               DispatchLedger.session_ended_with(
-                 runner.tenant_id,
-                 implement.story_id,
-                 implement.claim_epoch,
-                 reasons
-               )
-
-      assert {:ok, {:recorded, _}} =
                DispatchLedger.record_session_end(
                  runner.tenant_id,
                  runner.id,
-                 ended.(implement, "max_turns_exceeded"),
                  %{
-                   reason: "max_turns_exceeded",
-                   digest: "implement-digest",
-                   counts_toward_retry_ceiling: nil,
-                   story_id: implement.story_id
+                   dispatch_id: triage.dispatch_id,
+                   claim_epoch: triage.claim_epoch,
+                   reason: "crashed"
+                 },
+                 %{
+                   reason: "crashed",
+                   digest: "d2",
+                   counts_toward_retry_ceiling: true,
+                   story_id: triage.story_id
                  }
                )
-
-      assert %{dispatch_id: dispatch_id} =
-               DispatchLedger.session_ended_with(
-                 runner.tenant_id,
-                 implement.story_id,
-                 implement.claim_epoch,
-                 reasons
-               )
-
-      assert dispatch_id == implement.dispatch_id
     end
   end
 

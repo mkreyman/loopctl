@@ -53,7 +53,7 @@ defmodule Loopctl.Delivery.Stages do
   ## Slow connections
 
   Every transition here sets `lock_timeout` (2s) and `statement_timeout` (5s) locally; the
-  read paths (`fetch/3`, `entered_at/4`) wait `Loopctl.Runners.Capacity.lock_timeout_ms(opts)`
+  read path (`fetch/3`) waits `Loopctl.Runners.Capacity.lock_timeout_ms(opts)`
   (5s unless a caller passes its own) instead. Either way a transaction waiting behind a lock holder — the reclaimer, a
   claim, a concurrent transition, the tenant's audit-chain head — gives up instead of
   waiting without bound while holding a pooled connection. That, and a pool checkout that
@@ -163,11 +163,6 @@ defmodule Loopctl.Delivery.Stages do
   # decides once it has requeued the row (US-44.4).
   @release_only_edges [:runner_lost, :claim_released] ++
                         StageMachine.release_escalation_edges()
-
-  # The base merged into a thread (US-45.5): taken only by `follow_base_update/4`, in the
-  # transaction that records the `base_update` checkpoint it moves the head to, so `advance/4`
-  # refuses it from every caller exactly as it refuses the release edges.
-  @base_update_edge :base_updated
 
   # WHY a claim was released, which decides where the story goes next (US-44.4, #877). Every
   # caller of `follow_release/5` names one; see its doc for the table.
@@ -330,29 +325,6 @@ defmodule Loopctl.Delivery.Stages do
       end)
 
     transitions
-  end
-
-  @doc """
-  When `story_id` last ENTERED `stage` — the newest transition into it — as `{:ok, at}`, or
-  `{:ok, nil}` when it never has (US-45.6: what a merge gate's CI wait is measured from). Its
-  lock wait is bounded and contention is `{:error, :busy}`, counted as
-  `[:loopctl, :delivery, :stage_read_busy]`. The wait is `Capacity.lock_timeout_ms(opts)`.
-  """
-  @spec entered_at(Ecto.UUID.t(), Ecto.UUID.t(), atom(), keyword()) ::
-          {:ok, DateTime.t() | nil} | {:error, term()}
-  def entered_at(tenant_id, story_id, stage, opts \\ []) do
-    answering_busy(tenant_id, [:loopctl, :delivery, :stage_read_busy], "stage entry read", fn ->
-      Repo.with_tenant(tenant_id, fn ->
-        Capacity.set_lock_timeout!(Repo, opts)
-
-        Repo.one(
-          from e in StageEvent,
-            where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
-            where: e.event == "transitioned" and e.to_stage == ^Atom.to_string(stage),
-            select: max(e.inserted_at)
-        )
-      end)
-    end)
   end
 
   @doc "A story's stage events, oldest first."
@@ -959,8 +931,7 @@ defmodule Loopctl.Delivery.Stages do
 
   - `:claim_epoch` (required), `:actor_label`
   - `:event_data` — a JSON-encodable map recorded under `"payload"` on the `effect_recorded`
-    event, bounded as `advance/4`'s is. The merge gate names the checkpoint a thread-mode
-    allow was granted for this way (US-45.4). Nothing is recorded for a replay of a write
+    event, bounded as `advance/4`'s is. Nothing is recorded for a replay of a write
     that already landed, because a replay writes no event.
   """
   @spec record_effect(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), keyword()) ::
@@ -1066,129 +1037,6 @@ defmodule Loopctl.Delivery.Stages do
 
   defp event_value(value) when is_integer(value), do: value
   defp event_value(value), do: to_string(value)
-
-  @doc """
-  Takes `{:ci, :ci, :base_updated}` for a `base_update` checkpoint the caller has just
-  recorded, INSIDE the caller's `Loopctl.Repo` tenant transaction (US-45.5, AC-45.5.7). Its
-  only caller is `Loopctl.Threads.record_base_update/4`, so the checkpoint and the head it
-  becomes commit together or not at all: a crash between them cannot leave a recorded base
-  update the stage row never moved to, nor a head no checkpoint describes.
-
-  `base_update` names the checkpoint: `:id`, `:commit_sha` and `:parent_commit_sha`, the
-  commit of its FIRST parent. Refused, rolling the caller's
-  transaction back, unless all of these hold on rows read under lock:
-
-  - `:not_found` — no story or no stage row in the tenant
-  - `:allow_not_for_parent` — the row's `merge_gate_allowed_sha` is not the first parent's
-    commit. The edge is for merging the base into the checkpoint the gate LAST ALLOWED, and
-    that allow is the row's; any other head movement goes over `:base_moved`
-  - `:stale_stage` / `:stale_claim_epoch` — the row is not at `ci`, or not under the story's
-    current claim (the compare-and-set). The CALLER fences the checkpoint's own claim:
-    `record_base_update/4` refuses a parent recorded under an ended one
-
-  The transition clears everything bound to the old head (`StageMachine.clears/3`), the allow
-  included, and records `head_sha` as the base update's commit in the same transaction. It
-  touches neither the story's custody fields nor its review records. Not chained: `ci` is not
-  a custody stage, and the checkpoint's own entry is on the chain already.
-
-  ## Options
-
-  - `:actor_label` — recorded on the events
-  """
-  @spec follow_base_update(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) :: StoryStage.t()
-  def follow_base_update(tenant_id, story_id, base_update, opts \\ []) do
-    unless Repo.in_transaction?(),
-      do: raise(ArgumentError, "follow_base_update/4 runs inside the recording transaction")
-
-    transition = {:ci, :ci, @base_update_edge}
-
-    # The machine's table is what makes the edge legal, here as in `advance/4`: this path
-    # skips `allowed_for_caller/3`, so it asks the table itself rather than trusting it.
-    unless StageMachine.allowed?(:ci, :ci, @base_update_edge),
-      do: raise(ArgumentError, "base_updated is not in StageMachine.transitions/0")
-
-    story = share_lock_story(tenant_id, story_id) || Repo.rollback(:not_found)
-    row = lock_row(tenant_id, story_id) || Repo.rollback(:not_found)
-
-    if is_nil(row.merge_gate_allowed_sha) or
-         row.merge_gate_allowed_sha != base_update.parent_commit_sha,
-       do: Repo.rollback(:allow_not_for_parent)
-
-    # The stage and both epochs are the compare-and-set's: it matches only a row at `ci` under
-    # the story's current epoch, and `diagnose/3` names which one it was not.
-    moved = compare_and_set(tenant_id, story, transition, nil)
-
-    data = %{
-      "payload" => %{
-        "checkpoint_id" => base_update.id,
-        "commit_sha" => base_update.commit_sha,
-        "parent_commit_sha" => base_update.parent_commit_sha
-      }
-    }
-
-    insert_event(Repo, moved, "transitioned", :ci, @base_update_edge, opts[:actor_label], data)
-    put_effect(moved, :head_sha, base_update.commit_sha, opts)
-  end
-
-  @doc """
-  Whether the stage row still AUTHORISES a squash of `sha` (US-45.5): at `ci`, under the
-  story's current claim `claim_epoch`, with `merge_gate_allowed_sha == sha`. Read under a
-  `FOR SHARE` lock on the story and then the row — the order every writer here takes — INSIDE
-  the caller's `Loopctl.Repo` tenant transaction, so a release, a transition or a cleared
-  allow cannot commit until that transaction ends. `:ok`, or `{:error, reason}` naming what
-  moved: `:not_found`, `:stale_claim_epoch`, `{:not_at_ci, stage}`, `:allow_withdrawn`.
-  """
-  @spec mergeable_in(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), String.t()) ::
-          :ok | {:error, term()}
-  def mergeable_in(tenant_id, story_id, claim_epoch, sha) do
-    story = share_lock_story(tenant_id, story_id)
-    row = story && row_query(tenant_id, story_id) |> lock("FOR SHARE") |> Repo.one()
-
-    cond do
-      is_nil(row) ->
-        {:error, :not_found}
-
-      # The ROW's epoch is the story's: every write that moves `stories.claim_epoch` moves this
-      # row with it in the same transaction — a claim through `follow_claim/4`
-      # (`Progress.claim_story/3`, `BulkOperations.bulk_claim/4`), every release through
-      # `follow_release/5` — and the story is held FOR SHARE here, so neither can land mid-read.
-      row.claim_epoch != claim_epoch ->
-        {:error, :stale_claim_epoch}
-
-      row.stage != :ci ->
-        {:error, {:not_at_ci, row.stage}}
-
-      row.merge_gate_allowed_sha != sha ->
-        {:error, :allow_withdrawn}
-
-      true ->
-        :ok
-    end
-  end
-
-  @doc """
-  The story's most recent merge-gate allow, as recorded on its `effect_recorded` event:
-  `%{sha, checkpoint_id, base_sha, claim_epoch}`, the last three `nil` for a pull-request
-  allow (`Loopctl.Delivery.MergePrecondition` records them for a thread only). A query, run
-  by the caller inside its own tenant transaction. The event outlives the row's
-  `merge_gate_allowed_sha`, which the next head clears, so it answers "which checkpoint did
-  the gate LAST allow" after the allow itself is gone (US-45.5, AC-45.5.9).
-  """
-  @spec last_allow_query(Ecto.UUID.t(), Ecto.UUID.t()) :: Ecto.Query.t()
-  def last_allow_query(tenant_id, story_id) do
-    from e in StageEvent,
-      where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
-      where: e.event == "effect_recorded",
-      where: fragment("?->>'effect'", e.data) == "merge_gate_allowed_sha",
-      order_by: [desc: e.inserted_at, desc: e.lock_version],
-      limit: 1,
-      select: %{
-        sha: fragment("?->>'value'", e.data),
-        checkpoint_id: fragment("?->'payload'->>'checkpoint_id'", e.data),
-        base_sha: fragment("?->'payload'->>'base_sha'", e.data),
-        claim_epoch: e.claim_epoch
-      }
-  end
 
   @doc """
   Makes a story's stage row follow a claim RELEASE, inside the releasing transaction, and
@@ -1612,8 +1460,6 @@ defmodule Loopctl.Delivery.Stages do
   defp allowed_for_caller(_from, _to, edge) when edge in @release_only_edges,
     do: {:error, :invalid_transition}
 
-  defp allowed_for_caller(_from, _to, @base_update_edge), do: {:error, :invalid_transition}
-
   defp allowed_for_caller(from, to, edge) do
     if StageMachine.allowed?(from, to, edge), do: :ok, else: {:error, :invalid_transition}
   end
@@ -1988,9 +1834,8 @@ defmodule Loopctl.Delivery.Stages do
   `{:error, :busy}` rather than raising, with a warning naming `what` and one `event`
   telemetry count carrying `tenant_id` and the `reason`. Everything else reraises.
 
-  The ONE copy of that policy: stage writes (`[:loopctl, :delivery, :stage_busy]`) and change
-  thread writes (`[:loopctl, :threads, :busy]`, `Loopctl.Threads` and
-  `Loopctl.Delivery.RunnerThreads`). `:busy` does NOT promise nothing was written: a
+  The ONE copy of that policy, for stage writes (`[:loopctl, :delivery, :stage_busy]`) and the
+  reads and writes beside them that name their own event. `:busy` does NOT promise nothing was written: a
   connection lost while the write committed is contention by this classification and may have
   committed, so every caller answering it must be safe to resend.
   """

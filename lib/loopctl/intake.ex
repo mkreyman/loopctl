@@ -155,8 +155,8 @@ defmodule Loopctl.Intake do
 
   Returns `{:ok, %{source: source, webhook_secret: secret}}`. The secret is returned once.
 
-  `attrs` may also carry `:mode` (`"pr"` or `"thread"`, read by PRESENCE and defaulting to
-  `pr`, US-45.4), `:target_epic_id` (optional, and `nil` means "not answered") and
+  `attrs` may also carry `:mode` (`"pr"`, read by PRESENCE and defaulting to it),
+  `:target_epic_id` (optional, and `nil` means "not answered") and
   `:base_branch` (optional, and read by PRESENCE: omit it for the `master` default, or name
   the branch this repository's dispatches are cut from — `main` for a repository created on
   GitHub since 2020. It is NOT nullable, so an explicit `nil` or `""` is a validation error
@@ -316,7 +316,7 @@ defmodule Loopctl.Intake do
                  # this the chain could say what a branch was changed TO and never what it
                  # started as.
                  "base_branch" => source.base_branch,
-                 # US-45.4: which route the merge gate reads, recorded for the same reason
+                 # Which route the merge gate reads, recorded for the same reason
                  # as the branch — a later `intake_source_mode_set` says what it changed TO.
                  "mode" => Atom.to_string(source.mode)
                }
@@ -368,9 +368,7 @@ defmodule Loopctl.Intake do
   Updates an ACTIVE source's mutable fields in ONE transaction (#803 round 2).
 
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
-  `:base_branch` (NOT nullable) and `:mode` (`"pr"` or `"thread"`, NOT nullable; US-45.4). A
-  mode only decides what FUTURE placements of the project's stories are bound to; a story
-  already placed keeps the mode its dispatch recorded, so a change is always allowed. A key that is ABSENT is left alone, which is why this
+  `:base_branch` (NOT nullable) and `:mode` (`"pr"`, NOT nullable). A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
 
@@ -418,11 +416,8 @@ defmodule Loopctl.Intake do
 
     changeset = if mode?, do: cast_mode(changeset, Map.get(attrs, :mode)), else: changeset
 
-    # Judged over the source AS IT WILL BE whenever either half moves: a thread-mode source
-    # must name a required check, so switching to `thread` without one, or clearing the list
-    # on a thread source, is refused whichever field the request named (US-45.6).
     changeset =
-      if mode? or :required_checks in fields,
+      if :required_checks in fields,
         do: cast_required_checks(changeset, attrs),
         else: changeset
 

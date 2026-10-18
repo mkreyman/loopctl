@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.0.0 — 2026-10-18 (change threads retired)
+
+### Removed
+
+- **The `thread_*` tools** — `thread_get`, `thread_checkpoint`, `thread_entry`,
+  `thread_request_review`, `thread_review_get`, `thread_fix` and `thread_stage_report`. The
+  endpoints they called are gone with Epic 45's change threads (loopctl #984); landing a
+  change moves to chg (Epic 47).
+- **`thread` as an intake-source `mode`**: `intake_source_enroll` and `intake_source_update`
+  accept `pr` only, and refuse `thread` locally. `merge_precondition` and `claim_story` no
+  longer describe thread mode, and `claim_story`'s result carries no `route`.
+
 ## 2.116.0 — 2026-10-15 (thread kb_refs)
 
 ### Added

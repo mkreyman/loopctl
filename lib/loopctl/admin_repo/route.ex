@@ -39,9 +39,9 @@ defmodule Loopctl.AdminRepo.Route do
   **Measured, 2026-10-07**, by a temporary runtime trace over the whole default suite
   (`test/loopctl`, `test/loopctl_web`, `test/mix`, `test/e2e` with `E2E_TESTS=true`: 12,202
   tests; the 63 `:scale`, `:scale_nightly`, `:pgbouncer` and IPv6-tagged tests excluded):
-  - AdminRepo statements under the tenant's RLS role came from ONE lib call site,
-    `Loopctl.Threads.not_halted/1` reading the tenant row inside `in_story_lock/3`, and
-    `tenants` carries no RLS policy, so it reads the same row either way.
+  - AdminRepo statements under the tenant's RLS role came from ONE lib call site, a change
+    thread's custody-halt read of the tenant row (since deleted, #984), and `tenants` carries
+    no RLS policy, so it read the same row either way.
   - A transaction of one repo nested in the other's in lib code: only
     `Loopctl.Embeddings.off_dimension_rows?/3` (a heavy read inside a Repo transaction),
     which handles only the overload shed, decided before its transaction opens. No inner

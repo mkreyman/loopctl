@@ -2,8 +2,8 @@
  * `github_credential`, `set_github_credential`, `clear_github_credential` — the tenant's own
  * GitHub token (#936), `GET|PUT|DELETE /api/v1/tenants/me/github-credential`.
  *
- * loopctl calls GitHub for a tenant in the merge gate, story and post-deploy verification,
- * thread checkpoint reads and issue closing. Each call authenticates with the tenant's own
+ * loopctl calls GitHub for a tenant in the merge gate, story and post-deploy verification
+ * and issue closing. Each call authenticates with the tenant's own
  * token when one is set, else with the operator's token for the (tenant, repository) pairs
  * the operator named in VERIFICATION_OPERATOR_TOKEN_TENANTS, else not at all
  * (`credential_unavailable`). The tenant's token is what lets loopctl serve a repository

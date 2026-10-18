@@ -101,9 +101,7 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "`already_merged` reports a merge GitHub had already performed AND a " <>
                 "recorded allow authorised — one nobody authorised is a `refuse` naming " <>
                 "the sha. `head_moved` sends the story back to `implementing` because the " <>
-                "pull request's head is not the one CI ran on (in thread mode, also a " <>
-                "thread branch that is missing, names a commit nobody recorded, or names " <>
-                "a checkpoint that was never pushed). `unevaluated` (HTTP 503) is " <>
+                "pull request's head is not the one CI ran on. `unevaluated` (HTTP 503) is " <>
                 "a transient forge fault: nothing was decided, nothing transitioned, retry."
           },
           reasons: %OpenApiSpex.Schema{
@@ -112,27 +110,6 @@ defmodule LoopctlWeb.MergePreconditionController do
             items: @reason_schema
           },
           repo: %OpenApiSpex.Schema{type: :string, nullable: true},
-          mode: %OpenApiSpex.Schema{
-            type: :string,
-            enum: ["pr", "thread", nil],
-            nullable: true,
-            description:
-              "The mode BOUND on the claim's implement dispatch at placement, not the intake " <>
-                "source's current mode. `thread` judges the latest RECORDED checkpoint " <>
-                "instead of a pull request, so `pr_number` is null. A claim with no accepted " <>
-                "implement dispatch is `pr`, whatever the source says now. null only when the " <>
-                "dispatch ledger could not be read for contention, which is an `unevaluated` " <>
-                "verdict."
-          },
-          checkpoint_id: %OpenApiSpex.Schema{
-            type: :string,
-            format: :uuid,
-            nullable: true,
-            description:
-              "Thread mode: the recorded checkpoint judged. A thread-mode allow is recorded " <>
-                "naming it and `checkpoint_sha`."
-          },
-          checkpoint_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
           pr_number: %OpenApiSpex.Schema{type: :integer, nullable: true},
           head_sha: %OpenApiSpex.Schema{
             type: :string,
@@ -147,27 +124,6 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "at. A verdict is `head_moved` when the two disagree."
           },
           merge_base_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
-          base_sha: %OpenApiSpex.Schema{
-            type: :string,
-            nullable: true,
-            description:
-              "Thread mode: the MERGE BASE the judged three-dot diff is relative to. A " <>
-                "thread-mode allow records it, and the merge executor merges only while the " <>
-                "base head still equals it, and otherwise takes its base-update path."
-          },
-          ci_evidence: %OpenApiSpex.Schema{
-            type: :object,
-            nullable: true,
-            description:
-              "Thread mode (US-45.6): what CI said about the checkpoint's EXACT commit — `sha`, " <>
-                "`read_at`, `required`, `jobs` (the jobs under a required name from the " <>
-                "GitHub Actions workflow runs a push of the thread branch triggered: `name`, " <>
-                "`workflow`, `run_id`, `status`, `conclusion`, `url`), `local_gate` (from the " <>
-                "commit statuses, best effort; recorded, never counted), and the judgement " <>
-                "`passed` / `pending` / `missing` / " <>
-                "`failed`. The same object is copied onto the checkpoint's `gate_evidence` " <>
-                "under `ci`. null when it was not read (pr mode, a moved or merged head)."
-          },
           merge_sha: %OpenApiSpex.Schema{
             type: :string,
             nullable: true,
@@ -250,59 +206,6 @@ defmodule LoopctlWeb.MergePreconditionController do
         "GitHub, a truncated file list, a diff that does not parse, a stale trigger at " <>
         "either the head or the merge base, and an unverified or custody-unattributed " <>
         "story all REFUSE.\n\n" <>
-        "THREAD MODE — the story's current claim was PLACED under an intake source with " <>
-        "`mode: thread`; the mode is bound to the dispatch at placement and a later change to " <>
-        "the source does not reach it — needs no pull request: " <>
-        "the gate judges the latest checkpoint the story's CURRENT claim recorded, on the " <>
-        "branch that claim's dispatch ran on and against the base branch it was placed on " <>
-        "(both pinned in the dispatch ledger; a row that pinned no base branch, or a claim " <>
-        "with no accepted dispatch, falls back to the source's current base branch, and a " <>
-        "claim with no accepted dispatch is judged as a pull request), and `pr_number` " <>
-        "is null. Its runners must be at runner contract 1.20.0 or later and send " <>
-        "`checkpoint` messages, or every story is refused `no_checkpoint_recorded`. A story " <>
-        "whose current claim recorded none while an earlier claim did (it was released) is " <>
-        "refused `claim_ended`; a thread loopctl could not read is refused " <>
-        "`thread_unreadable`. It also refuses `empty_change` (the checkpoint's tree equals " <>
-        "the base branch's, or no file changed) and `checkpoint_tree_mismatch` (the forge's " <>
-        "tree for it is not the one recorded). CI is read by the checkpoint's EXACT SHA " <>
-        "(US-45.6): only a job of a GitHub Actions workflow run that a PUSH of the thread " <>
-        "branch at that commit triggered satisfies a required check, and only by concluding " <>
-        "`success` (a skipped job fails); commit statuses are recorded, never trusted; " <>
-        "against the " <>
-        "source's `required_checks`: a failed one refuses `required_check_failed`, one still " <>
-        "running or not yet reported is `unevaluated` (`required_check_pending` / " <>
-        "`required_check_missing`, `Retry-After` #{MergePrecondition.ci_wait_retry_after()}; " <>
-        "neither counts toward the unevaluated bound, and " <>
-        "#{div(MergePrecondition.ci_wait_limit_seconds(), 3600)} hours after the story " <>
-        "entered `ci` (or, with no recorded entry, the checkpoint was recorded) both are " <>
-        "refused " <>
-        "`required_check_timed_out`; per name the latest run of each workflow counts and " <>
-        "every workflow must pass), the required checks are the source's current list, a " <>
-        "checkpoint changing `.github/workflows/` or `.github/actions/` is refused " <>
-        "`ci_definition_changed` (and one whose diff could not be listed " <>
-        "`ci_definition_unknown`), a source requiring none refuses `required_checks_unset`, a " <>
-        "failed read is `ci_evidence_unavailable`, and a `local-gate` status is recorded but " <>
-        "never satisfies a required check. `ci_evidence` is what was read; it is copied onto " <>
-        "the checkpoint, and an allow whose copy did not land is refused " <>
-        "`ci_evidence_not_recorded`. The BRANCH is judged first: a branch missing " <>
-        "from a readable repository (`branch_missing`), one naming a commit nobody recorded " <>
-        "(`branch_head_unrecorded`), one naming an EARLIER checkpoint of the claim " <>
-        "(`branch_head_regressed`), a checkpoint that is not the head the stage row " <>
-        "recorded all mean the head moved. While the claim is LIVE — the claimant can still " <>
-        "record a checkpoint — that is `head_moved`, back to `implementing`, not escalated. " <>
-        "When the claim is NOT live (reported, review requested, lease expired) nobody can " <>
-        "record the fix, so it is a `refuse` naming `claim_not_live`, and escalates. A " <>
-        "repository the token cannot read, or a 404 on the checkpoint's commit or comparison " <>
-        "once the branch names it, refuses `pull_request_unavailable`. A checkpoint carrying " <>
-        "a merge commit counts as `already_merged` only when that commit is on the base " <>
-        "branch. A checkpoint the base branch already contains (its branch deleted or not) " <>
-        "is `already_merged` only under a recorded allow naming it, and otherwise refused " <>
-        "`checkpoint_on_base_without_allow`, never `ungated_merge`. The diff judged " <>
-        "is the three-dot diff against the merge base, so a base that moved on is not a " <>
-        "refusal. A thread-mode allow is recorded naming the checkpoint id and sha and the " <>
-        "`base_sha` (that merge base), and the verdict carries `mode`, `checkpoint_id`, " <>
-        "`checkpoint_sha` and `base_sha`. A thread read that met database contention is " <>
-        "`unevaluated`.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>
@@ -471,15 +374,10 @@ defmodule LoopctlWeb.MergePreconditionController do
       decision: verdict.decision,
       reasons: Enum.map(verdict.reasons, &reason/1),
       repo: verdict.repo,
-      mode: verdict.mode,
-      checkpoint_id: verdict.checkpoint_id,
-      checkpoint_sha: verdict.checkpoint_sha,
       pr_number: verdict.pr_number,
       head_sha: verdict.head_sha,
       recorded_head_sha: verdict.recorded_head_sha,
       merge_base_sha: verdict.merge_base_sha,
-      base_sha: thread_base_sha(verdict),
-      ci_evidence: verdict.ci_evidence,
       merge_sha: verdict.merge_sha,
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),
@@ -536,9 +434,4 @@ defmodule LoopctlWeb.MergePreconditionController do
       route: result.route
     }
   end
-
-  # The MERGE BASE a thread-mode verdict judged against, under the name an allow records it by.
-  # One field on the verdict (`merge_base_sha`), so the two names cannot diverge.
-  defp thread_base_sha(%{mode: :thread, merge_base_sha: sha}), do: sha
-  defp thread_base_sha(_verdict), do: nil
 end

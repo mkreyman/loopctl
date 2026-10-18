@@ -1,7 +1,7 @@
 # PRD — Epic 47: loopctl's half of the modified-Scion change protocol
 
 **Status:** draft 2026-10-18 · **Epic:** 47 · **Issue:** mkreyman/loopctl#989
-**Succeeds:** Epic 45 (`../epic_45_change_threads/PRD.md`), deleted by #984.
+**Succeeds:** Epic 45 (change threads), deleted by #984; its PRD is in git history.
 **Depends on:** mkreyman/chg, phase 2 (`chg-server`: ledger, lander, review dispatch), designed
 in chg `docs/design.md` (2026-10-16).
 
@@ -165,8 +165,8 @@ decides.
 control-only edge, `:change_outside_lifecycle`, and the event is recorded. A `landed` on a story
 an operator escalated is one example. This is the shape of `:merged_outside_ci` today: trunk
 holds a change the story did not expect, and only a human can say what the story is now. Every
-control escalation here goes through `Escalations.escalate_as_control/3`, which #984 must
-therefore keep (§10).
+control escalation here goes through `Escalations.escalate_as_control/3`, which 47.4 adds
+back with its own edges (§10).
 
 ## 6. Review custody
 
@@ -259,7 +259,7 @@ calls it today.
 | CAS squash merge executor: `merge_executor.ex`, `merge_forge.ex`, `github_app_merge_forge.ex`, `merge_message.ex`, `ThreadMergeWorker`, `ThreadMergeSweepWorker` | **delete** | `MergeExecutor.run/3` is called only by `thread_merge_worker.ex:51`. Landing is chg's (§2), and chg's lander does the same CAS with `merge-tree` + an ff-only push and the same lost-ack recovery by trailer reachability (chg §3.6 step 5) |
 | `Loopctl-Story:` trailer | **delete with the executor** | chg writes `Change-Id:`; a story is found from its binding (47.1), not from trunk |
 | Checkpoint-bound findings with `introduced_by`, `Reviews` rules, `RunnerReviews`, `thread_review_controller.ex`, `ReviewCeilingWorker`, `Placement.place_review/4`, the `:review_ceiling` edge, the `review` dispatch kind | **delete** | No callers outside threads. The round ceiling moves into chg (chg §3.10: one round plus an interdiff re-review). loopctl keeps only what custody needs: `review_records`, which predates Epic 45 and gains `commit_sha` in 47.5 |
-| `Escalations.escalate_as_control/3` | **keep** | Its only caller today is `ReviewCeilingWorker`, which goes. 47.4 and 47.5 need exactly this: control escalating a story over its own edge with the compare-and-set the worker relies on. Deleting it in #984 only to rebuild it in 47.4 would be churn |
+| `Escalations.escalate_as_control/3` | **delete** (amended in #984) | It hard-coded `:review_ceiling`, the one control edge, which goes with `ReviewCeilingWorker`; kept, it could only be called with an edge the machine refuses. What 47.4 and 47.5 need is the replay and `:stale_stage` recovery `escalate/3` already has, minus the claimant check: 47.4 re-adds the function taking its edge (`:change_outside_lifecycle`, and 47.5's `:review_missing`) together with the edges themselves |
 | `merge_precondition.ex` thread branch, `checkpoint_source.ex`, thread refusals (`empty_change`, `checkpoint_tree_mismatch`, `no_checkpoint_recorded`, `branch_*`, `base_update_in_flight`) | **delete the branch, keep the module** | The PR-mode gate is the delivery loop's live merge gate (`merge_precondition_controller.ex:414`, MCP `merge_precondition`) and `transient?/1` is shared by verification, `IssueCloser` and post-deploy verification. 47.2 adds the `:chg` refusal to the same module |
 | `ci_evidence.ex`, `empty_change.ex`, `ci_definition.ex`, `intake_sources.required_checks` | **keep** | Story verification uses them in both modes (`verification/github_actions.ex:51,81,116-148`, `verification/ci_target.ex:98`) |
 | Stage machine thread edges: `:base_updated`, `:merged_outside_ci`, `:review_ceiling`, `claimant_reportable?/3`; `Stages.follow_base_update/4`, `last_allow_query/2` | **delete** | Thread-only. 47.4 adds `:reverted` and `:change_outside_lifecycle`; `:change_outside_lifecycle` is the same idea as `:merged_outside_ci` and is written fresh against the chg event |

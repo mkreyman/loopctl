@@ -164,23 +164,4 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
     assert %{local_gate: "unread", passed: ["test"]} =
              judge(["test"], [job("test", "completed", "success")], {:unread, :forbidden})
   end
-
-  test "to_record/5 keeps only what the judgement read, with string keys" do
-    evidence = %{
-      jobs: [job("test", "completed", "failure"), job("codeql", "completed", "success")],
-      statuses: [status("local-gate", "success"), status("other", "success")]
-    }
-
-    result = CiEvidence.judge(["test"], evidence)
-    record = CiEvidence.to_record("abc", ["test"], evidence, result, ~U[2026-09-27 10:00:00Z])
-
-    assert record["sha"] == "abc"
-    # Always six fractional digits, so records order correctly as text.
-    assert record["read_at"] == "2026-09-27T10:00:00.000000Z"
-    assert record["local_gate"] == "success"
-    assert record["failed"] == [%{"name" => "test", "why" => "failure"}]
-
-    assert [%{"name" => "test", "workflow" => "ci.yml", "conclusion" => "failure"}] =
-             record["jobs"]
-  end
 end

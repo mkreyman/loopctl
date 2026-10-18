@@ -4,6 +4,30 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Removed
+
+- **Epic 45's change threads are deleted (#984).** BREAKING for anything still calling them:
+  `GET /api/v1/stories/:id/thread`, `POST .../thread/checkpoints`, `.../thread/entries`,
+  `.../thread/reviews`, `.../thread/fixes`, `GET .../thread/reviews/:review_id`,
+  `POST /api/v1/stories/:id/stage/transitions`, and the browser pages `/login`, `/logout`
+  and `/threads/:story_id` are gone (404). The claim response carries no `route`. The merge
+  gate is pull-request only, and its answer no longer carries `mode`, `checkpoint_id`,
+  `checkpoint_sha`, `base_sha` or `ci_evidence`. `thread` is no longer an intake-source
+  `mode` (422): **the migration moves any source still on `thread` to `pr`.** Runner contract
+  **1.23.0** (minor: the server answers the retired `checkpoint`, `thread_entry`,
+  `review_finding` and `review_verdict` events `unknown_event`, and `review` is no longer a
+  dispatchable kind, which a joining runner may still declare). MCP: loopctl-mcp-server
+  3.0.0 drops the `thread_*` tools.
+- **Migration `20261018120000_drop_change_threads`** drops `thread_entries`,
+  `thread_reviews`, `thread_issue_links`, `thread_checkpoints`, `claim_routes`,
+  `browser_sessions` and `webauthn_login_challenges`, drops `runner_dispatches.mode`,
+  removes `review` from the dispatch `kind` CHECK, and deletes queued jobs of the four
+  retired workers. Irreversible; no manual step.
+- **Env vars no longer read:** `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
+  `REVIEW_WALL_CLOCK_SECONDS`, `REVIEW_MAX_TURNS`. They can be unset (`fly secrets unset`);
+  leaving them set is harmless. loopctl no longer uses GitHub App 5101362 (its fate is
+  mkreyman/chg#33).
+
 ### Added
 
 - **`POST /api/v1/projects/:id/restore` re-activates an archived work project, and

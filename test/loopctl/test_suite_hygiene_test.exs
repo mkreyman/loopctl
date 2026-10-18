@@ -25,8 +25,6 @@ defmodule Loopctl.TestSuiteHygieneTest do
                        "are committed for both connections to see"
   @trigger_fault "injects its fault with a trigger on a shared table; that DDL lock would " <>
                    "stall every concurrent test writing the table until the test ended"
-  @audit_chain_fault "installs a refusing trigger on the shared `audit_chain` table: the " <>
-                       "broken chain is the subject and nothing in the app can produce one"
   @migration "runs a shipped migration's DDL against a shared table, the migration being the subject"
   @scale "commits a seeded corpus and asserts on the planner over it, and planner statistics " <>
            "are database-wide; excluded from the default suite by its scale tag"
@@ -46,7 +44,6 @@ defmodule Loopctl.TestSuiteHygieneTest do
       "drops `stories.sort_key`: a real stale schema is the subject, and the DDL lock on " <>
         "`stories` would block every concurrent test",
     "test/loopctl/coordination_claim_race_test.exs" => @race,
-    "test/loopctl/delivery/merge_precondition_lock_test.exs" => @second_connection,
     "test/loopctl/delivery/placement_fault_test.exs" =>
       @trigger_fault <> "; the sweep test is about committed rows by definition",
     "test/loopctl/delivery/session_end_release_fault_test.exs" =>
@@ -94,8 +91,6 @@ defmodule Loopctl.TestSuiteHygieneTest do
     "test/loopctl/test_lock_guard_test.exs" =>
       "takes DDL locks deliberately, on a probe table it commits, to test the guard that " <>
         "refuses them in async tests",
-    "test/loopctl/threads/review_dispatch_race_test.exs" => @race,
-    "test/loopctl/threads/thread_reviews_rollback_test.exs" => @migration,
     "test/loopctl/token_usage/correction_lock_test.exs" => @race,
     "test/loopctl/workers/audit_partition_worker_test.exs" =>
       "creates and drops partitions of the shared `audit_log` tree: catalog DDL every " <>
@@ -103,9 +98,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
     "test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs" => @scale,
     "test/loopctl/workers/triage_trigger_worker_lock_test.exs" => @second_connection,
     "test/loopctl/workers/verification_runner_worker_lock_test.exs" => @second_connection,
-    "test/loopctl_web/controllers/story_stage_report_broken_chain_test.exs" => @audit_chain_fault,
-    "test/loopctl_web/runner_channel_lock_test.exs" => @second_connection,
-    "test/loopctl_web/runner_channel_thread_broken_chain_test.exs" => @audit_chain_fault
+    "test/loopctl_web/runner_channel_lock_test.exs" => @second_connection
   }
 
   # Writes to state every test process shares. A line matching `@global_writes`, or a call
@@ -505,7 +498,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
     # A helper is matched by name, never by a module whose name only contains it.
     assert references?("Loopctl.Test.BrokenChain.install!(id)", "Loopctl.Test.BrokenChain")
     assert references?("alias Loopctl.Test.{BrokenChain, Other}", "Loopctl.Test.BrokenChain")
-    refute references?("LoopctlWeb.StoryStageReportBrokenChainTest", "Loopctl.Test.BrokenChain")
+    refute references?("LoopctlWeb.StoryEscalationBrokenChainTest", "Loopctl.Test.BrokenChain")
     refute references?("# Loopctl.Test.BrokenChain", "Loopctl.Test.BrokenChain")
   end
 end

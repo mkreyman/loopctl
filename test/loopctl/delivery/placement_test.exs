@@ -117,12 +117,11 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert pushed.branch == "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
     end
 
-    # US-45.4: the merge ROUTE is bound on the implement ledger row at placement — the mode from
-    # the same source read that filled `repo` and `base_branch`, and the base branch the
-    # dispatch was sent with — and neither is put on the wire.
-    test "the ledger row binds the source's mode and the base branch sent, off the wire", ctx do
+    # The base branch the dispatch was sent with is bound on the implement ledger row at
+    # placement, and nothing route-shaped from a caller reaches the wire.
+    test "the ledger row binds the base branch sent, off the wire", ctx do
       %{runner: runner, story: story} = ctx
-      bind_repo(runner.tenant_id, story, "mkreyman/thread_repo", :thread)
+      bind_repo(runner.tenant_id, story, "mkreyman/cron_books")
 
       minimal = %{
         "dispatch_id" => Ecto.UUID.generate(),
@@ -135,40 +134,9 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert {:ok, placed} = place(ctx, minimal)
       assert_push "dispatch", pushed, @reply_timeout
       refute Map.has_key?(pushed, :mode)
-      refute Map.has_key?(pushed, :placed_mode)
 
       row = DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id)
-      assert row.mode == "thread"
       assert row.base_branch == "master"
-    end
-
-    test "a caller that named repo and base_branch still binds the source's mode", ctx do
-      %{runner: runner, story: story} = ctx
-      bind_repo(runner.tenant_id, story, "mkreyman/thread_repo", :thread)
-
-      # The caller's own refs mean nothing resolved the source; a project-filtered read
-      # answers the mode. A caller-sent "mode" is not the route: only loopctl binds it.
-      payload =
-        :placement_dispatch
-        |> build(%{"story_id" => story.id})
-        |> Map.merge(%{"base_branch" => "main", "mode" => "pr", "placed_mode" => "pr"})
-
-      assert {:ok, placed} = place(ctx, payload)
-      assert_push "dispatch", _pushed, @reply_timeout
-
-      row = DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id)
-      assert row.mode == "thread"
-      assert row.base_branch == "main"
-    end
-
-    test "a caller-named dispatch for a project with no source records no mode", ctx do
-      %{runner: runner, story: story} = ctx
-
-      assert {:ok, placed} = place(ctx, build(:placement_dispatch, %{"story_id" => story.id}))
-      assert_push "dispatch", _pushed, @reply_timeout
-
-      row = DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id)
-      assert row.mode == nil
     end
 
     test "a budget nobody configured is named BEFORE anything is minted", ctx do
@@ -1616,25 +1584,11 @@ defmodule Loopctl.Delivery.PlacementTest do
                :kind,
                :max_turns,
                :repo,
-               :review,
                :story,
                :story_id,
                :token_budget,
                :triage,
                :wall_clock_seconds
-             ]
-
-      # `review` (contract 1.21.0, US-45.3) is the third nested object, and the reason a review
-      # is a runner dispatch at all: it names WHAT to read and carries no credential to write
-      # with. Every field is loopctl's own id, round number or sha; the review's findings and
-      # verdict go back over the socket the runner already holds.
-      assert RunnerContract.RunnerReview.schema().properties |> Map.keys() |> Enum.sort() == [
-               :checkpoint_id,
-               :checkpoint_seq,
-               :commit_sha,
-               :review_id,
-               :round,
-               :tree_sha
              ]
 
       # `triage` (contract 1.7.0) is the second nested object and is pinned for the same
@@ -1858,7 +1812,7 @@ defmodule Loopctl.Delivery.PlacementTest do
 
   # The story's project bound to a repository, which is where the fill reads `repo` and
   # `base_branch` from.
-  defp bind_repo(tenant_id, story, repo, mode \\ :pr) do
+  defp bind_repo(tenant_id, story, repo) do
     now = DateTime.utc_now()
 
     AdminRepo.insert!(%Loopctl.Intake.Source{
@@ -1866,7 +1820,6 @@ defmodule Loopctl.Delivery.PlacementTest do
       project_id: story.project_id,
       repo_full_name: repo,
       base_branch: "master",
-      mode: mode,
       webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
       inserted_at: now,
       updated_at: now

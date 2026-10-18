@@ -1,12 +1,9 @@
 defmodule Loopctl.Verification.Credential do
   @moduledoc """
   The ONE credential seam every forge call reads GitHub through (US-26.4.6, #936): the merge
-  gate, story verification, post-deploy verification, the thread checkpoint reads, the issue
-  closer and the thread issue links. Each asks here per tenant AND repository, and makes no
-  request when it answers `{:error, :credential_unavailable}`. The thread-mode merge, which
-  loopctl's GitHub App writes, asks here too before it opens an App session
-  (`Loopctl.Delivery.MergeExecutor`): only an operator credential licenses it, never a
-  tenant token.
+  gate, story verification, post-deploy verification and the issue closer. Each asks here per
+  tenant AND repository, and makes no request when it answers
+  `{:error, :credential_unavailable}`.
 
   ## Why a (tenant, repository) pair has to be named before anything is read
 
@@ -81,7 +78,7 @@ defmodule Loopctl.Verification.Credential do
 
   - the merge gate REFUSES on it (the refusal names it, and a human re-queues after fixing it);
   - story verification ends the run with no verdict (`credential_unavailable`);
-  - post-deploy verification and the forge outboxes (issue closer, thread issue links) WAIT on
+  - post-deploy verification and the issue closer's outbox WAIT on
     it like a transient fault, under their own existing bounds, asking again after
     `configuration_retry_seconds/0` — a story that shipped is never judged failed, and a
     closure is only abandoned once its attempts are spent, in the shape

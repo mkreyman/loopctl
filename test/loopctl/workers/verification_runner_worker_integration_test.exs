@@ -70,7 +70,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       refute_wrong_reads()
     end
 
-    test "thread mode: DispatchPayload.thread_branch/3 and the base the claim was placed on",
+    test "the claim's dispatched branch and the base it was placed on win over the stage row",
          ctx do
       # The stage row names a STALE branch; the ledger's route names the claim's own.
       fixture(:story_stage, %{
@@ -80,10 +80,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         branch: "loop/stale"
       })
 
-      place_thread!(ctx, "loop/thread-branch", "release")
+      place_dispatch!(ctx, "loop/claim-branch", "release")
 
       stub_forge(ctx, %{
-        branch: "loop/thread-branch",
+        branch: "loop/claim-branch",
         base: "release",
         evidence: build(:forge_evidence, %{status: "completed", conclusion: "failure"})
       })
@@ -639,7 +639,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   # -- plumbing ------------------------------------------------------------------------------
 
-  defp place_thread!(ctx, branch, base_branch) do
+  defp place_dispatch!(ctx, branch, base_branch) do
     runner = fixture(:stage_runner, %{tenant_id: ctx.tenant_id})
 
     {:ok, _row} =
@@ -651,7 +651,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           story_id: ctx.story_id,
           claim_epoch: 0,
           kind: "implement",
-          mode: "thread",
           branch: branch,
           base_branch: base_branch,
           status: "accepted",

@@ -1,11 +1,8 @@
 defmodule Loopctl.Forge do
   @moduledoc """
   A tenant's own GitHub token (#936), which every forge call made on that tenant's behalf
-  authenticates with: the merge gate, story verification, post-deploy verification, the
-  thread checkpoint reads, the issue closer and thread issue links. The one forge WRITE it
-  does not authenticate is the thread-mode merge, which loopctl's GitHub App performs
-  (`Loopctl.Delivery.MergeExecutor`); that write is licensed only for a pair the operator
-  named, never by a tenant's own token.
+  authenticates with: the merge gate, story verification, post-deploy verification and the
+  issue closer.
 
   ## Why the tenant's token
 

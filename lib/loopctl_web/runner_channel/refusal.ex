@@ -130,26 +130,13 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # `session_ended` (1.16.0) uses it with the same meaning: a DIFFERENT report of how a
   # session ended, for a dispatch whose report is already on the ledger row.
   #
-  # The change thread's five (1.20.0, `Loopctl.Delivery.RunnerThreads`), all PERMANENT for the
-  # bytes that earned them: `not_claimant` and `claim_not_live` — the claim is not this
-  # runner's, or is over — `checkpoint_conflict` and `idempotency_key_reused` — a resend that
-  # is not the same write — and `secret_blocked`, a credential in a text field.
-  #
-  # A review's five (1.21.0, `Loopctl.Delivery.RunnerReviews`): `review_closed`,
-  # `review_claim_ended`, `review_round_superseded` and `reviewer_not_separate` are permanent
-  # for that review, and
-  # `tenant_halted` clears when an operator lifts the custody halt.
-  #
   # The one-message halves split out of overloaded codes (1.22.0, loopctl#920), so a runner
   # can tell a claim that is over from one message that was wrong: `claim_epoch_mismatch`
   # (was `stale_claim_epoch`) and `wrong_dispatch_kind` (was `unknown_dispatch`).
   # A runner that joined on an older contract is sent the old code (`RunnerContract.for_version/2`).
   @verbatim ~w(unknown_dispatch stale_claim_epoch already_replied dispatch_not_accepted
                run_mismatch stale_stage unknown_story_stage effect_conflict
-               already_recorded not_claimant claim_not_live checkpoint_conflict
-               idempotency_key_reused secret_blocked tenant_halted review_closed
-               review_claim_ended review_round_superseded reviewer_not_separate
-               claim_epoch_mismatch wrong_dispatch_kind)a
+               already_recorded claim_epoch_mismatch wrong_dispatch_kind)a
 
   def for_message(reason) when reason in @verbatim, do: %{reason: Atom.to_string(reason)}
 

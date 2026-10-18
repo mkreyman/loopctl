@@ -70,20 +70,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # does not guess differently.
   @default_prefix "feature/"
 
-  # Where `fill/3` puts the merge mode an implement dispatch is placed under (US-45.4). An ATOM
-  # key: it never goes on the wire (`RunnerContract.cast_dispatch/1` keeps only declared
-  # fields), and no caller's JSON can supply it.
-  @placed_mode :placed_mode
-
-  @doc """
-  The key under which `fill/3` carries the intake source's mode, as a string (`"pr"`,
-  `"thread"`), or nil for a project with no single live source, to
-  `Loopctl.Runners.dispatch/3`, which records it on the ledger row
-  (`Loopctl.Runners.DispatchLedger.record_sent/4`), which keeps it on an implement row only.
-  """
-  @spec placed_mode_key() :: :placed_mode
-  def placed_mode_key, do: @placed_mode
-
   # Nothing on the wire can reach this: eight prefixes of 40 characters and a suffix under 30
   # leave it unreachable by a factor of two. It is the bound that holds when the prefixes came
   # from somewhere other than `cast_join/1`, the same role `Runners.declared_max_sessions/1`'s
@@ -197,28 +183,18 @@ defmodule Loopctl.Delivery.DispatchPayload do
   end
 
   @doc """
-  The ROUTE `story`'s current claim was bound to (US-45.4, US-45.9): the merge `mode` and the
-  `base_branch` it was placed or claimed under, and the branch it named. Read from the route
-  rows of the story's CURRENT `claim_epoch` (`Loopctl.Runners.DispatchLedger.claim_route_query/2`,
-  which owns those rules): the implement row its runner ACCEPTED, newest first, for a placed
-  claim, and the `Loopctl.Delivery.ClaimRoute` an INTERACTIVE claim recorded, both through
-  `DispatchLedger.route_rows_query/0`. An interactive claim therefore HAS a route, and never
-  inherits the source's live mode or base branch.
+  The ROUTE `story`'s current claim was dispatched on: the `base_branch` it was placed under and
+  the branch it named, read from the newest implement row of the story's CURRENT `claim_epoch`
+  that its runner ACCEPTED (`Loopctl.Runners.DispatchLedger.claim_route_query/2`, which owns
+  those rules).
 
   Every field is a RECORDED fact, never a derivation; a caller that needs a fallback applies
   it, and one that does not need a field never pays for resolving it:
 
-  - `mode` — the row's recorded mode (`Loopctl.Runners.DispatchLedger.record_sent/4` binds it
-    at placement). A row that records none is `:pr`: written before the column existed, when
-    `pr` was the only route, or placed where no single source resolved one. `nil` when there is
-    NO route row for the claim (neither an accepted placement nor an interactive claim's
-    route, e.g. a claim made before either was recorded); only then does the caller fall back
-    to the intake source's CURRENT mode, as it does for the base branch
-  - `base_branch` — the base branch the dispatch was placed on, pinned the same way. nil for a
-    row that records none (or no route row); only then does the caller fall back to the intake
-    source's CURRENT base branch
-  - `branch` — the name the dispatch put on the wire (#846.2), or nil. `thread_branch/3`
-    resolves the branch a thread is judged on from it
+  - `base_branch` — the base branch the dispatch was placed on. nil for a row that records none
+    (or no accepted row); only then does the caller fall back to the intake source's CURRENT
+    base branch
+  - `branch` — the name the dispatch put on the wire (#846.2), or nil
 
   The read's lock wait is bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/2`).
   `{:error, :busy}` for contention a caller retries out of
@@ -229,7 +205,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   @spec dispatch_route(Ecto.UUID.t(), Story.t()) ::
           {:ok,
            %{
-             mode: :pr | :thread | nil,
              branch: String.t() | nil,
              base_branch: String.t() | nil
            }}
@@ -238,13 +213,12 @@ defmodule Loopctl.Delivery.DispatchPayload do
     do: dispatch_route(tenant_id, story, story.claim_epoch, [])
 
   @doc """
-  `dispatch_route/2` for the claim of `claim_epoch` rather than the current one (US-45.7): the
-  route a checkpoint recorded under an earlier claim was built on. Same lock bound, same `:busy`.
+  `dispatch_route/2` for the claim of `claim_epoch` rather than the current one. Same lock
+  bound, same `:busy`.
   """
   @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer()) ::
           {:ok,
            %{
-             mode: :pr | :thread | nil,
              branch: String.t() | nil,
              base_branch: String.t() | nil
            }}
@@ -259,7 +233,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer(), keyword()) ::
           {:ok,
            %{
-             mode: :pr | :thread | nil,
              branch: String.t() | nil,
              base_branch: String.t() | nil
            }}
@@ -272,8 +245,8 @@ defmodule Loopctl.Delivery.DispatchPayload do
       fn ->
         tenant_id
         |> Repo.with_tenant(fn ->
-          # A lock held on the ledger (a retention prune, a migration) costs the gate a bounded
-          # wait and an `:unevaluated` answer, never a request held open behind it.
+          # A lock held on the ledger (a retention prune, a migration) costs the caller a bounded
+          # wait and a retry, never a request held open behind it.
           Capacity.set_lock_timeout!(Repo, opts)
           Repo.one(DispatchLedger.claim_route_query(tenant_id, story.id, claim_epoch))
         end)
@@ -282,55 +255,22 @@ defmodule Loopctl.Delivery.DispatchPayload do
     )
   end
 
-  defp route({:ok, nil}), do: {:ok, %{mode: nil, branch: nil, base_branch: nil}}
-  defp route({:ok, row}), do: {:ok, %{row | mode: route_mode(row.mode)}}
+  defp route({:ok, nil}), do: {:ok, %{branch: nil, base_branch: nil}}
+  defp route({:ok, row}), do: {:ok, row}
   defp route({:error, _reason} = error), do: error
-
-  defp route_mode("thread"), do: :thread
-  defp route_mode(_pr_or_legacy), do: :pr
 
   @doc """
   The base branch a claim was PLACED on, from its `dispatch_route/2`, so repointing the source
   afterwards cannot move the base a placed story is judged against or merged onto. A ledger
   row written before the column existed records none and falls back to `source`'s current base
-  branch — the only base there was when it was placed. The one derivation of it: the merge gate
-  and the merge executor both read it here (US-45.4, US-45.5).
+  branch — the only base there was when it was placed. The one derivation of it: story
+  verification reads it here (`Loopctl.Verification.CiTarget`).
   """
   @spec placed_base_branch(map(), map()) :: String.t()
   def placed_base_branch(%{base_branch: base_branch}, _source) when is_binary(base_branch),
     do: base_branch
 
   def placed_base_branch(_route, source), do: source.base_branch
-
-  @doc """
-  The branch a THREAD-mode story is judged on (US-45.4), the first that is present:
-
-  1. the route's `branch` (`dispatch_route/2`), the name the CURRENT claim's dispatch put on
-     the wire
-  2. `stage_branch` — the `branch` effect a runner reported on the stage row, for a claim whose
-     row records no branch (written before that column). It comes second because the stage
-     row OUTLIVES a claim: a release does not clear `branch`, so after a re-claim onto a
-     machine declaring another prefix it still names the PREVIOUS claim's branch, whose head
-     is not among the current claim's checkpoints (US-45.4 review round 3, finding 1)
-  3. `branch_for/2` with no prefixes, for a story nothing names a branch for: the name such a
-     dispatch carried whenever its runner declared none. For one that did, the forge answers
-     it as missing
-
-  Only thread mode asks: a pull request names its own head, so the pr path never resolves one.
-  """
-  @spec thread_branch(
-          %{:branch => String.t() | nil, optional(atom()) => term()},
-          Story.t(),
-          String.t() | nil
-        ) ::
-          {:ok, String.t()} | {:error, {:no_conforming_branch, [String.t()]}}
-  def thread_branch(%{branch: branch}, %Story{}, _stage_branch) when is_binary(branch),
-    do: {:ok, branch}
-
-  def thread_branch(_route, %Story{}, stage_branch) when is_binary(stage_branch),
-    do: {:ok, stage_branch}
-
-  def thread_branch(_route, %Story{} = story, _stage_branch), do: branch_for(story, [])
 
   @doc """
   The part of a branch name that makes it this story's and nobody else's.
@@ -497,37 +437,18 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   defp derive_branch(story, prefixes, :refuse), do: branch_for(story, prefixes)
 
-  # The MODE rides the same resolution as `repo` and `base_branch` (US-45.4): where this reads
-  # the source, its mode comes from that one read; where the caller supplied both refs, the
-  # same resolution runs for the mode alone, and a project with no single live source places
-  # with none.
   defp fill_repo(tenant_id, story, dispatch) do
     if Map.has_key?(dispatch, "repo") and Map.has_key?(dispatch, "base_branch") do
-      {:ok, put_placed_mode(dispatch, source_mode(tenant_id, story.project_id))}
+      {:ok, dispatch}
     else
       with {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id) do
         {:ok,
          dispatch
          |> put_new("repo", source.repo_full_name)
-         |> put_new("base_branch", source.base_branch)
-         |> put_placed_mode(source.mode)}
+         |> put_new("base_branch", source.base_branch)}
       end
     end
   end
-
-  # An ATOM key, so a caller's JSON can never carry one. Carried for every kind: the ledger
-  # records it on an implement row only (`DispatchLedger.record_sent/4`), the one rule.
-  defp put_placed_mode(dispatch, mode), do: Map.put(dispatch, @placed_mode, mode_string(mode))
-
-  defp source_mode(tenant_id, project_id) do
-    case Intake.source_for_project(tenant_id, project_id) do
-      {:ok, source} -> source.mode
-      {:error, _no_single_source} -> nil
-    end
-  end
-
-  defp mode_string(nil), do: nil
-  defp mode_string(mode) when is_atom(mode), do: Atom.to_string(mode)
 
   # ONE READ OF THE OPERATOR'S POLICY, and the same reader the unattended driver uses, so an
   # operator's placement and the driver's cannot disagree about what a session may spend.
@@ -548,7 +469,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   end
 
   defp budget_keys("triage"), do: {:triage_wall_clock_seconds, :triage_max_turns}
-  defp budget_keys("review"), do: {:review_wall_clock_seconds, :review_max_turns}
   defp budget_keys(_implement), do: {:dispatch_wall_clock_seconds, :dispatch_max_turns}
 
   defp budget(key), do: DispatchDriver.normalise_budget(Application.get_env(:loopctl, key), key)

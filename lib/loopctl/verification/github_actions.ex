@@ -2,12 +2,10 @@ defmodule Loopctl.Verification.GitHubActions do
   @moduledoc """
   US-26.4.3, redesigned by US-26.4.6 — story verification's CI adapter, over GitHub Actions.
 
-  It judges a commit by EXACTLY the merge gate's rules, through the merge gate's own code, so a
-  verification run means what a merge decision means (issue #913):
+  It judges a commit in three steps:
 
   1. `check_change/1` reads the commit's tree (`commit/2`) and compares the change with the
-     story's base branch (`compare/3`), then applies the thread merge gate's two change rules
-     through the gate's own code. An EMPTY change — the commit's tree is the base's, or the
+     story's base branch (`compare/3`), then applies the two change rules. An EMPTY change — the commit's tree is the base's, or the
      three-dot diff lists no file — is refused `empty_change` by
      `Loopctl.Delivery.EmptyChange.reasons/3`: nothing shows the story's work is in the
      commit, which is what an old green commit of the base, or an empty commit on top of one,
@@ -92,7 +90,7 @@ defmodule Loopctl.Verification.GitHubActions do
 
   def verdict(_request), do: {:refused, "credential_unavailable"}
 
-  # The merge gate's two rules, through its own code and in its order: an empty change
+  # The two change rules, in order: an empty change
   # (`EmptyChange.reasons/3`), then a change to CI definitions (`CiDefinition.reasons/1`).
   # Neither is ever judged on CI.
   defp change(commit, comparison) do

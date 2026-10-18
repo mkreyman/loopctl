@@ -1,16 +1,13 @@
 defmodule Loopctl.Delivery.CiEvidence do
   @moduledoc """
-  What CI said about ONE commit of a thread, judged against the required checks (US-45.6).
-  Pure.
-
-  A thread-mode story merges the checkpoint's exact commit with no pull request, so no forge
-  rule holds the merge to green CI: the merge gate reads the evidence itself
+  What CI said about ONE commit of a story's branch, judged against the required checks.
+  Pure. Story verification (`Loopctl.Verification.GitHubActions`) reads the evidence
   (`Loopctl.Delivery.PullRequestSource.check_evidence/3`) and this module decides what it
   says.
 
-  ## What may satisfy a required check: a job of the thread's own push run
+  ## What may satisfy a required check: a job of the branch's own push run
 
-  Only a JOB of a GitHub Actions WORKFLOW RUN that a PUSH of the thread's branch at exactly
+  Only a JOB of a GitHub Actions WORKFLOW RUN that a PUSH of the story's branch at exactly
   this commit triggered. Anything weaker is something the implementer can produce itself:
 
   - a commit STATUS can be posted by anyone holding `statuses: write`, which includes the
@@ -19,16 +16,16 @@ defmodule Loopctl.Delivery.CiEvidence do
     under any name by a workflow on ANOTHER branch the implementer pushed, through its
     `GITHUB_TOKEN`
   - a workflow run triggered some other way (`workflow_dispatch`, a different branch) runs
-    workflow files the checkpoint's review never saw
+    workflow files the change's review never saw
 
-  A push run of the thread branch runs the workflow files of the checkpoint's own tree, and a
-  checkpoint that CHANGES those files is refused before this is consulted
-  (`ci_definition_changed` in `Loopctl.Delivery.MergePrecondition`), so the definitions a
-  trusted job ran are the base's.
+  A push run of the story branch runs the workflow files of the commit's own tree, and a
+  change that CHANGES those files is refused before this is consulted
+  (`Loopctl.Delivery.CiDefinition.reasons/1`), so the definitions a trusted job ran are the
+  base's.
 
   What those jobs EXECUTE is repository code — test files, scripts — which the implementer
   writes, exactly as it writes the change itself. Tampering there is a defect in the change,
-  and the review of the thread (US-45.3) is what judges it; this module proves that the
+  and the change's review is what judges it; this module proves that the
   required jobs ran on this commit and passed, not that they test the right thing.
 
   ## How one required check is judged
@@ -204,45 +201,4 @@ defmodule Loopctl.Delivery.CiEvidence do
       _other -> nil
     end)
   end
-
-  @doc """
-  The evidence and its judgement as stored on the checkpoint's `gate_evidence` under `"ci"`
-  (AC-45.6.1): string keys, so it reads back as it was written.
-
-  Only what the judgement READ is kept: the jobs under a required name and the `local-gate`
-  state. A commit can carry many unrelated jobs, and keeping them made the record change
-  whenever any of them moved, so an unchanged judgement was rewritten on every poll.
-  """
-  @spec to_record(String.t(), [String.t()], evidence(), result(), DateTime.t()) :: map()
-  def to_record(sha, required, %{jobs: jobs}, result, read_at) do
-    names = lookup_names(required)
-
-    %{
-      "sha" => sha,
-      "read_at" => fixed_width_iso8601(read_at),
-      "required" => required,
-      "jobs" =>
-        for job <- jobs, job.name in names do
-          %{
-            "name" => job.name,
-            "workflow" => Map.get(job, :workflow),
-            "run_id" => Map.get(job, :run_id),
-            "status" => job.status,
-            "conclusion" => job.conclusion,
-            "url" => Map.get(job, :url)
-          }
-        end,
-      "local_gate" => result.local_gate,
-      "passed" => result.passed,
-      "pending" => result.pending,
-      "missing" => result.missing,
-      "failed" => Enum.map(result.failed, fn {name, why} -> %{"name" => name, "why" => why} end)
-    }
-  end
-
-  # ALWAYS six fractional digits, so two records order correctly as TEXT: the evidence write
-  # compares `read_at` (`Loopctl.Threads.record_gate_evidence/5`), and `"...:00Z"` sorts after
-  # `"...:00.5Z"` although it is earlier.
-  defp fixed_width_iso8601(%DateTime{microsecond: {micro, _precision}} = at),
-    do: DateTime.to_iso8601(%{at | microsecond: {micro, 6}})
 end
