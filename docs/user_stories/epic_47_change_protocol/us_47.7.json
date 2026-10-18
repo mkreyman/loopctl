@@ -1,0 +1,64 @@
+{
+  "id": "US-47.7",
+  "title": "Pilot on the first chg phase-2 repo",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "medium",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "see 20 consecutive story-bound changes go through chg and loopctl end to end",
+    "so_that": "the split is proven before any other repo depends on it"
+  },
+  "rationale": "PRD \u00a711. The pilot repo is whichever repo chg phase 2 enrolls first that also has a loopctl intake source.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.7.1",
+      "description": "The pilot repo's intake source is switched to mode: chg in the same week chg enrolls it."
+    },
+    {
+      "id": "AC-47.7.2",
+      "description": "Over 20 consecutive story-bound changes, every story reaches merged from a landed event with no stage written by hand, and none records a stale-head or superseded-CI incident."
+    },
+    {
+      "id": "AC-47.7.3",
+      "description": "Every one of those stories has a chg-minted reviewer lineage separate from its implementer's, or escalated review_missing."
+    },
+    {
+      "id": "AC-47.7.4",
+      "description": "The result, with the 20 story ids, is recorded as a KB finding and posted on the loopctl channel."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.7.1",
+      "verifies": [
+        "AC-47.7.2",
+        "AC-47.7.3"
+      ],
+      "name": "pilot audit",
+      "type": "e2e",
+      "preconditions": [
+        "20 changes landed"
+      ],
+      "steps": [
+        "read change_binding_get and story history for each"
+      ],
+      "expected_results": [
+        "criteria hold for all 20"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "If chg phase 2 enrolls no repo with a loopctl intake source, enroll one; do not pilot on loopctl itself."
+  ],
+  "dependencies": [
+    "US-47.2",
+    "US-47.3",
+    "US-47.4",
+    "US-47.5",
+    "US-47.6"
+  ]
+}

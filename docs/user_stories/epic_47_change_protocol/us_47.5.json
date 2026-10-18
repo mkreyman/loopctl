@@ -1,0 +1,94 @@
+{
+  "id": "US-47.5",
+  "title": "Intake mode :chg and verification from verified/master",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "merge gate and story verification",
+    "i_want_to": "treat a chg-enrolled repo as having no PR route",
+    "so_that": "the PR path is closed for that repo and verification reads the trunk verifier's verdict"
+  },
+  "rationale": "PRD \u00a73 item 3 and \u00a77. The forcing function on loopctl's side.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.5.1",
+      "description": "Loopctl.Intake.Source.mode accepts :chg beside :pr. Enrolling or switching a source to :chg requires a change_events_secret."
+    },
+    {
+      "id": "AC-47.5.2",
+      "description": "MergePrecondition refuses any evaluation for a :chg source with 409 change_protocol_enrolled, naming chg submit as the route."
+    },
+    {
+      "id": "AC-47.5.3",
+      "description": "Story verification for a :chg source passes its CI-evidence input only when the current binding's landed sha is an ancestor of verified/master (compare by sha) and no reverted event follows it."
+    },
+    {
+      "id": "AC-47.5.4",
+      "description": "A compare call that times out or errors answers unevaluated with Retry-After; it is never read as a pass."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.5.1",
+      "verifies": [
+        "AC-47.5.2"
+      ],
+      "name": "PR route closed",
+      "type": "integration",
+      "preconditions": [
+        "a :chg source"
+      ],
+      "steps": [
+        "call merge_precondition"
+      ],
+      "expected_results": [
+        "409 change_protocol_enrolled"
+      ]
+    },
+    {
+      "id": "TC-47.5.2",
+      "verifies": [
+        "AC-47.5.3"
+      ],
+      "name": "not yet verified",
+      "type": "integration",
+      "preconditions": [
+        "landed sha not an ancestor of verified/master (mocked forge)"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "CI evidence not satisfied"
+      ]
+    },
+    {
+      "id": "TC-47.5.3",
+      "verifies": [
+        "AC-47.5.4"
+      ],
+      "name": "slow forge",
+      "type": "integration",
+      "preconditions": [
+        "mocked compare times out"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "unevaluated with Retry-After"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "#984 removes :thread from the same enum; whichever lands second resolves the conflict.",
+    "Every forge call authenticates with the tenant's own GitHub token (#936)."
+  ],
+  "dependencies": [
+    "US-47.3"
+  ]
+}

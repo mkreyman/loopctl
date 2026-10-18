@@ -1,0 +1,71 @@
+{
+  "id": "US-47.6",
+  "title": "MCP tools for bindings and chg enrollment",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "medium",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "orchestrating session",
+    "i_want_to": "read a story's changes and enroll a repo in chg mode through MCP",
+    "so_that": "the new surface is reachable from a session, which is the only way the fleet reaches loopctl"
+  },
+  "rationale": "CLAUDE.md: an operator-facing endpoint is not done until an MCP tool calls it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.6.1",
+      "description": "GET /api/v1/stories/:id/changes returns the story's bindings and each change's applied events, agent role, and a change_binding_get tool calls it."
+    },
+    {
+      "id": "AC-47.6.2",
+      "description": "intake_source_enroll and intake_source_update accept mode: chg and change_events_secret; the secret is write-only and never returned."
+    },
+    {
+      "id": "AC-47.6.3",
+      "description": "Each tool's description states what the endpoint refuses and which key it needs; the declared-and-dispatched wiring test covers the new tool; mcp-server/README.md lists it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.6.1",
+      "verifies": [
+        "AC-47.6.3"
+      ],
+      "name": "wiring",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "run the mcp-server tool wiring test"
+      ],
+      "expected_results": [
+        "change_binding_get declared and dispatched"
+      ]
+    },
+    {
+      "id": "TC-47.6.2",
+      "verifies": [
+        "AC-47.6.2"
+      ],
+      "name": "secret write-only",
+      "type": "integration",
+      "preconditions": [
+        "a source enrolled with a secret"
+      ],
+      "steps": [
+        "read the source"
+      ],
+      "expected_results": [
+        "no secret in the response"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "mcp-server is plain ESM tested with node --test."
+  ],
+  "dependencies": [
+    "US-47.1",
+    "US-47.5"
+  ]
+}

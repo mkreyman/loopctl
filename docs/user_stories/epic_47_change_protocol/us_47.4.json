@@ -1,0 +1,117 @@
+{
+  "id": "US-47.4",
+  "title": "Review custody for chg-dispatched reviews",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "critical",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "tenant operator",
+    "i_want_to": "have chg's review jobs record verdicts under a lineage separate from every implementer",
+    "so_that": "a story implemented and landed through chg can still be verified with its custody intact"
+  },
+  "rationale": "PRD \u00a76. chg auto-approves some classes and runs reviews headless; loopctl's custody must still hold.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.4.1",
+      "description": "The operator mints chg-server's key as a parentless orchestrator-role dispatch with the existing POST /api/v1/dispatches; no new mint path and no change to root_dispatch_forbidden or the role ceiling."
+    },
+    {
+      "id": "AC-47.4.2",
+      "description": "review_records gains a nullable commit_sha. review_complete for a chg-mode story requires it and refuses a sha that is not a revision of the story's current binding with 422 commit_sha_not_bound."
+    },
+    {
+      "id": "AC-47.4.3",
+      "description": "self_review_blocked, caller_lineage_required and unresolvable_dispatch_lineage behave unchanged for a chg-minted reviewer key; a reviewer key on the implementer's chain is refused."
+    },
+    {
+      "id": "AC-47.4.4",
+      "description": "A landed event for a story-bound change with no review_records row for its landed revision leaves the story at merged flagged review_missing and escalates it; it never verifies."
+    },
+    {
+      "id": "AC-47.4.5",
+      "description": "verify_story on a chg-mode story requires a review_records row whose commit_sha is the landed revision."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.4.1",
+      "verifies": [
+        "AC-47.4.3"
+      ],
+      "name": "separate root passes",
+      "type": "integration",
+      "preconditions": [
+        "implementer under root R1, reviewer under chg root R2"
+      ],
+      "steps": [
+        "review_complete with the R2 child key"
+      ],
+      "expected_results": [
+        "201"
+      ]
+    },
+    {
+      "id": "TC-47.4.2",
+      "verifies": [
+        "AC-47.4.3"
+      ],
+      "name": "same chain refused",
+      "type": "integration",
+      "preconditions": [
+        "reviewer key a descendant of the implementer's dispatch"
+      ],
+      "steps": [
+        "review_complete"
+      ],
+      "expected_results": [
+        "409 self_review_blocked"
+      ]
+    },
+    {
+      "id": "TC-47.4.3",
+      "verifies": [
+        "AC-47.4.2",
+        "AC-47.4.5"
+      ],
+      "name": "verdict on a stale revision",
+      "type": "integration",
+      "preconditions": [
+        "review recorded on revision 1, revision 2 landed"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "refused: no review for the landed revision"
+      ]
+    },
+    {
+      "id": "TC-47.4.4",
+      "verifies": [
+        "AC-47.4.4"
+      ],
+      "name": "auto-approved landing",
+      "type": "integration",
+      "preconditions": [
+        "a docs-class change bound to a story, no review"
+      ],
+      "steps": [
+        "apply landed"
+      ],
+      "expected_results": [
+        "stage merged",
+        "review_missing escalation"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/chain-of-custody/SKILL.md before touching this.",
+    "Do not convert any exact_role gate to role:. Do not let commit_sha come from anything but the request body checked against the binding."
+  ],
+  "dependencies": [
+    "US-47.1"
+  ]
+}

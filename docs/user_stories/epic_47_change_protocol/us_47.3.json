@@ -1,0 +1,118 @@
+{
+  "id": "US-47.3",
+  "title": "Stage mapping from change events",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "delivery loop",
+    "i_want_to": "move a story's stage from its change's events",
+    "so_that": "the stage machine reflects landing, deploy and revert without a PR stage"
+  },
+  "rationale": "PRD \u00a75 mapping table. Reuses existing stages; adds two control-only edges.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.3.1",
+      "description": "submitted moves implementing to reviewing; review_findings moves reviewing to implementing over :review_findings; check_passed with an approved review moves reviewing to ci; landed moves ci to merged with merge_sha set to the landing commit; deployed moves merged to deployed."
+    },
+    {
+      "id": "AC-47.3.2",
+      "description": "verified records trunk_verified_sha on the stage row and writes no edge."
+    },
+    {
+      "id": "AC-47.3.3",
+      "description": "A new control-only edge :reverted takes merged or deployed to implementing, keeping the claim; it is not runner-reportable and is distinct from :merge_refused."
+    },
+    {
+      "id": "AC-47.3.4",
+      "description": "An event whose edge the machine does not allow from the row's current stage escalates over a new control-only edge :change_outside_lifecycle and records the event; it never forces the stage."
+    },
+    {
+      "id": "AC-47.3.5",
+      "description": "pr_open is never entered for a story whose intake source is mode: :chg."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.3.1",
+      "verifies": [
+        "AC-47.3.1",
+        "AC-47.3.5"
+      ],
+      "name": "happy path",
+      "type": "integration",
+      "preconditions": [
+        "a chg-mode story at implementing"
+      ],
+      "steps": [
+        "apply submitted, check_passed + approval, landed, deployed"
+      ],
+      "expected_results": [
+        "stages reviewing, ci, merged, deployed",
+        "pr_open never written",
+        "merge_sha is the landing sha"
+      ]
+    },
+    {
+      "id": "TC-47.3.2",
+      "verifies": [
+        "AC-47.3.3"
+      ],
+      "name": "revert",
+      "type": "integration",
+      "preconditions": [
+        "a story at deployed"
+      ],
+      "steps": [
+        "apply reverted"
+      ],
+      "expected_results": [
+        "stage implementing over :reverted",
+        "claim unchanged"
+      ]
+    },
+    {
+      "id": "TC-47.3.3",
+      "verifies": [
+        "AC-47.3.4"
+      ],
+      "name": "outside lifecycle",
+      "type": "integration",
+      "preconditions": [
+        "a story an operator escalated"
+      ],
+      "steps": [
+        "apply landed"
+      ],
+      "expected_results": [
+        "escalated over :change_outside_lifecycle",
+        "event recorded"
+      ]
+    },
+    {
+      "id": "TC-47.3.4",
+      "verifies": [
+        "AC-47.3.3"
+      ],
+      "name": "not runner-reportable",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "read runner_transitions/0"
+      ],
+      "expected_results": [
+        "neither new edge present"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Both edges go in @transitions in lib/loopctl/delivery/stage_machine.ex and stay out of the runner allowlist.",
+    "Ask what writes the edge out of every stage a new writer leaves stories in (the stage_machine.ex comment on absorbing stages)."
+  ],
+  "dependencies": [
+    "US-47.2"
+  ]
+}
