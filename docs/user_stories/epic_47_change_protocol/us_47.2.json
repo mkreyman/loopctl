@@ -1,0 +1,92 @@
+{
+  "id": "US-47.2",
+  "title": "Intake mode :chg closes the PR route",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "tenant operator",
+    "i_want_to": "enroll a repo's intake source in chg mode",
+    "so_that": "the PR route is closed for that repo and loopctl knows the secret and the reviewer root chg uses"
+  },
+  "rationale": "PRD \u00a73 item 3 and \u00a76. The forcing function on loopctl's side, and the registration everything after it reads.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.2.1",
+      "description": "Loopctl.Intake.Source.mode accepts :chg beside :pr. A :chg source carries an encrypted change_events_secret (redacted, never cast from a response) and a chg_root_dispatch_id; enrolling or switching to :chg without both is refused 422."
+    },
+    {
+      "id": "AC-47.2.2",
+      "description": "chg_root_dispatch_id must name a parentless, unrevoked, orchestrator-role dispatch of the same tenant, or the write is refused 422 chg_root_invalid."
+    },
+    {
+      "id": "AC-47.2.3",
+      "description": "MergePrecondition refuses any evaluation for a story on a :chg source with 409 change_protocol_enrolled, naming chg submit as the route."
+    },
+    {
+      "id": "AC-47.2.4",
+      "description": "The endpoint specs (operation/2) document the new fields and refusals."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.2.1",
+      "verifies": [
+        "AC-47.2.1"
+      ],
+      "name": "missing secret",
+      "type": "integration",
+      "preconditions": [
+        "a :pr source"
+      ],
+      "steps": [
+        "switch to :chg without a secret"
+      ],
+      "expected_results": [
+        "422"
+      ]
+    },
+    {
+      "id": "TC-47.2.2",
+      "verifies": [
+        "AC-47.2.2"
+      ],
+      "name": "root must be a root",
+      "type": "integration",
+      "preconditions": [
+        "a child dispatch"
+      ],
+      "steps": [
+        "enroll :chg naming it as chg_root_dispatch_id"
+      ],
+      "expected_results": [
+        "422 chg_root_invalid"
+      ]
+    },
+    {
+      "id": "TC-47.2.3",
+      "verifies": [
+        "AC-47.2.3"
+      ],
+      "name": "PR route closed",
+      "type": "integration",
+      "preconditions": [
+        "a story on a :chg source"
+      ],
+      "steps": [
+        "call merge_precondition"
+      ],
+      "expected_results": [
+        "409 change_protocol_enrolled"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "#984 removes :thread from the same enum; whichever lands second resolves the conflict.",
+    "Load .claude/skills/chain-of-custody/SKILL.md: chg_root_dispatch_id is a custody input."
+  ],
+  "dependencies": []
+}

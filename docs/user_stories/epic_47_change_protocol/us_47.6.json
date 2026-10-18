@@ -1,0 +1,90 @@
+{
+  "id": "US-47.6",
+  "title": "Story verification from verified/master",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "story verifier",
+    "i_want_to": "judge a chg-mode story's CI evidence from the trunk verifier",
+    "so_that": "verification reads the one sha that landed and was verified"
+  },
+  "rationale": "PRD \u00a77.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.6.1",
+      "description": "For a :chg source, the CI-evidence input passes only when the current binding's landed sha is an ancestor of verified/master (compare by sha), no reverted event follows it, and a review_records row names that sha."
+    },
+    {
+      "id": "AC-47.6.2",
+      "description": "A compare call that times out or errors answers unevaluated with Retry-After; it is never read as a pass."
+    },
+    {
+      "id": "AC-47.6.3",
+      "description": "Every other verify gate is unchanged."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.6.1",
+      "verifies": [
+        "AC-47.6.1"
+      ],
+      "name": "not yet verified",
+      "type": "integration",
+      "preconditions": [
+        "landed sha not an ancestor of verified/master (mocked forge)"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "CI evidence not satisfied"
+      ]
+    },
+    {
+      "id": "TC-47.6.2",
+      "verifies": [
+        "AC-47.6.1"
+      ],
+      "name": "reverted",
+      "type": "integration",
+      "preconditions": [
+        "landed, verified, then reverted"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "not satisfied"
+      ]
+    },
+    {
+      "id": "TC-47.6.3",
+      "verifies": [
+        "AC-47.6.2"
+      ],
+      "name": "slow forge",
+      "type": "integration",
+      "preconditions": [
+        "mocked compare times out"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "unevaluated with Retry-After"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Every forge call authenticates with the tenant's own GitHub token (#936)."
+  ],
+  "dependencies": [
+    "US-47.4",
+    "US-47.5"
+  ]
+}

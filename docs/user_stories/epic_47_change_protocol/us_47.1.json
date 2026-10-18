@@ -1,0 +1,96 @@
+{
+  "id": "US-47.1",
+  "title": "Story to change bindings",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "loopctl tenant",
+    "i_want_to": "bind a chg change to the story it implements",
+    "so_that": "a story's lifecycle can follow its change without a pull request"
+  },
+  "rationale": "PRD \u00a74. The binding is the one join both halves need.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.1.1",
+      "description": "A change_bindings table (tenant_id, story_id, repo, change_id, superseded_at) exists with RLS ENABLEd, unique on (tenant_id, repo, change_id); tenant_id is never cast."
+    },
+    {
+      "id": "AC-47.1.2",
+      "description": "Exactly one binding per story is current. Binding a second change supersedes the previous current one in the same transaction."
+    },
+    {
+      "id": "AC-47.1.3",
+      "description": "A story_id the tenant does not own never creates a binding; it is recorded as an unbound event, and the answer is identical to an unknown id."
+    },
+    {
+      "id": "AC-47.1.4",
+      "description": "Binding never writes assigned_agent_id or implementer_dispatch_id. A submitter whose session does not hold the story's claim is recorded with the flag submitter_not_claimant."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.1.1",
+      "verifies": [
+        "AC-47.1.1",
+        "AC-47.1.3"
+      ],
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": [
+        "two tenants, a story in tenant B"
+      ],
+      "steps": [
+        "bind from tenant A with tenant B's story_id"
+      ],
+      "expected_results": [
+        "no row in either tenant",
+        "answer identical to an unknown id"
+      ]
+    },
+    {
+      "id": "TC-47.1.2",
+      "verifies": [
+        "AC-47.1.2"
+      ],
+      "name": "one current binding",
+      "type": "unit",
+      "preconditions": [
+        "a story bound to change C1"
+      ],
+      "steps": [
+        "bind C2 to the same story"
+      ],
+      "expected_results": [
+        "C1 superseded",
+        "C2 current"
+      ]
+    },
+    {
+      "id": "TC-47.1.3",
+      "verifies": [
+        "AC-47.1.4"
+      ],
+      "name": "no re-anchor",
+      "type": "integration",
+      "preconditions": [
+        "a story claimed by agent A"
+      ],
+      "steps": [
+        "bind with a submitter session that is not A's"
+      ],
+      "expected_results": [
+        "assigned_agent_id and implementer_dispatch_id unchanged",
+        "submitter_not_claimant set"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Context module Loopctl.Changes; every function takes tenant_id first.",
+    "Custody identity is never an injectable input (CLAUDE.md, Dependency Injection)."
+  ],
+  "dependencies": []
+}
