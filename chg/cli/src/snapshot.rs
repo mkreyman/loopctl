@@ -1,4 +1,7 @@
-//! `chg snapshot build <repo> <sha>` (design §3.5, story S4).
+//! `chg snapshot build <repo> <sha> [--timeout-secs N]` (design §3.5, story S4). The
+//! flag replaces the 30 min cap on the adapter's `snapshot` command, for a first full
+//! build on a slow machine; `chg culprit --snapshot-timeout-secs` does the same for the
+//! snapshot a search builds.
 //!
 //! 1. CoW-clone the nearest existing snapshot (else start from an empty dir).
 //! 2. Bring its source files to `<sha>`: only the tracked files that differ from `<sha>`
@@ -15,12 +18,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::adapter::{self, Invoked};
 use crate::clone::clone_tree;
 use crate::contract::CommandName;
-use crate::exec;
 use crate::git;
 use crate::output::Document;
 use crate::store::{self, META, Meta, Store};
@@ -42,7 +44,7 @@ impl Drop for TempGuard {
     }
 }
 
-pub fn build(repo: &Path, rev: &str) -> Result<Built, String> {
+pub fn build(repo: &Path, rev: &str, timeout: Duration) -> Result<Built, String> {
     let started = Instant::now();
     let sha = git::resolve(repo, rev)?;
     let store = Store::for_repo(repo)?;
@@ -103,7 +105,7 @@ pub fn build(repo: &Path, rev: &str) -> Result<Built, String> {
         CommandName::Snapshot,
         BTreeMap::from([("sha", sha.clone())]),
         Some(slot),
-        exec::default_timeout(CommandName::Snapshot),
+        timeout,
     ) {
         Invoked::Ok(Document::Snapshot(s)) => s,
         Invoked::Ok(_) | Invoked::Failed(_) => unreachable!("snapshot documents never fail"),

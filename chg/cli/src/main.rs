@@ -135,6 +135,10 @@ enum Top {
         /// Reruns on <bad> before a failing test counts as real.
         #[arg(long, default_value_t = 2)]
         reruns: u32,
+        /// Overrides the wall-clock cap of the snapshot build a search runs when no
+        /// snapshot exists yet.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        snapshot_timeout_secs: Option<u64>,
     },
     /// File one open issue per flaky test (`chg culprit`'s `flaky`), or comment on the
     /// one already open; idempotent per run id (story S8). Prints the issue URLs.
@@ -240,7 +244,14 @@ enum ShadowCmd {
 enum SnapshotCmd {
     /// Build the snapshot of <sha>, cloned from the nearest existing one, then GC.
     /// Exit 0 built or already present, 1 failed (nothing is left half-built).
-    Build { repo: PathBuf, sha: String },
+    Build {
+        repo: PathBuf,
+        sha: String,
+        /// Overrides the snapshot command's wall-clock cap, for a first full build on a
+        /// slow machine.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
+    },
     /// List this repo's snapshots, newest first, as JSON lines.
     List {
         #[arg(long)]
@@ -304,7 +315,7 @@ enum AdapterCmd {
         #[arg(long)]
         balance_by: Option<String>,
         /// Overrides the per-command wall-clock cap.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
 }
@@ -313,8 +324,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Top::Snapshot { command } => match command {
-            SnapshotCmd::Build { repo, sha } => {
-                with_worktree(Some(repo), |r| snapshot_build(r, &sha))
+            SnapshotCmd::Build {
+                repo,
+                sha,
+                timeout_secs,
+            } => {
+                let timeout = exec::cap(CommandName::Snapshot, timeout_secs);
+                with_worktree(Some(repo), |r| snapshot_build(r, &sha, timeout))
             }
             SnapshotCmd::List { repo } => with_worktree(repo, snapshot_list),
             SnapshotCmd::Gc { repo } => with_worktree(repo, snapshot_gc),
@@ -413,7 +429,15 @@ fn main() -> ExitCode {
             repo,
             tests,
             reruns,
-        } => culprit_cmd(&repo_root(repo), &good, &bad, tests, reruns),
+            snapshot_timeout_secs,
+        } => culprit_cmd(
+            &repo_root(repo),
+            &good,
+            &bad,
+            tests,
+            reruns,
+            exec::cap(CommandName::Snapshot, snapshot_timeout_secs),
+        ),
         Top::Flaky {
             tests,
             run_id,
@@ -496,9 +520,7 @@ fn main() -> ExitCode {
                         values.insert(k, v);
                     }
                 }
-                let timeout = timeout_secs
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| exec::default_timeout(name));
+                let timeout = exec::cap(name, timeout_secs);
                 let root = repo_root(repo);
                 if let Some(sha) = balance_by {
                     match balance_record(&root, name, &sha) {
@@ -609,8 +631,8 @@ fn exec_cmd(
     }
 }
 
-fn snapshot_build(repo: &Path, sha: &str) -> ExitCode {
-    let r = snapshot::build(repo, sha);
+fn snapshot_build(repo: &Path, sha: &str, timeout: Duration) -> ExitCode {
+    let r = snapshot::build(repo, sha, timeout);
     let store = Store::for_repo(repo);
     let gc = store.map(|s| s.gc());
     match r {
@@ -972,6 +994,7 @@ fn culprit_cmd(
     bad: &str,
     tests: Option<PathBuf>,
     reruns: u32,
+    snapshot_timeout: Duration,
 ) -> ExitCode {
     let tests = match tests.map(|t| read_ids(&t)).transpose() {
         Ok(t) => t,
@@ -980,7 +1003,7 @@ fn culprit_cmd(
             return ExitCode::from(2);
         }
     };
-    match culprit::find(repo, good, bad, tests, reruns) {
+    match culprit::find(repo, good, bad, tests, reruns, snapshot_timeout) {
         Ok(f) => {
             println!("{}", serde_json::to_string(&f).expect("reports serialize"));
             eprintln!("chg: culprit: {}", f.reason);

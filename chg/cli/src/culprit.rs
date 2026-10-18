@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -52,6 +52,7 @@ pub struct Searcher<'a> {
     git_dir: &'a Path,
     store: Store,
     built: bool,
+    snapshot_timeout: Duration,
     pub probes: Vec<Probe>,
 }
 
@@ -64,7 +65,7 @@ impl<'a> Searcher<'a> {
             // `good` once, and every candidate after it hydrates from it.
             Hydrated::NoSnapshot if !self.built => {
                 // Built through this worktree: a snapshot checks out with a work tree.
-                snapshot::build(&s.path, good)?;
+                snapshot::build(&s.path, good, self.snapshot_timeout)?;
                 drop(s);
                 self.built = true;
                 self.scratch(sha, good)
@@ -185,6 +186,7 @@ pub fn find(
     bad: &str,
     tests: Option<Vec<String>>,
     reruns: u32,
+    snapshot_timeout: Duration,
 ) -> Result<Found, String> {
     // Revisions as the caller's worktree sees them (its HEAD); shared state by git dir.
     let good = git::resolve(repo, good)?;
@@ -216,6 +218,7 @@ pub fn find(
         git_dir: &git_dir,
         store,
         built: false,
+        snapshot_timeout,
         probes: vec![],
     };
     let found = |s: Searcher, culprit: Option<String>, failing, flaky, reason: String| {

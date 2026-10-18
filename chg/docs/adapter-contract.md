@@ -67,4 +67,4 @@ Before running `affected`, `chg` compares the changed paths against `always_all`
 
 `affected` never exits 2. Any of those failures **fails closed**: it prints `{"mode":"all","reason":"failed closed: …"}` and the reason on stderr, and exits 0, so the caller runs the whole suite.
 
-Wall-clock caps (override with `--timeout-secs`): snapshot 30 min, static 15, affected 5, run 15, shard 20. Stdout is relayed to stderr as it arrives (minus the newest line, held back as the candidate document), so a hung command still shows how far it got. When the command exits or times out, `chg` kills its whole process group, so no helper it started outlives it.
+Wall-clock caps (override with `--timeout-secs` on `chg adapter exec` and `chg snapshot build`, and `--snapshot-timeout-secs` on `chg culprit`): snapshot 30 min, static 15, affected 5, run 15, shard 20. Stdout is relayed to stderr as it arrives (minus the newest line, held back as the candidate document), so a hung command still shows how far it got. When the command exits or times out, `chg` kills its whole process group, so no helper it started outlives it.

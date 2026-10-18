@@ -23,6 +23,14 @@ pub fn default_timeout(name: CommandName) -> Duration {
     })
 }
 
+/// The cap a command runs under: `override_secs` when given (`--timeout-secs`), else the
+/// per-kind default. Every caller resolves its cap here.
+pub fn cap(name: CommandName, override_secs: Option<u64>) -> Duration {
+    override_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| default_timeout(name))
+}
+
 /// How long to wait for stdout EOF once the group is dead. Only a process that escaped
 /// the group (setsid) can hold the pipe that long, and the document is already in hand.
 const EOF_GRACE: Duration = Duration::from_secs(5);
@@ -217,6 +225,19 @@ pub fn workspace_slot(repo: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_override_replaces_the_cap_in_either_direction() {
+        assert_eq!(
+            cap(CommandName::Snapshot, None),
+            default_timeout(CommandName::Snapshot)
+        );
+        assert_eq!(
+            cap(CommandName::Snapshot, Some(7200)),
+            Duration::from_secs(7200)
+        );
+        assert_eq!(cap(CommandName::Snapshot, Some(1)), Duration::from_secs(1));
+    }
 
     #[test]
     fn quoting() {

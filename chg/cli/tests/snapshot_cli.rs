@@ -34,6 +34,7 @@ fn cow_tempdir() -> Option<TempDir> {
 const SNAP: &str = r#"#!/bin/sh
 # Stand-in snapshot command: builds the artifacts once, then only what src/version changed.
 echo "$(pwd)" >> "$SNAP_LOG"
+[ -n "${SNAP_SLEEP:-}" ] && sleep "$SNAP_SLEEP"
 # The tree has no .git; chg names its commit.
 mkdir -p _build; printf %s "$CHG_SHA" > _build/sha
 if [ -f _build/version ] && cmp -s src/version _build/version; then
@@ -655,4 +656,36 @@ fn a_failed_snapshot_command_leaves_no_snapshot() {
         0,
         "temp dir left behind"
     );
+}
+
+#[test]
+fn timeout_secs_overrides_the_snapshot_cap() {
+    let Some(e) = Env::new() else { return };
+    let sha = e.head();
+    e.chg()
+        .env("SNAP_SLEEP", "30")
+        .args(["snapshot", "build", "--timeout-secs", "1"])
+        .arg(&e.repo)
+        .arg(&sha)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("timed out after 1s"));
+    assert!(
+        e.snapshots().is_empty(),
+        "a timed-out build leaves no snapshot"
+    );
+}
+
+#[test]
+fn a_zero_timeout_is_refused_before_any_work() {
+    let Some(e) = Env::new() else { return };
+    let sha = e.head();
+    e.chg()
+        .args(["snapshot", "build", "--timeout-secs", "0"])
+        .arg(&e.repo)
+        .arg(&sha)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--timeout-secs"));
+    assert_eq!(e.builds(), 0, "no adapter run");
 }

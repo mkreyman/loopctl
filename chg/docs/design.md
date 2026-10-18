@@ -376,7 +376,7 @@ All stories ship in both repos unless marked otherwise. "Baseline" means the 202
 - `static` runs eslint on changed files, an incremental `tsc` per package, `check-pr-hygiene.mjs` and the secrets scan.
 
 **S4. Snapshot store and CoW workspaces.**
-- On each machine, `chg snapshot build <repo> <sha>` produces a snapshot under the store root, cloned from the previous snapshot. It keeps the newest 3 and never deletes a snapshot a live workspace was cloned from in the last 24 h.
+- On each machine, `chg snapshot build <repo> <sha>` produces a snapshot under the store root (`--timeout-secs` lifts the 30 min cap for a first full build on a slow machine), cloned from the previous snapshot. It keeps the newest 3 and never deletes a snapshot a live workspace was cloned from in the last 24 h.
 - The `post-checkout` hook on `git worktree add` (branch checkout, prev sha all zeros) runs `chg ws hydrate`, which clones the artifact paths from the nearest-ancestor snapshot.
 - p50 time from `git worktree add` to tests-runnable is under 15 s on HCB and fleet-holding, on mac-mini and minis, measured over 10 runs each and recorded.
 - In HCB, when HEAD equals the snapshot sha, the first `mix test <file>` prints no `Compiling` line for project modules. In fleet-holding, no install or build runs.
