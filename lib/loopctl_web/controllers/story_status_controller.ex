@@ -18,6 +18,7 @@ defmodule LoopctlWeb.StoryStatusController do
   require Logger
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Capabilities
   alias Loopctl.Dispatches
@@ -130,7 +131,8 @@ defmodule LoopctlWeb.StoryStatusController do
         "cap has passed). It is placed_at + `wall_clock_seconds` + " <>
         "`DISPATCH_LEASE_GRACE_SECONDS`, and moves only forward, only while the claim is " <>
         "live: to a resume's time or the runner's acceptance + `wall_clock_seconds` + the " <>
-        "grace.",
+        "grace. A key descending from an intake source's `chg_root_dispatch_id` is refused " <>
+        "409 `chg_root_review_only` (US-47.5): chg-server's keys may only review.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 =>
@@ -142,8 +144,9 @@ defmodule LoopctlWeb.StoryStatusController do
         {"Invalid transition, dependencies not met, or `story_held` — the story's delivery " <>
            "stage is `escalated`, `done` or `failed`, so it is not available to agents. An " <>
            "escalated story is claimable again only once a human resolves it to `queued` " <>
-           "(POST /stories/:id/stage/resolve); a done or failed one never is", "application/json",
-         Schemas.ErrorResponse},
+           "(POST /stories/:id/stage/resolve); a done or failed one never is. Or " <>
+           "`chg_root_review_only` (" <> Messages.chg_root_review_only() <> ")",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
         {"The claim's capability could not be minted; nothing was claimed. Retryable only " <>
@@ -223,6 +226,8 @@ defmodule LoopctlWeb.StoryStatusController do
         "structural lineage separation, not by L1, because a capability can only be " <>
         "bound to a lineage known when it is minted, and the reporter is by definition " <>
         "a principal distinct from the implementer who started the work. " <>
+        "A key descending from an intake source's `chg_root_dispatch_id` is refused 409 " <>
+        "`chg_root_review_only` (US-47.5). " <>
         "Optionally includes an artifact report and/or a token usage record.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
@@ -289,8 +294,9 @@ defmodule LoopctlWeb.StoryStatusController do
       400 =>
         {"claim_epoch is not a non-negative integer", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition, self-report blocked, or stale_claim_epoch", "application/json",
-         Schemas.ErrorResponse},
+        {"Invalid transition, self-report blocked, stale_claim_epoch, or " <>
+           "`chg_root_review_only` (" <> Messages.chg_root_review_only() <> ")",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -419,6 +425,7 @@ defmodule LoopctlWeb.StoryStatusController do
       AuditContext.from_conn(conn)
       |> Keyword.merge(agent_id: api_key.agent_id)
       |> Keyword.merge(custody_identity(api_key))
+      |> Keyword.merge(chg_root_opts(api_key))
 
     case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
@@ -574,6 +581,7 @@ defmodule LoopctlWeb.StoryStatusController do
       # gate fed by :reporter_lineage above is the enforcement. :dispatch_id is
       # still resolved server-side so the reporter's dispatch is recorded.
       |> Keyword.merge(custody_identity(api_key))
+      |> Keyword.merge(chg_root_opts(api_key))
       |> maybe_add_token_usage(params)
       |> Keyword.put(:claim_epoch, params["claim_epoch"])
 
@@ -597,7 +605,9 @@ defmodule LoopctlWeb.StoryStatusController do
              :unresolvable_dispatch_lineage,
              :missing_assigned_agent,
              # #803: the reporter presented an epoch from a claim that has ended.
-             :stale_claim_epoch
+             :stale_claim_epoch,
+             # US-47.5: chg-server's keys may only review.
+             :chg_root_review_only
            ] ->
         {:error, reason}
 
@@ -764,6 +774,14 @@ defmodule LoopctlWeb.StoryStatusController do
   # key). `[]` is inert — it matches a cap minted for `[]` and is never a lineage
   # "match" for the custody gates (Dispatches.lineage_shares_prefix?/2), so such a
   # caller falls back to the agent-id checks rather than short-circuiting them.
+  # US-47.5: the lineage the chg-root refusal judges on claim and report — the MINTING one,
+  # revoked or not (`Loopctl.Changes.ReviewCustody`), from the authenticating key.
+  defp chg_root_opts(api_key),
+    do: [
+      caller_minting_lineage:
+        Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id)
+    ]
+
   defp custody_identity(api_key) do
     case Dispatches.dispatch_for_api_key(api_key.tenant_id, api_key.id) do
       {:ok, dispatch} -> [dispatch_id: dispatch.id, lineage: dispatch.lineage_path]

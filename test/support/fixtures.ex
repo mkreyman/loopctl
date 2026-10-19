@@ -1973,11 +1973,16 @@ defmodule Loopctl.Fixtures do
 
     data = build(:review_record, attrs)
 
+    # US-47.5: a chg review's revision and reviewer dispatch, set on the struct as
+    # `Progress.record_review/4` sets them (never cast). Pass both or neither — the
+    # `review_records_chg_review_shape` CHECK refuses one alone.
     changeset =
       %ReviewRecord{
         tenant_id: tenant_id,
         story_id: story_id,
-        reviewer_agent_id: reviewer_agent_id
+        reviewer_agent_id: reviewer_agent_id,
+        commit_sha: Map.get(attrs, :commit_sha),
+        reviewer_dispatch_id: Map.get(attrs, :reviewer_dispatch_id)
       }
       |> ReviewRecord.create_changeset(data)
 
@@ -3945,6 +3950,10 @@ defmodule Loopctl.Fixtures do
         "WHERE tenant_id = ANY($1)",
       [raw_ids]
     )
+
+    # A chg review references its reviewer dispatch (US-47.5); the review rows would go with
+    # the tenant cascade anyway, so they go first.
+    AdminRepo.query!("DELETE FROM review_records WHERE tenant_id = ANY($1)", [raw_ids])
 
     AdminRepo.query!("DELETE FROM dispatches WHERE tenant_id = ANY($1)", [raw_ids])
     AdminRepo.delete_all(from(t in Tenant, where: t.id in ^ids))

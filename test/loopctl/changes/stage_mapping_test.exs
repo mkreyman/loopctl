@@ -29,8 +29,8 @@ defmodule Loopctl.Changes.StageMappingTest do
   @repo "mkreyman/infra"
 
   setup do
-    %{secret: secret, source: source} = fixture(:chg_source, %{})
-    %{secret: secret, source: source, tenant_id: source.tenant_id}
+    %{secret: secret, source: source, root: root} = fixture(:chg_source, %{})
+    %{secret: secret, source: source, root: root, tenant_id: source.tenant_id}
   end
 
   defp push(ctx, event) do
@@ -45,6 +45,20 @@ defmodule Loopctl.Changes.StageMappingTest do
   end
 
   defp sha(char), do: String.duplicate(char, 40)
+
+  # US-47.5: a chg review recorded for `story` at revision commit `revision_sha`, by a child of
+  # the source's chg root — what a landing reads before it lets the merge stand
+  # (AC-47.5.5; `Loopctl.Changes.ReviewCustodyTest` drives the gate itself).
+  defp reviewed!(ctx, story, revision_sha) do
+    reviewer = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id, parent: ctx.root})
+
+    fixture(:review_record, %{
+      tenant_id: ctx.tenant_id,
+      story_id: story.id,
+      commit_sha: revision_sha,
+      reviewer_dispatch_id: reviewer.id
+    })
+  end
 
   # A story with an assigned agent and its stage row at `stage`.
   defp story_at(ctx, stage, row_attrs \\ %{}) do
@@ -117,6 +131,7 @@ defmodule Loopctl.Changes.StageMappingTest do
     test "TC-47.4.1: two review rounds, landed, deployed — and pr_open never written", ctx do
       story = story_at(ctx, :implementing)
       merge_sha = sha("c")
+      reviewed!(ctx, story, sha("a"))
 
       events = [
         submitted("C1", 1, story),
@@ -192,7 +207,13 @@ defmodule Loopctl.Changes.StageMappingTest do
       assert {:ok, _} = push(ctx, submitted("C1", 1, story))
       assert {:ok, _} = push(ctx, event("C1", 2, "review_approved", %{data: %{"by" => "model"}}))
       assert {:ok, _} = push(ctx, event("C1", 3, "check_passed"))
-      assert {:ok, _} = push(ctx, event("C1", 4, "landed", %{data: %{"merge_sha" => sha("d")}}))
+      reviewed!(ctx, story, sha("f"))
+
+      assert {:ok, _} =
+               push(
+                 ctx,
+                 event("C1", 4, "landed", %{sha: sha("f"), data: %{"merge_sha" => sha("d")}})
+               )
 
       after_events = AdminRepo.get!(Story, story.id)
       assert row(ctx, story).stage == :merged
@@ -210,8 +231,12 @@ defmodule Loopctl.Changes.StageMappingTest do
       assert {:ok, _} = push(ctx, event("C1", 2, "check_passed"))
       assert row(ctx, story).stage == :ci
 
+      # It lands like any other change: the edge into `merged` is taken and chained. With no
+      # chg review for the landed revision it is then held over `:review_missing` (US-47.5,
+      # TC-47.5.5 in `Loopctl.Changes.ReviewCustodyTest`).
       assert {:ok, _} = push(ctx, event("C1", 3, "landed", %{data: %{"merge_sha" => sha("e")}}))
-      assert row(ctx, story).stage == :merged
+      assert {"ci", "merged", "forward"} in transitions(ctx, story)
+      assert row(ctx, story).merge_sha == sha("e")
     end
 
     test "the pair is the pair whichever order it arrives in", ctx do

@@ -39,6 +39,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
         "two connections over committed rows",
     "test/loopctl/changes_lock_test.exs" => @race,
     "test/loopctl/changes/events_lock_test.exs" => @race,
+    "test/loopctl/changes/review_custody_lock_test.exs" => @race,
     "test/loopctl/config_test_exs_partition_wiring_test.exs" =>
       "the subject is config/test.exs's own read of the OS environment at load time",
     "test/loopctl/context_retriever/entity_definitions_rollback_test.exs" => @migration,

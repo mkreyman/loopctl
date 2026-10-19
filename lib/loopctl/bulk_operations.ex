@@ -21,6 +21,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
@@ -56,7 +57,8 @@ defmodule Loopctl.BulkOperations do
   @spec bulk_claim(Ecto.UUID.t(), [Ecto.UUID.t()], Ecto.UUID.t(), keyword()) ::
           {:ok, [map()]} | {:error, atom()}
   def bulk_claim(tenant_id, story_ids, agent_id, opts \\ []) do
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_review_only) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       sorted_ids = Enum.sort(story_ids)
@@ -108,7 +110,8 @@ defmodule Loopctl.BulkOperations do
   def bulk_verify(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
     story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
 
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
 
@@ -162,7 +165,8 @@ defmodule Loopctl.BulkOperations do
   def bulk_reject(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
     story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
 
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
 
@@ -229,7 +233,8 @@ defmodule Loopctl.BulkOperations do
   def bulk_mark_complete(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
     story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
 
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
 
@@ -371,6 +376,24 @@ defmodule Loopctl.BulkOperations do
     Keyword.get_lazy(opts, :verifier_lineage, fn ->
       Dispatches.lineage_for_api_key(tenant_id, Keyword.get(opts, :actor_id))
     end)
+  end
+
+  # US-47.5 (AC-47.5.4): chg-server's keys review and never certify or implement. The WHOLE
+  # batch is refused, before any story is locked: it is the caller that may not act, on every
+  # story alike, so a per-story error list would only repeat it. Judged on the caller's MINTING
+  # lineage, revoked or not (`Loopctl.Changes.ReviewCustody`), which the controller resolves as
+  # `:caller_minting_lineage`; a direct context caller falls back to the live
+  # `:verifier_lineage`, then to the minting lineage of `:actor_id` — the same fallback order,
+  # and the same caveat, as `caller_lineage/2` above.
+  defp refuse_chg_root(tenant_id, opts, refusal) do
+    lineage =
+      Keyword.get_lazy(opts, :caller_minting_lineage, fn ->
+        Keyword.get_lazy(opts, :verifier_lineage, fn ->
+          Dispatches.minting_lineage_for_api_key(tenant_id, Keyword.get(opts, :actor_id))
+        end)
+      end)
+
+    ReviewCustody.refuse_chg_root(tenant_id, lineage, refusal)
   end
 
   # ===================================================================

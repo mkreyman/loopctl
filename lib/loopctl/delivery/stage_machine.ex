@@ -118,6 +118,11 @@ defmodule Loopctl.Delivery.StageMachine do
     story at `implementing`). Trunk holds a change the story did not expect, and only a human
     can say what the story is now. It is NOT taken from `escalated`: a story already there is
     waiting on a human, and `escalated` leaves only over `:human_resolution`
+  - `:review_missing` — merged -> escalated (US-47.5, Epic 47 PRD §6), taken in the SAME event
+    transaction as the `landed` that entered `merged`, when no chg review is recorded for the
+    landed revision (a policy auto-approval, or a review loopctl never accepted). chg lands on
+    its own authority, so the merge stands and nothing is cleared; the story is held for a
+    human and is never verified without one
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
 
@@ -206,7 +211,7 @@ defmodule Loopctl.Delivery.StageMachine do
 
   # The change protocol (US-47.4). The control-side escalations a change event can decide,
   # taken through `Loopctl.Delivery.Escalations.escalate_as_control/3` and nothing else.
-  @control_escalations [:change_outside_lifecycle, :reverted_after_verify]
+  @control_escalations [:change_outside_lifecycle, :reverted_after_verify, :review_missing]
 
   # From every stage a change event can find a story at that is not terminal: the event is
   # recorded either way, and a story `done` or `failed` has nowhere to go. NOT from
@@ -230,7 +235,10 @@ defmodule Loopctl.Delivery.StageMachine do
                      {:reviewing, :ci, :change_ready},
                      {:ci, :reviewing, :change_resubmitted},
                      {:ci, :implementing, :change_review_findings},
-                     {:verified, :escalated, :reverted_after_verify}
+                     {:verified, :escalated, :reverted_after_verify},
+                     # US-47.5: a landing with no chg review recorded for its revision.
+                     # `escalated` leaves over `:human_resolution`, so it is not absorbing.
+                     {:merged, :escalated, :review_missing}
                    ] ++
                      @reverted ++ @change_outside_lifecycle
 
@@ -631,8 +639,8 @@ defmodule Loopctl.Delivery.StageMachine do
   def release_escalation_edges, do: @release_escalations
 
   @doc """
-  The control-side escalations a chg change event decides (US-47.4): `:change_outside_lifecycle`
-  and `:reverted_after_verify`. Taken through
+  The control-side escalations a chg change event decides: `:change_outside_lifecycle` and
+  `:reverted_after_verify` (US-47.4), and `:review_missing` (US-47.5). Taken through
   `Loopctl.Delivery.Escalations.escalate_as_control/3`, never by a runner.
   """
   @spec control_escalation_edges() :: [edge()]
@@ -641,7 +649,7 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc """
   The change-protocol edges (US-47.4): `:change_ready`, `:change_resubmitted`,
   `:change_review_findings`, `:reverted`, `:reverted_after_verify` and
-  `:change_outside_lifecycle`. Control-only — none is runner-reportable, and
+  `:change_outside_lifecycle`, plus US-47.5's `:review_missing`. Control-only — none is runner-reportable, and
   `Loopctl.Delivery.Stages.advance/4` refuses every one of them: only the change-event seam
   (`Stages.advance_in_tenant_transaction/4`) takes them.
   """

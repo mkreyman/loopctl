@@ -524,7 +524,7 @@ describe("the wiring in index.js", () => {
   });
 
   test("force_unclaim_story selects its key the way every exact_role verb does", () => {
-    // The endpoint is `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`),
+    // The endpoint is `exact_role: :orchestrator` (`story_verification_controller.ex:30-31`),
     // so it needs an orchestrator-ROLE key; which env var holds one is a separate question
     // and `lib/custody-key.js` answers it — LOOPCTL_ORCH_KEY sent exactly when set, a global
     // LOOPCTL_API_KEY otherwise. What this pins is that the handler does not answer it itself.

@@ -81,6 +81,20 @@ All notable changes to loopctl are documented here.
   Migration `20261019160000_add_change_stage_mapping` adds `story_stages.trunk_verified_sha`
   and the `change_revert_issues` table; additive, no deploy ordering. Each chained stage
   retraction now also names `release_id` and `trunk_verified_sha` under `retracted`.
+- **Review custody for chg-dispatched reviews (US-47.5).** On a story bound to a chg change,
+  `POST /api/v1/stories/:id/review-complete` accepts the review only from a key whose dispatch
+  is a strict descendant of the intake source's `chg_root_dispatch_id` (409
+  `chg_reviewer_required`, chg-server's root key included), requires a new body field
+  `commit_sha` naming a submitted revision of the story's current change (422
+  `commit_sha_not_bound`), and records one verdict per reviewer dispatch (409
+  `chg_review_already_recorded`, held by a unique index). These run after the existing custody
+  gates, whose codes are unchanged; on any other story `commit_sha` is ignored and not stored.
+  Review records now serialise `commit_sha` and `reviewer_dispatch_id`. A chg story that
+  reaches `merged` with no such review for its landed revision is escalated in the same
+  transaction over a new control-only edge `review_missing` (`merged -> escalated`; the merge
+  stands) and waits for a human. Migration `20261019170000_add_chg_review_custody_to_review_records`
+  adds the two nullable columns, a CHECK that they are set together, and the unique index;
+  additive, no deploy ordering. MCP: loopctl-mcp-server 3.3.0.
 - **Intake-source mode `chg` (US-47.2).** `POST /api/v1/intake/sources` and `PATCH
   /api/v1/intake/sources/:id` accept `mode: "chg"` beside `pr`, plus two fields a `chg`
   source must carry: `change_events_secret` (the HMAC key chg-server will sign its event
@@ -418,6 +432,18 @@ All notable changes to loopctl are documented here.
     MCP server 2.109.0 adds `thread_stage_report`.
 
 ### Changed
+
+- **chg-server's keys never certify or implement (US-47.5).** A key whose MINTING lineage
+  (revoked or not) is rooted at a dispatch any intake source of the tenant registers as
+  `chg_root_dispatch_id` — live or revoked source, either mode — is refused 409
+  `chg_root_cannot_verify` by `POST /stories/:id/verify`, `/reject` (exempt from
+  `caller_lineage_required` only), `/backfill`, `POST /epics/:id/verify-all` and
+  `POST /stories/bulk/verify`, `/bulk/reject` and `/bulk/mark-complete` (the bulk paths and
+  verify-all refuse the whole call), and 409 `chg_root_review_only` by `POST /stories/:id/claim`,
+  `/report` and `/bulk/claim`. No other caller's answer changes.
+- **`POST /api/v1/stories/:id/review-complete` answers `caller_lineage_required` as the
+  documented 409.** The controller had no clause for it, so a key no dispatch minted reviewing
+  dispatch-minted work got a 500.
 
 - **The app's HTTP listener no longer serves HTTP/2.** Bandit now closes a connection that
   opens with the HTTP/2 preface, which keeps CVE-2026-105659 (HIGH, Bandit's HTTP/2 stack,

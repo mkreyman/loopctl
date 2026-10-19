@@ -29,7 +29,7 @@ defmodule Loopctl.Changes.EventEffects do
   | `review_findings` | `reviewing -> implementing`, `:review_findings` |
   | `review_findings`, at `ci` | `ci -> implementing`, `:change_review_findings` |
   | `review_approved` (`by: model` or `policy`) and `check_passed` on the same revision | `reviewing -> ci`, `:change_ready` |
-  | `landed` | `ci -> merged`, `:forward`, `merge_sha` = `data.merge_sha` (the new trunk commit) |
+  | `landed` | `ci -> merged`, `:forward`, `merge_sha` = `data.merge_sha` (the new trunk commit); then `merged -> escalated`, `:review_missing`, when no chg review names the landed revision (US-47.5) |
   | `deployed` | `merged -> deployed`, `:forward` |
   | `verified` | none: `trunk_verified_sha` = `data.sha` on the stage row |
   | `reverted`, at `merged` or `deployed` | `-> implementing`, `:reverted`, keeping the claim |
@@ -94,6 +94,7 @@ defmodule Loopctl.Changes.EventEffects do
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
   alias Loopctl.Changes.RevertIssues
+  alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
@@ -432,7 +433,13 @@ defmodule Loopctl.Changes.EventEffects do
     {%{"outcome" => "reverted_after_done", "issue" => Atom.to_string(issue)}, []}
   end
 
-  defp move(tenant_id, event, %{story_id: story_id, claim_epoch: epoch}, transition, effects) do
+  defp move(
+         tenant_id,
+         event,
+         %{story_id: story_id, claim_epoch: epoch} = target,
+         transition,
+         effects
+       ) do
     {_from, to, edge} = transition
 
     opts =
@@ -441,14 +448,50 @@ defmodule Loopctl.Changes.EventEffects do
 
     case Stages.advance_in_tenant_transaction(tenant_id, story_id, transition, opts) do
       {:ok, _row, entry} ->
-        {%{"outcome" => "moved", "to" => Atom.to_string(to), "edge" => Atom.to_string(edge)},
-         entries(entry)}
+        moved = %{
+          "outcome" => "moved",
+          "to" => Atom.to_string(to),
+          "edge" => Atom.to_string(edge)
+        }
+
+        after_move(tenant_id, event, target, to, {moved, entries(entry)})
 
       # Only a refusal decided before the database comes back here (an effect value the
       # machine will not store); the event is recorded with it rather than lost.
       {:error, reason} ->
         {%{"outcome" => "refused", "reason" => Atom.to_string(reason)}, []}
     end
+  end
+
+  # ── review custody at the landing (US-47.5, AC-47.5.5) ─────────────────────────────────────
+
+  # A landing is where a missing review becomes a fact: chg lands on its own authority, so the
+  # merge stands, but a story whose landed revision no chg reviewer recorded a verdict on is
+  # held for a human over `:review_missing` and never verified without one. Decided HERE, in
+  # the transaction that entered `merged`, on the revision the event names (`event.sha`, the
+  # revision commit — never `data.merge_sha`, the trunk commit a review never saw), so the
+  # merge and its escalation commit together or not at all. A review that commits after this
+  # read is too late for this landing: the escalation stands and a human resolves it.
+  defp after_move(tenant_id, %Event{kind: "landed"} = event, target, :merged, {moved, pending}) do
+    if ReviewCustody.reviewed_revision?(Repo, tenant_id, target.story_id, event.sha) do
+      {Map.put(moved, "review", "recorded"), pending}
+    else
+      {escalation, more} =
+        escalate(tenant_id, event, target, :review_missing, review_missing_reason(event))
+
+      {Map.merge(moved, %{"review" => "missing", "review_missing" => escalation}),
+       pending ++ more}
+    end
+  end
+
+  defp after_move(_tenant_id, _event, _target, _to, result), do: result
+
+  defp review_missing_reason(%Event{} = event) do
+    "review_missing: chg landed change #{RevertIssues.safe_id(event.change_id)} revision " <>
+      "#{event.revision} (#{RevertIssues.safe_sha(event.sha)}) with no review recorded for " <>
+      "that revision by a reviewer chg-server minted — a policy auto-approval, or a review " <>
+      "loopctl never accepted. The merge stands; a human decides what the story is now, " <>
+      "and it is not verified without one."
   end
 
   # An edge the machine does not allow from here: a human decides what the story is now.

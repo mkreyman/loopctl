@@ -22,6 +22,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
+  alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
@@ -251,10 +252,32 @@ defmodule Loopctl.Progress do
     (`Loopctl.Delivery.Stages.held_story_ids/2`): `escalated`, which is claimable again once
     `Loopctl.Delivery.Escalations.resolve/3` sends it to `queued`, or `done` / `failed`,
     which never are
+  - `{:error, :chg_root_review_only}` (US-47.5) if the caller is chg-rooted
+    (`Loopctl.Changes.ReviewCustody`): chg-server's keys may review and nothing else
   """
   @spec claim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
   def claim_story(tenant_id, story_id, opts \\ []) do
+    # US-47.5: chg-server's keys review and never implement — a chg-rooted agent-role CHILD
+    # clears `exact_role: :agent`, and claiming would let one chg tree implement a story and
+    # review it as a sibling, which the lineage gates read as separation.
+    with :ok <- refuse_chg_root_actor(tenant_id, opts, [:lineage]) do
+      do_claim_story(tenant_id, story_id, opts)
+    end
+  end
+
+  # US-47.5: the claim and report half of the chg-root refusal (`refuse_chg_root_verifier/2`
+  # is the certification half), on the caller's MINTING lineage when the controller resolved
+  # it, else the call's own live lineage from `fallbacks`.
+  defp refuse_chg_root_actor(tenant_id, opts, fallbacks),
+    do:
+      ReviewCustody.refuse_chg_root(
+        tenant_id,
+        ReviewCustody.caller_lineage(opts, fallbacks),
+        :chg_root_review_only
+      )
+
+  defp do_claim_story(tenant_id, story_id, opts) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -1048,6 +1071,7 @@ defmodule Loopctl.Progress do
     failure that fails closed (LCP-1 §7.5)
   - `{:error, :stale_claim_epoch}` if `:claim_epoch` is given and is not the story's
     current epoch (#803); omitting it skips the check
+  - `{:error, :chg_root_review_only}` (US-47.5) if the caller is chg-rooted; checked first
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
@@ -1061,7 +1085,8 @@ defmodule Loopctl.Progress do
     # SAME guard the standalone TokenUsage.create_report/3 path runs. A
     # cross-tenant (or non-existent) skill_version_id is rejected here, so no
     # report row is ever stored. The 3-tuple maps to a 422 via FallbackController.
-    with :ok <- validate_token_usage_ownership(tenant_id, token_usage_params) do
+    with :ok <- refuse_chg_root_actor(tenant_id, opts, [:reporter_lineage, :lineage]),
+         :ok <- validate_token_usage_ownership(tenant_id, token_usage_params) do
       do_report_story(tenant_id, story_id, opts, artifact_params)
     end
   end
@@ -2364,21 +2389,29 @@ defmodule Loopctl.Progress do
   - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
   - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
     dispatch cannot be resolved (lineage-integrity failure, fails closed — LCP-1 §7.5)
+  - `{:error, :chg_reviewer_required}` (US-47.5) on a story bound to a chg change, when the
+    reviewer's dispatch is not a STRICT descendant of the change's chg root
+    (`Loopctl.Changes.ReviewCustody`) — the root's own key included
+  - `{:error, :commit_sha_not_bound}` (US-47.5) on such a story, when `params["commit_sha"]`
+    is absent, malformed, or not the sha of a `submitted` revision of its current binding
+  - `{:error, :chg_review_already_recorded}` (US-47.5) when that reviewer dispatch already
+    recorded a verdict
   - `{:error, %Ecto.Changeset{}}` on validation failure
+
+  Every chg refusal runs AFTER the existing ones, so a non-chg story is answered exactly as
+  before and a chg story still meets `self_review_blocked`, `caller_lineage_required` and
+  `unresolvable_dispatch_lineage` first.
   """
   @spec record_review(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, ReviewRecord.t()} | {:error, atom() | Ecto.Changeset.t()}
   def record_review(tenant_id, story_id, params, opts \\ []) do
     reviewer_agent_id = Keyword.get(opts, :reviewer_agent_id)
+    reviewer_lineage = Keyword.get(opts, :reviewer_lineage, [])
 
     with {:ok, story} <- fetch_story_for_review(tenant_id, story_id),
          :ok <- validate_story_reported_done(story),
-         :ok <-
-           validate_not_self_review(
-             story,
-             reviewer_agent_id,
-             Keyword.get(opts, :reviewer_lineage, [])
-           ) do
+         :ok <- validate_not_self_review(story, reviewer_agent_id, reviewer_lineage),
+         {:ok, chg_review} <- chg_review(tenant_id, story, reviewer_lineage, params) do
       attrs = build_review_attrs(params)
 
       changeset =
@@ -2390,7 +2423,11 @@ defmodule Loopctl.Progress do
           # snapshotting the story's CURRENT reported_done_at. Programmatic (never
           # cast from client input). verify_story/4 + bulk_verify later require
           # this to match the story's reported_done_at at verify time.
-          reviewed_report_at: story.reported_done_at
+          reviewed_report_at: story.reported_done_at,
+          # US-47.5: the revision and the reviewer dispatch of a chg review, both decided
+          # by `chg_review/4` — never cast. `nil` on every other story.
+          commit_sha: chg_review.commit_sha,
+          reviewer_dispatch_id: chg_review.reviewer_dispatch_id
         }
         |> ReviewRecord.create_changeset(attrs)
 
@@ -2407,6 +2444,25 @@ defmodule Loopctl.Progress do
         attrs,
         reviewer_agent_id
       )
+    end
+  end
+
+  # US-47.5 (Epic 47 PRD §6): a story bound to a chg change takes its review only from a STRICT
+  # descendant of the change's chg root, naming a revision of its CURRENT binding. It runs
+  # AFTER `validate_not_self_review/3` and never instead of it, so on a chg story the existing
+  # refusals keep their codes, and on any other story this is a no-op that writes nothing:
+  # a `commit_sha` sent for a non-chg story is not stored, so a review recorded before a story
+  # was bound can never later count as the chg review of its landed revision.
+  @no_chg_review %{commit_sha: nil, reviewer_dispatch_id: nil}
+
+  defp chg_review(tenant_id, story, reviewer_lineage, params) do
+    case ReviewCustody.chg_story(tenant_id, story.id) do
+      :not_chg ->
+        {:ok, @no_chg_review}
+
+      {:chg, chg} ->
+        commit_sha = Map.get(params, "commit_sha") || Map.get(params, :commit_sha)
+        ReviewCustody.authorize_review(tenant_id, chg, reviewer_lineage, commit_sha)
     end
   end
 
@@ -2468,8 +2524,13 @@ defmodule Loopctl.Progress do
     {:ok, review_record}
   end
 
+  # One reviewer dispatch records one verdict (AC-47.5.1), decided by the unique index
+  # `review_records_reviewer_dispatch_uidx` rather than a read-then-write, so two concurrent
+  # verdicts from one key cannot both land.
   defp handle_review_transaction({:error, :review_record, changeset, _}, _, _, _, _) do
-    {:error, changeset}
+    if Keyword.has_key?(changeset.errors, :reviewer_dispatch_id),
+      do: {:error, :chg_review_already_recorded},
+      else: {:error, changeset}
   end
 
   defp handle_review_transaction({:error, :enqueue_knowledge_worker, reason, _}, _, _, _, _) do
@@ -2522,15 +2583,35 @@ defmodule Loopctl.Progress do
   - `{:error, :unresolvable_dispatch_lineage}` if a dispatch the story references
     (implementer or verifier) cannot be resolved (lineage-integrity failure, fails
     closed — LCP-1 §7.4.1)
+  - `{:error, :chg_root_cannot_verify}` (US-47.5) if the caller's lineage is rooted at a
+    registered `chg_root_dispatch_id` (`Loopctl.Changes.ReviewCustody`), judged on
+    `:caller_minting_lineage` when given, else `:verifier_lineage`, before any story is read
   """
   @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
   def verify_story(tenant_id, story_id, params, opts \\ []) do
+    verification_params = extract_verification_params(params)
+
+    with :ok <- refuse_chg_root_verifier(tenant_id, opts) do
+      do_verify_story(tenant_id, story_id, opts, verification_params)
+    end
+  end
+
+  # US-47.5 (AC-47.5.4): chg-server's keys can review and never certify. Judged on the caller's
+  # MINTING lineage (`:caller_minting_lineage`, revoked or not), falling back to its live
+  # `:verifier_lineage`, BEFORE any story is read: it is a refusal of the principal, the same on
+  # every story, so it never changes which code a non-chg-rooted caller meets.
+  defp refuse_chg_root_verifier(tenant_id, opts),
+    do:
+      ReviewCustody.refuse_chg_root(
+        tenant_id,
+        ReviewCustody.caller_lineage(opts, [:verifier_lineage])
+      )
+
+  defp do_verify_story(tenant_id, story_id, opts, verification_params) do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
-
-    verification_params = extract_verification_params(params)
 
     # #621: verify consumes NO capability, for the same reason report does not
     # (see start_story/3). A verify_cap was minted to the lineage
@@ -2718,6 +2799,8 @@ defmodule Loopctl.Progress do
       markers are now clear; use report/review/verify
     * `{:error, :story_in_progress}` — story is mid-lifecycle (e.g. `:contracted`)
       with no dispatch lineage yet; it is being worked, not pre-existing done work
+    * `{:error, :chg_root_cannot_verify}` (US-47.5) — the caller is chg-rooted; backfill
+      reaches the same `verified` state as verify, so it takes the same refusal, first
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
   """
   @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -2734,11 +2817,13 @@ defmodule Loopctl.Progress do
              | :story_has_dispatch_lineage
              | :story_entered_lifecycle
              | :story_in_progress
+             | :chg_root_cannot_verify
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
     reason = params |> Map.get("reason") |> normalize_string()
 
-    with :ok <- validate_backfill_reason(reason),
+    with :ok <- refuse_chg_root_verifier(tenant_id, opts),
+         :ok <- validate_backfill_reason(reason),
          {:ok, pr_number} <- cast_pr_number(Map.get(params, "pr_number")),
          {:ok, evidence_url} <-
            validate_evidence_url(params |> Map.get("evidence_url") |> normalize_string()) do
@@ -3169,6 +3254,8 @@ defmodule Loopctl.Progress do
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if story is not reported_done or verified
   - `{:error, :reason_required}` if reason is missing or blank
+  - `{:error, :chg_root_cannot_verify}` (US-47.5) if the caller is chg-rooted, as for
+    `verify_story/4`; checked before the reason
   """
   @spec reject_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -3180,7 +3267,11 @@ defmodule Loopctl.Progress do
     reason = Map.get(params, "reason") || Map.get(params, :reason)
     rejection_params = extract_rejection_params(params)
 
-    with :ok <- validate_reason(reason) do
+    # US-47.5: reject is exempt from `caller_lineage_required` only. A chg-rooted caller is
+    # refused here as on verify — sending work back is still a terminal custody decision, and
+    # one chg-server must never make about a story it reviewed.
+    with :ok <- refuse_chg_root_verifier(tenant_id, opts),
+         :ok <- validate_reason(reason) do
       multi =
         Multi.new()
         |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
@@ -3251,10 +3342,20 @@ defmodule Loopctl.Progress do
   ## Returns
 
   - `{:ok, %{verified_count: integer, skipped_count: integer, errors: [map()]}}` on success
+  - `{:error, :chg_root_cannot_verify}` (US-47.5) if the caller is chg-rooted; nothing is
+    verified
   """
   @spec verify_all_in_epic(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, map()}
+          {:ok, map()} | {:error, :chg_root_cannot_verify}
   def verify_all_in_epic(tenant_id, epic_id, params, opts \\ []) do
+    # US-47.5: the principal is refused once, for the whole epic, rather than once per story
+    # as a list of per-story errors — it is the caller, not any story, that cannot verify.
+    with :ok <- refuse_chg_root_verifier(tenant_id, opts) do
+      do_verify_all_in_epic(tenant_id, epic_id, params, opts)
+    end
+  end
+
+  defp do_verify_all_in_epic(tenant_id, epic_id, params, opts) do
     stories_to_verify = fetch_eligible_stories_for_verify(tenant_id, epic_id)
     results = Enum.map(stories_to_verify, &verify_single(tenant_id, &1, params, opts))
 

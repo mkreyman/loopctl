@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ReviewRecordController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Dispatches
   alias Loopctl.Progress
@@ -37,7 +38,15 @@ defmodule LoopctlWeb.ReviewRecordController do
     description:
       "Records that the review pipeline completed for a story. " <>
         "Must be called AFTER the story is in reported_done status and BEFORE verify. " <>
-        "Creates a review_record that verify uses as proof of independent review.",
+        "Creates a review_record that verify uses as proof of independent review. " <>
+        "A story BOUND TO A chg CHANGE (US-47.5) takes its review only from a key whose " <>
+        "dispatch is a strict descendant of the intake source's `chg_root_dispatch_id` " <>
+        "(409 `chg_reviewer_required` otherwise, chg-server's root key included), must " <>
+        "name the reviewed revision as `commit_sha` (422 `commit_sha_not_bound` when it is " <>
+        "absent, malformed or not a submitted revision of the story's current change), and " <>
+        "records one verdict per reviewer dispatch (409 `chg_review_already_recorded`). " <>
+        "These run after, never instead of, the existing custody gates. On any other story " <>
+        "`commit_sha` is ignored and not stored.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Review completion params", "application/json",
@@ -77,13 +86,32 @@ defmodule LoopctlWeb.ReviewRecordController do
              description:
                "When the review completed (defaults to now). Must be after reported_done_at.",
              example: "2026-03-30T01:44:41Z"
+           },
+           commit_sha: %OpenApiSpex.Schema{
+             type: :string,
+             pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$",
+             description:
+               "REQUIRED for a story bound to a chg change (US-47.5): the revision commit " <>
+                 "reviewed, the sha of a submitted revision of the story's current change. " <>
+                 "Ignored and not stored for any other story.",
+             example: "3f786850e387550fdab836ed7e6dc881de23001b"
            }
          }
        }},
     responses: %{
       201 => {"Review recorded", "application/json", Schemas.ReviewRecordResponse},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Story not in reported_done status", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Custody refusal. `self_review_blocked`, `caller_lineage_required`, " <>
+           "`missing_assigned_agent`, `unresolvable_dispatch_lineage`; and on a story bound " <>
+           "to a chg change `chg_reviewer_required` (" <>
+           Messages.chg_reviewer_required() <>
+           ") or `chg_review_already_recorded` (" <>
+           Messages.chg_review_already_recorded() <> ")", "application/json",
+         Schemas.ErrorResponse},
+      422 =>
+        {"Story not in reported_done status, a validation error, or `commit_sha_not_bound` (" <>
+           Messages.commit_sha_not_bound() <> ")", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -131,29 +159,14 @@ defmodule LoopctlWeb.ReviewRecordController do
       # hash-chained audit entry, atomically with the review record.
       |> Keyword.put(:custody_claim, conn.assigns[:custody_signed_claim])
 
-    case Progress.record_review(tenant_id, story_id, params, opts) do
-      {:ok, review_record} ->
-        conn
-        |> put_status(:created)
-        |> json(%{review_record: review_record})
-
-      {:error, :not_found} ->
-        {:error, :not_found}
-
-      {:error, :story_not_reported_done} ->
-        {:error, :story_not_reported_done}
-
-      {:error, :self_review_blocked} ->
-        {:error, :self_review_blocked}
-
-      {:error, :unresolvable_dispatch_lineage} ->
-        {:error, :unresolvable_dispatch_lineage}
-
-      {:error, :missing_assigned_agent} ->
-        {:error, :missing_assigned_agent}
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+    # TOTAL over `Progress.record_review/4`'s returns: every refusal goes to
+    # `LoopctlWeb.FallbackController`, which has a clause for each. The enumerated `case`
+    # this replaces had none for `:caller_lineage_required`, so that documented 409 was an
+    # unhandled `CaseClauseError` — a 500 — on this route.
+    with {:ok, review_record} <- Progress.record_review(tenant_id, story_id, params, opts) do
+      conn
+      |> put_status(:created)
+      |> json(%{review_record: review_record})
     end
   end
 end
