@@ -18,12 +18,14 @@ defmodule Loopctl.IntakeGenerationTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.IssueCloser
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Signature
+  alias Loopctl.MockPullRequestSource
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.TriageTriggerWorker
 
@@ -106,6 +108,21 @@ defmodule Loopctl.IntakeGenerationTest do
       assert gen2.status == :escalated
       assert gen2.escalation_reasons == escalated.escalation_reasons
       refute gen2.id in candidate_ids(ctx.tenant)
+
+      # The new record's own chain entry, naming where its reasons came from.
+      assert [payload] = escalation_payloads(ctx.tenant.id, gen2.id)
+      assert payload["signals"] == escalated.escalation_reasons
+      assert payload["escalation_reasons"] == escalated.escalation_reasons
+      assert payload["generation"] == 2
+      assert payload["inherited_from_generation"] == 1
+      assert payload["inherited_from_record_id"] == gen1.id
+    end
+
+    test "a generation that inherits nothing writes no escalation entry", ctx do
+      finished_issue(ctx, 42, :done)
+      assert {:ok, :recorded} = deliver(ctx.source, 42, action: "reopened", at: "T12")
+      [_gen1, gen2] = generations(ctx.source, 42)
+      assert escalation_payloads(ctx.tenant.id, gen2.id) == []
     end
 
     test "a reopen in the same second as the close is applied, and marked ambiguous", ctx do
@@ -262,6 +279,43 @@ defmodule Loopctl.IntakeGenerationTest do
     end
   end
 
+  describe "an earlier generation's closure after the bump" do
+    test "is abandoned superseded_by_generation, with nothing written to GitHub", ctx do
+      # Deployed ends the loop before the verdict writes the closure.
+      gen1 = finished_issue(ctx, 42, :deployed)
+      story1 = story_for(gen1.id)
+
+      assert {:ok, :recorded} = deliver(ctx.source, 42, action: "reopened", at: "T12")
+      assert [1, 2] == generations(ctx.source, 42) |> Enum.map(& &1.generation)
+
+      # Generation 1 then reaches its verdict and its closure is recorded.
+      assert :ok = IssueClosures.record_in(AdminRepo, ctx.tenant.id, story1.id, gen1.id, :shipped)
+      closure1 = IssueClosures.get(ctx.tenant.id, story1.id)
+
+      for call <- [:issue, :label_issue, :remove_label, :comment_issue, :close_issue] do
+        arity = if call == :issue, do: 2, else: 3
+        expect(MockPullRequestSource, call, 0, stub_of(arity))
+      end
+
+      assert {:abandoned, nil} = IssueCloser.close(closure1)
+
+      row = IssueClosures.get(ctx.tenant.id, story1.id)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "superseded_by_generation"
+    end
+
+    test "the newest generation's own closure is not superseded", ctx do
+      finished_issue(ctx, 42, :done)
+      assert {:ok, :recorded} = deliver(ctx.source, 42, action: "reopened", at: "T12")
+      [_, gen2] = generations(ctx.source, 42)
+      assert :ok = TriageTriggerWorker.drain(tenant_id: ctx.tenant.id)
+      story2 = story_for(gen2.id)
+
+      assert :ok = IssueClosures.record_in(AdminRepo, ctx.tenant.id, story2.id, gen2.id, :shipped)
+      refute IssueClosures.superseded?(IssueClosures.get(ctx.tenant.id, story2.id))
+    end
+  end
+
   describe "tenant isolation" do
     test "another tenant's ended loop on the same repository and issue starts nothing here",
          ctx do
@@ -355,6 +409,19 @@ defmodule Loopctl.IntakeGenerationTest do
   defp story_for(record_id), do: AdminRepo.get_by(Story, intake_record_id: record_id)
 
   defp stage_of(story_id), do: AdminRepo.get_by!(StoryStage, story_id: story_id).stage
+
+  defp escalation_payloads(tenant_id, record_id) do
+    AdminRepo.all(
+      from e in "audit_chain",
+        where:
+          e.tenant_id == type(^tenant_id, :binary_id) and e.action == "intake_escalated" and
+            e.entity_id == type(^record_id, :binary_id),
+        select: e.payload
+    )
+  end
+
+  defp stub_of(2), do: fn _a, _b -> {:error, :not_stubbed} end
+  defp stub_of(3), do: fn _a, _b, _c -> {:error, :not_stubbed} end
 
   defp candidate_ids(tenant),
     do: TriageTriggerWorker.candidates(tenant_id: tenant.id) |> Enum.map(& &1.id)

@@ -1046,27 +1046,26 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # made underneath it.
   defp post(repo, path, body), do: write(&Req.post/2, repo, path, body)
   defp patch(repo, path, body), do: write(&Req.patch/2, repo, path, body)
+  defp delete(repo, path), do: write(&Req.delete/2, repo, path, nil)
 
-  # DELETE carries no body. Same options, same statuses, same `failure/1`.
-  defp delete(repo, path) do
-    case Req.delete(url(repo, path), req_options(repo)) do
-      {:ok, %Req.Response{status: status, body: body}} when status in [200, 204] -> {:ok, body}
-      {:ok, %Req.Response{} = response} -> {:error, failure(response)}
-      {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
-    end
-  end
-
-  # GitHub answers 200 or 201 to the three writes here. Every other status goes through the
-  # SAME `failure/1` a read does, so a rate limit stays transient and a 403 the headers do not
+  # GitHub answers 200 or 201 to the POST and PATCH writes here, and 200 or 204 to the
+  # DELETE, which carries no body (`nil`). Every other status goes through the SAME
+  # `failure/1` a read does, so a rate limit stays transient and a 403 the headers do not
   # call a limit stays a permanent permission problem — one classification for the whole
   # client, which is why these live on this module rather than a second one.
   defp write(verb, repo, path, body) do
-    url = url(repo, path)
+    opts =
+      if body == nil, do: req_options(repo), else: Keyword.put(req_options(repo), :json, body)
 
-    case verb.(url, Keyword.put(req_options(repo), :json, body)) do
-      {:ok, %Req.Response{status: status, body: body}} when status in [200, 201] -> {:ok, body}
-      {:ok, %Req.Response{} = response} -> {:error, failure(response)}
-      {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
+    case verb.(url(repo, path), opts) do
+      {:ok, %Req.Response{status: status, body: body}} when status in [200, 201, 204] ->
+        {:ok, body}
+
+      {:ok, %Req.Response{} = response} ->
+        {:error, failure(response)}
+
+      {:error, reason} ->
+        {:error, {:github_unreachable, shape(reason)}}
     end
   end
 

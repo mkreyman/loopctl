@@ -71,6 +71,7 @@ defmodule Loopctl.Intake.IssueClosures do
   @type abandon_reason ::
           :closed_by_other
           | :source_revoked
+          | :superseded_by_generation
           | :retries_exhausted
           | {:permanent_forge_failure, term()}
 
@@ -175,6 +176,30 @@ defmodule Loopctl.Intake.IssueClosures do
         on: s.id == r.source_id and s.tenant_id == r.tenant_id,
         where: r.tenant_id == ^tenant_id and r.id == ^record_id,
         where: is_nil(s.revoked_at)
+    )
+  end
+
+  @doc """
+  Whether the issue a closure targets has a LATER intake generation than the closure's own
+  record (US-47.10).
+
+  Read by `Loopctl.Delivery.IssueCloser` before its first forge call. The issue was
+  reopened after this closure's story ended the loop, and the reopen is being triaged as
+  new work. Closing the issue now would answer it with the earlier fix's message. A closure
+  can be recorded before the reopen, so the check runs at close time, not at write time.
+
+  Committed state on `AdminRepo`, unlocked. `false` for a record that is gone;
+  `source_live?/1` already abandons that case.
+  """
+  @spec superseded?(IssueClosure.t()) :: boolean()
+  def superseded?(%IssueClosure{tenant_id: tenant_id, intake_record_id: record_id}) do
+    AdminRepo.exists?(
+      from r in Record,
+        join: later in Record,
+        on:
+          later.tenant_id == r.tenant_id and later.source_id == r.source_id and
+            later.issue_number == r.issue_number and later.generation > r.generation,
+        where: r.tenant_id == ^tenant_id and r.id == ^record_id
     )
   end
 
@@ -580,6 +605,7 @@ defmodule Loopctl.Intake.IssueClosures do
 
   defp abandon_text(:closed_by_other), do: "closed_by_other"
   defp abandon_text(:source_revoked), do: "source_revoked"
+  defp abandon_text(:superseded_by_generation), do: "superseded_by_generation"
   defp abandon_text(:retries_exhausted), do: "retries_exhausted"
 
   defp abandon_text({:permanent_forge_failure, reason}),

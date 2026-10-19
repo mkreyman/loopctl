@@ -1,21 +1,22 @@
 defmodule Loopctl.IntakeGenerationConcurrencyTest do
   @moduledoc """
-  US-47.10: two concurrent reopens of a finished issue start ONE new generation between
-  them (see "Generations" in `Loopctl.Intake`).
+  US-47.10: a delivery that races a generation bump lands on the NEW generation (see
+  "Generations" in `Loopctl.Intake`).
 
-  `async: false` and COMMITTED rows on two real connections, because the subject is the
-  interaction of the `FOR UPDATE` lock on the newest record with the unique index on
-  `(tenant_id, source_id, issue_number, generation)` across two transactions. The sandbox
-  gives every process one connection, so there the two reopens are serial by construction
-  and the losing branch is unreachable. The rows are this module's own, under a committed
-  tenant it sweeps.
+  `async: false` and COMMITTED rows on two real connections. The subject is
+  `SELECT ... ORDER BY generation DESC LIMIT 1 FOR UPDATE` picking its row from its snapshot
+  before it waits on the lock, which only exists between two transactions. The sandbox gives
+  every process one connection, so there every delivery is serial and the race cannot
+  happen. The rows are this module's own, under a committed tenant it sweeps.
 
-  The HOLDER stands in for the reopen that wins: it locks generation 1, inserts generation 2
-  and waits to commit. The contender is a real reopen through the webhook path. It reads
-  generation 1 as newest, waits on the lock, and once the holder commits it still holds
-  generation 1 as newest, because the winner did not change that row. Its insert of
-  generation 2 must then conflict, and its delivery must land on the winner's generation
-  rather than starting a third.
+  The HOLDER stands in for the reopen that bumps. It locks generation 1, inserts generation
+  2 and waits to commit. The contender is a real delivery through the webhook path. It reads
+  generation 1 as newest and waits on the lock. Once the holder commits it gets generation 1
+  back, because the bump did not change that row. Without the re-check in
+  `newest_locked/2` it would apply there:
+  - a second reopen would see a finished loop and try to insert generation 2 again;
+  - an edit would rewrite generation 1, which is never to be written again.
+  With the re-check, both land on generation 2.
   """
   use Loopctl.DataCase, async: false
 
@@ -43,42 +44,40 @@ defmodule Loopctl.IntakeGenerationConcurrencyTest do
 
   test "two concurrent reopens of a finished issue start one generation", %{tenant: tenant} do
     {source, gen1} = finished_issue(tenant, 42)
+
+    [after1, gen2] = race(tenant, source, gen1, "reopened", "Back again")
+
+    assert gen2.untrusted_title == "Back again"
+    assert gen2.last_action == "reopened"
+    assert after1 == gen1
+  end
+
+  test "an edit racing the bump lands on generation 2, and generation 1 is unchanged", %{
+    tenant: tenant
+  } do
+    {source, gen1} = finished_issue(tenant, 42)
+
+    [after1, gen2] = race(tenant, source, gen1, "edited", "Edited during the bump")
+
+    assert gen2.untrusted_title == "Edited during the bump"
+    assert gen2.last_action == "edited"
+    assert after1 == gen1
+  end
+
+  # The holder bumps to generation 2 under generation 1's lock while a real `action`
+  # delivery waits on that lock. Returns the issue's records once both have committed, after
+  # asserting there are exactly two generations.
+  defp race(tenant, source, gen1, action, title) do
     test_pid = self()
 
-    holder =
-      spawn_link(fn ->
-        Sandbox.unboxed_run(Loopctl.Repo, fn ->
-          AdminRepo.transaction(fn ->
-            AdminRepo.one!(from r in Record, where: r.id == ^gen1.id, lock: "FOR UPDATE")
-
-            now = DateTime.utc_now()
-
-            {1, _} =
-              AdminRepo.insert_all(Record, [
-                %{
-                  id: Ecto.UUID.generate(),
-                  tenant_id: gen1.tenant_id,
-                  source_id: gen1.source_id,
-                  project_id: gen1.project_id,
-                  issue_number: gen1.issue_number,
-                  generation: 2,
-                  inserted_at: now,
-                  updated_at: now
-                }
-              ])
-
-            send(test_pid, :locked)
-            receive do: (:commit -> :ok)
-          end)
-        end)
-      end)
+    holder = spawn_link(fn -> hold_while_bumping(gen1, test_pid) end)
 
     assert_receive :locked, 5_000
 
     contender =
       Task.async(fn ->
         Sandbox.unboxed_run(Loopctl.Repo, fn ->
-          deliver(source, 42, "reopened", "Back again", "2026-09-12T12:00:00Z")
+          deliver(source, gen1.issue_number, action, title, "2026-09-12T12:00:00Z")
         end)
       end)
 
@@ -93,20 +92,43 @@ defmodule Loopctl.IntakeGenerationConcurrencyTest do
       Sandbox.unboxed_run(Loopctl.Repo, fn ->
         AdminRepo.all(
           from r in Record,
-            where: r.tenant_id == ^tenant.id and r.issue_number == 42,
+            where: r.tenant_id == ^tenant.id and r.issue_number == ^gen1.issue_number,
             order_by: r.generation
         )
       end)
 
     assert [1, 2] == Enum.map(records, & &1.generation)
-    [after1, gen2] = records
+    records
+  end
 
-    # The contender's delivery landed on the winner's generation, and generation 1 is as the
-    # holder left it.
-    assert gen2.untrusted_title == "Back again"
-    assert gen2.last_action == "reopened"
-    assert after1.untrusted_title == gen1.untrusted_title
-    assert after1.last_action == "opened"
+  # The bump: generation 1 locked, generation 2 inserted, then wait to be told to commit.
+  defp hold_while_bumping(gen1, test_pid) do
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
+      AdminRepo.transaction(fn ->
+        AdminRepo.one!(from r in Record, where: r.id == ^gen1.id, lock: "FOR UPDATE")
+        insert_generation_2(gen1)
+        send(test_pid, :locked)
+        receive do: (:commit -> :ok)
+      end)
+    end)
+  end
+
+  defp insert_generation_2(gen1) do
+    now = DateTime.utc_now()
+
+    {1, _} =
+      AdminRepo.insert_all(Record, [
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: gen1.tenant_id,
+          source_id: gen1.source_id,
+          project_id: gen1.project_id,
+          issue_number: gen1.issue_number,
+          generation: 2,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
   end
 
   # A committed issue opened through the webhook, promoted, and its story put at `done`.

@@ -11,7 +11,10 @@ defmodule Loopctl.Delivery.IssueCloser do
   0. **Checks the intake source is still connected.** A revoked source is a tenant
      disconnecting that repository; loopctl abandons with `source_revoked` rather than writing
      to it (#826 review, finding 6). `IssueClosures.record_in/5` covers a source revoked before
-     the verdict; this covers one revoked after it.
+     the verdict; this covers one revoked after it. **Then checks the closure's record is
+     still the issue's newest intake generation** (US-47.10). A record a reopen has
+     superseded is abandoned with `superseded_by_generation`: the reopen is being triaged
+     again, and closing the issue with the earlier fix's message would answer it wrongly.
   1. **READS the issue.** Closed already?
      - carrying EXACTLY ONE loopctl resolution label, it is THIS CLOSURE'S, and this closure
        has stamped `labelled_at` (step 2, which stamps it whether it added the label or found
@@ -148,15 +151,23 @@ defmodule Loopctl.Delivery.IssueCloser do
   # `IssueClosures.record_in/5` refuses at verdict time, which covers a source already revoked
   # then; this covers one revoked between the verdict and the sweep.
   defp attempt(%IssueClosure{} = closure) do
-    if IssueClosures.source_live?(closure) do
-      # The credential is resolved ONCE per attempt (#936) and every call below uses it. None
-      # sends nothing and waits (`fault/2`, `Credential.configuration?/1`).
-      case Credential.repo(closure.tenant_id, closure.repo_full_name) do
-        {:ok, repo} -> read_issue(closure, repo)
-        {:error, reason} -> fault(closure, reason)
-      end
-    else
-      abandon(closure, :source_revoked, nil)
+    cond do
+      not IssueClosures.source_live?(closure) ->
+        abandon(closure, :source_revoked, nil)
+
+      # US-47.10: the issue was reopened after this closure's story ended the loop, and the
+      # reopen is a newer generation in triage. Closing it now would tell the reporter the
+      # earlier fix answers a report that is being worked again.
+      IssueClosures.superseded?(closure) ->
+        abandon(closure, :superseded_by_generation, nil)
+
+      true ->
+        # The credential is resolved ONCE per attempt (#936) and every call below uses it.
+        # None sends nothing and waits (`fault/2`, `Credential.configuration?/1`).
+        case Credential.repo(closure.tenant_id, closure.repo_full_name) do
+          {:ok, repo} -> read_issue(closure, repo)
+          {:error, reason} -> fault(closure, reason)
+        end
     end
   end
 

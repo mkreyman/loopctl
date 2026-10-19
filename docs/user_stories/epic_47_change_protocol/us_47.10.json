@@ -20,7 +20,7 @@
     },
     {
       "id": "AC-47.10.2",
-      "description": "Every issues delivery applies to the issue's NEWEST generation, which ensure_record/2 locks FOR UPDATE."
+      "description": "Every issues delivery applies to the issue's NEWEST generation, decided AFTER the row lock: ensure_record/2 locks the newest record FOR UPDATE, then a fresh statement checks for a newer generation and, if one exists, locks that instead, until the locked row is the newest. A delivery queued behind a bump lands on the new generation."
     },
     {
       "id": "AC-47.10.3",
@@ -40,11 +40,11 @@
     },
     {
       "id": "AC-47.10.7",
-      "description": "Two concurrent reopens start one generation between them. The next generation is inserted ON CONFLICT DO NOTHING on the generation index. The loser re-reads the newest generation and applies its delivery there under the ordinary order rules."
+      "description": "Two concurrent reopens start one generation between them, and an edit racing a bump lands on the new generation. A bump holds generation N's lock while it inserts N+1, and every delivery re-checks for a newer generation once it holds the lock. The unique generation index is a backstop that raises on a conflict."
     },
     {
       "id": "AC-47.10.8",
-      "description": "A new generation inherits its predecessor's escalation (status, reasons, escalated_at). An escalated issue is not put back into the triage queue by a reopen."
+      "description": "A new generation inherits its predecessor's escalation (status, reasons, escalated_at). An escalated issue is not put back into the triage queue by a reopen. The new record gets its own intake_escalated audit entry carrying the inherited reasons, inherited_from_generation and inherited_from_record_id."
     },
     {
       "id": "AC-47.10.9",
@@ -61,6 +61,10 @@
     {
       "id": "AC-47.10.12",
       "description": "A closed issue carrying exactly one loopctl resolution label, this closure's own, is recorded closed only when the closure has stamped labelled_at. Otherwise it is abandoned closed_by_other, because the label may be an earlier generation's. The closer stamps labelled_at when it finds its own label already on the open issue, as well as when it adds it, so its own crash window between close and record still reads as ours."
+    },
+    {
+      "id": "AC-47.10.13",
+      "description": "The issue closer abandons a pending closure whose intake record is not the issue's newest generation with superseded_by_generation, before any forge call. A story can end the loop at merged or deployed before its verdict writes the closure, and that closure must not close the reopened issue with the earlier fix's message."
     }
   ],
   "test_cases": [
@@ -146,19 +150,19 @@
       "verifies": [
         "AC-47.10.7"
       ],
-      "name": "two concurrent reopens start one generation",
+      "name": "a reopen or an edit racing a bump lands on the new generation",
       "type": "integration",
       "preconditions": [
         "a committed finished issue",
         "a holder transaction that has locked generation 1 and inserted generation 2"
       ],
       "steps": [
-        "deliver a reopened from a second connection",
+        "deliver a reopened, and separately an edited, from a second connection",
         "commit the holder"
       ],
       "expected_results": [
         "the contender waits, then records",
-        "exactly generations 1 and 2 exist, and the contender's content is on generation 2"
+        "exactly generations 1 and 2 exist, the contender's content is on generation 2, and generation 1 is unchanged"
       ]
     },
     {
@@ -198,7 +202,7 @@
         "deliver a reopened at second T to the second"
       ],
       "expected_results": [
-        "the first issue's generation 2 is escalated with the same reasons and is not a candidate",
+        "the first issue's generation 2 is escalated with the same reasons and is not a candidate, with its own intake_escalated entry naming generation 1",
         "the second issue's generation 2 is open with order_ambiguous set at T"
       ]
     },
@@ -262,6 +266,26 @@
         "abandoned closed_by_other, nothing closed",
         "labelled_at is stamped on the first attempt and the retry records closed",
         "recorded closed (the generation-1 crash window)"
+      ]
+    },
+    {
+      "id": "TC-47.10.11",
+      "verifies": [
+        "AC-47.10.13"
+      ],
+      "name": "an earlier generation's closure written after the bump is superseded",
+      "type": "integration",
+      "preconditions": [
+        "issue 42's story at deployed, then reopened into generation 2"
+      ],
+      "steps": [
+        "record generation 1's shipped closure",
+        "run the closer on it"
+      ],
+      "expected_results": [
+        "no forge call is made",
+        "the closure is abandoned superseded_by_generation",
+        "the newest generation's own closure is not superseded"
       ]
     }
   ],

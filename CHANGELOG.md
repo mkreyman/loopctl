@@ -63,7 +63,10 @@ All notable changes to loopctl are documented here.
   which needs the same `issues: write` the closer already uses). A closed issue found
   carrying only this closure's label now counts as loopctl's own close only when the
   closure recorded `labelled_at`; otherwise it is `abandoned` with `closed_by_other`,
-  because the label may be an earlier generation's.
+  because the label may be an earlier generation's. A pending closure whose record is no
+  longer the issue's newest generation is `abandoned` with the new reason
+  `superseded_by_generation`, before any GitHub call; it is not re-drivable by
+  `requeue_abandoned`.
 - **chg-server's change-events webhook (US-47.3): `POST /api/v1/change_events/:source_id`.**
   For a `chg` intake source. No API key: authenticated by `X-Chg-Signature: sha256=<hex>`, an
   HMAC-SHA256 over `"<X-Chg-Timestamp>.<raw body>"` with the source's `change_events_secret`,
