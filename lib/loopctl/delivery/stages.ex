@@ -933,9 +933,14 @@ defmodule Loopctl.Delivery.Stages do
   - `:event_data` — a JSON-encodable map recorded under `"payload"` on the `effect_recorded`
     event, bounded as `advance/4`'s is. Nothing is recorded for a replay of a write
     that already landed, because a replay writes no event.
+  - `:guard` — a zero-arity function returning `:ok` or `{:error, reason}`, run INSIDE the
+    write's transaction once the story and the row are locked and the epochs check, before
+    anything is written. `{:error, reason}` rolls the write back and is returned as is. It is
+    how a writer re-checks, under a lock, a fact it decided on before the transaction opened
+    (`Loopctl.Delivery.MergePrecondition` re-reads the intake source's mode there).
   """
   @spec record_effect(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), keyword()) ::
-          {:ok, StoryStage.t()} | {:error, effect_error()}
+          {:ok, StoryStage.t()} | {:error, effect_error() | atom()}
   def record_effect(tenant_id, story_id, effect, value, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
@@ -972,7 +977,11 @@ defmodule Loopctl.Delivery.Stages do
 
   defp apply_effect(row, story, effect, value, opts) do
     if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
-    put_effect(row, effect, value, opts)
+
+    case Keyword.get(opts, :guard, fn -> :ok end).() do
+      :ok -> put_effect(row, effect, value, opts)
+      {:error, reason} -> Repo.rollback(reason)
+    end
   end
 
   # The one place an identity is written, shared by `record_effect/5` and by the `:effects`

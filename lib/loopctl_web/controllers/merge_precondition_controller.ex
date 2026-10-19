@@ -146,7 +146,9 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "own state and drops every runner socket, the asking session's included; " <>
                 "claude-config is symlinked into every machine's ~/.claude. A refusal names " <>
                 "`self_deploy_excluded` and a human merges it instead. Decided before " <>
-                "everything else, including a forge outage, because no retry clears it."
+                "every other part of the verdict, including a forge outage, because no " <>
+                "retry clears it. (A story on a `chg` source gets no verdict at all: 409 " <>
+                "`change_protocol_enrolled`, decided before this.)"
           },
           custody: %OpenApiSpex.Schema{type: :string, nullable: true},
           gate_a_inputs: %OpenApiSpex.Schema{
@@ -213,7 +215,9 @@ defmodule LoopctlWeb.MergePreconditionController do
         "again. Only `allow` licenses a merge.\n\n" <>
         "409 `change_protocol_enrolled` when the story's intake source is in mode `chg` " <>
         "(US-47.2), decided before the stage check and before any GitHub read, and nothing " <>
-        "is escalated: " <> MergePrecondition.change_protocol_message(),
+        "is escalated. A source switched to `chg` while the gate ran is caught again where " <>
+        "the allow is written, with the same 409 and nothing recorded: " <>
+        MergePrecondition.change_protocol_message(),
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Merge precondition params", "application/json",

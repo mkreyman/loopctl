@@ -44,8 +44,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
      either is ordinary work rather than an escalation, so it goes back to `implementing`
      on `:base_moved`; it does not merge, because no CI run and no verifier saw it.
   6. **The repository is not one the loop deploys itself from** — issue #803's correction
-     11, and the only precondition decided before anything else, including a forge outage.
-     See below.
+     11, and the only precondition of the VERDICT decided before every other, including a
+     forge outage. See below. (A `chg` source is refused earlier still, but that is not a
+     verdict: no verdict is produced at all — next section.)
 
   ## A `chg` repository has no PR route (US-47.2)
 
@@ -55,6 +56,14 @@ defmodule Loopctl.Delivery.MergePrecondition do
   (PRD §3 item 3): chg lands that repository's changes (`chg submit`), so a pull-request merge
   there is the old route, and answering it with a verdict would be answering the wrong
   question. `evaluate/3` and `enforce/3` share the refusal, so `enforce/3` writes nothing.
+
+  The mode is read once more where the allow is WRITTEN: `enforce/3` records an allow through
+  `Stages.record_effect/5` with a guard (`Intake.hold_pr_route/3`) that re-reads it under a
+  share lock on the source, so a switch to `chg` that lands between the evaluation and the
+  write records nothing and answers the same `{:error, :change_protocol_enrolled}`. The other
+  half is `Intake.update_source/4`, which refuses the switch (`pr_route_in_flight`) while a
+  story still holds an allow it has not merged on — the `ci -> merged` edge that consumes an
+  allow does not read the mode, so an allow recorded before the switch must not exist after it.
 
   ## The loop may not merge its own control plane
 
@@ -196,6 +205,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.DeliveryGates.GateB
   alias Loopctl.Intake
   alias Loopctl.Progress
+  alias Loopctl.Repo
   alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
@@ -481,8 +491,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec enforce(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, Verdict.t()} | {:error, error()}
   def enforce(tenant_id, story_id, opts) do
-    with {:ok, verdict} <- evaluate(tenant_id, story_id, opts) do
-      {:ok, act(tenant_id, story_id, verdict, opts)}
+    with {:ok, verdict} <- evaluate(tenant_id, story_id, opts),
+         %Verdict{} = acted <- act(tenant_id, story_id, verdict, opts) do
+      {:ok, acted}
     end
   end
 
@@ -1083,6 +1094,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     case record_allow(tenant_id, story_id, verdict, opts) do
       %Verdict{decision: :allow} = allowed -> allowed
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
+      {:error, :change_protocol_enrolled} = closed -> closed
     end
   end
 
@@ -1107,8 +1119,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # lives only in the response, and an already-merged pull request cannot be told from one
   # merged around the gate — so a write that does not land turns the allow into a refusal
   # rather than a merge nobody can later account for.
+  #
+  # The guard re-reads the source's mode INSIDE the write, under a share lock, because
+  # `evaluate/3` read it before any transaction opened: a switch to `chg` committed in between
+  # answers `change_protocol_enrolled` — the route is closed, exactly as if `evaluate/3` had
+  # seen it — rather than recording an allow on a `chg` source or escalating a story whose
+  # route merely changed.
   defp record_allow(tenant_id, story_id, %Verdict{head_sha: head} = verdict, opts) do
-    write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+    write_opts =
+      opts
+      |> Keyword.take([:claim_epoch, :actor_label])
+      |> Keyword.put(:guard, fn -> Intake.hold_pr_route(Repo, tenant_id, story_id) end)
+
     write_allow(tenant_id, story_id, verdict, head, write_opts, opts)
   end
 
@@ -1116,6 +1138,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
     case Stages.record_effect(tenant_id, story_id, :merge_gate_allowed_sha, head, write_opts) do
       {:ok, _row} ->
         clear_unevaluated(tenant_id, story_id, verdict, opts)
+
+      {:error, :change_protocol_enrolled} = closed ->
+        closed
 
       {:error, reason} ->
         Logger.warning(

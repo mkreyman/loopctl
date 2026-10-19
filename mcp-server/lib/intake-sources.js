@@ -74,10 +74,12 @@
  * is. The controller mounts `RequireRole, role: :user` — the HIERARCHY form, so a
  * `:superadmin` key would pass too and this package holds no such variable — plus
  * `RequireHumanAnchor` on create/update/delete and `RequireUnlineagedCaller` on create
- * (`lib/loopctl_web/controllers/intake_source_controller.ex:27-29`). That last one is why a
+ * (`lib/loopctl_web/controllers/intake_source_controller.ex:34-36`). That last one is why a
  * global `LOOPCTL_API_KEY` must not stand in: creating a source MINTS A CREDENTIAL that
  * belongs to no dispatch lineage, so a caller whose own key a dispatch minted is refused
- * `403 api_key_mint_forbidden`, exactly as it is on `POST /api/v1/api_keys`.
+ * `403 api_key_mint_forbidden`, exactly as it is on `POST /api/v1/api_keys`. An update that
+ * names a `chg` credential or sets `mode` to `chg` is held to the same ceiling under its own
+ * code, `403 chg_registration_forbidden`, whose remedy is the operator key itself.
  *
  * ## MODE `chg` AND ITS TWO CREDENTIALS (US-47.2, AC-47.7.2)
  *

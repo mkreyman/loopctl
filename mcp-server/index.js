@@ -8942,17 +8942,26 @@ const TOOLS = [
       "report to a human instead of filing a story. Leave the field out instead. " +
       "`base_branch` and `mode` have no cleared state at all, so a null there is refused. " +
       "`base_branch` is BOUND to each implement dispatch when it is placed: a story already " +
-      "placed is merge-gated against the base branch its dispatch was sent with.\n\n" +
+      "placed is merge-gated against the base branch its dispatch was sent with. `mode` is " +
+      "NOT bound that way: the merge gate reads the source's current mode.\n\n" +
       "SWITCHING TO `chg` closes the PR route for EVERY story on the source at once: " +
       "merge_precondition reads the source's current mode and answers 409 " +
-      "`change_protocol_enrolled` (land with `chg submit`). The resulting source must carry " +
+      "`change_protocol_enrolled` (land with `chg submit`). The switch is itself refused 409 " +
+      "`pr_route_in_flight`, with the `story_ids`, while any story of the project sits at " +
+      "`ci` holding a merge allow it has not merged on: merge those (or let the gate escalate " +
+      "them) and retry. The resulting source must carry " +
       "BOTH `change_events_secret` and `chg_root_dispatch_id`, named here or kept from an " +
-      "earlier `chg` stint (422 naming the missing one), and the root is re-checked on every " +
-      "switch or change (422 `chg_root_invalid` unless it is a parentless, unrevoked, " +
-      "orchestrator-role dispatch of this tenant). Switching to `pr` KEEPS both and ignores " +
+      "earlier `chg` stint (422 naming the missing one), and the root is re-checked on EVERY " +
+      "write that leaves the source `chg` — a secret rotation or a base-branch edit included " +
+      "— and whenever one is named (422 `chg_root_invalid` unless it is a parentless, " +
+      "unrevoked, orchestrator-role dispatch of this tenant; a revoked root blocks every such " +
+      "write until a live one is named, while switching to `pr` is never blocked). Switching " +
+      "to `pr` KEEPS both and ignores " +
       "them; on a `pr` source an explicit null clears either, and on a `chg` source a null is " +
-      "a 422. Naming either credential needs a key NO DISPATCH MINTED (403 " +
-      "`api_key_mint_forbidden` otherwise, as enrolment does). The secret is write-only and " +
+      "a 422. Naming either credential, or setting `mode` to `chg` (which re-activates the " +
+      "kept ones), needs the tenant's operator key — a user-role key NO DISPATCH MINTED — " +
+      "and anything else is 403 `chg_registration_forbidden`; a key minted by a dispatch " +
+      "beneath yours is refused the same way. The secret is write-only and " +
       "never comes back.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
@@ -9014,7 +9023,8 @@ const TOOLS = [
           type: ["string", "null"],
           description:
             "The parentless, unrevoked, orchestrator-role dispatch of this tenant chg-server's " +
-            "key was minted from; anything else is 422 `chg_root_invalid`. Null clears it on a " +
+            "key was minted from; anything else is 422 `chg_root_invalid`, and the root a `chg` " +
+            "source keeps is re-checked on every write to it. Null clears it on a " +
             "`pr` source (422 on a `chg` one). Omit to leave it alone.",
         },
         required_checks: {

@@ -338,7 +338,11 @@ when the caller carries a lineage. The invariant is **credentials that carry no 
 only be minted by a principal that has none**; the key is NOT made to inherit the minter's
 lineage, because a key's lineage IS its `dispatches` row, and a second lineage source that
 the custody gates did not read would be the same failure one layer down. Reads (`index`) and
-`delete` are unaffected.
+`delete` are unaffected. The same plug guards intake-source enrolment (it mints the webhook
+secret), and a `PATCH /api/v1/intake/sources/:id` that names `change_events_secret` or
+`chg_root_dispatch_id` OR sets `mode` to `chg` — a bare switch re-activates the secret and
+custody root the source kept — under its own code, `403 chg_registration_forbidden`, whose
+remedy is the operator key: a dispatch minted beneath the caller would be refused again.
 
 All three refusals are logged (`lineage_ceiling_refused`) and emit
 `[:loopctl, :custody, :lineage_ceiling_refused]`. A 403 body carries the caller's own

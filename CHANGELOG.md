@@ -47,9 +47,14 @@ All notable changes to loopctl are documented here.
   orchestrator-role dispatch of the tenant that chg-server's key was minted from; mint it with
   the operator key via `POST /api/v1/dispatches` and no parent). Without both a `chg` write is
   422; a root that is anything else, another tenant's dispatch included, is 422
-  `chg_root_invalid`. Switching back to `pr` keeps both and ignores them. A PATCH naming either
-  field from a dispatch-minted key is 403 `api_key_mint_forbidden`, as enrolment already is.
-  Sources now serialise `chg_root_dispatch_id`.
+  `chg_root_invalid`, and the root is re-checked on EVERY write that leaves a source `chg` (a
+  secret rotation or base-branch edit on a source whose root has been revoked is the same 422
+  until a live root is named; switching to `pr` is never blocked). Switching back to `pr` keeps
+  both and ignores them. A PATCH naming either field, or setting `mode` to `chg`, from a
+  dispatch-minted key is 403 `chg_registration_forbidden` (use the tenant's operator key).
+  Switching a source to `chg` — or enrolling a `chg` source — is 409 `pr_route_in_flight`,
+  naming `story_ids`, while any story of the project sits at `ci` holding a merge allow it has
+  not merged on. Sources now serialise `chg_root_dispatch_id`.
 - **The merge precondition refuses a `chg` source's stories** with 409
   `change_protocol_enrolled` (`POST /api/v1/stories/:id/merge-precondition`), before any
   GitHub read and without escalating: the PR route is closed for that repository and changes

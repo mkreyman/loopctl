@@ -900,7 +900,17 @@ describe("mode chg (US-47.2)", () => {
     }
 
     const update = loadTools().find((t) => t.name === "intake_source_update");
-    assert.match(update.description, /api_key_mint_forbidden/);
+    const updateRow =
+      README.split("\n").find((line) => line.startsWith("| `intake_source_update` |")) ?? "";
+    for (const text of [update.description, updateRow]) {
+      // The PATCH's own lineage-ceiling refusal, not enrolment's API-key one, and the switch's
+      // in-flight refusal.
+      assert.match(text, /chg_registration_forbidden/);
+      assert.doesNotMatch(text, /api_key_mint_forbidden/);
+      assert.match(text, /operator key/);
+      assert.match(text, /pr_route_in_flight/);
+      assert.match(text, /story_ids/);
+    }
     assert.match(update.description, /LOOPCTL_USER_KEY/);
   });
 });

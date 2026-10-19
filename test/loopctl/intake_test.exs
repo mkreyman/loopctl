@@ -576,7 +576,7 @@ defmodule Loopctl.IntakeTest do
       assert stored.chg_root_dispatch_id == nil
     end
 
-    test "an unrelated edit on a chg source does not re-judge the root", ctx do
+    test "every write that leaves a source chg re-judges its root", ctx do
       {:ok, %{source: source}} = enrol_chg(ctx, %{})
 
       {1, _} =
@@ -585,14 +585,40 @@ defmodule Loopctl.IntakeTest do
           set: [revoked_at: DateTime.utc_now()]
         )
 
-      assert {:ok, %{base_branch: "main"}} =
-               Intake.update_source(ctx.tenant.id, source.id, %{base_branch: "main"})
+      # A rotation and an unrelated edit alike: a revoked root keeps nothing operative.
+      for attrs <- [
+            %{change_events_secret: String.duplicate("r", 40)},
+            %{base_branch: "main"},
+            %{mode: "chg"}
+          ] do
+        assert {:error, :chg_root_invalid} = Intake.update_source(ctx.tenant.id, source.id, attrs)
+      end
 
-      # Naming a new root on the chg source re-judges it.
+      stored = AdminRepo.get!(Source, source.id)
+      assert stored.change_events_secret == @chg_secret
+      assert stored.base_branch == "master"
+
+      # Naming a child is no better than the revoked root.
       child = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, parent: ctx.root})
 
       assert {:error, :chg_root_invalid} =
                Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: child.id})
+
+      # Naming a live root clears it, and leaving `chg` is never blocked by the root left behind.
+      fresh = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id})
+
+      assert {:ok, %{chg_root_dispatch_id: fresh_id}} =
+               Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: fresh.id})
+
+      assert fresh_id == fresh.id
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^fresh.id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert {:ok, %{mode: :pr}} = Intake.update_source(ctx.tenant.id, source.id, %{mode: "pr"})
     end
 
     test "the chain records the root and whether a secret is set, never the secret", ctx do

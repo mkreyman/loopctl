@@ -179,7 +179,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       # can POST `to: queued` on any escalated story. `prepare_story/6` released the claim,
       # bumped the epoch, revoked the implementer's LIVE session credential and every
       # descendant dispatch, re-contracted the story — and only THEN did `Stages.human?/1`
-      # (`lib/loopctl/delivery/stages.ex:1127-1130`, which requires `actor_lineage == []`)
+      # (`lib/loopctl/delivery/stages.ex:1497-1500`, which requires `actor_lineage == []`)
       # refuse the caller. Repeatably, on any escalated story: a refusal that cost the
       # implementing agent its key.
       #

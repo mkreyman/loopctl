@@ -29,7 +29,7 @@ defmodule LoopctlWeb.StoryStatusController do
   action_fallback LoopctlWeb.FallbackController
 
   # #621: the L1 capability layer's two refusal shapes. Both are rendered as 403 by
-  # FallbackController (fallback_controller.ex:259, :272) but previously had no
+  # FallbackController (fallback_controller.ex:661, :683) but previously had no
   # clause in the controllers' case statements, so they raised CaseClauseError and
   # surfaced as 500s. Expressed as a guard so each action forwards them in ONE
   # branch — the controller actions sit at credo's cyclomatic-complexity limit.
@@ -490,7 +490,7 @@ defmodule LoopctlWeb.StoryStatusController do
       # #621: the capability layer's own refusals had NO clause here, so a missing
       # or rejected token raised CaseClauseError and surfaced as a 500 instead of
       # the documented 403 — the failure mode was indistinguishable from a crash.
-      # FallbackController already renders both (fallback_controller.ex:259, :272);
+      # FallbackController already renders both (fallback_controller.ex:661, :683);
       # they just have to reach it. The #803 fence and the ordering refusals take
       # the same single branch.
       {:error, reason} when is_forwarded_start_error(reason) ->

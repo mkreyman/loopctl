@@ -8,6 +8,7 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
   alias Loopctl.Intake
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
+  alias LoopctlWeb.IntakeSourceController
 
   setup :verify_on_exit!
 
@@ -704,7 +705,13 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
           |> patch(~p"/api/v1/intake/sources/#{source.id}", body)
           |> json_response(403)
 
-        assert refused["error"]["code"] == "api_key_mint_forbidden"
+        assert refused["error"]["code"] == "chg_registration_forbidden"
+        assert refused["error"]["message"] == IntakeSourceController.chg_ceiling_message()
+        # The remedy is the operator key, never "mint a dispatch beneath yours": a key minted
+        # that way is lineaged too, and this refuses it again.
+        assert refused["error"]["remediation"]["remedy"] =~ "operator key"
+        refute refused["error"]["message"] =~ "Mint a dispatch"
+        assert is_binary(refused["error"]["remediation"]["your_dispatch_id"])
       end
 
       stored = AdminRepo.get!(Source, source.id)
@@ -715,6 +722,94 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
              |> auth(dispatched_key)
              |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"base_branch" => "main"})
              |> json_response(200)
+    end
+
+    test "a dispatch-minted key may not re-activate a kept root with a bare mode: chg", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      %{"api_key" => %{"raw_key" => dispatched_key}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/dispatches", %{"role" => "user", "agent_id" => agent.id})
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      %{"source" => %{"id" => source_id}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", chg_params(ctx, root_id))
+        |> json_response(201)
+
+      # Back to pr: the secret and the root are KEPT on the row.
+      assert build_conn()
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source_id}", %{"mode" => "pr"})
+             |> json_response(200)
+
+      refused =
+        conn
+        |> auth(dispatched_key)
+        |> patch(~p"/api/v1/intake/sources/#{source_id}", %{"mode" => "chg"})
+        |> json_response(403)
+
+      assert refused["error"]["code"] == "chg_registration_forbidden"
+      assert AdminRepo.get!(Source, source_id).mode == :pr
+
+      # The operator key may.
+      assert %{"source" => %{"mode" => "chg"}} =
+               build_conn()
+               |> auth(ctx.operator_key)
+               |> patch(~p"/api/v1/intake/sources/#{source_id}", %{"mode" => "chg"})
+               |> json_response(200)
+    end
+
+    test "a revoked root refuses a secret rotation on a chg source with chg_root_invalid", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+
+      %{"source" => %{"id" => source_id}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", chg_params(ctx, root_id))
+        |> json_response(201)
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^root_id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      refused =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source_id}", %{
+          "change_events_secret" => String.duplicate("r", 40)
+        })
+        |> json_response(422)
+
+      assert refused["error"]["code"] == "chg_root_invalid"
+      assert AdminRepo.get!(Source, source_id).change_events_secret == @chg_secret
+    end
+
+    test "the PATCH spec documents the 403 and 409 with the messages they render", %{
+      conn: conn
+    } do
+      responses =
+        conn
+        |> get("/api/v1/openapi")
+        |> json_response(200)
+        |> get_in(["paths", "/api/v1/intake/sources/{id}", "patch", "responses"])
+
+      assert responses["403"]["description"] =~ "chg_registration_forbidden"
+      assert responses["403"]["description"] =~ IntakeSourceController.chg_ceiling_message()
+      assert responses["409"]["description"] =~ "pr_route_in_flight"
+      assert responses["409"]["description"] =~ Intake.pr_route_in_flight_message()
     end
 
     test "the request specs document the chg fields and the secret is write-only", %{

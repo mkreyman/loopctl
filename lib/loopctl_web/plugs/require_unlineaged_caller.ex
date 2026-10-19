@@ -31,6 +31,16 @@ defmodule LoopctlWeb.Plugs.RequireUnlineagedCaller do
 
   The remedy named in the 403 is one the refused caller can actually perform: mint a
   dispatch beneath its own, which yields an ephemeral key INSIDE its subtree.
+
+  ## Options
+
+  `:code`, `:message` and `:remedy` replace the refusal's code, message and
+  `remediation.remedy` for a caller whose refused act is not minting an API key. Minting a
+  dispatch is the remedy only when the caller wants a key; where the act itself needs an
+  unlineaged principal (registering a `chg` intake source's credentials,
+  `LoopctlWeb.IntakeSourceController`), a dispatch-minted key is refused again, so that caller
+  names the remedy that works — the tenant's operator key. Omitted, the API-key refusal
+  below is what every caller gets.
   """
 
   import Plug.Conn
@@ -38,6 +48,14 @@ defmodule LoopctlWeb.Plugs.RequireUnlineagedCaller do
   require Logger
 
   alias Loopctl.Dispatches
+
+  @mint_code "api_key_mint_forbidden"
+
+  @mint_message "Your key was minted by a dispatch, so it sits inside a lineage. A long-lived " <>
+                  "API key belongs to no lineage, and minting one would place you outside your " <>
+                  "own subtree — the separation the custody gates rest on. Mint a dispatch " <>
+                  "beneath your own instead (POST /api/v1/dispatches with `parent_dispatch_id`); " <>
+                  "it returns an ephemeral key that stays inside your lineage."
 
   def init(opts), do: opts
 
@@ -47,55 +65,51 @@ defmodule LoopctlWeb.Plugs.RequireUnlineagedCaller do
   # revocation, a property of a different function's WHERE clause. The question here
   # is whether the principal was EVER inside a lineage, and revocation does not
   # un-ask it.
-  def call(%Plug.Conn{assigns: %{current_api_key: %{} = api_key}} = conn, _opts) do
+  def call(%Plug.Conn{assigns: %{current_api_key: %{} = api_key}} = conn, opts) do
     case Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id) do
       [] -> conn
-      [_ | _] = lineage -> refuse(conn, api_key, lineage)
+      [_ | _] = lineage -> refuse(conn, api_key, lineage, opts)
     end
   end
 
   # No authenticated key in the assigns. The auth pipeline halts before controller
   # plugs run, so this is unreachable in the router — but a caller we cannot identify
   # is one we cannot show to be unlineaged, and nil is never permissive here.
-  def call(conn, _opts), do: refuse(conn, nil, [])
+  def call(conn, opts), do: refuse(conn, nil, [], opts)
 
-  defp refuse(conn, api_key, lineage) do
-    log_refusal(api_key, lineage)
+  defp refuse(conn, api_key, lineage, opts) do
+    code = Keyword.get(opts, :code, @mint_code)
+    log_refusal(api_key, lineage, code)
 
     conn
     |> put_status(:forbidden)
     |> Phoenix.Controller.json(%{
       error: %{
         status: 403,
-        code: "api_key_mint_forbidden",
-        message:
-          "Your key was minted by a dispatch, so it sits inside a lineage. A long-lived " <>
-            "API key belongs to no lineage, and minting one would place you outside your " <>
-            "own subtree — the separation the custody gates rest on. Mint a dispatch " <>
-            "beneath your own instead (POST /api/v1/dispatches with `parent_dispatch_id`); " <>
-            "it returns an ephemeral key that stays inside your lineage.",
-        remediation: remediation(lineage)
+        code: code,
+        message: Keyword.get(opts, :message, @mint_message),
+        remediation: remediation(lineage, Keyword.get(opts, :remedy))
       }
     })
     |> halt()
   end
 
-  defp remediation([]), do: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+  defp remediation(lineage, remedy) do
+    base = %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+    base = if remedy, do: Map.put(base, :remedy, remedy), else: base
 
-  defp remediation(lineage) do
-    %{
-      your_dispatch_id: List.last(lineage),
-      your_lineage_path: lineage,
-      learn_more: "https://loopctl.com/wiki/dispatch-lineage"
-    }
+    case lineage do
+      [] -> base
+      _ -> Map.merge(base, %{your_dispatch_id: List.last(lineage), your_lineage_path: lineage})
+    end
   end
 
   # Shares the `lineage_ceiling_refused` log prefix and telemetry event with the two
   # DispatchController refusals: an operator alerting on a principal trying to step
   # outside its lineage wants all three on one counter.
-  defp log_refusal(api_key, lineage) do
+  defp log_refusal(api_key, lineage, code) do
     Logger.warning(
-      "lineage_ceiling_refused: code=api_key_mint_forbidden " <>
+      "lineage_ceiling_refused: code=#{code} " <>
         "tenant_id=#{inspect(api_key && api_key.tenant_id)} " <>
         "api_key_id=#{inspect(api_key && api_key.id)} " <>
         "role=#{inspect(api_key && api_key.role)} " <>
@@ -106,7 +120,7 @@ defmodule LoopctlWeb.Plugs.RequireUnlineagedCaller do
       [:loopctl, :custody, :lineage_ceiling_refused],
       %{count: 1},
       %{
-        code: "api_key_mint_forbidden",
+        code: code,
         tenant_id: api_key && api_key.tenant_id,
         api_key_id: api_key && api_key.id
       }

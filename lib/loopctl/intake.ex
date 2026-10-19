@@ -89,6 +89,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
@@ -100,6 +101,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
 
   # The largest webhook body the intake route reads. An `issues` payload with a maximal
   # 65,536-character body, escaped, plus its repository and user objects, stays well under
@@ -170,13 +172,20 @@ defmodule Loopctl.Intake do
   (`Source.chg_root_requirement/0`). Another tenant's dispatch is the same refusal as an id
   that names nothing, so the answer leaks nothing about other tenants.
 
+  `{:error, {:pr_route_in_flight, story_ids}}` when the source would be `chg` and a story of
+  the project still holds a merge allow it has not merged on — see `update_source/4`.
+
   ## Options
 
   - `:actor_lineage` — the creating caller's dispatch lineage, for the audit entry.
   """
   @spec create_source(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, %{source: Source.t(), webhook_secret: String.t()}}
-          | {:error, Ecto.Changeset.t() | :chg_root_invalid | term()}
+          | {:error,
+             Ecto.Changeset.t()
+             | :chg_root_invalid
+             | {:pr_route_in_flight, [Ecto.UUID.t()]}
+             | term()}
   def create_source(tenant_id, attrs, opts \\ []) when is_binary(tenant_id) do
     secret = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
     project_id = Map.get(attrs, :project_id) || Map.get(attrs, "project_id")
@@ -315,6 +324,7 @@ defmodule Loopctl.Intake do
   defp insert_source(tenant_id, changeset, opts) do
     AdminRepo.transaction(fn ->
       with :ok <- check_chg_root(tenant_id, changeset),
+           :ok <- close_pr_route(tenant_id, changeset),
            {:ok, source} <- AdminRepo.insert(changeset),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
@@ -402,10 +412,17 @@ defmodule Loopctl.Intake do
   operator reading the chain still sees a repoint as a repoint and a rebase as a rebase.
 
   SWITCHING MODE. To `chg`: the RESULTING row must carry both credentials, from this update or
-  kept from an earlier `chg` stint, and the root is re-checked against `dispatches` whenever
-  the mode or the root changes (`{:error, :chg_root_invalid}`), so a kept root that has since
-  been revoked is refused rather than trusted. To `pr`: both credentials are KEPT and ignored;
-  nothing is cleared that the caller did not name.
+  kept from an earlier `chg` stint, and the root is re-checked against `dispatches` on EVERY
+  update whose resulting source is `chg`, and whenever a root is named
+  (`{:error, :chg_root_invalid}`), so a kept root that has since been revoked is refused
+  rather than trusted — a secret rotation on a revoked root included. To `pr`: both
+  credentials are KEPT and ignored; nothing is cleared that the caller did not name.
+
+  A switch to `chg` is refused with `{:error, {:pr_route_in_flight, story_ids}}` while any
+  story of the source's project sits at `ci` holding a recorded merge allow
+  (`merge_gate_allowed_sha`): that allow licenses a pull-request merge, and the `ci -> merged`
+  edge that consumes it does not read the mode, so switching under it would merge through the
+  route the switch closes. Merge or escalate those stories first. See `close_pr_route/2`.
   """
   @updatable_fields [
     :target_epic_id,
@@ -418,7 +435,12 @@ defmodule Loopctl.Intake do
 
   @spec update_source(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Source.t()}
-          | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update | :chg_root_invalid}
+          | {:error,
+             Ecto.Changeset.t()
+             | :not_found
+             | :nothing_to_update
+             | :chg_root_invalid
+             | {:pr_route_in_flight, [Ecto.UUID.t()]}}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
     fields =
@@ -511,6 +533,7 @@ defmodule Loopctl.Intake do
   defp write_update(tenant_id, changeset, fields, opts) do
     AdminRepo.transaction(fn ->
       with :ok <- check_chg_root(tenant_id, changeset),
+           :ok <- close_pr_route(tenant_id, changeset),
            {:ok, source} <- AdminRepo.update(changeset),
            :ok <- append_if(fields, :target_epic_id, tenant_id, source, opts),
            :ok <- append_if(fields, :base_branch, tenant_id, source, opts),
@@ -570,12 +593,19 @@ defmodule Loopctl.Intake do
   # review only from a child of it and refuse it as a verifier — so it is checked against the
   # `dispatches` row, not taken on the caller's word.
   #
-  # Judged whenever a write NAMES a root (whatever the mode), and whenever it switches the mode to
-  # `chg` (so a root kept from an earlier stint is re-judged rather than trusted). Naming one on a
-  # `pr` source is judged too, and that is not tidiness: unjudged, an unknown id would fail the
+  # Judged whenever a write NAMES a root (whatever the mode), and on EVERY write whose resulting
+  # source is `chg` — a switch, a secret rotation, a base-branch edit alike — so a root kept from
+  # an earlier stint, or revoked since it was named, is re-judged rather than trusted. A write on a
+  # `chg` source whose root has been revoked is therefore `chg_root_invalid` until it names a live
+  # root (or switches to `pr`, which is never blocked by the root it leaves behind). Naming one on
+  # a `pr` source is judged too, and that is not tidiness: unjudged, an unknown id would fail the
   # foreign key (422) while another tenant's id would be stored (200) — an existence oracle
-  # across tenants. An unrelated edit (a base branch) on a `chg` source does not re-judge a root
-  # revoked since; that root is refused where it is USED, by the gates that read it.
+  # across tenants.
+  #
+  # This guards the REGISTRATION only. Nothing here stops a source whose root is revoked between
+  # writes from staying `chg`; the change-events webhook (US-47.3, AC-47.3.6) must refuse an event
+  # for a source whose root is revoked, and every later gate that reads the root must judge it
+  # the same way.
   #
   # INSIDE the write's transaction and `FOR SHARE`, so a concurrent `Dispatches.revoke/3` of the
   # root either commits first (and this read sees `revoked_at`) or waits for this write to
@@ -590,9 +620,103 @@ defmodule Loopctl.Intake do
     mode = Ecto.Changeset.get_field(changeset, :mode)
     root_id = Ecto.Changeset.get_field(changeset, :chg_root_dispatch_id)
     named_root? = Ecto.Changeset.changed?(changeset, :chg_root_dispatch_id) and root_id != nil
-    switched? = mode == :chg and Ecto.Changeset.changed?(changeset, :mode)
 
-    if named_root? or switched?, do: judge_chg_root(tenant_id, root_id), else: :ok
+    if named_root? or mode == :chg, do: judge_chg_root(tenant_id, root_id), else: :ok
+  end
+
+  @pr_route_in_flight_message "A story on this source's project is at `ci` holding a recorded " <>
+                                "merge allow it has not merged on yet. That allow licenses a " <>
+                                "pull-request merge, and switching the source to `chg` under " <>
+                                "it would let that merge land through the route `chg` closes. " <>
+                                "Merge the story (or let the merge gate escalate it) and retry; " <>
+                                "`story_ids` names every story holding one."
+
+  @doc "The message `{:error, {:pr_route_in_flight, story_ids}}` is rendered and documented with."
+  @spec pr_route_in_flight_message() :: String.t()
+  def pr_route_in_flight_message, do: @pr_route_in_flight_message
+
+  # Finding 1 of the US-47.2 review: the PR route used to be closed only inside the merge
+  # precondition, so an allow recorded BEFORE a switch to `chg` still merged afterwards — the
+  # `ci -> merged` edge does not read the mode. A write that makes a source `chg` is therefore
+  # refused while any story of its project holds an unconsumed allow (stage `ci`, allow set:
+  # `ci -> merged` is the only edge that consumes one, and every edge out of `ci` toward
+  # `implementing` clears it).
+  #
+  # The project's live sources are locked FOR UPDATE first, and that lock is the whole race
+  # story. The one writer of an allow (`MergePrecondition`, through `Stages.record_effect/5`)
+  # re-reads the mode under FOR SHARE on the same rows inside its write (`hold_pr_route/3`), so
+  # either it commits first and the stage read below — a fresh READ COMMITTED snapshot taken
+  # after the lock — sees its allow, or this write commits first and it reads `chg` and records
+  # nothing. The stage rows are deliberately NOT locked here: the allow writer holds its stage row
+  # FOR UPDATE while it waits on the source, so locking stages after the source would be a
+  # lock-order cycle.
+  defp close_pr_route(tenant_id, %Ecto.Changeset{} = changeset) do
+    if Ecto.Changeset.get_field(changeset, :mode) == :chg and
+         Ecto.Changeset.changed?(changeset, :mode) do
+      project_id = Ecto.Changeset.get_field(changeset, :project_id)
+
+      AdminRepo.all(
+        from s in live_sources_query(tenant_id),
+          where: s.project_id == ^project_id,
+          select: s.id,
+          lock: "FOR UPDATE"
+      )
+
+      case unmerged_allows(tenant_id, project_id) do
+        [] -> :ok
+        story_ids -> {:error, {:pr_route_in_flight, story_ids}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp unmerged_allows(tenant_id, project_id) do
+    AdminRepo.all(
+      from st in StoryStage,
+        join: story in Story,
+        on: story.id == st.story_id and story.tenant_id == st.tenant_id,
+        where:
+          st.tenant_id == ^tenant_id and story.project_id == ^project_id and st.stage == :ci and
+            not is_nil(st.merge_gate_allowed_sha),
+        order_by: st.story_id,
+        select: st.story_id
+    )
+  end
+
+  @doc """
+  Whether a merge allow may be recorded for `story_id`: `{:error, :change_protocol_enrolled}`
+  when a live intake source of the story's project is in mode `chg`, `:ok` otherwise.
+
+  For the allow writer to call INSIDE its write transaction, on `repo` (`Loopctl.Repo` under
+  the tenant there): the project's live sources are read `FOR SHARE`, which waits on a
+  concurrent switch to `chg` holding them `FOR UPDATE` (`update_source/4`) and makes that
+  switch wait on this write. It is the second half of the rule `update_source/4` enforces —
+  between them no allow is ever recorded on a `chg` source, whichever commits first.
+  """
+  @spec hold_pr_route(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          :ok | {:error, :change_protocol_enrolled}
+  def hold_pr_route(repo, tenant_id, story_id) do
+    project_id =
+      repo.one(
+        from s in Story,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+          select: s.project_id
+      )
+
+    # A story that is not there has no source to hold; the caller's own write refuses it.
+    modes =
+      if project_id,
+        do:
+          repo.all(
+            from s in live_sources_query(tenant_id),
+              where: s.project_id == ^project_id,
+              select: s.mode,
+              lock: "FOR SHARE"
+          ),
+        else: []
+
+    if :chg in modes, do: {:error, :change_protocol_enrolled}, else: :ok
   end
 
   defp judge_chg_root(tenant_id, root_id) when is_binary(root_id) do

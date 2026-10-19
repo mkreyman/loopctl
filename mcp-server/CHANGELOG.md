@@ -21,8 +21,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
     tenant chg-server's key was minted from; anything else is 422 `chg_root_invalid`.
   Enrolling `chg` without both is refused locally before a secret file is reserved. On
   update a null clears either on a `pr` source; switching to `chg` with neither named is left
-  to the server, which counts values kept from an earlier `chg` stint. Naming either needs a
-  key no dispatch minted (403 `api_key_mint_forbidden`).
+  to the server, which counts values kept from an earlier `chg` stint. On update, naming
+  either or setting `mode` to `chg` needs the tenant's operator key, one no dispatch minted
+  (403 `chg_registration_forbidden`), and a switch to `chg` is 409 `pr_route_in_flight` while a
+  story of the project holds a merge allow it has not merged on.
 - **`intake_source_list` and the update/revoke results carry `chg_root_dispatch_id`.**
 - **`merge_precondition` documents 409 `change_protocol_enrolled`.**
 

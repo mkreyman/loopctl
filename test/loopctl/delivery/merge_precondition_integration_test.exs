@@ -522,6 +522,93 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end
   end
 
+  describe "an allow recorded on the PR route survives no switch to chg (US-47.2 finding 1)" do
+    test "a switch to chg is refused while a story holds an unmerged allow", ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha == @head
+
+      [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+      root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+      story_id = ctx.story_id
+
+      switch = %{
+        mode: "chg",
+        change_events_secret: String.duplicate("c", 32),
+        chg_root_dispatch_id: root.id
+      }
+
+      assert {:error, {:pr_route_in_flight, [^story_id]}} =
+               Loopctl.Intake.update_source(ctx.tenant_id, source.id, switch)
+
+      assert AdminRepo.get!(Loopctl.Intake.Source, source.id).mode == :pr
+
+      # Once the allow is consumed (`ci -> merged`), nothing is in flight and the switch lands.
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in StoryStage, where: s.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [stage: :merged])
+        end)
+
+      assert {:ok, %{mode: :chg}} = Loopctl.Intake.update_source(ctx.tenant_id, source.id, switch)
+    end
+
+    test "enrolling a new chg source over an unmerged allow is refused the same way", ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+      {:ok, _} = Loopctl.Intake.revoke_source(ctx.tenant_id, source.id)
+      root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+      story_id = ctx.story_id
+
+      assert {:error, {:pr_route_in_flight, [^story_id]}} =
+               Loopctl.Intake.create_source(ctx.tenant_id, %{
+                 repo_full_name: @repo,
+                 project_id: ctx.project_id,
+                 mode: "chg",
+                 change_events_secret: String.duplicate("c", 32),
+                 chg_root_dispatch_id: root.id
+               })
+    end
+
+    test "a switch that lands while the gate runs records no allow and escalates nothing",
+         ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+      [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+      root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+      tenant_id = ctx.tenant_id
+
+      # The switch commits AFTER `evaluate/3` read the mode as `pr` and before the allow is
+      # written: the forge read is the moment in between.
+      Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{full_name: @repo}, _n ->
+        {:ok, %{mode: :chg}} =
+          Loopctl.Intake.update_source(tenant_id, source.id, %{
+            mode: "chg",
+            change_events_secret: String.duplicate("c", 32),
+            chg_root_dispatch_id: root.id
+          })
+
+        {:ok,
+         %{
+           state: "open",
+           merged?: false,
+           merge_sha: nil,
+           head_sha: @head,
+           merge_base_sha: @base,
+           diffstat: %{files: 1, changed_lines: 10},
+           diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
+         }}
+      end)
+
+      assert {:error, :change_protocol_enrolled} = enforce(ctx)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.merge_gate_allowed_sha == nil
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------------------
 
   # Moves the fixture's intake source to `chg` through the context, as an operator would.
