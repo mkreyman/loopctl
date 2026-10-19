@@ -7,7 +7,9 @@ defmodule Loopctl.Changes.StoryChangesTest do
 
   use Loopctl.DataCase, async: true
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Changes
+  alias Loopctl.Changes.Binding
 
   setup :verify_on_exit!
 
@@ -43,6 +45,16 @@ defmodule Loopctl.Changes.StoryChangesTest do
         attrs
       )
     )
+  end
+
+  # `inserted_at` is the app's clock, so nothing stops a current binding being stamped EARLIER
+  # than one it superseded (clock skew between nodes, a backfill). Moving it is how a test lays
+  # that out.
+  defp stamp(binding_id, %DateTime{} = at) do
+    {1, _} =
+      AdminRepo.update_all(from(b in Binding, where: b.id == ^binding_id),
+        set: [inserted_at: at]
+      )
   end
 
   describe "story_changes/2" do
@@ -115,6 +127,44 @@ defmodule Loopctl.Changes.StoryChangesTest do
       assert total == max + 2
       assert Enum.map(listed, & &1.binding.id) == Enum.drop(ids, 2)
       assert is_nil(List.last(listed).binding.superseded_at)
+    end
+
+    test "the current binding is listed last even when its inserted_at is the OLDEST", ctx do
+      first = bind(ctx.tenant, ctx.story, "chg-first")
+      current = bind(ctx.tenant, ctx.story, "chg-current")
+      stamp(current.id, DateTime.add(first.inserted_at, -3600, :second))
+
+      assert {:ok, %{bindings: [a, b], binding_count: 2}} =
+               Changes.story_changes(ctx.tenant.id, ctx.story.id)
+
+      assert a.binding.id == first.id
+      assert b.binding.id == current.id
+      assert is_nil(b.binding.superseded_at)
+    end
+
+    test "past max_bindings, a current binding with the OLDEST inserted_at is still listed",
+         ctx do
+      max = Changes.max_bindings()
+      bindings = for n <- 1..(max + 2), do: bind(ctx.tenant, ctx.story, "chg-#{n}")
+      {superseded, [current]} = Enum.split(bindings, -1)
+      stamp(current.id, DateTime.add(hd(bindings).inserted_at, -3600, :second))
+
+      assert {:ok, %{bindings: listed, binding_count: total}} =
+               Changes.story_changes(ctx.tenant.id, ctx.story.id)
+
+      assert total == max + 2
+      assert length(listed) == max
+      # The window keeps the current one and the NEWEST superseded ones, oldest first.
+      assert Enum.map(listed, & &1.binding.id) ==
+               Enum.map(Enum.take(superseded, -(max - 1)), & &1.id) ++ [current.id]
+    end
+
+    test "answers the story's canonical id, whatever case the caller sent", ctx do
+      upper = String.upcase(ctx.story.id)
+      refute upper == ctx.story.id
+
+      assert {:ok, %{story_id: story_id}} = Changes.story_changes(ctx.tenant.id, upper)
+      assert story_id == ctx.story.id
     end
 
     test "unknown, malformed and another tenant's story ids all answer :not_found", ctx do

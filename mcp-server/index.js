@@ -3433,10 +3433,12 @@ async function storyStage(args) {
   );
 }
 
-// US-47.7: a READ, `role: :agent` with the hierarchy, so the agent key is sent explicitly for
-// the reason storyStage gives above — `resolveKey` never falls back to LOOPCTL_AGENT_KEY, and
-// a session on an agent-key-only config is exactly the one asking which change its story is
-// bound to. With no agent key set, the override is undefined and the usual order applies.
+// US-47.7: a READ, `role: :agent` with the hierarchy, so any role's key clears the gate and
+// nothing is pinned. LOOPCTL_AGENT_KEY is passed as this tool's own key for the reason
+// storyStage gives above — `resolveKey` never reads it by name, and a session on an
+// agent-key-only config is exactly the one asking which change its story is bound to. It is an
+// OVERRIDE, not `exactKey`, so `resolveKey`'s order holds: LOOPCTL_API_KEY when set, else
+// LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY.
 async function changeBindingGet(args) {
   const key = process.env.LOOPCTL_AGENT_KEY;
 
@@ -8643,8 +8645,9 @@ const TOOLS = [
       "and `max_events_per_change` events per change, the NEWEST of each, so the current " +
       "binding is always listed. `binding_count` and each binding's `applied_event_count` / " +
       "`events_truncated` say when more exist.\n\n" +
-      "Any key of the tenant may read it (`role: :agent` with the hierarchy): " +
-      "LOOPCTL_AGENT_KEY is sent when set, else the usual key. REFUSES: 404 when the story " +
+      "Any key of the tenant may read it (`role: :agent` with the hierarchy), so the key is " +
+      "the usual order with LOOPCTL_AGENT_KEY as this tool's own: LOOPCTL_API_KEY when set, " +
+      "else LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY. REFUSES: 404 when the story " +
       "is not your tenant's — another tenant's id answers exactly like an unknown one; 401 " +
       "for no key or one that does not authenticate; 400 for a superadmin key without " +
       "X-Impersonate-Tenant; 429 when rate limited. No 403: every key role clears the " +

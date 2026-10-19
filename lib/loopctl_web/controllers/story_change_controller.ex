@@ -18,6 +18,7 @@ defmodule LoopctlWeb.StoryChangeController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Changes
+  alias LoopctlWeb.CurrentTenant
   alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
@@ -119,10 +120,10 @@ defmodule LoopctlWeb.StoryChangeController do
 
   @doc "GET /api/v1/stories/:id/changes"
   def show(conn, %{"id" => story_id}) do
-    with {:ok, tenant_id} <- require_tenant(conn),
+    with {:ok, tenant_id} <- CurrentTenant.fetch_id(conn),
          {:ok, changes} <- Changes.story_changes(tenant_id, story_id) do
       json(conn, %{
-        story_id: story_id,
+        story_id: changes.story_id,
         bindings: Enum.map(changes.bindings, &render_binding/1),
         binding_count: changes.binding_count,
         meta: %{
@@ -158,14 +159,5 @@ defmodule LoopctlWeb.StoryChangeController do
       occurred_at: event.occurred_at,
       applied_at: event.applied_at
     }
-  end
-
-  # The TENANT, not the key's `tenant_id`: an impersonating superadmin reads the impersonated
-  # tenant, and one without the header is told so rather than dereferencing nil.
-  defp require_tenant(conn) do
-    case conn.assigns[:current_tenant] do
-      %{id: id} when is_binary(id) -> {:ok, id}
-      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
-    end
   end
 end

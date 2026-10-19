@@ -14,7 +14,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   applied events (`event_seq`, `kind`, `revision`, `sha`, `occurred_at`, `applied_at`; never
   the event `data` payload). Both lists are bounded by the server and the bounds are in the
   response's `meta`; a truncated list keeps the newest entries. Any tenant key reads it
-  (`role: :agent` with the hierarchy); `LOOPCTL_AGENT_KEY` is sent when set. 404 for a story
+  (`role: :agent` with the hierarchy), so nothing is pinned: `LOOPCTL_API_KEY` when set, else
+  `LOOPCTL_AGENT_KEY`, else `LOOPCTL_ORCH_KEY`. 404 for a story
   that is not the caller's tenant's, exactly as for an unknown id. A malformed `story_id` is
   refused locally.
 

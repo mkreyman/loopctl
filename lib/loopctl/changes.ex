@@ -60,7 +60,8 @@ defmodule Loopctl.Changes do
   ## Reading a story's changes
 
   `story_changes/2` is what `GET /api/v1/stories/:id/changes` serves (US-47.7): the story's
-  bindings OLDEST FIRST — the order they were made, so the current one is last — each with
+  bindings OLDEST FIRST with the current one last — the current binding is ordered by being
+  current, never by its `inserted_at` — each with
   its change's APPLIED events in `event_seq` order. An event held ahead of a gap is not
   applied, so it is not listed. Both halves are bounded, by `max_bindings/0` and
   `max_events_per_change/0`; a truncated list keeps the NEWEST entries (the current binding
@@ -117,8 +118,15 @@ defmodule Loopctl.Changes do
           applied_event_count: non_neg_integer()
         }
 
-  @typedoc "`story_changes/2`'s answer: the listed bindings, oldest first, and their total."
-  @type story_changes :: %{bindings: [story_change()], binding_count: non_neg_integer()}
+  @typedoc """
+  `story_changes/2`'s answer: the story's canonical (cast, lowercase) id, the listed bindings
+  oldest first with the current one last, and their total.
+  """
+  @type story_changes :: %{
+          story_id: Ecto.UUID.t(),
+          bindings: [story_change()],
+          binding_count: non_neg_integer()
+        }
 
   @doc """
   Binds `attrs.change_id` in `attrs.repo` to `attrs.story_id`.
@@ -245,7 +253,7 @@ defmodule Loopctl.Changes do
 
   `{:error, :not_found}` when the story is not the tenant's: another tenant's id, an id
   nobody issued and a malformed one answer alike. A tenant story with no binding is
-  `{:ok, %{bindings: [], binding_count: 0}}`. Every read runs through `Repo` under the
+  `{:ok, %{story_id: id, bindings: [], binding_count: 0}}`. Every read runs through `Repo` under the
   tenant's RLS context AND an explicit `tenant_id` predicate.
   """
   @spec story_changes(Ecto.UUID.t(), String.t()) :: {:ok, story_changes()} | {:error, :not_found}
@@ -267,23 +275,28 @@ defmodule Loopctl.Changes do
     if story?, do: {:ok, read_bindings(tenant_id, story_id)}, else: :not_found
   end
 
-  # The newest `@max_bindings`, then put back oldest first. `binding_count` is the story's
-  # total, so a reader can tell a truncated list from a whole one.
+  # The newest `@max_bindings`, then put back oldest first. The CURRENT binding sorts ahead of
+  # every superseded one before `inserted_at` is consulted: `inserted_at` is the app's clock,
+  # and a current row stamped earlier than a superseded one must still be in the window and
+  # still be listed last. `binding_count` is the story's total, taken as a window count in the
+  # SAME statement (it is computed before LIMIT), so the list and the total see one snapshot.
   defp read_bindings(tenant_id, story_id) do
-    base = from(b in Binding, where: b.tenant_id == ^tenant_id and b.story_id == ^story_id)
-
-    bindings =
-      base
-      |> order_by([b], desc: b.inserted_at, desc: b.id)
-      |> limit(^@max_bindings)
+    rows =
+      from(b in Binding,
+        where: b.tenant_id == ^tenant_id and b.story_id == ^story_id,
+        order_by: [desc: is_nil(b.superseded_at), desc: b.inserted_at, desc: b.id],
+        limit: ^@max_bindings,
+        select: {b, over(count(b.id))}
+      )
       |> Repo.all()
       |> Enum.reverse()
 
-    total = Repo.aggregate(base, :count)
+    bindings = Enum.map(rows, &elem(&1, 0))
     events = read_applied_events(tenant_id, Enum.map(bindings, & &1.id))
 
     %{
-      binding_count: total,
+      story_id: story_id,
+      binding_count: binding_total(rows),
       bindings:
         Enum.map(bindings, fn binding ->
           {listed, count} = Map.get(events, {binding.repo, binding.change_id}, {[], 0})
@@ -291,6 +304,9 @@ defmodule Loopctl.Changes do
         end)
     }
   end
+
+  defp binding_total([]), do: 0
+  defp binding_total([{_binding, total} | _]), do: total
 
   # One query for every listed binding's events, not one per binding: each change's applied
   # events are ranked newest first and counted in a window, and the outer query keeps the

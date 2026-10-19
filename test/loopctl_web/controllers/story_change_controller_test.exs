@@ -126,6 +126,18 @@ defmodule LoopctlWeb.StoryChangeControllerTest do
       assert b["events_truncated"] == true
     end
 
+    test "story_id is the canonical lowercase id, not the path param echoed back",
+         %{conn: conn} = ctx do
+      bind(ctx, "chg-case")
+      upper = String.upcase(ctx.story.id)
+      refute upper == ctx.story.id
+
+      body = conn |> read(ctx.agent_key, upper) |> json_response(200)
+
+      assert body["story_id"] == ctx.story.id
+      assert [%{"change_id" => "chg-case"}] = body["bindings"]
+    end
+
     test "a tenant story with no binding answers an empty list", %{conn: conn} = ctx do
       body = conn |> read(ctx.agent_key, ctx.story.id) |> json_response(200)
       assert body["bindings"] == []
