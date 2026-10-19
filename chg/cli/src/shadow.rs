@@ -39,8 +39,11 @@ use crate::scratch::{self, AtBuild};
 use crate::store::{Store, now_ms};
 
 pub const ROW_VERSION: u32 = 1;
-/// The `source` of a gate row filled in from a CI check run (`--ci-check`).
-const CI_SOURCE: &str = "ci";
+/// The `source` of a gate row this machine's gate judged.
+pub const LOCAL_SOURCE: &str = "local";
+/// The `source` of a gate row filled in from a CI check run (`--ci-check`, or by hand with
+/// `chg shadow record --source ci`).
+pub const CI_SOURCE: &str = "ci";
 /// How long a shadow check waits for an earlier one on this machine before skipping.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30 * 60);
 /// The cap on the snapshot build after a check. Nobody waits on it, and a dependency
@@ -966,7 +969,9 @@ fn ci_recorded(rows: &[Row]) -> BTreeSet<(&str, u64)> {
 }
 
 /// The commits to ask CI about at `now`: judged by chg, not by a local gate, and either
-/// without a CI verdict or with one younger than `CI_RECHECK`.
+/// without a CI verdict or with one younger than `CI_RECHECK`. A commit only replays judged
+/// is past history whose CI runs are finished, so one CI verdict settles it; this also keeps
+/// a replay's synthetic commit, which GitHub has never seen, from being asked about.
 fn ci_wanted<'a>(key: &str, rows: &'a [Row], now: u64) -> BTreeSet<&'a str> {
     let judged_locally: BTreeSet<&str> = rows
         .iter()
@@ -975,14 +980,19 @@ fn ci_wanted<'a>(key: &str, rows: &'a [Row], now: u64) -> BTreeSet<&'a str> {
         .map(|r| r.sha.as_str())
         .collect();
     let recorded = ci_recorded(rows);
+    let pushed: BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.kind == "chg" && r.source.as_deref() != Some(REPLAY))
+        .map(|r| r.sha.as_str())
+        .collect();
     let stale_before = now.saturating_sub(CI_RECHECK.as_millis() as u64);
     let settled = |sha: &str| {
-        recorded
+        let newest = recorded
             .iter()
             .filter(|(s, _)| *s == sha)
             .map(|(_, at)| *at)
-            .max()
-            .is_some_and(|at| at < stale_before)
+            .max();
+        newest.is_some_and(|at| at < stale_before || !pushed.contains(sha))
     };
     rows.iter()
         .filter(|r| r.kind == "chg" && r.repo == key)
@@ -1055,7 +1065,7 @@ mod tests {
             v,
             ms,
             "mix precommit",
-            "local",
+            LOCAL_SOURCE,
             failures.iter().map(|s| s.to_string()).collect(),
         )
     }
@@ -1323,6 +1333,20 @@ mod tests {
         assert!(ci_wanted("r", &rows, later).is_empty());
         let local = [rows.clone(), vec![gate("s", Outcome::Pass, 1, &[])]].concat();
         assert!(ci_wanted("r", &local, newest).is_empty());
+        // A commit only replays judged: asked until it has a CI verdict, then never again.
+        let mut replayed = chg("p", "h", Outcome::Pass, 1_000, &[]);
+        replayed.source = Some(REPLAY.into());
+        assert!(ci_wanted("r", &[replayed.clone()], newest).contains("p"));
+        let ci = Row::gate(
+            "r",
+            "p",
+            Outcome::Pass,
+            0,
+            "Tests (CI on abc)",
+            CI_SOURCE,
+            vec![],
+        );
+        assert!(ci_wanted("r", &[replayed, ci], newest).is_empty());
         let cancelled: Vec<serde_json::Value> =
             serde_json::from_str(r#"[{"status":"completed","conclusion":"cancelled"}]"#).unwrap();
         assert!(ci_rows("r", "s", "Tests", &cancelled).is_empty());

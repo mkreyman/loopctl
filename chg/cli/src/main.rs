@@ -226,6 +226,12 @@ enum ShadowCmd {
         /// A file listing the gate's failing test ids (`path:line`), one per line.
         #[arg(long)]
         failures_file: Option<PathBuf>,
+        /// `local` (a gate this machine ran) or `ci` (a CI check run's verdict, which has no
+        /// gate time, so `--ms` is refused, and stays out of the gate-time figures). A replay
+        /// of a commit with chg's enrollment overlaid records the original commit's CI
+        /// verdict this way, for the synthetic commit it judged.
+        #[arg(long, default_value = shadow::LOCAL_SOURCE, value_parser = [shadow::LOCAL_SOURCE, shadow::CI_SOURCE])]
+        source: String,
     },
     /// Pair chg's verdicts with the gate's by commit: disagreements, time saved, and the
     /// cutover criteria. Exit 0 when every criterion is met, 1 when not.
@@ -417,7 +423,16 @@ fn main() -> ExitCode {
                 ms,
                 gate,
                 failures_file,
-            } => shadow_record(&repo_root(repo), sha, &verdict, ms, &gate, failures_file),
+                source,
+            } => shadow_record(
+                &repo_root(repo),
+                sha,
+                &verdict,
+                ms,
+                &gate,
+                failures_file,
+                &source,
+            ),
             ShadowCmd::Report {
                 repo,
                 files,
@@ -944,6 +959,7 @@ fn shadow_record(
     ms: u64,
     gate_name: &str,
     failures_file: Option<PathBuf>,
+    source: &str,
 ) -> ExitCode {
     let verdict = match verdict {
         "pass" => Outcome::Pass,
@@ -953,6 +969,10 @@ fn shadow_record(
             return ExitCode::from(1);
         }
     };
+    if source == shadow::CI_SOURCE && ms != 0 {
+        eprintln!("chg: --ms has no meaning with --source ci: a CI verdict has no gate time");
+        return ExitCode::from(1);
+    }
     let sha = match git::resolve(repo, sha.as_deref().unwrap_or("HEAD")) {
         Ok(s) => s,
         Err(e) => {
@@ -974,7 +994,7 @@ fn shadow_record(
         }
     };
     let key = git::repo_key(repo);
-    let row = shadow::Row::gate(&key, &sha, verdict, ms, gate_name, "local", failures);
+    let row = shadow::Row::gate(&key, &sha, verdict, ms, gate_name, source, failures);
     match shadow::append(&shadow::log_path(&key), &row) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

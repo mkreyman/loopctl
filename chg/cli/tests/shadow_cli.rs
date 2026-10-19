@@ -837,6 +837,47 @@ fn record_and_report_pair_verdicts_by_commit() {
         .args(["shadow", "record", "--verdict", "maybe"])
         .assert()
         .code(1);
+
+    // A CI verdict recorded by hand is a CI row: no gate time, so the gate-time figures
+    // stay as they were, and `--ms` is refused with it.
+    env.chg()
+        .args(["shadow", "record", "--verdict", "pass", "--source", "ci"])
+        .args(["--gate", "Tests (CI on abc)"])
+        .assert()
+        .success();
+    let rows = env.rows();
+    assert_eq!(rows.last().unwrap()["source"], "ci");
+    assert_eq!(rows.last().unwrap()["ms"], 0);
+    let out = env
+        .chg()
+        .args(["shadow", "report", "--json"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let after: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(after["timed"], r["timed"]);
+    assert_eq!(after["median_gate_ms"], r["median_gate_ms"]);
+    env.chg()
+        .args([
+            "shadow",
+            "record",
+            "--verdict",
+            "pass",
+            "--source",
+            "ci",
+            "--ms",
+            "5",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--ms has no meaning with --source ci",
+        ));
+    env.chg()
+        .args(["shadow", "record", "--verdict", "pass", "--source", "other"])
+        .assert()
+        .failure();
 }
 
 #[test]
