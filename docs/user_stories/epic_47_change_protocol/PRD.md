@@ -129,6 +129,31 @@ by searching every tenant for a repo named in an unauthenticated body.
   (`events after N`): reconciliation, not trust in delivery.
 - Every applied event is appended to the audit chain with the change id and sha.
 
+**The wire contract, as chg emits it** (confirmed by the chg session on 2026-10-19; record:
+mkreyman/chg#33):
+
+- Headers `X-Chg-Timestamp` and `X-Chg-Signature`; the HMAC is over `"<timestamp>.<raw body>"`
+  keyed by `change_events_secret`. chg signs at send time, so a retry carries a fresh
+  timestamp and stays inside the 5-minute window.
+- Envelope: `{v, repo, change_id, event_seq, kind, revision, sha, occurred_at, data}`.
+  `event_seq` is per change, starts at 1 and has no gaps on chg's side.
+- Delivery is at-least-once with backoff for up to 24 h. A `401` is not retried, so a bad
+  secret shows up as missing events and the gap pull, not as a retry storm.
+- `data` per kind: `submitted` → `data.story_id` (or null); `review_approved` → `data.by`
+  (`model` | `policy`); `landed` → `data.merge_sha`; `verified` → `data.sha`.
+- `story_id` comes from a `Story:` commit trailer that `chg submit --story` writes. chg treats
+  it as opaque and never calls loopctl, so loopctl is not on chg's merge path.
+- chg also emits `review_requested`, `check_failed`, `conflict` and `ready`. loopctl answers
+  `2xx` to any kind this table does not map and ignores it, so chg can add kinds without a
+  loopctl release.
+- The gap pull is `GET /api/v1/changes/:change_id/events?after=N` on chg-server, HMAC-signed
+  with the same secret.
+- chg-server is chg's Phase 2 and is not running yet (mkreyman/chg#35). Until then, 47.3 is
+  built and tested against this contract but receives no real events.
+- GitHub App 5101362 is ADOPTED by chg as chg-server's lander (renamed chg-lander, given a new
+  key). loopctl holds none of its credentials: `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`
+  were unset from loopctl's Fly app on 2026-10-19.
+
 **The stage mapping.** It uses the stages `Delivery.StageMachine` already has. The edges marked
 new are control-only (never runner-reportable). `pr_open` is skipped: a chg change has no PR.
 
