@@ -134,7 +134,7 @@
   ],
   "technical_notes": [
     "The chg client is a behaviour resolved from config (Loopctl.Changes.ChgClient), mocked in test/support/mocks.ex.",
-    "Build against PRD \u00a75's wire contract (confirmed on mkreyman/chg#33). The points \u00a75 lists as still open must be answered there first, not guessed."
+    "Build against PRD \u00a75's wire contract, confirmed on mkreyman/chg#33 (headers, signed strings for POST and the gap-pull GET, envelope, per-kind data)."
   ],
   "dependencies": [
     "US-47.1",
