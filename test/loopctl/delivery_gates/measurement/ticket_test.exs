@@ -32,6 +32,28 @@ defmodule Loopctl.DeliveryGates.Measurement.TicketTest do
                Ticket.parse(build(:measurement_ticket, %{"title" => "[Bug] the total is wrong"}))
     end
 
+    test "a chg-loop label marks a ticket chg filed (US-47.11)" do
+      assert {:ok, %{chg_loop?: true, intake?: false}} =
+               Ticket.parse(
+                 build(:measurement_ticket, %{
+                   "title" => "Flaky test: billing_test.exs:42 (fingerprint 3f9a)",
+                   labels: ["bug", "chg-loop"]
+                 })
+               )
+    end
+
+    test "no chg-loop label, or a label that only resembles it, is not a chg-loop ticket" do
+      for labels <- [[], ["bug"], ["chg"], ["chg-loop-candidate"], ["loop"]] do
+        assert {:ok, %{chg_loop?: false}} =
+                 Ticket.parse(build(:measurement_ticket, labels: labels))
+      end
+    end
+
+    test "the label is the whole test: the title does not make a ticket chg-loop" do
+      assert {:ok, %{chg_loop?: false}} =
+               Ticket.parse(build(:measurement_ticket, %{"title" => "chg-loop: a failure"}))
+    end
+
     test "an empty body is nil rather than an empty string" do
       assert {:ok, %{body: nil}} = Ticket.parse(build(:measurement_ticket, %{"body" => ""}))
     end
