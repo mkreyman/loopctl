@@ -233,6 +233,7 @@
     ["POST","/api/v1/stories/:id/artifacts","LoopctlWeb.ArtifactReportController",":create"],
     ["POST","/api/v1/stories/:id/backfill","LoopctlWeb.StoryVerificationController",":backfill"],
     ["GET","/api/v1/stories/:id/capabilities","LoopctlWeb.CapabilityController",":index"],
+    ["GET","/api/v1/stories/:id/changes","LoopctlWeb.StoryChangeController",":show"],
     ["POST","/api/v1/stories/:id/claim","LoopctlWeb.StoryStatusController",":claim"],
     ["POST","/api/v1/stories/:id/contract","LoopctlWeb.StoryStatusController",":contract"],
     ["POST","/api/v1/stories/:id/escalate","LoopctlWeb.StoryEscalationController",":escalate"],

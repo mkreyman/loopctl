@@ -56,6 +56,17 @@ defmodule Loopctl.Changes do
   tenant's audit chain INSIDE the bind's transaction
   (`Loopctl.AuditChain.append_in_tenant_transaction/2`), announced after commit. An idempotent
   re-bind writes nothing, so it appends nothing.
+
+  ## Reading a story's changes
+
+  `story_changes/2` is what `GET /api/v1/stories/:id/changes` serves (US-47.7): the story's
+  bindings OLDEST FIRST — the order they were made, so the current one is last — each with
+  its change's APPLIED events in `event_seq` order. An event held ahead of a gap is not
+  applied, so it is not listed. Both halves are bounded, by `max_bindings/0` and
+  `max_events_per_change/0`; a truncated list keeps the NEWEST entries (the current binding
+  is always present) and says so in its counts. The event's `data` and `effect` are not
+  returned: `data` is untrusted chg-authored text, and nothing a reader of this list needs
+  is in either.
   """
 
   import Ecto.Query
@@ -65,6 +76,7 @@ defmodule Loopctl.Changes do
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Changes.Binding
+  alias Loopctl.Changes.Event
   alias Loopctl.Changes.UnboundEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Repo
@@ -85,6 +97,28 @@ defmodule Loopctl.Changes do
           Ecto.Changeset.t() | :change_bound_to_other_story | :change_superseded | :busy
 
   @input_types %{story_id: :string, repo: :string, change_id: :string}
+
+  # The bounds on `story_changes/2`, held here once and read by the endpoint's response and its
+  # operation spec alike (`LoopctlWeb.StoryChangeController`), so the documented limit and the
+  # enforced one cannot drift. A change's life is a submit, a few revisions and their checks,
+  # so 100 events holds every ordinary change whole; a story bound to more than 20 changes
+  # has been re-submitted far past what a reader needs listed.
+  @max_events_per_change 100
+  @max_bindings 20
+
+  @typedoc """
+  One binding of `story_changes/2`: the row, its newest applied events (at most
+  `max_events_per_change/0`, ascending `event_seq`), and how many applied events the change
+  has in all.
+  """
+  @type story_change :: %{
+          binding: Binding.t(),
+          events: [Event.t()],
+          applied_event_count: non_neg_integer()
+        }
+
+  @typedoc "`story_changes/2`'s answer: the listed bindings, oldest first, and their total."
+  @type story_changes :: %{bindings: [story_change()], binding_count: non_neg_integer()}
 
   @doc """
   Binds `attrs.change_id` in `attrs.repo` to `attrs.story_id`.
@@ -195,6 +229,103 @@ defmodule Loopctl.Changes do
       end)
 
     bindings
+  end
+
+  @doc "The most applied events `story_changes/2` lists per change."
+  @spec max_events_per_change() :: pos_integer()
+  def max_events_per_change, do: @max_events_per_change
+
+  @doc "The most bindings `story_changes/2` lists per story."
+  @spec max_bindings() :: pos_integer()
+  def max_bindings, do: @max_bindings
+
+  @doc """
+  The story's bindings, oldest first, each with its change's applied events — see "Reading a
+  story's changes" above.
+
+  `{:error, :not_found}` when the story is not the tenant's: another tenant's id, an id
+  nobody issued and a malformed one answer alike. A tenant story with no binding is
+  `{:ok, %{bindings: [], binding_count: 0}}`. Every read runs through `Repo` under the
+  tenant's RLS context AND an explicit `tenant_id` predicate.
+  """
+  @spec story_changes(Ecto.UUID.t(), String.t()) :: {:ok, story_changes()} | {:error, :not_found}
+  def story_changes(tenant_id, story_id) when is_binary(tenant_id) and is_binary(story_id) do
+    with {:ok, id} <- Ecto.UUID.cast(story_id),
+         {:ok, {:ok, changes}} <-
+           Repo.with_tenant(tenant_id, fn -> read_story_changes(tenant_id, id) end) do
+      {:ok, changes}
+    else
+      :error -> {:error, :not_found}
+      {:ok, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  defp read_story_changes(tenant_id, story_id) do
+    story? =
+      Repo.exists?(from s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id)
+
+    if story?, do: {:ok, read_bindings(tenant_id, story_id)}, else: :not_found
+  end
+
+  # The newest `@max_bindings`, then put back oldest first. `binding_count` is the story's
+  # total, so a reader can tell a truncated list from a whole one.
+  defp read_bindings(tenant_id, story_id) do
+    base = from(b in Binding, where: b.tenant_id == ^tenant_id and b.story_id == ^story_id)
+
+    bindings =
+      base
+      |> order_by([b], desc: b.inserted_at, desc: b.id)
+      |> limit(^@max_bindings)
+      |> Repo.all()
+      |> Enum.reverse()
+
+    total = Repo.aggregate(base, :count)
+    events = read_applied_events(tenant_id, Enum.map(bindings, & &1.id))
+
+    %{
+      binding_count: total,
+      bindings:
+        Enum.map(bindings, fn binding ->
+          {listed, count} = Map.get(events, {binding.repo, binding.change_id}, {[], 0})
+          %{binding: binding, events: listed, applied_event_count: count}
+        end)
+    }
+  end
+
+  # One query for every listed binding's events, not one per binding: each change's applied
+  # events are ranked newest first and counted in a window, and the outer query keeps the
+  # top `@max_events_per_change` of each. Answers `%{{repo, change_id} => {events, count}}`.
+  defp read_applied_events(_tenant_id, []), do: %{}
+
+  defp read_applied_events(tenant_id, binding_ids) do
+    ranked =
+      from e in Event,
+        join: b in Binding,
+        on: b.tenant_id == e.tenant_id and b.repo == e.repo and b.change_id == e.change_id,
+        where: e.tenant_id == ^tenant_id and b.tenant_id == ^tenant_id,
+        where: b.id in ^binding_ids and not is_nil(e.applied_at),
+        windows: [
+          newest: [partition_by: [e.repo, e.change_id], order_by: [desc: e.event_seq]],
+          change: [partition_by: [e.repo, e.change_id]]
+        ],
+        select: %{
+          id: e.id,
+          rank: over(row_number(), :newest),
+          applied_count: over(count(e.id), :change)
+        }
+
+    from(e in Event,
+      join: r in subquery(ranked),
+      on: r.id == e.id,
+      where: e.tenant_id == ^tenant_id and r.rank <= ^@max_events_per_change,
+      order_by: [asc: e.repo, asc: e.change_id, asc: e.event_seq],
+      select: {e, r.applied_count}
+    )
+    |> Repo.all()
+    |> Enum.group_by(fn {e, _count} -> {e.repo, e.change_id} end)
+    |> Map.new(fn {key, [{_e, count} | _] = rows} ->
+      {key, {Enum.map(rows, fn {e, _} -> e end), count}}
+    end)
   end
 
   @doc "The tenant's unbound events for one change, oldest first."
