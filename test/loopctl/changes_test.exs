@@ -188,16 +188,17 @@ defmodule Loopctl.ChangesTest do
       assert payload["superseded_binding_ids"] == [c1.id]
     end
 
-    test "a failed bind rolls the supersede back with it", %{tenant: tenant, story: story} do
-      other_story = fixture(:story, %{tenant_id: tenant.id})
-      {:ok, c1} = Changes.bind(tenant.id, attrs(story.id, "C1"), nobody())
-      {:ok, _} = Changes.bind(tenant.id, attrs(other_story.id, "C2"), nobody())
+    test "re-binding a superseded change is refused, and the newer one stays current", %{
+      tenant: tenant,
+      story: story
+    } do
+      {:ok, _c1} = Changes.bind(tenant.id, attrs(story.id, "C1"), nobody())
+      {:ok, c2} = Changes.bind(tenant.id, attrs(story.id, "C2"), nobody())
 
-      # C2 is another story's: refused, and C1 stays current.
-      assert {:error, :change_bound_to_other_story} =
-               Changes.bind(tenant.id, attrs(story.id, "C2"), nobody())
+      assert {:error, :change_superseded} =
+               Changes.bind(tenant.id, attrs(story.id, "C1"), nobody())
 
-      assert Changes.current_binding(tenant.id, story.id).id == c1.id
+      assert Changes.current_binding(tenant.id, story.id).id == c2.id
     end
 
     test "the database refuses a second current binding for one story", %{
@@ -343,11 +344,30 @@ defmodule Loopctl.ChangesTest do
         fixture(:claimed_story, %{tenant_id: tenant.id})
 
       assert {:ok, %Binding{submitter_not_claimant: false}} =
-               Changes.bind(tenant.id, attrs(story.id, "C1"), %{agent_id: claimant.id})
+               Changes.bind(tenant.id, attrs(story.id, "C1"), %{
+                 agent_id: claimant.id,
+                 actor_lineage: dispatch.lineage_path
+               })
 
       reloaded = AdminRepo.get!(Story, story.id)
       assert reloaded.assigned_agent_id == claimant.id
       assert reloaded.implementer_dispatch_id == dispatch.id
+    end
+
+    test "the claimant agent in ANOTHER session does not hold the claim", %{tenant: tenant} do
+      %{story: story, agent: claimant} = fixture(:claimed_story, %{tenant_id: tenant.id})
+
+      # Another session's lineage, as the resolver would hand it over: not the implementer's.
+      other_session = [Ecto.UUID.generate()]
+
+      assert {:ok, %Binding{submitter_not_claimant: true}} =
+               Changes.bind(tenant.id, attrs(story.id, "C1"), %{
+                 agent_id: claimant.id,
+                 actor_lineage: other_session
+               })
+
+      assert {:ok, %Binding{submitter_not_claimant: true}} =
+               Changes.bind(tenant.id, attrs(story.id, "C2"), %{agent_id: claimant.id})
     end
 
     test "an unidentified submitter is not the claimant", %{tenant: tenant} do

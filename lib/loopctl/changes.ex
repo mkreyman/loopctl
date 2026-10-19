@@ -15,14 +15,20 @@ defmodule Loopctl.Changes do
     `Loopctl.Changes.UnboundEvent` in the CALLING tenant — no row is written in the tenant
     that owns the story. See that module for why the event is not a nullable-story binding.
   - **A change binds one story.** The same `(repo, change_id)` re-bound to the SAME story
-    returns the existing row (a redelivery is not an error). Bound to a DIFFERENT story it is
-    `{:error, :change_bound_to_other_story}` — both stories are this tenant's own by then, so
-    the refusal leaks nothing.
+    returns the existing row while it is current (a redelivery is not an error). Once another
+    change has superseded it, re-binding it is `{:error, :change_superseded}`: answering with
+    the old row would read as "this change is current" while the story follows another one.
+    Making a superseded change current again is a revert's decision (US-47.4), not a bind's.
+    Bound to a DIFFERENT story it is `{:error, :change_bound_to_other_story}` — both stories
+    are this tenant's own by then, so the refusal leaks nothing.
   - **Who submitted is not custody.** `bind/4` never writes `stories.assigned_agent_id` or
     `implementer_dispatch_id`. The submitter is an argument the CALLER resolved server-side
-    (never a request field); when its `agent_id` is not the story's `assigned_agent_id` — an
-    unclaimed story included, since then nobody's session holds the claim — the binding is
-    stored with `submitter_not_claimant: true` and the implementer of record is untouched.
+    (never a request field). It holds the claim only when its `agent_id` is the story's
+    `assigned_agent_id` AND, on dispatch-minted work, its `actor_lineage` contains the story's
+    `implementer_dispatch_id` (the implementer's dispatch or one beneath it) — the same agent
+    in another session does not hold it. Otherwise (an unclaimed story included, and a machine
+    caller with no lineage on dispatch-minted work) the binding is stored with
+    `submitter_not_claimant: true`; the implementer of record is untouched either way.
 
   ## Concurrency
 
@@ -36,7 +42,7 @@ defmodule Loopctl.Changes do
     child row of the story) takes `FOR KEY SHARE` on the story, which `UPDATE` would block.
   - **One story per change.** Binds of one change to two DIFFERENT stories lock different
     story rows, so they race on the `(tenant_id, repo, change_id)` unique index instead. The
-    insert is `ON CONFLICT DO NOTHING`, the loser re-reads the winner's row, and its
+    insert is `ON CONFLICT DO NOTHING ... RETURNING`, the loser reads the winner's row, and its
     transaction — including the supersede it already made — rolls back.
 
   The lock waits are bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/2`); contention
@@ -74,14 +80,15 @@ defmodule Loopctl.Changes do
           optional(:actor_lineage) => [String.t()]
         }
 
-  @type bind_error :: Ecto.Changeset.t() | :change_bound_to_other_story | :busy
+  @type bind_error ::
+          Ecto.Changeset.t() | :change_bound_to_other_story | :change_superseded | :busy
 
   @input_types %{story_id: :string, repo: :string, change_id: :string}
 
   @doc """
   Binds `attrs.change_id` in `attrs.repo` to `attrs.story_id`.
 
-  Returns `{:ok, binding}` (new, or the existing row for an identical re-bind),
+  Returns `{:ok, binding}` (new, or the existing CURRENT row for an identical re-bind),
   `{:ok, :unbound}` when the story is not the tenant's — foreign, unknown and malformed ids
   alike — or `{:error, reason}` (`t:bind_error/0`).
 
@@ -188,7 +195,11 @@ defmodule Loopctl.Changes do
           from s in Story,
             where: s.id == ^id and s.tenant_id == ^tenant_id,
             lock: "FOR NO KEY UPDATE",
-            select: %{id: s.id, assigned_agent_id: s.assigned_agent_id}
+            select: %{
+              id: s.id,
+              assigned_agent_id: s.assigned_agent_id,
+              implementer_dispatch_id: s.implementer_dispatch_id
+            }
         )
 
       :error ->
@@ -198,8 +209,11 @@ defmodule Loopctl.Changes do
 
   defp bind_story(tenant_id, story, input, agent_id, lineage) do
     case existing_binding(tenant_id, input) do
-      %Binding{story_id: story_id} = binding when story_id == story.id ->
+      %Binding{story_id: story_id, superseded_at: nil} = binding when story_id == story.id ->
         {:existing, binding}
+
+      %Binding{story_id: story_id} when story_id == story.id ->
+        Repo.rollback(:change_superseded)
 
       %Binding{} ->
         Repo.rollback(:change_bound_to_other_story)
@@ -229,7 +243,7 @@ defmodule Loopctl.Changes do
         set: [superseded_at: now, updated_at: now]
       )
 
-    not_claimant = is_nil(agent_id) or agent_id != story.assigned_agent_id
+    not_claimant = not claimant?(story, agent_id, lineage)
 
     changeset =
       %Binding{
@@ -243,12 +257,7 @@ defmodule Loopctl.Changes do
         change_id: input.change_id
       })
 
-    with {:ok, binding} <-
-           Repo.insert(changeset,
-             on_conflict: :nothing,
-             conflict_target: [:tenant_id, :repo, :change_id]
-           ),
-         :inserted <- inserted?(tenant_id, input, binding, story),
+    with {:ok, binding} <- insert_new(changeset, story),
          {:ok, entry} <-
            AuditChain.append_in_tenant_transaction(tenant_id, %{
              action: "change_bound",
@@ -270,23 +279,54 @@ defmodule Loopctl.Changes do
     end
   end
 
-  # `ON CONFLICT DO NOTHING` returns the struct it tried to insert, client-generated id and
-  # all, so whether it landed is read back: the row holding the key is ours or a concurrent
-  # bind's. Losing to a bind of the same story cannot happen under the story lock, but it is
-  # answered as the idempotent re-bind it would be rather than assumed away.
-  defp inserted?(tenant_id, input, %Binding{id: id}, story) do
-    case existing_binding(tenant_id, input) do
-      %Binding{id: ^id} ->
-        :inserted
+  # The submitting SESSION holds the claim, not merely the same agent: on dispatch-minted
+  # work the submitter's lineage must contain the implementer's dispatch.
+  defp claimant?(%{assigned_agent_id: nil}, _agent_id, _lineage), do: false
+  defp claimant?(_story, nil, _lineage), do: false
 
-      %Binding{story_id: story_id} = winner when story_id == story.id ->
-        {:error, {:lost_to, winner}}
+  defp claimant?(
+         %{assigned_agent_id: assigned, implementer_dispatch_id: dispatch_id},
+         agent_id,
+         lineage
+       ) do
+    assigned == agent_id and (is_nil(dispatch_id) or dispatch_id in lineage)
+  end
 
-      _other ->
-        {:error, :change_bound_to_other_story}
+  # `RETURNING` answers whether the row landed: `{1, [row]}` inserted, `{0, []}` lost the
+  # `(tenant, repo, change_id)` key to a concurrent bind, whose row is then read. Losing to a
+  # bind of the same story cannot happen under the story lock, but it is answered as the
+  # idempotent re-bind it would be rather than assumed away.
+  defp insert_new(%Ecto.Changeset{valid?: false} = changeset, _story), do: {:error, changeset}
+
+  defp insert_new(changeset, story) do
+    binding = Ecto.Changeset.apply_changes(changeset)
+    now = DateTime.utc_now()
+
+    row =
+      binding
+      |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
+      |> Map.take(Binding.__schema__(:fields))
+
+    case Repo.insert_all(Binding, [row],
+           on_conflict: :nothing,
+           conflict_target: [:tenant_id, :repo, :change_id],
+           returning: true
+         ) do
+      {1, [inserted]} ->
+        {:ok, inserted}
+
+      {0, []} ->
+        case existing_binding(binding.tenant_id, binding) do
+          %Binding{story_id: story_id} = winner when story_id == story.id ->
+            {:error, {:lost_to, winner}}
+
+          _other ->
+            {:error, :change_bound_to_other_story}
+        end
     end
   end
 
+  # A redelivery of the same unbound bind inserts nothing (`{0, []}`), so it appends nothing.
   defp record_unbound(tenant_id, input, agent_id, lineage) do
     changeset =
       %UnboundEvent{tenant_id: tenant_id, submitter_agent_id: agent_id}
@@ -296,45 +336,45 @@ defmodule Loopctl.Changes do
         claimed_story_id: input.story_id
       })
 
-    case Repo.insert(changeset,
-           on_conflict: :nothing,
-           conflict_target: [:tenant_id, :repo, :change_id, :claimed_story_id]
-         ) do
-      {:ok, %UnboundEvent{} = event} ->
-        {:unbound, append_unbound(tenant_id, input, event, agent_id, lineage)}
-
-      {:error, reason} ->
-        Repo.rollback(reason)
+    case Ecto.Changeset.apply_action(changeset, :insert) do
+      {:ok, event} -> insert_unbound(tenant_id, input, event, agent_id, lineage)
+      {:error, reason} -> Repo.rollback(reason)
     end
   end
 
-  # A redelivery of the same unbound bind inserts nothing, so it appends nothing either: the
-  # event row is read back to tell the two apart, as `inserted?/4` does for a binding.
-  defp append_unbound(tenant_id, input, %UnboundEvent{id: id}, agent_id, lineage) do
-    recorded =
-      Repo.one(
-        from e in UnboundEvent,
-          where: e.tenant_id == ^tenant_id and e.repo == ^input.repo,
-          where: e.change_id == ^input.change_id and e.claimed_story_id == ^input.story_id,
-          select: e.id
-      )
+  defp insert_unbound(tenant_id, input, event, agent_id, lineage) do
+    now = DateTime.utc_now()
 
-    if recorded == id do
-      case AuditChain.append_in_tenant_transaction(tenant_id, %{
-             action: "change_unbound",
-             actor_lineage: lineage,
-             entity_type: "unbound_change_event",
-             entity_id: id,
-             payload: %{
-               "repo" => input.repo,
-               "change_id" => input.change_id,
-               "claimed_story_id" => input.story_id,
-               "submitter_agent_id" => agent_id
-             }
-           }) do
-        {:ok, entry} -> entry
-        {:error, reason} -> Repo.rollback(reason)
-      end
+    row =
+      event
+      |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
+      |> Map.take(UnboundEvent.__schema__(:fields))
+
+    case Repo.insert_all(UnboundEvent, [row],
+           on_conflict: :nothing,
+           conflict_target: [:tenant_id, :repo, :change_id, :claimed_story_id],
+           returning: [:id]
+         ) do
+      {1, [%{id: id}]} -> {:unbound, append_unbound(tenant_id, input, id, agent_id, lineage)}
+      {0, []} -> {:unbound, nil}
+    end
+  end
+
+  defp append_unbound(tenant_id, input, id, agent_id, lineage) do
+    case AuditChain.append_in_tenant_transaction(tenant_id, %{
+           action: "change_unbound",
+           actor_lineage: lineage,
+           entity_type: "unbound_change_event",
+           entity_id: id,
+           payload: %{
+             "repo" => input.repo,
+             "change_id" => input.change_id,
+             "claimed_story_id" => input.story_id,
+             "submitter_agent_id" => agent_id
+           }
+         }) do
+      {:ok, entry} -> entry
+      {:error, reason} -> Repo.rollback(reason)
     end
   end
 
