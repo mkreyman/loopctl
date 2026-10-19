@@ -1,0 +1,16 @@
+#!/bin/bash
+# The fleet's commit-msg, unchanged (#985). This repo points core.hooksPath at its
+# own .githooks so that .githooks/pre-push can add chg's shadow check (see that
+# file's header for how and why); every other hook git looks for here hands
+# straight back to claude-config's git-hooks/commit-msg, which is what ran before.
+#
+# exec keeps the path in $0: the fleet hook resolves its own lib directory from
+# it. Without the fleet hook, git would have run no commit-msg at all, so this says
+# so and lets git go on, rather than stopping every commit on a machine that has
+# not synced claude-config.
+fleet="$HOME/.git-hooks/commit-msg"
+if [ ! -x "$fleet" ]; then
+  echo "⚠️  $fleet not found: the fleet's commit-msg did not run; re-sync claude-config" >&2
+  exit 0
+fi
+exec "$fleet" "$@"

@@ -1,0 +1,143 @@
+#!/bin/bash
+# Repo-local pre-push (#985): the fleet's pre-push exactly as before, then chg's
+# shadow phase (mkreyman/chg docs/shadow.md) for each commit the push carries.
+# Nothing chg does here blocks a push or changes the fleet hook's verdict.
+#
+# HOW GIT GETS HERE. The fleet sets core.hooksPath globally to ~/.git-hooks
+# (claude-config's git-hooks/), and that pre-push has no repo-local extension
+# point. So this repo overrides the setting in its own .git/config with the
+# absolute path of the main worktree's .githooks (.githooks/install.sh, run by
+# `mix setup`), the way home_care_billing points it at its .githooks. The other
+# hooks in this directory hand straight back to the fleet's.
+#
+# WHICH VERDICT IS THE GATE'S. loopctl's full gate, `mix precommit`, runs at
+# COMMIT time in the fleet's pre-commit, and claude-config's bin/local-gate.sh
+# attests the exact tree it passed. A pushed commit that `local-gate.sh check`
+# attests is therefore recorded as the gate's `pass`. A red gate produces no
+# commit, so nothing here can record a `fail`: `chg shadow report --ci-check
+# Test` takes those from CI's Test job. An unattested commit records nothing.
+# The fleet hook's own `mix test.e2e` is no verdict on the tests chg selects
+# (:e2e is excluded from the default suite), so it is never recorded.
+#
+# WHEN. Only after the fleet hook lets the push go ahead: a push it stops is
+# shadowed when it is retried, not once per attempt. Each pushed commit is
+# shadowed once per push; one already on the remote sends nothing new and is
+# skipped.
+set -uo pipefail
+
+REMOTE=${1:-origin}
+LINES=$(cat)
+
+FLEET_HOOK="$HOME/.git-hooks/pre-push"
+status=0
+if [ -x "$FLEET_HOOK" ]; then
+  # A here-string, not a pipe: a fleet hook that stops reading early must not
+  # SIGPIPE the writer and turn its own pass into a failure under pipefail.
+  "$FLEET_HOOK" "$@" <<<"$LINES" || status=$?
+else
+  echo "⚠️  $FLEET_HOOK not found: the fleet's pre-push (mix test.e2e) did not run; re-sync claude-config"
+fi
+[ "$status" -eq 0 ] || exit "$status"
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# CHG_MODE is chg's own answer (`chg gate`: CHG_GATE, then .chg/policy.toml, and
+# anything unreadable is off). Only `shadow` turns the helpers below on; `on` is
+# the cutover PR's to wire. Without chg on PATH the mode is off, and off means
+# the push is exactly what the fleet hook made it.
+CHG_MODE=off
+if command -v chg >/dev/null 2>&1; then
+  CHG_MODE=$(chg gate 2>/dev/null </dev/null) || CHG_MODE=off
+fi
+[ "$CHG_MODE" = shadow ] || exit 0
+
+# The repo's gate lock, where claude-config's lib says it is. Homebrew's flock
+# is not on a non-interactive macOS PATH, so it is appended when flock is
+# missing, never put ahead of what is already found.
+if ! command -v flock >/dev/null 2>&1 && [ -x "${GATE_FLOCK_DIR:-/opt/homebrew/bin}/flock" ]; then
+  PATH="$PATH:${GATE_FLOCK_DIR:-/opt/homebrew/bin}"
+fi
+GATE_LOCK_LIB="$HOME/.claude/hooks/lib/gate-lock-fd.sh"
+GATE_LOCK_UNUSABLE=""
+if [ -r "$GATE_LOCK_LIB" ]; then
+  # shellcheck source=/dev/null
+  . "$GATE_LOCK_LIB"
+  declare -F gate_lock_path >/dev/null ||
+    GATE_LOCK_UNUSABLE="claude-config's gate-lock-fd.sh has no gate_lock_path"
+else
+  GATE_LOCK_UNUSABLE="claude-config's gate-lock-fd.sh is not on this machine"
+fi
+
+LOCAL_GATE="$HOME/workspace/claude-config/bin/local-gate.sh"
+
+# 0 = the commit is already on this remote, so pushing a ref to it sends no new
+# content (a new branch at an old commit, a tag from --follow-tags).
+on_remote() {
+  [ -n "$(git for-each-ref --contains "$1" --count=1 --format='x' "refs/remotes/$REMOTE" 2>/dev/null)" ]
+}
+
+# Records the gate's verdict on $1 as the `gate` row chg pairs with: a pass,
+# when local-gate.sh attests that `mix precommit` passed on exactly its tree.
+chg_record() { # <sha>
+  local attestation secs gate
+  [ -r "$LOCAL_GATE" ] || return 0
+  attestation=$(bash "$LOCAL_GATE" check "$1" </dev/null 2>/dev/null) || return 0
+  secs=$(sed -n 's/^duration_s=\([0-9][0-9]*\)$/\1/p' <<<"$attestation" | head -1)
+  gate=$(sed -n 's/^gate=//p' <<<"$attestation" | head -1)
+  chg shadow record --sha "$1" --verdict pass --ms "$((10#${secs:-0} * 1000))" \
+    --gate "${gate:-mix precommit}" </dev/null || true
+}
+
+# Queues a chg check of $1 in chg's own worktree and test database, detached,
+# and returns at once. The check waits on this repo's gate lock first, because
+# two suites at once on one machine fail each other (KB 5822ea82): it never runs
+# beside a gate. A repo with no lock file has not adopted the lock, so its gates
+# take none and nothing would keep the check apart from them: it is not started.
+chg_shadow() { # <sha>
+  local lock base git_dir logs log
+  if [ -n "$GATE_LOCK_UNUSABLE" ]; then
+    echo "⚠️  chg shadow not started: $GATE_LOCK_UNUSABLE"
+    return 0
+  fi
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "⚠️  chg shadow not started: no flock on PATH to queue it behind the gate lock"
+    return 0
+  fi
+  if ! lock=$(gate_lock_path "$PWD") || [ ! -f "$lock" ]; then
+    echo "⚠️  chg shadow not started: this repo has no gate lock to queue it behind (${lock:-unknown path})."
+    echo "   Adopt one with: touch ${lock:-<main worktree>/.claude/gate.lock}"
+    return 0
+  fi
+  git_dir=$(git rev-parse --path-format=absolute --git-common-dir) || return 0
+  # No nearest base: chg picks its own (the merge-base with origin's default).
+  base=$(bash "$(dirname "${BASH_SOURCE[0]}")/lib/nearest-base.sh" "$REMOTE" "$1") || base=""
+  # Where the detached check writes its log, kept 14 days.
+  logs="${CHG_HOME:-$HOME/.chg}/shadow/logs"
+  mkdir -p "$logs" || return 0
+  find "$logs" -name '*.log' -mtime +14 -delete 2>/dev/null
+  log="$logs/$(basename -s .git "$(git remote get-url "$REMOTE" 2>/dev/null || echo repo)")-${1:0:12}.log"
+  # The shared git dir, not this worktree, which may be removed first; git's
+  # hook variables would point chg's own git calls back at this one.
+  (
+    cd "$git_dir" || exit 0
+    trap '' HUP INT
+    exec env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+      -u GIT_PREFIX -u GIT_OBJECT_DIRECTORY \
+      flock -w 1800 "$lock" chg check --shadow --foreground --repo "$git_dir" \
+      --sha "$1" ${base:+--base "$base"}
+  ) </dev/null >"$log" 2>&1 &
+  echo "🧪 chg shadow check of ${1:0:12} queued behind the gate lock (log $log)"
+}
+
+zero=0000000000000000000000000000000000000000
+seen=" "
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  # A blank line, or a deletion, which pushes nothing.
+  [ -n "${local_sha:-}" ] && [ "$local_sha" != "$zero" ] || continue
+  case "$seen" in *" $local_sha "*) continue ;; esac
+  seen="$seen$local_sha "
+  on_remote "$local_sha" && continue
+  chg_record "$local_sha"
+  chg_shadow "$local_sha"
+done <<<"$LINES"
+exit 0
