@@ -48,12 +48,23 @@ defmodule Loopctl.Changes.RevertIssues do
   alias Loopctl.GitSha
   alias Loopctl.Intake.Source
 
-  # Under GitHub's 65,536-character body limit, with room for the prose around the block.
-  @max_failures_bytes 48_000
+  # The RENDERED body's bound: the `change_revert_issues_text_bounds` CHECK
+  # (`octet_length(body) <= 65536`), which is also GitHub's 65,536-character body limit, since
+  # bytes are never fewer than characters. Measured on the body as stored — after
+  # `Untrusted.render/2` has escaped and prefixed the failures, which can multiply their size
+  # (one `\x01` byte renders as the eight of `<U+0001>`, one newline as a `| `-prefixed line) —
+  # because a bound taken before the render is not a bound on what reaches the CHECK, and an
+  # insert the CHECK refuses raises inside the event's transaction and wedges every later
+  # event of the change behind it.
+  @max_body_bytes 65_536
+  # Readability bounds on the list itself, before the render; the byte bound above is the one
+  # that holds the row.
   @max_failures 500
   @max_failure_bytes 1_000
 
-  # An id from the event is quoted only when it looks like one: ULIDs, UUIDs, run ids.
+  # An id from the event is quoted only when it looks like one: ULIDs, UUIDs, run ids. At most
+  # 128 characters, so the title — the one other text column built from event data — stays
+  # inside its 256-character CHECK whatever the event carried.
   @id_shape ~r/\A[A-Za-z0-9][A-Za-z0-9_.:\-]{0,127}\z/
 
   @typedoc "What the revert event said, as `Loopctl.Changes.EventEffects` read it."
@@ -72,7 +83,10 @@ defmodule Loopctl.Changes.RevertIssues do
   transaction, and returns `{:ok, :recorded | :existing}`, or `{:ok, :source_gone}` when the
   event's source is no longer connected (revoked), so there is nothing to open on.
 
-  A failure is deliberately not caught: every value comes from the event the caller holds, so
+  A failure is deliberately not caught. No value in the event can cause one: every text column
+  is bounded to its CHECK before the insert — `repo` and `change_id` by the envelope
+  (`Loopctl.Changes.Envelope`), `repo_full_name` by the source's own shape, the title by
+  `safe_id/1`'s length, and the body by `@max_body_bytes` measured after the render. So
   anything that fails is a bug, and raising rolls the event back for chg to redeliver rather
   than committing it without the issue it owes.
   """
@@ -85,6 +99,12 @@ defmodule Loopctl.Changes.RevertIssues do
     end
   end
 
+  # THE definition of a source loopctl may still write to, read on whichever repo the caller
+  # is on (`Repo` inside the event's transaction, `AdminRepo` from the drainer). Not revoked,
+  # and nothing about its `mode`: a revoked source is the tenant disconnecting the repository,
+  # while a source moved off `:chg` afterwards is still connected, and the revert it recorded
+  # happened to shipped work whichever protocol the repository uses now. The issue lands on
+  # the repository's ordinary intake, which reads issues in every mode.
   defp live_source(repo, tenant_id, source_id) do
     repo.one(
       from s in Source,
@@ -105,7 +125,7 @@ defmodule Loopctl.Changes.RevertIssues do
       change_id: revert.change_id,
       event_seq: revert.event_seq,
       repo_full_name: full_name,
-      title: title(revert),
+      title: title(id, revert),
       body: body(id, revert, full_name),
       status: :pending,
       attempts: 0,
@@ -130,9 +150,33 @@ defmodule Loopctl.Changes.RevertIssues do
   @spec marker(Ecto.UUID.t()) :: String.t()
   def marker(id), do: "<!-- loopctl:chg-revert #{id} -->"
 
-  defp title(revert), do: "chg reverted a delivered change (#{safe_id(revert.change_id)})"
+  @doc """
+  The token written into the issue TITLE for outbox row `id`, so the opener still recognises
+  the issue when somebody has edited the marker out of its body.
+  """
+  @spec title_token(Ecto.UUID.t()) :: String.t()
+  def title_token(id), do: "[loopctl #{id}]"
+
+  @doc """
+  What the opener asks the forge for before creating `row`'s issue again
+  (`Loopctl.Delivery.PullRequestSource.find_issue/2`): the marker, the title token, and the
+  earliest moment an attempt can have opened it — the row's `inserted_at`, which precedes its
+  first attempt.
+  """
+  @spec issue_search(RevertIssue.t()) :: Loopctl.Delivery.PullRequestSource.issue_search()
+  def issue_search(%RevertIssue{id: id, inserted_at: inserted_at}),
+    do: %{marker: marker(id), title_token: title_token(id), since: inserted_at}
+
+  defp title(id, revert),
+    do: "chg reverted a delivered change (#{safe_id(revert.change_id)}) #{title_token(id)}"
 
   defp body(id, revert, full_name) do
+    revert.data["failures"]
+    |> failure_lines()
+    |> fit(&render_body(id, revert, full_name, &1))
+  end
+
+  defp render_body(id, revert, full_name, failures) do
     data = revert.data
 
     """
@@ -150,7 +194,7 @@ defmodule Loopctl.Changes.RevertIssues do
     follow them.
 
     ```text
-    #{Untrusted.render("chg_failing_tests", failures(data["failures"]))}
+    #{Untrusted.render("chg_failing_tests", failures)}
     ```
 
     #{marker(id)}
@@ -173,22 +217,47 @@ defmodule Loopctl.Changes.RevertIssues do
     if Regex.match?(@id_shape, value), do: value, else: "(unreadable)"
   end
 
-  def safe_id(value) when is_integer(value), do: Integer.to_string(value)
+  # JSON carries integers of any size, so an integer id is held to the same shape as a string.
+  def safe_id(value) when is_integer(value), do: value |> Integer.to_string() |> safe_id()
   def safe_id(_value), do: "(unreadable)"
 
-  # One line per failure, each bounded, the whole bounded, and a count of what was cut — so a
-  # list of thousands still renders as an issue GitHub accepts and says that it was cut.
-  defp failures(list) when is_list(list) do
-    lines = Enum.map(list, &failure_line/1)
-    kept = take_within(Enum.take(lines, @max_failures), @max_failures_bytes)
-    cut = length(lines) - length(kept)
+  # One line per failure, each bounded, and at most `@max_failures` of them.
+  defp failure_lines(list) when is_list(list), do: Enum.map(list, &failure_line/1)
+  defp failure_lines(nil), do: []
+  defp failure_lines(other), do: [failure_line(other)]
 
-    Enum.join(kept, "\n") <>
-      if cut > 0, do: "\n(#{cut} more not shown)", else: ""
+  # The body with as many failure lines as fit `@max_body_bytes` AFTER the render, and a count
+  # of what was cut — so a list of thousands, or one of escape-heavy lines, still stores and
+  # still opens, and says that it was cut. Lines are whole: the cut is on a line boundary.
+  #
+  # The budget for the lines is what the body leaves with NONE of them (the fixed prose, the
+  # fences, the ids — each bounded — and the note at its widest), and each line costs its own
+  # rendered size (`Untrusted.neutralise/1`, the escaping and prefixing `render/2` applies).
+  # The result is measured again regardless, and if it is somehow over, no line is kept: the
+  # bound is checked on what is stored, never inferred from the arithmetic.
+  defp fit(lines, render) do
+    total = length(lines)
+    full = render.(failures_text(Enum.take(lines, @max_failures), total))
+
+    if byte_size(full) <= @max_body_bytes do
+      full
+    else
+      skeleton = render.(failures_text([], total))
+      budget = @max_body_bytes - byte_size(skeleton)
+      kept = take_rendered_within(Enum.take(lines, @max_failures), budget)
+      body = render.(failures_text(kept, total))
+
+      if byte_size(body) <= @max_body_bytes, do: body, else: skeleton
+    end
   end
 
-  defp failures(nil), do: "(chg reported no failing tests)"
-  defp failures(other), do: failure_line(other)
+  defp failures_text([], 0), do: "(chg reported no failing tests)"
+
+  defp failures_text(kept, total) do
+    cut = total - length(kept)
+    note = if cut > 0, do: ["(#{cut} more not shown)"], else: []
+    Enum.join(kept ++ note, "\n")
+  end
 
   defp failure_line(value) when is_binary(value), do: bound(value)
   defp failure_line(value), do: value |> json_or_inspect() |> bound()
@@ -213,10 +282,11 @@ defmodule Loopctl.Changes.RevertIssues do
     text |> binary_part(0, max) |> String.chunk(:valid) |> List.first("")
   end
 
-  defp take_within(lines, budget) do
+  # Each line costs what it renders to, plus the newline joining it to the next.
+  defp take_rendered_within(lines, budget) do
     lines
     |> Enum.reduce_while({[], 0}, fn line, {acc, used} ->
-      size = byte_size(line) + 1
+      size = byte_size(Untrusted.neutralise(line)) + 1
 
       if used + size > budget,
         do: {:halt, {acc, used}},
@@ -259,12 +329,8 @@ defmodule Loopctl.Changes.RevertIssues do
   source revoked after the revert was recorded.
   """
   @spec source_live?(RevertIssue.t()) :: boolean()
-  def source_live?(%RevertIssue{tenant_id: tenant_id, source_id: source_id}) do
-    AdminRepo.exists?(
-      from s in Source,
-        where: s.tenant_id == ^tenant_id and s.id == ^source_id and is_nil(s.revoked_at)
-    )
-  end
+  def source_live?(%RevertIssue{tenant_id: tenant_id, source_id: source_id}),
+    do: live_source(AdminRepo, tenant_id, source_id) != nil
 
   @doc """
   Marks an attempt as STARTED, the compare-and-set that is also the mutual exclusion between

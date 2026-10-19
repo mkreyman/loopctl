@@ -378,7 +378,15 @@ defmodule Loopctl.Delivery.StageMachineTest do
 
   describe "the change-protocol edges (US-47.4)" do
     test "TC-47.4.6: none of them is runner-reportable" do
-      new_edges = [:change_ready, :reverted, :reverted_after_verify, :change_outside_lifecycle]
+      new_edges = [
+        :change_ready,
+        :change_resubmitted,
+        :change_review_findings,
+        :reverted,
+        :reverted_after_verify,
+        :change_outside_lifecycle
+      ]
+
       assert Enum.sort(StageMachine.change_protocol_edges()) == Enum.sort(new_edges)
 
       for edge <- new_edges do
@@ -395,6 +403,8 @@ defmodule Loopctl.Delivery.StageMachineTest do
             {:implementing, :reviewing, :forward},
             {:reviewing, :implementing, :review_findings},
             {:reviewing, :ci, :change_ready},
+            {:ci, :reviewing, :change_resubmitted},
+            {:ci, :implementing, :change_review_findings},
             {:ci, :merged, :forward},
             {:merged, :deployed, :forward},
             {:merged, :implementing, :reverted},
@@ -423,6 +433,27 @@ defmodule Loopctl.Delivery.StageMachineTest do
       # `deployed` that kept `release_id` would refuse the re-land's own deploy.
       assert :release_id in StageMachine.merge_keyed()
       assert :trunk_verified_sha in StageMachine.merge_keyed()
+    end
+
+    test "AC-47.4.1: leaving ci backwards clears what ci keyed to the head, nothing merge-keyed" do
+      head_keyed = Enum.sort(StageMachine.head_keyed())
+
+      assert Enum.sort(StageMachine.clears(:ci, :reviewing, :change_resubmitted)) == head_keyed
+
+      assert Enum.sort(StageMachine.clears(:ci, :implementing, :change_review_findings)) ==
+               head_keyed
+
+      for edge <- [:change_resubmitted, :change_review_findings] do
+        to = if edge == :change_resubmitted, do: :reviewing, else: :implementing
+        refute StageMachine.chained?(:ci, to, edge)
+        refute StageMachine.reason_required?(to, edge)
+        assert StageMachine.counted?(edge)
+        # Each is the protocol's own; `:review_findings` stays a reviewing-only edge, so no
+        # runner gains a `ci -> implementing` it does not already have.
+        assert [{:ci, ^to, ^edge}] = for({_f, _t, ^edge} = t <- StageMachine.transitions(), do: t)
+      end
+
+      refute {:ci, :implementing, :review_findings} in StageMachine.transitions()
     end
 
     test "change_outside_lifecycle leaves every live stage but escalated, for escalated" do

@@ -25,7 +25,9 @@ defmodule Loopctl.Changes.EventEffects do
   | event | edge |
   |---|---|
   | `submitted` (any revision) | `implementing -> reviewing`, `:forward` |
+  | `submitted`, at `ci`, for a revision newer than any earlier one | `ci -> reviewing`, `:change_resubmitted` |
   | `review_findings` | `reviewing -> implementing`, `:review_findings` |
+  | `review_findings`, at `ci` | `ci -> implementing`, `:change_review_findings` |
   | `review_approved` (`by: model` or `policy`) and `check_passed` on the same revision | `reviewing -> ci`, `:change_ready` |
   | `landed` | `ci -> merged`, `:forward`, `merge_sha` = `data.merge_sha` (the new trunk commit) |
   | `deployed` | `merged -> deployed`, `:forward` |
@@ -38,6 +40,11 @@ defmodule Loopctl.Changes.EventEffects do
     (`Loopctl.Delivery.Stages` also refuses it to any writer on a bound story).
   - An event whose target is the row's CURRENT stage is a recorded no-op (a second
     `submitted` while review is still running).
+  - Any revision re-enters review (AC-47.4.1), including one pushed after the story was ready:
+    at `ci`, a `submitted` for a revision NEWER than every earlier `submitted` of the change
+    goes back to `reviewing`, and one that is not newer moves nothing. `review_findings` for a
+    revision an earlier `submitted` superseded moves nothing either, from any stage: the
+    findings are about a head the change no longer has.
   - The pair that makes a change ready is judged on the revision chg reviewed: whichever of
     `review_approved` and `check_passed` arrives second takes the edge, and a pair for a
     revision an EARLIER event already superseded moves nothing.
@@ -105,8 +112,11 @@ defmodule Loopctl.Changes.EventEffects do
   @approvers ["model", "policy"]
 
   # What of an event's `data` the story's history keeps: the ids and shas, never the failing
-  # tests, which can run to the body cap and belong on the issue a revert opens.
-  @history_keys ~w(merge_sha sha landed_sha revert_sha revert_change_id verification_id)
+  # tests, which can run to the body cap and belong on the issue a revert opens. Each in the
+  # SAME shape the revert reason and the revert issue quote it in (`RevertIssues.safe_sha/1`,
+  # `safe_id/1`), so chg's data reaches `audit_log` only as a sha, an id or `"(unreadable)"`.
+  @history_shas ~w(merge_sha sha landed_sha revert_sha)
+  @history_ids ~w(revert_change_id verification_id)
 
   @type pending :: [{:bind, Changes.pending_bind()} | {:entry, AuditChain.Entry.t()}]
 
@@ -175,6 +185,14 @@ defmodule Loopctl.Changes.EventEffects do
   # The mapping applies only to the story the change is CURRENTLY bound to, read after the bind
   # so a `submitted` that just bound it counts. A superseded binding moves nothing: the story
   # follows another change now.
+  #
+  # Re-read for EVERY kind, not only `submitted`, and the second read is the one that counts.
+  # The first (`target_story_id/2`) is taken BEFORE the story lock, because it is what names
+  # the story to lock. Another change's bind supersedes this binding while holding that same
+  # story `FOR NO KEY UPDATE` (`Loopctl.Changes`, `insert_binding/5`) — a different change, so
+  # a different cursor lock, so concurrent with this event — and under READ COMMITTED only a
+  # read taken after our lock is granted sees its commit. Reusing the first read would let a
+  # change that was just superseded move the story it no longer owns.
   defp current_story(tenant_id, event, story_id, %{} = locked) do
     case change_binding(tenant_id, event) do
       %Binding{story_id: ^story_id, superseded_at: nil} -> Map.put(locked, :story_id, story_id)
@@ -239,11 +257,24 @@ defmodule Loopctl.Changes.EventEffects do
   end
 
   # What the event asks for, judged on the locked row. Pure but for the pair read.
+  # At `ci` a `submitted` is a revision pushed after the pair made the story ready — unless it
+  # is not newer than one already seen, which says nothing new about the change.
+  defp intent(tenant_id, %Event{kind: "submitted"} = event, %StoryStage{stage: :ci}) do
+    if newest_revision?(tenant_id, event),
+      do: {:move, :reviewing, :change_resubmitted, []},
+      else: {:ignore, "not_a_newer_revision"}
+  end
+
   defp intent(_tenant_id, %Event{kind: "submitted"}, _row),
     do: {:move, :reviewing, :forward, []}
 
-  defp intent(_tenant_id, %Event{kind: "review_findings"}, _row),
-    do: {:move, :implementing, :review_findings, []}
+  defp intent(tenant_id, %Event{kind: "review_findings"} = event, row) do
+    cond do
+      superseded_revision?(tenant_id, event) -> {:ignore, "superseded_revision"}
+      row.stage == :ci -> {:move, :implementing, :change_review_findings, []}
+      true -> {:move, :implementing, :review_findings, []}
+    end
+  end
 
   defp intent(tenant_id, %Event{kind: kind} = event, _row)
        when kind in ["review_approved", "check_passed"],
@@ -319,6 +350,14 @@ defmodule Loopctl.Changes.EventEffects do
     |> Repo.exists?()
   end
 
+  # No earlier `submitted` of this change named this revision or a later one.
+  defp newest_revision?(tenant_id, event) do
+    not (tenant_id
+         |> earlier(event)
+         |> where([e], e.kind == "submitted" and e.revision >= ^event.revision)
+         |> Repo.exists?())
+  end
+
   defp earlier_pair?(tenant_id, %Event{kind: "check_passed"} = event) do
     tenant_id
     |> earlier(event)
@@ -340,6 +379,9 @@ defmodule Loopctl.Changes.EventEffects do
 
   defp realise({:wait, why}, _tenant_id, _event, _target),
     do: {%{"outcome" => "waiting", "for" => why}, []}
+
+  defp realise({:ignore, why}, _tenant_id, _event, _target),
+    do: {%{"outcome" => "ignored", "reason" => why}, []}
 
   defp realise({:move, to, edge, effects}, tenant_id, event, %{row: row} = target) do
     cond do
@@ -490,11 +532,28 @@ defmodule Loopctl.Changes.EventEffects do
           action: action,
           actor_type: "system",
           actor_label: @actor_label,
-          metadata: Map.put(event_data(event), "data", Map.take(event.data, @history_keys))
+          metadata: Map.put(event_data(event), "data", history_data(event.data))
         },
         Repo
       )
 
     :ok
+  end
+
+  # Only the keys chg sent, each normalised; a key it did not send stays absent.
+  defp history_data(data) do
+    shas =
+      for key <- @history_shas,
+          Map.has_key?(data, key),
+          into: %{},
+          do: {key, RevertIssues.safe_sha(data[key])}
+
+    ids =
+      for key <- @history_ids,
+          Map.has_key?(data, key),
+          into: %{},
+          do: {key, RevertIssues.safe_id(data[key])}
+
+    Map.merge(shas, ids)
   end
 end

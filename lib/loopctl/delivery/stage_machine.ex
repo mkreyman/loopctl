@@ -102,6 +102,17 @@ defmodule Loopctl.Delivery.StageMachine do
     revert says it held and was undone. The claim is kept
   - `:reverted_after_verify` — verified -> escalated, a revert of a story control had already
     verified. `verified` is not closed, so a human decides what it is now
+  - `:change_resubmitted` — ci -> reviewing, when chg reports a `submitted` for a revision
+    NEWER than the one that made the story ready. Any revision re-enters review (AC-47.4.1),
+    including one pushed after the pair took `:change_ready`; the readiness was decided on a
+    head that is no longer the change's, so it clears what `ci` was keyed to that head
+    (`head_keyed/0`) and nothing merge-keyed, since nothing has merged. Not chained: `ci` is
+    not a custody fact, and neither is leaving it backwards
+  - `:change_review_findings` — ci -> implementing, when chg's review of the CURRENT revision
+    comes back with findings after the story was ready. Its own edge rather than
+    `:review_findings` from `ci`, because `:review_findings` is runner-reportable and `ci` is a
+    runner source stage: reusing it would hand a runner a `ci -> implementing` edge nothing
+    on the pull-request path takes
   - `:change_outside_lifecycle` — any live stage but `escalated` -> escalated, when a change
     event names an edge the machine does not allow from where the story is (a `landed` on a
     story at `implementing`). Trunk holds a change the story did not expect, and only a human
@@ -212,8 +223,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # in-flight edge, so this makes nothing absorbing either.
   @reverted for from <- [:merged, :deployed], do: {from, :implementing, :reverted}
 
+  # A revision pushed after readiness goes back to review, and findings on the ready revision
+  # go back to work. `reviewing` and `implementing` both have edges out (`:change_ready`,
+  # `:review_findings`, `:forward`), so neither makes a stage absorbing.
   @change_protocol [
                      {:reviewing, :ci, :change_ready},
+                     {:ci, :reviewing, :change_resubmitted},
+                     {:ci, :implementing, :change_review_findings},
                      {:verified, :escalated, :reverted_after_verify}
                    ] ++
                      @reverted ++ @change_outside_lifecycle
@@ -474,6 +490,8 @@ defmodule Loopctl.Delivery.StageMachine do
           | :human_resolution
           | :session_escalated
           | :change_ready
+          | :change_resubmitted
+          | :change_review_findings
           | :reverted
           | :reverted_after_verify
           | :change_outside_lifecycle
@@ -621,11 +639,17 @@ defmodule Loopctl.Delivery.StageMachine do
   def control_escalation_edges, do: @control_escalations
 
   @doc """
-  The change-protocol edges (US-47.4): `:change_ready`, `:reverted`, `:reverted_after_verify`
-  and `:change_outside_lifecycle`. Control-only — none is runner-reportable.
+  The change-protocol edges (US-47.4): `:change_ready`, `:change_resubmitted`,
+  `:change_review_findings`, `:reverted`, `:reverted_after_verify` and
+  `:change_outside_lifecycle`. Control-only — none is runner-reportable, and
+  `Loopctl.Delivery.Stages.advance/4` refuses every one of them: only the change-event seam
+  (`Stages.advance_in_tenant_transaction/4`) takes them.
   """
   @spec change_protocol_edges() :: [edge()]
-  def change_protocol_edges, do: [:change_ready, :reverted | @control_escalations]
+  def change_protocol_edges,
+    do:
+      [:change_ready, :change_resubmitted, :change_review_findings, :reverted] ++
+        @control_escalations
 
   @doc "True for the edges only a human principal may take."
   @spec human_only?(edge()) :: boolean()
@@ -824,6 +848,10 @@ defmodule Loopctl.Delivery.StageMachine do
   # the merge-keyed fields and everything bound to the head.
   def clears(from, :implementing, :reverted) when from in [:merged, :deployed],
     do: clears(:merged, :implementing, :merge_refused)
+
+  # A revision pushed after readiness (US-47.4): the head the readiness was judged on is gone,
+  # and with it everything `ci` keyed to that head. Nothing merge-keyed exists yet.
+  def clears(:ci, :reviewing, :change_resubmitted), do: @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
 

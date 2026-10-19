@@ -18,8 +18,9 @@ defmodule Loopctl.Changes.RevertIssue do
   - `:pending` — the drainer's candidate set.
   - `:opened` — the issue exists, as `issue_number`, since `opened_at`. Terminal.
   - `:abandoned` — loopctl will not open it, and `abandoned_reason` says why: the source was
-    revoked or left the change protocol, the forge refused permanently, or the transient
-    retries ran out. Terminal.
+    revoked (a source merely moved off `:chg` is still connected, and still gets the issue —
+    `Loopctl.Changes.RevertIssues.source_live?/1`), the forge refused permanently, or the
+    transient retries ran out. Terminal.
 
   Every field is set by `Loopctl.Changes.RevertIssues`; nothing is cast from a request.
   """

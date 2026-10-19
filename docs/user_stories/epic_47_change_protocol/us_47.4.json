@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-47.4.1",
-      "description": "submitted for ANY revision moves implementing to reviewing over :forward; review_findings moves reviewing to implementing over :review_findings; review_approved (by model or by policy) together with check_passed on the same revision moves reviewing to ci over a new control-only edge :change_ready; landed moves ci to merged over :forward with merge_sha set to the landing commit; deployed moves merged to deployed over :forward."
+      "description": "submitted for ANY revision moves implementing to reviewing over :forward; review_findings moves reviewing to implementing over :review_findings; review_approved (by model or by policy) together with check_passed on the same revision moves reviewing to ci over a new control-only edge :change_ready; landed moves ci to merged over :forward with merge_sha set to the landing commit; deployed moves merged to deployed over :forward. Any revision re-enters review, including one submitted after the story reached ci: a submitted for a revision newer than every earlier submitted of the change moves ci to reviewing over a new control-only edge :change_resubmitted (not chained; clears the head-keyed fields the readiness set, nothing merge-keyed), and one that is not newer is recorded and moves nothing. review_findings for the ready revision moves ci to implementing over a new control-only edge :change_review_findings; review_findings for a revision a later submitted superseded moves nothing from any stage."
     },
     {
       "id": "AC-47.4.2",
@@ -40,7 +40,7 @@
     },
     {
       "id": "AC-47.4.7",
-      "description": "None of the new edges appears in runner_transitions/0."
+      "description": "None of the new edges appears in runner_transitions/0, and Stages.advance/4 refuses every one of them; only the change-event path (Stages.advance_in_tenant_transaction/4, which Escalations.escalate_as_control/3 also uses) takes them."
     }
   ],
   "test_cases": [
@@ -170,6 +170,61 @@
         "after seq 1 the stage is reviewing",
         "seq 2 moves nothing",
         "after seq 3 the stage is implementing over :review_findings"
+      ]
+    },
+    {
+      "id": "TC-47.4.8",
+      "verifies": [
+        "AC-47.4.1"
+      ],
+      "name": "a new revision after ready",
+      "type": "integration",
+      "preconditions": [
+        "a :chg story at ci after the revision 1 pair"
+      ],
+      "steps": [
+        "apply submitted r2, then review_approved + check_passed r2"
+      ],
+      "expected_results": [
+        "reviewing over :change_resubmitted with the head-keyed fields cleared",
+        "ci again over :change_ready",
+        "no chain entry"
+      ]
+    },
+    {
+      "id": "TC-47.4.9",
+      "verifies": [
+        "AC-47.4.1"
+      ],
+      "name": "findings on the ready revision",
+      "type": "integration",
+      "preconditions": [
+        "a :chg story at ci after the revision 1 pair"
+      ],
+      "steps": [
+        "apply review_findings r1, then submitted r2"
+      ],
+      "expected_results": [
+        "implementing over :change_review_findings",
+        "reviewing over :forward"
+      ]
+    },
+    {
+      "id": "TC-47.4.10",
+      "verifies": [
+        "AC-47.4.7"
+      ],
+      "name": "no ordinary writer takes a change-protocol edge",
+      "type": "unit",
+      "preconditions": [
+        "a story at each change-protocol edge's source stage"
+      ],
+      "steps": [
+        "Stages.advance/4 and Stages.precheck/2 with a :user, empty-lineage attribution"
+      ],
+      "expected_results": [
+        "invalid_transition for every edge",
+        "the row untouched"
       ]
     }
   ],

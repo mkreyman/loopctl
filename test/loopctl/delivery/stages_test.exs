@@ -77,6 +77,19 @@ defmodule Loopctl.Delivery.StagesTest do
   end
 
   # A story in `status` at `epoch` with its stage row at `stage`.
+  # The change-event seam's own path (US-47.4): locked first, then advanced, in one tenant
+  # transaction, returning what `advance/4` would.
+  defp in_change_event_transaction(story, transition, opts) do
+    Repo.with_tenant(story.tenant_id, fn ->
+      {:ok, _locked} = Stages.lock_for_control_in_tenant_transaction(story.tenant_id, story.id)
+
+      case Stages.advance_in_tenant_transaction(story.tenant_id, story.id, transition, opts) do
+        {:ok, row, _entry} -> row
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
   defp at_stage(stage, attrs \\ %{}) do
     attrs = Map.new(attrs)
 
@@ -143,7 +156,18 @@ defmodule Loopctl.Delivery.StagesTest do
             effects: required_effects(to)
           ]
 
-        result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
+        result =
+          if edge in StageMachine.change_protocol_edges() do
+            # Only the change-event seam takes these (US-47.4); `advance/4` refuses them from
+            # every caller, before the database.
+            assert {:error, :invalid_transition} =
+                     Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts),
+                   inspect({from, to, edge})
+
+            in_change_event_transaction(story, {from, to, edge}, opts)
+          else
+            Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
+          end
 
         if edge in ([:runner_lost, :claim_released] ++ StageMachine.release_escalation_edges()) do
           # Only a releasing transaction takes these (follow_release/5): the release edges,
@@ -164,6 +188,37 @@ defmodule Loopctl.Delivery.StagesTest do
           chained = chain_actions(story.tenant_id) != []
           assert chained == StageMachine.chained?(from, to, edge), inspect({from, to, edge})
         end
+      end
+    end
+
+    test "TC-47.4.10: advance/4 and precheck/2 refuse every change-protocol edge, from any caller" do
+      triples =
+        for {_f, _t, e} = triple <- StageMachine.transitions(),
+            e in StageMachine.change_protocol_edges(),
+            do: triple
+
+      # Every one of them, the two US-47.4 round-1 added included.
+      assert triples |> Enum.map(&elem(&1, 2)) |> Enum.uniq() |> Enum.sort() ==
+               Enum.sort(StageMachine.change_protocol_edges())
+
+      for {from, to, _edge} = triple <- triples do
+        {story, row} = at_stage(from)
+
+        # The most privileged attribution there is, so nothing but the edge refuses it.
+        opts = [
+          claim_epoch: story.claim_epoch,
+          reason: "because",
+          actor_role: :user,
+          actor_lineage: [],
+          effects: required_effects(to)
+        ]
+
+        assert {:error, :invalid_transition} =
+                 Stages.advance(story.tenant_id, story.id, triple, opts),
+               inspect(triple)
+
+        assert {:error, :invalid_transition} = Stages.precheck(triple, opts), inspect(triple)
+        assert Stages.get(story.tenant_id, story.id).lock_version == row.lock_version
       end
     end
 

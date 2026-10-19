@@ -320,6 +320,123 @@ defmodule Loopctl.Changes.StageMappingTest do
     end
   end
 
+  describe "AC-47.4.1: a revision after the story is ready re-enters review" do
+    # Submitted r1, the r1 pair, so the story is at `ci` for revision 1 with a head recorded.
+    defp ready_at_ci(ctx) do
+      story = story_at(ctx, :implementing)
+
+      for e <- [
+            submitted("C1", 1, story),
+            event("C1", 2, "review_approved", %{data: %{"by" => "model"}}),
+            event("C1", 3, "check_passed")
+          ] do
+        assert {:ok, %{outcome: :applied}} = push(ctx, e)
+      end
+
+      assert %StoryStage{stage: :ci} = row(ctx, story)
+
+      from(s in StoryStage, where: s.story_id == ^story.id)
+      |> AdminRepo.update_all(set: [head_sha: sha("1"), merge_gate_allowed_sha: sha("1")])
+
+      story
+    end
+
+    test "TC-47.4.8: submitted for a newer revision at ci goes back to reviewing, and the new pair makes it ready again",
+         ctx do
+      story = ready_at_ci(ctx)
+
+      assert {:ok, %{outcome: :applied}} = push(ctx, submitted("C1", 4, story, 2))
+
+      back = row(ctx, story)
+      assert back.stage == :reviewing
+      # The readiness was judged on revision 1's head; nothing of it survives the edge.
+      assert back.head_sha == nil
+      assert back.merge_gate_allowed_sha == nil
+      assert back.attempts == %{"change_ready" => 1, "change_resubmitted" => 1}
+
+      assert effect(ctx, "C1", 4)["stage"] == %{
+               "outcome" => "moved",
+               "to" => "reviewing",
+               "edge" => "change_resubmitted"
+             }
+
+      for e <- [
+            event("C1", 5, "review_approved", %{revision: 2, data: %{"by" => "model"}}),
+            event("C1", 6, "check_passed", %{revision: 2})
+          ] do
+        assert {:ok, %{outcome: :applied}} = push(ctx, e)
+      end
+
+      assert row(ctx, story).stage == :ci
+
+      assert transitions(ctx, story) == [
+               {"implementing", "reviewing", "forward"},
+               {"reviewing", "ci", "change_ready"},
+               {"ci", "reviewing", "change_resubmitted"},
+               {"reviewing", "ci", "change_ready"}
+             ]
+
+      # Not chained: leaving `ci` is not a custody fact.
+      assert chain_actions(ctx.tenant_id) == []
+    end
+
+    test "a submitted at ci that is not a newer revision moves nothing", ctx do
+      story = ready_at_ci(ctx)
+      before = row(ctx, story)
+
+      assert {:ok, %{outcome: :applied}} = push(ctx, submitted("C1", 4, story, 1))
+
+      assert row(ctx, story).lock_version == before.lock_version
+      assert row(ctx, story).stage == :ci
+
+      assert effect(ctx, "C1", 4)["stage"] == %{
+               "outcome" => "ignored",
+               "reason" => "not_a_newer_revision"
+             }
+    end
+
+    test "TC-47.4.9: review_findings on the ready revision at ci goes back to implementing",
+         ctx do
+      story = ready_at_ci(ctx)
+
+      assert {:ok, %{outcome: :applied}} =
+               push(ctx, event("C1", 4, "review_findings", %{data: %{"findings" => 1}}))
+
+      back = row(ctx, story)
+      assert back.stage == :implementing
+      assert back.head_sha == nil
+      assert back.merge_gate_allowed_sha == nil
+
+      assert effect(ctx, "C1", 4)["stage"] == %{
+               "outcome" => "moved",
+               "to" => "implementing",
+               "edge" => "change_review_findings"
+             }
+
+      # The next revision re-enters review over the main line, as any revision does.
+      assert {:ok, _} = push(ctx, submitted("C1", 5, story, 2))
+      assert row(ctx, story).stage == :reviewing
+    end
+
+    test "review_findings for a revision a later submitted superseded moves nothing", ctx do
+      story = story_at(ctx, :implementing)
+      assert {:ok, _} = push(ctx, submitted("C1", 1, story))
+      assert {:ok, _} = push(ctx, submitted("C1", 2, story, 2))
+      before = row(ctx, story)
+
+      assert {:ok, _} =
+               push(ctx, event("C1", 3, "review_findings", %{revision: 1, data: %{}}))
+
+      assert row(ctx, story).stage == :reviewing
+      assert row(ctx, story).lock_version == before.lock_version
+
+      assert effect(ctx, "C1", 3)["stage"] == %{
+               "outcome" => "ignored",
+               "reason" => "superseded_revision"
+             }
+    end
+  end
+
   describe "pr_open is never entered for a story on the change protocol (AC-47.4.2)" do
     test "a bound story is refused pr_open by every writer; an unbound one is not", ctx do
       bound = story_at(ctx, :reviewing)
@@ -486,6 +603,66 @@ defmodule Loopctl.Changes.StageMappingTest do
                "outcome" => "reverted_after_done",
                "issue" => "recorded"
              }
+    end
+  end
+
+  describe "AC-47.4.5: what a revert's data can reach" do
+    test "the history keeps chg's ids and shas only in their shape", ctx do
+      story = story_at(ctx, :done, %{merge_sha: sha("8")})
+      bind!(ctx, story, "C1")
+
+      revert =
+        event("C1", 1, "reverted", %{
+          data: %{
+            "landed_sha" => String.duplicate("z", 100_000),
+            "revert_sha" => sha("9"),
+            # A JSON integer of any size; quoted only in the shape of an id.
+            "revert_change_id" => String.to_integer(String.duplicate("9", 400)),
+            "verification_id" => "V1\n## heading",
+            "unrelated" => "dropped"
+          }
+        })
+
+      assert {:ok, %{outcome: :applied}} = push(ctx, revert)
+
+      [metadata] =
+        AdminRepo.all(
+          from a in AuditLog,
+            where: a.tenant_id == ^ctx.tenant_id and a.entity_id == ^story.id,
+            select: a.metadata
+        )
+
+      assert metadata["data"] == %{
+               "landed_sha" => "(unreadable)",
+               "revert_sha" => sha("9"),
+               "revert_change_id" => "(unreadable)",
+               "verification_id" => "(unreadable)"
+             }
+
+      [issue] = AdminRepo.all(from r in RevertIssue, where: r.tenant_id == ^ctx.tenant_id)
+      assert issue.body =~ "landed as: (unreadable)"
+      refute issue.body =~ String.duplicate("9", 200)
+    end
+
+    for {name, char} <- [{"control bytes", "\x01"}, {"newlines", "\n"}] do
+      test "failing tests of #{name} that render far past the body bound still apply and store",
+           ctx do
+        story = story_at(ctx, :done, %{merge_sha: sha("8")})
+        bind!(ctx, story, "C1")
+
+        # The webhook's own body cap bounds what one event can carry; this is near it, and
+        # renders to several times the column's bound.
+        count = if unquote(char) == "\x01", do: 40, else: 48
+        failures = for _ <- 1..count, do: String.duplicate(unquote(char), 1_000)
+
+        assert {:ok, %{outcome: :applied}} =
+                 push(ctx, event("C1", 1, "reverted", %{data: %{"failures" => failures}}))
+
+        [issue] = AdminRepo.all(from r in RevertIssue, where: r.tenant_id == ^ctx.tenant_id)
+        assert byte_size(issue.body) <= 65_536
+        assert issue.body =~ ~r/\| \(\d+ more not shown\)/
+        assert issue.body =~ RevertIssues.marker(issue.id)
+      end
     end
   end
 

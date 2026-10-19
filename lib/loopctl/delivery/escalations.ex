@@ -163,8 +163,12 @@ defmodule Loopctl.Delivery.Escalations do
   edge it hard-coded; it takes its edge now, so the next control escalation is a value rather
   than a copy.
 
-  The same replay and `:stale_stage` recovery as `escalate/3`, without the claimant check —
-  the principal deciding is not the claimant — and with the actor recorded as control is
+  The same replay as `escalate/3`, without the claimant check — the principal deciding is not
+  the claimant — and with no `:stale_stage` to recover from: it locks the story and its row
+  first (`Stages.lock_for_control_in_tenant_transaction/2`) and decides on the locked row, in
+  the caller's transaction or in one of its own. Either way the transition goes through
+  `Stages.advance_in_tenant_transaction/4`, the only path that takes a change-protocol edge;
+  `Stages.advance/4` refuses them. The actor is recorded as control is
   elsewhere: the caller's label, `actor_role: :agent` (which keeps every human-only edge out of
   reach; there is no system role) and the lineage the caller attests, `[]` for a machine
   caller holding no key.
@@ -177,11 +181,9 @@ defmodule Loopctl.Delivery.Escalations do
     `escalate/3`
   - `:in_tenant_transaction` — `true` to run inside the CALLER'S `Loopctl.Repo.with_tenant/2`
     transaction rather than its own (the change-events seam, whose escalation must commit with
-    the event that decided it). The caller has the story and row locked
-    (`Stages.lock_for_control_in_tenant_transaction/2`), so nothing can move the row under it
-    and there is no `:stale_stage` to recover from; the return is then
-    `{:ok, row, chain_entry}` for the caller to announce after it commits
-    (`Stages.advance_in_tenant_transaction/4`).
+    the event that decided it); the return is then `{:ok, row, chain_entry}` for the caller to
+    announce after it commits. Otherwise it opens its own bounded transaction
+    (`Stages.in_control_transaction/2`), announces the entry itself and returns `{:ok, row}`.
   """
   @spec escalate_as_control(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, StoryStage.t()}
@@ -195,7 +197,16 @@ defmodule Loopctl.Delivery.Escalations do
 
     if Keyword.get(opts, :in_tenant_transaction, false),
       do: escalate_in_tenant_transaction(tenant_id, story_id, opts),
-      else: escalate_row(tenant_id, story_id, opts)
+      else: escalate_in_own_transaction(tenant_id, story_id, opts)
+  end
+
+  defp escalate_in_own_transaction(tenant_id, story_id, opts) do
+    Stages.in_control_transaction(tenant_id, fn ->
+      case escalate_in_tenant_transaction(tenant_id, story_id, opts) do
+        {:ok, row, entry} -> {row, entry}
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
   end
 
   # Inside the caller's transaction, on the row it holds locked: the replay is answered from
@@ -291,8 +302,7 @@ defmodule Loopctl.Delivery.Escalations do
   # cannot re-enter the recovery: with the recovery inside the only attempt function, a story
   # a runner keeps advancing would have recursed without bound.
   defp attempt(tenant_id, story_id, row, opts) do
-    # `:session_escalated` for a claimant; `escalate_as_control/3` names its own control edge.
-    transition = {row.stage, :escalated, Keyword.get(opts, :edge, :session_escalated)}
+    transition = {row.stage, :escalated, :session_escalated}
     Stages.advance(tenant_id, story_id, transition, advance_opts(opts))
   end
 
@@ -426,7 +436,7 @@ defmodule Loopctl.Delivery.Escalations do
     # route's `role: :user` plug, so a SESSION could POST `to: queued` on any escalated story:
     # the claim was released, the epoch bumped, the implementer's live credential and its
     # whole subtree revoked, the story re-contracted — and only THEN did `Stages.human?/1`
-    # (`lib/loopctl/delivery/stages.ex:1669-1672`, which requires `actor_lineage == []`)
+    # (`lib/loopctl/delivery/stages.ex:1695-1698`, which requires `actor_lineage == []`)
     # refuse it. The caller got a refusal; the implementing agent got a dead key.
     # `LoopctlWeb.StoryEscalationController` publishes that gate's purpose to callers in its
     # `escalate` operation description — "so a session cannot escalate and then resolve its

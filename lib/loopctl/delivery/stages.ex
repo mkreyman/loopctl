@@ -165,6 +165,13 @@ defmodule Loopctl.Delivery.Stages do
   @release_only_edges [:runner_lost, :claim_released] ++
                         StageMachine.release_escalation_edges()
 
+  # Edges only a chg change event takes (US-47.4), inside the event's own transaction
+  # (`advance_in_tenant_transaction/4`, the change-event seam, which
+  # `Escalations.escalate_as_control/3` also runs through). `advance/4` and `precheck/2` refuse
+  # them from every caller, as they refuse the release edges: a runner, a session or a gate
+  # asserting "chg said so" is asserting an event it never received.
+  @change_event_edges StageMachine.change_protocol_edges()
+
   # WHY a claim was released, which decides where the story goes next (US-44.4, #877). Every
   # caller of `follow_release/5` names one; see its doc for the table.
   @release_causes [:attempt, :usage_exhausted, :placement_refused, :operator]
@@ -426,7 +433,7 @@ defmodule Loopctl.Delivery.Stages do
   def advance(tenant_id, story_id, {from, to, edge}, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
-    with {:ok, effects} <- precheck_effects({from, to, edge}, opts) do
+    with {:ok, effects} <- precheck_effects({from, to, edge}, opts, :ordinary) do
       # ESCAPED ONLY AFTER EVERY REFUSAL THE CALLER CAN PREDICT. See `sanitise_reason/1`:
       # the caller is bounded on the text it sent, the column holds the escaped form, and the
       # two numbers are deliberately different.
@@ -442,8 +449,10 @@ defmodule Loopctl.Delivery.Stages do
   transaction — the chg change-events seam (US-47.4, `Loopctl.Changes.EventEffects`), where an
   event applies with its stage effect and its audit entry or not at all.
 
-  The same refusals as `advance/4`, from the same code, with two differences a caller has to
-  design for:
+  The same refusals as `advance/4`, from the same code, with one exception and two
+  differences a caller has to design for. The exception: this is the ONLY path that takes the
+  change-protocol edges (`StageMachine.change_protocol_edges/0`), which `advance/4` refuses
+  from every caller. The differences:
 
   - **A refusal decided BEFORE the database** (`precheck/2`'s) is returned as
     `{:error, reason}` and writes nothing. **One decided IN the transaction** —
@@ -477,13 +486,27 @@ defmodule Loopctl.Delivery.Stages do
     epoch = Keyword.fetch!(opts, :claim_epoch)
     opts = Keyword.delete(opts, :session_dispatch)
 
-    with {:ok, effects} <- precheck_effects({from, to, edge}, opts) do
+    with {:ok, effects} <- precheck_effects({from, to, edge}, opts, :change_event) do
       {row, entry} =
         transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
 
       {:ok, row, entry}
     end
   end
+
+  @doc """
+  Runs `fun` in the bounded tenant transaction `advance/4` runs in (its `lock_timeout` and
+  `statement_timeout`, lock contention answered `{:error, :busy}`), for a control writer that
+  has no transaction of its own but must go through `advance_in_tenant_transaction/4` —
+  `Escalations.escalate_as_control/3` called on its own.
+
+  `fun` returns `{row, chain_entry_or_nil}` or calls `Loopctl.Repo.rollback/1`; the entry is
+  announced after the commit, never before. Returns `{:ok, row}` or `{:error, reason}`.
+  """
+  @spec in_control_transaction(Ecto.UUID.t(), (-> {StoryStage.t(), Entry.t() | nil})) ::
+          {:ok, StoryStage.t()} | {:error, term()}
+  def in_control_transaction(tenant_id, fun) when is_function(fun, 0),
+    do: in_tenant(tenant_id, fun)
 
   @doc """
   Locks a story and its stage row for a CONTROL writer inside the caller's
@@ -638,15 +661,15 @@ defmodule Loopctl.Delivery.Stages do
   def precheck({from, to}, opts), do: precheck({from, to, :forward}, opts)
 
   def precheck({_from, _to, _edge} = transition, opts) do
-    with {:ok, _effects} <- precheck_effects(transition, opts), do: :ok
+    with {:ok, _effects} <- precheck_effects(transition, opts, :ordinary), do: :ok
   end
 
   # THE ONE DEFINITION of "what this caller may be refused before the database". Order is
   # load-bearing and unchanged: the transition has to exist, its attribution has to be
   # declared, the principal has to be allowed, and only then is its PAYLOAD examined — so a
   # caller the gate refuses learns that rather than learning its reason was too long.
-  defp precheck_effects({from, to, edge}, opts) do
-    with :ok <- allowed_for_caller(from, to, edge),
+  defp precheck_effects({from, to, edge}, opts, path) do
+    with :ok <- allowed_for_caller(from, to, edge, path),
          :ok <- lineage_declared(from, to, edge, opts),
          :ok <- human_gate(edge, opts),
          :ok <- reason_given(to, edge, Keyword.get(opts, :reason)),
@@ -1638,10 +1661,13 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
-  defp allowed_for_caller(_from, _to, edge) when edge in @release_only_edges,
+  defp allowed_for_caller(_from, _to, edge, _path) when edge in @release_only_edges,
     do: {:error, :invalid_transition}
 
-  defp allowed_for_caller(from, to, edge) do
+  defp allowed_for_caller(_from, _to, edge, :ordinary) when edge in @change_event_edges,
+    do: {:error, :invalid_transition}
+
+  defp allowed_for_caller(from, to, edge, _path) do
     if StageMachine.allowed?(from, to, edge), do: :ok, else: {:error, :invalid_transition}
   end
 

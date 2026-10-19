@@ -171,10 +171,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @max_issue_body_bytes 65_536
   @max_issue_title_chars 256
 
-  # How many of the repository's newest issues `find_issue/2` reads for its marker. The issue
-  # it looks for was opened by an earlier attempt of the same outbox row, at most a few backoff
-  # windows ago, so it is among the newest; a page is one request.
-  @find_issue_page 50
+  # `find_issue/2` reads the issues THIS CREDENTIAL opened since the outbox row was written,
+  # page by page, until a short page says it has seen them all. The cap bounds one attempt's
+  # forge calls; reaching it without that short page is "cannot confirm", never "none" —
+  # "none" is what makes the caller create, and a create past an unread page is a duplicate.
+  @find_issue_page 100
+  @find_issue_max_pages 5
+  # GitHub filters `since` on `updated_at`, which is never before `created_at`; the margin
+  # absorbs clock skew between loopctl and GitHub.
+  @find_issue_since_margin_seconds 600
+  # A GitHub login, a bot's included (`name[bot]`), before it goes into a query string.
+  @login ~r/\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?\z/
 
   # Statuses read per deployment. More than one because `state` (the latest) and
   # `succeeded?` (did `success` EVER appear) are different questions, and it is the second
@@ -559,15 +566,60 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   @impl true
-  def find_issue(repo, marker) when is_binary(marker) and marker != "" do
+  def find_issue(repo, %{marker: marker, title_token: token, since: %DateTime{} = since})
+      when is_binary(marker) and marker != "" and is_binary(token) and token != "" do
     with {:ok, repo} <- repo_name(repo),
-         {:ok, issues} <-
-           get(repo, "/issues?state=all&sort=created&direction=desc&per_page=#{@find_issue_page}") do
-      marked_issue(issues, marker)
+         {:ok, login} <- own_login(repo) do
+      query = %{
+        "creator" => login,
+        "state" => "all",
+        "sort" => "created",
+        "direction" => "asc",
+        "since" =>
+          since
+          |> DateTime.add(-@find_issue_since_margin_seconds, :second)
+          |> DateTime.truncate(:second)
+          |> DateTime.to_iso8601(),
+        "per_page" => @find_issue_page
+      }
+
+      find_issue_page(repo, query, {marker, token}, 1)
     end
   end
 
-  def find_issue(_repo, marker), do: {:error, {:invalid_marker, shape(marker)}}
+  def find_issue(_repo, search), do: {:error, {:invalid_issue_search, shape(search)}}
+
+  # Who the credential is, so the search reads only what it can have opened.
+  defp own_login(repo) do
+    case fetch(repo, @api_base <> "/user", nil) do
+      {:ok, %{"login" => login}} when is_binary(login) ->
+        if Regex.match?(@login, login),
+          do: {:ok, login},
+          else: {:error, {:unreadable_login, :shape}}
+
+      {:ok, body} ->
+        {:error, {:unreadable_login, shape(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp find_issue_page(_repo, _query, _wanted, page) when page > @find_issue_max_pages,
+    do: {:error, {:issue_search_inconclusive, @find_issue_max_pages}}
+
+  defp find_issue_page(repo, query, wanted, page) do
+    path = "/issues?" <> URI.encode_query(Map.put(query, "page", page))
+
+    with {:ok, issues} <- get(repo, path),
+         {:ok, found} <- marked_issue(issues, wanted) do
+      cond do
+        found != nil -> {:ok, found}
+        length(issues) < @find_issue_page -> {:ok, nil}
+        true -> find_issue_page(repo, query, wanted, page + 1)
+      end
+    end
+  end
 
   # The NUMBER of what GitHub created, and nothing else of the payload.
   defp created_number(%{"number" => number}) when is_integer(number) and number > 0,
@@ -575,16 +627,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp created_number(body), do: {:error, {:unreadable_issue, shape(body)}}
 
-  # The newest issue whose body carries the marker. Pull requests share the endpoint and are
-  # skipped: a marker the outbox wrote is only ever in an issue it opened. A list this module
-  # cannot read is an error, never "none", because "none" is what makes the caller create.
-  defp marked_issue(issues, marker) when is_list(issues) do
+  # The first issue on the page whose body carries the marker or whose title carries the token
+  # (so an issue somebody edited still matches). Pull requests share the endpoint and are
+  # skipped: the outbox only ever opens issues. A list this module cannot read is an error,
+  # never "none", because "none" is what makes the caller create.
+  defp marked_issue(issues, {marker, token}) when is_list(issues) do
     found =
       Enum.find_value(issues, fn
-        %{"number" => number, "body" => body} = issue
-        when is_integer(number) and is_binary(body) ->
-          if not Map.has_key?(issue, "pull_request") and String.contains?(body, marker),
-            do: number
+        %{"number" => number} = issue when is_integer(number) ->
+          if not Map.has_key?(issue, "pull_request") and
+               (contains?(issue["body"], marker) or contains?(issue["title"], token)),
+             do: number
 
         _other ->
           nil
@@ -593,7 +646,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     {:ok, found}
   end
 
-  defp marked_issue(body, _marker), do: {:error, {:unreadable_issues, shape(body)}}
+  defp marked_issue(body, _wanted), do: {:error, {:unreadable_issues, shape(body)}}
+
+  defp contains?(text, part) when is_binary(text), do: String.contains?(text, part)
+  defp contains?(_text, _part), do: false
 
   defp issue_title(title) when is_binary(title) do
     if String.valid?(title) and String.trim(title) != "" and not Regex.match?(@control, title) and
@@ -946,9 +1002,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp tree(body, _ref), do: {:error, {:unreadable_tree, shape(body)}}
 
-  defp get(repo, path, headers \\ nil) do
-    url = url(repo, path)
+  defp get(repo, path, headers \\ nil), do: fetch(repo, url(repo, path), headers)
 
+  defp fetch(repo, url, headers) do
     opts =
       if headers, do: Keyword.put(req_options(repo), :headers, headers), else: req_options(repo)
 

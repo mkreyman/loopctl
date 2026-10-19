@@ -79,7 +79,7 @@ defmodule Loopctl.Changes.RevertIssuesTest do
       row = only_row(ctx)
       assert row.status == :pending
       assert row.repo_full_name == ctx.source.repo_full_name
-      assert row.title == "chg reverted a delivered change (01JCHANGE)"
+      assert row.title == "chg reverted a delivered change (01JCHANGE) [loopctl #{row.id}]"
       assert row.body =~ "landed as: #{String.duplicate("a", 40)}"
       assert row.body =~ "chg change 01JREVERT"
       assert row.body =~ "| test/a_test.exs:3"
@@ -121,6 +121,50 @@ defmodule Loopctl.Changes.RevertIssuesTest do
 
       assert byte_size(body) <= 65_536
       assert body =~ ~r/\((\d+) more not shown\)/
+    end
+
+    for {name, char, rendered} <- [
+          {"control bytes", "\x01", "<U+0001>"},
+          {"newlines", "\n", "\n| "}
+        ] do
+      test "48 failing tests of 1,000 #{name} are bounded AFTER the render", ctx do
+        failures = for _ <- 1..48, do: String.duplicate(unquote(char), 1_000)
+
+        # Measured before the render these fit the old 48,000-byte budget; rendered they are
+        # several times the column's CHECK, which then raised inside the event's transaction.
+        assert {:ok, :recorded} = record!(ctx, %{data: %{"failures" => failures}})
+        row = only_row(ctx)
+
+        assert byte_size(row.body) <= 65_536
+        assert row.body =~ unquote(rendered)
+        assert [_, cut] = Regex.run(~r/\| \((\d+) more not shown\)/, row.body)
+        assert String.to_integer(cut) in 1..47
+        # Cut on a line boundary, and the fence and the marker survive the cut.
+        assert String.valid?(row.body)
+        assert row.body =~ ~r/⟦END UNTRUSTED DATA field=chg_failing_tests nonce=[0-9a-f]+⟧/
+        assert row.body =~ RevertIssues.marker(row.id)
+      end
+    end
+
+    test "every id from the event is bounded, an integer of any size included", ctx do
+      huge = String.to_integer(String.duplicate("7", 5_000))
+
+      data = %{
+        "landed_sha" => String.duplicate("a", 100_000),
+        "revert_sha" => huge,
+        "revert_change_id" => huge,
+        "verification_id" => String.duplicate("v", 10_000)
+      }
+
+      assert {:ok, :recorded} = record!(ctx, %{data: data})
+      row = only_row(ctx)
+
+      assert row.body =~ "chg change (unreadable)"
+      assert row.body =~ "verification: (unreadable)"
+      assert byte_size(row.body) < 4_000
+      assert String.length(row.title) <= 256
+      assert RevertIssues.safe_id(42) == "42"
+      assert RevertIssues.safe_id(huge) == "(unreadable)"
     end
 
     test "a revoked source owes no issue", ctx do
@@ -175,9 +219,13 @@ defmodule Loopctl.Changes.RevertIssuesTest do
 
       assert {:deferred, nil} = RevertIssueOpener.open(row)
 
-      marker = RevertIssues.marker(row.id)
+      search = %{
+        marker: RevertIssues.marker(row.id),
+        title_token: RevertIssues.title_token(row.id),
+        since: row.inserted_at
+      }
 
-      expect(Loopctl.MockPullRequestSource, :find_issue, fn _repo, ^marker -> {:ok, 77} end)
+      expect(Loopctl.MockPullRequestSource, :find_issue, fn _repo, ^search -> {:ok, 77} end)
       expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
 
       assert {:opened, nil} = row |> make_due() |> RevertIssueOpener.open()
@@ -204,6 +252,26 @@ defmodule Loopctl.Changes.RevertIssuesTest do
       expect(Loopctl.MockPullRequestSource, :find_issue, fn _r, _m -> {:ok, nil} end)
       expect(Loopctl.MockPullRequestSource, :create_issue, fn _r, _t, _b -> {:ok, 5} end)
       assert {:opened, nil} = row |> make_due() |> RevertIssueOpener.open()
+    end
+
+    test "a search that cannot confirm the issue is absent defers and never creates", ctx do
+      record!(ctx)
+      row = only_row(ctx)
+
+      expect(Loopctl.MockPullRequestSource, :create_issue, fn _r, _t, _b ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      assert {:deferred, nil} = RevertIssueOpener.open(row)
+
+      expect(Loopctl.MockPullRequestSource, :find_issue, fn _r, _search ->
+        {:error, {:issue_search_inconclusive, 5}}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
+
+      assert {:deferred, nil} = row |> make_due() |> RevertIssueOpener.open()
+      assert %RevertIssue{status: :pending, attempts: 2} = only_row(ctx)
     end
 
     test "a permanent forge refusal abandons on its first occurrence", ctx do

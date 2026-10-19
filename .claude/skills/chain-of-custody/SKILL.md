@@ -355,8 +355,10 @@ act; a `submitted` event's binding is always `submitter_not_claimant` and never 
 The same holds for the stage moves an event makes (US-47.4, `Loopctl.Changes.EventEffects`):
 each is a CONTROL write inside the event's transaction, attributed `actor_role: :agent` with an
 attested-empty lineage, so no human-only edge (`:human_resolution`) is reachable from a change
-event. The four change-protocol edges (`StageMachine.change_protocol_edges/0`) are held out of
-`runner_reportable_edges/0`; `:reverted` is a chained retraction like `:merge_refused`; and a
+event. The change-protocol edges (`StageMachine.change_protocol_edges/0`) are held out of
+`runner_reportable_edges/0` and refused by `Stages.advance/4` to every caller — only the
+change-event path, `Stages.advance_in_tenant_transaction/4`, takes them; `:reverted` is a
+chained retraction like `:merge_refused`; and a
 story an operator escalated is never re-escalated or moved by an event — `escalated` still
 leaves only over `:human_resolution`.
 

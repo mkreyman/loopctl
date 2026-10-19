@@ -105,7 +105,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
   a second call is a second issue — so the caller writes a MARKER into the body and, on any
   attempt after its first, asks `find_issue/2` whether an earlier attempt already opened it
   before creating again: a crash between the create and the record of it costs a read, never a
-  duplicate issue.
+  duplicate issue. The search reads only the credential's own issues since the row was
+  written, ALL of them up to a page bound, and an exhausted bound is an error rather than
+  "none" — so a burst of other issues cannot push the earlier one out of sight.
   """
 
   alias Loopctl.Delivery.ForgeRepo
@@ -308,12 +310,24 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback create_issue(repo(), String.t(), String.t()) ::
               {:ok, pos_integer()} | {:error, term()}
 
-  @doc """
-  The number of the NEWEST issue among the repository's most recent ones whose body contains
-  `marker`, or `nil` when none does. `{:error, reason}` when the forge could not say — never
-  read as "none", because the caller would then create a duplicate.
+  @typedoc """
+  What `find_issue/2` looks for: an issue whose body contains `marker` or whose title contains
+  `title_token`, opened no earlier than `since`.
   """
-  @callback find_issue(repo(), String.t()) :: {:ok, pos_integer() | nil} | {:error, term()}
+  @type issue_search :: %{
+          marker: String.t(),
+          title_token: String.t(),
+          since: DateTime.t()
+        }
+
+  @doc """
+  The number of an issue the CREDENTIAL ITSELF opened since `search.since` whose body contains
+  the marker or whose title contains the token, or `nil` once every such issue has been read
+  and none does. `{:error, reason}` when the forge could not say — a failed read, and also a
+  search that reached its page bound without reading them all — never read as "none", because
+  the caller would then create a duplicate.
+  """
+  @callback find_issue(repo(), issue_search()) :: {:ok, pos_integer() | nil} | {:error, term()}
 
   # -- the checked entry points (#936) -------------------------------------------------------
   #

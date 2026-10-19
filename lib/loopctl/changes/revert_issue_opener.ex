@@ -10,10 +10,14 @@ defmodule Loopctl.Changes.RevertIssueOpener do
      due that pushes the next attempt forward, so of two drainers exactly one proceeds.
   1. **Checks the source is still connected.** A revoked source abandons `source_revoked`.
   2. **On any attempt after the first, asks the forge for the marker**
-     (`PullRequestSource.find_issue/2`). Creating is not idempotent: an earlier attempt that
-     created the issue and died before recording it left an issue carrying this row's marker,
-     and finding it records that issue instead of opening a second. The first attempt skips
-     the read, because nothing can have opened it yet.
+     (`PullRequestSource.find_issue/2`, with `RevertIssues.issue_search/1`). Creating is not
+     idempotent: an earlier attempt that created the issue and died before recording it left
+     an issue carrying this row's marker in its body and its token in its title, and finding
+     it records that issue instead of opening a second. The search reads every issue the
+     credential opened since the row was written; one that reaches its page bound without
+     finishing cannot confirm the issue is absent, so it DEFERS like a transient fault and
+     creates nothing. The first attempt skips the read, because nothing can have opened it
+     yet.
   3. **Creates the issue** and records its number.
 
   ## Transient versus permanent
@@ -70,7 +74,7 @@ defmodule Loopctl.Changes.RevertIssueOpener do
   defp find_or_create(%RevertIssue{attempts: 1} = row, repo), do: create(row, repo)
 
   defp find_or_create(%RevertIssue{} = row, repo) do
-    case PullRequestSource.find_issue(repo, RevertIssues.marker(row.id)) do
+    case PullRequestSource.find_issue(repo, RevertIssues.issue_search(row)) do
       {:ok, nil} -> create(row, repo)
       {:ok, number} -> record_opened(row, number, :found_from_earlier_attempt)
       {:error, reason} -> fault(row, reason)
@@ -107,6 +111,11 @@ defmodule Loopctl.Changes.RevertIssueOpener do
     cond do
       MergePrecondition.transient?(reason) ->
         defer(row, reason, retry_after)
+
+      # More of the credential's issues than one attempt reads: absence is unconfirmed, so
+      # wait and read again rather than create. Bounded like any transient fault.
+      match?({:issue_search_inconclusive, _pages}, reason) ->
+        defer(row, reason, nil)
 
       Credential.configuration?(reason) ->
         {outcome, _wait} = defer(row, reason, Credential.configuration_retry_seconds())
