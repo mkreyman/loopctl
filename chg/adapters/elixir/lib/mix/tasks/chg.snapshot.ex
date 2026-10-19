@@ -25,6 +25,13 @@ defmodule Mix.Tasks.Chg.Snapshot do
   def run(_args) do
     started = System.monotonic_time()
 
+    unless honours_check_cwd?(System.version()) do
+      Mix.raise(
+        "Elixir #{System.version()} ignores `check_cwd: false` (it exists since 1.19.2), so a " <>
+          "workspace cloned from this snapshot would recompile every module"
+      )
+    end
+
     for env <- [:dev, :test], not check_cwd_off?(project_config(Mix.Project.get!(), env)) do
       Mix.raise(
         "add `elixirc_options: [check_cwd: false]` to project/0 in mix.exs (MIX_ENV=#{env} " <>
@@ -116,4 +123,7 @@ defmodule Mix.Tasks.Chg.Snapshot do
       status -> Mix.raise("#{cmd} #{Enum.join(args, " ")} exited #{status}")
     end
   end
+
+  @doc "Whether Elixir `version` honours `elixirc_options: [check_cwd: false]`."
+  def honours_check_cwd?(version), do: Version.match?(version, ">= 1.19.2")
 end

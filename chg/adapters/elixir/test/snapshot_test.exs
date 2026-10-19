@@ -1,10 +1,18 @@
 defmodule ChgAdapter.SnapshotTest do
   use ExUnit.Case, async: false
 
-  import Mix.Tasks.Chg.Snapshot, only: [check_cwd_off?: 1, project_config: 2]
+  import Mix.Tasks.Chg.Snapshot,
+    only: [check_cwd_off?: 1, honours_check_cwd?: 1, project_config: 2]
 
   defmodule PerEnvProject do
     def project, do: [elixirc_options: if(Mix.env() == :dev, do: [check_cwd: false], else: [])]
+  end
+
+  test "an Elixir older than 1.19.2 is refused: it ignores check_cwd" do
+    refute honours_check_cwd?("1.19.1")
+    assert honours_check_cwd?("1.19.2")
+    assert honours_check_cwd?("1.20.4")
+    assert honours_check_cwd?(System.version())
   end
 
   test "the cwd check is off through elixirc_options or a compile alias" do

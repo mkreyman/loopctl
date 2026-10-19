@@ -53,7 +53,7 @@ defmodule Mix.Tasks.Chg.Static do
   end
 
   @doc """
-  Which of `files` mix format reported. Elixir 1.20 prints each as an absolute path in
+  Which of `files` mix format reported. Elixir 1.19 and 1.20 print each as an absolute path in
   ANSI colour above its diff, so a line is matched by its suffix once colour is stripped.
   """
   def unformatted(out, files) do

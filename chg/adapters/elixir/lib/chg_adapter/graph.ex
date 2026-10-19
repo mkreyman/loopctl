@@ -64,7 +64,7 @@ defmodule ChgAdapter.Graph do
     %__MODULE__{source_modules: source_modules, external: external, dependents: dependents}
   end
 
-  # Elixir 1.20 records an external resource as `{path, mtime, digest}`.
+  # Elixir 1.19 and 1.20 record an external resource as `{path, {mtime, size}, digest}`.
   defp external_path(t) when is_tuple(t), do: elem(t, 0)
   defp external_path(path), do: path
 

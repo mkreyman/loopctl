@@ -5,6 +5,10 @@ The `mix chg.*` tasks behind a Mix project's `.chg/adapter.toml` (contract v1,
 product repo needs no dependency and no `mix.lock` line:
 
     scripts/install-elixir-adapter.sh      # once per machine and Elixir version
+    ASDF_ELIXIR_VERSION=1.19.5-otp-28 scripts/install-elixir-adapter.sh   # another version
+
+It needs Elixir 1.19.5 or later (`check_cwd: false` exists since 1.19.2), and CI runs its tests
+on 1.19.5 and on the version in [.tool-versions](.tool-versions).
 
 A product then adds:
 

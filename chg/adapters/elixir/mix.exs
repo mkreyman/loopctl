@@ -8,7 +8,7 @@ defmodule ChgAdapter.MixProject do
     [
       app: :chg_adapter,
       version: "1.0.0",
-      elixir: "~> 1.20",
+      elixir: "~> 1.19 and >= 1.19.5",
       start_permanent: false,
       deps: [],
       elixirc_paths: ["lib"],

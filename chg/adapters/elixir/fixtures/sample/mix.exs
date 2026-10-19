@@ -5,7 +5,7 @@ defmodule Sample.MixProject do
     [
       app: :sample,
       version: "0.1.0",
-      elixir: "~> 1.20",
+      elixir: "~> 1.19 and >= 1.19.5",
       elixirc_paths: elixirc_paths(Mix.env()),
       elixirc_options: [check_cwd: false],
       deps: []
