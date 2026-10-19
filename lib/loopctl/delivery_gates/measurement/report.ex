@@ -59,10 +59,11 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   @gate_a_biases [
     "Trio DISAGREEMENT, the design's primary signal, is unobservable in a replay: every ticket is presented as three identical outputs. The measured rate is a strict LOWER BOUND.",
     "The contradicts field is empty by construction, not by measurement. Lower bound again.",
-    "workflow_change_not_defect_fix stands in as the intake chat's [Feature] prefix for an INTAKE ticket and as an enhancement/idea label with no bug label for everything else. The two strata are NOT two corpora: `all` is the whole corpus and therefore MIXES both classifiers, because it contains the intake tickets too. Only the label half carries hindsight (a label is often applied after the outcome was known); the prefix is stamped at filing time.",
+    "workflow_change_not_defect_fix stands in as the intake chat's [Feature] prefix for an INTAKE ticket and as an enhancement/idea label with no bug label for everything else. `intake` and `all` are NOT two corpora: `all` is the whole corpus and therefore MIXES both classifiers, because it contains the intake tickets too. Only the label half carries hindsight (a label is often applied after the outcome was known); the prefix is stamped at filing time.",
     "inverts_or_removes_deliberate_behaviour stands in as an inversion phrase in the title or body, so an inversion described in other words is missed. Conservative.",
     "confidence is sent as 0.0. Gate A requires the field and never reads it; the column is a placeholder, not a measurement.",
-    "Read `intake_is_feature_share` before comparing the intake rate with the design's 54%. Where every intake escalation is a [Feature] ticket firing on workflow_change alone, the rate is ARITHMETICALLY the [Feature] share of the corpus — the harness is measuring the corpus split, not Gate A's judgement, and the comparison is weaker than the bare number reads."
+    "Read `intake_is_feature_share` before comparing the intake rate with the design's 54%. Where every intake escalation is a [Feature] ticket firing on workflow_change alone, the rate is ARITHMETICALLY the [Feature] share of the corpus — the harness is measuring the corpus split, not Gate A's judgement, and the comparison is weaker than the bare number reads.",
+    "`chg_loop` and `human` PARTITION `all` on the `chg-loop` label chg stamps at filing time: `human` is every ticket WITHOUT that label, so it holds the intake tickets AND the engineering issues, and is not the `intake` stratum. The label only STRATIFIES: a `chg_loop` ticket is replayed exactly like any other, by the intake prefix if its title carries one and by label otherwise. An empty `chg_loop` stratum means chg filed nothing in the window, not that its tickets never escalate."
   ]
 
   @doc """
@@ -140,10 +141,9 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
         note:
           "Design section 5: collapsing Gate A and Gate B into one escalation produced a 54% escalation rate on 80 first-parent commits, and a rate resembling it is a design failure rather than a tuning question."
       },
-      strata: %{
-        intake: gate_a_stratum(intake),
-        all: gate_a_stratum(replays)
-      },
+      # `chg_loop` and `human` sit BESIDE `intake` and `all`, never in place of them: the
+      # committed artifacts and every comparison quoted against them read those two (US-47.11).
+      strata: gate_a_strata(replays),
       intake_is_feature_share: feature_share(intake),
       sensitivity: sensitivity(Keyword.get(opts, :sensitivity)),
       escalations:
@@ -225,6 +225,8 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
        "",
        gate_a_line("intake tickets", report.strata.intake),
        gate_a_line("all tickets", report.strata.all),
+       gate_a_line("chg-loop tickets", report.strata.chg_loop),
+       gate_a_line("human tickets", report.strata.human),
        ""
      ] ++
        sensitivity_lines(report.sensitivity) ++
@@ -257,7 +259,9 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     [
       "sensitivity — with #{sensitivity.suppressed} suppressed:",
       "  " <> gate_a_line("intake tickets", sensitivity.intake),
-      "  " <> gate_a_line("all tickets", sensitivity.all)
+      "  " <> gate_a_line("all tickets", sensitivity.all),
+      "  " <> gate_a_line("chg-loop tickets", sensitivity.chg_loop),
+      "  " <> gate_a_line("human tickets", sensitivity.human)
     ]
   end
 
@@ -362,13 +366,36 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   end
 
   defp sensitivity(replays) when is_list(replays) do
-    %{
+    Map.merge(gate_a_strata(replays), %{
       suppressed: "workflow_change_not_defect_fix",
       run: true,
       note:
-        "the same corpus with every feature request read as NOT a workflow change. The true rate is between this and the headline, and which end it sits at is a definition question for the design, not a tuning question.",
+        "the same corpus with every feature request read as NOT a workflow change. The true rate is between this and the headline, and which end it sits at is a definition question for the design, not a tuning question."
+    })
+  end
+
+  @doc """
+  The four Gate A strata of one set of replays.
+
+  `intake` and `all` are the original two. `chg_loop` and `human` (US-47.11) PARTITION `all` on
+  the ticket's `chg-loop` label, so `chg_loop.total + human.total == all.total` and the same
+  holds for `escalated` and `not_story`. They measure machine-filed tickets apart from
+  everything else; the gate is unchanged and reads no label.
+  """
+  @spec gate_a_strata([GateAReplay.t()]) :: %{
+          intake: map(),
+          all: map(),
+          chg_loop: map(),
+          human: map()
+        }
+  def gate_a_strata(replays) when is_list(replays) do
+    {chg_loop, human} = Enum.split_with(replays, & &1.ticket.chg_loop?)
+
+    %{
       intake: gate_a_stratum(Enum.filter(replays, & &1.ticket.intake?)),
-      all: gate_a_stratum(replays)
+      all: gate_a_stratum(replays),
+      chg_loop: gate_a_stratum(chg_loop),
+      human: gate_a_stratum(human)
     }
   end
 
@@ -551,6 +578,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
       issue: replay.ticket.number,
       created_at: replay.ticket.created_at,
       intake: replay.ticket.intake?,
+      chg_loop: replay.ticket.chg_loop?,
       reasons: replay.result.reasons |> Enum.map(&elem(&1, 0)) |> Enum.uniq(),
       signals: replay.signals
     }

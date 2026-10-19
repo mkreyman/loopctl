@@ -122,6 +122,18 @@ Before a merge, an orchestrator or operator calls `merge_precondition` (`POST /a
 | `head_moved` | The pull request's head changed since CI ran. The story goes back to `implementing` over `base_moved`, and the recorded head is cleared, so the gate is not called again until the story is back at `ci`. |
 | `unevaluated` | 503 with `Retry-After`. After repeated `unevaluated` answers the story escalates. |
 
+### Gate B on the repositories that gate the loop
+
+Gate B reads one trigger list per repository from `DELIVERY_GATES_CONFIG` (`Loopctl.DeliveryGates.Triggers`, loaded by `Loopctl.DeliveryGates.Config`). A repository with no entry there escalates EVERY change, at triage and at the merge gate, with `{:unknown_repo, repo}` (`Loopctl.DeliveryGates.GateB`, `repo_triggers/2`); `test/loopctl/delivery_gates/gate_b_test.exs` pins it.
+
+`mkreyman/claude-config` and `mkreyman/chg` have no entry today. Every change to them therefore goes to a human, which is what issue #986 asks for: the loop must not be able to change, unreviewed, the code that lands, reverts or gates its own work, or the hooks that stop a session from doing what it must not.
+
+**The rule: when either repository gets an entry, its `human_paths` MUST name that repository's self-modification code**, which the loop must never change unreviewed:
+- for chg, its gate, the code that advances `verified/master`, culprit and revert, its adapters, and its CI;
+- for claude-config, the deny lists and hook wiring, the hooks that block or grant, the plugins that gate commits, merges and secrets, the commit gate and its CI.
+
+The exact glob lists live in the operator's knowledge base (article `4a86157b`), not here: both repositories are private, and a list of their safety code does not belong in a public document. That article is a floor. Add to it, never remove from it, and re-check each glob against the repository before pasting it, because a pattern that matches no file is a stale trigger and escalates every change.
+
 ## 7. After the merge
 
 - **`deployed` to `verified`, or to `escalated`:** `PostDeployVerification` compares the merge commit with the repository's deployment records.

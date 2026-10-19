@@ -18,7 +18,7 @@ SHIPPED gate code over history and count.
 |---|---|
 | `gate_b_<date>.json` | the machine-readable Gate B result: outcome counts, three strata with their rates, the false-negative rows |
 | `gate_b_<date>.md` | the same run's human summary, including every bias |
-| `gate_a_<date>.json` | the Gate A result: two strata, the sensitivity run, the escalated issue numbers |
+| `gate_a_<date>.json` | the Gate A result: four strata, the sensitivity run over the same four, the escalated issue numbers |
 | `gate_a_<date>.md` | that run's human summary |
 
 Add a new dated pair per run rather than overwriting: the point of these is a TRACK RECORD, and
@@ -168,13 +168,20 @@ Every Gate B artifact carries `scope_note` saying so.
 
 ## Reading a Gate A result
 
-Two strata plus a sensitivity run:
+Four strata plus a sensitivity run over the same four:
 
 - **intake** — the tickets Gate A is actually for: the ones the in-app chat filed with a
   `[Bug] <agency>: ` / `[Feature] <agency>: ` prefix. The headline, because that split was
   decided at FILING time and carries no hindsight.
 - **all** — every issue in the repository, classified by label. Wider, and biased by labels
   applied after the outcome was known.
+- **chg_loop** — the tickets carrying the `chg-loop` label, which chg stamps on every issue it
+  files: machine-written, with a failure fingerprint, occurrences, a root cause or "unknown,
+  investigate", and acceptance criteria written as checks (US-47.11, issue #986). Measured apart
+  because such a ticket is expected to escalate far less than one a person wrote. It is replayed
+  exactly like any other ticket; the label only decides which stratum counts it.
+- **human** — every ticket WITHOUT the `chg-loop` label. `chg_loop` and `human` partition `all`,
+  so their totals add up to it. `human` is not `intake`: it holds the engineering issues too.
 - **sensitivity** — the same corpus with `workflow_change_not_defect_fix` suppressed. Gate A's
   rate turns almost entirely on whether a feature request counts as a workflow change, so the
   result is a RANGE and the report says so rather than picking one end.
@@ -185,6 +192,12 @@ prefix, the escalation count IS the count of feature requests — so the rate is
 the `[Feature]` share of the corpus, and the harness has measured the intake chat's bug/feature
 mix rather than any judgement Gate A made. The field is computed, not asserted, so a later run
 where the inversion trigger also fires reports `false` and the comparison regains its force.
+
+`chg_loop` and `human` were added in US-47.11 BESIDE `intake` and `all`, which kept their
+definitions, so an artifact from before then still compares with one from after on those two.
+An artifact from before then has no `chg_loop`/`human` keys at all; that is the absence of the
+split, not an empty `chg_loop` stratum. An EMPTY `chg_loop` stratum (rate `null`) means chg filed
+nothing in the window.
 
 The `all` stratum is the whole corpus and therefore MIXES the two classifiers: it contains the
 intake tickets, which keep the filing-time prefix reading, plus everything else, classified by

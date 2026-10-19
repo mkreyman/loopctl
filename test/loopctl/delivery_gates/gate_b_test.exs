@@ -352,6 +352,23 @@ defmodule Loopctl.DeliveryGates.GateBTest do
       assert %Result{outcome: :human, reasons: [{:unknown_repo, nil}]} =
                GateB.evaluate(:merge, Map.delete(input(), :repo), triggers())
     end
+
+    # US-47.11 (#986): docs/agent-delivery-loop.md relies on this to say that claude-config and
+    # chg, absent from DELIVERY_GATES_CONFIG, send EVERY change to a human. "Every" is the
+    # claim, so it is pinned on the change the gate would otherwise clear — an unguarded file
+    # well inside the size bound — and on the triage screen with no predicted touch at all.
+    test "a repository absent from the configuration escalates every change, at triage and at merge" do
+      # The control: the same change to a configured repository clears.
+      assert %Result{outcome: :clear} = evaluate(:merge, %{files: ["README.md"]})
+
+      for repo <- ["mkreyman/claude-config", "mkreyman/chg"] do
+        assert %Result{outcome: :human, reasons: [{:unknown_repo, ^repo}]} =
+                 evaluate(:merge, %{repo: repo, files: ["README.md"]})
+
+        assert GateB.triage_screen(triggers(), repo, []) == [{:unknown_repo, repo}]
+        assert GateB.triage_screen(triggers(), repo, ["README.md"]) == [{:unknown_repo, repo}]
+      end
+    end
   end
 
   describe "stale triggers" do
