@@ -8661,7 +8661,10 @@ const TOOLS = [
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
       "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
-      "404 for an unknown story, 422 when `claim_epoch` is missing or the story is not at `ci` " +
+      "404 for an unknown story, 409 `change_protocol_enrolled` when the story's intake source " +
+      "is in mode `chg` (the PR route is closed for that repository — land the change with " +
+      "`chg submit`; decided before the stage check and any GitHub read, and nothing is " +
+      "escalated), 422 when `claim_epoch` is missing or the story is not at `ci` " +
       "or has no stage row. A `story_id` that is not a UUID or a bad `claim_epoch` is refused " +
       "here, before any call.",
     inputSchema: {
@@ -8792,8 +8795,15 @@ const TOOLS = [
       "does not exist, and the failure arrives after the claim. There is no cleared state for " +
       "it (a dispatch must name one), so null or blank is refused rather than falling back to " +
       "the default; intake_source_update changes it afterwards.\n\n" +
-      "`mode` is the merge route, and `pr` (the default) is the only one: the merge gate reads " +
-      "a pull request by number. Any other value, null included, is refused.",
+      "`mode` is the merge route. `pr` (the default): the merge gate reads a pull request by " +
+      "number. `chg` (Epic 47): the change protocol lands the repository's changes with " +
+      "`chg submit`, and merge_precondition refuses every story on the source with 409 " +
+      "`change_protocol_enrolled`. A `chg` enrolment needs `change_events_secret` (or " +
+      "`change_events_secret_file`) AND `chg_root_dispatch_id` in the same call — refused " +
+      "here, and 422 at the server, without them — and a root that is not a parentless, " +
+      "unrevoked, orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`. The " +
+      "change-events secret is write-only: no response and no tool result ever carries it. " +
+      "Any other mode, null included, is refused.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8832,10 +8842,37 @@ const TOOLS = [
         },
         mode: {
           type: "string",
-          enum: ["pr"],
+          enum: ["pr", "chg"],
           description:
-            "Optional. How this repository's changes reach its base branch: `pr`, the default " +
-            "and only value — the merge gate reads a pull request by number. Not nullable.",
+            "Optional. How this repository's changes reach its base branch: `pr` (the " +
+            "default; the merge gate reads a pull request by number) or `chg` (the change " +
+            "protocol lands them and the PR route is closed, 409 `change_protocol_enrolled`; " +
+            "needs the two fields below). Not nullable.",
+        },
+        change_events_secret: {
+          type: "string",
+          description:
+            "WRITE-ONLY; required with `mode: chg`. The HMAC key chg-server signs its event " +
+            "webhook with (POST /api/v1/change_events/:source_id); chg-server must hold the " +
+            "same value. 32-256 bytes (422 otherwise). Encrypted at rest and NEVER returned by " +
+            "any response or tool result. A tool input lands in the transcript, so prefer " +
+            "`change_events_secret_file`. Not GitHub's webhook secret.",
+        },
+        change_events_secret_file: {
+          type: "string",
+          description:
+            "Alternative to `change_events_secret`, and the preferred one: an absolute (or " +
+            "`~/`) path the tool READS the secret from, so the value never passes through the " +
+            "transcript. One trailing newline is stripped. Not both.",
+        },
+        chg_root_dispatch_id: {
+          type: "string",
+          description:
+            "Required with `mode: chg`. The dispatch (UUID) chg-server's key was minted from: " +
+            "a PARENTLESS, UNREVOKED, ORCHESTRATOR-role dispatch of this tenant, minted by the " +
+            "operator key with `dispatch` and no parent. Anything else — a child, a revoked " +
+            "or agent-role dispatch, another tenant's or an unknown id — is refused 422 " +
+            "`chg_root_invalid`, all alike.",
         },
         required_checks: {
           type: "array",
@@ -8868,10 +8905,12 @@ const TOOLS = [
     description:
       "LIST THE TENANT'S GITHUB INTAKE SOURCES (GET /api/v1/intake/sources): per source its " +
       "`id` (the webhook URL is /api/v1/intake/github/<id>), `project_id`, `repo_full_name`, " +
-      "`base_branch`, `mode` (`pr`), `target_epic_id`, `revoked_at` and " +
+      "`base_branch`, `mode` (`pr` or `chg`), `chg_root_dispatch_id`, `target_epic_id`, " +
+      "`revoked_at` and " +
       "timestamps. Active sources only " +
       "unless `include_revoked` is true.\n\n" +
-      "THE WEBHOOK SECRET IS NOT HERE AND IS NOT ANYWHERE. It is returned once by " +
+      "THE WEBHOOK SECRET IS NOT HERE AND IS NOT ANYWHERE, and neither is a `chg` source's " +
+      "change-events secret, which is never returned at all. The webhook secret is returned once by " +
       "intake_source_enroll and the column is redacted on the schema, so this is not the way " +
       "to recover one — revoking and enrolling again is. Use this to find the source behind a " +
       "409 `no_intake_source` (the project is bound to none) or a 409 " +
@@ -8894,19 +8933,27 @@ const TOOLS = [
     description:
       "SET WHERE A SOURCE'S WORK LANDS (PATCH /api/v1/intake/sources/:id): `target_epic_id`, " +
       "the epic triaged stories are created in, `base_branch`, the branch every dispatch " +
-      "for this repository is cut FROM and carries, and `mode`, the merge route (`pr`, the " +
-      "only one).\n\n" +
+      "for this repository is cut FROM and carries, `mode`, the merge route (`pr` or `chg`), " +
+      "and a `chg` source's `change_events_secret` and `chg_root_dispatch_id`.\n\n" +
       "PRESENCE DECIDES, AND A FIELD YOU DO NOT NAME IS LEFT EXACTLY AS IT WAS. Naming " +
       "none of them is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
       "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
       "only way to CLEAR the epic, and clearing it returns the source to escalating every " +
       "report to a human instead of filing a story. Leave the field out instead. " +
       "`base_branch` and `mode` have no cleared state at all, so a null there is refused. " +
-      "The mode is BOUND to each implement dispatch when it is placed: a change affects " +
-      "only stories placed afterwards, and a story already placed keeps the mode its " +
-      "dispatch recorded, so a change is always allowed. `base_branch` is bound the same " +
-      "way: a story already placed is merge-gated against the base branch its dispatch " +
-      "was sent with.\n\n" +
+      "`base_branch` is BOUND to each implement dispatch when it is placed: a story already " +
+      "placed is merge-gated against the base branch its dispatch was sent with.\n\n" +
+      "SWITCHING TO `chg` closes the PR route for EVERY story on the source at once: " +
+      "merge_precondition reads the source's current mode and answers 409 " +
+      "`change_protocol_enrolled` (land with `chg submit`). The resulting source must carry " +
+      "BOTH `change_events_secret` and `chg_root_dispatch_id`, named here or kept from an " +
+      "earlier `chg` stint (422 naming the missing one), and the root is re-checked on every " +
+      "switch or change (422 `chg_root_invalid` unless it is a parentless, unrevoked, " +
+      "orchestrator-role dispatch of this tenant). Switching to `pr` KEEPS both and ignores " +
+      "them; on a `pr` source an explicit null clears either, and on a `chg` source a null is " +
+      "a 422. Naming either credential needs a key NO DISPATCH MINTED (403 " +
+      "`api_key_mint_forbidden` otherwise, as enrolment does). The secret is write-only and " +
+      "never comes back.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
       "call; this is what corrects one that was not — a source enrolled before the parameter " +
@@ -8943,10 +8990,32 @@ const TOOLS = [
         },
         mode: {
           type: "string",
-          enum: ["pr"],
+          enum: ["pr", "chg"],
           description:
-            "`pr`, the only merge route: the merge gate reads a pull request. Not nullable. " +
-            "Omit to leave the current value alone.",
+            "`pr` (the merge gate reads a pull request) or `chg` (the change protocol lands " +
+            "changes; the PR route is closed). Not nullable. Omit to leave the current value " +
+            "alone.",
+        },
+        change_events_secret: {
+          type: ["string", "null"],
+          description:
+            "WRITE-ONLY. The HMAC key chg-server signs its event webhook with, 32-256 bytes; " +
+            "never returned. Null clears it on a `pr` source (422 on a `chg` one). Prefer " +
+            "`change_events_secret_file`. Omit to leave it alone.",
+        },
+        change_events_secret_file: {
+          type: "string",
+          description:
+            "Alternative to `change_events_secret`: an absolute (or `~/`) path the tool reads " +
+            "the secret from, so it never passes through the transcript. One trailing newline " +
+            "is stripped. Not both.",
+        },
+        chg_root_dispatch_id: {
+          type: ["string", "null"],
+          description:
+            "The parentless, unrevoked, orchestrator-role dispatch of this tenant chg-server's " +
+            "key was minted from; anything else is 422 `chg_root_invalid`. Null clears it on a " +
+            "`pr` source (422 on a `chg` one). Omit to leave it alone.",
         },
         required_checks: {
           type: "array",

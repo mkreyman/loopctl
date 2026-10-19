@@ -26,6 +26,8 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :dependencies_not_met}` -> 409 `dependencies_not_met` (claim of a story with an unverified prerequisite)
   - `{:error, :story_held}` -> 409 (contract or claim of a story whose delivery stage is `escalated`, `done` or `failed`; an escalated one is claimable again once a human resolves it to `queued`)
+  - `{:error, :change_protocol_enrolled}` -> 409 (US-47.2: the merge precondition asked for a story whose intake source is in mode `chg`; the PR route is closed, land it with `chg submit`)
+  - `{:error, :chg_root_invalid}` -> 422 (US-47.2: an intake source's `chg_root_dispatch_id` names no parentless, unrevoked, orchestrator-role dispatch of the tenant)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
   - `{:error, :claim_not_live}` -> 409 (the claim no longer accepts work — lease lapsed, or not in a claimed status)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
@@ -69,7 +71,9 @@ defmodule LoopctlWeb.FallbackController do
   alias Ecto.Changeset
   alias Loopctl.ApiSpec.Messages
   alias Loopctl.Custody.ViolationMonitor
+  alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.StageMachine
+  alias Loopctl.Intake.Source
   alias Loopctl.Llm.Remediation
   alias Loopctl.Runners.Capacity
   alias LoopctlWeb.DBError
@@ -402,6 +406,36 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "A story this one depends on, or a story in an epic its epic depends on, is not " <>
             "verified. GET /api/v1/stories/blocked (MCP list_blocked_stories) names them."
+      }
+    })
+  end
+
+  # US-47.2 (AC-47.2.3): the PR route is closed for a repository enrolled in the change
+  # protocol. 409, not 422: the request is well-formed and the story exists; what is wrong is
+  # the route. The message is `MergePrecondition`'s own, which the endpoint spec also reads.
+  def call(conn, {:error, :change_protocol_enrolled}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "change_protocol_enrolled",
+        message: MergePrecondition.change_protocol_message()
+      }
+    })
+  end
+
+  # US-47.2 (AC-47.2.2): the root a `chg` intake source names is a custody input, and it did
+  # not resolve to a root this tenant may name. One answer for every cause — another tenant's
+  # dispatch included — so the refusal says nothing about rows outside the caller's tenant.
+  def call(conn, {:error, :chg_root_invalid}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "chg_root_invalid",
+        message: Source.chg_root_requirement()
       }
     })
   end

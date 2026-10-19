@@ -47,6 +47,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
      11, and the only precondition decided before anything else, including a forge outage.
      See below.
 
+  ## A `chg` repository has no PR route (US-47.2)
+
+  A story whose intake source is in mode `:chg` is refused with
+  `{:error, :change_protocol_enrolled}` (HTTP 409) before anything else is read: no stage
+  check, no forge call, no verdict and no escalation. It is the forcing function of Epic 47
+  (PRD §3 item 3): chg lands that repository's changes (`chg submit`), so a pull-request merge
+  there is the old route, and answering it with a verdict would be answering the wrong
+  question. `evaluate/3` and `enforce/3` share the refusal, so `enforce/3` writes nothing.
+
   ## The loop may not merge its own control plane
 
   loopctl deploys on every push to master AND IS the control plane: a story that changes
@@ -218,7 +227,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
           optional(:self_deploy_excluded) => [String.t()]
         }
 
-  @type error :: :not_found | :no_stage | :wrong_stage
+  @type error :: :not_found | :no_stage | :wrong_stage | :change_protocol_enrolled
+
+  # US-47.2 (AC-47.2.3). ONE string, read by the 409 this renders as and by the endpoint's
+  # operation spec, so the refusal and its documentation cannot name different routes.
+  @change_protocol_message "This story's repository is enrolled in the change protocol " <>
+                             "(its intake source is in mode `chg`), so the pull-request " <>
+                             "route is closed for it: there is no merge to precondition. " <>
+                             "Land the change with `chg submit`; loopctl follows the " <>
+                             "story through chg's events."
 
   # The forge faults that mean "we could not tell", as opposed to a gate verdict: transport,
   # a 5xx, and a status the forge itself said to come back after. Every one clears on its
@@ -415,6 +432,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   ## Errors
 
+  `{:error, :change_protocol_enrolled}` for a story whose intake source is in mode `:chg`
+  (US-47.2): the PR route is closed for that repository, whatever the stage row says, and the
+  refusal is decided from the database alone, BEFORE any forge read and before the stage is
+  looked at — it is not a verdict about a change, it is the wrong route.
+
   `{:error, :not_found}` for a story that is not in the tenant, `{:error, :no_stage}` when
   it has no stage row, and `{:error, :wrong_stage}` when the row is not at `ci` — the only
   stage a merge is decided from, and the only one the `:merge_gate` edge leaves. These are
@@ -424,10 +446,21 @@ defmodule Loopctl.Delivery.MergePrecondition do
           {:ok, Verdict.t()} | {:error, error()}
   def evaluate(tenant_id, story_id, opts) do
     with {:ok, story} <- fetch_story(tenant_id, story_id),
+         source = source_for_story(story),
+         :ok <- pr_route_open(source),
          {:ok, stage} <- fetch_stage(tenant_id, story_id) do
-      {:ok, story |> gather(stage, opts) |> judge()}
+      {:ok, story |> gather(stage, source, opts) |> judge()}
     end
   end
+
+  @doc "The message `{:error, :change_protocol_enrolled}` is rendered and documented with."
+  @spec change_protocol_message() :: String.t()
+  def change_protocol_message, do: @change_protocol_message
+
+  # Only a RESOLVED `chg` source closes the route. A missing or ambiguous source falls through to
+  # `judge/1`, which refuses it as `repository_unresolved` — failing closed either way.
+  defp pr_route_open({:ok, %{mode: :chg}}), do: {:error, :change_protocol_enrolled}
+  defp pr_route_open(_source), do: :ok
 
   @doc """
   `evaluate/3`, and on a refusal the escalation it implies: `{:ci, :escalated, :merge_gate}`
@@ -910,8 +943,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # -- gathering the facts ---------------------------------------------------------------
 
-  defp gather(story, stage, opts) do
-    repo = story |> source_for_story() |> repo_of()
+  # `source` is the one `evaluate/3` resolved for the route check, so the repository judged here
+  # is the one whose mode was read: one read, one answer.
+  defp gather(story, stage, source, opts) do
+    repo = repo_of(source)
 
     # The repository with the credential every forge read below authenticates with (#936),
     # chosen per (tenant, repository). `repo` itself stays the bare name: the exclusion list

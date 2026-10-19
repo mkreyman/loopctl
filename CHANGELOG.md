@@ -39,6 +39,28 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Intake-source mode `chg` (US-47.2).** `POST /api/v1/intake/sources` and `PATCH
+  /api/v1/intake/sources/:id` accept `mode: "chg"` beside `pr`, plus two fields a `chg`
+  source must carry: `change_events_secret` (the HMAC key chg-server will sign its event
+  webhook with; 32-256 bytes, encrypted at rest like `webhook_secret`, WRITE-ONLY — no
+  response ever returns it) and `chg_root_dispatch_id` (the parentless, unrevoked,
+  orchestrator-role dispatch of the tenant that chg-server's key was minted from; mint it with
+  the operator key via `POST /api/v1/dispatches` and no parent). Without both a `chg` write is
+  422; a root that is anything else, another tenant's dispatch included, is 422
+  `chg_root_invalid`. Switching back to `pr` keeps both and ignores them. A PATCH naming either
+  field from a dispatch-minted key is 403 `api_key_mint_forbidden`, as enrolment already is.
+  Sources now serialise `chg_root_dispatch_id`.
+- **The merge precondition refuses a `chg` source's stories** with 409
+  `change_protocol_enrolled` (`POST /api/v1/stories/:id/merge-precondition`), before any
+  GitHub read and without escalating: the PR route is closed for that repository and changes
+  land with `chg submit`.
+- **Migration `20261019140000_add_chg_mode_to_intake_sources`** widens `intake_sources_mode`
+  to `('pr', 'chg')`, adds the two columns (the root references `dispatches(id)`), and adds the
+  CHECK `intake_sources_chg_requires_credentials`. Additive and reversible (`down` moves any
+  `chg` source back to `pr`). **Deploy ordering:** enrol or switch a source to `chg` only once
+  the release carrying this migration runs on every machine — the previous release cannot load
+  a `chg` row. MCP: loopctl-mcp-server 3.1.0.
+
 - **`POST /api/v1/projects/:id/restore` re-activates an archived work project, and
   `PATCH /api/v1/projects/:id` no longer changes status (#975).** BREAKING: a PATCH body
   carrying `status` is now refused 422 whatever its value, where it used to archive or

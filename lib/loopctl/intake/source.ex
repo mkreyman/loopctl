@@ -12,10 +12,32 @@ defmodule Loopctl.Intake.Source do
   server-side, encrypted at rest (`Loopctl.Vault.Binary`, AES-256-GCM), returned once at
   creation and never serialised again.
 
+  ## Mode `chg` (US-47.2)
+
+  A source in `mode: :chg` has its changes landed by the change protocol rather than by a pull
+  request, and `Loopctl.Delivery.MergePrecondition` refuses the PR route for it
+  (`409 change_protocol_enrolled`). Such a source carries two more things, BOTH required:
+
+  - `change_events_secret` — the HMAC key chg-server signs its event webhook with. Supplied by
+    the operator (chg-server must hold the same value), encrypted at rest like
+    `webhook_secret`, `redact: true`, and NEVER serialised: it is absent from the
+    `Jason.Encoder` list below, so no response can echo it and no client can round-trip it.
+  - `chg_root_dispatch_id` — the parentless, unrevoked, orchestrator-role dispatch of this
+    tenant chg-server's key was minted from. A custody input (PRD §6), so `Loopctl.Intake`
+    checks it against the `dispatches` row inside the write's transaction; this module only
+    validates presence and shape.
+
+  Switching a `chg` source back to `pr` KEEPS both: they are ignored while the mode is `pr`,
+  and switching back to `chg` re-checks the root rather than trusting the kept id. A caller
+  who wants them gone on a `pr` source sends an explicit `null`, which is a clear rather than
+  a silent loss; on a `chg` source the same `null` is a 422.
+
   ## Trust boundary
 
   `tenant_id`, `project_id`, `webhook_secret` and `revoked_at` are set programmatically in
-  `Loopctl.Intake`, never via `cast/3`. `repo_full_name` is the only cast field.
+  `Loopctl.Intake`, never via `cast/3`. The caller-supplied fields are cast by PRESENCE
+  (`empty_values: []`), so an explicit null is a request about the field rather than an
+  absent key.
 
   ## Isolation
 
@@ -35,6 +57,12 @@ defmodule Loopctl.Intake.Source do
   # letters, digits, '.', '_' or '-', at most 100. Mirrored by `intake_sources_repo_shape`.
   @repo_format ~r/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/
 
+  # An HMAC key for chg-server's event webhook (PRD §5). 32 bytes is the entropy the
+  # server-generated `webhook_secret` carries (as 64 hex characters); 256 bounds what is
+  # encrypted and stored per row.
+  @min_change_events_secret_bytes 32
+  @max_change_events_secret_bytes 256
+
   @derive {Jason.Encoder,
            only: [
              :id,
@@ -43,6 +71,7 @@ defmodule Loopctl.Intake.Source do
              :base_branch,
              :mode,
              :required_checks,
+             :chg_root_dispatch_id,
              :target_epic_id,
              :revoked_at,
              :inserted_at,
@@ -68,10 +97,10 @@ defmodule Loopctl.Intake.Source do
     # is repointed through `PATCH /api/v1/intake/sources/:id` rather than by guessing.
     field :base_branch, :string, default: "master"
 
-    # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE. `:pr` is the one route today: the merge gate
-    # reads a pull request by number. The column stays because Epic 47 adds `:chg` beside it
-    # (docs/user_stories/epic_47_change_protocol/PRD.md §10). NOT NULL, default `:pr`.
-    field :mode, Ecto.Enum, values: [:pr], default: :pr
+    # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE. `:pr`: the merge gate reads a pull request by
+    # number. `:chg` (US-47.2): the change protocol lands them, and the merge gate refuses the
+    # PR route outright. NOT NULL, default `:pr`; `intake_sources_mode` is the database's copy.
+    field :mode, Ecto.Enum, values: [:pr, :chg], default: :pr
 
     # THE CHECKS STORY VERIFICATION JUDGES A STORY'S COMMIT BY (US-26.4.6): GitHub Actions JOB
     # names, as they appear on the commit (a commit-status context can never satisfy one; see
@@ -85,6 +114,10 @@ defmodule Loopctl.Intake.Source do
     # (`credential_unavailable` if there is none).
     field :required_checks, {:array, :string}, default: []
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
+
+    # `:chg` only (see the moduledoc). Never in the encoder list: write-only.
+    field :change_events_secret, Loopctl.Vault.Binary, redact: true
+    field :chg_root_dispatch_id, :binary_id
     field :revoked_at, :utc_datetime_usec
 
     timestamps()
@@ -117,6 +150,7 @@ defmodule Loopctl.Intake.Source do
     # the field gets its value validated rather than a silent substitution.
     |> cast(attrs, [:mode], empty_values: [])
     |> cast(attrs, [:required_checks], empty_values: [])
+    |> cast(attrs, [:change_events_secret, :chg_root_dispatch_id], empty_values: [])
     |> validate_required([:repo_full_name])
     |> validate_mode()
     |> validate_required_checks()
@@ -162,16 +196,77 @@ defmodule Loopctl.Intake.Source do
   end
 
   @doc """
-  Everything `mode` must satisfy, for every path that writes it: present (the column is NOT
-  NULL, so there is no cleared state) and `pr`, which the `Ecto.Enum` cast
-  already refuses otherwise. `intake_sources_mode` is the database's copy of the same rule.
+  Everything `mode` and the `chg` credentials must satisfy, for every path that writes any of
+  them: `mode` present (the column is NOT NULL, so there is no cleared state) and `pr` or
+  `chg`, which the `Ecto.Enum` cast already refuses otherwise; and, when the RESULTING mode is
+  `:chg`, both `change_events_secret` and `chg_root_dispatch_id` present
+  (`intake_sources_chg_requires_credentials` is the database's copy). Resulting, not changed: switching back to `chg` with the values a `pr` stint kept is
+  accepted here, and `Loopctl.Intake` re-checks the root.
+
+  A secret, when one is written, is #{@min_change_events_secret_bytes} to
+  #{@max_change_events_secret_bytes} bytes: it is an HMAC key, and a short one is guessable.
   """
   @spec validate_mode(Ecto.Changeset.t()) :: Ecto.Changeset.t()
   def validate_mode(%Ecto.Changeset{} = changeset) do
     changeset
     |> validate_required([:mode])
+    |> validate_chg_credentials()
+    |> validate_change(:change_events_secret, &check_secret/2)
     |> check_constraint(:mode, name: :intake_sources_mode)
+    |> check_constraint(:mode,
+      name: :intake_sources_chg_requires_credentials,
+      message: "chg requires change_events_secret and chg_root_dispatch_id"
+    )
+    |> foreign_key_constraint(:chg_root_dispatch_id,
+      name: :intake_sources_chg_root_dispatch_id_fkey
+    )
   end
+
+  defp validate_chg_credentials(changeset) do
+    if get_field(changeset, :mode) == :chg,
+      do:
+        validate_required(changeset, [:change_events_secret, :chg_root_dispatch_id],
+          message: "is required when mode is chg"
+        ),
+      else: changeset
+  end
+
+  defp check_secret(:change_events_secret, secret) when is_binary(secret) do
+    if byte_size(secret) in @min_change_events_secret_bytes..@max_change_events_secret_bytes,
+      do: [],
+      else: [change_events_secret: change_events_secret_rule()]
+  end
+
+  defp check_secret(:change_events_secret, _not_a_string),
+    do: [change_events_secret: change_events_secret_rule()]
+
+  @doc "The fewest bytes a `change_events_secret` may have."
+  @spec min_change_events_secret_bytes() :: pos_integer()
+  def min_change_events_secret_bytes, do: @min_change_events_secret_bytes
+
+  @doc "The most bytes a `change_events_secret` may have."
+  @spec max_change_events_secret_bytes() :: pos_integer()
+  def max_change_events_secret_bytes, do: @max_change_events_secret_bytes
+
+  @doc "The rule a `change_events_secret` is held to, as the refusal and the API docs state it."
+  @spec change_events_secret_rule() :: String.t()
+  def change_events_secret_rule,
+    do:
+      "must be a string of #{@min_change_events_secret_bytes} to " <>
+        "#{@max_change_events_secret_bytes} bytes"
+
+  @doc """
+  What `chg_root_dispatch_id` must name, as the `chg_root_invalid` refusal and the API docs
+  state it. ONE string for both, so the two cannot describe different rules.
+  """
+  @spec chg_root_requirement() :: String.t()
+  def chg_root_requirement,
+    do:
+      "chg_root_dispatch_id must name a PARENTLESS, UNREVOKED, ORCHESTRATOR-role dispatch of " <>
+        "this tenant: the root chg-server's key was minted from, created by the tenant's " <>
+        "operator key with POST /api/v1/dispatches and no parent_dispatch_id. An id that " <>
+        "names no such dispatch of this tenant, including another tenant's, is refused the " <>
+        "same way."
 
   # The status a session posts about its OWN work (claude-config#677): the implementer attesting
   # itself, the shape chain of custody refuses, so it can never be a required check.

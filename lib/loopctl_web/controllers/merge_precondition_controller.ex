@@ -210,7 +210,10 @@ defmodule LoopctlWeb.MergePreconditionController do
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>
         "`merge_sha`, so a caller that crashed after merging adopts it instead of merging " <>
-        "again. Only `allow` licenses a merge.",
+        "again. Only `allow` licenses a merge.\n\n" <>
+        "409 `change_protocol_enrolled` when the story's intake source is in mode `chg` " <>
+        "(US-47.2), decided before the stage check and before any GitHub read, and nothing " <>
+        "is escalated: " <> MergePrecondition.change_protocol_message(),
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Merge precondition params", "application/json",
@@ -256,6 +259,10 @@ defmodule LoopctlWeb.MergePreconditionController do
         {"Insufficient role (exact orchestrator or user)", "application/json",
          Schemas.ErrorResponse},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`change_protocol_enrolled`: the story's repository is enrolled in the change " <>
+           "protocol, so the pull-request route is closed. " <>
+           MergePrecondition.change_protocol_message(), "application/json", Schemas.ErrorResponse},
       422 =>
         {"Story has no stage row, is not at the ci stage, or the request is malformed",
          "application/json", Schemas.ErrorResponse},
@@ -317,6 +324,7 @@ defmodule LoopctlWeb.MergePreconditionController do
     case MergePrecondition.enforce(tenant_id, story_id, opts) do
       {:ok, verdict} -> {:ok, verdict}
       {:error, :not_found} -> {:error, :not_found}
+      {:error, :change_protocol_enrolled} -> {:error, :change_protocol_enrolled}
       {:error, :no_stage} -> {:error, :unprocessable_entity, "Story has no delivery stage row"}
       {:error, :wrong_stage} -> {:error, :unprocessable_entity, "Story is not at the ci stage"}
     end

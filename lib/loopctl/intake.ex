@@ -89,6 +89,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
   alias Loopctl.Intake.Record
@@ -155,12 +156,19 @@ defmodule Loopctl.Intake do
 
   Returns `{:ok, %{source: source, webhook_secret: secret}}`. The secret is returned once.
 
-  `attrs` may also carry `:mode` (`"pr"`, read by PRESENCE and defaulting to it),
+  `attrs` may also carry `:mode` (`"pr"` or `"chg"`, read by PRESENCE and defaulting to
+  `"pr"`; a `"chg"` source also needs `:change_events_secret` and `:chg_root_dispatch_id`, see
+  `Loopctl.Intake.Source` and `chg_root_invalid` below),
   `:target_epic_id` (optional, and `nil` means "not answered") and
   `:base_branch` (optional, and read by PRESENCE: omit it for the `master` default, or name
   the branch this repository's dispatches are cut from — `main` for a repository created on
   GitHub since 2020. It is NOT nullable, so an explicit `nil` or `""` is a validation error
   rather than a silent fallback to the default).
+
+  `{:error, :chg_root_invalid}` when the source would be `chg` and `chg_root_dispatch_id`
+  does not name a parentless, unrevoked, orchestrator-role dispatch of THIS tenant
+  (`Source.chg_root_requirement/0`). Another tenant's dispatch is the same refusal as an id
+  that names nothing, so the answer leaks nothing about other tenants.
 
   ## Options
 
@@ -168,7 +176,7 @@ defmodule Loopctl.Intake do
   """
   @spec create_source(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, %{source: Source.t(), webhook_secret: String.t()}}
-          | {:error, Ecto.Changeset.t() | term()}
+          | {:error, Ecto.Changeset.t() | :chg_root_invalid | term()}
   def create_source(tenant_id, attrs, opts \\ []) when is_binary(tenant_id) do
     secret = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
     project_id = Map.get(attrs, :project_id) || Map.get(attrs, "project_id")
@@ -201,7 +209,13 @@ defmodule Loopctl.Intake do
   defp create_attrs(repo, attrs) do
     base = %{repo_full_name: repo}
 
-    fields = [base_branch: "base_branch", mode: "mode", required_checks: "required_checks"]
+    fields = [
+      base_branch: "base_branch",
+      mode: "mode",
+      required_checks: "required_checks",
+      change_events_secret: "change_events_secret",
+      chg_root_dispatch_id: "chg_root_dispatch_id"
+    ]
 
     Enum.reduce(fields, base, fn {key, string_key}, acc ->
       case fetch_either(attrs, key, string_key) do
@@ -300,7 +314,8 @@ defmodule Loopctl.Intake do
 
   defp insert_source(tenant_id, changeset, opts) do
     AdminRepo.transaction(fn ->
-      with {:ok, source} <- AdminRepo.insert(changeset),
+      with :ok <- check_chg_root(tenant_id, changeset),
+           {:ok, source} <- AdminRepo.insert(changeset),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
                action: "intake_source_created",
@@ -318,7 +333,11 @@ defmodule Loopctl.Intake do
                  "base_branch" => source.base_branch,
                  # Which route the merge gate reads, recorded for the same reason
                  # as the branch — a later `intake_source_mode_set` says what it changed TO.
-                 "mode" => Atom.to_string(source.mode)
+                 "mode" => Atom.to_string(source.mode),
+                 # The custody input a `chg` source names (PRD §6). The secret itself is never
+                 # on the chain; only whether one was set.
+                 "chg_root_dispatch_id" => source.chg_root_dispatch_id,
+                 "change_events_secret_set" => is_binary(source.change_events_secret)
                }
              }) do
         source
@@ -368,7 +387,9 @@ defmodule Loopctl.Intake do
   Updates an ACTIVE source's mutable fields in ONE transaction (#803 round 2).
 
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
-  `:base_branch` (NOT nullable) and `:mode` (`"pr"`, NOT nullable). A key that is ABSENT is left alone, which is why this
+  `:base_branch` (NOT nullable), `:mode` (`"pr"` or `"chg"`, NOT nullable),
+  `:required_checks`, `:change_events_secret` and `:chg_root_dispatch_id` (both nullable on a
+  `pr` source and required on a `chg` one). A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
 
@@ -379,14 +400,29 @@ defmodule Loopctl.Intake do
 
   One chain entry per field that actually changed, under the action that names it, so an
   operator reading the chain still sees a repoint as a repoint and a rebase as a rebase.
+
+  SWITCHING MODE. To `chg`: the RESULTING row must carry both credentials, from this update or
+  kept from an earlier `chg` stint, and the root is re-checked against `dispatches` whenever
+  the mode or the root changes (`{:error, :chg_root_invalid}`), so a kept root that has since
+  been revoked is refused rather than trusted. To `pr`: both credentials are KEPT and ignored;
+  nothing is cleared that the caller did not name.
   """
+  @updatable_fields [
+    :target_epic_id,
+    :base_branch,
+    :mode,
+    :required_checks,
+    :change_events_secret,
+    :chg_root_dispatch_id
+  ]
+
   @spec update_source(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Source.t()}
-          | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update}
+          | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update | :chg_root_invalid}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
     fields =
-      for key <- [:target_epic_id, :base_branch, :mode, :required_checks],
+      for key <- @updatable_fields,
           Map.has_key?(attrs, key),
           do: key
 
@@ -414,7 +450,17 @@ defmodule Loopctl.Intake do
     changeset =
       if branch?, do: cast_base_branch(changeset, Map.get(attrs, :base_branch)), else: changeset
 
-    changeset = if mode?, do: cast_mode(changeset, Map.get(attrs, :mode)), else: changeset
+    # The mode and the `chg` credentials are cast TOGETHER and validated once, because the rule
+    # that binds them reads the resulting row: a switch to `chg` in one field is judged with the
+    # credentials named beside it, or kept on the row.
+    changeset =
+      if mode? or :change_events_secret in fields or :chg_root_dispatch_id in fields,
+        do:
+          cast_mode(
+            changeset,
+            Map.take(attrs, [:mode, :change_events_secret, :chg_root_dispatch_id])
+          ),
+        else: changeset
 
     changeset =
       if :required_checks in fields,
@@ -436,9 +482,11 @@ defmodule Loopctl.Intake do
 
   # `empty_values: []` for the reason `cast_base_branch/2` gives: a caller that SENT a value
   # gets an answer about it, so an explicit null or `""` is a 422, never a kept old value.
-  defp cast_mode(changeset, value) do
+  defp cast_mode(changeset, attrs) do
     changeset
-    |> Ecto.Changeset.cast(%{mode: value}, [:mode], empty_values: [])
+    |> Ecto.Changeset.cast(attrs, [:mode, :change_events_secret, :chg_root_dispatch_id],
+      empty_values: []
+    )
     |> Source.validate_mode()
   end
 
@@ -462,11 +510,14 @@ defmodule Loopctl.Intake do
   # the table it describes.
   defp write_update(tenant_id, changeset, fields, opts) do
     AdminRepo.transaction(fn ->
-      with {:ok, source} <- AdminRepo.update(changeset),
+      with :ok <- check_chg_root(tenant_id, changeset),
+           {:ok, source} <- AdminRepo.update(changeset),
            :ok <- append_if(fields, :target_epic_id, tenant_id, source, opts),
            :ok <- append_if(fields, :base_branch, tenant_id, source, opts),
            :ok <- append_if(fields, :mode, tenant_id, source, opts),
-           :ok <- append_if(fields, :required_checks, tenant_id, source, opts) do
+           :ok <- append_if(fields, :required_checks, tenant_id, source, opts),
+           :ok <- append_if(fields, :chg_root_dispatch_id, tenant_id, source, opts),
+           :ok <- append_if(fields, :change_events_secret, tenant_id, source, opts) do
         source
       else
         {:error, reason} -> AdminRepo.rollback(reason)
@@ -493,6 +544,14 @@ defmodule Loopctl.Intake do
 
         :required_checks ->
           {"intake_source_required_checks_set", %{"required_checks" => source.required_checks}}
+
+        :chg_root_dispatch_id ->
+          {"intake_source_chg_root_set", %{"chg_root_dispatch_id" => source.chg_root_dispatch_id}}
+
+        # Whether a secret is set, never the secret: the chain is readable by every auditor.
+        :change_events_secret ->
+          {"intake_source_change_events_secret_set",
+           %{"change_events_secret_set" => is_binary(source.change_events_secret)}}
       end
 
     case AuditChain.append(tenant_id, %{
@@ -506,6 +565,58 @@ defmodule Loopctl.Intake do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # AC-47.2.2: the root a `chg` source names is a CUSTODY INPUT (PRD §6) — later stories accept a
+  # review only from a child of it and refuse it as a verifier — so it is checked against the
+  # `dispatches` row, not taken on the caller's word.
+  #
+  # Judged whenever a write NAMES a root (whatever the mode), and whenever it switches the mode to
+  # `chg` (so a root kept from an earlier stint is re-judged rather than trusted). Naming one on a
+  # `pr` source is judged too, and that is not tidiness: unjudged, an unknown id would fail the
+  # foreign key (422) while another tenant's id would be stored (200) — an existence oracle
+  # across tenants. An unrelated edit (a base branch) on a `chg` source does not re-judge a root
+  # revoked since; that root is refused where it is USED, by the gates that read it.
+  #
+  # INSIDE the write's transaction and `FOR SHARE`, so a concurrent `Dispatches.revoke/3` of the
+  # root either commits first (and this read sees `revoked_at`) or waits for this write to
+  # commit; there is no window in which a revoked root is enrolled.
+  #
+  # By id AND tenant: another tenant's dispatch is `nil` here, exactly like an id that names
+  # nothing, so the two refusals are one and the same.
+  #
+  # Expiry is NOT judged. A root's key expiring is chg-server's credential lapsing, which
+  # refuses every call it makes; it does not make the registration a different principal.
+  defp check_chg_root(tenant_id, %Ecto.Changeset{} = changeset) do
+    mode = Ecto.Changeset.get_field(changeset, :mode)
+    root_id = Ecto.Changeset.get_field(changeset, :chg_root_dispatch_id)
+    named_root? = Ecto.Changeset.changed?(changeset, :chg_root_dispatch_id) and root_id != nil
+    switched? = mode == :chg and Ecto.Changeset.changed?(changeset, :mode)
+
+    if named_root? or switched?, do: judge_chg_root(tenant_id, root_id), else: :ok
+  end
+
+  defp judge_chg_root(tenant_id, root_id) when is_binary(root_id) do
+    dispatch =
+      AdminRepo.one(
+        from d in Dispatch,
+          where: d.id == ^root_id and d.tenant_id == ^tenant_id,
+          lock: "FOR SHARE"
+      )
+
+    if chg_root?(dispatch), do: :ok, else: {:error, :chg_root_invalid}
+  end
+
+  # `validate_mode/1` already required it, so a nil here is a caller bypassing the changeset.
+  defp judge_chg_root(_tenant_id, _root_id), do: {:error, :chg_root_invalid}
+
+  # `lineage_path == [id]` is what a parentless dispatch carries (`Loopctl.Dispatches`); a row
+  # where the two disagree is not trusted as a root.
+  defp chg_root?(%Dispatch{} = d),
+    do:
+      is_nil(d.parent_dispatch_id) and is_nil(d.revoked_at) and d.role == :orchestrator and
+        d.lineage_path == [d.id]
+
+  defp chg_root?(_none), do: false
 
   @doc """
   Sets the branch dispatches for this source's repository are cut FROM (#803 round 1).

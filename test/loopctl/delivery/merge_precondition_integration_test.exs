@@ -472,7 +472,70 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end
   end
 
+  describe "a story on a chg source (US-47.2, AC-47.2.3)" do
+    setup ctx do
+      enrol_in_chg(ctx)
+      :ok
+    end
+
+    test "evaluate and enforce refuse with change_protocol_enrolled before any forge read",
+         ctx do
+      # STUBS that report, not `expect/4` with 0: DataCase's `stub_all_defaults/0` stubs these
+      # already, and Mox falls back to a stub once expectations are exhausted, so a 0-count
+      # expectation would let a forge call through unseen.
+      test_pid = self()
+      Mox.stub(MockPullRequestSource, :pull_request, fn _r, _n -> send(test_pid, :forge_read) end)
+      Mox.stub(MockPullRequestSource, :repo_files, fn _r, _ref -> send(test_pid, :forge_read) end)
+
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _t, _r ->
+        send(test_pid, :credential_resolved)
+      end)
+
+      assert {:error, :change_protocol_enrolled} = evaluate(ctx)
+      assert {:error, :change_protocol_enrolled} = enforce(ctx)
+
+      refute_received :forge_read
+      refute_received :credential_resolved
+
+      # Nothing was decided, so nothing was escalated or recorded.
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.merge_gate_allowed_sha == nil
+    end
+
+    test "the refusal precedes the stage check", ctx do
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in StoryStage, where: s.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [stage: :implementing])
+        end)
+
+      assert {:error, :change_protocol_enrolled} = evaluate(ctx)
+    end
+
+    test "switching the source back to pr reopens the route", ctx do
+      [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, source.id, %{mode: "pr"})
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+
+      assert {:ok, %Verdict{decision: :allow}} = evaluate(ctx)
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------------------
+
+  # Moves the fixture's intake source to `chg` through the context, as an operator would.
+  defp enrol_in_chg(ctx) do
+    root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+    [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+
+    {:ok, %{mode: :chg}} =
+      Loopctl.Intake.update_source(ctx.tenant_id, source.id, %{
+        mode: "chg",
+        change_events_secret: String.duplicate("c", 32),
+        chg_root_dispatch_id: root.id
+      })
+  end
 
   defp evaluate(ctx), do: MergePrecondition.evaluate(ctx.tenant_id, ctx.story_id, opts())
   defp enforce(ctx), do: MergePrecondition.enforce(ctx.tenant_id, ctx.story_id, opts())
