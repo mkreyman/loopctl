@@ -21,6 +21,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Changes
+  alias Loopctl.Changes.Binding, as: ChangeBinding
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.Stages
@@ -3198,6 +3200,52 @@ defmodule Loopctl.Fixtures do
     else
       insert.()
     end
+  end
+
+  # US-47.1: a story CLAIMED the way `claim` leaves it — an assigned agent and the implementer
+  # dispatch that agent works under. Returns `%{story:, agent:, dispatch:}`. Pass `:tenant_id`.
+  def fixture(:claimed_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    agent = fixture(:agent, %{tenant_id: tenant_id, agent_type: :implementer})
+
+    {:ok, %{dispatch: dispatch}} =
+      Dispatches.create_dispatch(tenant_id, %{role: :agent, agent_id: agent.id})
+
+    story =
+      fixture(:story, %{tenant_id: tenant_id})
+      |> Ecto.Changeset.change(%{
+        agent_status: :assigned,
+        assigned_agent_id: agent.id,
+        implementer_dispatch_id: dispatch.id
+      })
+      |> AdminRepo.update!()
+
+    %{story: story, agent: agent, dispatch: dispatch}
+  end
+
+  # US-47.1: a story bound to a chg change through `Loopctl.Changes.bind/4`, so the row carries
+  # what the context derives (the supersede, `submitter_not_claimant`). Pass `:tenant_id`;
+  # `:story_id`, `:repo`, `:change_id` and `:submitter_agent_id` are optional.
+  def fixture(:change_binding, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    story_id =
+      Map.get_lazy(attrs, :story_id, fn -> fixture(:story, %{tenant_id: tenant_id}).id end)
+
+    {:ok, %ChangeBinding{} = binding} =
+      Changes.bind(
+        tenant_id,
+        %{
+          story_id: story_id,
+          repo: Map.get(attrs, :repo, "mkreyman/loopctl"),
+          change_id: Map.get(attrs, :change_id, "chg-#{System.unique_integer([:positive])}")
+        },
+        %{agent_id: Map.get(attrs, :submitter_agent_id)}
+      )
+
+    binding
   end
 
   # An agent and its `:agent`-role key, sandboxed. Returns `{raw_key, api_key, agent}`; the

@@ -37,6 +37,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
     "test/loopctl/admin_repo_topology_test.exs" =>
       "an AdminRepo write committing apart from a failed Repo transaction is the subject: " <>
         "two connections over committed rows",
+    "test/loopctl/changes_lock_test.exs" => @race,
     "test/loopctl/config_test_exs_partition_wiring_test.exs" =>
       "the subject is config/test.exs's own read of the OS environment at load time",
     "test/loopctl/context_retriever/entity_definitions_rollback_test.exs" => @migration,
