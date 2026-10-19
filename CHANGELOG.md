@@ -34,8 +34,9 @@ All notable changes to loopctl are documented here.
   machine; that release no longer reads any of them. Irreversible.
 - **Env vars no longer read:** `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
   `REVIEW_WALL_CLOCK_SECONDS`, `REVIEW_MAX_TURNS`. They can be unset (`fly secrets unset`);
-  leaving them set is harmless. loopctl no longer uses GitHub App 5101362 (its fate is
-  mkreyman/chg#33).
+  leaving them set is harmless. loopctl no longer uses GitHub App 5101362; chg adopted it
+  as chg-server's lander (mkreyman/chg#33). On loopctl.com the two `GITHUB_APP_*` secrets
+  were unset on 2026-10-19.
 
 ### Added
 
