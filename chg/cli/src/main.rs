@@ -12,6 +12,7 @@ use chg::exec;
 use chg::gate::{self, Mode};
 use chg::git;
 use chg::output::{Affected, Document};
+use chg::scratch::{self, AtBuild};
 use chg::shadow;
 use chg::snapshot::{self, Built, Refresh};
 use chg::store::Store;
@@ -47,8 +48,8 @@ enum Top {
         #[command(subcommand)]
         command: HookCmd,
     },
-    /// Static checks plus the affected tests of the working tree against its base.
-    /// Exit 0 pass, 1 fail, 2 no verdict (the adapter broke the contract), 3 the gate is
+    /// Static checks plus the affected tests of a commit against its base, run where the
+    /// repo's snapshots are built (under its build lock), else in the live tree. Exit 0 pass, 1 fail, 2 no verdict (the adapter broke the contract), 3 the gate is
     /// off (`CHG_GATE=off` or `.chg/policy.toml`): run the repo's old gate instead.
     /// Prints the verdict as one JSON line.
     Check {
@@ -65,9 +66,11 @@ enum Top {
         /// and exit 0 at once, whatever happens.
         #[arg(long, conflicts_with = "all")]
         shadow: bool,
-        /// The commit to judge (default HEAD). Without --shadow the check runs in the
-        /// live tree, so that tree must be exactly this commit, with nothing uncommitted,
-        /// before and after the run.
+        /// The commit to judge (default HEAD). It is checked out where snapshots are built,
+        /// so what the live tree holds beyond it is not judged. When that path cannot be
+        /// used (no store, the path busy, no snapshot, a failed worktree or hydrate), the
+        /// check runs in the live tree instead, which must then be exactly this commit, with
+        /// nothing uncommitted, before and after the run.
         #[arg(long)]
         sha: Option<String>,
         /// With --shadow: run in this process instead of detaching (tests, debugging).
@@ -784,22 +787,39 @@ fn check_cmd(repo: &Path, base: Option<String>, sha: Option<String>, all: bool) 
             return ExitCode::from(2);
         }
     };
-    // A gate asked to judge a commit must judge that commit, not whatever the tree holds.
-    if let Some(sha) = &pinned
-        && let Err(e) = git::is_exactly(repo, sha)
+    let sha = match pinned
+        .clone()
+        .map_or_else(|| git::resolve(repo, "HEAD"), Ok)
     {
-        eprintln!("chg: no verdict for {sha}: {e}");
-        return ExitCode::from(2);
-    }
-    let mut v = check::run(repo, &base, all);
-    if let Some(sha) = &pinned
-        && let Err(e) = git::is_exactly(repo, sha)
-    {
-        v = Verdict {
-            ms: v.ms,
-            ..Verdict::error(format!("the tree moved while the check ran: {e}"))
-        };
-    }
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("chg: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let v = match gate_at_build(repo, &sha, &base, all) {
+        Some(v) => v,
+        None => {
+            // A gate asked to judge a commit must judge that commit, not whatever the
+            // tree holds.
+            if let Some(sha) = &pinned
+                && let Err(e) = git::is_exactly(repo, sha)
+            {
+                eprintln!("chg: no verdict for {sha}: {e}");
+                return ExitCode::from(2);
+            }
+            let mut v = check::run(repo, &base, all);
+            if let Some(sha) = &pinned
+                && let Err(e) = git::is_exactly(repo, sha)
+            {
+                v = Verdict {
+                    ms: v.ms,
+                    ..Verdict::error(format!("the tree moved while the check ran: {e}"))
+                };
+            }
+            v
+        }
+    };
     println!("{}", serde_json::to_string(&v).expect("verdicts serialize"));
     let selected = match v.mode.as_deref() {
         Some("all") => "the whole suite".to_string(),
@@ -820,6 +840,49 @@ fn check_cmd(repo: &Path, base: Option<String>, sha: Option<String>, all: bool) 
         Outcome::Fail => ExitCode::from(1),
         Outcome::Error | Outcome::Skipped => ExitCode::from(2),
     }
+}
+
+/// Checks the commit `sha` where snapshots are built, under the build lock, as a shadow
+/// check does: a check in the pushing worktree recompiles what the snapshot baked in at
+/// another path (on HCB, 933 of 945 files). `None` when that cannot run, and the caller
+/// checks the live tree instead, as before. That happens when there is no store, the build
+/// path is busy, there is no snapshot to hydrate from, or the worktree or its hydrate
+/// fails. A busy path never makes the gate wait: a snapshot build there can take as long
+/// as a PLT build, and another worktree's gate holds it for a whole check.
+fn gate_at_build(repo: &Path, sha: &str, base: &str, all: bool) -> Option<Verdict> {
+    let started = std::time::Instant::now();
+    let fallback = |why: String| {
+        eprintln!("chg: checking the live tree: {why}");
+        None
+    };
+    let git_dir = match git::common_dir(repo) {
+        Ok(d) => d,
+        Err(e) => return fallback(format!("no git dir: {e}")),
+    };
+    let store = match Store::for_repo(&git_dir) {
+        Ok(s) => s,
+        Err(e) => return fallback(format!("no snapshot store: {e}")),
+    };
+    let lock = match store.try_lock_build() {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return fallback("a snapshot build or another check holds the build path".into());
+        }
+        Err(e) => return fallback(format!("build lock: {e}")),
+    };
+    let mut v = match scratch::check_at_build(&git_dir, &store, sha, base, all) {
+        AtBuild::Checked { verdict, .. } => verdict,
+        AtBuild::NoSnapshot { .. } => {
+            return fallback(format!("no snapshot is an ancestor of {sha}"));
+        }
+        AtBuild::Failed { why, .. } => return fallback(why),
+    };
+    drop(lock);
+    // What the push waited for, the worktree and its hydrate included.
+    v.ms = started.elapsed().as_millis() as u64;
+    // As after a shadow check: the next push starts from a snapshot of this base.
+    shadow::refresh(repo, base, true);
+    Some(v)
 }
 
 /// Never fails: a shadow that cannot start says why on stderr and exits 0, because the

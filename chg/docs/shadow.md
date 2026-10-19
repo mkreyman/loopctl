@@ -12,10 +12,10 @@ A repo moves its push gate to `chg check` in three modes, chosen by `chg gate`:
 
 ## Commands
 
-- `chg check [--sha S] [--base B] [--all]`: static checks, then the affected tests of the working tree against `B` (default: the merge-base of `S`, or HEAD, with origin's default branch). Prints the verdict as one JSON line. Exit 0 pass, 1 fail, 2 no verdict, 3 the gate is `off`. With `--sha`, the tree must be exactly `S` (HEAD is `S`, nothing uncommitted or untracked) before the run, or it exits 2 without running anything; if the tree changed by the end of the run, the verdict is `error`, so a gate never passes a commit it did not test.
+- `chg check [--sha S] [--base B] [--all]`: static checks, then the affected tests of commit `S` (default HEAD) against `B` (default: the merge-base of `S` with origin's default branch). Prints the verdict as one JSON line. Exit 0 pass, 1 fail, 2 no verdict, 3 the gate is `off`. It checks `S` out at the repo's snapshot build path, hydrated from the nearest-ancestor snapshot, under the build lock, so only the delta compiles. Uncommitted changes in the live tree are not judged. Afterwards it starts a detached refresh of `B`'s snapshot, logged to `~/.chg/shadow/logs/<repo>-refresh-<base12>.log`. When that path cannot be used, it runs in the live tree as before and says why on stderr. That happens with no store, a busy path (a snapshot build or another worktree's check: the gate never waits for it), no snapshot, or a failed worktree or hydrate. With `--sha`, the live tree must then be exactly `S` (HEAD is `S`, nothing uncommitted or untracked) before the run, or it exits 2 without running anything. If the tree changed by the end of the run, the verdict is `error`, so a gate never passes a commit it did not test.
 - `chg check --shadow [--sha S] [--base B]`: resolves `S` (default HEAD) and `B` now, starts a detached copy of itself in a new session, and exits 0 at once, whatever happens. The copy:
-  1. runs at `nice 10` and waits up to 30 min for this machine's shadow lock, so a burst of pushes queues instead of running several suites beside the real gate;
-  2. checks `S` out, with no hooks, into the repo's shadow worktree inside the snapshot store (one fixed path per repo, cleared first of anything a killed check left there), and hydrates it from the nearest-ancestor snapshot. With no snapshot it records `skipped` instead of cold-building, which would compete with the real gate for the machine;
+  1. runs at `nice 10`, waits up to 95 min for the repo's build lock (a refresh may be building there), then up to 30 min for this machine's shadow lock, so a burst of pushes queues instead of running several suites beside the real gate;
+  2. checks `S` out, with no hooks, at the repo's snapshot build path (one fixed path per repo, where snapshots are built, cleared first of anything a killed check left there), and hydrates it from the nearest-ancestor snapshot. With no snapshot it records `skipped` instead of cold-building, which would compete with the real gate for the machine;
   3. runs `chg check` there. The fixed path gives every shadow check of the repo the same workspace slot, so one test database of its own, reused run after run; the live tree is never read, because the real gate may be compiling and testing it at that moment;
   4. appends a `chg` row to `~/.chg/shadow/<repo>.jsonl` and removes the worktree.
 
@@ -71,7 +71,8 @@ Cutover (one PR in the product repo, after the report says ready): set `[gate] m
 case "$(chg gate 2>/dev/null || echo off)" in
   on) chg check --sha "$GATE_SHA" --base "$BASE_SHA"; status=$? ;
       # 3 = the gate was switched off between the two calls: run the old one. 2 (no
-      # verdict, or the tree is not exactly $GATE_SHA) blocks the push like a failure.
+      # verdict; or, when chg had to check the live tree, that tree is not exactly
+      # $GATE_SHA) blocks the push like a failure.
       [ "$status" -eq 3 ] && { run_the_existing_gate; status=$?; } ;;
   *)  run_the_existing_gate; status=$? ;;
 esac

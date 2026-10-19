@@ -1,5 +1,7 @@
-//! `chg check` (design §3.7): the static checks, then the affected tests of the working
-//! tree against its base, through the repo's adapter.
+//! `chg check` (design §3.7): the static checks, then the affected tests of a tree against
+//! its base, through the repo's adapter. The tree is a worktree of the commit at the
+//! snapshot build path (`scratch::check_at_build`), or the live tree when that path
+//! cannot be used.
 //!
 //! Static runs first and a failure stops there, as the gate it replaces does. `affected`
 //! that breaks the contract fails closed to the whole suite (`chg adapter exec`'s rule),

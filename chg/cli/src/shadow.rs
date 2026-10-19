@@ -29,15 +29,14 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::check::{self, Outcome, Verdict};
+use crate::check::{Outcome, Verdict};
 use crate::git;
-use crate::scratch::Scratch;
+use crate::scratch::{self, AtBuild};
 use crate::store::{Store, now_ms};
-use crate::ws::{self, Hydrated};
 
 pub const ROW_VERSION: u32 = 1;
 /// The `source` of a gate row filled in from a CI check run (`--ci-check`).
@@ -326,7 +325,7 @@ pub fn run_foreground(repo: &Path, sha: &str, base: &str) -> Result<Row, String>
     let key = git::repo_key(repo);
     let row = judge(repo, &key, sha, base);
     append(&log_path(&key), &row)?;
-    refresh(repo, base);
+    refresh(repo, base, false);
     Ok(row)
 }
 
@@ -336,7 +335,12 @@ pub fn run_foreground(repo: &Path, sha: &str, base: &str) -> Result<Row, String>
 /// and must not hold the next gate back for it. So it runs at nice 19 with every
 /// inherited descriptor closed, the gate lock's among them. The refresh decides the rest
 /// under the build lock: never cold, never queued behind another build, then GC.
-fn refresh(repo: &Path, base: &str) {
+///
+/// With `own_log`, its output goes to `~/.chg/shadow/logs/<repo>-refresh-<base12>.log`
+/// (pruned with the other logs) instead of wherever this process's does. A gate-mode check needs that: a hook
+/// reading its stdout or stderr through a pipe would otherwise wait for the refresh to
+/// close it, and its stdout must hold only the verdict.
+pub fn refresh(repo: &Path, base: &str, own_log: bool) {
     let spawned = (|| {
         let git_dir = git::common_dir(repo)?;
         let mut c = chg_command()?;
@@ -347,6 +351,21 @@ fn refresh(repo: &Path, base: &str) {
             .arg(REFRESH_TIMEOUT.as_secs().to_string())
             .current_dir(&git_dir)
             .stdin(Stdio::null());
+        if own_log {
+            let logs = home().join("shadow").join("logs");
+            let log = logs.join(format!(
+                "{}-refresh-{}.log",
+                git::repo_key(repo),
+                &base[..base.len().min(12)]
+            ));
+            let out = fs::create_dir_all(&logs)
+                .and_then(|_| File::create(&log))
+                .map_err(|e| format!("opening {}: {e}", log.display()))?;
+            let err = out
+                .try_clone()
+                .map_err(|e| format!("{}: {e}", log.display()))?;
+            c.stdout(out).stderr(err);
+        }
         for v in git::HOOK_ENV {
             c.env_remove(v);
         }
@@ -368,7 +387,7 @@ fn refresh(repo: &Path, base: &str) {
             .map_err(|e| format!("starting {}: {e}", Path::new(c.get_program()).display()))
     })();
     if let Err(e) = spawned {
-        eprintln!("chg: shadow could not refresh the snapshot of {base}: {e}");
+        eprintln!("chg: could not start a refresh of the snapshot of {base}: {e}");
     }
 }
 
@@ -414,34 +433,22 @@ fn judge(repo: &Path, key: &str, sha: &str, base: &str) -> Row {
         }
         Err(e) => return skipped(format!("shadow lock: {e}")),
     };
-    // One fixed path per repo, the one snapshots are built at: its workspace slot, so its
-    // test database, is the same on every run, and the build lock makes it ours alone.
-    let scratch = match Scratch::at(&git_dir, &store.build_dir(), sha) {
-        Ok(s) => s,
-        Err(e) => return failed(0, e),
-    };
-
-    let t = Instant::now();
-    let hydrated = ws::hydrate(&scratch.path);
-    let hydrate_ms = t.elapsed().as_millis() as u64;
-    match hydrated {
-        Ok(Hydrated::Done { .. }) => {}
-        Ok(Hydrated::NoSnapshot) => {
-            return Row::from_check(
-                key,
-                sha,
-                base,
-                hydrate_ms,
-                Verdict::skipped(format!(
-                    "no snapshot is an ancestor of {sha}; a cold build would compete with the real gate (build one with `chg snapshot build`)"
-                )),
-            );
-        }
-        Err(e) => return failed(hydrate_ms, format!("hydrate: {e}")),
+    match scratch::check_at_build(&git_dir, &store, sha, base, false) {
+        AtBuild::Checked {
+            verdict,
+            hydrate_ms,
+        } => Row::from_check(key, sha, base, hydrate_ms, verdict),
+        AtBuild::NoSnapshot { hydrate_ms } => Row::from_check(
+            key,
+            sha,
+            base,
+            hydrate_ms,
+            Verdict::skipped(format!(
+                "no snapshot is an ancestor of {sha}; a cold build would compete with the real gate (build one with `chg snapshot build`)"
+            )),
+        ),
+        AtBuild::Failed { why, hydrate_ms } => failed(hydrate_ms, why),
     }
-    let v = check::run(&scratch.path, base, false);
-    drop(scratch);
-    Row::from_check(key, sha, base, hydrate_ms, v)
 }
 
 // ---------------------------------------------------------------------------------------

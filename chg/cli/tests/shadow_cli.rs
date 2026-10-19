@@ -245,6 +245,146 @@ fn check_runs_static_then_the_affected_tests() {
 }
 
 #[test]
+fn a_gate_mode_check_judges_the_commit_where_snapshots_are_built() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let old = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&old)
+        .assert()
+        .success();
+    // The base has no snapshot yet, so the refresh after the check really builds one.
+    let base = env.commit("lib/b.ex", "b\n");
+    env.commit("lib/a.ex", "two\n");
+    fs::write(env.repo.join("lib/a.ex"), "uncommitted\n").unwrap();
+    let built_at = env
+        .calls()
+        .lines()
+        .find_map(|l| l.strip_prefix("snapshot ").map(String::from))
+        .unwrap();
+    fs::remove_file(&env.calls).unwrap();
+
+    // A slow refresh: the check must return without waiting for it, with only its
+    // verdict on stdout.
+    let started = Instant::now();
+    let out = env
+        .chg()
+        .args(["check", "--base", &base])
+        .env("SNAP_SLEEP", "15")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "waited for the refresh"
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["verdict"], "pass", "{v}");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("checking the live tree"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Every adapter call ran at the build path, none in the live tree, whose uncommitted
+    // change is neither judged nor touched.
+    let calls = env.calls();
+    let ran: Vec<&str> = calls
+        .lines()
+        .filter(|l| {
+            ["static ", "affected ", "run "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .map(|l| l.split_once(' ').unwrap().1)
+        .collect();
+    assert!(!ran.is_empty(), "{calls}");
+    assert!(ran.iter().all(|d| *d == built_at), "{calls}");
+    assert_eq!(
+        fs::read_to_string(env.repo.join("lib/a.ex")).unwrap(),
+        "uncommitted\n"
+    );
+    assert_eq!(env.worktrees(), 1, "the build-path worktree is removed");
+    // The refresh builds the base's snapshot, its output in a log of its own.
+    let log = env
+        .home
+        .join(format!("shadow/logs/product-refresh-{}.log", &base[..12]));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let snaps = || {
+        let out = env
+            .chg()
+            .args(["snapshot", "list"])
+            .output()
+            .unwrap()
+            .stdout;
+        String::from_utf8_lossy(&out).contains(&base)
+    };
+    while !snaps() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(snaps(), "the base's snapshot was built");
+    let logged = || fs::read_to_string(&log).unwrap_or_default();
+    while !logged().contains("\"status\":\"built\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(logged().contains("\"status\":\"built\""), "{}", logged());
+
+    // While a snapshot build holds the build path, the gate does not wait for it: it
+    // checks the live tree at once.
+    let next = env.commit("lib/c.ex", "c\n");
+    fs::remove_file(&env.calls).unwrap();
+    let mut build = Std::new(assert_cmd::cargo::cargo_bin("chg"))
+        .current_dir(&env.repo)
+        .env("CHG_HOME", &env.home)
+        .env("CHG_STORE", &env.store)
+        .env("CALLS", &env.calls)
+        .env("SNAP_SLEEP", "15")
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&next)
+        .spawn()
+        .unwrap();
+    while !env.calls().starts_with("snapshot ") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let started = Instant::now();
+    env.chg()
+        .args(["check", "--base", &base])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("holds the build path"));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "waited for the build"
+    );
+    let live = format!(" {}", env.repo.display());
+    assert!(
+        env.calls()
+            .lines()
+            .any(|l| l.starts_with("run ") && l.ends_with(&live)),
+        "{}",
+        env.calls()
+    );
+    build.wait().unwrap();
+
+    // With no snapshot to start from, the live tree is checked, as before.
+    let cold = Env::plain();
+    cold.chg()
+        .args(["check", "--base", "HEAD"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("checking the live tree"));
+    let live = format!(" {}", cold.repo.display());
+    assert!(
+        cold.calls().lines().all(|l| l.ends_with(&live)),
+        "{}",
+        cold.calls()
+    );
+}
+
+#[test]
 fn check_with_the_gate_off_exits_3_without_running_anything() {
     let env = Env::plain();
     env.chg()
