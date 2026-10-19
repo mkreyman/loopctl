@@ -1,9 +1,9 @@
 defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
   @moduledoc """
-  `Loopctl.Delivery.DispatchPayload.dispatch_route/2` and `thread_branch/3` (US-45.4): the
-  merge mode, base branch and branch a story's CURRENT claim was placed under, read from the
-  implement ledger row of that claim its runner accepted, and the branch a thread is judged on. The merge gate judges a story on this route,
-  so a later source change, a triage row, or a dispatch that never ran must not change it.
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/4`: the base branch and branch a story's
+  CURRENT claim was placed under, read from the implement ledger row of that claim its runner
+  accepted. Story verification judges a story on this route, so a later source change, a
+  triage row, or a dispatch that never ran must not change it.
   """
 
   use Loopctl.DataCase, async: true
@@ -31,7 +31,6 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
           claim_epoch: Keyword.get(fields, :claim_epoch, ctx.story.claim_epoch),
           kind: Keyword.get(fields, :kind, "implement"),
           branch: Keyword.get(fields, :branch),
-          mode: Keyword.get(fields, :mode),
           base_branch: Keyword.get(fields, :base_branch),
           status: status,
           # `runner_dispatches_reason_iff_refused`: a refused row carries its reason.
@@ -46,95 +45,69 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     row
   end
 
-  defp route(ctx), do: DispatchPayload.dispatch_route(ctx.story.tenant_id, ctx.story)
+  defp route(ctx), do: route(ctx.story.tenant_id, ctx.story, ctx.story.claim_epoch)
 
-  defp thread_branch(ctx, stage_branch \\ nil) do
-    {:ok, route} = route(ctx)
-    DispatchPayload.thread_branch(route, ctx.story, stage_branch)
-  end
+  defp route(tenant_id, story, epoch),
+    do: DispatchPayload.dispatch_route(tenant_id, story, epoch, [])
 
   @t1 ~U[2026-09-26 10:00:00.000000Z]
   @t2 ~U[2026-09-26 11:00:00.000000Z]
   @t3 ~U[2026-09-26 12:00:00.000000Z]
 
-  test "the mode is the one the claim's dispatch recorded at placement", ctx do
-    record(ctx, @t1, mode: "thread", branch: "agent/b")
-
-    assert {:ok, %{mode: :thread, branch: "agent/b"}} = route(ctx)
-  end
-
   test "the base branch is the one the claim's dispatch was sent with; none is nil", ctx do
     assert {:ok, %{base_branch: nil}} = route(ctx)
 
-    record(ctx, @t1, mode: "thread", base_branch: "trunk")
+    record(ctx, @t1, base_branch: "trunk")
     assert {:ok, %{base_branch: "trunk"}} = route(ctx)
   end
 
-  test "dispatch_route/4 reads the claim of the epoch it is given, not the current one (US-45.7)",
+  test "dispatch_route/4 reads the claim of the epoch it is given, not the current one",
        ctx do
     earlier = ctx.story.claim_epoch
-    record(ctx, @t1, mode: "thread", base_branch: "release-1", claim_epoch: earlier)
-    record(ctx, @t2, mode: "thread", base_branch: "main", claim_epoch: earlier + 1)
+    record(ctx, @t1, base_branch: "release-1", claim_epoch: earlier)
+    record(ctx, @t2, base_branch: "main", claim_epoch: earlier + 1)
 
     story = %{ctx.story | claim_epoch: earlier + 1}
 
-    assert {:ok, %{base_branch: "main"}} = DispatchPayload.dispatch_route(story.tenant_id, story)
+    assert {:ok, %{base_branch: "main"}} = route(story.tenant_id, story, story.claim_epoch)
 
     assert {:ok, %{base_branch: "release-1"}} =
-             DispatchPayload.dispatch_route(story.tenant_id, story, earlier)
+             route(story.tenant_id, story, earlier)
 
     assert {:ok, %{base_branch: nil}} =
-             DispatchPayload.dispatch_route(story.tenant_id, story, earlier + 7)
+             route(story.tenant_id, story, earlier + 7)
   end
 
-  test "a row that recorded no mode is pr; NO row is nil, for the caller's source fallback",
-       ctx do
-    assert {:ok, %{mode: nil, branch: nil, base_branch: nil}} = route(ctx)
-
-    record(ctx, @t1, branch: "agent/b")
-    assert {:ok, %{mode: :pr}} = route(ctx)
-  end
-
-  test "thread branch order: the current claim's dispatch, then the stage's, then derived",
-       ctx do
-    {:ok, derived} = DispatchPayload.branch_for(ctx.story, [])
-    assert {:ok, ^derived} = thread_branch(ctx)
-    assert {:ok, "loop/earlier-claim"} = thread_branch(ctx, "loop/earlier-claim")
-
-    # Round 3 finding 1: the stage row still names an EARLIER claim's branch after a re-claim;
-    # the current claim's dispatched branch wins over it.
-    record(ctx, @t1, branch: "agent/dispatched")
-    assert {:ok, "agent/dispatched"} = thread_branch(ctx)
-    assert {:ok, "agent/dispatched"} = thread_branch(ctx, "loop/earlier-claim")
+  test "NO row is all nil, for the caller's source fallback", ctx do
+    assert {:ok, %{branch: nil, base_branch: nil}} = route(ctx)
   end
 
   test "the newest ACCEPTED row, of the CURRENT claim, of an implement kind", ctx do
-    record(ctx, @t1, mode: "thread", branch: "agent/ran")
-    record(ctx, @t2, mode: "pr", branch: "agent/refused", status: "refused")
-    record(ctx, @t2, mode: "pr", branch: "agent/sent", status: "sent")
-    record(ctx, @t2, mode: "pr", branch: "agent/triage", kind: "triage")
+    record(ctx, @t1, branch: "agent/ran")
+    record(ctx, @t2, branch: "agent/refused", status: "refused")
+    record(ctx, @t2, branch: "agent/sent", status: "sent")
+    record(ctx, @t2, branch: "agent/triage", kind: "triage")
 
     record(ctx, @t3,
-      mode: "pr",
       branch: "agent/other-claim",
       claim_epoch: ctx.story.claim_epoch + 1
     )
 
-    assert {:ok, %{mode: :thread, branch: "agent/ran"}} = route(ctx)
+    assert {:ok, %{branch: "agent/ran"}} = route(ctx)
 
     # A superseded row names a claim that has moved on, never the current one's route.
-    record(ctx, @t3, mode: "pr", branch: "agent/superseded", status: "superseded")
-    assert {:ok, %{mode: :thread, branch: "agent/ran"}} = route(ctx)
+    record(ctx, @t3, branch: "agent/superseded", status: "superseded")
+    assert {:ok, %{branch: "agent/ran"}} = route(ctx)
 
-    record(ctx, @t3, mode: "pr", branch: "agent/newer")
-    assert {:ok, %{mode: :pr, branch: "agent/newer"}} = route(ctx)
+    record(ctx, @t3, branch: "agent/newer")
+    assert {:ok, %{branch: "agent/newer"}} = route(ctx)
   end
 
   test "another tenant's dispatch is never read (tenant isolation)", ctx do
-    record(ctx, @t1, mode: "thread", branch: "agent/mine")
+    record(ctx, @t1, branch: "agent/mine")
     other = fixture(:stage_story, %{})
 
-    assert {:ok, %{mode: nil, branch: nil}} =
-             DispatchPayload.dispatch_route(other.tenant_id, ctx.story)
+    assert {:ok, %{branch: nil}} =
+             route(other.tenant_id, ctx.story, ctx.story.claim_epoch)
   end
 end

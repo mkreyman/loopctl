@@ -1,16 +1,13 @@
 defmodule Loopctl.Delivery.CiDefinition do
   @moduledoc """
-  Whether a change touches the definitions its own CI runs (US-45.6, lifted for US-26.4.6).
+  Whether a change touches the definitions its own CI runs (US-26.4.6).
   Pure.
 
   GitHub Actions runs the workflow files of the commit under test, so a change that edits
   `.github/workflows/` — or a composite action they call — can make its own required checks
-  report green: the implementer attesting its own work through a job it wrote. Two callers
-  refuse such a change rather than judge it on that CI, and both call `reasons/1` so they
-  cannot disagree about what counts:
-
-  - the thread merge gate (`Loopctl.Delivery.MergePrecondition`), before it merges a checkpoint
-  - story verification (`Loopctl.Verification.GitHubActions`), before it records a CI verdict
+  report green: the implementer attesting its own work through a job it wrote. Story
+  verification (`Loopctl.Verification.GitHubActions`) refuses such a change before it records a
+  CI verdict, rather than judge it on that CI.
 
   Matched on every name the diff carries, renames' old and new names included, so moving a
   workflow file is caught too, and on any composite action's `action.yml`, wherever it sits.

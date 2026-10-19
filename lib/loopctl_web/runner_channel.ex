@@ -91,32 +91,6 @@ defmodule LoopctlWeb.RunnerChannel do
   first copy caused. Like `stage`, it does not check the custody halt: it records what a
   session already did.
 
-  Since 1.21.0 the same message also ends a REVIEW session
-  (`Loopctl.Delivery.RunnerReviews.end_session/3`): recorded once on its ledger row, the slot
-  freed, and nothing else — no stage effect, no retry-ceiling count. Its reply is `kind` and
-  `replayed` only.
-
-  ## Change threads (contract 1.20.0, US-45.2)
-
-  `"checkpoint"` (`RunnerCheckpoint`) is a commit the session pushed, and `"thread_entry"`
-  (`RunnerThreadEntry`) a note it wants on the story's thread. Each is cast by the contract,
-  metered by its own bucket (`RunnerContract.checkpoint_burst/0`,
-  `RunnerContract.thread_entry_burst/0`), and applied by `Loopctl.Delivery.RunnerThreads`,
-  which resolves the runner's implement dispatch to its story (accepted, for a new write) and calls
-  `Loopctl.Threads` — the function the HTTP surface calls, with the same claimant fence. The
-  channel opens no second write path to a thread. The reply is the recorded id, its `seq` and
-  `replayed`, and an identical resend is answered `ok` with `replayed: true`. Like `stage`,
-  neither checks the custody halt: each records what a session already did.
-
-  ## Reviews (contract 1.21.0, US-45.3)
-
-  `"review_finding"` (`RunnerReviewFinding`) and `"review_verdict"` (`RunnerReviewVerdict`) are
-  a review session's judgements. Each is cast by the contract, metered by its own bucket, and
-  applied by `Loopctl.Delivery.RunnerReviews`, which resolves the runner's `review` dispatch
-  from the ledger and calls `Loopctl.Threads.record_judgement/5`, the ONE write path a
-  judgement has. Unlike the thread's other messages these DO check the custody halt
-  (`tenant_halted`): a judgement decides what may merge.
-
   ## What an operator can see (issue #815)
 
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
@@ -140,9 +114,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
-  alias Loopctl.Delivery.RunnerReviews
   alias Loopctl.Delivery.RunnerStages
-  alias Loopctl.Delivery.RunnerThreads
   alias Loopctl.Delivery.TriageVerdict
   alias Loopctl.LogValue
   alias Loopctl.Runners
@@ -167,14 +139,6 @@ defmodule LoopctlWeb.RunnerChannel do
   @session_ended_capacity RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
   @session_ended_refill_ms RunnerContract.session_ended_burst()
                            |> Map.fetch!("refill_interval_ms")
-  @checkpoint_capacity RunnerContract.checkpoint_burst() |> Map.fetch!("capacity")
-  @checkpoint_refill_ms RunnerContract.checkpoint_burst() |> Map.fetch!("refill_interval_ms")
-  @entry_capacity RunnerContract.thread_entry_burst() |> Map.fetch!("capacity")
-  @entry_refill_ms RunnerContract.thread_entry_burst() |> Map.fetch!("refill_interval_ms")
-  @finding_capacity RunnerContract.review_finding_burst() |> Map.fetch!("capacity")
-  @finding_refill_ms RunnerContract.review_finding_burst() |> Map.fetch!("refill_interval_ms")
-  @verdict_capacity RunnerContract.review_verdict_burst() |> Map.fetch!("capacity")
-  @verdict_refill_ms RunnerContract.review_verdict_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -214,10 +178,6 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:stage_bucket, :full)
        |> assign(:verdict_bucket, :full)
        |> assign(:session_ended_bucket, :full)
-       |> assign(:checkpoint_bucket, :full)
-       |> assign(:thread_entry_bucket, :full)
-       |> assign(:review_finding_bucket, :full)
-       |> assign(:review_verdict_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -445,9 +405,7 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   # Why an implement session ended (contract 1.16.0, US-44.3). The runner states the fact;
-  # `RunnerStages.end_session/4` records it once and decides what it does to the story. A
-  # REVIEW session's report (1.21.0) goes to `RunnerReviews.end_session/3` instead, which only
-  # frees its slot.
+  # `RunnerStages.end_session/4` records it once and decides what it does to the story.
   #
   # IDEMPOTENT, and the ack says which it was, for the reason `triage_verdict`'s does: the
   # session that ended cannot say it again differently, so a runner refused for anything
@@ -463,81 +421,6 @@ defmodule LoopctlWeb.RunnerChannel do
       fn message ->
         with {:ok, held} <- RunnerStages.held_dispatch(tenant_id, runner.id, message.dispatch_id),
              do: end_session(tenant_id, runner, message, held)
-      end
-    )
-  end
-
-  # A commit the session pushed (contract 1.20.0, US-45.2). `RunnerThreads` resolves the
-  # dispatch to its story and records it through `Loopctl.Threads`, fenced on the claim.
-  # IDEMPOTENT, and the ack says which it was: a resend after a lost ack is the same bytes.
-  defp handle_message("checkpoint", payload, socket) do
-    %{runner: runner, tenant_id: tenant_id} = socket.assigns
-
-    bucketed(
-      socket,
-      "checkpoint",
-      RunnerContract.cast_checkpoint(payload),
-      {:checkpoint_bucket, @checkpoint_capacity, @checkpoint_refill_ms},
-      fn message ->
-        with {:ok, %{checkpoint: checkpoint, replayed?: replayed?}} <-
-               RunnerThreads.record_checkpoint(tenant_id, runner, message),
-             do: {:ok, %{checkpoint_id: checkpoint.id, seq: checkpoint.seq, replayed: replayed?}}
-      end
-    )
-  end
-
-  # A note the session puts on the story's thread (contract 1.20.0, US-45.2), keyed
-  # `<dispatch_id>:<client_seq>` so a resend is recognised as the same note.
-  defp handle_message("thread_entry", payload, socket) do
-    %{runner: runner, tenant_id: tenant_id} = socket.assigns
-
-    bucketed(
-      socket,
-      "thread_entry",
-      RunnerContract.cast_thread_entry(payload),
-      {:thread_entry_bucket, @entry_capacity, @entry_refill_ms},
-      fn message ->
-        with {:ok, %{entry: entry, replayed?: replayed?}} <-
-               RunnerThreads.record_entry(tenant_id, runner, message),
-             do: {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}
-      end
-    )
-  end
-
-  # A review's finding (contract 1.21.0, US-45.3), bound to the review loopctl recorded for the
-  # dispatch and this runner. Idempotent on `<dispatch_id>:<client_seq>` within the review.
-  defp handle_message("review_finding", payload, socket) do
-    %{runner: runner, tenant_id: tenant_id} = socket.assigns
-
-    bucketed(
-      socket,
-      "review_finding",
-      RunnerContract.cast_review_finding(payload),
-      {:review_finding_bucket, @finding_capacity, @finding_refill_ms},
-      fn message ->
-        with {:ok, %{entry: entry, replayed?: replayed?}} <-
-               RunnerReviews.record_finding(tenant_id, runner, message),
-             do: {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}
-      end
-    )
-  end
-
-  # A review's ONE verdict (contract 1.21.0, US-45.3): it completes the round and ends the
-  # review.
-  defp handle_message("review_verdict", payload, socket) do
-    %{runner: runner, tenant_id: tenant_id} = socket.assigns
-
-    bucketed(
-      socket,
-      "review_verdict",
-      RunnerContract.cast_review_verdict(payload),
-      {:review_verdict_bucket, @verdict_capacity, @verdict_refill_ms},
-      fn message ->
-        with {:ok, %{entry: entry, replayed?: replayed?, escalated?: escalated?}} <-
-               RunnerReviews.record_verdict(tenant_id, runner, message),
-             do:
-               {:ok,
-                %{entry_id: entry.id, seq: entry.seq, replayed: replayed?, escalated: escalated?}}
       end
     )
   end
@@ -651,21 +534,12 @@ defmodule LoopctlWeb.RunnerChannel do
   # sends the same row for the same reason (#849) and the two must not be able to drift.
   defp stage_ack(row), do: RunnerStages.row_state(row)
 
-  # Routed on the kind of the row read ONCE for this report. A review session (1.21.0) frees
-  # its slot and touches no stage, so its ack carries no row: only what it was and whether this
-  # was a resend.
-  defp end_session(tenant_id, runner, message, %{kind: kind} = held) do
-    if kind == RunnerReviews.kind() do
-      with {:ok, %{replayed?: replayed?}} <-
-             RunnerReviews.end_session(tenant_id, runner, message),
-           do: {:ok, %{kind: kind, replayed: replayed?}}
-    else
-      with {:ok, %{row: row, replayed?: replayed?}} <-
-             RunnerStages.end_held_session(tenant_id, runner.id, message, held,
-               actor_id: runner.api_key_id
-             ),
-           do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
-    end
+  defp end_session(tenant_id, runner, message, held) do
+    with {:ok, %{row: row, replayed?: replayed?}} <-
+           RunnerStages.end_held_session(tenant_id, runner.id, message, held,
+             actor_id: runner.api_key_id
+           ),
+         do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
   end
 
   defp rate_limited(socket, event, min_interval_ms),
@@ -988,7 +862,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
   # The lock wait of the ledger writes this channel makes DIRECTLY (push, drop, reply, trace,
   # slot reservation): `Capacity.lock_timeout_ms/0`, unless the SOCKET carries
-  # `:lock_timeout_ms`. The writes behind `RunnerStages` and `RunnerReviews` (a session's end,
+  # `:lock_timeout_ms`. The writes behind `RunnerStages` (a session's end,
   # the slot a stage report frees) are not given it and always wait the deployed bound: no
   # test takes their busy path, so a shorter wait there would buy nothing. Nothing a runner sends can set it:
   # `LoopctlWeb.RunnerSocket.connect/3` never assigns it and no join or message param reaches

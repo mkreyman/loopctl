@@ -341,15 +341,15 @@ describe("intake_source_enroll", () => {
       {
         repo_full_name: REPO,
         project_id: PROJECT_ID,
-        mode: "thread",
+        mode: "pr",
         secret_file: secretFileIn("m-b"),
       },
       deps({ apiCall }),
     );
-    assert.equal(calls[1].body.mode, "thread");
+    assert.equal(calls[1].body.mode, "pr");
   });
 
-  test("sends required_checks only when given (US-45.6)", async () => {
+  test("sends required_checks only when given", async () => {
     const { calls, apiCall } = fakeApi(created(), created());
 
     await enrollIntakeSource(
@@ -362,7 +362,6 @@ describe("intake_source_enroll", () => {
       {
         repo_full_name: REPO,
         project_id: PROJECT_ID,
-        mode: "thread",
         required_checks: ["test", "lint"],
         secret_file: secretFileIn("rc-b"),
       },
@@ -386,7 +385,6 @@ describe("intake_source_enroll", () => {
         {
           repo_full_name: REPO,
           project_id: PROJECT_ID,
-          mode: "thread",
           required_checks: bad,
           secret_file: secretFileIn(`rc-bad-${i}.secret`),
         },
@@ -400,7 +398,7 @@ describe("intake_source_enroll", () => {
   });
 
   test("an unknown or null mode is refused locally, without enrolling anything", async () => {
-    for (const [i, bad] of [null, "", "merge"].entries()) {
+    for (const [i, bad] of [null, "", "merge", "thread"].entries()) {
       const { calls, apiCall } = fakeApi(created());
 
       const result = await enrollIntakeSource(
@@ -414,7 +412,7 @@ describe("intake_source_enroll", () => {
       );
 
       assert.equal(result.error, true);
-      assert.match(result.body, /`mode` must be `pr` or `thread`/);
+      assert.match(result.body, /`mode` must be `pr`/);
       assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
     }
   });
@@ -789,16 +787,13 @@ describe("intake_source_update", () => {
     assert.equal(calls.length, 0);
   });
 
-  test("mode alone is a complete update, and is forwarded as named (US-45.4)", async () => {
-    const { calls, apiCall } = fakeApi({ source: { ...created().source, mode: "thread" } });
+  test("mode alone is a complete update, and is forwarded as named", async () => {
+    const { calls, apiCall } = fakeApi({ source: { ...created().source, mode: "pr" } });
 
-    const result = await updateIntakeSource(
-      { source_id: SOURCE_ID, mode: "thread" },
-      deps({ apiCall }),
-    );
+    const result = await updateIntakeSource({ source_id: SOURCE_ID, mode: "pr" }, deps({ apiCall }));
 
-    assert.deepEqual(calls[0].body, { mode: "thread" });
-    assert.equal(result.source.mode, "thread");
+    assert.deepEqual(calls[0].body, { mode: "pr" });
+    assert.equal(result.source.mode, "pr");
   });
 
   test("required_checks alone is a complete update, forwarded as named (US-45.6)", async () => {
@@ -828,7 +823,7 @@ describe("intake_source_update", () => {
       deps({ apiCall }),
     );
 
-    assert.match(result.body, /`mode` must be `pr` or `thread`/);
+    assert.match(result.body, /`mode` must be `pr`/);
     assert.equal(calls.length, 0);
   });
 
@@ -1082,15 +1077,15 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
-  test("both write tools declare mode with exactly the two values the server accepts", () => {
+  test("both write tools declare mode with exactly the value the server accepts", () => {
     for (const name of ["intake_source_enroll", "intake_source_update"]) {
       const tool = loadTools().find((t) => t.name === name);
       // Copied out of the vm realm the declarations were evaluated in, so deepEqual compares
       // values and not array prototypes.
-      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], ["pr", "thread"], name);
+      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], ["pr"], name);
     }
     for (const text of [description("intake_source_enroll"), row("intake_source_enroll")]) {
-      assert.match(text, /thread/, "it never says what thread mode does");
+      assert.ok(!/thread/.test(text), "it still describes the retired thread mode");
     }
   });
 
@@ -1116,27 +1111,6 @@ describe("the descriptions carry what a caller needs instead of the controller",
         `${name}'s README row`,
       );
       assert.ok(!/tenant and (this )?repository (are )?in/.test(row(name)), `${name}'s README row still says the pair gates no_required_checks`);
-    }
-  });
-
-  test("both write tools say a thread source needs runners at contract 1.20.0 (US-45.4)", () => {
-    for (const name of ["intake_source_enroll", "intake_source_update"]) {
-      const tool = loadTools().find((t) => t.name === name);
-      assert.match(tool.inputSchema.properties.mode.description, /1\.20\.0/, name);
-      assert.match(tool.inputSchema.properties.mode.description, /no_checkpoint_recorded/, name);
-    }
-  });
-
-  test("both write tools say the mode is bound at placement, so a change is always allowed", () => {
-    for (const text of [
-      description("intake_source_update"),
-      row("intake_source_update"),
-      description("intake_source_enroll"),
-      row("intake_source_enroll"),
-    ]) {
-      assert.match(text, /placed/, "it never says the mode is bound at placement");
-      assert.match(text, /always allowed/, "it never says a mode change is always allowed");
-      assert.ok(!/stories_in_flight/.test(text), "it still names a refusal that no longer exists");
     }
   });
 

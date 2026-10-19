@@ -12,10 +12,8 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
       verified at, so the change goes back to `implementing`. New commits are ordinary; this
       is not an escalation
     - `:unevaluated` — nothing was decided yet, and nothing transitions; the caller retries.
-      Either a TRANSIENT fault (the forge, or database contention), which one network blip
-      must not turn into a parked story, or — THREAD mode (US-45.6) — required CI checks
-      still running or not yet reported on the checkpoint's commit. Only the first counts
-      toward the consecutive-unevaluated bound; a CI wait is bounded in time instead
+      A TRANSIENT fault (the forge, or database contention), which one network blip must not
+      turn into a parked story
   - `reasons` — every reason the decision is what it is, all of them rather than the first,
     so one escalation names the whole list. Empty on `:allow` and on an authorised
     `:already_merged`
@@ -29,27 +27,15 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     verified at. Known even when the forge cannot be reached, which is why the
     consecutive-unevaluated count is kept per THIS head rather than the forge's
   - `retry_after` — on `:unevaluated`, the seconds the forge asked a caller to wait, when it
-    said so at all, or `MergePrecondition.ci_wait_retry_after/0` for a CI wait. The endpoint sends it as `Retry-After`; the dominant cause of an
+    said so at all. The endpoint sends it as `Retry-After`; the dominant cause of an
     unevaluated verdict is a rate limit, so an unbounded retry would amplify the very
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
-    A verdict is only ever about the diff at THIS head. In THREAD mode `merge_base_sha` is
-    what a thread-mode allow records as `base_sha`, and the merge executor (US-45.5) merges
-    only while the base head still equals it, taking the base-update path otherwise
-  - `mode` — `:pr` or `:thread`: the mode BOUND on the claim's implement dispatch at
-    placement (US-45.4), not the intake source's current mode. nil when the route could not
-    be read (the verdict is then `:unevaluated`)
-  - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
-    in thread mode is recorded naming both
-  - `ci_evidence` — THREAD mode (US-45.6): what CI said about the checkpoint's exact commit,
-    as `Loopctl.Delivery.CiEvidence.to_record/5` shapes it, and what `enforce/3` copies onto
-    the checkpoint's `gate_evidence`. nil when it was not read
+    A verdict is only ever about the diff at THIS head
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
     request that was merged before this evaluation ran
-  - `diffstat` — `%{files: n, changed_lines: n}`. In pr mode the forge's own totals, never
-    `length(files)`. In THREAD mode GitHub's comparison carries no totals, so both are derived
-    from the files it lists — and a list that reaches `@compare_file_cap` in
-    `Loopctl.Delivery.GitHubPullRequestSource` is refused as truncated rather than counted
+  - `diffstat` — `%{files: n, changed_lines: n}`: the forge's own totals, never
+    `length(files)`
   - `gate_a`, `gate_b`, `proof` — the underlying gate results, recorded whatever the
     decision, so a refusal can be read without re-running anything. `nil` for a gate that
     was never reached
@@ -81,10 +67,6 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :proof,
     :retry_after,
     :recorded_head_sha,
-    :checkpoint_id,
-    :checkpoint_sha,
-    :ci_evidence,
-    mode: :pr,
     custody: nil,
     gate_a_inputs: :missing,
     trio_outputs_ignored: false
@@ -108,10 +90,6 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_a_inputs: :persisted_triage | :human_resolution | :missing,
           trio_outputs_ignored: boolean(),
           retry_after: pos_integer() | nil,
-          recorded_head_sha: String.t() | nil,
-          mode: :pr | :thread | nil,
-          checkpoint_id: Ecto.UUID.t() | nil,
-          checkpoint_sha: String.t() | nil,
-          ci_evidence: map() | nil
+          recorded_head_sha: String.t() | nil
         }
 end

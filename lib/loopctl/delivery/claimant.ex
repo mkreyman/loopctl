@@ -1,7 +1,7 @@
 defmodule Loopctl.Delivery.Claimant do
   @moduledoc """
   The ONE definition of "this caller is the story's current claimant under this epoch", shared
-  by every path that fences on it (`Loopctl.Delivery.Escalations`, `Loopctl.Threads`).
+  by every path that fences on it (`Loopctl.Delivery.Escalations`).
 
   An UNCLAIMED story is not this caller's, and a key with no agent must never satisfy the
   check by matching that nil: an unclaimed story is refused before any comparison, so a nil

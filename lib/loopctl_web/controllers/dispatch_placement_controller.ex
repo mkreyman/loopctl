@@ -545,8 +545,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
     })
   end
 
-  # THE SAME RULE FOR THE BASE (US-45.4 review round 3, finding 3): the first push's base
-  # branch is the one the merge gate judges the thread against, so a retry may not move it.
+  # THE SAME RULE FOR THE BASE: the first push's base branch is the one the merge gate
+  # judges the change against, so a retry may not move it.
   defp refuse(conn, {:base_branch_conflict, supplied, recorded}) do
     error(conn, 422, "base_branch_conflict", %{
       message:

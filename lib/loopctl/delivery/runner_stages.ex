@@ -672,7 +672,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   line, to name the write.
 
   The ONE copy of that policy for every runner-message path that appends to the chain: the
-  stage machine's transitions here, and `Loopctl.Delivery.RunnerThreads`' thread writes.
+  stage machine's transitions here.
   """
   @spec answering_broken_chain(Ecto.UUID.t(), (-> String.t()), (-> result)) ::
           result | {:error, :audit_chain_append_failed}

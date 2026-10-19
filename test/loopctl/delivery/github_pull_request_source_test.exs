@@ -337,41 +337,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
-  describe "the thread-mode reads (US-45.4)" do
-    test "branch_head/2 reads the EXACT ref, never the prefix-matching list" do
-      stub(fn conn ->
-        assert conn.request_path == "/repos/acme/widgets/git/ref/heads/loop/abc"
-
-        json(conn, %{
-          "ref" => "refs/heads/loop/abc",
-          "object" => %{"type" => "commit", "sha" => @head}
-        })
-      end)
-
-      assert {:ok, @head} = Source.branch_head(@repo, "loop/abc")
-    end
-
-    test "branch_head/2 refuses a ref that is not a commit, and a missing branch is an api error" do
-      stub(fn conn -> json(conn, %{"object" => %{"type" => "tag", "sha" => @head}}) end)
-      assert {:error, {:unreadable_ref, _}} = Source.branch_head(@repo, "loop/abc")
-
-      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
-      assert {:error, {:github_api_error, 404}} = Source.branch_head(@repo, "loop/abc")
-    end
-
-    test "repository_readable/1 reads the repository itself, and passes its failure through" do
-      stub(fn conn ->
-        assert conn.request_path == "/repos/acme/widgets"
-        json(conn, %{"full_name" => "acme/widgets"})
-      end)
-
-      assert :ok = Source.repository_readable(@repo)
-
-      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
-      assert {:error, {:github_api_error, 404}} = Source.repository_readable(@repo)
-    end
-
-    test "commit/2 returns the commit's tree and its parents in order" do
+  describe "the one-commit reads (US-26.4.6)" do
+    test "commit/2 returns the commit's tree" do
       stub(fn conn ->
         assert conn.request_path == "/repos/acme/widgets/git/commits/#{@head}"
 
@@ -381,7 +348,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         })
       end)
 
-      assert {:ok, %{tree_sha: "t1", parents: ["p1", "p2"]}} = Source.commit(@repo, @head)
+      assert {:ok, %{tree_sha: "t1"}} = Source.commit(@repo, @head)
     end
 
     test "compare/3 reads the merge base, the base's tree and a diffstat over every file" do
@@ -765,15 +732,15 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       end)
     end
 
-    test "a read, the diff stream, the sha read and a write all carry the tenant's token" do
+    test "a read, the sha read and a write all carry the tenant's token" do
       capture_auth(fn conn ->
         case conn.method do
           "POST" -> Plug.Conn.resp(conn, 201, "{}")
-          _get -> json(conn, %{"object" => %{"sha" => @head, "type" => "commit"}})
+          _get -> json(conn, %{"tree" => %{"sha" => "t1"}})
         end
       end)
 
-      assert {:ok, @head} = Source.branch_head(@tenant_repo, "main")
+      assert {:ok, %{tree_sha: "t1"}} = Source.commit(@tenant_repo, @head)
       assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
 
       assert :ok = Source.comment_issue(@tenant_repo, 3, "done")
@@ -782,14 +749,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       capture_auth(fn conn -> sha_response(conn, 200, @head) end)
       assert {:ok, @head} = Source.resolve_commit(@tenant_repo, "aaaaaaa")
       assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
-
-      capture_auth(fn conn -> Plug.Conn.resp(conn, 200, "") end)
-      assert {:ok, _diff} = Source.checkpoint_diff(@tenant_repo, "main", @head)
-      assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
     end
 
     test "a bare repository name is refused before any request, whatever it names" do
-      assert {:error, {:invalid_repo, :unreadable}} = Source.branch_head("acme/widgets", "main")
+      assert {:error, {:invalid_repo, :unreadable}} = Source.commit("acme/widgets", @head)
       assert {:error, {:invalid_repo, :unreadable}} = Source.pull_request("acme/widgets", 7)
       assert {:error, {:invalid_repo, :unreadable}} = Source.comment_issue("acme/widgets", 3, "x")
     end
@@ -835,7 +798,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
-  describe "check_evidence/3 (US-45.6)" do
+  describe "check_evidence/3 (US-26.4.6)" do
     @branch "loop/story-7-abcd1234"
 
     defp gh_run(id, extra \\ %{}) do
@@ -899,7 +862,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
 
     # Round 1 of #910, finding 2: a run the API filter let through for another branch, event or
-    # commit is dropped here too — only the thread's own push runs are trusted.
+    # commit is dropped here too — only the branch's own push runs are trusted.
     test "a run for another branch, event or commit is never read" do
       stub_ci(%{
         runs: %{
@@ -1183,58 +1146,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
       assert {:error, {:github_api_error, 404} = reason} = Source.label_issue(@repo, 7, "x")
       refute MergePrecondition.transient?(reason)
-    end
-  end
-
-  describe "checkpoint_diff/3 (US-45.7)" do
-    test "compares the base branch with the checkpoint, asking for the diff media type" do
-      stub(fn conn ->
-        send(self(), {:diff_request, conn.request_path, Plug.Conn.get_req_header(conn, "accept")})
-        Plug.Conn.send_resp(conn, 200, "diff --git a/x b/x\n+added\n")
-      end)
-
-      assert {:ok, %{text: "diff --git a/x b/x\n+added\n", truncated: false}} =
-               Source.checkpoint_diff(@repo, "release/1.2", @head)
-
-      assert_received {:diff_request, path, ["application/vnd.github.diff"]}
-      assert path == "/repos/acme/widgets/compare/release/1.2...#{@head}"
-    end
-
-    test "chunks are accumulated in order, and the bound and the deadline both cut" do
-      far = System.monotonic_time(:millisecond) + 60_000
-      start = {Req.new(), Req.Response.new(status: 200)}
-
-      {:cont, acc} = Source.collect_diff({:data, "one "}, start, far)
-      {:cont, acc} = Source.collect_diff({:data, "two "}, acc, far)
-      {:cont, {_req, response}} = Source.collect_diff({:data, "three"}, acc, far)
-
-      assert {chunks, 13} = Req.Response.get_private(response, :diff)
-      assert IO.iodata_to_binary(chunks) == "one two three"
-      refute Req.Response.get_private(response, :truncated)
-
-      past = System.monotonic_time(:millisecond) - 1
-      {:halt, {_req, late}} = Source.collect_diff({:data, "late"}, start, past)
-      assert Req.Response.get_private(late, :truncated)
-    end
-
-    test "a diff past the byte bound is cut and marked truncated, never refused" do
-      big = String.duplicate("+", 600 * 1024)
-      stub(fn conn -> Plug.Conn.send_resp(conn, 200, big) end)
-
-      assert {:ok, %{text: text, truncated: true}} =
-               Source.checkpoint_diff(@repo, "master", @head)
-
-      assert byte_size(text) == 512 * 1024
-    end
-
-    test "a forge failure keeps the shared classification; a malformed ref or sha is refused unread" do
-      stub(fn conn -> Plug.Conn.send_resp(conn, 502, "") end)
-
-      assert {:error, {:github_api_error, 502}} = Source.checkpoint_diff(@repo, "master", @head)
-
-      assert {:error, {:invalid_sha, _}} = Source.checkpoint_diff(@repo, "master", "HEAD?x=1")
-      assert {:error, {:invalid_ref, _}} = Source.checkpoint_diff(@repo, "../../x", @head)
-      assert {:error, {:invalid_ref, _}} = Source.checkpoint_diff(@repo, nil, @head)
     end
   end
 end

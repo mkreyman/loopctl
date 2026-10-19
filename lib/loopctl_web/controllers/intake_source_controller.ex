@@ -30,31 +30,28 @@ defmodule LoopctlWeb.IntakeSourceController do
 
   tags(["Intake"])
 
-  @required_checks_doc "The CI checks a THREAD-mode checkpoint must pass on its exact commit before " <>
-                         "the merge gate allows it (US-45.6), and the checks STORY VERIFICATION " <>
-                         "judges a story's commit by in EITHER mode (US-26.4.6): GitHub Actions " <>
-                         "JOB names as they appear on the commit. A `thread` source must name at " <>
-                         "least one (422 otherwise, whichever of `mode` and `required_checks` " <>
-                         "the request named). Story verification first needs a GitHub credential " <>
+  @required_checks_doc "The checks STORY VERIFICATION judges a story's commit by (US-26.4.6): " <>
+                         "GitHub Actions JOB names as they appear on the commit. Story " <>
+                         "verification first needs a GitHub credential " <>
                          "for the tenant: its own token (`set_github_credential`) or an entry " <>
                          "in `VERIFICATION_OPERATOR_TOKEN_TENANTS` (`credential_unavailable` " <>
                          "otherwise, whatever this list holds); then a `pr` source that names " <>
                          "none records `no_required_checks` and reads nothing — naming them is " <>
-                         "how a pr-mode source opts in — and a source that names some has its " <>
+                         "how a source opts in — and a source that names some has its " <>
                          "(tenant, repository) credential resolved before any GitHub read " <>
                          "(`credential_unavailable` if there is none). At most " <>
                          "#{Source.max_required_checks()} distinct, non-blank names of at most " <>
                          "#{Source.max_check_name_bytes()} bytes, no surrounding whitespace. Only a " <>
                          "job of a GitHub Actions workflow run that a push of the story's " <>
-                         "branch triggered, concluding `success`, satisfies one — for a pr " <>
-                         "source too, so a check that runs only `on: pull_request` never " <>
+                         "branch triggered, concluding `success`, satisfies one, so a " <>
+                         "check that runs only `on: pull_request` never " <>
                          "satisfies verification. Each required job must run on every push " <>
                          "to the story branches (no path " <>
-                         "filter or job-level `if:`): one that never appears is refused after " <>
-                         "the merge gate's CI wait. " <>
+                         "filter or job-level `if:`): one that never appears leaves the story " <>
+                         "unverified. " <>
                          "`local-gate` is refused (422): " <>
-                         "that status is posted by whoever pushed, so it is recorded on the " <>
-                         "checkpoint and can never satisfy a required check."
+                         "that status is posted by whoever pushed, so it can never satisfy a " <>
+                         "required check."
 
   @source_schema %Schema{
     type: :object,
@@ -101,14 +98,10 @@ defmodule LoopctlWeb.IntakeSourceController do
       },
       mode: %Schema{
         type: :string,
-        enum: ["pr", "thread"],
+        enum: ["pr"],
         description:
-          "How this repository's changes reach its base branch. `pr` (the default, and " <>
-            "what every source did before the field existed): the merge gate reads a pull " <>
-            "request by number. `thread`: the merge gate reads the story's latest RECORDED " <>
-            "thread checkpoint and needs no pull request (Epic 45 change threads). Bound to " <>
-            "each implement dispatch when it is placed, so it decides what LATER placements " <>
-            "get."
+          "How this repository's changes reach its base branch. `pr`, the only mode: the " <>
+            "merge gate reads a pull request by number."
       },
       revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
       inserted_at: %Schema{type: :string, format: :"date-time"},
@@ -154,17 +147,10 @@ defmodule LoopctlWeb.IntakeSourceController do
            },
            mode: %Schema{
              type: :string,
-             enum: ["pr", "thread"],
+             enum: ["pr"],
              description:
-               "Optional. `pr` (the default when omitted) or `thread`. A `thread` source's " <>
-                 "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
-                 "pull request (see `POST /stories/:id/merge-precondition`); its runners " <>
-                 "must be at runner contract 1.20.0 or later and send `checkpoint` " <>
-                 "messages, or every story is refused `no_checkpoint_recorded`. NOT " <>
-                 "nullable: an explicit null or any other value is a 422. " <>
-                 "The mode is BOUND to each implement dispatch when it is placed: a change " <>
-                 "affects only stories placed afterwards, and a story already placed keeps " <>
-                 "the mode its dispatch recorded, so a change is always allowed."
+               "Optional, `pr` when omitted. `pr` is the only mode. NOT nullable: an explicit null or any other " <>
+                 "value is a 422."
            },
            target_epic_id: %Schema{
              type: :string,
@@ -281,17 +267,10 @@ defmodule LoopctlWeb.IntakeSourceController do
            },
            mode: %Schema{
              type: :string,
-             enum: ["pr", "thread"],
+             enum: ["pr"],
              description:
-               "Optional; omitted leaves it as it is. `pr` or `thread`. A `thread` source's " <>
-                 "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
-                 "pull request (see `POST /stories/:id/merge-precondition`); its runners " <>
-                 "must be at runner contract 1.20.0 or later and send `checkpoint` " <>
-                 "messages, or every story is refused `no_checkpoint_recorded`. NOT " <>
-                 "nullable: an explicit null or any other value is a 422. " <>
-                 "The mode is BOUND to each implement dispatch when it is placed: a change " <>
-                 "affects only stories placed afterwards, and a story already placed keeps " <>
-                 "the mode its dispatch recorded, so a change is always allowed."
+               "Optional; omitted leaves it as it is. `pr` is the only mode. NOT nullable: an explicit null or any other " <>
+                 "value is a 422."
            },
            target_epic_id: %Schema{
              type: :string,

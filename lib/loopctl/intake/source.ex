@@ -68,26 +68,21 @@ defmodule Loopctl.Intake.Source do
     # is repointed through `PATCH /api/v1/intake/sources/:id` rather than by guessing.
     field :base_branch, :string, default: "master"
 
-    # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE (US-45.4). `:pr` is the route every source
-    # took before the column existed: the merge gate reads a pull request by number. `:thread`
-    # is the change-thread route, where the gate reads the story's latest RECORDED checkpoint
-    # and no pull request exists. NOT NULL, default `:pr`, so an existing source is unchanged.
-    field :mode, Ecto.Enum, values: [:pr, :thread], default: :pr
+    # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE. `:pr` is the one route today: the merge gate
+    # reads a pull request by number. The column stays because Epic 47 adds `:chg` beside it
+    # (docs/user_stories/epic_47_change_protocol/PRD.md §10). NOT NULL, default `:pr`.
+    field :mode, Ecto.Enum, values: [:pr], default: :pr
 
-    # THE CHECKS A THREAD-MODE CHECKPOINT MUST PASS ON ITS EXACT COMMIT (US-45.6). A pull
-    # request's required checks are its base branch's protection, enforced by GitHub at merge
-    # time; a thread has no pull request and the loopctl App pushes the squash itself, so the
-    # merge gate reads the checks by SHA and this names which ones it requires: GitHub Actions
-    # JOB names, as they appear on the commit (a commit-status context can never satisfy one;
-    # see `Loopctl.Delivery.CiEvidence`). STORY VERIFICATION reads it in EITHER mode
-    # (US-26.4.6): it judges the story's commit against these names by the merge gate's rules.
-    # It first needs a GitHub credential for the tenant, its own token (`Loopctl.Forge`) or an
-    # entry in `VERIFICATION_OPERATOR_TOKEN_TENANTS` (`credential_unavailable` otherwise,
-    # whatever this list holds); then a `pr` source that names none records
+    # THE CHECKS STORY VERIFICATION JUDGES A STORY'S COMMIT BY (US-26.4.6): GitHub Actions JOB
+    # names, as they appear on the commit (a commit-status context can never satisfy one; see
+    # `Loopctl.Delivery.CiEvidence`). A pull request's merge is held to its base branch's
+    # protection by GitHub; this list is what loopctl itself reads. It first needs a GitHub
+    # credential for the tenant, its own token (`Loopctl.Forge`) or an entry in
+    # `VERIFICATION_OPERATOR_TOKEN_TENANTS` (`credential_unavailable` otherwise, whatever this
+    # list holds); then a source that names none records
     # `no_required_checks` and reads nothing, which is how it opts in, and a source that names
     # some has its (tenant, repository) credential resolved before any GitHub read
-    # (`credential_unavailable` if there is none). The merge gate
-    # still reads it for `thread` mode only.
+    # (`credential_unavailable` if there is none).
     field :required_checks, {:array, :string}, default: []
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec
@@ -168,7 +163,7 @@ defmodule Loopctl.Intake.Source do
 
   @doc """
   Everything `mode` must satisfy, for every path that writes it: present (the column is NOT
-  NULL, so there is no cleared state) and one of `pr` or `thread`, which the `Ecto.Enum` cast
+  NULL, so there is no cleared state) and `pr`, which the `Ecto.Enum` cast
   already refuses otherwise. `intake_sources_mode` is the database's copy of the same rule.
   """
   @spec validate_mode(Ecto.Changeset.t()) :: Ecto.Changeset.t()
@@ -178,9 +173,8 @@ defmodule Loopctl.Intake.Source do
     |> check_constraint(:mode, name: :intake_sources_mode)
   end
 
-  # The status a session posts about its OWN work (claude-config#677). On the thread path it
-  # is the implementer attesting itself, the shape chain of custody refuses (PRD §5), so it is
-  # recorded on the checkpoint and can never be a required check.
+  # The status a session posts about its OWN work (claude-config#677): the implementer attesting
+  # itself, the shape chain of custody refuses, so it can never be a required check.
   @local_gate "local-gate"
   @max_required_checks 20
   @max_check_name_bytes 200
@@ -198,17 +192,12 @@ defmodule Loopctl.Intake.Source do
   def local_gate, do: @local_gate
 
   @doc """
-  Everything `required_checks` must satisfy, for every path that writes it (US-45.6):
+  Everything `required_checks` must satisfy, for every path that writes it:
 
   - a list of at most #{@max_required_checks} distinct, non-blank names of at most
     #{@max_check_name_bytes} bytes each
-  - never `#{@local_gate}`: that status is posted by whoever pushed, so on the thread path it
-    is the implementer attesting its own work
-  - NON-EMPTY when the source is `thread`-mode: a thread merges with no pull request and no
-    forge rule, so a source requiring nothing would merge whatever CI said
-
-  Runs over the source as it WILL BE, so an update naming only `mode` or only
-  `required_checks` is judged together with the field it did not name.
+  - never `#{@local_gate}`: that status is posted by whoever pushed, so it is the implementer
+    attesting its own work
   """
   @spec validate_required_checks(Ecto.Changeset.t()) :: Ecto.Changeset.t()
   def validate_required_checks(%Ecto.Changeset{} = changeset) do
@@ -216,7 +205,6 @@ defmodule Loopctl.Intake.Source do
     |> validate_required([:required_checks])
     |> validate_length(:required_checks, max: @max_required_checks)
     |> validate_change(:required_checks, fn :required_checks, names -> check_names(names) end)
-    |> validate_thread_requires_checks()
   end
 
   defp check_names(names) do
@@ -246,21 +234,11 @@ defmodule Loopctl.Intake.Source do
   end
 
   # Surrounding whitespace is refused, not trimmed: a job name never carries it, so `"test "`
-  # could never match and every thread would wait out the CI limit on a typo.
+  # could never match and every verification would wait out its CI limit on a typo.
   defp usable_name?(name) when is_binary(name),
     do: name != "" and String.trim(name) == name and byte_size(name) <= @max_check_name_bytes
 
   defp usable_name?(_not_a_string), do: false
-
-  defp validate_thread_requires_checks(changeset) do
-    if get_field(changeset, :mode) == :thread and get_field(changeset, :required_checks) == [] do
-      add_error(changeset, :required_checks, "a thread-mode source must name at least one",
-        validation: :required_for_thread
-      )
-    else
-      changeset
-    end
-  end
 
   @doc "The modes a source may take."
   @spec modes() :: [atom()]

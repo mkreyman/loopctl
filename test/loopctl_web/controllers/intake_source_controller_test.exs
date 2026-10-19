@@ -435,8 +435,8 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
     end
   end
 
-  describe "mode (US-45.4)" do
-    test "enrolment defaults to pr, and takes thread when named", %{conn: conn} do
+  describe "mode" do
+    test "enrolment defaults to pr, and takes pr when named", %{conn: conn} do
       ctx = operator_ctx()
 
       defaulted =
@@ -447,19 +447,17 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
 
       assert defaulted["source"]["mode"] == "pr"
 
-      threaded =
+      named =
         conn
         |> auth(ctx.operator_key)
         |> post(
           ~p"/api/v1/intake/sources",
-          create_params(ctx, "mkreyman/infra")
-          |> Map.put("mode", "thread")
-          |> Map.put("required_checks", ["test"])
+          Map.put(create_params(ctx, "mkreyman/infra"), "mode", "pr")
         )
         |> json_response(201)
 
-      assert threaded["source"]["mode"] == "thread"
-      assert AdminRepo.get!(Source, threaded["source"]["id"]).mode == :thread
+      assert named["source"]["mode"] == "pr"
+      assert AdminRepo.get!(Source, named["source"]["id"]).mode == :pr
     end
 
     test "a PATCH naming only mode sets it, records it, and leaves the rest alone", %{
@@ -479,16 +477,16 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       body =
         conn
         |> auth(ctx.operator_key)
-        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "pr"})
         |> json_response(200)
 
-      assert body["source"]["mode"] == "thread"
+      assert body["source"]["mode"] == "pr"
       stored = AdminRepo.get!(Source, source.id)
-      assert stored.mode == :thread
+      assert stored.mode == :pr
       assert stored.target_epic_id == epic.id
       assert stored.base_branch == "master"
 
-      assert [%{payload: %{"mode" => "thread"}}] =
+      assert [%{payload: %{"mode" => "pr"}}] =
                AdminRepo.all(
                  from e in Entry,
                    where: e.tenant_id == ^ctx.tenant.id and e.action == "intake_source_mode_set"
@@ -501,7 +499,8 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       {_s, source} =
         fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
 
-      for bad <- ["merge", nil, ""] do
+      # `thread` was retired with the change threads (#984).
+      for bad <- ["merge", "thread", nil, ""] do
         conn
         |> auth(ctx.operator_key)
         |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => bad})
@@ -519,39 +518,6 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       assert AdminRepo.get!(Source, source.id).mode == :pr
     end
 
-    test "a mode change is ALWAYS allowed, a story in flight included (bound at placement)",
-         %{conn: conn} do
-      ctx = operator_ctx()
-
-      {_s, source} =
-        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
-
-      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
-
-      story =
-        fixture(:story, %{tenant_id: ctx.tenant.id, epic_id: epic.id, project_id: ctx.project.id})
-
-      fixture(:story_stage, %{
-        tenant_id: ctx.tenant.id,
-        story_id: story.id,
-        stage: :ci,
-        repo: AdminRepo
-      })
-
-      # The story in flight keeps the mode its dispatch recorded; the change reaches only
-      # stories placed afterwards, so nothing about it is refused.
-      body =
-        conn
-        |> auth(ctx.operator_key)
-        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
-          "mode" => "thread",
-          "required_checks" => ["test"]
-        })
-        |> json_response(200)
-
-      assert body["source"]["mode"] == "thread"
-    end
-
     test "another tenant's source keeps its mode (tenant isolation)", %{conn: conn} do
       ctx = operator_ctx()
       other = fixture(:tenant)
@@ -559,10 +525,10 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
 
       conn
       |> auth(ctx.operator_key)
-      |> patch(~p"/api/v1/intake/sources/#{foreign.id}", %{"mode" => "thread"})
+      |> patch(~p"/api/v1/intake/sources/#{foreign.id}", %{"mode" => "pr"})
       |> json_response(404)
 
-      assert AdminRepo.get!(Source, foreign.id).mode == :pr
+      assert AdminRepo.get!(Source, foreign.id).updated_at == foreign.updated_at
     end
   end
 

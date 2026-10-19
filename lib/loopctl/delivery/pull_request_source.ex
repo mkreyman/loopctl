@@ -33,12 +33,11 @@ defmodule Loopctl.Delivery.PullRequestSource do
     `{:error, reason}`, which becomes Gate B's unreadable-diff marker. Every added,
     modified, deleted and renamed-to path, plus both names of every rename
 
-  ## `branch_head/2`, `commit/2` and `compare/3` — a checkpoint instead of a pull request
+  ## `commit/2`, `compare/3`, `check_evidence/3` and `resolve_commit/2` — one commit
 
-  The reads `Loopctl.Delivery.CheckpointSource` builds the same `t:pull_request/0` facts from
-  for a THREAD-mode story (US-45.4, Epic 45), where no pull request exists: the thread
-  branch's head, the checkpoint commit's tree, and the comparison of the base
-  branch with the checkpoint. Same forge, same timeouts, same failure classification.
+  The reads story verification (`Loopctl.Verification.GitHubActions`, US-26.4.6) judges one
+  commit by: its tree, the comparison of the base branch with it, and the CI that ran on it.
+  Same forge, same timeouts, same failure classification.
 
   ## `repo_files/2`
 
@@ -162,16 +161,15 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback pull_request(repo(), pos_integer()) :: {:ok, pull_request()} | {:error, term()}
 
   @typedoc """
-  One commit, as much of it as the thread-mode merge gate judges (US-45.4): its tree.
+  One commit, as much of it as story verification judges: its tree.
   """
-  @type commit :: %{tree_sha: String.t(), parents: [String.t()]}
+  @type commit :: %{tree_sha: String.t()}
 
   @typedoc """
-  The three-dot comparison `base...head` (US-45.4): what a pull request from `head` into
-  `base` would show, without a pull request.
+  The three-dot comparison `base...head`: what a pull request from `head` into `base` would
+  show, without a pull request.
 
-  - `:merge_base_sha` — the merge base of the two: what the diff is relative to, and the
-    `base_sha` a thread-mode allow records
+  - `:merge_base_sha` — the merge base of the two: what the diff is relative to
   - `:base_tree_sha` — the tree of the commit `base` names NOW. An `empty_change` is judged
     against it
   - `:diffstat`, `:diff` — the same shapes as on `t:pull_request/0`, over the files the
@@ -184,42 +182,14 @@ defmodule Loopctl.Delivery.PullRequestSource do
           diff: diff()
         }
 
-  @doc """
-  The commit a branch names now (US-45.4) — the thread branch head the merge gate compares
-  against the latest RECORDED checkpoint. Exact-match on the branch, never a prefix.
-  """
-  @callback branch_head(repo(), String.t()) :: {:ok, String.t()} | {:error, term()}
-
-  @doc "The tree of one commit (US-45.4)."
+  @doc "The tree of one commit."
   @callback commit(repo(), String.t()) :: {:ok, commit()} | {:error, term()}
 
-  @doc """
-  `:ok` when the repository itself can be read (US-45.4). What tells a branch that does not
-  exist (a 404 on its ref in a readable repository) from a token that cannot see the
-  repository at all (the same 404, for a different reason a human has to fix).
-  """
-  @callback repository_readable(repo()) :: :ok | {:error, term()}
-
-  @typedoc """
-  A checkpoint's unified diff as the thread page shows it (US-45.7): the text, cut at the
-  adapter's byte bound, and whether it was cut.
-  """
-  @type checkpoint_diff :: %{text: String.t(), truncated: boolean()}
-
-  @doc """
-  The unified diff of the three-dot comparison `base_ref...head_sha` (US-45.7): what the change
-  at `head_sha` is against the branch it will merge onto, as the merge gate judges it. Read for
-  a HUMAN on demand and never stored, so it is bounded in bytes and in wall clock rather than
-  refused when large: a cut diff is marked `truncated`.
-  """
-  @callback checkpoint_diff(repo(), String.t(), String.t()) ::
-              {:ok, checkpoint_diff()} | {:error, term()}
-
-  @doc "The three-dot comparison `base...head` (US-45.4). See `t:comparison/0`."
+  @doc "The three-dot comparison `base...head`. See `t:comparison/0`."
   @callback compare(repo(), String.t(), String.t()) :: {:ok, comparison()} | {:error, term()}
 
   @doc """
-  The CI evidence for ONE commit of a thread (US-45.6): the jobs (latest attempt) of every
+  The CI evidence for ONE commit (US-26.4.6): the jobs (latest attempt) of every
   workflow run that a PUSH of `branch` at exactly `sha` triggered, each tagged with its run
   and workflow file, and — best effort, `{:unread, reason}` when they could not be read — the
   commit statuses. The required names are matched by `Loopctl.Delivery.CiEvidence`, never
@@ -332,16 +302,7 @@ defmodule Loopctl.Delivery.PullRequestSource do
   def pull_request(%ForgeRepo{} = repo, a), do: impl().pull_request(repo, a)
 
   @doc false
-  def branch_head(%ForgeRepo{} = repo, a), do: impl().branch_head(repo, a)
-
-  @doc false
   def commit(%ForgeRepo{} = repo, a), do: impl().commit(repo, a)
-
-  @doc false
-  def repository_readable(%ForgeRepo{} = repo), do: impl().repository_readable(repo)
-
-  @doc false
-  def checkpoint_diff(%ForgeRepo{} = repo, a, b), do: impl().checkpoint_diff(repo, a, b)
 
   @doc false
   def compare(%ForgeRepo{} = repo, a, b), do: impl().compare(repo, a, b)

@@ -65,7 +65,7 @@ defmodule Loopctl.Intake.IssueClosures do
   alias Loopctl.Intake.Source
 
   # The attempt bound, the backoff schedule, the in-flight delay and the compare-and-set are
-  # `Loopctl.ForgeOutbox`'s, shared with the thread-link outbox so the two cannot drift.
+  # `Loopctl.ForgeOutbox`'s.
 
   @typedoc "Why a closure will never be attempted again."
   @type abandon_reason ::

@@ -1,11 +1,9 @@
 defmodule Loopctl.ForgeOutbox do
   @moduledoc """
   The mechanics every forge OUTBOX shares: a table of `:pending` rows, each an outward act on
-  GitHub waiting to be performed with nothing held, drained by a cron worker. Two outboxes use
-  it — `Loopctl.Intake.IssueClosures` (closing a reporter's issue, #805) and
-  `Loopctl.Threads.IssueLinks` (linking an intake issue to its thread page, US-45.7) — and each
-  keeps its own states and its own outward calls; what is here is only what they must not
-  disagree about.
+  GitHub waiting to be performed with nothing held, drained by a cron worker. Its one user is
+  `Loopctl.Intake.IssueClosures` (closing a reporter's issue, #805), which keeps its own states
+  and its own outward calls; what is here is the mechanics an outbox must get right.
 
   A row's schema must carry `tenant_id`, `id`, `status` (with `:pending`), `attempts`,
   `next_attempt_at` and `updated_at`. Every function is on `AdminRepo` with an explicit

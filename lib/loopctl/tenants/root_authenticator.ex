@@ -69,8 +69,7 @@ defmodule Loopctl.Tenants.RootAuthenticator do
     |> unique_constraint(:credential_id,
       name: :tenant_root_authenticators_tenant_id_credential_id_index
     )
-    # US-45.7: a credential id is GLOBALLY unique — a usernameless login identifies the tenant
-    # by it, so one id enrolled in two tenants would leave that login choosing between them.
+    # A credential id is GLOBALLY unique: one authenticator never roots two tenants.
     |> unique_constraint(:credential_id, name: :tenant_root_authenticators_credential_id_uidx)
   end
 

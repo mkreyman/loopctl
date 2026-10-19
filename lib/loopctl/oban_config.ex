@@ -655,18 +655,6 @@ defmodule Loopctl.ObanConfig do
            # Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.PostDeployVerificationWorker},
-           # US-45.3: moves a story to `escalated` for a review ceiling its thread recorded and
-           # the stage machine has not caught up with. The verdict records the escalation in
-           # its own transaction and enqueues one ReviewCeilingWorker job for that story
-           # (unique per story), which makes the move; this cron sweep is the backstop for a
-           # job that was never enqueued or did not land. Every minute, local statements
-           # only. Bounded per run.
-           {"* * * * *", Loopctl.Workers.ReviewCeilingWorker},
-           # US-45.5: re-drives a thread story's merge when its job never finished — a node
-           # killed mid-run, a redeploy, an enqueue that failed after the allow committed. The
-           # gate enqueues the merge itself; this is the backstop. Every five minutes, one
-           # bounded AdminRepo read; a story whose job is still live is deduplicated into it.
-           {"*/5 * * * *", Loopctl.Workers.ThreadMergeSweepWorker},
            # #805: drains the issue-closure outbox — tells the reporter what happened to the
            # issue her story came from. Up to FOUR bounded GitHub calls per candidate (read,
            # label, comment, close), 80 for a full batch, which is where the worker's
@@ -675,11 +663,6 @@ defmodule Loopctl.ObanConfig do
            # reporter has already been waiting for the deploy. Keep in sync with the crontab
            # assertion in oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.IntakeIssueCloseWorker},
-           # US-45.7: drains the thread-link outbox — one comment on a story's intake issue
-           # linking its thread page, written when the thread records its first checkpoint.
-           # ONE bounded GitHub call per candidate. Two minutes, like the closure drainer
-           # beside it, because it is the same forge and the same token.
-           {"*/2 * * * *", Loopctl.Workers.ThreadIssueLinkWorker},
            # #803 §2/§4: drains pending_triage intake records into stories the delivery loop
            # can see — the production caller of Loopctl.Delivery.TriageTrigger.promote/1, which
            # had none. EVERY MINUTE, unlike the two-minute forge drainers beside it, because a

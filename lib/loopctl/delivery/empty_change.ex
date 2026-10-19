@@ -1,13 +1,9 @@
 defmodule Loopctl.Delivery.EmptyChange do
   @moduledoc """
-  Whether a change is EMPTY — nothing shows the work is in the commit (US-45.4, lifted for
-  US-26.4.6). Pure.
+  Whether a change is EMPTY — nothing shows the work is in the commit (US-26.4.6). Pure.
 
-  Two callers refuse an empty change rather than judge it, and both call `reasons/3` so they
-  cannot disagree about what counts:
-
-  - the thread merge gate (`Loopctl.Delivery.MergePrecondition`), before it merges a checkpoint
-  - story verification (`Loopctl.Verification.GitHubActions`), before it records a CI verdict
+  Story verification (`Loopctl.Verification.GitHubActions`) refuses an empty change before it
+  records a CI verdict, rather than judge it.
 
   A change is empty two ways: the commit's tree IS the base's tree now (the work is already on
   the base, or was never made), or the three-dot comparison with the base lists no changed

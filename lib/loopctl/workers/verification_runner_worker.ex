@@ -1,7 +1,7 @@
 defmodule Loopctl.Workers.VerificationRunnerWorker do
   @moduledoc """
   US-26.4.2, redesigned by US-26.4.6 — executes one verification run: records a CI verdict for
-  the run's commit by the merge gate's evidence rules, or a short reason why there is none.
+  the run's commit by the CI evidence rules (`Loopctl.Delivery.CiEvidence`), or a short reason why there is none.
 
   ## What one poll does
 
@@ -24,8 +24,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
      `no_required_checks`.
   5. An abbreviated SHA is resolved to its full id ONCE and persisted on the run
      (`resolved_commit_sha`); every later poll reuses it.
-  6. THE CHANGE CHECK (`CiBehaviour.check_change/1`), ONCE per run, by the thread merge
-     gate's own change rules: an empty change (the commit's tree is the base's, or its
+  6. THE CHANGE CHECK (`CiBehaviour.check_change/1`), ONCE per run, by the two change
+     rules: an empty change (the commit's tree is the base's, or its
      three-dot diff with the base lists no file) is `empty_change`, a change to CI definitions
      `ci_definition_changed` (or `ci_definition_unknown`). Passing it stamps
      `change_checked_at` on the run, and a stamped run is never compared again, so a merge

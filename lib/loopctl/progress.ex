@@ -23,7 +23,6 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
   alias Loopctl.Delivery.DispatchLease
-  alias Loopctl.Delivery.InteractiveClaims
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
@@ -320,14 +319,6 @@ defmodule Loopctl.Progress do
       |> Multi.run(:stage, fn _repo, %{story: updated} ->
         Stages.follow_claim(tenant_id, updated.id, updated.claim_epoch, actor_label: actor_label)
       end)
-      # US-45.9: a claim a session makes itself records its route here, in the claim's
-      # transaction, where every reader of a claim's route looks. A placement records its own
-      # on the dispatch ledger and says so with `:placement`.
-      |> Multi.run(:route, fn _repo, %{story: updated, stage: stage_row} ->
-        if Keyword.get(opts, :placement, false),
-          do: {:ok, nil},
-          else: InteractiveClaims.record_route(tenant_id, updated, stage_row)
-      end)
       |> Multi.run(:mint_cap, fn _repo, %{story: updated} ->
         mint_cap(tenant_id, "start_cap", updated.id, Keyword.get(opts, :lineage, []))
       end)
@@ -384,11 +375,10 @@ defmodule Loopctl.Progress do
       else: {:ok, :not_held}
   end
 
-  defp claim_result({:ok, %{story: updated, mint_cap: cap} = changes}) do
+  defp claim_result({:ok, %{story: updated, mint_cap: cap}}) do
     # #621: the token is returned on the struct's virtual :minted_capability
-    # field so the caller can present it to POST /start. US-45.9: an interactive claim's
-    # route rides on the virtual :claim_route, so the caller need not read it again.
-    {:ok, %{updated | minted_capability: cap, claim_route: Map.get(changes, :route)}}
+    # field so the caller can present it to POST /start.
+    {:ok, %{updated | minted_capability: cap}}
   end
 
   # Already logged with the underlying reason in mint_cap/4. The story is

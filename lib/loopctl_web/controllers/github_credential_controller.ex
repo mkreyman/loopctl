@@ -62,16 +62,14 @@ defmodule LoopctlWeb.GitHubCredentialController do
     summary: "Set the tenant's GitHub token",
     description:
       "Stores the tenant's own GitHub token, encrypted, and uses it for EVERY forge call made " <>
-        "for the tenant from then on: the merge gate, story and post-deploy verification, " <>
-        "thread checkpoint reads and issue closing. It replaces the operator's token for " <>
+        "for the tenant from then on: the merge gate, story and post-deploy verification " <>
+        "and issue closing. It replaces the operator's token for " <>
         "every repository, including pairs `VERIFICATION_OPERATOR_TOKEN_TENANTS` names. It " <>
         "needs read access to contents, pull requests, actions, commit statuses and " <>
         "deployments on the " <>
         "tenant's intake-source repositories, and issues: write for issue closing. The token " <>
         "is not checked against GitHub here: a token that cannot read a repository shows up " <>
-        "as that repository's forge refusal. Thread-mode merges are still WRITTEN by " <>
-        "loopctl's GitHub App, and only for a pair the operator named: this token never " <>
-        "licenses them (escalated `app_not_licensed`). 422 when blank, over " <>
+        "as that repository's forge refusal. 422 when blank, over " <>
         "#{TenantCredential.max_token_length()} characters or " <>
         "containing anything but letters, digits and underscores. 403 custody_tier_required " <>
         "on an agent-rooted tenant. Role: user+.",

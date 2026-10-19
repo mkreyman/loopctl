@@ -47,92 +47,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
      11, and the only precondition decided before anything else, including a forge outage.
      See below.
 
-  ## Thread mode: a checkpoint instead of a pull request (US-45.4)
-
-  A story whose CURRENT claim was placed in `thread` mode (Epic 45) has no pull request. The
-  mode is the one its implement dispatch RECORDED at placement
-  (`Loopctl.Runners.DispatchLedger.record_sent/3`), read with the branch from the same ledger
-  row (`Loopctl.Delivery.DispatchPayload.dispatch_route/2`), never the intake source's mode
-  now: changing a source decides only what LATER placements get, so a story is always judged
-  on the route it was built for. Its facts come from the latest checkpoint that claim
-  recorded (`Loopctl.Threads.claim_checkpoints/2`), through
-  `Loopctl.Delivery.CheckpointSource`.
-  They come in the same shape, so every gate above runs unchanged and no `pr_number` is
-  needed. Refusals added, each read from the forge or the ledger, never from the claimant's
-  report:
-
-  - `{:empty_change, tree | :no_changed_files}` — the checkpoint's tree equals the base's, or
-    the comparison lists no changed file. There is nothing to merge, and an empty change is
-    never read as merged
-  - `{:checkpoint_tree_mismatch, forge, recorded}` — the forge's tree for the checkpoint
-    commit is not the tree the claimant reported, so the record is not what it describes
-  - `{:no_checkpoint_recorded, _}` — the thread has no checkpoint at all. A thread-mode
-    source's runners must be at runner contract 1.20.0 or later and send `checkpoint`
-    messages, or every story is refused here
-  - `{:claim_ended, _}` — the current claim recorded no checkpoint but an earlier claim did:
-    the story was released (force-unclaimed, rejected, reclaimed) and its new claim has not
-    reported yet
-  - `{:thread_unreadable, reason}` — the thread's checkpoints could not be READ for a reason
-    that is not contention. Refused like `pull_request_unavailable`: the remedy is loopctl's,
-    never the runner's contract version
-  - `{:checkpoint_on_base_without_allow, checkpoint}` — the base already CONTAINS the
-    checkpoint (see below) and no recorded allow names it
-
-  The BRANCH FACT is judged first. `{:branch_missing, checkpoint}` (a 404 on the branch in a
-  repository the token can read), `{:branch_head_unrecorded, branch, checkpoint}` (the branch
-  names a commit nobody reported — a push not recorded yet, or a reclaimed runner's),
-  `{:branch_head_regressed, branch, checkpoint}` (it names an EARLIER checkpoint of this
-  claim), and a checkpoint that is not the head the stage row recorded all mean the head
-  MOVED. Where that goes is decided by the ledger fence's own predicate,
-  `Loopctl.Delivery.Claimant.live?/2`:
-
-  - claim LIVE — `:head_moved`, back to `implementing` over `:base_moved`: the claimant can
-    push and record the checkpoint that fixes it
-  - claim NOT live (reported, review requested, lease run out) — `:refuse` naming
-    `:claim_not_live`, which escalates. Nobody can record the pushed commit, so sending the
-    story back would loop it ci -> implementing -> ci for ever
-
-  One unrecorded head is not a move: while the checkpoint is the one the recorded allow names,
-  a head whose FIRST parent is that checkpoint is the merge executor's base update between
-  moving the thread branch and recording it (US-45.5), answered `{:base_update_in_flight,
-  head}` — transient, so `:unevaluated` and retried, never sent back to `implementing`.
-
-  loopctl never adopts a head nobody reported, and a merge squashes the RECORDED checkpoint's
-  tree, never the branch head (PRD §4 item 2). A thread read that meets database contention
-  is `:busy`, which is transient: `:unevaluated`, and counted like any other.
-
-  The BASE BRANCH is the one the claim was placed on, pinned on the same ledger row as the
-  mode; a row that records none (written before the column existed) falls back to the
-  source's current base branch. A claim with NO accepted implement row is judged as a pull
-  request whatever the source's current mode: no runner was placed on it, so no checkpoint can
-  exist for it, and a source flipped to `thread` must not re-route it. The branch
-  itself (`DispatchPayload.thread_branch/3`) is resolved for a thread only: a pull request
-  names its own head.
-
-  The gate judges the checkpoint's THREE-DOT diff — the change relative to its merge base with
-  the base branch — so a base that moved on since the checkpoint was cut is not a reason
-  here: in a busy repository that would be nearly every story. A checkpoint the base already
-  CONTAINS (its merge base IS the checkpoint), whether or not a `merge_commit_sha` was
-  recorded and whether or not its branch still exists, is `:already_merged` ONLY when a
-  recorded allow names it. Otherwise it is `checkpoint_on_base_without_allow`: the commit the
-  branch was cut from with nothing done on it, or a fast-forward nobody gated. Neither is a
-  merge AROUND the gate, so neither raises the `ungated_merge` alarm.
-
-  A thread-mode allow is recorded naming the checkpoint id and its sha, and `base_sha` — the
-  MERGE BASE the judged diff is relative to — on the `effect_recorded` event of
-  `merge_gate_allowed_sha`, and then enqueues `Loopctl.Workers.ThreadMergeWorker`. THAT IS THE
-  MERGE EXECUTOR'S CONTRACT (`Loopctl.Delivery.MergeExecutor`, US-45.5): it merges only while
-  the base head still equals the recorded `base_sha`, and otherwise takes the base-update path
-  (AC-45.5.4, AC-45.5.7). A squash of the checkpoint's tree onto a base that moved would
-  silently revert every base commit the judged diff never saw, so base freshness is enforced
-  at the one step that writes the base.
-
-  The checkpoint judged is `Loopctl.Threads.claim_checkpoints/2`'s `latest`: the claim's latest
-  claimant checkpoint, or a `base_update` — the executor's merge of the base into the thread —
-  whose parents reach the checkpoint this gate last allowed (AC-45.5.9). Such a base update is
-  the same change on a newer base, so it keeps its review and custody and is judged here like
-  any checkpoint, green CI on its exact sha included. Any other `base_update` is invisible.
-
   ## The loop may not merge its own control plane
 
   loopctl deploys on every push to master AND IS the control plane: a story that changes
@@ -253,8 +167,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   - `:allow` — `record_effect(:merge_gate_allowed_sha, head)`. A write that does not land
     turns the allow into a refusal, because an allow nobody recorded is an allow nobody can
     later account for
-  - `:already_merged` and `:unevaluated` — nothing (a thread-mode `:already_merged` enqueues
-    the merge executor, which records the adopted merge; US-45.5)
+  - `:already_merged` and `:unevaluated` — nothing
 
   The merge itself is still the CALLER's: it merges and then advances `{:ci, :merged}`
   carrying the sha the forge returned, because the merge commit does not exist until the
@@ -263,12 +176,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   require Logger
 
-  alias Loopctl.Delivery.CheckpointSource
-  alias Loopctl.Delivery.CiDefinition
-  alias Loopctl.Delivery.CiEvidence
-  alias Loopctl.Delivery.Claimant
-  alias Loopctl.Delivery.DispatchPayload
-  alias Loopctl.Delivery.EmptyChange
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.PullRequestSource
@@ -280,11 +187,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.DeliveryGates.GateB
   alias Loopctl.Intake
   alias Loopctl.Progress
-  alias Loopctl.Threads
-  alias Loopctl.Threads.Checkpoint
   alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
-  alias Loopctl.Workers.ThreadMergeWorker
 
   # Design §5: "the 12-file / 1,000-line bound". A CEILING over the configured limits, not
   # a default for them — configuration may tighten it and may not loosen it. Without this,
@@ -311,20 +215,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
           # OPTIONAL, and the fallback behind it is deliberate: a caller of `judge/1` that
           # omits it gets the configured list, because a guard that disappears when a fact is
           # missing is the failure this key exists to prevent.
-          optional(:self_deploy_excluded) => [String.t()],
-          # US-45.4: the mode bound on the claim's implement dispatch at placement. Absent is
-          # `:pr`; nil is a route that could not be read, reported as unknown.
-          optional(:mode) => :pr | :thread | nil,
-          optional(:checkpoint) => fact(map()),
-          # Whether the claimant can still record a checkpoint (`Claimant.live?/2`). Absent is
-          # NOT live: a thread-mode head that moved then escalates rather than looping.
-          optional(:claim_live?) => boolean(),
-          # THREAD mode (US-45.6): the checks the source requires, and what CI said about the
-          # checkpoint's exact commit (`{:ok, nil}` where nothing was read).
-          optional(:required_checks) => [String.t()],
-          optional(:ci_evidence) => fact(map() | nil),
-          optional(:ci_entered_at) => fact(DateTime.t() | nil),
-          optional(:now) => DateTime.t()
+          optional(:self_deploy_excluded) => [String.t()]
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage
@@ -370,8 +261,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec judge(facts()) :: Verdict.t()
   def judge(facts) do
-    # CI is judged ONCE per evaluation, and every step that turns on it reads that one result.
-    facts = Map.put(facts, :ci_result, judge_ci(facts))
     {gate_a, gate_a_inputs} = gate_a(Map.get(facts, :gate_a_input, :missing))
     gate_a = redact_gate_a(gate_a)
     custody = Map.get(facts, :custody, {:error, :custody_unknown})
@@ -386,11 +275,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
       custody: custody_code(custody),
       repo: value(facts, :repo),
       pr_number: value(facts, :pr_number),
-      recorded_head_sha: Map.get(facts, :recorded_head_sha),
-      mode: mode(facts),
-      checkpoint_id: checkpoint_field(facts, :id),
-      checkpoint_sha: checkpoint_field(facts, :commit_sha),
-      ci_evidence: ci_record(facts)
+      recorded_head_sha: Map.get(facts, :recorded_head_sha)
     }
 
     # Computed ONCE, from the facts, and handed to every step that turns on it.
@@ -439,14 +324,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # evaluated, so nothing transitions. The reasons still carry whatever else is known —
     # a caller fixing custody should not have to wait for the forge to come back to hear
     # about it — but the DECISION is that there is no verdict yet.
-    {ci_waits, forge} = Enum.split_with(transient, &ci_wait?/1)
-
-    case {forge, other} do
+    case {transient, other} do
       {[_ | _] = forge, other} ->
         %{
           base
           | decision: :unevaluated,
-            reasons: Enum.uniq(forge ++ ci_waits ++ other ++ carried),
+            reasons: Enum.uniq(forge ++ other ++ carried),
             retry_after: longest_retry_after(forge)
         }
 
@@ -454,9 +337,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
         refuse(base, broken ++ carried)
 
       {[], []} ->
-        base
-        |> decide(facts, value(facts, :pull_request), carried, moved)
-        |> await_ci(ci_waits)
+        decide(base, facts, value(facts, :pull_request), carried, moved)
     end
   end
 
@@ -531,8 +412,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
     database by `Loopctl.Delivery.GateAInput`
   - `:effect_proof` — `%{intent: _, fixture_set: _, fixture_results: _, coverage: _}` for a
     change that touches an effect path. Absent, a `:prove_effect` outcome is a refusal
-  - `:lock_timeout_ms` — the lock wait of the claim-route read and of the stage-entry read
-    behind it (`Loopctl.Runners.Capacity.lock_timeout_ms/1`). Only a test passes it (US-46.7)
 
   ## Errors
 
@@ -570,46 +449,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @spec enforce(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, Verdict.t()} | {:error, error()}
   def enforce(tenant_id, story_id, opts) do
     with {:ok, verdict} <- evaluate(tenant_id, story_id, opts) do
-      {:ok, act(tenant_id, story_id, verdict, opts) |> note_ci_evidence(tenant_id, story_id)}
+      {:ok, act(tenant_id, story_id, verdict, opts)}
     end
   end
-
-  # AC-45.6.1: the CI evidence a DECISION rested on is copied onto the checkpoint it was read
-  # for, so the thread shows why a checkpoint did or did not merge. An allow has ALREADY
-  # copied it (`record_allow/4`, where a copy that does not land is not an allow); for a
-  # refusal a copy that does not land is logged and changes nothing,
-  # because the decision it would explain was not an authorisation.
-  defp note_ci_evidence(%Verdict{decision: :allow} = verdict, _tenant_id, _story_id),
-    do: verdict
-
-  # Only a DECISION is copied (#910 round 3, finding 5): a CI wait, a moved head or an adopted
-  # merge explains nothing about why a checkpoint did or did not merge, and copying every wait
-  # rewrote the checkpoint on every poll for up to a day.
-  defp note_ci_evidence(%Verdict{decision: decision} = verdict, _tenant_id, _story_id)
-       when decision != :refuse,
-       do: verdict
-
-  defp note_ci_evidence(%Verdict{} = verdict, tenant_id, story_id) do
-    case copy_ci_evidence(tenant_id, story_id, verdict) do
-      # A newer read already stands, which is the record the thread should show.
-      ok when ok in [:ok, :superseded] ->
-        verdict
-
-      {:error, reason} ->
-        Logger.warning(
-          "merge_gate ci evidence not recorded story_id=#{story_id} tenant_id=#{tenant_id} " <>
-            "checkpoint_id=#{verdict.checkpoint_id} reason=#{inspect(reason)}"
-        )
-
-        verdict
-    end
-  end
-
-  defp copy_ci_evidence(tenant_id, story_id, %Verdict{ci_evidence: %{} = record} = verdict)
-       when is_binary(verdict.checkpoint_id),
-       do: Threads.record_gate_evidence(tenant_id, story_id, verdict.checkpoint_id, "ci", record)
-
-  defp copy_ci_evidence(_tenant_id, _story_id, %Verdict{}), do: :ok
 
   # -- the judgement (pure) --------------------------------------------------------------
 
@@ -619,21 +461,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
     {:pull_request, :pull_request_unavailable}
   ]
 
-  # THREAD mode (US-45.4): the recorded checkpoint takes the pull request number's place, and
-  # a thread with no checkpoint is refused rather than judged against a branch nobody reported.
-  @thread_input_facts [
-    {:repo, :repository_unresolved},
-    {:checkpoint, :thread_unreadable},
-    {:pull_request, :pull_request_unavailable},
-    {:ci_evidence, :ci_evidence_unavailable},
-    {:ci_entered_at, :ci_entry_unreadable}
-  ]
-
   @forge_facts [
-    {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable},
-    {:ci_evidence, :ci_evidence_unavailable},
-    {:ci_entered_at, :ci_entry_unreadable},
     {:head_files, :head_files_unavailable},
     {:base_files, :base_files_unavailable}
   ]
@@ -642,10 +471,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # merge already happened: the already-merged branch reads neither file list. Judging a
   # transient tree fault there would suppress the ungated-merge escalation — the loudest
   # signal this module produces — on a fault the decision never touches.
-  # The checkpoint read is consumed on every path: a thread-mode read that could not be made
-  # (contention, `:busy`) is a retry, never a verdict. In pr mode the fact is `{:ok, nil}`.
   @merged_facts [
-    {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable}
   ]
 
@@ -654,153 +480,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # to fix half a problem. `:not_attempted` is dropped: it is the CONSEQUENCE of a missing
   # input listed alongside it, never a second fault.
   defp input_reasons(facts) do
-    input_facts = if mode(facts) == :thread, do: @thread_input_facts, else: @input_facts
-
-    for {key, kind} <- input_facts,
+    for {key, kind} <- @input_facts,
         reason = error_reason(facts, key),
         reason != :not_attempted,
-        do: input_reason(kind, reason)
+        do: {kind, reason}
   end
-
-  # The checkpoint fact names WHY there is nothing to judge (US-45.4). A thread that recorded
-  # nothing is `no_checkpoint_recorded`, whose remedy is the runner's contract version. One
-  # whose CURRENT claim recorded nothing while an earlier claim did was released —
-  # force-unclaimed, rejected, reclaimed — and is told so. Any other failure to READ the thread
-  # is `thread_unreadable`, refused like `pull_request_unavailable`: sending an operator to
-  # check a runner's contract for a read loopctl itself could not make is the wrong remedy.
-  defp input_reason(:thread_unreadable, :none), do: {:no_checkpoint_recorded, :none}
-
-  defp input_reason(:thread_unreadable, :claim_ended),
-    do: {:claim_ended, :no_checkpoint_under_current_claim}
-
-  defp input_reason(kind, reason), do: {kind, reason}
 
   defp unevaluated_reasons(facts, moved) do
-    forge =
-      for {key, kind} <- consumed_facts(facts, moved),
-          reason = error_reason(facts, key),
-          transient?(reason),
-          do: {kind, reason}
-
-    forge ++ ci_wait_reasons(facts, moved)
+    for {key, kind} <- consumed_facts(facts, moved),
+        reason = error_reason(facts, key),
+        transient?(reason),
+        do: {kind, reason}
   end
-
-  # US-45.6: a required check still running, or not reported on the commit at all, is not a
-  # verdict: the gate answers `:unevaluated` and the loop asks again. Only on the path that
-  # would otherwise be JUDGED (nothing moved, nothing merged), only when no required check
-  # has already FAILED — a failure is decisive whatever is still running, and is refused by
-  # `thread_reasons/2` — and only inside `ci_wait_limit_seconds/0` of the checkpoint being
-  # recorded. Past it the same checks are refused (`ci_timeout_reasons/1`).
-  defp ci_wait_reasons(facts, moved) do
-    with :thread <- mode(facts),
-         [] <- moved,
-         %{merged?: false} <- value(facts, :pull_request),
-         %{failed: []} = result <- ci_result(facts),
-         false <- ci_wait_exceeded?(facts) do
-      waiting_checks(result)
-    else
-      _judged_elsewhere -> []
-    end
-  end
-
-  defp waiting_checks(%{pending: pending, missing: missing}) do
-    Enum.map(pending, &{:required_check_pending, &1}) ++
-      Enum.map(missing, &{:required_check_missing, &1})
-  end
-
-  # HOW LONG A THREAD WAITS FOR CI: a bound in TIME, never a count of polls, measured from
-  # when the story ENTERED `ci` — the moment the gate starts asking for CI at all.
-  #
-  # Polls were the wrong unit at both ends: a job gated by `needs:` has no check run until it
-  # starts, so a legitimately slow pipeline read as missing and escalated after a few polls,
-  # and a check that never finishes was never bounded at all. And the checkpoint's recording
-  # time was the wrong origin: a story can spend hours in review between recording its last
-  # checkpoint and reaching `ci`, and was then refused on its first evaluation with no wait.
-  #
-  # Twenty-four hours is GitHub's ceiling on how long a job may QUEUE for a self-hosted runner
-  # (this fleet's CI runs on one), which is longer than any job may RUN on a hosted one: past
-  # it nothing still waiting will start, and a human is told which check never came back.
-  @ci_wait_limit_seconds 24 * 60 * 60
-
-  @doc "How long a thread waits for its required checks before they are refused (US-45.6)."
-  @spec ci_wait_limit_seconds() :: pos_integer()
-  def ci_wait_limit_seconds, do: @ci_wait_limit_seconds
-
-  defp ci_wait_exceeded?(facts) do
-    case {value(facts, :ci_entered_at), Map.get(facts, :now)} do
-      {%DateTime{} = entered, %DateTime{} = now} ->
-        DateTime.diff(now, entered) > @ci_wait_limit_seconds
-
-      _unknown ->
-        false
-    end
-  end
-
-  # A CI wait asks again after five minutes. Each evaluation re-reads the whole thread from
-  # the forge (about nine calls), and a pipeline takes minutes to hours, so a tighter loop
-  # only spends the shared token's rate limit (round 2, finding 6).
-  @ci_wait_retry_after 300
-
-  @doc "The `Retry-After` a CI wait answers with, in seconds (US-45.6)."
-  @spec ci_wait_retry_after() :: pos_integer()
-  def ci_wait_retry_after, do: @ci_wait_retry_after
-
-  # A CI wait holds back only an ALLOW (round 2, finding 3). Everything else the change was
-  # judged on is decided now: a refusal (a tree mismatch, an empty change, the size bound, a
-  # gate) or a moved head does not wait up to a day for CI to finish first.
-  defp await_ci(%Verdict{decision: :allow} = verdict, [_ | _] = ci_waits) do
-    %{verdict | decision: :unevaluated, reasons: ci_waits, retry_after: @ci_wait_retry_after}
-  end
-
-  defp await_ci(verdict, _ci_waits), do: verdict
-
-  defp ci_wait?({kind, _name}),
-    do: kind in [:required_check_pending, :required_check_missing, :ci_evidence_superseded]
-
-  defp ci_wait?(_reason), do: false
-
-  @doc """
-  Whether an `:unevaluated` verdict counts toward `max_consecutive_unevaluated/0`: every one
-  does EXCEPT one that is only waiting for CI (US-45.6). A CI wait has its own bound, in TIME
-  (`ci_wait_limit_seconds/0`), because polls are the wrong unit for it: a pipeline waiting on
-  `needs:` outlasts a few polls legitimately. A wait that ALSO carries a transient forge fault
-  counts, as that fault always has.
-
-  A pure CI wait also CLEARS the count, because the forge answered. Faults that alternate with
-  answered waits therefore never reach the bound — and do not need to: every answered poll is
-  judged against `ci_wait_limit_seconds/0`, so the wait still ends at that limit on the first
-  poll the forge answers after it.
-  """
-  @spec counts_toward_unevaluated_bound?(Verdict.t()) :: boolean()
-  def counts_toward_unevaluated_bound?(%Verdict{reasons: reasons}) do
-    not Enum.any?(reasons, &ci_wait?/1) or
-      Enum.any?(reasons, fn
-        {_kind, reason} -> transient?(reason)
-        _other -> false
-      end)
-  end
-
-  # Put by `judge/1` before anything reads it: CI is judged once per evaluation.
-  defp ci_result(facts), do: Map.fetch!(facts, :ci_result)
-
-  defp judge_ci(facts) do
-    case value(facts, :ci_evidence) do
-      %{evidence: evidence} -> CiEvidence.judge(required_checks(facts), evidence)
-      _not_read -> nil
-    end
-  end
-
-  defp ci_record(facts) do
-    case {value(facts, :ci_evidence), ci_result(facts)} do
-      {%{evidence: evidence, sha: sha, read_at: read_at}, %{} = result} ->
-        CiEvidence.to_record(sha, required_checks(facts), evidence, result, read_at)
-
-      _not_read ->
-        nil
-    end
-  end
-
-  defp required_checks(facts), do: Map.get(facts, :required_checks, [])
 
   # A branch that reads neither file list must not be judged on one. Both the merged branch
   # and the head-moved branch decide from the pull request alone, so a rate-limited tree
@@ -814,18 +505,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  # Everything that sends a story back to `implementing` rather than being judged: in thread
-  # mode the branch fact FIRST (a missing branch, a head nobody recorded, a checkpoint never
-  # pushed), then a head that is not the one the stage row recorded. Empty for a merged pull
-  # request, which is judged on its recorded allow instead, and for an unreadable one, which
-  # the input reasons already refuse.
+  # Everything that sends a story back to `implementing` rather than being judged: a head that
+  # is not the one the stage row recorded. Empty for a merged pull request, which is judged on
+  # its recorded allow instead, and for an unreadable one, which the input reasons already
+  # refuse.
   defp moved_reasons(facts) do
     case value(facts, :pull_request) do
       %{merged?: true} ->
         []
 
       %{} = pr ->
-        branch_reasons(facts, pr) ++ head_moved_reasons(pr, Map.get(facts, :recorded_head_sha))
+        head_moved_reasons(pr, Map.get(facts, :recorded_head_sha))
 
       _unreadable ->
         []
@@ -855,8 +545,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   def transient?({:github_api_error, status}), do: status in @transient_statuses
   # A database read that met contention (`Loopctl.Delivery.Stages.answering_busy/4`).
   def transient?(:busy), do: true
-  # US-45.5: the executor has moved the thread branch to a base update it has not recorded yet.
-  def transient?({:base_update_in_flight, _head}), do: true
   def transient?(_reason), do: false
 
   @doc "How long the forge asked a caller to wait, when it said so at all."
@@ -919,30 +607,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
         diffstat: Map.get(pr, :diffstat)
     }
 
-    cond do
-      moved == [] -> gated(verdict, facts, pr, carried)
-      back_to_implementing?(facts) -> head_moved(verdict, moved ++ carried)
-      true -> refuse(verdict, moved ++ [:claim_not_live] ++ carried)
+    case moved do
+      [] -> gated(verdict, facts, pr, carried)
+      moved -> head_moved(verdict, moved ++ carried)
     end
   end
 
   defp head_moved(verdict, reasons),
     do: %{verdict | decision: :head_moved, reasons: Enum.uniq(reasons)}
 
-  # Sending a THREAD-mode story back to `implementing` helps only if its claimant can still
-  # record the checkpoint that fixes it — the same predicate the ledger's fence applies
-  # (`Loopctl.Delivery.Claimant.live?/2`). At `ci` the claim is often not live any more (the
-  # work was reported, or review was requested), and the fence would refuse `claim_not_live`
-  # to every checkpoint, so the story would loop ci -> implementing -> ci for ever. Then
-  # nobody can record the pushed commit, and a human must: the move is REFUSED, and escalates.
-  # A pull request needs no recording, so pr mode always goes back.
-  defp back_to_implementing?(facts),
-    do: mode(facts) != :thread or Map.get(facts, :claim_live?, false) == true
-
   defp gated(verdict, facts, pr, carried) do
     own =
-      hard_bound_reasons(Map.get(pr, :diffstat)) ++
-        open_reasons(pr) ++ thread_reasons(facts, pr) ++ carried
+      hard_bound_reasons(Map.get(pr, :diffstat)) ++ open_reasons(pr) ++ carried
 
     case gate_b_verdict(facts, pr) do
       {:ok, gate_b} ->
@@ -962,21 +638,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # A merge nobody authorised. The sha is still reported on the verdict and named in the
   # reason, so the fact is not lost — but the decision is a REFUSAL, because the last gate
   # before an outward effect must never report clean for an effect it did not license.
-  # A THREAD checkpoint the base already contains (`CheckpointSource`, `on_base?`) is merged
-  # only when a recorded allow names it. Otherwise it is the commit the branch was cut from
-  # (nothing was done) or a fast-forward nobody gated — and in neither case did anything merge
-  # AROUND the gate, so it is `checkpoint_on_base_without_allow`, never the ungated-merge alarm.
-  defp merged_reasons(%{on_base?: true, head_sha: head}, head), do: []
-
-  defp merged_reasons(%{on_base?: true, head_sha: head}, _allowed),
-    do: [{:checkpoint_on_base_without_allow, head}]
-
-  defp merged_reasons(pr, allowed), do: ungated_reasons(pr, allowed)
-
-  defp ungated_reasons(%{merge_sha: nil}, _allowed),
+  defp merged_reasons(%{merge_sha: nil}, _allowed),
     do: [:merged_without_sha]
 
-  defp ungated_reasons(%{merge_sha: merge_sha, head_sha: head}, allowed) do
+  defp merged_reasons(%{merge_sha: merge_sha, head_sha: head}, allowed) do
     cond do
       is_nil(allowed) -> [{:ungated_merge, merge_sha, :no_recorded_allow}]
       allowed == head -> []
@@ -984,7 +649,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  defp ungated_reasons(pr, _allowed), do: [{:unreadable_pull_request, shape(pr)}]
+  defp merged_reasons(pr, _allowed), do: [{:unreadable_pull_request, shape(pr)}]
 
   # The head the gate is about to judge must be the head CI ran on and the story was
   # verified at. A push after either is ordinary work, not an escalation, so it goes back
@@ -1000,103 +665,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp head_moved_reasons(_pr, _recorded), do: [:head_sha_not_recorded]
 
   defp refuse(verdict, reasons), do: %{verdict | decision: :refuse, reasons: Enum.uniq(reasons)}
-
-  # AC-45.4.3, and the recorded tree checked against the forge's. See the moduledoc.
-  defp thread_reasons(facts, pr) do
-    if mode(facts) == :thread do
-      tree = Map.get(pr, :head_tree_sha)
-
-      tree_reasons(tree, checkpoint_field(facts, :tree_sha)) ++
-        empty_change_reasons(tree, Map.get(pr, :base_tree_sha), Map.get(pr, :diffstat)) ++
-        ci_definition_reasons(Map.get(pr, :diff)) ++
-        ci_reasons(facts)
-    else
-      []
-    end
-  end
-
-  # A THREAD THAT CHANGES ITS OWN CI IS NEVER MERGED ON THAT CI (US-45.6 review round 3).
-  # GitHub Actions runs the workflow files of the commit under test, so a checkpoint that
-  # edits `.github/workflows/` — or a composite action they call — can make its own required
-  # checks report green. A human merges such a change. The rule is `CiDefinition.reasons/1`,
-  # shared with story verification (US-26.4.6) so the two readings of one commit cannot
-  # disagree about what a CI definition is; a diff that could not be listed is refused
-  # `ci_definition_unknown` by it, rather than left to whichever other rule happens to refuse
-  # an unreadable diff.
-  defp ci_definition_reasons(diff), do: CiDefinition.reasons(diff)
-
-  # US-45.6: a thread merges with no forge rule holding it to green CI, so a source that
-  # requires nothing would merge whatever CI said; and a required check that FAILED on the
-  # checkpoint's exact commit refuses. Waits are `ci_wait_reasons/2`'s.
-  defp ci_reasons(facts) do
-    cond do
-      CiEvidence.lookup_names(required_checks(facts)) == [] ->
-        [:required_checks_unset]
-
-      result = ci_result(facts) ->
-        failed = for {name, why} <- result.failed, do: {:required_check_failed, name, why}
-        failed ++ ci_timeout_reasons(facts, result)
-
-      # Checks are required and nothing was read: this path would otherwise ALLOW with no CI
-      # at all. Every way here refuses elsewhere today; this makes it fail CLOSED by itself
-      # rather than by coincidence (round 2, finding 5).
-      true ->
-        [:ci_evidence_not_read]
-    end
-  end
-
-  # Past `ci_wait_limit_seconds/0` a check still running or never reported is refused, naming
-  # which state it was stuck in, so a human is told rather than the gate waiting for ever.
-  defp ci_timeout_reasons(facts, result) do
-    if ci_wait_exceeded?(facts) do
-      Enum.map(result.pending, &{:required_check_timed_out, &1, :pending}) ++
-        Enum.map(result.missing, &{:required_check_timed_out, &1, :missing})
-    else
-      []
-    end
-  end
-
-  # AC-45.4.3's branch fact, routed as a moved head is: back to `implementing`.
-  defp branch_reasons(facts, pr) do
-    head = Map.get(pr, :head_sha)
-
-    earlier = checkpoint_field(facts, :earlier_shas) || []
-
-    case {mode(facts), Map.get(pr, :branch_head_sha)} do
-      {:thread, :missing} ->
-        [{:branch_missing, head}]
-
-      {:thread, ^head} ->
-        []
-
-      # An EARLIER checkpoint of this claim: the branch went back, it did not gain a commit
-      # nobody reported.
-      {:thread, branch_head} ->
-        if branch_head in earlier,
-          do: [{:branch_head_regressed, branch_head, head}],
-          else: [{:branch_head_unrecorded, branch_head, head}]
-
-      {_mode, _branch_head} ->
-        []
-    end
-  end
-
-  defp tree_reasons(tree, tree) when is_binary(tree), do: []
-  defp tree_reasons(forge, recorded), do: [{:checkpoint_tree_mismatch, forge, recorded}]
-
-  # Two ways a change is empty: its tree IS the base's, or the comparison lists no file. The
-  # rule is `EmptyChange.reasons/3`, shared with story verification (US-26.4.6) so the two
-  # readings of one commit cannot disagree about what an empty change is.
-  defp empty_change_reasons(tree, base, diffstat), do: EmptyChange.reasons(tree, base, diffstat)
-
-  defp mode(facts), do: Map.get(facts, :mode, :pr)
-
-  defp checkpoint_field(facts, key) do
-    case value(facts, :checkpoint) do
-      %{} = checkpoint -> Map.get(checkpoint, key)
-      _other -> nil
-    end
-  end
 
   # A pull request that is neither open nor merged was closed without merging; there is
   # nothing to gate and nothing to adopt, so it escalates rather than reporting a clean run.
@@ -1343,45 +911,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # -- gathering the facts ---------------------------------------------------------------
 
   defp gather(story, stage, opts) do
-    source = source_for_story(story)
-    repo = repo_of(source)
+    repo = story |> source_for_story() |> repo_of()
 
-    # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
-    # under (US-45.4), never the source's now: a source changed after placement decides only
-    # what later placements get. Read from the same ledger row as the dispatched branch.
-    # A pr-mode evaluation pays this read too, and cannot skip it: the ROW is what says the
-    # story is pr, and the source's current mode cannot stand in for it (a story placed as a
-    # thread under a source since flipped back to pr must still be judged as a thread). Its
-    # lock wait is bounded (`Loopctl.Runners.Capacity.lock_timeout_ms(opts)`) and contention
-    # answers `:unevaluated`, which the loop retries.
-    {mode, forge, {pr_number, checkpoint, pull_request}} =
-      case DispatchPayload.dispatch_route(story.tenant_id, story, story.claim_epoch, opts) do
-        {:ok, route} ->
-          # The repository with the credential every forge read below authenticates with
-          # (#936), chosen per (tenant, repository) and only once there is a route to read
-          # for. `repo` itself stays the bare name: the exclusion list and Gate B's trigger
-          # list are keyed by it.
-          forge = with {:ok, name} <- repo, do: Credential.repo(story.tenant_id, name)
-
-          case placed_mode(route, source) do
-            :thread -> {:thread, forge, thread_facts(story, stage, source, forge, route)}
-            :pr -> {:pr, forge, pr_facts(stage, forge)}
-          end
-
-        # The route could not be read (contention): nothing is judged on a guessed route, and
-        # the mode is reported as UNKNOWN (nil), not as `pr`. The failure travels as the pull
-        # request fact, so `:busy` answers `:unevaluated`.
-        {:error, reason} ->
-          {nil, {:error, :not_attempted},
-           {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
-      end
+    # The repository with the credential every forge read below authenticates with (#936),
+    # chosen per (tenant, repository). `repo` itself stays the bare name: the exclusion list
+    # and Gate B's trigger list are keyed by it.
+    forge = with {:ok, name} <- repo, do: Credential.repo(story.tenant_id, name)
+    pr_number = pr_number(stage)
 
     facts = %{
       repo: repo,
-      mode: mode,
       pr_number: pr_number,
-      checkpoint: checkpoint,
-      pull_request: pull_request,
+      pull_request: pull_request(forge, pr_number),
       triggers: DeliveryGates.load_triggers(),
       # Resolved HERE, with the other configured facts, so `judge/1` stays the pure function
       # its moduledoc says it is and a test can name a different list without touching
@@ -1392,21 +933,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # granted for. Both are read from the stage row, never from the caller.
       recorded_head_sha: stage.head_sha,
       recorded_allow_sha: stage.merge_gate_allowed_sha,
-      # Whether the claimant can still record a checkpoint — the ledger fence's own predicate.
-      # Decides where a thread-mode head that moved goes (`back_to_implementing?/1`).
-      claim_live?: Claimant.live?(story, DateTime.utc_now()),
       # Read from the database and NEVER from the caller (US-44.1). A caller that still sends
       # `trio_outputs` is recorded as having done so, and nothing it sent is read.
       gate_a_input: GateAInput.for_story(story.tenant_id, story.id),
       trio_outputs_ignored: Keyword.has_key?(opts, :trio_outputs),
-      effect_proof: Keyword.get(opts, :effect_proof),
-      # The source's CURRENT list, read live like the gate triggers (US-45.6). Deliberately
-      # NOT bound at placement: a list bound to the claim can never be corrected, so renaming
-      # a CI job stranded every story already placed. A source switched away from `thread`
-      # with its list cleared makes a thread already placed refuse `required_checks_unset`,
-      # which names the fix — setting the list again — and is not a dead end.
-      required_checks: source_required_checks(source),
-      now: DateTime.utc_now()
+      effect_proof: Keyword.get(opts, :effect_proof)
     }
 
     # NOT fetched when the decision will not read them: the merged branch and a moved head
@@ -1417,92 +948,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # the same facts.
     skip? = moved_reasons(facts) != []
 
-    # The three forge reads are independent, so they run CONCURRENTLY: the wait is the slowest
-    # read's, not their sum (#910 round 3, finding 6). Each is bounded by the adapter's own
-    # timeouts; the order of the results is fixed.
-    [head_files, base_files, ci_evidence] =
+    # The two forge reads are independent, so they run CONCURRENTLY: the wait is the slower
+    # read's, not their sum. Each is bounded by the adapter's own timeouts; the order of the
+    # results is fixed.
+    [head_files, base_files] =
       [
-        fn -> repo_files(forge, pull_request, :head_sha, skip?) end,
-        fn -> repo_files(forge, pull_request, :merge_base_sha, skip?) end,
-        fn -> ci_evidence(facts, forge, pull_request, skip?) end
+        fn -> repo_files(forge, facts.pull_request, :head_sha, skip?) end,
+        fn -> repo_files(forge, facts.pull_request, :merge_base_sha, skip?) end
       ]
       |> Task.async_stream(& &1.(), timeout: :infinity)
       |> Enum.map(fn {:ok, fact} -> fact end)
 
-    Map.merge(facts, %{
-      head_files: head_files,
-      base_files: base_files,
-      ci_evidence: ci_evidence,
-      # When the story entered `ci`, what a CI wait is measured from — read on exactly the path
-      # that reads CI, so a lock wait on it can never mask a merged or moved head's decision
-      # (#910 round 2, finding 2).
-      ci_entered_at: ci_entered_at(facts, pull_request, skip?, story, opts)
-    })
+    Map.merge(facts, %{head_files: head_files, base_files: base_files})
   end
-
-  # When the CI wait started: the story's entry into `ci`, read under a bounded lock wait
-  # (contention is `{:error, :busy}`, a retry). A story that reached `ci` with no recorded
-  # transition — a backfill, a repair — falls back to its checkpoint's recording, which is
-  # always known, so the wait is bounded for every story (round 1 of #910, finding 8).
-  defp ci_entered_at(
-         %{mode: :thread} = facts,
-         {:ok, %{merged?: false}},
-         false = _skip?,
-         story,
-         opts
-       ) do
-    case Stages.entered_at(story.tenant_id, story.id, :ci, opts) do
-      {:ok, %DateTime{} = entered} -> {:ok, entered}
-      {:ok, nil} -> {:ok, checkpoint_recorded_at(facts.checkpoint)}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp ci_entered_at(_facts, _pull_request, _skip?, _story, _opts), do: {:ok, nil}
-
-  defp checkpoint_recorded_at({:ok, %{recorded_at: %DateTime{} = at}}), do: at
-  defp checkpoint_recorded_at(_checkpoint), do: nil
-
-  defp source_required_checks({:ok, %{required_checks: checks}}) when is_list(checks), do: checks
-  defp source_required_checks(_no_source), do: []
-
-  # US-45.6: the evidence for the CHECKPOINT'S exact commit, never the branch head's or a
-  # parent's. Read only where a thread is about to be judged: a moved head or a merged
-  # checkpoint decides without it, and a source requiring nothing is refused without a read.
-  defp ci_evidence(
-         %{mode: :thread} = facts,
-         forge,
-         {:ok, %{merged?: false, thread_branch: branch}},
-         false = _skip?
-       ) do
-    names = CiEvidence.lookup_names(facts.required_checks)
-
-    # A repository or checkpoint that could not be read is already refused as itself; only
-    # the evidence read's OWN failure is this fact's. The BRANCH is the one the thread is
-    # judged on: only the runs a push of it triggered are trusted (`CiEvidence`).
-    with {:ok, repo} <- forge,
-         {:ok, %{commit_sha: sha}} <- facts.checkpoint,
-         [_ | _] <- names do
-      # Stamped BEFORE the read: evidence is ordered by when it was read FROM, so a slow read
-      # that began earlier can never pass for the newer one (#910 round 3, finding 1).
-      started = DateTime.utc_now()
-
-      case source().check_evidence(repo, sha, branch) do
-        {:ok, evidence} -> {:ok, %{evidence: evidence, sha: sha, read_at: started}}
-        {:error, _reason} = error -> error
-      end
-    else
-      _nothing_to_read -> {:ok, nil}
-    end
-  end
-
-  defp ci_evidence(_facts, _forge, _pull_request, _skip?), do: {:ok, nil}
-
-  # The branch travels with the thread's facts so the CI read can name it.
-  defp with_thread_branch({:ok, %{} = facts}, branch),
-    do: {:ok, Map.put(facts, :thread_branch, branch)}
-
-  defp with_thread_branch(other, _branch), do: other
 
   defp fetch_story(tenant_id, story_id) do
     case Stories.get_story(tenant_id, story_id) do
@@ -1519,97 +977,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  defp pr_facts(stage, repo) do
-    pr_number = pr_number(stage)
-    {pr_number, {:ok, nil}, pull_request(repo, pr_number)}
-  end
-
-  # The latest RECORDED checkpoint, never the branch head (PRD §4 item 2), read as one row.
-  # The branch is the one the story was DISPATCHED on, never re-derived here.
-  # A thread-mode story whose project has no single source still has no repository: the input
-  # reasons refuse it `:repository_unresolved`, and nothing is read.
-  # A repository with no credential for this tenant (#936) still has its checkpoint READ — that
-  # is a database read and needs no credential — so the refusal names every broken input: the
-  # missing credential through the pull request fact (`{:pull_request_unavailable,
-  # :credential_unavailable}`), and an ended claim or a missing checkpoint beside it.
-  defp thread_facts(
-         story,
-         stage,
-         {:ok, source},
-         {:error, :credential_unavailable} = forge,
-         route
-       ),
-       do: thread_checkpoint_facts(story, stage, source, forge, route)
-
-  defp thread_facts(_story, _stage, _source, {:error, _reason}, _route),
-    do: {{:ok, nil}, {:error, :not_attempted}, {:error, :not_attempted}}
-
-  defp thread_facts(story, stage, {:ok, source}, {:ok, _repo} = forge, route),
-    do: thread_checkpoint_facts(story, stage, source, forge, route)
-
-  defp thread_checkpoint_facts(story, stage, source, forge, route) do
-    case Threads.claim_checkpoints(story.tenant_id, story.id) do
-      {:ok, %{latest: %Checkpoint{} = checkpoint} = claim} ->
-        # The branch is resolved HERE, for a thread only: a pull request names its own head.
-        pull_request =
-          with {:ok, repo} <- forge,
-               {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
-            repo
-            |> CheckpointSource.pull_request(
-              DispatchPayload.placed_base_branch(route, source),
-              branch,
-              checkpoint,
-              stage.merge_gate_allowed_sha
-            )
-            |> with_thread_branch(branch)
-          end
-
-        {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, claim.earlier_shas)}, pull_request}
-
-      {:ok, %{earlier_claim_recorded?: true}} ->
-        {{:ok, nil}, {:error, :claim_ended}, unread(forge)}
-
-      {:ok, _none} ->
-        {{:ok, nil}, {:error, :none}, unread(forge)}
-
-      {:error, reason} ->
-        {{:ok, nil}, {:error, reason}, unread(forge)}
-    end
-  end
-
   # The pull request fact where nothing was read: a missing credential is still reported as
-  # itself beside whatever else is wrong; otherwise it is only the consequence, `:not_attempted`.
+  # itself; otherwise it is only the consequence of a missing input, `:not_attempted`.
   defp unread({:error, :credential_unavailable} = error), do: error
   defp unread(_forge), do: {:error, :not_attempted}
-
-  # The mode the claim's ROUTE records (`DispatchPayload.dispatch_route/2`): the accepted
-  # implement row of a placed claim, or the route an interactive claim recorded when it was made
-  # (`Loopctl.Delivery.InteractiveClaims`, US-45.9). A claim with NEITHER is `:pr`, NEVER the
-  # source's current mode (US-45.4 review round 3, finding 2): reading the source there would
-  # let an operator flipping a source to `thread` re-route an in-flight claim onto a path it
-  # cannot satisfy, which is the "a change affects only later claims" promise broken. Such a
-  # claim is one made before routes were recorded, or of a project with no single intake
-  # source.
-  defp placed_mode(%{mode: mode}, _source) when mode in [:pr, :thread], do: mode
-  defp placed_mode(_route, _source), do: :pr
-
-  defp checkpoint_fact(%Checkpoint{} = checkpoint, earlier_shas) do
-    %{
-      id: checkpoint.id,
-      # The CI wait's fallback origin, for a story with no recorded entry into `ci`.
-      recorded_at: checkpoint.inserted_at,
-      commit_sha: checkpoint.commit_sha,
-      tree_sha: checkpoint.tree_sha,
-      earlier_shas: earlier_shas
-    }
-  end
 
   defp pr_number(%{pr_number: number}) when is_integer(number) and number > 0, do: {:ok, number}
   defp pr_number(%{pr_number: number}), do: {:error, {:not_recorded, number}}
 
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
   # A missing credential is reported as itself whether or not a number was recorded, so both
-  # broken inputs are named in one refusal (the thread path does the same through `unread/1`).
+  # broken inputs are named in one refusal.
   defp pull_request(forge, _number), do: unread(forge)
 
   defp repo_files(_repo, {:ok, %{merged?: true}}, _key, _skip?), do: {:error, :not_consumed}
@@ -1642,8 +1020,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   def repo_for_story(story), do: story |> source_for_story() |> repo_of()
 
   # ONE derivation of the repository from a resolved source, shared by `repo_for_story/1` and
-  # `gather/3` — which needs the source itself too, for its mode and base branch, and so reads
-  # it once rather than twice.
+  # `gather/3`.
   defp source_for_story(%{tenant_id: tenant_id, project_id: project_id}),
     do: Intake.source_for_project(tenant_id, project_id)
 
@@ -1656,11 +1033,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # `:unevaluated` and `:already_merged` transition NOTHING. `:unevaluated` because there is
   # no verdict to act on and a network blip must not park a story on a human; an authorised
-  # `:already_merged` because the caller's next act is recording the merge it adopted. In
-  # THREAD mode that caller is the merge executor, so it is enqueued: its own already-merged
-  # path advances `ci -> merged` on the commit the base contains (US-45.5, TC-45.5.1).
+  # `:already_merged` because the caller's next act is recording the merge it adopted.
   defp act(tenant_id, story_id, %Verdict{decision: :already_merged} = verdict, opts) do
-    merge_thread(tenant_id, story_id, clear_unevaluated(tenant_id, story_id, verdict, opts))
+    clear_unevaluated(tenant_id, story_id, verdict, opts)
   end
 
   defp act(tenant_id, story_id, %Verdict{decision: :allow} = verdict, opts) do
@@ -1671,7 +1046,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # because the epoch does not move across a `ci -> implementing -> ci` cycle. The
     # recursion terminates: the second call carries `:refuse`.
     case record_allow(tenant_id, story_id, verdict, opts) do
-      %Verdict{decision: :allow} = allowed -> merge_thread(tenant_id, story_id, allowed)
+      %Verdict{decision: :allow} = allowed -> allowed
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
     end
   end
@@ -1679,15 +1054,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The same shape for the unevaluated backstop: past the bound it stops being "retry" and
   # becomes a refusal, which escalates through the ordinary path.
   defp act(tenant_id, story_id, %Verdict{decision: :unevaluated} = verdict, opts) do
-    # A pure CI wait is a COMPLETED evaluation — the forge answered — so it ends a run of
-    # transient faults rather than being skipped over; otherwise faults hours apart across a
-    # long pipeline accumulated as "consecutive" (round 2, finding 7).
-    counted =
-      if counts_toward_unevaluated_bound?(verdict),
-        do: note_unevaluated(tenant_id, story_id, verdict, opts),
-        else: clear_unevaluated(tenant_id, story_id, verdict, opts)
-
-    case counted do
+    case note_unevaluated(tenant_id, story_id, verdict, opts) do
       %Verdict{decision: :unevaluated} = waiting -> waiting
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
     end
@@ -1701,75 +1068,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
     transition(tenant_id, story_id, verdict, escalation_transition(), opts)
   end
 
-  # US-45.5: a RECORDED thread-mode allow is what the merge executor acts on, so it is enqueued
-  # here — after the allow landed, never before — and on a thread-mode `:already_merged`,
-  # which only a recorded allow produces. On every such verdict, replays included: a caller
-  # asking the gate again after an enqueue that did not land enqueues again, and a waiting job
-  # absorbs the resend. A pull request is merged by whoever opened it, not by loopctl.
-  defp merge_thread(tenant_id, story_id, %Verdict{mode: :thread, checkpoint_id: id} = allowed)
-       when is_binary(id) do
-    :ok = ThreadMergeWorker.enqueue(tenant_id, story_id)
-    allowed
-  end
-
-  defp merge_thread(_tenant_id, _story_id, %Verdict{} = allowed), do: allowed
-
   # An allow is a RECORDED fact or it is not an allow. Without this the gate's authorisation
   # lives only in the response, and an already-merged pull request cannot be told from one
   # merged around the gate — so a write that does not land turns the allow into a refusal
   # rather than a merge nobody can later account for.
   defp record_allow(tenant_id, story_id, %Verdict{head_sha: head} = verdict, opts) do
-    write_opts =
-      opts
-      |> Keyword.take([:claim_epoch, :actor_label])
-      |> Keyword.merge(allow_event_data(verdict))
-
-    # The evidence an allow rests on is recorded BEFORE the allow, and an allow whose evidence
-    # did not land is not an allow: a thread-mode merge is licensed by green CI on the exact
-    # commit, and the thread must be able to show it (AC-45.6.1).
-    with :ok <- evidence_for_allow(tenant_id, story_id, verdict) do
-      write_allow(tenant_id, story_id, verdict, head, write_opts, opts)
-    end
-  end
-
-  # A copy that met contention (`:busy`) is a RETRY, as every transient fault in this module
-  # is: the verdict becomes `:unevaluated` rather than escalating a green change for a lock
-  # wait (US-45.6 review round 1, finding 4). Any other failure refuses.
-  defp evidence_for_allow(tenant_id, story_id, verdict),
-    do: allow_evidence_outcome(verdict, copy_ci_evidence(tenant_id, story_id, verdict))
-
-  @doc false
-  # Public so the classification can be tested without contending for a row lock.
-  @spec allow_evidence_outcome(Verdict.t(), :ok | :superseded | {:error, term()}) ::
-          :ok | Verdict.t()
-  def allow_evidence_outcome(verdict, copy_result) do
-    case copy_result do
-      :ok ->
-        :ok
-
-      # A newer read is on the checkpoint (an overlapping evaluation): this allow rests on
-      # evidence that is no longer the thread's, so it is judged again rather than recorded.
-      # It is a CI wait like any other — not a fault — so it is not counted toward the
-      # unevaluated bound and asks again on the CI-wait interval (round 3).
-      :superseded ->
-        %{
-          verdict
-          | decision: :unevaluated,
-            reasons: [{:ci_evidence_superseded, verdict.checkpoint_sha}],
-            retry_after: @ci_wait_retry_after
-        }
-
-      {:error, reason} ->
-        if transient?(reason) do
-          %{
-            verdict
-            | decision: :unevaluated,
-              reasons: Enum.uniq(verdict.reasons ++ [{:ci_evidence_not_recorded, reason}])
-          }
-        else
-          refuse(verdict, [{:ci_evidence_not_recorded, reason}])
-        end
-    end
+    write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+    write_allow(tenant_id, story_id, verdict, head, write_opts, opts)
   end
 
   defp write_allow(tenant_id, story_id, verdict, head, write_opts, opts) do
@@ -1786,22 +1091,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
         refuse(verdict, [{:allow_not_recorded, reason}])
     end
   end
-
-  # AC-45.4.5: a thread-mode allow names the checkpoint it allowed, id and sha, on the event
-  # that records it. A pr-mode allow carries nothing extra, exactly as before.
-  # `base_sha` is the MERGE BASE the judged diff is relative to — the executor merges only
-  # while the base head still equals it (see the moduledoc's thread section).
-  defp allow_event_data(%Verdict{mode: :thread, checkpoint_id: id} = verdict)
-       when is_binary(id),
-       do: [
-         event_data: %{
-           "checkpoint_id" => id,
-           "checkpoint_sha" => verdict.checkpoint_sha,
-           "base_sha" => verdict.merge_base_sha
-         }
-       ]
-
-  defp allow_event_data(%Verdict{}), do: []
 
   # Counting is itself a write, so it is fenced and it can fail. A count that does not land
   # leaves the verdict `:unevaluated` — the backstop is a safety net, not a second way to

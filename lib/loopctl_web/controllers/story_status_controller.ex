@@ -20,7 +20,6 @@ defmodule LoopctlWeb.StoryStatusController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Capabilities
-  alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Dispatches
   alias Loopctl.LogValue
   alias Loopctl.Progress
@@ -424,7 +423,7 @@ defmodule LoopctlWeb.StoryStatusController do
     case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         role = conn.assigns.current_api_key.role
-        respond_with_story(conn, story, role, claim_route(story))
+        respond_with_story(conn, story, role)
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
@@ -794,13 +793,6 @@ defmodule LoopctlWeb.StoryStatusController do
 
     json(conn, body)
   end
-
-  # US-45.9: the route an interactive claim recorded, so the session knows which branch its
-  # checkpoints go on and which base it was bound to. A placed claim's route is its runner's.
-  defp claim_route(%{claim_route: %ClaimRoute{} = route}),
-    do: %{route: Map.take(route, [:mode, :base_branch, :branch])}
-
-  defp claim_route(_story), do: %{}
 
   defp maybe_add_token_usage(opts, %{"token_usage" => token_usage}) when is_map(token_usage) do
     Keyword.put(opts, :token_usage, token_usage)

@@ -144,28 +144,25 @@ function epicRefusal(value, { clearable }) {
 }
 
 /**
- * The two merge routes a source may take (US-45.4). `pr` is the default and what every source
- * did before the field existed; `thread` makes the merge gate read the story's latest recorded
- * checkpoint instead of a pull request. NOT nullable — the server answers 422 — so a null is
- * refused here where the reason can be stated.
+ * The merge routes a source may take: `pr`, the default and the only one (#984 retired
+ * `thread`). NOT nullable — the server answers 422 — so a null is refused here where the
+ * reason can be stated.
  */
-export const SOURCE_MODES = ["pr", "thread"];
+export const SOURCE_MODES = ["pr"];
 
 export function modeRefusal(mode) {
   if (SOURCE_MODES.includes(mode)) return null;
 
   return refuse(
-    "`mode` must be `pr` or `thread`, or must be left out entirely (enrolment then takes " +
-      "`pr`, and an update keeps the current value). It cannot be null: every source reaches " +
-      "its base branch by one route or the other.",
+    "`mode` must be `pr`, or must be left out entirely (enrolment then takes `pr`, and an " +
+      "update keeps the current value). It cannot be null.",
   );
 }
 
 /**
- * The CI checks a thread-mode checkpoint must pass on its exact commit (US-45.6). A list of
+ * The CI checks story verification judges a story's commit by (US-26.4.6). A list of
  * distinct, non-blank names; `local-gate` is refused because whoever pushed posts it. The
- * server holds the bounds and the "a thread source must name one" rule, which depends on the
- * stored mode this client cannot see, so only the shape is judged here.
+ * server holds the bounds, so only the shape is judged here.
  */
 export function requiredChecksRefusal(checks) {
   // The same shape the server holds (`Source.validate_required_checks/1`): non-blank, no
@@ -186,8 +183,8 @@ export function requiredChecksRefusal(checks) {
 
   if (checks.includes("local-gate")) {
     return refuse(
-      "`local-gate` can never be a required check: whoever pushed posts it, so on a thread " +
-        "it is the implementer attesting its own work. It is recorded on the checkpoint instead.",
+      "`local-gate` can never be a required check: whoever pushed posts it, so it is the " +
+        "implementer attesting its own work.",
     );
   }
 
@@ -298,16 +295,15 @@ export async function enrollIntakeSource(
   }
 
   // OPTIONAL, read by PRESENCE like the branch: omitted, the source takes `pr`. Named, it
-  // must be one of the two modes; anything else (null included) is a 422 at the server and
+  // must be a known mode; anything else (null included) is a 422 at the server and
   // is refused here, before a secret file is reserved.
   if (mode !== undefined) {
     const badMode = modeRefusal(mode);
     if (badMode) return badMode;
   }
 
-  // OPTIONAL too (US-45.6): the CI checks a thread checkpoint must pass. Its SHAPE is judged
-  // here, before a secret file is reserved; whether a thread source names enough of them
-  // depends on the stored mode, which only the server knows.
+  // OPTIONAL too: the CI checks story verification judges by. Its SHAPE is judged here,
+  // before a secret file is reserved.
   if (required_checks !== undefined) {
     const badChecks = requiredChecksRefusal(required_checks);
     if (badChecks) return badChecks;

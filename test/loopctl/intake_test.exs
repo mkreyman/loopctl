@@ -89,11 +89,11 @@ defmodule Loopctl.IntakeTest do
                Intake.source_for_project(tenant.id, project.id)
 
       {_secret, mine} =
-        fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id, mode: :thread})
+        fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id})
 
       fixture(:intake_source, %{tenant_id: tenant.id, repo_full_name: "acme/other"})
 
-      assert {:ok, %Source{id: id, mode: :thread}} =
+      assert {:ok, %Source{id: id}} =
                Intake.source_for_project(tenant.id, project.id)
 
       assert id == mine.id
@@ -297,7 +297,7 @@ defmodule Loopctl.IntakeTest do
     end
   end
 
-  describe "required_checks (US-45.6)" do
+  describe "required_checks" do
     setup do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -311,26 +311,24 @@ defmodule Loopctl.IntakeTest do
       )
     end
 
-    test "a thread source enrols with its required checks, and stores them", ctx do
-      assert {:ok, %{source: source}} =
-               enrol(ctx, %{mode: :thread, required_checks: ["test", "lint"]})
+    test "a source enrols with its required checks, and stores them", ctx do
+      assert {:ok, %{source: source}} = enrol(ctx, %{required_checks: ["test", "lint"]})
 
       assert AdminRepo.get!(Source, source.id).required_checks == ["test", "lint"]
     end
 
-    test "a thread source naming no required check is refused at enrolment", ctx do
-      assert {:error, changeset} = enrol(ctx, %{mode: :thread})
+    test "a source naming no required check enrols", ctx do
+      assert {:ok, %{source: _}} = enrol(ctx, %{})
+    end
 
-      assert %{required_checks: ["a thread-mode source must name at least one"]} =
-               errors_on(changeset)
-
-      # A pr source needs none: it merges through the pull request's own protection.
-      assert {:ok, %{source: _}} = enrol(ctx, %{mode: :pr})
+    test "thread is no longer a mode (#984)", ctx do
+      assert {:error, changeset} = enrol(ctx, %{mode: :thread, required_checks: ["test"]})
+      assert %{mode: [_]} = errors_on(changeset)
     end
 
     test "local-gate can never be a required check", ctx do
       assert {:error, changeset} =
-               enrol(ctx, %{mode: :thread, required_checks: ["test", "local-gate"]})
+               enrol(ctx, %{required_checks: ["test", "local-gate"]})
 
       assert %{required_checks: [message]} = errors_on(changeset)
       assert message =~ "local-gate"
@@ -348,37 +346,13 @@ defmodule Loopctl.IntakeTest do
             ["test "],
             [" lint"]
           ] do
-        assert {:error, _changeset} = enrol(ctx, %{mode: :thread, required_checks: bad}),
+        assert {:error, _changeset} = enrol(ctx, %{required_checks: bad}),
                inspect(bad)
       end
     end
 
-    test "switching to thread, or clearing a thread source's checks, is judged as a whole", ctx do
-      {:ok, %{source: source}} = enrol(ctx, %{})
-
-      # `mode` alone on a source with no checks: refused, whichever field was named.
-      assert {:error, changeset} =
-               Intake.update_source(ctx.tenant.id, source.id, %{mode: :thread})
-
-      assert %{required_checks: [_]} = errors_on(changeset)
-      assert AdminRepo.get!(Source, source.id).mode == :pr
-
-      assert {:ok, threaded} =
-               Intake.update_source(ctx.tenant.id, source.id, %{
-                 mode: :thread,
-                 required_checks: ["test"]
-               })
-
-      assert threaded.required_checks == ["test"]
-
-      assert {:error, _} =
-               Intake.update_source(ctx.tenant.id, source.id, %{required_checks: []})
-
-      assert AdminRepo.get!(Source, source.id).required_checks == ["test"]
-    end
-
     test "a required_checks change is recorded on the audit chain", ctx do
-      {:ok, %{source: source}} = enrol(ctx, %{mode: :thread, required_checks: ["test"]})
+      {:ok, %{source: source}} = enrol(ctx, %{required_checks: ["test"]})
 
       assert {:ok, _} =
                Intake.update_source(ctx.tenant.id, source.id, %{required_checks: ["test", "e2e"]})

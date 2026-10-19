@@ -2,7 +2,7 @@ defmodule Loopctl.GitSha do
   @moduledoc """
   The ONE rule for a git object id loopctl accepts: lowercase hex, 40 characters (SHA-1) or 64
   (SHA-256). Every module that validates a commit, tree or merge SHA calls `valid?/1`, so the
-  rule cannot drift between the thread ledger, the stage machine and the forge clients.
+  rule cannot drift between the stage machine, story verification and the forge clients.
 
   The OpenAPI schemas state the same rule as a JSON-schema `pattern` string (`pattern/0`).
   """

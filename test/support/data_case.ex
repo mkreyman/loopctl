@@ -343,7 +343,7 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
-    # US-45.6: CI evidence for a checkpoint's commit, on the same fail-closed default.
+    # US-26.4.6: CI evidence for one commit, on the same fail-closed default.
     Mox.stub(Loopctl.MockPullRequestSource, :check_evidence, fn _repo, _sha, _branch ->
       {:error, :not_stubbed}
     end)
@@ -365,36 +365,7 @@ defmodule Loopctl.DataCase do
        %Loopctl.Verification.Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
     end)
 
-    # US-45.5: the merge executor's App writes, on the same fail-closed default.
-    Mox.stub(Loopctl.MockMergeForge, :session, fn _repo -> {:error, :not_stubbed} end)
-
-    for {name, arity} <- [
-          branch_head: 2,
-          commit: 2,
-          ancestor?: 3,
-          create_commit: 2,
-          update_ref: 3,
-          create_ref: 3,
-          delete_ref: 2,
-          merge: 4
-        ] do
-      Mox.stub(Loopctl.MockMergeForge, name, not_stubbed(arity))
-    end
-
-    # US-45.4: the thread-mode reads, on the same fail-closed default.
-    Mox.stub(Loopctl.MockPullRequestSource, :branch_head, fn _repo, _branch ->
-      {:error, :not_stubbed}
-    end)
-
     Mox.stub(Loopctl.MockPullRequestSource, :commit, fn _repo, _sha -> {:error, :not_stubbed} end)
-
-    Mox.stub(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, _base, _head ->
-      {:error, :not_stubbed}
-    end)
-
-    Mox.stub(Loopctl.MockPullRequestSource, :repository_readable, fn _repo ->
-      {:error, :not_stubbed}
-    end)
 
     Mox.stub(Loopctl.MockPullRequestSource, :compare, fn _repo, _base, _head ->
       {:error, :not_stubbed}
@@ -722,11 +693,6 @@ defmodule Loopctl.DataCase do
     # every request and only raises when an opt-in `x-test-raise-db-error` header
     # is present — so there is NO global router mock to stub here.
   end
-
-  # `{:error, :not_stubbed}` at any arity, for a behaviour whose every callback defaults the same.
-  defp not_stubbed(2), do: fn _a, _b -> {:error, :not_stubbed} end
-  defp not_stubbed(3), do: fn _a, _b, _c -> {:error, :not_stubbed} end
-  defp not_stubbed(4), do: fn _a, _b, _c, _d -> {:error, :not_stubbed} end
 
   @doc """
   A helper that transforms changeset errors into a map of messages.

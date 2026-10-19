@@ -11,29 +11,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   and one `GET /repos/:repo/git/trees/:ref?recursive=1` per `repo_files/2` call.
 
-  A THREAD-mode story (US-45.4) has no pull request, and these reads replace the pull
-  request's:
-
-  - `GET /repos/:repo/git/ref/heads/:branch` — the thread branch head. `ref`, singular: the
-    plural endpoint matches by PREFIX, so `loop/1` would answer with `loop/10` too
-  - `GET /repos/:repo/git/commits/:sha` — a checkpoint's tree
-  - `GET /repos/:repo` — only after a 404 on the branch ref, to tell a missing branch from a
-    repository the token cannot read
-  - `GET /repos/:repo/compare/:base...:head` — the merge base, the base's CURRENT head and
-    tree, and the changed files. The comparison lists at most `@compare_file_cap` files and carries no
-    total of its own, so a list that reaches the cap is refused as truncated rather than
-    presented as the whole diff
-
-  Story verification (US-26.4.6) adds one, and reads CI through `check_evidence/3` below
-  exactly as the merge gate does:
+  Story verification (US-26.4.6) judges one commit by its exact SHA:
 
   - `GET /repos/:repo/commits/:ref` with `Accept: application/vnd.github.sha` — the full id of
     an abbreviated commit SHA, once per verification run
-
-  CI evidence for a thread checkpoint (US-45.6), by the checkpoint's exact SHA:
-
+  - `GET /repos/:repo/git/commits/:sha` — the commit's tree
+  - `GET /repos/:repo/compare/:base...:head` — the merge base, the base's CURRENT head and
+    tree, and the changed files. The comparison lists at most `@compare_file_cap` files and
+    carries no total of its own, so a list that reaches the cap is refused as truncated rather
+    than presented as the whole diff
   - `GET /repos/:repo/actions/runs?head_sha=:sha&branch=:branch&event=push` — the workflow
-    runs a PUSH of the thread branch at exactly this commit triggered: the only runs whose
+    runs a PUSH of the story's branch at exactly this commit triggered: the only runs whose
     jobs may satisfy a required check
   - `GET /repos/:repo/actions/runs/:id/jobs?filter=latest` — one per such run, its jobs' latest
     attempt
@@ -74,14 +62,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   — Req retries transient failures by DEFAULT, which would multiply the ceiling silently.
   Three calls for `pull_request/2` and one for `repo_files/2`, so a precondition that makes
   all five (a pull request plus two refs) waits at most 35 seconds before it has an answer,
-  and the answer to a timeout is an ESCALATION, never a pass. A THREAD-mode evaluation makes
-  more: the branch ref, the commit, the comparison, two trees, the workflow runs, one jobs
-  read per workflow run (at most `@max_workflow_runs`, read `@job_read_concurrency` at a time)
-  and the combined status. Their ceiling is the sum of the sequential reads' timeouts plus
-  the jobs reads' in batches: with ten workflows, seven reads plus three batches at 7s each,
-  70 seconds before an answer, and a
-  timeout is a transient `:unevaluated`, never a pass. Plus one repository read after a 404 on
-  the branch. Nothing here runs inside a
+  and the answer to a timeout is an ESCALATION, never a pass. Story verification's CI read
+  makes one jobs read per workflow run (at most `@max_workflow_runs`, read
+  `@job_read_concurrency` at a time) plus the workflow runs and the combined status. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -138,7 +121,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @files_per_page 100
   # The combined status lists the LATEST status per context, one page of them.
   @status_page_size 100
-  # US-45.6: the push-triggered workflow runs of one commit fit one page, and so do one run's
+  # The push-triggered workflow runs of one commit fit one page, and so do one run's
   # jobs; more is refused as truncated rather than judged on a part.
   @workflow_run_page 100
   @job_page 100
@@ -151,12 +134,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @max_reset_delay_seconds 3_900
 
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
-  # US-45.7: a checkpoint diff is read for a HUMAN on the thread page and never stored. It is
-  # bounded in bytes (a generated file can make a diff megabytes long) and in WALL CLOCK: the
-  # receive timeout bounds each chunk, not the whole body, so a forge trickling bytes would
-  # otherwise hold the page's diff panel for as long as it liked.
-  @max_diff_bytes 512 * 1024
-  @diff_deadline_ms 10_000
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
   @control ~r/[\x00-\x1f\x7f]/
 
@@ -209,31 +186,11 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @compare_file_cap 300
 
   @impl true
-  def branch_head(repo, branch) do
-    with {:ok, repo} <- repo_name(repo),
-         {:ok, branch} <- ref(branch),
-         {:ok, body} <- get(repo, "/git/ref/heads/#{branch}") do
-      case body do
-        %{"object" => %{"sha" => sha, "type" => "commit"}} when is_binary(sha) -> {:ok, sha}
-        _other -> {:error, {:unreadable_ref, shape(body)}}
-      end
-    end
-  end
-
-  @impl true
   def commit(repo, sha) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, sha} <- ref(sha),
          {:ok, body} <- get(repo, "/git/commits/#{sha}") do
       commit_facts(body)
-    end
-  end
-
-  @impl true
-  def repository_readable(repo) do
-    with {:ok, repo} <- repo_name(repo),
-         {:ok, _body} <- get(repo, "") do
-      :ok
     end
   end
 
@@ -440,86 +397,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp status?(_status), do: false
 
   @impl true
-  def checkpoint_diff(repo, base_ref, head_sha) do
-    with {:ok, repo} <- repo_name(repo),
-         {:ok, head} <- hex_sha(head_sha),
-         {:ok, base} <- ref(base_ref) do
-      read_diff(repo, "/compare/#{base}...#{head}")
-    end
-  end
-
-  defp hex_sha(sha) when is_binary(sha) do
-    if GitSha.valid?(sha), do: {:ok, sha}, else: {:error, {:invalid_sha, printable(sha)}}
-  end
-
-  defp hex_sha(sha), do: {:error, {:invalid_sha, shape(sha)}}
-
-  defp read_diff(repo, path) do
-    url = url(repo, path)
-    deadline = System.monotonic_time(:millisecond) + @diff_deadline_ms
-
-    opts =
-      repo
-      |> req_options()
-      |> Keyword.put(:headers, diff_headers(repo))
-      |> Keyword.put(:into, &collect_diff(&1, &2, deadline))
-
-    case Req.get(url, opts) do
-      {:ok, %Req.Response{status: 200} = response} ->
-        {chunks, _bytes} = Req.Response.get_private(response, :diff, {[], 0})
-        text = chunks |> IO.iodata_to_binary() |> String.replace_invalid()
-        {:ok, %{text: text, truncated: Req.Response.get_private(response, :truncated, false)}}
-
-      {:ok, %Req.Response{} = response} ->
-        {:error, failure(response)}
-
-      {:error, reason} ->
-        {:error, {:github_unreachable, shape(reason)}}
-    end
-  end
-
-  # Accumulates at most `@max_diff_bytes` as IODATA with a running byte count — each chunk is
-  # consed on once, never copied again — and stops at the deadline. Either stop marks the
-  # response `truncated`, so the page says the diff is partial rather than showing it as whole.
-  # An error response's body is collected the same way and never read. Public only so the
-  # accumulation can be driven chunk by chunk: `Req.Test` delivers a body in one piece.
-  @doc false
-  @spec collect_diff({:data, binary()}, {Req.Request.t(), Req.Response.t()}, integer()) ::
-          {:cont | :halt, {Req.Request.t(), Req.Response.t()}}
-  def collect_diff({:data, data}, {request, response}, deadline) do
-    {chunks, bytes} = Req.Response.get_private(response, :diff, {[], 0})
-    room = @max_diff_bytes - bytes
-
-    cond do
-      byte_size(data) > room ->
-        {:halt, {request, truncated(response, [chunks, binary_part(data, 0, room)], room)}}
-
-      System.monotonic_time(:millisecond) > deadline ->
-        {:halt, {request, truncated(response, [chunks, data], byte_size(data))}}
-
-      true ->
-        {:cont,
-         {request,
-          Req.Response.put_private(response, :diff, {[chunks, data], bytes + byte_size(data)})}}
-    end
-  end
-
-  defp truncated(response, chunks, added) do
-    {_chunks, bytes} = Req.Response.get_private(response, :diff, {[], 0})
-
-    response
-    |> Req.Response.put_private(:diff, {chunks, bytes + added})
-    |> Req.Response.put_private(:truncated, true)
-  end
-
-  defp diff_headers(repo) do
-    Enum.map(headers(repo), fn
-      {"accept", _} -> {"accept", "application/vnd.github.diff"}
-      header -> header
-    end)
-  end
-
-  @impl true
   def compare(repo, base, head) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, base} <- ref(base),
@@ -531,12 +408,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  # Parents in order (US-45.5): a thread branch head whose FIRST parent is the allowed
-  # checkpoint is the merge executor's base update in flight, not a push nobody reported.
-  defp commit_facts(%{"tree" => %{"sha" => tree}} = body) when is_binary(tree) do
-    parents = for %{"sha" => sha} <- Map.get(body, "parents", []), is_binary(sha), do: sha
-    {:ok, %{tree_sha: tree, parents: parents}}
-  end
+  defp commit_facts(%{"tree" => %{"sha" => tree}}) when is_binary(tree),
+    do: {:ok, %{tree_sha: tree}}
 
   defp commit_facts(body), do: {:error, {:unreadable_commit, shape(body)}}
 
@@ -1034,13 +907,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
     end
   end
-
-  @doc false
-  # The classification below, for `Loopctl.Delivery.GitHubAppMergeForge` (US-45.5): the App's
-  # writes fail in the same shapes as these reads, and a second copy of what a 403 means is
-  # the copy that drifts.
-  @spec classify_failure(Req.Response.t()) :: term()
-  def classify_failure(%Req.Response{} = response), do: failure(response)
 
   # A 403 is TWO different things at GitHub and they need opposite answers.
   #

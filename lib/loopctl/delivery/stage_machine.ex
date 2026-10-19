@@ -63,10 +63,6 @@ defmodule Loopctl.Delivery.StageMachine do
     with no way out, and it is its own edge rather than `:session_escalated` because the
     escalated queue has to tell "the loop spent its budget on this" apart from "the session
     asked for Mark". Never retried: a budget kill retried is the same kill again, paid twice.
-  - `:review_ceiling` — an in-flight stage -> escalated, when a change thread's final review
-    round completes with a critical, high or medium finding (US-45.3). CONTROL takes it, from
-    `Loopctl.Workers.ReviewCeilingWorker`, never a runner: it is loopctl's verdict about the
-    review, and the remedy is a rewrite, which is Mark's call.
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
     that could report itself lost is not lost.
@@ -89,24 +85,6 @@ defmodule Loopctl.Delivery.StageMachine do
     as it refuses the release edges, and neither is runner-reportable.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
-  - `:base_updated` — ci -> ci, when the merge executor (US-45.5) found the base branch moved
-    since the gate's allow and merged it INTO the thread as the GitHub App. The story's
-    change is the same diff against a newer merge base, so it keeps its review verdict and its
-    custody binding and does not go back to `implementing`: the edge replaces `head_sha` with
-    the `base_update` checkpoint's sha and clears the allow, and the merge gate judges the
-    new head again, CI included. TRANSACTION-ONLY like the release edges: `advance/4` refuses
-    it from every caller, and it is taken only by `Loopctl.Threads.record_base_update/4`, in
-    the transaction that records the `base_update` checkpoint, for a checkpoint whose first
-    parent is the one the stage row's allow names (`Loopctl.Delivery.Stages.follow_base_update/4`).
-    Any other head movement is still `:base_moved`. Counted in `attempts`, so a thread's base
-    moves are visible on its row.
-  - `:merged_outside_ci` — `queued` or an in-flight stage -> escalated, when the merge
-    executor (US-45.5) finds the squash it wrote ON the base branch while the story is no
-    longer at `ci`: the claim was released or the stage moved between the executor's last
-    check and its ref update, or the ref update's answer was lost and the stage write after it
-    failed. The base branch holds a merge the stage row does not, and only a human can decide
-    what that story is now. CONTROL-ONLY: not runner-reportable, and `ci` has `:merge_gate`.
-
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
 
@@ -193,18 +171,6 @@ defmodule Loopctl.Delivery.StageMachine do
   # and there the session's own `:session_escalated` is the way out. See the moduledoc entry.
   @budget_reported for from <- @in_flight, do: {from, :escalated, :budget_reported}
 
-  # A review ceiling reached (US-45.3). CONTROL takes it, from
-  # `Loopctl.Workers.ReviewCeilingWorker` via `Escalations.escalate_as_control/3`, when a
-  # thread's final review round completes with a material finding. Its own edge rather than `:session_escalated`, so the
-  # escalated queue shows the loop's own verdict rather than a session asking for Mark, and it
-  # is not in `@runner_reportable_edges`: a runner cannot assert a review outcome.
-  @review_ceiling for from <- @in_flight, do: {from, :escalated, :review_ceiling}
-
-  # A merge the executor wrote that the stage row never recorded (US-45.5). From `queued` as
-  # well, because a release is the commonest way the story leaves `ci` under the executor.
-  @merged_outside_ci for from <- (@in_flight -- [:ci]) ++ [:queued],
-                         do: {from, :escalated, :merged_outside_ci}
-
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -215,14 +181,13 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
-                   {:merged, :implementing, :merge_refused},
-                   {:ci, :ci, :base_updated}
+                   {:merged, :implementing, :merge_refused}
                  ] ++
                  @budget_exceeded ++
                  @released ++
                  @human_resolution ++
                  @session_escalated ++
-                 @budget_reported ++ @release_escalated ++ @review_ceiling ++ @merged_outside_ci
+                 @budget_reported ++ @release_escalated
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -447,15 +412,12 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_refused
           | :budget_exceeded
           | :budget_reported
-          | :review_ceiling
           | :runner_lost
           | :claim_released
           | :attempts_exhausted
           | :operator_released
           | :human_resolution
           | :session_escalated
-          | :base_updated
-          | :merged_outside_ci
 
   @type effect ::
           :runner_id
@@ -640,31 +602,6 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec runner_reportable?(stage(), stage(), edge()) :: boolean()
   def runner_reportable?(from, to, edge), do: {from, to, edge} in @runner_transitions
 
-  # The claimant of an INTERACTIVE thread claim (US-45.9) reports what a runner reports, minus
-  # the MERGE. In thread mode loopctl's App makes the merge (`Loopctl.Delivery.MergeExecutor`)
-  # and records `ci -> merged` itself; a runner reporting `merged` describes a pull request IT
-  # merged, which a thread never has. Letting the implementing session enter `merged`, or undo
-  # one with `merge_refused`, would let it record (or erase) a merge the gate never allowed and
-  # no executor made.
-  #
-  # AFTER the merge it keeps the runner's two edges out of `merged`, because with no runner for
-  # the claim nothing else writes them: `merged -> deployed` (with its required `release_id`)
-  # and `merged -> escalated` on `:session_escalated`. Without them an interactively merged
-  # story sat at `merged` for good and post-deploy verification never ran. `deployed` is not
-  # the session's word on the outcome: `Loopctl.Delivery.PostDeployVerification` decides
-  # `verified` or `escalated` by comparing the deployed sha against the merge commit, so a
-  # false `deployed` escalates rather than completes.
-  @claimant_transitions for {_from, to, edge} = t <- @runner_transitions,
-                            to != :merged and edge != :merge_refused,
-                            do: t
-
-  @doc """
-  Whether the claimant of an interactive thread claim may report `{from, to, edge}`: a
-  runner-reportable transition that neither enters `merged` nor leaves it on `:merge_refused`.
-  """
-  @spec claimant_reportable?(atom(), atom(), atom()) :: boolean()
-  def claimant_reportable?(from, to, edge), do: {from, to, edge} in @claimant_transitions
-
   @doc "Every stage that appears as the SOURCE of a runner-reportable transition."
   @spec runner_from_stages() :: [stage()]
   def runner_from_stages, do: @runner_from_stages
@@ -810,11 +747,6 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(:merged, :implementing, :merge_refused), do: @merge_keyed ++ @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
-
-  # The base merged into the thread (US-45.5): a new head, so everything bound to the old one
-  # goes — the allow above all, which was granted for a commit that is no longer the head.
-  # The transaction taking the edge writes the new `head_sha` (`Stages.follow_base_update/4`).
-  def clears(:ci, :ci, :base_updated), do: @head_keyed
 
   def clears(_from, _to, _edge), do: []
 

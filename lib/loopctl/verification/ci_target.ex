@@ -7,11 +7,10 @@ defmodule Loopctl.Verification.CiTarget do
   - the REPOSITORY is the story's project's intake source (`Intake.source_for_project/2`),
     the one derivation the merge gate and the dispatcher use. No live source is
     `no_intake_source`, more than one `ambiguous_intake_source`
-  - the REQUIRED CHECKS are that source's `required_checks`, in either mode. None (after
+  - the REQUIRED CHECKS are that source's `required_checks`. None (after
     dropping `local-gate`, which is never trusted) is `no_required_checks`: the opt-in
-  - the BRANCH is the one the story's placement recorded. For a THREAD it is exactly
-    `DispatchPayload.thread_branch/3`, the branch the merge gate judges. Otherwise it is the
-    branch the claim's dispatch put on the wire (the pull request's head branch, which the
+  - the BRANCH is the one the story's placement recorded: the branch the claim's dispatch put
+    on the wire (the pull request's head branch, which the
     runner created), then the branch the runner reported on the stage row; a story with
     neither was never placed on a branch and is `no_story_branch`. The pull request's head
     ref is deliberately not read back from GitHub: a fork's pull request names a branch in
@@ -50,7 +49,7 @@ defmodule Loopctl.Verification.CiTarget do
          {:route, {:ok, route}} <-
            {:route, DispatchPayload.dispatch_route(tenant_id, story, story.claim_epoch, opts)},
          {:stage, {:ok, stage}} <- {:stage, Stages.fetch(tenant_id, story.id, opts)} do
-      resolve(story, source, required, route, stage && stage.branch)
+      resolve(source, required, route, stage && stage.branch)
     else
       {:story, {:error, :not_found}} -> {:unconfigured, "story_not_found"}
       {:route, {:error, _busy}} -> {:wait, :database_busy}
@@ -60,13 +59,13 @@ defmodule Loopctl.Verification.CiTarget do
   end
 
   @doc """
-  The pure half of `gather/3`: the target, given the story, its source, the required names,
+  The pure half of `gather/3`: the target, given the story's source, the required names,
   the claim's dispatch route and the branch the stage row records.
   """
-  @spec resolve(map(), map(), [String.t()], map(), String.t() | nil) ::
+  @spec resolve(map(), [String.t()], map(), String.t() | nil) ::
           {:ok, t()} | {:unconfigured, String.t()}
-  def resolve(story, source, required, route, stage_branch) do
-    case story_branch(route, story, stage_branch) do
+  def resolve(source, required, route, stage_branch) do
+    case story_branch(route, stage_branch) do
       {:ok, branch} ->
         {:ok,
          %{
@@ -103,14 +102,7 @@ defmodule Loopctl.Verification.CiTarget do
 
   defp required_checks(_source), do: {:unconfigured, "no_required_checks"}
 
-  defp story_branch(%{mode: :thread} = route, story, stage_branch) do
-    case DispatchPayload.thread_branch(route, story, stage_branch) do
-      {:ok, branch} -> {:ok, branch}
-      {:error, _reason} -> :none
-    end
-  end
-
-  defp story_branch(route, _story, stage_branch) do
+  defp story_branch(route, stage_branch) do
     case Map.get(route, :branch) || stage_branch do
       branch when is_binary(branch) and branch != "" -> {:ok, branch}
       _none -> :none

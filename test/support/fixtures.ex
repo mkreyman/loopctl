@@ -62,8 +62,6 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report, as: TokenUsageReport
-  alias Loopctl.WebAuthn.BrowserLogin
-  alias Loopctl.WebAuthn.BrowserSession
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
@@ -1118,8 +1116,7 @@ defmodule Loopctl.Fixtures do
   end
 
   # `:repo` picks the sandbox connection: `AdminRepo` (default), where the WebAuthn ceremony
-  # reads it, or `Loopctl.Repo` for a test whose tenant lives there (the thread page, which
-  # validates its session under the tenant's RLS).
+  # reads it, or `Loopctl.Repo` for a test whose tenant lives there.
   def fixture(:root_authenticator, attrs) do
     attrs = Enum.into(attrs, %{})
     {repo, attrs} = Map.pop(attrs, :repo, AdminRepo)
@@ -1141,28 +1138,6 @@ defmodule Loopctl.Fixtures do
     end
 
     in_tenant(repo, tenant_id, insert)
-  end
-
-  # A `browser_sessions` row (US-45.7) for `:tenant_id` and `:authenticator_id`, live for the
-  # session lifetime unless `:expires_at` / `:revoked_at` say otherwise. `:repo` as for
-  # `fixture(:root_authenticator)`; the thread page validates on `Loopctl.Repo`.
-  def fixture(:browser_session, attrs) do
-    attrs = Enum.into(attrs, %{})
-    repo = Map.get(attrs, :repo, AdminRepo)
-
-    tenant_id = Map.fetch!(attrs, :tenant_id)
-
-    in_tenant(repo, tenant_id, fn ->
-      repo.insert!(%BrowserSession{
-        tenant_id: tenant_id,
-        authenticator_id: Map.fetch!(attrs, :authenticator_id),
-        expires_at:
-          Map.get_lazy(attrs, :expires_at, fn ->
-            DateTime.add(DateTime.utc_now(), BrowserLogin.lifetime_seconds())
-          end),
-        revoked_at: Map.get(attrs, :revoked_at)
-      })
-    end)
   end
 
   def fixture(:agent, attrs) do
@@ -2409,57 +2384,6 @@ defmodule Loopctl.Fixtures do
     |> Loopctl.Repo.insert!()
   end
 
-  # One `thread_checkpoints` row inserted DIRECTLY on the RLS `Loopctl.Repo` connection
-  # (US-45.4), so a merge-gate or stage-machine test can place a checkpoint of either kind
-  # without driving a claim, a lease and a runner through `Loopctl.Threads`. `:repo` picks the
-  # connection, as `fixture(:story_stage)` does, for the committed-tenant modules. `seq` is
-  # required, so a test states the order it means; `parent_checkpoint_id` links a base update
-  # to the checkpoint it was merged into.
-  def fixture(:thread_checkpoint, attrs) do
-    attrs = Enum.into(attrs, %{})
-    repo = Map.get(attrs, :repo, Loopctl.Repo)
-    tenant_id = Map.fetch!(attrs, :tenant_id)
-
-    row =
-      struct!(
-        Loopctl.Threads.Checkpoint,
-        attrs
-        |> Map.drop([:repo])
-        |> Map.put_new(:kind, :checkpoint)
-        |> Map.put_new(:claim_epoch, 0)
-        |> Map.put_new(:tree_sha, String.duplicate("e", 40))
-      )
-
-    if repo == Loopctl.Repo do
-      {:ok, checkpoint} = Loopctl.Repo.with_tenant(tenant_id, fn -> repo.insert!(row) end)
-      checkpoint
-    else
-      repo.insert!(row)
-    end
-  end
-
-  # One `thread_issue_links` row inserted DIRECTLY on `AdminRepo` (US-45.7), where the drainer
-  # (`Loopctl.Threads.IssueLinks.due/1` and `attempt/2`) reads and writes it, so a drain test
-  # does not have to record a checkpoint on the RLS `Repo` connection it cannot see. Needs a
-  # story on `AdminRepo` (`fixture(:story)`); `:repo_full_name` must name a live intake source
-  # for the attempt to post.
-  def fixture(:thread_issue_link, attrs) do
-    attrs = Enum.into(attrs, %{})
-    now = DateTime.utc_now()
-
-    AdminRepo.insert!(%Loopctl.Threads.IssueLink{
-      tenant_id: Map.fetch!(attrs, :tenant_id),
-      story_id: Map.fetch!(attrs, :story_id),
-      repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
-      issue_number: Map.get(attrs, :issue_number, 42),
-      status: Map.get(attrs, :status, :pending),
-      attempts: Map.get(attrs, :attempts, 0),
-      next_attempt_at: Map.get(attrs, :next_attempt_at),
-      inserted_at: now,
-      updated_at: now
-    })
-  end
-
   def fixture(:stage_story, attrs) do
     attrs = Enum.into(attrs, %{})
 
@@ -2631,47 +2555,6 @@ defmodule Loopctl.Fixtures do
     fixture(:triage_verdict, %{tenant_id: tenant_id, story_id: story.id})
 
     %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
-  end
-
-  # The claim's implement dispatch, PLACED in thread mode on `master` (US-45.4) — the merge
-  # gate reads the mode, the base branch and the branch from this row, never from the intake
-  # source — and the claim's first checkpoint at `:commit_sha`/`:tree_sha`. Written to the
-  # ledger row directly: placement is `DispatchLedger.record_sent/4`'s, tested there. Pass
-  # `:tenant_id`, `:story_id` and `:runner_id`. Returns `%{checkpoint:, dispatch_row:}`.
-  def fixture(:thread_claim, attrs) do
-    attrs = Enum.into(attrs, %{})
-    tenant_id = Map.fetch!(attrs, :tenant_id)
-    story_id = Map.fetch!(attrs, :story_id)
-
-    {:ok, dispatch_row} =
-      Loopctl.Repo.with_tenant(tenant_id, fn ->
-        Loopctl.Repo.insert!(%DispatchRecord{
-          tenant_id: tenant_id,
-          runner_id: Map.fetch!(attrs, :runner_id),
-          dispatch_id: Ecto.UUID.generate(),
-          story_id: story_id,
-          claim_epoch: 0,
-          kind: "implement",
-          mode: "thread",
-          base_branch: "master",
-          # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
-          # has nothing to bound.
-          status: "accepted",
-          wall_clock_seconds: 3_600,
-          released_at: DateTime.utc_now()
-        })
-      end)
-
-    checkpoint =
-      fixture(:thread_checkpoint, %{
-        tenant_id: tenant_id,
-        story_id: story_id,
-        seq: 1,
-        commit_sha: Map.fetch!(attrs, :commit_sha),
-        tree_sha: Map.fetch!(attrs, :tree_sha)
-      })
-
-    %{checkpoint: checkpoint, dispatch_row: dispatch_row}
   end
 
   # A delivery stage row inserted DIRECTLY at any stage (#803), bypassing
@@ -2976,11 +2859,8 @@ defmodule Loopctl.Fixtures do
             project_id: project_id,
             target_epic_id: Map.get(attrs, :target_epic_id)
           },
-          # By presence, as the context reads it: omitted keeps the `pr` default. A THREAD
-          # source must name a required check (US-45.6), so one that names none gets `test`.
-          attrs
-          |> Map.take([:mode, :required_checks])
-          |> default_thread_checks()
+          # By presence, as the context reads it: omitted keeps the `pr` default.
+          Map.take(attrs, [:mode, :required_checks])
         )
       )
 
@@ -3920,11 +3800,6 @@ defmodule Loopctl.Fixtures do
 
       :ok
   end
-
-  defp default_thread_checks(%{mode: mode} = attrs) when mode in [:thread, "thread"],
-    do: Map.put_new(attrs, :required_checks, ["test"])
-
-  defp default_thread_checks(attrs), do: attrs
 
   # On the RLS `Loopctl.Repo`, a row is inserted under its tenant's context: an earlier
   # `with_tenant/2` in the same sandbox transaction leaves another tenant's context set.

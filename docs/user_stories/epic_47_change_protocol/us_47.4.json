@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-47.4.6",
-      "description": "An event whose edge is not allowed from the row's current stage escalates over a new control-only edge :change_outside_lifecycle through Escalations.escalate_as_control/3, records the event, and never forces the stage."
+      "description": "An event whose edge is not allowed from the row's current stage escalates over a new control-only edge :change_outside_lifecycle through Escalations.escalate_as_control/3 (re-added by this story, taking the edge it escalates over; #984 deleted the single-edge version), records the event, and never forces the stage."
     },
     {
       "id": "AC-47.4.7",

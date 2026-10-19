@@ -145,11 +145,9 @@ defmodule Loopctl.Delivery.StagesTest do
 
         result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
 
-        if edge in ([:runner_lost, :claim_released, :base_updated] ++
-                      StageMachine.release_escalation_edges()) do
+        if edge in ([:runner_lost, :claim_released] ++ StageMachine.release_escalation_edges()) do
           # Only a releasing transaction takes these (follow_release/5): the release edges,
-          # and the two escalations a release decides (US-44.4). And only the transaction
-          # recording a base update takes `:base_updated` (follow_base_update/4, US-45.5).
+          # and the two escalations a release decides (US-44.4).
           assert {:error, :invalid_transition} = result, inspect({from, to, edge})
         else
           assert {:ok, %StoryStage{stage: ^to} = moved} = result, inspect({from, to, edge})
@@ -192,26 +190,6 @@ defmodule Loopctl.Delivery.StagesTest do
         end
 
       assert refused != []
-    end
-
-    test "base_updated is refused to every caller of advance/4, whatever it carries (US-45.5)" do
-      {story, _row} = at_stage(:ci)
-
-      assert {:error, :invalid_transition} =
-               Stages.advance(story.tenant_id, story.id, {:ci, :ci, :base_updated},
-                 claim_epoch: story.claim_epoch,
-                 actor_role: :user,
-                 actor_lineage: [],
-                 effects: [head_sha: String.duplicate("c", 40)]
-               )
-
-      assert Stages.get(story.tenant_id, story.id).stage == :ci
-    end
-
-    test "follow_base_update/4 refuses outside a transaction" do
-      assert_raise ArgumentError, fn ->
-        Stages.follow_base_update(Ecto.UUID.generate(), Ecto.UUID.generate(), %{})
-      end
     end
 
     test "a repeated attempt counts again" do
@@ -452,37 +430,6 @@ defmodule Loopctl.Delivery.StagesTest do
 
       assert {:error, :not_found} =
                Stages.advance(story.tenant_id, story.id, {:detected, :triaged}, claim_epoch: 0)
-    end
-  end
-
-  describe "entered_at/3 (US-45.6)" do
-    test "the newest transition INTO the stage, nil before the story ever entered it" do
-      {story, _row} = at_stage(:pr_open)
-      opts = [claim_epoch: story.claim_epoch]
-
-      assert Stages.entered_at(story.tenant_id, story.id, :ci) == {:ok, nil}
-
-      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:pr_open, :ci}, opts)
-      {:ok, first} = Stages.entered_at(story.tenant_id, story.id, :ci)
-      assert %DateTime{} = first
-
-      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red}, opts)
-
-      [:implementing, :reviewing, :pr_open, :ci]
-      |> Enum.chunk_every(2, 1, :discard)
-      |> Enum.each(fn [from, to] ->
-        {:ok, _} = Stages.advance(story.tenant_id, story.id, {from, to}, opts)
-      end)
-
-      {:ok, second} = Stages.entered_at(story.tenant_id, story.id, :ci)
-      assert DateTime.compare(second, first) == :gt
-
-      # A later transition OUT of the stage does not move when it was entered.
-      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red}, opts)
-      assert Stages.entered_at(story.tenant_id, story.id, :ci) == {:ok, second}
-
-      # Another tenant's story is never read.
-      assert Stages.entered_at(fixture(:tenant).id, story.id, :ci) == {:ok, nil}
     end
   end
 

@@ -32,10 +32,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `internal_error` |
   | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts, effects}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage`, `effect_conflict`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | `"session_ended"` | `RunnerSessionEnded` (since 1.16.0) | `RunnerSessionEndedAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
-  | runner -> control | `"checkpoint"` | `RunnerCheckpoint` (since 1.20.0) | `RunnerCheckpointAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `not_claimant`, `claim_not_live`, `checkpoint_conflict`, `secret_blocked`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
-  | runner -> control | `"thread_entry"` | `RunnerThreadEntry` (since 1.20.0) | `RunnerThreadEntryAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
-  | runner -> control | `"review_finding"` | `RunnerReviewFinding` (since 1.21.0) | `RunnerReviewFindingAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
-  | runner -> control | `"review_verdict"` | `RunnerReviewVerdict` (since 1.21.0) | `RunnerReviewVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | `"triage_verdict"` | `RunnerTriageVerdictMessage` (since 1.9.0) | `RunnerTriageVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `stale_stage`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
@@ -61,6 +57,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.20.0) A SESSION REPORTS ITS WORK AS IT HAPPENS, on the story's change thread (epic 45, US-45.2). Two new messages: `checkpoint` (`RunnerCheckpoint`: `dispatch_id`, `claim_epoch`, `commit_sha`, `tree_sha`, optional `note`) for each commit the session pushed, and `thread_entry` (`RunnerThreadEntry`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, optional `checkpoint_id`) for each note it wants on the thread. Both name an ACCEPTED `implement` dispatch at its `claim_epoch`; a checkpoint is recorded only for the story's current claimant while its claim is live. Both are IDEMPOTENT: a resend of the same checkpoint, or of the same `client_seq` with the same content, is answered `ok` with `replayed: true`, and a DIFFERENT write reusing either is `checkpoint_conflict` or `idempotency_key_reused`. Each has its own bucket (`checkpoint_burst`, `thread_entry_burst`) and its own byte budget (`x-connection.limits.checkpoint`, `x-connection.limits.thread_entry`). OPTIONAL — a runner that sends neither gets exactly today's behaviour. RE-VENDOR to send them: a 1.19.0 copy has neither event, no `RunnerCheckpointAck`, no `RunnerThreadEntryAck` and no bucket for either | | | | |
   | (1.21.0) REVIEW IS DISPATCHABLE (epic 45, US-45.3). `x-connection.dispatchable_kinds` adds `review`: loopctl places a review of a story's change thread as a runner dispatch of kind `review`, carrying the story (`RunnerStory`, as an implement dispatch does) and a `review` object (`RunnerReview`: `review_id`, `round`, and the checkpoint to read — `checkpoint_id`, `checkpoint_seq`, `commit_sha`, `tree_sha`). It CLAIMS NOTHING: `claim_epoch` is the implementer's claim, echoed back like any dispatch's, and the review never writes code. The session answers with two new messages: `review_finding` (`RunnerReviewFinding`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, `severity`, optional `location` and `introduced_by`) for each defect it found, and ONE `review_verdict` (`RunnerReviewVerdict`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`) that completes the review's round and ends it; the slot is freed by the session's `session_ended`, not by the verdict. Both are bound to the review loopctl recorded for THIS dispatch and THIS runner, and are idempotent on `<dispatch_id>:<client_seq>`. New refusal codes: `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`. `session_ended` now also ends a REVIEW session: recorded once, the slot freed, no stage effect and no retry-ceiling count, answered with `kind: "review"` and `replayed` only (`RunnerSessionEndedAck` requires only `replayed` from this version; an implement session's ack still carries every row field). Only a runner that DECLARES `review` on join is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run reviews: a 1.20.0 copy has no `review` kind, no `RunnerReview`, no `review_finding` and no `review_verdict` | | | | |
   | (1.22.0) ONE CODE, ONE MEANING, then WHICH REFUSALS END THE CLAIM (loopctl#920). Two codes were each answered both when the claim was over and when one message was wrong, so those halves get codes of their own: `claim_epoch_mismatch` (was `stale_claim_epoch`: the message's epoch is not its own dispatch's while the claim stands; `stale_claim_epoch` now means only that the claim moved) and `wrong_dispatch_kind` (was `unknown_dispatch`: this runner's dispatch of another kind; `unknown_dispatch` now means not this runner's, or gone). Both are permanent for that one message. A runner that JOINS declaring 1.22.0 or later gets the new codes; an older one keeps getting the old. Then `x-connection.claim_ending_errors`, keyed by work event with no `"*"` (`unknown_dispatch` and `stale_claim_epoch` on every work event except `stale_claim_epoch` on `triage_verdict`, whose resend is the reclaim repair; `not_claimant` on `checkpoint`; `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` on the judgements), and `x-connection.claim_ending_remedy`: send that dispatch no more of its work and stop its session; its `session_ended` on exit is sent as always, resent on `rate_limited`, and final on any permanent refusal. `claim_not_live` is not claim-ending: it is also answered once review is requested, while the session still reports its stages. RE-VENDOR, and declare 1.22.0 on join, to get the split codes and derive the set | | | | |
+  | (1.23.0) THE CHANGE THREAD AND REVIEW SURFACE IS RETIRED (loopctl#984; Epic 45 was deleted and its successor, Epic 47, hears about a change from chg rather than from a runner). Gone: the `checkpoint`, `thread_entry`, `review_finding` and `review_verdict` messages with their schemas, acks, buckets, limits and refusal codes; the `review` dispatch kind and the dispatch's `review` object; the `kind` field of `RunnerSessionEndedAck`. Any of the four events is now answered `unknown_event`, and a join declaring `review` is admitted as before (the join never refuses a kind) and is simply never sent one. This NARROWS the contract, which a minor version otherwise may not do. It is a minor anyway: loopctl can no longer create a dispatch that would make a runner send one of these messages, production held no thread checkpoint, entry or review when it shipped, and a major would have refused the join of every connected runner until each re-vendored. RE-VENDOR to drop the dead events from your copy | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -122,12 +119,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   ## Dispatchable kinds
 
-  `kind` declares the vocabulary (`triage`, `implement`, `review`);
+  `kind` declares the vocabulary (`triage`, `implement`);
   `RunnerDispatch.dispatchable_kinds/0` is what loopctl will actually send, and
   `cast_dispatch/1` refuses anything else BEFORE a payload is recorded or broadcast. Since
-  1.10.0 that is `triage` and `implement`, and since 1.21.0 `review` too — added to the
-  vocabulary and the dispatchable set together, and kept out of `implied_by_silence/0` for the
-  reason given below for triage: only a runner that DECLARES `review` is sent one.
+  1.10.0 that is `triage` and `implement`.
 
   **THE INTERLOCK HAS MOVED (1.10.0), and the reasoning is kept rather than deleted, because
   it is what says when it may move again.** Triage has had its payload since 1.7.0
@@ -256,14 +251,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `unknown_dispatch`. It is optional: a runner that never sends it gets exactly the behaviour
   before 1.16.0.
 
-  **A REVIEW SESSION (since 1.21.0)** ends the same way, whatever `reason`: send it when the
-  session stops without a verdict (superseded, closed, crashed, out of budget) or after one. A
-  review holds no claim, so the report does ONE thing — it frees the runner's slot for the
-  dispatch. No stage moves and nothing is counted against the retry ceiling. It is fenced on
-  the dispatch alone: its `claim_epoch` is the one the dispatch was sent under, and it was
-  accepted, however the implementer's claim has moved since. The ack is `kind: "review"` and
-  `replayed`, with no stage row; recorded once, as for an implement session.
-
   **RECORDED ONCE PER DISPATCH, AND RESENDING IS SAFE.** A byte-identical resend is answered
   `ok` with `replayed: true` and the row as it now stands — EVEN AFTER the release its first
   copy caused has moved the story's `claim_epoch` on, because the resend is matched on its
@@ -284,107 +271,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   same escalation instead of re-queueing the story, and leaves the claim held while the chain
   still refuses — so a budget-killed story is never re-queued, and is escalated on the first
   sweep after the repair.
-
-  ## Change threads (since 1.20.0)
-
-  A story's change thread (`Loopctl.Threads`) is the record of the commits its claimant
-  reported and the notes written around them. The runner is the only party that knows when a
-  checkpoint exists, so it reports each one as the session pushes it, rather than leaving the
-  thread to be reconstructed afterwards. Both messages are OPTIONAL: a runner that never sends
-  them gets exactly the behaviour before 1.20.0.
-
-  - `checkpoint` — a commit the session pushed: `commit_sha` and its `tree_sha`, lowercase
-    hex, both 40 or both 64 characters, and an optional `note` saying why. It is recorded only
-    for the story's CURRENT claimant (the runner's agent, which a placement claims the story
-    as) presenting the current `claim_epoch` while the claim is live — `not_claimant`,
-    `stale_claim_epoch` and `claim_not_live` otherwise, all permanent. `not_claimant` and
-    `stale_claim_epoch` end the claim (`claim_ending_errors`); `claim_not_live` refuses
-    checkpoints only, because review may have been requested on a claim whose session still
-    reports its stages. Since 1.22.0 a message whose epoch is not its own dispatch's, on a
-    claim that stands, is `claim_epoch_mismatch` instead of `stale_claim_epoch`. A checkpoint's parent is loopctl's to derive
-    (the previous checkpoint of the same claim); nothing on the wire names one.
-  - `thread_entry` — a note on the thread (kind `message`, always). `client_seq` is the
-    runner's own counter for the dispatch, and the entry's idempotency key is
-    `<dispatch_id>:<client_seq>`, so number each note once and never reuse a number for
-    different content. An optional `checkpoint_id` (from a `checkpoint` ack) ties the note to
-    that checkpoint. A NEW note is refused `stale_claim_epoch` once the story's claim has
-    moved past the message's epoch.
-
-  Both name an ACCEPTED `implement` dispatch; any other kind is `unknown_dispatch`, as on
-  `session_ended`, and a dispatch no longer accepted is `dispatch_not_accepted` — except for
-  a RESEND, below. The story is never taken off the wire. A write that could not
-  get its locks in time, or lost its connection, is refused `rate_limited` with
-  `min_interval_ms`: resend after that interval, and a write that did commit is answered
-  `replayed: true`.
-
-  **RESENDING IS SAFE, AND IS THE ANSWER TO A LOST ACK.** A byte-identical checkpoint, or a
-  `thread_entry` with the same `client_seq` and the same content, is answered `ok` with
-  `replayed: true` and the id it was first recorded under. Either one's resend is answered from
-  its row even after the claim's lease has lapsed or the claim has moved, and whatever the
-  dispatch's status by then, because the write happened while it was live. A DIFFERENT write reusing either identity is refused — `checkpoint_conflict` (the
-  same commit under this claim with another tree or note) and `idempotency_key_reused` (the
-  same `client_seq` with other content) — permanently, because acknowledging it would tell the
-  runner its new content was recorded when it was not.
-
-  **AFTER A BASE UPDATE THE THREAD BRANCH HEAD IS LOOPCTL'S** (US-45.5; no wire change). When
-  the base branch moves under a checkpoint the merge gate allowed, loopctl's merge executor
-  merges the base INTO the thread branch as its GitHub App, records that merge commit as a
-  `base_update` checkpoint, and keeps the story at `ci` over control's `base_updated` edge (a
-  runner never reports it). The thread branch head is then that merge commit, not the
-  session's last push. A session that goes on working on the story must FETCH the thread
-  branch and build on its head before pushing again: a push from the old head is not a
-  fast-forward, and a forced one is a head nobody reported, which the gate sends back. Report
-  the next commit as an ordinary `checkpoint`; in the thread its parent is the previous
-  CLAIMANT checkpoint, never the base update.
-
-  **EVERY `note` AND `body` IS SCANNED FOR CREDENTIALS** before anything is written, because
-  an entry is served to every role of the tenant and nothing can edit or remove one. A
-  credential-shaped value is `secret_blocked`, permanently for those bytes: remove the value
-  and send a new write under a new `client_seq`.
-
-  **THE MESSAGE CAP IS WHAT BINDS.** The whole message is bounded by the byte rule at
-  `x-connection.limits.checkpoint.max_bytes` / `thread_entry.max_bytes`, so a conforming
-  message always fits a frame. The byte rule charges 6 bytes per character, so a note well
-  under the per-field `thread_body_max_utf8_bytes` (the HTTP surface's cap, whose `maxLength`
-  counts graphemes and is looser still) can already exceed it: measure the message under the
-  byte rule, not the field, and split a long note across several entries.
-
-  ## Review (since 1.21.0)
-
-  A review of a story's change thread is a dispatch of kind `review`, placed by loopctl on a
-  runner that DECLARES the kind. It reads; it never writes code and it claims nothing. It
-  carries the story (`story`, a `RunnerStory`) and `review` (`RunnerReview`): which review this
-  is, its round, and the ONE checkpoint to read — the story's latest at placement. The rest of
-  the thread (its notes, and every fix with the findings it answers) is served by
-  `GET /api/v1/stories/{story_id}/thread/reviews/{review_id}` on the runner's own key.
-
-  The session answers with:
-
-  - `review_finding` — a defect, with `severity` (`critical`, `high`, `medium`, `low`), an
-    optional `location` (`file:line`) and `introduced_by`: absent in round 1, REQUIRED after
-    it — the id of a checkpoint of this story at or before the one being read, or `none`.
-  - `review_verdict` — ONE per review, sent last. It completes the review's round and ends it:
-    every later judgement is `review_closed`. The capacity slot is NOT given back by the
-    verdict — the session is still running when it sends it — but by the `session_ended` the
-    runner sends when the session stops, as for an implement session.
-
-  Both name an ACCEPTED `review` dispatch at its `claim_epoch`; any other kind is
-  `unknown_dispatch`. Once that dispatch's `session_ended` is recorded the session is over: a
-  resend of a judgement it made is still answered, and a new one is `dispatch_not_accepted`. Each is bound to the review loopctl recorded for that dispatch and that
-  runner, and refused, permanently: `review_closed` after the verdict,
-  `review_claim_ended` when the implementer's claim the review was placed under has ended (a
-  release, a force-unclaim, a new claim) — nothing it judged can count for the claim that
-  follows, so the review is over — `review_round_superseded` when another review completed
-  this round first, and
-  `reviewer_not_separate` when this runner's agent is the story's claimant, recorded a
-  checkpoint of the thread, or is the agent of a dispatch on the implementer's lineage chain.
-  `tenant_halted` is the tenant's custody halt, and clears when an operator lifts it; a resend
-  of a judgement already recorded is answered even during a halt.
-
-  Idempotent on `<dispatch_id>:<client_seq>` WITHIN THE REVIEW: a resend with the same content
-  is answered `ok` with `replayed: true`, other content is `idempotency_key_reused`. Every
-  `body` and `location` is scanned for credentials (`secret_blocked`), and the message cap
-  under the byte rule is what binds, as on `thread_entry`.
 
   ## Server-initiated disconnects (since 1.2.0)
 
@@ -414,20 +300,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   - `session_ended_burst` (`session_ended_burst/0`, since 1.16.0) — a bucket of 4 that
     refills one a second, for the same reason as the verdict's: one message per session, and a
     report refused by a token bucket is a report the runner must hold and resend.
-  - `checkpoint_burst` (`checkpoint_burst/0`, since 1.20.0) — a bucket of 8 that refills one
-    every 500 ms. A session pushes a commit every few minutes; the bucket is for a runner
-    flushing what it buffered across a rejoin.
-  - `thread_entry_burst` (`thread_entry_burst/0`, since 1.20.0) — a bucket of 12 that refills
-    one every 250 ms, the `stage` bucket's size: notes come in bursts, and each one is a
-    transaction that appends to the tenant's audit chain.
-  - `review_finding_burst` (`review_finding_burst/0`, since 1.21.0) — a bucket of 12 that
-    refills one every 250 ms: a review's findings come in a burst at its end, and each is a
-    transaction that appends to the tenant's audit chain, as a `thread_entry` is.
-  - `review_verdict_burst` (`review_verdict_burst/0`, since 1.21.0) — a bucket of 4 that refills
-    one a second: one verdict per review, sized like `session_ended_burst`.
-  - `permanent_errors` (`permanent_errors/0`) — the refusal codes no resend can clear.
-    Branch on this rather than on a list copied into a runner's own source; everything not
-    in it is worth resending unchanged.
   - `claim_ending_errors` (`claim_ending_errors/0`, since 1.22.0) — which of those END THE
     CLAIM the message ran under, keyed by WORK event with no `"*"`; `session_ended` has no
     key. `claim_ending_remedy` (`claim_ending_remedy/0`) says what to do: send that dispatch
@@ -526,10 +398,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.Runners.Usage
-  alias Loopctl.Threads.Entry, as: ThreadEntry
   alias OpenApiSpex.Schema
 
-  @version "1.22.0"
+  @version "1.23.0"
   @major 1
 
   defmodule ByteRule do
@@ -704,8 +575,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # argues that a second copy is the drift to avoid. What holds triage back now is the
     # OTHER END: no deployed runner accepts the kind. The moduledoc has the full version;
     # this stays one sentence so the two cannot diverge again.
-    @all ["triage", "implement", "review"]
-    @dispatchable ["triage", "implement", "review"]
+    @all ["triage", "implement"]
+    @dispatchable ["triage", "implement"]
 
     # What a runner built before 1.6.0 is read as having declared. It MUST be the set loopctl
     # was already sending when the field did not exist, or introducing the field would start
@@ -1940,68 +1811,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
-  defmodule RunnerReview do
-    @moduledoc """
-    The `review` object a `review` dispatch carries (since 1.21.0, epic 45 US-45.3): which review
-    this session is, its round, and the ONE checkpoint it reads. The rest of the thread is
-    served by `GET /api/v1/stories/{story_id}/thread/reviews/{review_id}`.
-    """
-
-    require OpenApiSpex
-
-    alias Loopctl.ApiSpec.RunnerContract.Limits
-
-    @sha_pattern "^[0-9a-f]{40}([0-9a-f]{24})?$"
-
-    # Ids, two integers and two shas: well under a kilobyte under any encoding. The bound is
-    # stated so `x-connection.limits` carries it like every other object.
-    @max_bytes 4_000
-
-    @doc "The byte budget of the object, under the byte rule."
-    @spec max_bytes() :: pos_integer()
-    def max_bytes, do: @max_bytes
-
-    @doc "The bounds a runner cannot read off the schema, for `x-connection.limits`."
-    @spec limits() :: map()
-    def limits, do: Limits.of(schema(), @max_bytes)
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerReview",
-        description:
-          "What a `review` dispatch reviews (since 1.21.0). Required on a `review` dispatch " <>
-            "and refused on any other kind. `review_id` is the review loopctl recorded; " <>
-            "every `review_finding` and the `review_verdict` of this dispatch are bound to it.",
-        type: :object,
-        required: [:review_id, :round, :checkpoint_id, :checkpoint_seq, :commit_sha, :tree_sha],
-        properties: %{
-          review_id: %Schema{type: :string, format: :uuid},
-          round: %Schema{
-            type: :integer,
-            minimum: 1,
-            maximum: 3,
-            description:
-              "The review round. After round 1 every finding must carry `introduced_by`."
-          },
-          checkpoint_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description: "The checkpoint to read; `introduced_by` names checkpoints like it."
-          },
-          checkpoint_seq: %Schema{type: :integer, minimum: 1},
-          commit_sha: %Schema{type: :string, pattern: @sha_pattern},
-          tree_sha: %Schema{type: :string, pattern: @sha_pattern}
-        }
-      },
-      struct?: false
-    )
-  end
-
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
 
-    alias Loopctl.ApiSpec.RunnerContract.RunnerReview
     alias Loopctl.ApiSpec.RunnerContract.RunnerStory
 
     # A session's wall clock, bounded (since 1.3.0). The runner stops a session there, and
@@ -2164,8 +1977,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "absent otherwise."
           },
           story: RunnerStory.schema(),
-          triage: RunnerTriage.schema(),
-          review: RunnerReview.schema()
+          triage: RunnerTriage.schema()
         }
       },
       struct?: false
@@ -2442,8 +2254,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   defmodule RunnerSessionEnded do
     @moduledoc """
     The `session_ended` message: why the session under an implement dispatch stopped (1.16.0,
-    epic 44 US-44.3), or under a review dispatch (1.21.0, US-45.3), where it only frees the
-    slot. See "Session end" in `Loopctl.ApiSpec.RunnerContract` for what each reason does to
+    epic 44 US-44.3). See "Session end" in `Loopctl.ApiSpec.RunnerContract` for what each reason does to
     the story.
 
     Three fields and no free text, deliberately. Everything control does with it is decided from
@@ -2465,9 +2276,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       %{
         title: "RunnerSessionEnded",
         description:
-          "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0), or " <>
-            "under an accepted `review` dispatch (since 1.21.0), for which it only frees the " <>
-            "runner's slot: no stage effect, no retry-ceiling count, whatever `reason`. " <>
+          "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). " <>
             "Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, " <>
             "not a request — control decides the story's next stage from `reason`: " <>
             "`completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` " <>
@@ -2485,7 +2294,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :string,
             format: :uuid,
             description:
-              "The ACCEPTED implement or review dispatch whose session ended. It names the " <>
+              "The ACCEPTED implement dispatch whose session ended. It names the " <>
                 "story; a " <>
                 "story id is never taken from the wire."
           },
@@ -2525,16 +2334,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         description:
           "The reply to an accepted `session_ended`: where the story now is, and whether this " <>
             "was a resend. The row fields are the ones a `stage` ack carries, and an implement " <>
-            "session's ack always has every one. A review session's (since 1.21.0) is " <>
-            "`kind: \"review\"` and `replayed` only: it moved no stage.",
+            "session's ack always has every one.",
         type: :object,
         required: [:replayed],
         properties: %{
-          kind: %Schema{
-            type: :string,
-            enum: ["review"],
-            description: "Present only on a review session's ack (since 1.21.0)."
-          },
           stage: %Schema{type: :string, description: "The stage the story is at now."},
           claim_epoch: %Schema{
             type: :integer,
@@ -2661,452 +2464,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
-  defmodule RunnerCheckpoint do
-    @moduledoc """
-    The `checkpoint` message: a commit the session under an implement dispatch pushed (1.20.0,
-    epic 45 US-45.2). See "Change threads" in `Loopctl.ApiSpec.RunnerContract`.
-
-    Recorded by `Loopctl.Threads.record_checkpoint/3`, the function the HTTP surface uses, with
-    the same claimant fence. The story comes from the dispatch, never from the wire, and a
-    checkpoint's parent is derived by loopctl, so nothing here names either.
-    """
-
-    require OpenApiSpex
-
-    alias Loopctl.ApiSpec.RunnerContract.ByteRule
-    alias Loopctl.ApiSpec.RunnerContract.Limits
-    alias Loopctl.Threads.Entry
-
-    # The same shape `Loopctl.Threads` enforces: lowercase hex, SHA-1 or SHA-256.
-    @sha_pattern "^[0-9a-f]{40}([0-9a-f]{24})?$"
-
-    # The message under the byte rule. A note may be `Entry.max_body_bytes/0` UTF-8 bytes,
-    # which the byte rule can charge six times over, so without a message budget a note
-    # loopctl would store could be a frame the socket closes on — and that close takes every
-    # session on the socket with it. Leaves `frame_envelope_bytes/0` of the frame for the
-    # envelope, as `RunnerTraceBatch`'s budget does.
-    @max_bytes 60_000
-
-    @doc "The byte budget of one `checkpoint` message, under the byte rule."
-    @spec max_bytes() :: pos_integer()
-    def max_bytes, do: @max_bytes
-
-    @doc "The bounds a runner cannot read off the schema, for `x-connection.limits`."
-    @spec limits() :: map()
-    def limits, do: Limits.of(schema(), @max_bytes)
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerCheckpoint",
-        description:
-          "A commit the session under an ACCEPTED `implement` dispatch pushed (since " <>
-            "1.20.0), recorded on the story's change thread. Optional: a runner that never " <>
-            "sends it gets today's behaviour. Recorded only for the story's current " <>
-            "claimant at the current `claim_epoch` while the claim is live. IDEMPOTENT: a " <>
-            "resend of the same commit, tree and note is answered `ok` with `replayed: " <>
-            "true`; the same commit under this claim with another tree or note is " <>
-            "`checkpoint_conflict`. At most #{@max_bytes} bytes under the byte rule. " <>
-            ByteRule.text(),
-        type: :object,
-        required: [:dispatch_id, :claim_epoch, :commit_sha, :tree_sha],
-        properties: %{
-          dispatch_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description:
-              "The ACCEPTED implement dispatch whose session pushed the commit. It names the " <>
-                "story; a story id is never taken from the wire."
-          },
-          claim_epoch: %Schema{
-            type: :integer,
-            minimum: 0,
-            description: "The `claim_epoch` of the dispatch, echoed."
-          },
-          commit_sha: %Schema{
-            type: :string,
-            pattern: @sha_pattern,
-            description: "The pushed commit: lowercase hex, 40 or 64 characters."
-          },
-          tree_sha: %Schema{
-            type: :string,
-            pattern: @sha_pattern,
-            description:
-              "The commit's tree, in the same object format as `commit_sha` (both 40 or " <>
-                "both 64); a mismatch is `invalid_payload`."
-          },
-          note: %Schema{
-            type: :string,
-            minLength: 1,
-            maxLength: Entry.max_body_bytes(),
-            description:
-              "Why this commit, in the session's words. Untrusted: recorded, never executed. " <>
-                "At most #{Entry.max_body_bytes()} UTF-8 BYTES — the `maxLength` beside this " <>
-                "is the same number counted as graphemes, which is looser. THE MESSAGE CAP IS " <>
-                "WHAT BINDS: the whole message is at most #{@max_bytes} bytes under the byte " <>
-                "rule, which charges 6 bytes per character and 12 for one outside the Basic " <>
-                "Multilingual Plane, so a note under this field's maximum can still be " <>
-                "`invalid_payload`. Whitespace alone is `invalid_payload`, and a " <>
-                "credential-shaped value is `secret_blocked`."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerCheckpointAck do
-    @moduledoc "The reply to a `checkpoint` (1.20.0)."
-
-    require OpenApiSpex
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerCheckpointAck",
-        description: "The reply to an accepted `checkpoint`.",
-        type: :object,
-        required: [:checkpoint_id, :seq, :replayed],
-        properties: %{
-          checkpoint_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description:
-              "The checkpoint's id — the same on every resend. A `thread_entry` may name it " <>
-                "as its `checkpoint_id`."
-          },
-          seq: %Schema{
-            type: :integer,
-            minimum: 1,
-            description: "The checkpoint's position among the story's checkpoints."
-          },
-          replayed: %Schema{
-            type: :boolean,
-            description:
-              "False on the delivery that recorded this checkpoint, true on any resend of " <>
-                "it. A resend writes nothing."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerThreadEntry do
-    @moduledoc """
-    The `thread_entry` message: a note the session under an implement dispatch puts on the
-    story's change thread (1.20.0, epic 45 US-45.2). Always kind `message`: the kinds that
-    decide what may merge are written by the review flow (US-45.3), never by a runner.
-
-    Its idempotency key is `<dispatch_id>:<client_seq>`, built by loopctl, so a runner numbers
-    its notes and never spells a key.
-    """
-
-    require OpenApiSpex
-
-    alias Loopctl.ApiSpec.RunnerContract.ByteRule
-    alias Loopctl.ApiSpec.RunnerContract.Limits
-    alias Loopctl.Threads.Entry
-
-    # See `RunnerCheckpoint`'s budget: the same reason, the same number.
-    @max_bytes 60_000
-
-    @doc "The byte budget of one `thread_entry` message, under the byte rule."
-    @spec max_bytes() :: pos_integer()
-    def max_bytes, do: @max_bytes
-
-    @doc "The bounds a runner cannot read off the schema, for `x-connection.limits`."
-    @spec limits() :: map()
-    def limits, do: Limits.of(schema(), @max_bytes)
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerThreadEntry",
-        description:
-          "A note on the story's change thread from the session under an ACCEPTED " <>
-            "`implement` dispatch (since 1.20.0), recorded as a `message` entry. Optional: a " <>
-            "runner that never sends it gets today's behaviour. The entry's idempotency key " <>
-            "is `<dispatch_id>:<client_seq>`: a resend with the same `client_seq` and the " <>
-            "same `body` and `checkpoint_id` is answered `ok` with `replayed: true`, and a " <>
-            "different one is `idempotency_key_reused`. At most #{@max_bytes} bytes under " <>
-            "the byte rule. " <> ByteRule.text(),
-        type: :object,
-        required: [:dispatch_id, :claim_epoch, :client_seq, :body],
-        properties: %{
-          dispatch_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description:
-              "The ACCEPTED implement dispatch whose session wrote the note. It names the " <>
-                "story; a story id is never taken from the wire."
-          },
-          claim_epoch: %Schema{
-            type: :integer,
-            minimum: 0,
-            description: "The `claim_epoch` of the dispatch, echoed."
-          },
-          client_seq: %Schema{
-            type: :integer,
-            minimum: 0,
-            description:
-              "The runner's own number for this note within the dispatch. Number each note " <>
-                "once; a resend carries the same number."
-          },
-          body: %Schema{
-            type: :string,
-            minLength: 1,
-            maxLength: Entry.max_body_bytes(),
-            description:
-              "The note. Untrusted: recorded, never executed. At most " <>
-                "#{Entry.max_body_bytes()} UTF-8 BYTES — the `maxLength` beside this is the " <>
-                "same number counted as graphemes, which is looser. THE MESSAGE CAP IS WHAT " <>
-                "BINDS: the whole message is at most #{@max_bytes} bytes under the byte rule, " <>
-                "which charges 6 bytes per character and 12 for one outside the Basic " <>
-                "Multilingual Plane, so a note under this field's maximum can still be " <>
-                "`invalid_payload`; split it across entries. Whitespace alone is " <>
-                "`invalid_payload`, and a credential-shaped value is `secret_blocked`."
-          },
-          checkpoint_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description:
-              "A checkpoint of THIS story (a `checkpoint` ack's `checkpoint_id`) the note is " <>
-                "about. Any other id is `invalid_payload`."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerThreadEntryAck do
-    @moduledoc "The reply to a `thread_entry` (1.20.0)."
-
-    require OpenApiSpex
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerThreadEntryAck",
-        description: "The reply to an accepted `thread_entry`.",
-        type: :object,
-        required: [:entry_id, :seq, :replayed],
-        properties: %{
-          entry_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description: "The entry's id — the same on every resend."
-          },
-          seq: %Schema{
-            type: :integer,
-            minimum: 1,
-            description: "The entry's position on the story's thread."
-          },
-          replayed: %Schema{
-            type: :boolean,
-            description:
-              "False on the delivery that recorded this note, true on any resend of it. A " <>
-                "resend writes nothing."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerReviewFinding do
-    @moduledoc """
-    The `review_finding` message: a defect the session under a `review` dispatch found (1.21.0,
-    epic 45 US-45.3). See "Review" in `Loopctl.ApiSpec.RunnerContract`. Recorded by
-    `Loopctl.Threads.record_judgement/5`, bound to the review loopctl recorded for the dispatch
-    and the runner; nothing here names a story, a review or a checkpoint to bind to.
-    """
-
-    require OpenApiSpex
-
-    alias Loopctl.ApiSpec.RunnerContract.ByteRule
-    alias Loopctl.ApiSpec.RunnerContract.Limits
-    alias Loopctl.Threads.Entry
-    alias Loopctl.Threads.Reviews
-
-    # See `RunnerCheckpoint`'s budget: the same reason, the same number.
-    @max_bytes 60_000
-
-    @doc "The byte budget of one `review_finding` message, under the byte rule."
-    @spec max_bytes() :: pos_integer()
-    def max_bytes, do: @max_bytes
-
-    @doc "The bounds a runner cannot read off the schema, for `x-connection.limits`."
-    @spec limits() :: map()
-    def limits, do: Limits.of(schema(), @max_bytes)
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerReviewFinding",
-        description:
-          "A defect found by the session under an ACCEPTED `review` dispatch (since 1.21.0), " <>
-            "recorded as a `finding` on the story's change thread and bound to the dispatch's " <>
-            "review and the checkpoint it reads. Idempotent on `<dispatch_id>:<client_seq>` " <>
-            "within the review. At most #{@max_bytes} bytes under the byte rule. " <>
-            ByteRule.text(),
-        type: :object,
-        required: [:dispatch_id, :claim_epoch, :client_seq, :body, :severity],
-        properties: %{
-          dispatch_id: %Schema{
-            type: :string,
-            format: :uuid,
-            description: "The ACCEPTED review dispatch. It names the story and the review."
-          },
-          claim_epoch: %Schema{
-            type: :integer,
-            minimum: 0,
-            description: "The `claim_epoch` of the dispatch, echoed."
-          },
-          client_seq: %Schema{
-            type: :integer,
-            minimum: 0,
-            description:
-              "The runner's own number for this judgement within the dispatch, shared with " <>
-                "`review_verdict`. Number each once; a resend carries the same number."
-          },
-          body: %Schema{
-            type: :string,
-            minLength: 1,
-            maxLength: Entry.max_body_bytes(),
-            description:
-              "The failure scenario. Untrusted: recorded, never executed. At most " <>
-                "#{Entry.max_body_bytes()} UTF-8 BYTES, and the message cap under the byte " <>
-                "rule is what binds. A credential-shaped value is `secret_blocked`."
-          },
-          severity: %Schema{
-            type: :string,
-            enum: Enum.map(Entry.severities(), &to_string/1),
-            description:
-              "`critical`, `high` or `medium` is MATERIAL: at the round ceiling a material " <>
-                "finding escalates the story for a rewrite."
-          },
-          location: %Schema{
-            type: :string,
-            minLength: 1,
-            maxLength: Reviews.max_location_bytes(),
-            description:
-              "`file:line`, at most #{Reviews.max_location_bytes()} UTF-8 bytes. Untrusted."
-          },
-          introduced_by: %Schema{
-            type: :string,
-            minLength: 1,
-            maxLength: 36,
-            description:
-              "Absent in round 1 (`introduced_by_not_allowed` otherwise, as " <>
-                "`invalid_payload`); REQUIRED after it: the id of a checkpoint of this story " <>
-                "at or before the one being read, or `none`."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerReviewFindingAck do
-    @moduledoc "The reply to a `review_finding` (1.21.0)."
-
-    require OpenApiSpex
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerReviewFindingAck",
-        description: "The reply to an accepted `review_finding`.",
-        type: :object,
-        required: [:entry_id, :seq, :replayed],
-        properties: %{
-          entry_id: %Schema{type: :string, format: :uuid, description: "The finding's id."},
-          seq: %Schema{type: :integer, minimum: 1},
-          replayed: %Schema{
-            type: :boolean,
-            description: "True on a resend of a finding already recorded; it writes nothing."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerReviewVerdict do
-    @moduledoc """
-    The `review_verdict` message: the ONE verdict of a `review` dispatch (1.21.0, epic 45
-    US-45.3). It completes the review's round and ends the review.
-    """
-
-    require OpenApiSpex
-
-    alias Loopctl.ApiSpec.RunnerContract.ByteRule
-    alias Loopctl.ApiSpec.RunnerContract.Limits
-    alias Loopctl.Threads.Entry
-
-    @max_bytes 60_000
-
-    @doc "The byte budget of one `review_verdict` message, under the byte rule."
-    @spec max_bytes() :: pos_integer()
-    def max_bytes, do: @max_bytes
-
-    @doc "The bounds a runner cannot read off the schema, for `x-connection.limits`."
-    @spec limits() :: map()
-    def limits, do: Limits.of(schema(), @max_bytes)
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerReviewVerdict",
-        description:
-          "The verdict of the session under an ACCEPTED `review` dispatch (since 1.21.0): ONE " <>
-            "per review, sent after every finding. It completes the review's round, ends the " <>
-            "review — every later judgement is `review_closed`. It does not free the " <>
-            "capacity slot: the `session_ended` the runner sends when the session stops does. " <>
-            "Idempotent on `<dispatch_id>:<client_seq>`. At most " <>
-            "#{@max_bytes} bytes under the byte rule. " <> ByteRule.text(),
-        type: :object,
-        required: [:dispatch_id, :claim_epoch, :client_seq, :body],
-        properties: %{
-          dispatch_id: %Schema{type: :string, format: :uuid},
-          claim_epoch: %Schema{type: :integer, minimum: 0},
-          client_seq: %Schema{type: :integer, minimum: 0},
-          body: %Schema{
-            type: :string,
-            minLength: 1,
-            maxLength: Entry.max_body_bytes(),
-            description:
-              "The verdict in the session's words. Untrusted. Whether the round asked for " <>
-                "changes is its findings, not this text."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
-  defmodule RunnerReviewVerdictAck do
-    @moduledoc "The reply to a `review_verdict` (1.21.0)."
-
-    require OpenApiSpex
-
-    OpenApiSpex.schema(
-      %{
-        title: "RunnerReviewVerdictAck",
-        description: "The reply to an accepted `review_verdict`.",
-        type: :object,
-        required: [:entry_id, :seq, :replayed, :escalated],
-        properties: %{
-          entry_id: %Schema{type: :string, format: :uuid},
-          seq: %Schema{type: :integer, minimum: 1},
-          replayed: %Schema{type: :boolean},
-          escalated: %Schema{
-            type: :boolean,
-            description:
-              "True when this verdict reached the round ceiling with a material finding: the " <>
-                "story is escalated for a rewrite."
-          }
-        }
-      },
-      struct?: false
-    )
-  end
-
   defmodule RunnerTraceAck do
     @moduledoc false
     require OpenApiSpex
@@ -3138,15 +2495,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerTriageVerdictAck,
     RunnerSessionEnded,
     RunnerSessionEndedAck,
-    RunnerCheckpoint,
-    RunnerCheckpointAck,
-    RunnerThreadEntry,
-    RunnerThreadEntryAck,
-    RunnerReview,
-    RunnerReviewFinding,
-    RunnerReviewFindingAck,
-    RunnerReviewVerdict,
-    RunnerReviewVerdictAck,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,
@@ -3238,49 +2586,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          already_recorded unknown_story_stage audit_chain_append_failed claim_epoch_mismatch
          wrong_dispatch_kind internal_error),
-    # Since 1.20.0 (US-45.2), the change thread. The codes below are NEW, each because nothing
-    # already published carries its remedy:
-    #
-    # - `not_claimant` — the story's claim is not this runner's agent (or the story is not
-    #   claimed at all). `stale_claim_epoch` names a moved epoch, which this is not.
-    # - `claim_not_live` — the claim is this runner's and at this epoch, but no longer takes
-    #   the implementer's work: its lease lapsed, review was requested, or the story left the
-    #   claimed statuses (`Claimant.live?/2`). Permanent for that checkpoint; not claim-ending
-    #   (`@claim_ending_errors` says why).
-    # - `checkpoint_conflict` / `idempotency_key_reused` — a resend that is NOT the same write.
-    #   Acknowledging it would say the new content was recorded when it was not.
-    # - `secret_blocked` — a text field carries a credential shape. `invalid_payload` would
-    #   send the runner looking for a malformed field; this names the one thing to remove.
-    #
-    # `audit_chain_append_failed` is the tenant's hash chain refusing the write's entry, as on
-    # `stage`: permanent, and nothing was written.
-    "checkpoint" =>
-      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         not_claimant claim_not_live checkpoint_conflict secret_blocked
-         audit_chain_append_failed claim_epoch_mismatch wrong_dispatch_kind internal_error),
-    "thread_entry" =>
-      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         idempotency_key_reused secret_blocked audit_chain_append_failed claim_epoch_mismatch
-         wrong_dispatch_kind internal_error),
-    # Since 1.21.0 (US-45.3), a review's judgements. NEW codes, each because nothing already
-    # published carries its remedy:
-    #
-    # - `tenant_halted` — the tenant's custody is halted (L6). A judgement decides what may
-    #   merge, so it waits for the halt to be lifted; it is not permanent.
-    # - `review_closed` — the review already recorded its verdict.
-    # - `review_claim_ended` — the claim the review was placed under has ended.
-    # - `review_round_superseded` — another review completed this round first.
-    # - `reviewer_not_separate` — this runner's agent may not judge this story.
-    "review_finding" =>
-      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         tenant_halted review_closed review_claim_ended review_round_superseded
-         reviewer_not_separate idempotency_key_reused secret_blocked audit_chain_append_failed
-         claim_epoch_mismatch wrong_dispatch_kind internal_error),
-    "review_verdict" =>
-      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         tenant_halted review_closed review_claim_ended review_round_superseded
-         reviewer_not_separate idempotency_key_reused secret_blocked audit_chain_append_failed
-         claim_epoch_mismatch wrong_dispatch_kind internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
@@ -3348,22 +2653,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "rate_limited" => ~w(min_interval_ms),
       "invalid_payload" => ~w(details)
     },
-    "checkpoint" => %{
-      "rate_limited" => ~w(min_interval_ms),
-      "invalid_payload" => ~w(details)
-    },
-    "thread_entry" => %{
-      "rate_limited" => ~w(min_interval_ms),
-      "invalid_payload" => ~w(details)
-    },
-    "review_finding" => %{
-      "rate_limited" => ~w(min_interval_ms),
-      "invalid_payload" => ~w(details)
-    },
-    "review_verdict" => %{
-      "rate_limited" => ~w(min_interval_ms),
-      "invalid_payload" => ~w(details)
-    },
     "unknown_event" => %{}
   }
 
@@ -3374,7 +2663,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
   @inbound_events ~w(status dispatch_reply trace trace_cursor stage triage_verdict
-                     session_ended checkpoint thread_entry review_finding review_verdict)
+                     session_ended)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -3402,20 +2691,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # finished sessions to report at once, and each one refused is one it has to hold.
   @session_ended_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
 
-  # The change thread (1.20.0). A checkpoint is one pushed commit, minutes apart in a working
-  # session; the bucket is sized for a runner flushing what it buffered across a rejoin, two
-  # sessions' worth. A note is written as the session reasons, so it comes in bursts, and each
-  # one is a transaction appending to the tenant's audit chain — `stage`'s bucket, for the
-  # same reason `stage` has it.
-  @checkpoint_burst %{"capacity" => 8, "refill_interval_ms" => 500}
-  @thread_entry_burst %{"capacity" => 12, "refill_interval_ms" => 250}
-
-  # A review's judgements (1.21.0). Findings come in a burst at the end of a review, each a
-  # transaction appending to the tenant's audit chain — `thread_entry`'s bucket, for the same
-  # reason. A verdict is one per review — `session_ended`'s bucket.
-  @review_finding_burst %{"capacity" => 12, "refill_interval_ms" => 250}
-  @review_verdict_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
-
   # THE REFUSALS NO RESEND CAN CLEAR, published so a runner branches on the contract rather
   # than on a list it copied into its own source. Asked for by the `loopctl-runner`
   # maintaining session on that ground, 2026-09-15: it is the same lesson as reading the
@@ -3431,30 +2706,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   #
   # `"*"` is what holds for every event; an event's own entry ADDS to it and never subtracts,
   # so a code cannot be permanent globally and transient for one message.
-  # The codes that say a REVIEW can take no more judgements (1.21.0): permanent for both
-  # judgement messages, and the review half of `@claim_ending_errors` (1.22.0). One literal, so
-  # a code added later reaches both maps and both messages together.
-  @review_ending_codes ~w(review_closed review_claim_ended review_round_superseded
-                          reviewer_not_separate)
-
   @permanent_errors %{
     "*" => ~w(invalid_payload not_authorized unsupported_contract_version machine_mismatch
          forbidden_topic unknown_topic unknown_event unknown_dispatch stale_claim_epoch
          already_replied already_recorded dispatch_not_accepted run_mismatch effect_conflict
          audit_chain_append_failed unknown_story_stage claim_epoch_mismatch
          wrong_dispatch_kind),
-    "triage_verdict" => ~w(stale_stage),
-    # 1.20.0. The claim a checkpoint names is over or is not this runner's, or the write is
-    # not the one already recorded, or it carries a credential: none of them changes by
-    # sending the same bytes again.
-    "checkpoint" => ~w(not_claimant claim_not_live checkpoint_conflict secret_blocked),
-    "thread_entry" => ~w(idempotency_key_reused secret_blocked),
-    # 1.21.0. The review is over, its claim ended, it lost its round, or it may not judge this
-    # story, or the write is
-    # not the one already recorded, or it carries a credential. `tenant_halted` is NOT here:
-    # it clears when an operator lifts the halt.
-    "review_finding" => @review_ending_codes ++ ~w(idempotency_key_reused secret_blocked),
-    "review_verdict" => @review_ending_codes ++ ~w(idempotency_key_reused secret_blocked)
+    "triage_verdict" => ~w(stale_stage)
   }
 
   # WHICH PERMANENT REFUSALS END THE CLAIM (1.22.0, loopctl#920), rather than refuse one
@@ -3474,14 +2732,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   #   permanent for that one message.
   # - `unknown_dispatch` — no such dispatch for this runner (never held, or its story deleted).
   #   This runner's dispatch of the wrong kind is now `wrong_dispatch_kind`.
-  # - `not_claimant` on `checkpoint` — the claim is another agent's.
-  # - `@review_ending_codes` on a judgement — that review takes no more judgements.
-  #
-  # NOT `claim_not_live`: it is also answered once REVIEW IS REQUESTED, which clears only by a
-  # release that bumps the epoch, and meanwhile the session still reports its stages. It is
-  # permanent for the checkpoint that drew it; a claim that then ends shows as
-  # `stale_claim_epoch` on the next message. It is not split, because on the runner channel
-  # none of its cases is retryable: a placed claim's lapsed lease is always past its cap.
   #
   # PER WORK EVENT, no `"*"`: `session_ended` is not work and has no key, so no refusal of it
   # ever asks for another message (`@claim_ending_remedy`). `dispatch_not_accepted` is decided
@@ -3490,16 +2740,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "dispatch_reply" => ~w(unknown_dispatch stale_claim_epoch),
     "trace" => ~w(unknown_dispatch stale_claim_epoch),
     "stage" => ~w(unknown_dispatch stale_claim_epoch),
-    "triage_verdict" => ~w(unknown_dispatch),
-    "checkpoint" => ~w(unknown_dispatch stale_claim_epoch not_claimant),
-    "thread_entry" => ~w(unknown_dispatch stale_claim_epoch),
-    "review_finding" => ~w(unknown_dispatch stale_claim_epoch) ++ @review_ending_codes,
-    "review_verdict" => ~w(unknown_dispatch stale_claim_epoch) ++ @review_ending_codes
+    "triage_verdict" => ~w(unknown_dispatch)
   }
 
   @claim_ending_remedy "The claim the refused message ran under is over: send that dispatch " <>
                          "no more messages of its work (the events keyed here) and stop its " <>
-                         "session. An implement or review session still sends its " <>
+                         "session. An implement session still sends its " <>
                          "`session_ended` when its process exits, as always, and treats its " <>
                          "answer by `session_ended`'s own rules: `rate_limited` is resent, " <>
                          "and any permanent refusal of it is final. Every OTHER permanent " <>
@@ -3617,26 +2863,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec session_ended_burst() :: %{String.t() => pos_integer()}
   def session_ended_burst, do: @session_ended_burst
-
-  @doc """
-  The `checkpoint` bucket (1.20.0). See the note above `@checkpoint_burst`.
-  """
-  @spec checkpoint_burst() :: %{String.t() => pos_integer()}
-  def checkpoint_burst, do: @checkpoint_burst
-
-  @doc """
-  The `thread_entry` bucket (1.20.0). See the note above `@checkpoint_burst`.
-  """
-  @spec thread_entry_burst() :: %{String.t() => pos_integer()}
-  def thread_entry_burst, do: @thread_entry_burst
-
-  @doc "The `review_finding` bucket (1.21.0). See the note above `@review_finding_burst`."
-  @spec review_finding_burst() :: %{String.t() => pos_integer()}
-  def review_finding_burst, do: @review_finding_burst
-
-  @doc "The `review_verdict` bucket (1.21.0). See the note above `@review_finding_burst`."
-  @spec review_verdict_burst() :: %{String.t() => pos_integer()}
-  def review_verdict_burst, do: @review_verdict_burst
 
   @doc """
   The refusal codes no resend can clear, per event (1.9.0).
@@ -3834,7 +3060,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   defp dispatch_shape_errors(dispatch) do
     kind_errors(dispatch) ++
-      story_errors(dispatch) ++ triage_errors(dispatch) ++ review_errors(dispatch)
+      story_errors(dispatch) ++ triage_errors(dispatch)
   end
 
   defp kind_errors(%{kind: kind}) do
@@ -3850,8 +3076,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   defp story_errors(%{story: story, kind: kind, story_id: story_id}) do
     cond do
-      kind not in ["implement", "review"] ->
-        ["story is only allowed when kind is implement or review"]
+      kind != "implement" ->
+        ["story is only allowed when kind is implement"]
 
       Map.get(story, :id) != story_id ->
         ["story.id must be the dispatch's story_id"]
@@ -3904,21 +3130,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     do: ["a triage dispatch must carry the triage object"]
 
   defp triage_errors(_dispatch), do: []
-
-  # The `review` object rides only a `review` dispatch, and a `review` dispatch must carry it:
-  # a review session with no review to bind its judgements to would spend a slot on findings
-  # every one of which is refused.
-  defp review_errors(%{review: review, kind: "review"}) do
-    if ByteRule.bytes(review) > RunnerReview.max_bytes(),
-      do: ["review exceeds #{RunnerReview.max_bytes()} bytes under the byte rule"],
-      else: []
-  end
-
-  defp review_errors(%{review: _review}), do: ["review is only allowed when kind is review"]
-
-  defp review_errors(%{kind: "review"}), do: ["a review dispatch must carry the review object"]
-
-  defp review_errors(_dispatch), do: []
 
   @doc """
   Validates a triage verdict (since 1.7.0). Returns the declared fields only, with atom
@@ -4340,73 +3551,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
-  @doc """
-  Validates a `checkpoint` payload (1.20.0). Returns the declared fields only, with atom keys,
-  or `{:error, {:invalid, messages}}` — including for a message over
-  `RunnerCheckpoint.max_bytes/0` under the byte rule, measured on the payload as sent.
-
-  The object format rule (both shas 40 or both 64) and the note's UTF-8 byte cap are
-  `Loopctl.Threads`' own and are enforced there, where the HTTP surface meets them too.
-  """
-  @spec cast_checkpoint(term()) :: {:ok, map()} | {:error, term()}
-  def cast_checkpoint(payload) do
-    with :ok <- values_ok(payload),
-         {:ok, cast} <- cast(payload, RunnerCheckpoint.schema()),
-         :ok <- message_bytes_ok(payload, RunnerCheckpoint.max_bytes()) do
-      {:ok, known_fields(cast, RunnerCheckpoint.schema())}
-    end
-  end
-
-  @doc """
-  Validates a `thread_entry` payload (1.20.0). Returns the declared fields only, with atom
-  keys, or `{:error, {:invalid, messages}}` — including for a message over
-  `RunnerThreadEntry.max_bytes/0` under the byte rule, measured on the payload as sent.
-  """
-  @spec cast_thread_entry(term()) :: {:ok, map()} | {:error, term()}
-  def cast_thread_entry(payload) do
-    with :ok <- values_ok(payload),
-         {:ok, cast} <- cast(payload, RunnerThreadEntry.schema()),
-         :ok <- message_bytes_ok(payload, RunnerThreadEntry.max_bytes()) do
-      {:ok, known_fields(cast, RunnerThreadEntry.schema())}
-    end
-  end
-
-  @doc """
-  Validates a `review_finding` payload (1.21.0). Returns the declared fields only, with atom
-  keys, or `{:error, {:invalid, messages}}` — including for a message over
-  `RunnerReviewFinding.max_bytes/0` under the byte rule.
-  """
-  @spec cast_review_finding(term()) :: {:ok, map()} | {:error, term()}
-  def cast_review_finding(payload) do
-    with :ok <- values_ok(payload),
-         {:ok, cast} <- cast(payload, RunnerReviewFinding.schema()),
-         :ok <- message_bytes_ok(payload, RunnerReviewFinding.max_bytes()) do
-      {:ok, known_fields(cast, RunnerReviewFinding.schema())}
-    end
-  end
-
-  @doc """
-  Validates a `review_verdict` payload (1.21.0). Returns the declared fields only, with atom
-  keys, or `{:error, {:invalid, messages}}` — including for a message over
-  `RunnerReviewVerdict.max_bytes/0` under the byte rule.
-  """
-  @spec cast_review_verdict(term()) :: {:ok, map()} | {:error, term()}
-  def cast_review_verdict(payload) do
-    with :ok <- values_ok(payload),
-         {:ok, cast} <- cast(payload, RunnerReviewVerdict.schema()),
-         :ok <- message_bytes_ok(payload, RunnerReviewVerdict.max_bytes()) do
-      {:ok, known_fields(cast, RunnerReviewVerdict.schema())}
-    end
-  end
-
-  # Measured on the payload AS SENT, undeclared keys included, as a trace batch is: those were
-  # in the frame.
-  defp message_bytes_ok(payload, max_bytes) do
-    if ByteRule.bytes(payload) <= max_bytes,
-      do: :ok,
-      else: {:error, {:invalid, ["the message exceeds #{max_bytes} bytes under the byte rule"]}}
-  end
-
   @doc "Validates a `trace_cursor` payload. Returns `{:ok, %{run_id: run_id}}`."
   @spec cast_trace_cursor(term()) :: {:ok, map()} | {:error, term()}
   def cast_trace_cursor(payload) do
@@ -4533,12 +3677,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "stage" => "RunnerStageReport",
           "triage_verdict" => "RunnerTriageVerdictMessage",
           "session_ended" => "RunnerSessionEnded",
-          "checkpoint" => "RunnerCheckpoint",
-          "thread_entry" => "RunnerThreadEntry",
-          "review_finding" => "RunnerReviewFinding",
-          "review_verdict" => "RunnerReviewVerdict",
-          "story" => "RunnerStory",
-          "review" => "RunnerReview"
+          "story" => "RunnerStory"
         },
         # The kinds loopctl will actually send. `RunnerDispatch.kind`'s enum is the
         # VOCABULARY, which is wider: `triage` is declared and refused by `cast_dispatch/1`
@@ -4553,11 +3692,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace" => "RunnerTraceAck",
           "trace_cursor" => "RunnerTraceAck",
           "triage_verdict" => "RunnerTriageVerdictAck",
-          "session_ended" => "RunnerSessionEndedAck",
-          "checkpoint" => "RunnerCheckpointAck",
-          "thread_entry" => "RunnerThreadEntryAck",
-          "review_finding" => "RunnerReviewFindingAck",
-          "review_verdict" => "RunnerReviewVerdictAck"
+          "session_ended" => "RunnerSessionEndedAck"
         },
         "errors" => @error_reasons,
         "limits" => %{
@@ -4573,10 +3708,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "dispatch_reply_burst" => @dispatch_reply_burst,
           "triage_verdict_burst" => @triage_verdict_burst,
           "session_ended_burst" => @session_ended_burst,
-          "checkpoint_burst" => @checkpoint_burst,
-          "thread_entry_burst" => @thread_entry_burst,
-          "review_finding_burst" => @review_finding_burst,
-          "review_verdict_burst" => @review_verdict_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
           # The clamp control applies to `RunnerUsage.resets_at` (since 1.17.0), in seconds from
@@ -4588,16 +3719,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           },
           "story" => RunnerStory.limits(),
           "triage" => RunnerTriage.limits(),
-          "triage_verdict" => RunnerTriageVerdict.limits(),
-          # The change thread (1.20.0): each message's byte budget and field bounds, and the
-          # UTF-8 cap on a `note` or `body`, which no JSON Schema keyword can state.
-          "checkpoint" => RunnerCheckpoint.limits(),
-          "thread_entry" => RunnerThreadEntry.limits(),
-          "thread_body_max_utf8_bytes" => ThreadEntry.max_body_bytes(),
-          # A review (1.21.0): the dispatch's `review` object and each judgement message.
-          "review" => RunnerReview.limits(),
-          "review_finding" => RunnerReviewFinding.limits(),
-          "review_verdict" => RunnerReviewVerdict.limits()
+          "triage_verdict" => RunnerTriageVerdict.limits()
         },
         # The transition table a `stage` message is checked against, published so a runner
         # can refuse an impossible transition locally instead of learning it from a refusal.
