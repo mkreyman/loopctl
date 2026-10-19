@@ -31,7 +31,10 @@ defmodule Loopctl.Changes.TrunkEvidence do
   `ensure_trunk_verified/4` runs INSIDE the transaction, under the story lock, after
   `ReviewCustody.ensure_landed_review/3`. It re-reads the landing and the revert from the
   database and applies the assessment only when it was made for the SAME landing; a landing
-  that arrived in between answers unevaluated (`landing_changed`), never the stale answer.
+  that arrived in between answers unevaluated (`landing_changed`), never the stale answer, as
+  does a story with no assessment at all (its local gates refused before the read and pass
+  now). The bindings and landings are read through `Loopctl.Changes.Landings`, the reads the
+  landed-review gate makes, so the two gates always judge the same landing.
 
   ## What each answer means to the caller
 
@@ -62,10 +65,10 @@ defmodule Loopctl.Changes.TrunkEvidence do
   alias Loopctl.AdminRepo
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
+  alias Loopctl.Changes.Landings
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.GitSha
-  alias Loopctl.Intake.Source
   alias Loopctl.Verification.Credential
 
   @verified_ref "verified/master"
@@ -109,70 +112,81 @@ defmodule Loopctl.Changes.TrunkEvidence do
 
   @doc """
   The assessment for one story, made OUTSIDE any transaction. Asks the forge only for a chg
-  story whose current landing is not already reverted and names a valid trunk commit.
+  story whose current landing is not already reverted and names a valid trunk commit, and
+  only when `ask?` (called with no arguments, just before the forge read) answers true: the
+  caller passes its own cheap local gates there, so a verify they would refuse spends no
+  credentialed forge call. A declined ask is no assessment (`nil`), which the in-transaction
+  half answers as unevaluated `landing_changed` should those gates have passed since.
   """
-  @spec assess(Ecto.UUID.t(), Ecto.UUID.t()) :: assessment()
-  def assess(tenant_id, story_id) do
-    case facts(AdminRepo, tenant_id, story_id) do
-      :not_chg -> :not_chg
-      {:chg, nil} -> %{landed_event_id: nil, outcome: nil}
-      {:chg, landing} -> %{landed_event_id: landing.id, outcome: judge(tenant_id, landing)}
-    end
+  @spec assess(Ecto.UUID.t(), Ecto.UUID.t(), (-> boolean())) :: assessment() | nil
+  def assess(tenant_id, story_id, ask? \\ fn -> true end) do
+    tenant_id
+    |> assess_many([story_id], fn _story_id -> ask?.() end)
+    |> Map.get(story_id, :not_chg)
   end
 
   @doc """
-  `assess/2` for a batch, as a map keyed by story id. One query finds the bound stories; only
-  they are assessed, the forge calls `@batch_concurrency` at a time. A call that outlives its
-  task bound is `forge_unavailable` for that story.
+  `assess/3` for a batch, as a map keyed by story id; a story with no change binding is
+  absent (`:not_chg`). The bindings, landings and reverts are read in one query each; `ask?`
+  (called with the story id) is asked only for the stories that would make a forge call, and
+  those calls run `@batch_concurrency` at a time. A call that outlives its task bound is
+  `forge_unavailable` for that story.
   """
-  @spec assess_many(Ecto.UUID.t(), [Ecto.UUID.t()]) :: %{optional(Ecto.UUID.t()) => assessment()}
-  def assess_many(tenant_id, story_ids) when is_list(story_ids) do
+  @spec assess_many(Ecto.UUID.t(), [Ecto.UUID.t()], (Ecto.UUID.t() -> boolean())) ::
+          %{optional(Ecto.UUID.t()) => assessment() | nil}
+  def assess_many(tenant_id, story_ids, ask? \\ fn _story_id -> true end)
+      when is_list(story_ids) do
     ids = Enum.filter(story_ids, &match?({:ok, _}, Ecto.UUID.cast(&1)))
+    facts = facts_many(AdminRepo, tenant_id, ids)
 
-    bound =
-      AdminRepo.all(
-        from b in Binding,
-          where: b.tenant_id == ^tenant_id and b.story_id in ^ids,
-          distinct: true,
-          select: b.story_id
-      )
+    {to_forge, decided} =
+      Enum.split_with(facts, fn {story_id, landing} ->
+        needs_forge?(landing) and ask?.(story_id)
+      end)
 
-    landings =
-      Enum.map(bound, fn story_id -> {story_id, facts(AdminRepo, tenant_id, story_id)} end)
+    decided =
+      Map.new(decided, fn
+        {story_id, nil} -> {story_id, %{landed_event_id: nil, outcome: nil}}
+        {story_id, landing} -> {story_id, local_assessment(landing)}
+      end)
 
-    landings
+    to_forge
     |> Task.async_stream(
-      fn
-        {story_id, {:chg, nil}} ->
-          {story_id, %{landed_event_id: nil, outcome: nil}}
-
-        {story_id, {:chg, landing}} ->
-          {story_id, %{landed_event_id: landing.id, outcome: judge(tenant_id, landing)}}
-
-        {story_id, :not_chg} ->
-          {story_id, :not_chg}
+      fn {story_id, landing} ->
+        {story_id, %{landed_event_id: landing.id, outcome: judge(tenant_id, landing)}}
       end,
       max_concurrency: @batch_concurrency,
       timeout: @batch_task_timeout_ms,
       on_timeout: :kill_task,
       ordered: true
     )
-    |> Enum.zip(landings)
+    |> Enum.zip(to_forge)
     |> Map.new(fn
       {{:ok, {story_id, assessment}}, _landing} ->
         {story_id, assessment}
 
-      {{:exit, _reason}, {story_id, {:chg, landing}}} ->
+      {{:exit, _reason}, {story_id, landing}} ->
         {story_id,
          %{
-           landed_event_id: landing && landing.id,
+           landed_event_id: landing.id,
            outcome: {:unevaluated, "forge_unavailable", @default_retry_after_seconds}
          }}
-
-      {{:exit, _reason}, {story_id, :not_chg}} ->
-        {story_id, :not_chg}
     end)
+    |> Map.merge(decided)
   end
+
+  # A landing the forge must be asked about: not reverted, and naming a valid trunk commit.
+  defp needs_forge?(%{reverted?: false, merge_sha: sha}) when is_binary(sha), do: true
+  defp needs_forge?(_landing), do: false
+
+  # A landing decided without the forge, or one whose forge read the caller declined (`nil`).
+  defp local_assessment(%{reverted?: true} = landing),
+    do: %{landed_event_id: landing.id, outcome: :reverted}
+
+  defp local_assessment(%{merge_sha: nil} = landing),
+    do: %{landed_event_id: landing.id, outcome: :no_trunk_commit}
+
+  defp local_assessment(_declined), do: nil
 
   @doc """
   The in-transaction half: `:ok` or a refusal (see the moduledoc), from the landing as the
@@ -183,17 +197,17 @@ defmodule Loopctl.Changes.TrunkEvidence do
   @spec ensure_trunk_verified(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t(), assessment() | nil) ::
           :ok | {:error, refusal()}
   def ensure_trunk_verified(repo \\ AdminRepo, tenant_id, story_id, assessment) do
-    case facts(repo, tenant_id, story_id) do
-      :not_chg ->
+    case Map.fetch(facts_many(repo, tenant_id, [story_id]), story_id) do
+      :error ->
         :ok
 
-      {:chg, nil} ->
+      {:ok, nil} ->
         {:error, :chg_landing_not_trunk_verified}
 
-      {:chg, %{reverted?: true}} ->
+      {:ok, %{reverted?: true}} ->
         refuse(tenant_id, story_id, :chg_landing_reverted)
 
-      {:chg, %{id: landed_id}} ->
+      {:ok, %{id: landed_id}} ->
         case assessment do
           %{landed_event_id: ^landed_id, outcome: outcome} ->
             decide(tenant_id, story_id, outcome)
@@ -206,65 +220,51 @@ defmodule Loopctl.Changes.TrunkEvidence do
 
   # -- the facts -----------------------------------------------------------------------------
 
-  # `:not_chg` when the story has no binding at all; `{:chg, nil}` when its newest binding is
-  # superseded or its change has no applied landing; else the newest applied landing.
-  defp facts(repo, tenant_id, story_id) do
-    newest =
-      repo.one(
-        from b in Binding,
-          where: b.tenant_id == ^tenant_id and b.story_id == ^story_id,
-          order_by: [desc: is_nil(b.superseded_at), desc: b.inserted_at, desc: b.id],
-          limit: 1
-      )
+  # Keyed by story id, for the stories that have a binding: `nil` when the newest binding is
+  # superseded or its change has no applied landing, else that landing. Three queries for any
+  # batch: the bindings and the landings through `Loopctl.Changes.Landings` — the reads the
+  # landed-review gate makes, so the two gates judge the same landing — and the reverts.
+  defp facts_many(repo, tenant_id, story_ids) do
+    bindings = Landings.newest_bindings(repo, tenant_id, story_ids)
+    current = for {_story_id, %Binding{superseded_at: nil} = b} <- bindings, do: b
+    landings = Landings.newest_applied_landings(repo, tenant_id, current)
+    reverts = newest_reverts(repo, tenant_id, current)
 
-    case newest do
-      nil -> :not_chg
-      %Binding{superseded_at: nil} = binding -> {:chg, landing(repo, tenant_id, binding)}
-      %Binding{} -> {:chg, nil}
-    end
+    Map.new(bindings, fn
+      {story_id, %Binding{superseded_at: nil} = binding} ->
+        key = {binding.repo, binding.change_id}
+        {story_id, landing(Map.get(landings, key), Map.get(reverts, key))}
+
+      {story_id, %Binding{}} ->
+        {story_id, nil}
+    end)
   end
 
-  defp landing(repo, tenant_id, %Binding{} = binding) do
-    case newest_landing(repo, tenant_id, binding) do
-      nil ->
-        nil
+  defp landing(nil, _revert_seq), do: nil
 
-      %{} = landed ->
-        %{
-          id: landed.id,
-          repo: landed.repo,
-          merge_sha: merge_sha(landed.data),
-          reverted?: reverted_after?(repo, tenant_id, binding, landed.event_seq)
-        }
-    end
+  defp landing(landed, revert_seq) do
+    %{
+      id: landed.id,
+      repo: landed.source_repo,
+      merge_sha: merge_sha(landed.data),
+      reverted?: is_integer(revert_seq) and revert_seq > landed.event_seq
+    }
   end
 
-  # The newest APPLIED `landed` event of the binding's change, with the repository of the
-  # source that delivered it — the intake source's own `repo_full_name`, which the credential
-  # is asked for, as every other forge read asks.
-  defp newest_landing(repo, tenant_id, binding) do
-    repo.one(
+  # The highest `event_seq` of an APPLIED `reverted` event of each binding's change.
+  defp newest_reverts(_repo, _tenant_id, []), do: %{}
+
+  defp newest_reverts(repo, tenant_id, bindings) do
+    repo.all(
       from e in Event,
-        join: s in Source,
-        on: s.id == e.source_id and s.tenant_id == e.tenant_id,
         where:
-          e.tenant_id == ^tenant_id and e.repo == ^binding.repo and
-            e.change_id == ^binding.change_id and e.kind == "landed" and
+          e.tenant_id == ^tenant_id and e.repo in ^Enum.map(bindings, & &1.repo) and
+            e.change_id in ^Enum.map(bindings, & &1.change_id) and e.kind == "reverted" and
             not is_nil(e.applied_at),
-        order_by: [desc: e.event_seq],
-        limit: 1,
-        select: %{id: e.id, event_seq: e.event_seq, data: e.data, repo: s.repo_full_name}
+        group_by: [e.repo, e.change_id],
+        select: {{e.repo, e.change_id}, max(e.event_seq)}
     )
-  end
-
-  defp reverted_after?(repo, tenant_id, binding, landed_seq) do
-    repo.exists?(
-      from e in Event,
-        where:
-          e.tenant_id == ^tenant_id and e.repo == ^binding.repo and
-            e.change_id == ^binding.change_id and e.kind == "reverted" and
-            not is_nil(e.applied_at) and e.event_seq > ^landed_seq
-    )
+    |> Map.new()
   end
 
   defp merge_sha(%{"merge_sha" => sha}) when is_binary(sha) do
@@ -274,9 +274,6 @@ defmodule Loopctl.Changes.TrunkEvidence do
   defp merge_sha(_data), do: nil
 
   # -- the forge -----------------------------------------------------------------------------
-
-  defp judge(_tenant_id, %{reverted?: true}), do: :reverted
-  defp judge(_tenant_id, %{merge_sha: nil}), do: :no_trunk_commit
 
   defp judge(tenant_id, %{repo: repo, merge_sha: sha}) do
     with {:ok, forge_repo} <- Credential.repo(tenant_id, repo),

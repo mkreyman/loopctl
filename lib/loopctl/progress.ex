@@ -2608,8 +2608,33 @@ defmodule Loopctl.Progress do
     verification_params = extract_verification_params(params)
 
     with :ok <- refuse_chg_root_verifier(tenant_id, opts) do
-      do_verify_story(tenant_id, story_id, opts, verification_params)
+      # US-47.6: a chg story's CI evidence is read from the forge HERE, before the
+      # transaction, so no story lock is held across a network read, and only when the
+      # story's cheap local gates would let it through. It is applied under the lock.
+      trunk =
+        TrunkEvidence.assess(tenant_id, story_id, fn ->
+          verify_worth_asking?(tenant_id, story_id)
+        end)
+
+      do_verify_story(tenant_id, story_id, opts, verification_params, trunk)
     end
+  end
+
+  # The read-only gates `do_verify_story/5` runs before the trunk gate, on an unlocked read:
+  # a story they refuse is refused there again, under the lock, and never costs a forge call.
+  # The self-verify gate is not run here: its refusal escalates, which belongs to the
+  # transaction that answers the caller.
+  defp verify_worth_asking?(tenant_id, story_id) do
+    case AdminRepo.one(from s in Story, where: s.tenant_id == ^tenant_id and s.id == ^story_id) do
+      nil -> false
+      story -> verify_local_gates_pass?(tenant_id, story)
+    end
+  end
+
+  defp verify_local_gates_pass?(tenant_id, story) do
+    match?({:ok, _}, validate_verifiable(story)) and
+      match?({:ok, _}, validate_review_record_exists(tenant_id, story.id, story)) and
+      match?({:ok, _}, chg_landed_review(tenant_id, story.id))
   end
 
   # US-47.5 (AC-47.5.4): chg-server's keys can review and never certify. Judged on the caller's
@@ -2623,7 +2648,9 @@ defmodule Loopctl.Progress do
         ReviewCustody.caller_lineage(opts, [:verifier_lineage])
       )
 
-  defp do_verify_story(tenant_id, story_id, opts, verification_params) do
+  # `trunk` is the story's `TrunkEvidence` assessment, made by the caller before the
+  # transaction.
+  defp do_verify_story(tenant_id, story_id, opts, verification_params, trunk) do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -2646,10 +2673,6 @@ defmodule Loopctl.Progress do
     # story's recorded verifier; the caller comparison binds the principal that
     # actually makes the call, on EVERY path including the one that skips the
     # optional request-review.
-    # US-47.6: a chg story's CI evidence is read from the forge HERE, before the transaction,
-    # so no story lock is held across a network read. It is applied under the lock below.
-    trunk = TrunkEvidence.assess(tenant_id, story_id)
-
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
@@ -2795,7 +2818,7 @@ defmodule Loopctl.Progress do
   `stories_with_lifecycle_history/2`), so a 50-story batch costs one audit query
   rather than 50 inside the locking transaction.
 
-  `trunk` is the batch's `Loopctl.Changes.TrunkEvidence.assess_many/2` map, made BEFORE the
+  `trunk` is the batch's `Loopctl.Changes.TrunkEvidence.assess_many/3` map, made BEFORE the
   transaction (US-47.6). A chg story missing from it is unevaluated (`landing_changed`), never
   passed, so the default only serves a caller whose batch holds no chg story.
   """
@@ -2951,8 +2974,12 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    # US-47.6: the forge read happens before the transaction, as on verify.
-    trunk = TrunkEvidence.assess(tenant_id, story_id)
+    # US-47.6: the forge read happens before the transaction, as on verify, and only for a
+    # story the landed-review gate would let through.
+    trunk =
+      TrunkEvidence.assess(tenant_id, story_id, fn ->
+        match?({:ok, _}, chg_landed_review(tenant_id, story_id))
+      end)
 
     multi =
       Multi.new()
@@ -3178,7 +3205,7 @@ defmodule Loopctl.Progress do
 
   @doc """
   The subset of `ids` whose audit log shows lifecycle history — the set
-  `backfill_story/4` and `ensure_mark_complete_allowed/2` refuse.
+  `backfill_story/4` and `ensure_mark_complete_allowed/3` refuse.
 
   Hoisted out of the per-story guard so the bulk mark-complete path pays ONE query
   per batch instead of one per story while holding `FOR UPDATE` locks on all of them
@@ -3436,7 +3463,17 @@ defmodule Loopctl.Progress do
 
   defp do_verify_all_in_epic(tenant_id, epic_id, params, opts) do
     stories_to_verify = fetch_eligible_stories_for_verify(tenant_id, epic_id)
-    results = Enum.map(stories_to_verify, &verify_single(tenant_id, &1, params, opts))
+    by_id = Map.new(stories_to_verify, &{&1.id, &1})
+
+    # US-47.6: the epic's forge reads are made once, before any story's transaction, a batch
+    # at a time (`TrunkEvidence.assess_many/3`), for the stories whose local gates pass.
+    trunk =
+      TrunkEvidence.assess_many(tenant_id, Map.keys(by_id), fn story_id ->
+        verify_local_gates_pass?(tenant_id, Map.fetch!(by_id, story_id))
+      end)
+
+    results =
+      Enum.map(stories_to_verify, &verify_single(tenant_id, &1, params, opts, trunk))
 
     verified = Enum.count(results, &match?({:ok, _}, &1))
     errors = results |> Enum.filter(&match?({:error, _}, &1)) |> Enum.map(&elem(&1, 1))
@@ -3465,8 +3502,14 @@ defmodule Loopctl.Progress do
   # The chg-root refusal already ran ONCE for the whole epic (`verify_all_in_epic/4`), so each
   # story goes to the inner verify; every per-story gate — the chg landed-review check
   # included — still runs there.
-  defp verify_single(tenant_id, story, params, opts) do
-    case do_verify_story(tenant_id, story.id, opts, extract_verification_params(params)) do
+  defp verify_single(tenant_id, story, params, opts, trunk) do
+    case do_verify_story(
+           tenant_id,
+           story.id,
+           opts,
+           extract_verification_params(params),
+           Map.get(trunk, story.id, :not_chg)
+         ) do
       {:ok, _updated} -> {:ok, story.id}
       {:error, reason} -> {:error, %{story_id: story.id, reason: inspect(reason)}}
     end

@@ -72,6 +72,7 @@ defmodule Loopctl.Changes.ReviewCustody do
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
+  alias Loopctl.Changes.Landings
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.GitSha
@@ -93,15 +94,7 @@ defmodule Loopctl.Changes.ReviewCustody do
   """
   @spec chg_story(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: :not_chg | {:chg, chg_story()}
   def chg_story(repo \\ AdminRepo, tenant_id, story_id) do
-    newest =
-      repo.one(
-        from b in Binding,
-          where: b.tenant_id == ^tenant_id and b.story_id == ^story_id,
-          order_by: [desc: is_nil(b.superseded_at), desc: b.inserted_at, desc: b.id],
-          limit: 1
-      )
-
-    case newest do
+    case Landings.newest_binding(repo, tenant_id, story_id) do
       nil ->
         :not_chg
 
@@ -233,16 +226,10 @@ defmodule Loopctl.Changes.ReviewCustody do
 
   # The revision commit of the newest APPLIED `landed` event of the current binding's change.
   defp landed_revision(repo, tenant_id, %{binding: %Binding{} = binding}) do
-    repo.one(
-      from e in Event,
-        where:
-          e.tenant_id == ^tenant_id and e.repo == ^binding.repo and
-            e.change_id == ^binding.change_id and e.kind == "landed" and
-            not is_nil(e.applied_at),
-        order_by: [desc: e.event_seq],
-        limit: 1,
-        select: e.sha
-    )
+    case Landings.newest_applied_landing(repo, tenant_id, binding) do
+      %{sha: sha} -> sha
+      nil -> nil
+    end
   end
 
   defp landed_revision(_repo, _tenant_id, _chg), do: nil

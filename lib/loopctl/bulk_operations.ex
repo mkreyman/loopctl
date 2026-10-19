@@ -131,8 +131,9 @@ defmodule Loopctl.BulkOperations do
         actor_id: actor_id,
         actor_label: actor_label,
         caller_lineage: caller_lineage(tenant_id, opts),
-        # US-47.6: the chg stories' forge reads, made BEFORE the locking transaction.
-        trunk: TrunkEvidence.assess_many(tenant_id, sorted_ids)
+        # US-47.6: the chg stories' forge reads, made BEFORE the locking transaction, and
+        # only for a story the landed-review gate would let through.
+        trunk: TrunkEvidence.assess_many(tenant_id, sorted_ids, &landed_review_ok?(tenant_id, &1))
       }
 
       AdminRepo.transaction(fn ->
@@ -255,8 +256,9 @@ defmodule Loopctl.BulkOperations do
         orch_id: orchestrator_agent_id,
         actor_id: actor_id,
         actor_label: actor_label,
-        # US-47.6: the chg stories' forge reads, made BEFORE the locking transaction.
-        trunk: TrunkEvidence.assess_many(tenant_id, sorted_ids)
+        # US-47.6: the chg stories' forge reads, made BEFORE the locking transaction, and
+        # only for a story the landed-review gate would let through.
+        trunk: TrunkEvidence.assess_many(tenant_id, sorted_ids, &landed_review_ok?(tenant_id, &1))
       }
 
       AdminRepo.transaction(fn ->
@@ -422,6 +424,11 @@ defmodule Loopctl.BulkOperations do
         %{story_id: story.id, status: "error", reason: format_reason(reason)}
     end
   end
+
+  # A story the landed-review gate refuses is refused again under the lock, so asking the
+  # forge about it would spend a credentialed call on an answer nobody reads.
+  defp landed_review_ok?(tenant_id, story_id),
+    do: ReviewCustody.ensure_landed_review(tenant_id, story_id) == :ok
 
   defp process_verify(story, params, ctx) do
     %{

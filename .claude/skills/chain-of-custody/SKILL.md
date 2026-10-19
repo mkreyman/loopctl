@@ -149,7 +149,7 @@ Neither refusal records a custody violation.
 on the same five paths, the landing's TRUNK commit (`data.merge_sha`, never `event.sha`) must be in
 `verified/master` (`PullRequestSource.contains?/3`; `chg_landing_not_trunk_verified`) and no applied
 `reverted` may follow the landing (`chg_landing_reverted`). The forge is read BEFORE the
-transaction (`assess/2`, `assess_many/2`) and applied under the lock only to the landing it was
+transaction (`assess/3`, `assess_many/3`) and applied under the lock only to the landing it was
 made for (`ensure_trunk_verified/4`); any forge failure, a 404 included, is
 `{:chg_trunk_unevaluated, reason, retry_after}` — a 503 with `Retry-After`, never a pass. Do not
 move the read into the Multi (a lock held across a network call), and do not short-circuit on the
@@ -161,7 +161,7 @@ is exactly the orphaned shape — do not delete `custody_orphaned?/1` or `custod
 redundant with the constraint.
 
 **Backfill is the fourth way to reach `verified`, and its guard is `stories.lifecycle_entered_at`.**
-`backfill_story/4` / `ensure_mark_complete_allowed/2` certify with no report, no review record and no
+`backfill_story/4` / `ensure_mark_complete_allowed/3` certify with no report, no review record and no
 verifier, so they are confined to work that never entered the lifecycle. State alone cannot answer
 that: `force_unclaim_story/3` CLEARS `assigned_agent_id`, and a legacy bearer claim never writes
 `implementer_dispatch_id`, so claim -> force-unclaim leaves a worked story indistinguishable from

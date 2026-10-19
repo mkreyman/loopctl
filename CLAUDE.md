@@ -262,10 +262,10 @@ landed event's own transaction over the control-only edge `:review_missing`
 fails CLOSED: a refused escalation rolls the whole landing back (`:busy`, or
 `change_event_failed`, logged and counted) so chg redelivers it — the merge never commits
 without its hold. Such a story is never verified: every path that reaches `verified` —
-verify and verify-all through `chg_landed_review/2` (`progress.ex:2713`), bulk verify
-through `process_verify/3` (`bulk_operations.ex:426`), backfill and bulk mark-complete
-through `guard_backfill/3` (`progress.ex:2824`) — calls one function,
-`ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:215`). It refuses a chg story with
+verify and verify-all through `chg_landed_review/2` (`progress.ex:2736`), bulk verify
+through `process_verify/3` (`bulk_operations.ex:433`), backfill and bulk mark-complete
+through `guard_backfill/3` (`progress.ex:2847`) — calls one function,
+`ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:208`). It refuses a chg story with
 `review_missing_escalated` while its stage is escalated over `:review_missing` (a human
 resolves it) and with `chg_review_not_for_landed_revision` unless a chg review names its
 LANDED revision: the `sha` of the newest APPLIED `landed` event of its current binding. A

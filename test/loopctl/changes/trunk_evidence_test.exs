@@ -152,13 +152,33 @@ defmodule Loopctl.Changes.TrunkEvidenceTest do
 
   # The forge's answer for `merge_sha` against `verified/master`, asserting the call names the
   # TRUNK commit and the ref — never the revision commit — and runs outside every transaction.
+  # On a batch path the call runs in a `Task.async_stream` worker, which never joins its
+  # caller's transaction, so `in_transaction?/0` there proves nothing: the check reads the
+  # transaction state of the calling process AND of every process it was started for.
   defp forge(merge_sha, answer, times \\ 1) do
     expect(MockPullRequestSource, :contains?, times, fn %ForgeRepo{full_name: @repo},
                                                         ^merge_sha,
                                                         "verified/master" ->
-      refute Loopctl.Repo.in_transaction?()
-      refute AdminRepo.in_transaction?()
+      refute any_caller_in_transaction?()
       answer
+    end)
+  end
+
+  # Ecto keeps a process's checked-out connection under `{Ecto.Adapters.SQL, pool}` in that
+  # process's dictionary, with `conn_mode: :transaction` while a transaction is open — the
+  # same read `Repo.in_transaction?/0` makes, here made on another process too.
+  defp any_caller_in_transaction? do
+    Enum.any?([self() | Process.get(:"$callers", [])], fn pid ->
+      case Process.info(pid, :dictionary) do
+        {:dictionary, dict} ->
+          Enum.any?(
+            dict,
+            &match?({{Ecto.Adapters.SQL, _}, %DBConnection{conn_mode: :transaction}}, &1)
+          )
+
+        nil ->
+          false
+      end
     end)
   end
 
@@ -316,9 +336,38 @@ defmodule Loopctl.Changes.TrunkEvidenceTest do
         push!(ctx, "C1", 1, "submitted", %{sha: sha("a"), data: %{"story_id" => ctx.story.id}})
 
       :ok = push!(ctx, "C1", 2, "landed", %{sha: sha("a"), data: %{"merge_sha" => sha("c")}})
-      stub(MockPullRequestSource, :contains?, fn _, _, _ -> {:ok, true} end)
+      no_forge_call()
 
       assert {:error, :chg_review_not_for_landed_revision} = verify(ctx, ctx.story)
+    end
+
+    test "a story the local gates refuse costs no forge call, on any verify path", ctx do
+      # Landed but never reviewed: review_not_conducted on verify, the landed-review gate on
+      # the bulk paths. Each refusal is answered under the lock as before, unasked.
+      :ok =
+        push!(ctx, "C1", 1, "submitted", %{sha: sha("a"), data: %{"story_id" => ctx.story.id}})
+
+      :ok = push!(ctx, "C1", 2, "landed", %{sha: sha("a"), data: %{"merge_sha" => sha("c")}})
+      no_forge_call()
+      opts = verifier_opts(ctx)
+
+      assert {:error, :review_not_conducted} = verify(ctx, ctx.story)
+
+      assert {:ok, %{verified_count: 0, errors: [%{reason: ":review_not_conducted"}]}} =
+               Progress.verify_all_in_epic(ctx.tenant_id, ctx.epic.id, %{"summary" => "a"}, opts)
+
+      assert {:ok, [%{status: "error"}]} =
+               BulkOperations.bulk_verify(
+                 ctx.tenant_id,
+                 [%{"story_id" => ctx.story.id}],
+                 opts[:orchestrator_agent_id],
+                 opts
+               )
+
+      assert {:error, _refused} =
+               Progress.backfill_story(ctx.tenant_id, ctx.story.id, %{"reason" => "pre"}, [])
+
+      unverified!(ctx.story)
     end
 
     test "a story with NO change binding never asks the forge, on any path", ctx do
@@ -447,6 +496,16 @@ defmodule Loopctl.Changes.TrunkEvidenceTest do
 
       forge(sha("c"), {:ok, true})
       assert {:ok, %Story{verified_status: :verified}} = verify(ctx, story)
+    end
+  end
+
+  describe "the transaction probe the forge stub asserts with" do
+    test "sees a transaction open in the process a task was started for", _ctx do
+      AdminRepo.transaction(fn ->
+        assert Task.async(fn -> any_caller_in_transaction?() end) |> Task.await()
+      end)
+
+      refute Task.async(fn -> any_caller_in_transaction?() end) |> Task.await()
     end
   end
 end

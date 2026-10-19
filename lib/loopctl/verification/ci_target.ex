@@ -6,10 +6,12 @@ defmodule Loopctl.Verification.CiTarget do
 
   - the REPOSITORY is the story's project's intake source (`Intake.source_for_project/2`),
     the one derivation the merge gate and the dispatcher use. No live source is
-    `no_intake_source`, more than one `ambiguous_intake_source`. A `mode: :chg` source is
-    `chg_landed_on_trunk`: chg lands the change, not a pull request, so no story branch
-    carries CI to read, and verify already required the landing on verified/master
-    (US-47.6, `Loopctl.Changes.TrunkEvidence`)
+    `no_intake_source`, more than one `ambiguous_intake_source`
+  - a story bound to a chg change is `chg_landed_on_trunk`, before any of the above: chg lands
+    it, not a pull request, so no story branch carries CI to read, and every verify path
+    already required its landing on verified/master (US-47.6, `Loopctl.Changes.TrunkEvidence`,
+    which keys on the same binding — never on the source's mode, which an unbound story
+    delivered by pull request shares after its project switches to chg)
   - the REQUIRED CHECKS are that source's `required_checks`. None (after
     dropping `local-gate`, which is never trusted) is `no_required_checks`: the opt-in
   - the BRANCH is the one the story's placement recorded: the branch the claim's dispatch put
@@ -26,6 +28,7 @@ defmodule Loopctl.Verification.CiTarget do
   forge, so it neither counts toward nor ends the worker's forge-fault streak.
   """
 
+  alias Loopctl.Changes.Landings
   alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Stages
@@ -47,6 +50,7 @@ defmodule Loopctl.Verification.CiTarget do
           {:ok, t()} | {:unconfigured, String.t()} | {:wait, :database_busy}
   def gather(tenant_id, story_id, opts) do
     with {:story, {:ok, story}} <- {:story, Stories.get_story(tenant_id, story_id)},
+         :ok <- not_chg_bound(tenant_id, story),
          {:ok, source} <- source(tenant_id, story),
          {:ok, required} <- required_checks(source),
          {:route, {:ok, route}} <-
@@ -83,11 +87,15 @@ defmodule Loopctl.Verification.CiTarget do
     end
   end
 
+  defp not_chg_bound(tenant_id, story) do
+    case Landings.newest_binding(tenant_id, story.id) do
+      nil -> :ok
+      _binding -> {:unconfigured, "chg_landed_on_trunk"}
+    end
+  end
+
   defp source(tenant_id, story) do
     case Intake.source_for_project(tenant_id, story.project_id) do
-      {:ok, %{mode: :chg}} ->
-        {:unconfigured, "chg_landed_on_trunk"}
-
       {:ok, source} ->
         {:ok, source}
 
