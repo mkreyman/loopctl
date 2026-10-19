@@ -34,6 +34,8 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   """
   use ExUnit.Case, async: true
 
+  alias Loopctl.TelemetryHelpers
+
   import Mox
 
   alias Loopctl.Telemetry.ScaleAlerts
@@ -100,9 +102,11 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     native = System.convert_time_unit(ms, :millisecond, :native)
 
     for _ <- 1..n do
-      :telemetry.execute([:loopctl, :heavy_read_repo, :query], %{total_time: native}, %{
-        options: [endpoint: :semantic_search]
-      })
+      :telemetry.execute(
+        [:loopctl, :heavy_read_repo, :query],
+        %{total_time: native},
+        TelemetryHelpers.repo_query_metadata(%{options: [endpoint: :semantic_search]})
+      )
     end
   end
 
@@ -114,7 +118,11 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     native = System.convert_time_unit(ms, :millisecond, :native)
 
     for _ <- 1..n do
-      :telemetry.execute([:loopctl, :repo, :query], %{queue_time: native}, %{repo: Loopctl.Repo})
+      :telemetry.execute(
+        [:loopctl, :repo, :query],
+        %{queue_time: native},
+        TelemetryHelpers.repo_query_metadata(%{repo: Loopctl.Repo})
+      )
     end
   end
 
@@ -124,7 +132,11 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   # for a statement inside a transaction after the first checkout.
   defp emit_queue_time_absent(n) do
     for _ <- 1..n do
-      :telemetry.execute([:loopctl, :repo, :query], %{}, %{repo: Loopctl.Repo})
+      :telemetry.execute(
+        [:loopctl, :repo, :query],
+        %{},
+        TelemetryHelpers.repo_query_metadata(%{repo: Loopctl.Repo})
+      )
     end
   end
 

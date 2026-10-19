@@ -532,7 +532,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       :telemetry.execute(
         [:loopctl, :repo, :query],
         %{queue_time: 5_000_000, query_time: 1_000_000, total_time: 6_000_000},
-        %{}
+        TelemetryHelpers.repo_query_metadata()
       )
 
       scrape = TelemetryMetricsPrometheus.Core.scrape(reporter)
@@ -560,7 +560,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       :telemetry.execute(
         [:loopctl, :admin_repo, :query],
         %{query_time: 500_000, total_time: 500_000},
-        %{}
+        TelemetryHelpers.repo_query_metadata()
       )
 
       scrape = TelemetryMetricsPrometheus.Core.scrape(reporter)
@@ -578,7 +578,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       :telemetry.execute(
         [:loopctl, :repo, :query],
         %{queue_time: 1_000_000, query_time: 100_000, total_time: 1_100_000},
-        %{}
+        TelemetryHelpers.repo_query_metadata()
       )
 
       assert TelemetryMetricsPrometheus.Core.scrape(reporter) =~

@@ -709,18 +709,6 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
   end
 
-  test "the exhaust handler ignores another test's query event instead of raising" do
-    config = %{pid: self(), id: {__MODULE__, make_ref()}, runner_id: Ecto.UUID.generate()}
-
-    assert :ok =
-             exhaust_after_select(
-               [:loopctl, :admin_repo, :query],
-               %{query_time: 500_000},
-               %{},
-               config
-             )
-  end
-
   # -- helpers ---------------------------------------------------------------------------
 
   # Runs `fun` with `runner_id` exhausted the moment the pass has SELECTED its runners (the
@@ -758,11 +746,6 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
         )
     end
   end
-
-  # The event name is global: another async test's query event reaches this handler too, and
-  # a synthetic one may carry no `:query`. A raise would make telemetry DETACH the handler,
-  # and this test would then place on a runner that never went dry.
-  def exhaust_after_select(_event, _measurements, _metadata, _config), do: :ok
 
   # A story contracted and standing at `queued` — what a placement takes.
   defp queued_story(ctx), do: ctx |> triaged_story() |> queue()
