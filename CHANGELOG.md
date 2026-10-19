@@ -40,6 +40,30 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A reopened issue whose loop has ended comes back to triage (US-47.10, #986).** Migration
+  `20261019180000_add_generation_to_intake_records` adds `intake_records.generation`
+  (default 1, so every existing row becomes generation 1) and replaces the unique index
+  `intake_records_issue_uidx` with `intake_records_issue_generation_uidx` on
+  `(tenant_id, source_id, issue_number, generation)`. A `reopened` delivery for an issue whose
+  newest record has a closure, or whose story is `merged`, `deployed`, `verified` or `done`,
+  starts a new record at `pending_triage`. The earlier record, its story and its closure stay
+  as they were. **Deploy ordering:** once the migration runs, a machine still on the previous
+  release answers every `issues` webhook delivery with a 500 until it is replaced, because
+  its insert names the dropped index. GitHub does not retry these. After the rollout, for
+  each enrolled repository, list the webhook's deliveries
+  (`GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries`) and, for every `issues` delivery
+  in the deploy window whose status code is not 2xx, call
+  `POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts`. A
+  redelivery reuses its `X-GitHub-Delivery` id, so one that had in fact succeeded is not
+  applied twice. No manual data step. `down` refuses while any issue has a second
+  generation.
+  The issue closer now removes any OTHER loopctl resolution label from the open issue
+  before adding its own, so a reopened issue's later close never carries two
+  (`PullRequestSource.remove_label/3`, `DELETE /repos/{owner}/{repo}/issues/{n}/labels/{name}`,
+  which needs the same `issues: write` the closer already uses). A closed issue found
+  carrying only this closure's label now counts as loopctl's own close only when the
+  closure recorded `labelled_at`; otherwise it is `abandoned` with `closed_by_other`,
+  because the label may be an earlier generation's.
 - **chg-server's change-events webhook (US-47.3): `POST /api/v1/change_events/:source_id`.**
   For a `chg` intake source. No API key: authenticated by `X-Chg-Signature: sha256=<hex>`, an
   HMAC-SHA256 over `"<X-Chg-Timestamp>.<raw body>"` with the source's `change_events_secret`,

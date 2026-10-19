@@ -13,14 +13,19 @@ defmodule Loopctl.Delivery.IssueCloser do
      to it (#826 review, finding 6). `IssueClosures.record_in/5` covers a source revoked before
      the verdict; this covers one revoked after it.
   1. **READS the issue.** Closed already?
-     - carrying EXACTLY ONE loopctl resolution label and it is THIS CLOSURE'S — loopctl closed
-       it, for this verdict. Record `:closed` and stop. This is what makes a replay a no-op
-       even when the crash landed between the close and the record of it.
+     - carrying EXACTLY ONE loopctl resolution label, it is THIS CLOSURE'S, and this closure
+       has stamped `labelled_at` (step 2, which stamps it whether it added the label or found
+       it there) — loopctl closed it, for this verdict. Record `:closed` and stop. This is
+       what makes a replay a no-op even when the crash landed between the close and the
+       record of it. Without the marker the label may be an EARLIER generation's on a
+       reopened issue (US-47.10), and the close is `closed_by_other`.
      - carrying anything else — the other verdict's label, BOTH labels, or none — not our
        close, or not unambiguously ours. `:abandoned` with `closed_by_other`, never retried.
        Re-closing an issue somebody already resolved would fire the reporting system's webhook
        and email the reporter about work she has already been told about.
-  2. **ADDS the resolution label**, unless the issue's LIVE label list already carries it. Not
+  2. **REMOVES any OTHER loopctl resolution label** the open issue carries, which a reopened
+     issue's earlier generation left there (US-47.10), and then **ADDS the resolution
+     label**, unless the issue's LIVE label list already carries it. Not
      unless our own `labelled_at` marker is set — a maintainer can remove the label between
      attempts, and trusting the marker there closes the issue unlabelled, which is precisely
      the default-text failure this feature exists to prevent (#826 review, finding 2).
@@ -94,7 +99,7 @@ defmodule Loopctl.Delivery.IssueCloser do
 
   Every call carries `Loopctl.Delivery.GitHubPullRequestSource`'s bounded connect and receive
   timeouts with no retries, so the worst case for one closure is FIVE bounded calls —
-  read, label, comment, re-read, close.
+  read, label, comment, re-read, close — plus one removal per stale resolution label.
   **No database transaction is open across any of them** — each marker is its own short
   write between calls.
   """
@@ -179,10 +184,22 @@ defmodule Loopctl.Delivery.IssueCloser do
   #
   # Either way the answer is `closed_by_other`: it is not this closure's close, and
   # re-closing is not the remedy.
+  #
+  # And the one own label counts only when THIS closure's `labelled_at` is set (US-47.10). A
+  # reopened issue still carries the label an EARLIER generation's close put on it. If
+  # somebody else closes it before this closure ever ran, the label is the same one and is not
+  # ours. `labelled_at` is written only on the open path, by `apply_label/4`, which stamps it
+  # whether it added the label or found it there. So a set marker means this closure saw the
+  # issue open with its label on, and a close found afterwards is the crash window this check
+  # exists for. An unset marker means this closure never got that far, and the close is
+  # somebody else's.
   defp proceed(%IssueClosure{} = closure, _repo, %{state: "closed", labels: labels}) do
     %Resolution{label: own_label} = IssueClosure.resolution(closure)
 
     case Enum.filter(labels, &(&1 in Resolution.labels())) do
+      [^own_label] when is_nil(closure.labelled_at) ->
+        abandon(closure, :closed_by_other, {:own_label_not_applied_by_this_closure, 1})
+
       [^own_label] ->
         record_closed(closure, :already_closed_by_loopctl)
 
@@ -201,7 +218,8 @@ defmodule Loopctl.Delivery.IssueCloser do
   defp proceed(%IssueClosure{} = closure, repo, %{state: _open, labels: live_labels}) do
     resolution = IssueClosure.resolution(closure)
 
-    with {:ok, closure} <- apply_label(closure, repo, resolution, live_labels),
+    with :ok <- remove_stale_labels(closure, repo, resolution, live_labels),
+         {:ok, closure} <- apply_label(closure, repo, resolution, live_labels),
          {:ok, closure} <- apply_comment(closure, repo, resolution),
          :open <- recheck_state(closure, repo) do
       apply_close(closure, repo, resolution)
@@ -251,6 +269,33 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
+  # STEP 2a: take off every OTHER loopctl resolution label the open issue carries (US-47.10).
+  #
+  # A reopened issue's later generation closes the SAME issue, and it still carries the label
+  # the earlier generation's close put on it. Left there, a close with a different verdict
+  # carries both labels. The reporting system then sends whichever it reads first, and step
+  # 1's classifier calls such a close ambiguous.
+  #
+  # Read from the live labels step 1 just read, and only on the OPEN path. A closed issue is
+  # never written to, so step 1's "exactly one, ours" test still sees every label as it was,
+  # and two labels there still mean not ours.
+  #
+  # BEFORE the add, so a crash in between leaves an open issue with NO resolution label. The
+  # retry reads that, finds nothing to remove and adds ours. The other order would leave
+  # both labels for a human close to fire the reporting system's webhook on. A failure is a
+  # fault like any other forge call (transient backs off, permanent abandons), never a pass:
+  # proceeding would put a second label on the issue. Removal is idempotent at the forge.
+  defp remove_stale_labels(%IssueClosure{} = closure, repo, %Resolution{label: own}, live_labels) do
+    live_labels
+    |> Enum.filter(&(&1 in Resolution.labels() and &1 != own))
+    |> Enum.reduce_while(:ok, fn stale, :ok ->
+      case source().remove_label(repo, closure.issue_number, stale) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:fault, reason}}
+      end
+    end)
+  end
+
   # STEP 2, GATED ON THE ISSUE'S LIVE LABELS RATHER THAN ON OUR OWN MARKER (#826 review,
   # finding 2).
   #
@@ -262,19 +307,30 @@ defmodule Loopctl.Delivery.IssueCloser do
   # reporter a fix shipped for something nobody built.
   #
   # The corrective data costs nothing: the closer has just READ the issue for its replay
-  # check, so the live label list is already in hand. `labelled_at` stays on the row as the
-  # record of when loopctl first applied it, and is no longer consulted as a gate.
+  # check, so the live label list is already in hand. `labelled_at` is not consulted as a
+  # gate HERE. It is what step 1 reads to tell this closure's close from somebody else's
+  # (US-47.10).
   #
   # Re-applying a label that IS present would be harmless at the forge — the endpoint is
   # additive — so this test is about spending a call, not about safety. Its absence is not.
+  #
+  # A label already present is ADOPTED: the marker is stamped once, as if this call had put
+  # it there, because step 1 must count a later close as ours. Without that, a reopened
+  # issue carrying the earlier generation's same-verdict label would be closed by us and then,
+  # after a crash before the record, read back as somebody else's close.
   defp apply_label(%IssueClosure{} = closure, repo, %Resolution{label: label}, live_labels) do
-    if label in live_labels do
-      {:ok, closure}
-    else
-      case source().label_issue(repo, closure.issue_number, label) do
-        :ok -> IssueClosures.mark_labelled(closure.tenant_id, closure.id)
-        {:error, reason} -> {:fault, reason}
-      end
+    cond do
+      label not in live_labels ->
+        case source().label_issue(repo, closure.issue_number, label) do
+          :ok -> IssueClosures.mark_labelled(closure.tenant_id, closure.id)
+          {:error, reason} -> {:fault, reason}
+        end
+
+      is_nil(closure.labelled_at) ->
+        IssueClosures.mark_labelled(closure.tenant_id, closure.id)
+
+      true ->
+        {:ok, closure}
     end
   end
 

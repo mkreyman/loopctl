@@ -58,6 +58,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
       "poisons and VACUUMs the shared HNSW graph: every concurrent insert enters the same " <>
         "graph, so neither state would be this test's alone",
     "test/loopctl/intake_escalation_concurrency_test.exs" => @race,
+    "test/loopctl/intake_generation_concurrency_test.exs" => @race,
     "test/loopctl/knowledge/by_source_change_feed_plan_scale_test.exs" => @scale,
     "test/loopctl/knowledge/cosine_lint_vs_scale_gate_scale_test.exs" => @scale,
     "test/loopctl/knowledge/distant_pairs_novelty_scale_test.exs" => @scale,

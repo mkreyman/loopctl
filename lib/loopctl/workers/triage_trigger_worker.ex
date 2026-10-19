@@ -45,6 +45,11 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   A stage row is never deleted except with its story, so an ADVANCED story keeps excluding its
   record exactly as a `detected` one does.
 
+  The read is per RECORD, and an issue has one record per generation (US-47.10, see
+  "Generations" in `Loopctl.Intake`). A reopen after the issue's story finished starts a new
+  record with no story, so that record is a candidate here and the finished one stays
+  excluded. Nothing in this read had to change for that.
+
   ## A revoked source is excluded by the predicate, not skipped in the loop
 
   `promote/1` returns `:source_revoked` for one, and the record can then never become a story:
@@ -287,7 +292,8 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # The issue number and the source are loopctl's own facts and are what an operator greps.
   defp identity(%Record{} = record) do
     "tenant_id=#{record.tenant_id} record_id=#{record.id} " <>
-      "source_id=#{record.source_id} issue_number=#{record.issue_number}"
+      "source_id=#{record.source_id} issue_number=#{record.issue_number} " <>
+      "generation=#{record.generation}"
   end
 
   # A changeset is summarised by the keys that failed; its data is an intake record and would
