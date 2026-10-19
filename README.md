@@ -107,6 +107,10 @@ psql -U postgres -c "GRANT ALL ON DATABASE loopctl_dev TO loopctl_app;"
 
 # 2. Setup and run
 #    mix setup installs deps, creates the database, and runs migrations.
+#    On a machine with the maintainer's fleet git hooks (~/.git-hooks) it also
+#    points core.hooksPath at a dispatcher in the git dir that runs the main
+#    worktree's .githooks, or the fleet's hooks when a checkout there predates
+#    them (.githooks/install.sh); elsewhere it leaves git's hooks alone.
 #    A default Cloak encryption key is configured in config.exs for dev.
 mix setup
 mix phx.server       # Start server at localhost:4030

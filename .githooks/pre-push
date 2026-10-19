@@ -1,0 +1,263 @@
+#!/bin/bash
+# Repo-local pre-push (#985): the fleet's pre-push exactly as before, then chg's
+# shadow phase (mkreyman/chg docs/shadow.md). For every commit the push carries
+# (up to the newest 100 per ref) that local-gate.sh attests, it records the
+# gate's pass; for each pushed ref TIP it queues one chg check. Nothing chg does
+# here blocks a push or changes the fleet hook's verdict: every call into chg or
+# local-gate.sh is bounded (CHG_HOOK_TIMEOUT_S, default 60s; a timeout is said
+# and counts as off, or as no record), and the check itself runs detached.
+#
+# HOW GIT GETS HERE. The fleet sets core.hooksPath globally to ~/.git-hooks
+# (claude-config's git-hooks/), and that pre-push has no repo-local extension
+# point. So this repo overrides the setting in its own .git/config with a
+# dispatcher in its git common dir (.githooks/install.sh, run by `mix setup`),
+# which runs the main worktree's .githooks/<hook>, or the fleet's when the main
+# worktree is on a commit older than .githooks/. The other hooks in this
+# directory hand straight back to the fleet's.
+#
+# WHICH VERDICT IS THE GATE'S. loopctl's full gate, `mix precommit`, runs at
+# COMMIT time in the fleet's pre-commit, and claude-config's bin/local-gate.sh
+# attests the exact tree it passed. A pushed commit that `local-gate.sh check`
+# attests is therefore recorded as the gate's `pass`. A red gate produces no
+# commit, so nothing here can record a `fail`: `chg shadow report --ci-check
+# Test` takes those from CI's Test job. An unattested commit records nothing.
+# The fleet hook's own `mix test.e2e` is no verdict on the tests chg selects
+# (:e2e is excluded from the default suite), so it is never recorded.
+#
+# WHEN, AND HOW OFTEN. Only after the fleet hook lets the push go ahead: a push
+# it stops is shadowed when it is retried. A commit already on the remote sends
+# nothing new and is skipped. Each commit is recorded at most once, and each tip
+# checked at most once, per machine: an atomic claim under ~/.chg/shadow/claims
+# (kept 14 days, as the logs are) is taken first, so a retried push of the same
+# commit, while its check is queued or running or after it is done, does nothing
+# again and never touches that check's log.
+set -uo pipefail
+
+REMOTE_ARG=${1:-origin}
+URL=${2:-}
+LINES=$(cat)
+
+FLEET_HOOK="$HOME/.git-hooks/pre-push"
+status=0
+if [ -x "$FLEET_HOOK" ]; then
+  # A here-string, not a pipe: a fleet hook that stops reading early must not
+  # SIGPIPE the writer and turn its own pass into a failure under pipefail.
+  "$FLEET_HOOK" "$@" <<<"$LINES" || status=$?
+else
+  echo "⚠️  $FLEET_HOOK not found: the fleet's pre-push (mix test.e2e) did not run; re-sync claude-config"
+fi
+[ "$status" -eq 0 ] || exit "$status"
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+HOOK_TIMEOUT=${CHG_HOOK_TIMEOUT_S:-60}
+case "$HOOK_TIMEOUT" in '' | *[!0-9]*) HOOK_TIMEOUT=60 ;; esac
+
+# bounded CMD...: CMD, killed with its process group after HOOK_TIMEOUT seconds,
+# exiting 124 then. timeout(1) is GNU or BusyBox; macOS has gtimeout only with
+# coreutils, so perl (on every Mac) is the fallback.
+bounded() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$HOOK_TIMEOUT" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$HOOK_TIMEOUT" "$@"
+  else
+    perl -e '
+      my $secs = shift;
+      my $pid = fork() // exit 127;
+      if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", -$pid; waitpid($pid, 0); exit 124 };
+      alarm $secs;
+      waitpid($pid, 0);
+      exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+    ' "$HOOK_TIMEOUT" "$@"
+  fi
+}
+
+# Says so when a bounded call ran out of time (exit 124).
+timed_out() { # <exit status> <what> <what it means>
+  [ "$1" -eq 124 ] && echo "⚠️  $2 timed out after ${HOOK_TIMEOUT}s: $3"
+  return 0
+}
+
+# CHG_MODE is chg's own answer (`chg gate`: CHG_GATE, then .chg/policy.toml, and
+# anything unreadable is off). Only `shadow` turns the helpers below on; `on` is
+# the cutover PR's to wire. Without chg on PATH the mode is off, and off means
+# the push is exactly what the fleet hook made it.
+CHG_MODE=off
+if command -v chg >/dev/null 2>&1; then
+  CHG_MODE=$(bounded chg gate 2>/dev/null </dev/null) || {
+    timed_out $? "chg gate" "chg is off for this push"
+    CHG_MODE=off
+  }
+fi
+[ "$CHG_MODE" = shadow ] || exit 0
+
+# The configured remote this push goes to. git passes the name as $1, or, for
+# `git push <url>`, the URL as both $1 and $2; then it is the remote whose URL
+# that is, or none.
+resolve_remote() {
+  local n
+  if git config --get "remote.$REMOTE_ARG.url" >/dev/null 2>&1; then
+    echo "$REMOTE_ARG"
+    return 0
+  fi
+  [ -n "$URL" ] || return 1
+  while IFS= read -r n; do
+    if [ "$(git remote get-url --push "$n" 2>/dev/null)" = "$URL" ] ||
+      [ "$(git remote get-url "$n" 2>/dev/null)" = "$URL" ]; then
+      echo "$n"
+      return 0
+    fi
+  done < <(git remote 2>/dev/null)
+  return 1
+}
+REMOTE=$(resolve_remote) || REMOTE=""
+
+# The repo's gate lock, where claude-config's lib says it is. Homebrew's flock
+# is not on a non-interactive macOS PATH, so it is appended when flock is
+# missing, never put ahead of what is already found.
+if ! command -v flock >/dev/null 2>&1 && [ -x "${GATE_FLOCK_DIR:-/opt/homebrew/bin}/flock" ]; then
+  PATH="$PATH:${GATE_FLOCK_DIR:-/opt/homebrew/bin}"
+fi
+GATE_LOCK_LIB="$HOME/.claude/hooks/lib/gate-lock-fd.sh"
+GATE_RUN="$HOME/workspace/claude-config/bin/gate-run.sh"
+GATE_LOCK_UNUSABLE=""
+if [ -r "$GATE_LOCK_LIB" ]; then
+  # shellcheck source=/dev/null
+  . "$GATE_LOCK_LIB"
+  declare -F gate_lock_path >/dev/null ||
+    GATE_LOCK_UNUSABLE="claude-config's gate-lock-fd.sh has no gate_lock_path"
+else
+  GATE_LOCK_UNUSABLE="claude-config's gate-lock-fd.sh is not on this machine"
+fi
+[ -n "$GATE_LOCK_UNUSABLE" ] || [ -r "$GATE_RUN" ] ||
+  GATE_LOCK_UNUSABLE="claude-config's bin/gate-run.sh is not on this machine"
+
+LOCAL_GATE="$HOME/workspace/claude-config/bin/local-gate.sh"
+
+# Claims and logs, both kept 14 days. Without them nothing here could be done
+# once only, so nothing is done.
+SHADOW="${CHG_HOME:-$HOME/.chg}/shadow"
+CLAIMS="$SHADOW/claims"
+LOGS="$SHADOW/logs"
+mkdir -p "$CLAIMS" "$LOGS" || {
+  echo "⚠️  chg shadow skipped: cannot create $CLAIMS and $LOGS"
+  exit 0
+}
+find "$LOGS" -name '*.log' -mtime +14 -delete 2>/dev/null
+find "$CLAIMS" -mindepth 1 -maxdepth 1 -mtime +14 -delete 2>/dev/null
+REPO_NAME=$(basename -s .git "${URL:-repo}")
+
+# claim <kind> <sha>: 0 for the first caller only, on this machine. mkdir is
+# atomic, so two pushes of one commit cannot both win.
+claim() { mkdir "$CLAIMS/$REPO_NAME-$2.$1" 2>/dev/null; }
+
+zero=0000000000000000000000000000000000000000
+
+# 0 = the remote already has <sha>, so pushing a ref to it sends no new content
+# (a new branch at an old commit, a tag from --follow-tags): a remote-tracking
+# ref of this remote contains it, or the ref's old value on the remote does.
+on_remote() { # <sha> <remote_sha>
+  if [ -n "$REMOTE" ] &&
+    [ -n "$(git for-each-ref --contains "$1" --count=1 --format='x' "refs/remotes/$REMOTE" 2>/dev/null)" ]; then
+    return 0
+  fi
+  [ "$2" != "$zero" ] && git merge-base --is-ancestor "$1" "$2" 2>/dev/null
+}
+
+# The commits a ref update carries, newest first, at most 100: those of <sha>
+# not in the ref's old value nor on this remote's tracking refs (on any remote's
+# when the push names none). A longer run is an import, not commits the gate
+# judged one at a time.
+pushed_commits() { # <sha> <remote_sha>
+  local old=""
+  [ "$2" != "$zero" ] && git rev-parse -q --verify "$2^{commit}" >/dev/null 2>&1 && old=$2
+  git rev-list --max-count=100 "$1" --not ${old:+"$old"} "--remotes${REMOTE:+=$REMOTE}" 2>/dev/null
+}
+
+# Records the gate's verdict on $1 as the `gate` row chg pairs with: a pass,
+# when local-gate.sh attests that `mix precommit` passed on exactly its tree.
+# The duration goes with it only when local-gate.sh knew it (it writes
+# `duration_s=?` when it did not).
+chg_record() { # <sha>
+  local attestation secs gate
+  [ -r "$LOCAL_GATE" ] || return 0
+  attestation=$(bounded bash "$LOCAL_GATE" check "$1" </dev/null 2>/dev/null) || {
+    timed_out $? "local-gate.sh check ${1:0:12}" "no gate verdict recorded for it"
+    return 0
+  }
+  claim record "$1" || return 0
+  secs=$(sed -n 's/^duration_s=\([0-9][0-9]*\)$/\1/p' <<<"$attestation" | head -1)
+  gate=$(sed -n 's/^gate=//p' <<<"$attestation" | head -1)
+  bounded chg shadow record --sha "$1" --verdict pass ${secs:+--ms "$((10#$secs * 1000))"} \
+    --gate "${gate:-mix precommit}" </dev/null ||
+    timed_out $? "chg shadow record ${1:0:12}" "its gate row may be missing"
+}
+
+# Queues a chg check of $1 in chg's own worktree and test database, detached,
+# and returns at once. A repo with no lock file has not adopted the gate lock,
+# so nothing would keep the check apart from its gates: it is not started.
+#
+# WHY IT HOLDS NO LOCK WHILE IT RUNS. A shadow measurement must never delay or
+# fail a real commit, and any hold of gate.lock across the run would: the
+# commit gate's take is EXCLUSIVE and waits for every holder, SHARED ones
+# included (claude-config hooks/lib/gate-lock-fd.sh, SLOTS). The library's one
+# slot for non-gate work, bin/gate-run.sh's light take, is for `mix test`
+# naming 1..10 files; any other command takes its heavy, exclusive take
+# (gate-run.sh, LIGHT/HEAVY). A bare `flock <gate.lock>` would skip the
+# turnstile every take passes (gate-run.sh, ONE WAY IN). So the check enters
+# through gate-run.sh's heavy take, turnstile and all, running only `true`:
+# that waits for a gap between gates, in its turn, and holds the lock for no
+# longer than `true` takes. chg check then runs holding nothing, at chg's own
+# nice 10 and behind chg's machine-wide shadow lock (chg docs/shadow.md), so a
+# gate that starts meanwhile shares the box with it but never waits on it.
+chg_shadow() { # <sha>
+  local lock base git_dir log claimed
+  if [ -n "$GATE_LOCK_UNUSABLE" ]; then
+    echo "⚠️  chg shadow not started: $GATE_LOCK_UNUSABLE"
+    return 0
+  fi
+  if ! lock=$(gate_lock_path "$PWD") || [ ! -f "$lock" ]; then
+    echo "⚠️  chg shadow not started: this repo has no gate lock to queue it behind (${lock:-unknown path})."
+    echo "   Adopt one with: touch ${lock:-<main worktree>/.claude/gate.lock}"
+    return 0
+  fi
+  git_dir=$(git rev-parse --path-format=absolute --git-common-dir) || return 0
+  if ! claim check "$1"; then
+    echo "🧪 chg shadow check of ${1:0:12} already queued, running or done on this machine: not queued again"
+    return 0
+  fi
+  claimed="$CLAIMS/$REPO_NAME-$1.check"
+  # No nearest base: chg picks its own (the merge-base with origin's default).
+  base=$(bash "$(dirname "${BASH_SOURCE[0]}")/lib/nearest-base.sh" "${REMOTE:-origin}" "$1") || base=""
+  log="$LOGS/$REPO_NAME-${1:0:12}.log"
+  # The shared git dir, not this worktree, which may be removed first; git's
+  # hook variables would point chg's own git calls back at this one. Appended
+  # to, never truncated: the claim keeps a second push from opening it at all.
+  (
+    cd "$git_dir" || exit 0
+    trap '' HUP INT
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY
+    if ! bash "$GATE_RUN" -w 1800 --heavy -- true; then
+      # Never started, so a later push of this commit may try again.
+      echo "chg shadow check of $1 not started: no gap between gates on $lock"
+      rmdir "$claimed" 2>/dev/null
+      exit 0
+    fi
+    exec chg check --shadow --foreground --repo "$git_dir" --sha "$1" ${base:+--base "$base"}
+  ) </dev/null >>"$log" 2>&1 &
+  echo "🧪 chg shadow check of ${1:0:12} queued for a gap between gates (log $log)"
+}
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  # A blank line, or a deletion, which pushes nothing.
+  [ -n "${local_sha:-}" ] && [ "$local_sha" != "$zero" ] || continue
+  remote_sha=${remote_sha:-$zero}
+  on_remote "$local_sha" "$remote_sha" && continue
+  while IFS= read -r sha; do
+    [ -n "$sha" ] && chg_record "$sha"
+  done < <(pushed_commits "$local_sha" "$remote_sha")
+  chg_shadow "$local_sha"
+done <<<"$LINES"
+exit 0

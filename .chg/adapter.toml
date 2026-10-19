@@ -1,0 +1,69 @@
+# .chg/adapter.toml for loopctl (chg adapter contract v1), from mkreyman/chg
+# adapters/elixir and home_care_billing's (#985). `chg adapter validate` checks it.
+[adapter]
+kind = "elixir"
+version = "1"
+# The dialyzer PLT is priv/plts/dialyzer.plt (mix.exs plt_file), outside _build.
+# A hydrate only adds what the workspace lacks, so the tracked
+# priv/plts/dialyzer_ignore.exs beside it stays the commit's own.
+artifacts = ["deps", "_build", "priv/plts"]
+# Past lib/ and test/, the suite reads files no xref edge leads to: the hooks
+# (githooks_pre_push_test runs .githooks/*), the workflows (CI guards), docs/
+# (the story schema and runbook guards), deploy/FLY_SECRETS.md
+# (check_env_docs), CLAUDE.md, CHANGELOG.md and .claude/skills (citation and
+# runbook guards), assets/js (the WebAuthn hook guards), fly.toml, the credo
+# config and custom checks, and three mcp-server files: package.json
+# (WellKnownController's compile-time version), and the route snapshot and
+# route-coverage test the router guards read. chg cannot map a change there to
+# the tests that read it, so each selects the whole suite rather than nothing.
+# The rest of mcp-server/ is JavaScript no Elixir test reads, and its own CI job
+# judges it.
+inputs = [
+  "lib/**", "test/**", "config/**", "priv/**", "mix.exs", "mix.lock", ".tool-versions",
+  ".chg/**", ".githooks/**", ".github/**", ".claude/**", "docs/**", "deploy/**",
+  "assets/**", "fly.toml", "CLAUDE.md", "CHANGELOG.md", ".credo/**", ".credo.exs",
+  ".formatter.exs", "mcp-server/package.json", "mcp-server/test/router-routes.json",
+  "mcp-server/test/route_coverage.test.js",
+]
+always_all = [
+  "mix.exs",
+  "mix.lock",
+  "config/**",
+  "priv/**",
+  "test/test_helper.exs",
+  "test/support/**",
+  ".tool-versions",
+  ".chg/**",
+  ".githooks/**",
+  ".github/**",
+  ".claude/**",
+  "docs/**",
+  "deploy/**",
+  "assets/**",
+  "fly.toml",
+  "CLAUDE.md",
+  "CHANGELOG.md",
+  ".credo/**",
+  ".credo.exs",
+  ".formatter.exs",
+  "mcp-server/package.json",
+  "mcp-server/test/router-routes.json",
+  "mcp-server/test/route_coverage.test.js",
+]
+# Each workspace gets its own test database, loopctl_test_chg_ws<hash>, found
+# with `psql -l | grep _chg_`. An explicit MIX_TEST_PARTITION wins over
+# config/worktree_partition.exs's derivation, and `mix chg.run` goes through
+# the `test` alias (Mix.Task.run honours aliases), which creates and migrates it.
+# The default suite's excluded tags (:scale, :scale_nightly, :pgbouncer, :e2e,
+# :requires_ipv6) stay excluded: test_helper.exs reads SCALE_TESTS,
+# SCALE_NIGHTLY, PGBOUNCER_URL and E2E_TESTS, and nothing here sets them, so
+# chg judges the same suite `mix precommit` runs.
+isolation_env = { MIX_TEST_PARTITION = "_chg_{workspace_slot}" }
+
+[commands]
+snapshot = "mix chg.snapshot"
+# MIX_ENV=test spares each task re-running itself in the test env.
+static   = "MIX_ENV=test mix chg.static --base {base}"
+affected = "MIX_ENV=test mix chg.affected --base {base}"
+run      = "MIX_ENV=test mix chg.run --tests {file}"
+shard    = "MIX_ENV=test mix chg.shard --of {n} --index {i}"

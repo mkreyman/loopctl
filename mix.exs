@@ -7,6 +7,17 @@ defmodule Loopctl.MixProject do
       version: "1.0.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
+      # chg (#985) hydrates its check workspace from a snapshot built at another
+      # path. With the cwd check on, the manifest's stored cwd differs there and
+      # Mix recompiles every module; `mix chg.snapshot` refuses the project
+      # without this. A checkout that never moves compiles exactly as before. In a
+      # moved build, a module that was not recompiled keeps its compile-time paths
+      # (its source, __DIR__), which name the snapshot's tree, and that tree may be
+      # gone by the time a test runs. So nothing in lib/ or test/support may bake
+      # such a path into a module for run-time use: test/loopctl/project_root_guard_test.exs.
+      # A compile-time read is fine (Mix records an @external_resource relative to
+      # the project, so the moved build still recompiles its reader on a change).
+      elixirc_options: [check_cwd: false],
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
@@ -292,7 +303,10 @@ defmodule Loopctl.MixProject do
 
   defp aliases do
     [
-      setup: ["deps.get", "ecto.setup", "assets.setup"],
+      # The first step points core.hooksPath at a dispatcher that runs the main
+      # worktree's .githooks (#985: .githooks/pre-push adds chg's shadow check
+      # to the fleet's hooks).
+      setup: ["cmd bash .githooks/install.sh", "deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
