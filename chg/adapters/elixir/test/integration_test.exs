@@ -93,6 +93,33 @@ defmodule ChgAdapter.IntegrationTest do
     assert snapshot!(ctx) == "none"
   end
 
+  test "snapshot of the same commit moved to another path compiles again there", ctx do
+    # Like Phoenix's embed_templates: recompiles when the tree's path changes, which
+    # `check_cwd: false` does not suppress.
+    File.write!(Path.join(ctx.dir, "lib/sample/baked.ex"), """
+    defmodule Sample.Baked do
+      @cwd File.cwd!()
+      def __mix_recompile__?, do: File.cwd!() != @cwd
+      def cwd, do: @cwd
+    end
+    """)
+
+    git!(ctx.dir, ["add", "lib/sample/baked.ex"])
+    git!(ctx.dir, ["commit", "-qm", "baked"])
+    assert snapshot!(ctx) == "full"
+
+    moved = ctx.dir <> "-moved"
+    {_, 0} = System.cmd("cp", ["-a", ctx.dir, moved])
+    beam = Path.join(moved, "_build/test/lib/sample/ebin/Elixir.Sample.Baked.beam")
+    before = File.stat!(beam, time: :posix).mtime
+    # Past a whole second, so a rebuilt beam's mtime differs.
+    Process.sleep(1100)
+
+    assert snapshot!(%{ctx | dir: moved}) == "incremental"
+    assert File.stat!(beam, time: :posix).mtime > before, "the moved tree's beam was not rebuilt"
+    assert snapshot!(%{ctx | dir: moved}) == "none"
+  end
+
   test "snapshot builds a tree with no .git from CHG_SHA, the reference cache too", ctx do
     File.rm_rf!(Path.join(ctx.dir, ".git"))
     env = [{"CHG_SHA", ctx.base}, {"GIT_CEILING_DIRECTORIES", ctx.root}]

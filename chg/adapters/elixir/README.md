@@ -35,7 +35,7 @@ A product then adds:
 
 | Task | Contract command | What it does |
 |---|---|---|
-| `mix chg.snapshot` | `snapshot` | `deps.get`, `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock` and the toolchain match its marker. |
+| `mix chg.snapshot` | `snapshot` | `deps.get`, `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
 | `mix chg.refs` | (part of `snapshot`) | Compiles the test files without running them or starting the app, and records each one's module references in `_build/chg/test_refs.etf`. |
 | `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest. |
 | `mix chg.static --base <sha>` | `static` | `format --check-formatted` and `credo --strict` on the changed files, `compile --warnings-as-errors`, `dialyzer`. |

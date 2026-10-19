@@ -8,9 +8,14 @@ defmodule Mix.Tasks.Chg.Snapshot do
 
       mix chg.snapshot
 
-  Idempotent: when that commit, `mix.lock` and the toolchain match the marker the last
-  successful run wrote, it does nothing and reports `{"work":"none"}`. The marker is
-  written last, so an interrupted run is redone, never trusted.
+  Idempotent: when that commit, `mix.lock`, the toolchain and the tree's absolute path
+  match the marker the last successful run wrote, it does nothing and reports
+  `{"work":"none"}`. The marker is written last, so an interrupted run is redone, never
+  trusted. The path is in it because a build can bake in absolute paths: `check_cwd: false`
+  turns off only Mix's cwd check, and a module whose `__mix_recompile__?` hashes absolute
+  paths (Phoenix's `embed_templates`) or config that expands them still recompiles at
+  another path. A tree cloned there must therefore build again, though its commit is the
+  same.
 
   Prints `{"work":"none"|"incremental"|"full","ms":N}`.
 
@@ -92,6 +97,7 @@ defmodule Mix.Tasks.Chg.Snapshot do
     Enum.join(
       [
         ChgAdapter.head!(),
+        File.cwd!(),
         Base.encode16(:crypto.hash(:sha256, lock), case: :lower),
         System.version(),
         System.otp_release()
