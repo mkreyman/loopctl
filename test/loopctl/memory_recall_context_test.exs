@@ -653,13 +653,15 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert first.meta.diversity.dropped_already_seen == 0
     end
 
-    test "lambda 1.0 with the dedup stages off reproduces the pre-#792 selection exactly",
-         ctx do
+    # The selection property itself — lambda 1.0 takes the top-N in the order given — is
+    # pinned at unit level in `Loopctl.Knowledge.DiversityTest`, on one fixed pool. This
+    # test pins only the WIRING through recall_context/2, from ONE search: comparing two
+    # independent vector searches for equality failed whenever their candidate pools
+    # differed at the cut (#1002), which is the search's nondeterminism, not the selector's.
+    test "lambda 1.0 with the dedup stages off reaches the selector and drops nothing", ctx do
       marker = "lambda#{System.unique_integer([:positive])}"
 
       for i <- 1..4, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 23))
-
-      off = Memory.recall_context(ctx.scope, query: marker, limit: 3, diversity_enabled: false)
 
       pure =
         Memory.recall_context(ctx.scope,
@@ -669,9 +671,13 @@ defmodule Loopctl.MemoryRecallContextTest do
           diversity_near_dup_threshold: 2.0
         )
 
-      assert knowledge_result_ids(pure) == knowledge_result_ids(off)
-      assert Enum.map(pure.results, & &1.score) == Enum.map(off.results, & &1.score)
+      assert length(knowledge_result_ids(pure)) == 3
       assert pure.meta.diversity.lambda == 1.0
+      assert pure.meta.diversity.dropped_near_duplicates == 0
+      assert pure.meta.diversity.dropped_exact_duplicates == 0
+      assert pure.meta.diversity.dropped_already_seen == 0
+
+      off = Memory.recall_context(ctx.scope, query: marker, limit: 3, diversity_enabled: false)
       assert off.meta.diversity.enabled == false
     end
 
