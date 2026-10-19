@@ -104,6 +104,12 @@ const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 
 async function affected(opts) {
   const base = need(opts, "base", "affected");
+  // This adapter keeps no record of the files tests read, so a changed path `chg` names as
+  // read at run time (`read_at_runtime`) selects everything.
+  const read = (process.env.CHG_READ || "").split("\n").filter(Boolean);
+  if (read.length) {
+    return emit({ mode: "all", reason: `${read[0]} is read at run time (read_at_runtime), and this adapter records no reads` });
+  }
   const { sha, paths, deleted } = git.changed(base);
   const pkgs = await packages(ROOT);
   const c = classify({ paths, deleted, ignore: opts.ignore, pkgs, e2eDir: opts["e2e-dir"] });

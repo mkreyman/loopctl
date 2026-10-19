@@ -8,12 +8,15 @@ defmodule Mix.Tasks.Chg.Affected do
 
   It selects by coverage when `chg` hands it a record in `CHG_COVER`
   (`ChgAdapter.Record.given/1`): the test files whose recorded run executed a module whose
-  compiled code differs now. Otherwise it selects from the module graph and
+  compiled code differs now, or that read a changed path `chg` names in `CHG_READ` (those
+  matching `read_at_runtime`). Otherwise it selects from the module graph and
   the snapshot's test reference cache, and its reason says why coverage was not used.
 
-  Prints `{"mode":"subset","reason":…,"tests":[…]}`, or `{"mode":"all","reason":…}` when
-  the selection cannot be trusted: no cache, an unreadable compile manifest, a deleted
-  source the cache does not know, or a change to a module every test runs. `always_all` is applied by `chg adapter exec affected`
+  Prints `{"mode":"subset","reason":…,"tests":[…]}` (with `"read":true` when `CHG_READ`
+  is set), or `{"mode":"all","reason":…}` when the selection cannot be trusted: no cache,
+  an unreadable compile manifest, a deleted source the cache does not know, a change to a
+  module every test runs, or a path in `CHG_READ` with no record to say which tests read
+  it, or read outside any one test file. `always_all` is applied by `chg adapter exec affected`
   before this task runs; called directly, this task does not apply it.
   """
   use Mix.Task
@@ -57,7 +60,9 @@ defmodule Mix.Tasks.Chg.Affected do
         test_files: ChgAdapter.test_files(),
         test_file?: &ChgAdapter.test_file?/1,
         test_path?: &ChgAdapter.test_path?/1,
-        impl?: &protocol_impl?/1
+        impl?: &protocol_impl?/1,
+        read: ChgAdapter.read_paths(),
+        not_read_by: ChgAdapter.not_read_by()
       })
     end
   end
@@ -77,7 +82,8 @@ defmodule Mix.Tasks.Chg.Affected do
              refs: refs,
              test_files: ChgAdapter.test_files(),
              test_file?: &ChgAdapter.test_file?/1,
-             exists?: &File.exists?/1
+             exists?: &File.exists?/1,
+             read: ChgAdapter.read_paths()
            }) do
         {:subset, reason, tests} -> {:subset, "#{reason} (#{no_coverage})", tests}
         other -> other
@@ -87,9 +93,17 @@ defmodule Mix.Tasks.Chg.Affected do
 
   defp emit(doc) do
     case doc do
-      {:subset, reason, tests} -> ChgAdapter.emit(%{mode: "subset", reason: reason, tests: tests})
-      {:all, reason} -> ChgAdapter.emit(%{mode: "all", reason: reason})
-      {:error, why} -> ChgAdapter.emit(%{mode: "all", reason: why})
+      {:subset, reason, tests} ->
+        # Coverage selection accounts for `CHG_READ`; the graph's never returns a subset
+        # with it set.
+        read = if ChgAdapter.read_paths() != [], do: %{read: true}, else: %{}
+        ChgAdapter.emit(Map.merge(%{mode: "subset", reason: reason, tests: tests}, read))
+
+      {:all, reason} ->
+        ChgAdapter.emit(%{mode: "all", reason: reason})
+
+      {:error, why} ->
+        ChgAdapter.emit(%{mode: "all", reason: why})
     end
   end
 end

@@ -22,6 +22,23 @@ defmodule ChgAdapter.Cover do
   computed at compile time) is credited to it. The worker's own touches (a macro, an
   attribute) go to its file alone, never to the windows of tests running meanwhile.
 
+  Files are recorded the same way. Every `:file` and `:prim_file` call that names a path
+  (read, open, stat, list a directory, follow a link), which is every way `File` and
+  `Path.wildcard/1` reach the disk, is a read of that path by whichever windows are open,
+  whether it was found or not. So is starting an operating-system process
+  (`:erlang.open_port/2` with a command: `System.cmd/3`, `:os.cmd/1`), recorded as
+  `{:spawn, name}`, because what a subprocess reads is not traced. Sockets and the resolver's
+  `inet_gethost` are ports too, and are not spawns. The file server, the code server and
+  the prim loader touch files for others, so their calls are not reads: the caller's
+  `:file` call is.
+
+  Reads are attributed by process where they can be, since async neighbours would
+  otherwise share every read and subprocess. A test module's runner process starts its
+  tests and `setup_all`, and every process started from one of those, transitively,
+  belongs to that module's file from the moment it starts (`:procs` tracing); so does
+  every process a compiling worker starts. A read by any other process (the Repo pool, a
+  server the app started) is attributed by time, like a touch.
+
   Touches no window can own count for every test, and a change to such a module selects
   the whole suite:
     * before the first test module started (application start, `test_helper.exs`);
@@ -38,6 +55,41 @@ defmodule ChgAdapter.Cover do
   @compiling {:elixir_compiler, :file, 2}
   @file_arg [{[:"$1", :_], [], [{:message, :"$1"}, {:exception_trace}]}]
   @test_module [{[:_, %{name: :"$1", file: :"$2"}], [], [{:message, {{:"$1", :"$2"}}}]}]
+  # Every call whose first argument names a path a test may read (Elixir 1.20.4, OTP 28).
+  @path_calls [
+    file: [
+      read_file: 1,
+      read_file: 2,
+      read_file_info: 1,
+      read_file_info: 2,
+      read_link_info: 1,
+      read_link_info: 2,
+      read_link: 1,
+      read_link_all: 1,
+      list_dir: 1,
+      list_dir_all: 1,
+      open: 2,
+      consult: 1,
+      eval: 1,
+      script: 1,
+      copy: 2,
+      copy: 3
+    ],
+    prim_file: [
+      read_file: 1,
+      read_file_info: 1,
+      read_file_info: 2,
+      read_link_info: 1,
+      read_link_info: 2,
+      read_link: 1,
+      read_link_all: 1,
+      list_dir: 1,
+      list_dir_all: 1,
+      open: 2
+    ]
+  ]
+  @open_port {:erlang, :open_port, 2}
+  @set_cwd {:file, :set_cwd, 1}
 
   # How long `stop/1` waits for the tracer to work through its queue.
   @stop_timeout :timer.minutes(10)
@@ -59,13 +111,30 @@ defmodule ChgAdapter.Cover do
     :trace.function(session, @compiling, @file_arg, [:global])
     :trace.function(session, @started, @test_module, [:global])
     :trace.function(session, @finished, @test_module, [:global])
-    :trace.process(session, :all, true, [:call, :arity, :monotonic_timestamp])
+
+    for {mod, calls} <- @path_calls, {fun, arity} <- calls do
+      kind = if fun in [:list_dir, :list_dir_all], do: :listed, else: :path
+      ms = [{[:"$1" | List.duplicate(:_, arity - 1)], [], [{:message, {{kind, :"$1"}}}]}]
+      :trace.function(session, {mod, fun, arity}, ms, [:global])
+    end
+
+    :trace.function(session, @set_cwd, [{[:"$1"], [], [{:message, {{:cwd, :"$1"}}}]}], [:global])
+
+    :trace.function(session, @open_port, [{[:"$1", :_], [], [{:message, {{:port, :"$1"}}}]}], [
+      :global
+    ])
+
+    :trace.process(session, :all, true, [:call, :procs, :arity, :monotonic_timestamp])
     {session, tracer}
   end
 
   @doc """
-  Stops tracing and returns `%{cover: %{file => [module]}, global: [module]}`. Files are
-  relative to the working directory. A module still open (the run stopped at
+  Stops tracing and returns `%{cover: %{file => [module]}, global: [module], reads: %{file
+  => [path]}, global_reads: [path]}`. Test files and read paths are relative to the
+  working directory; reads outside it, and under `_build` and `deps`, are left out. A
+  directory listed ends in `/` (the root is `./`), since what is under it decides what a
+  listing returns; any other read is of the path alone. `{:spawn, name}` stands for a
+  subprocess, named by its executable. A module still open (the run stopped at
   `--max-failures`) is closed with everything touched since it started.
 
   Raises when the tracer died or took longer than #{div(@stop_timeout, 60_000)} minutes,
@@ -73,7 +142,7 @@ defmodule ChgAdapter.Cover do
   probes no longer fit this Elixir, so compile-time calls would be misattributed).
   """
   def stop({session, tracer}) do
-    :trace.process(session, :all, false, [:call])
+    :trace.process(session, :all, false, [:call, :procs])
     ref = make_ref()
     mon = Process.monitor(tracer)
     send(tracer, {:stop, self(), ref})
@@ -109,6 +178,24 @@ defmodule ChgAdapter.Cover do
     %{
       session: nil,
       touched: :ets.new(:touched, [:set, :private]),
+      read: :ets.new(:read, [:set, :private]),
+      # pid => the test file whose module, or whose compile, it descends from
+      owners: :ets.new(:owners, [:set, :private]),
+      # module runner pid => the test file of the module it runs now
+      running: %{},
+      # the working directories tests set, newest first: `{trace timestamp, absolute dir}`;
+      # before the first, `cwd`
+      cwds: [],
+      owned_reads: %{},
+      global_reads: MapSet.new(),
+      reads: %{},
+      # Servers that touch files for a caller whose own `:file` call is traced.
+      drivers: drivers(),
+      servers:
+        Enum.flat_map(
+          [:file_server_2, :code_server, :erl_prim_loader],
+          &List.wrap(Process.whereis(&1))
+        ),
       first_start: nil,
       # pid => the file it compiles, or nil when not known (yet)
       compilers: %{},
@@ -147,12 +234,48 @@ defmodule ChgAdapter.Cover do
        when done in [:return_from, :exception_from],
        do: closing(s, {:compile, pid})
 
-  defp handle({:trace_ts, _pid, :call, @started, {name, file}, ts}, s) do
+  defp handle({:trace_ts, pid, :call, @started, {name, file}, ts}, s) do
     first = if s.first_start, do: min(s.first_start, ts), else: ts
-    %{s | first_start: first, open: Map.put(s.open, name, {ts, file})}
+
+    %{
+      s
+      | first_start: first,
+        open: Map.put(s.open, name, {ts, file}),
+        running: Map.put(s.running, pid, file)
+    }
+  end
+
+  # A process inherits its parent's owner when it starts, so a test's processes stay its
+  # own after its runner has moved on to the next module.
+  defp handle({:trace_ts, parent, :spawn, child, _mfa, _ts}, s) do
+    if owner = owner(s, parent), do: :ets.insert(s.owners, {child, owner})
+    s
+  end
+
+  # A process with a name can be reached by any test, so it is no one test's.
+  defp handle({:trace_ts, pid, :register, _name, _ts}, s) do
+    :ets.delete(s.owners, pid)
+    s
+  end
+
+  # `File.cd/1`. The call is traced before it takes effect, so the process's own later
+  # reads are stamped after it; a read another process makes at the same moment may be
+  # resolved against either directory.
+  defp handle({:trace_ts, _pid, :call, @set_cwd, {:cwd, dir}, ts}, s) do
+    case path_name(dir, :path, s, ts) do
+      {d, _} -> %{s | cwds: Enum.sort_by([{ts, d} | s.cwds], &elem(&1, 0), :desc)}
+      nil -> s
+    end
   end
 
   defp handle({:trace_ts, _pid, :call, @finished, {name, _file}, _ts}, s), do: closing(s, name)
+
+  defp handle({:trace_ts, pid, :call, _mfa, {kind, name}, ts}, s) when kind in [:path, :listed] do
+    if pid in s.servers, do: s, else: read(s, pid, path_name(name, kind, s, ts), ts)
+  end
+
+  defp handle({:trace_ts, pid, :call, @open_port, {:port, name}, ts}, s),
+    do: read(s, pid, spawned(name, s.drivers), ts)
 
   # A compiling process's touch is its file's, never timed. Any other touch is timed; one
   # made before the first test module or while none is open is no test's, so it is global.
@@ -194,10 +317,19 @@ defmodule ChgAdapter.Cover do
       end)
       |> Map.new(fn {file, mods} -> {file, Enum.sort(mods)} end)
 
+    reads =
+      Enum.concat(s.reads, s.owned_reads)
+      |> Enum.reduce(%{}, fn {file, paths}, acc ->
+        Map.update(acc, rel.(file), MapSet.new(paths), &Enum.into(paths, &1))
+      end)
+      |> Map.new(fn {file, paths} -> {file, kept(paths, s.cwd)} end)
+
     {:reply, from, ref,
      %{
        cover: cover,
        global: Enum.sort(s.global),
+       reads: reads,
+       global_reads: kept(s.global_reads, s.cwd),
        compiling: Enum.count(s.compilers, fn {_, file} -> file != nil end)
      }}
   end
@@ -229,9 +361,112 @@ defmodule ChgAdapter.Cover do
         s
 
       {{start, file}, open} ->
-        mods = :ets.select(s.touched, [{{:"$1", :"$2"}, [{:>=, :"$2", start}], [:"$1"]}])
+        since = [{{:"$1", :"$2"}, [{:>=, :"$2", start}], [:"$1"]}]
+        mods = :ets.select(s.touched, since)
+        paths = :ets.select(s.read, since)
         cover = Map.update(s.cover, file, MapSet.new(mods), &Enum.into(mods, &1))
-        %{s | open: open, cover: cover}
+        reads = Map.update(s.reads, file, MapSet.new(paths), &Enum.into(paths, &1))
+        %{s | open: open, cover: cover, reads: reads}
     end
+  end
+
+  # A read is the file's of the test module or compile its process descends from, while
+  # that module or compile is open and the process has no name. Any other (a pool, a
+  # server the app started, one a finished module left behind) is attributed like a
+  # touch: by time, and outside every window to every test.
+  defp read(s, _pid, nil, _ts), do: s
+
+  defp read(s, pid, path, ts) do
+    case {s.compilers, open_owner(s, pid)} do
+      {%{^pid => nil}, _} ->
+        %{s | global_reads: MapSet.put(s.global_reads, path)}
+
+      {_, file} when file != nil ->
+        %{
+          s
+          | owned_reads:
+              Map.update(s.owned_reads, file, MapSet.new([path]), &MapSet.put(&1, path))
+        }
+
+      _ ->
+        :ets.insert(s.read, {path, System.monotonic_time()})
+
+        if s.first_start == nil or ts < s.first_start or map_size(s.open) == 0,
+          do: %{s | global_reads: MapSet.put(s.global_reads, path)},
+          else: s
+    end
+  end
+
+  # The owner only while its module or compile is still open: afterwards a process it left
+  # behind may be doing another test's work.
+  defp open_owner(s, pid) do
+    owner = owner(s, pid)
+    if owner && Enum.any?(s.open, fn {_, {_, file}} -> file == owner end), do: owner
+  end
+
+  defp owner(s, pid) do
+    case :ets.lookup(s.owners, pid) do
+      [{_, file}] -> file
+      [] -> Map.get(s.running, pid) || Map.get(s.compilers, pid)
+    end
+  end
+
+  # The absolute path a call names, against the working directory at `ts`, and whether it
+  # lists a directory; nil for a file descriptor or an unreadable name.
+  defp path_name(name, kind, s, ts) when is_binary(name) do
+    {_, cwd} = Enum.find(s.cwds, {nil, s.cwd}, fn {at, _} -> at <= ts end)
+    {Path.expand(name, cwd), kind}
+  end
+
+  defp path_name({name, _modes}, kind, s, ts), do: path_name(name, kind, s, ts)
+
+  defp path_name(name, kind, s, ts) when is_list(name) do
+    path_name(IO.chardata_to_string(name), kind, s, ts)
+  rescue
+    _ -> nil
+  end
+
+  defp path_name(_, _, _, _), do: nil
+
+  # `{:spawn, command}` for a port that runs a command, named by its executable's basename;
+  # nil for a driver (a socket, `ram_file_drv`) and the resolver (`inet_gethost`).
+  defp spawned({:spawn_executable, exe}, _drivers) do
+    case exe |> to_string() |> Path.basename() do
+      "inet_gethost" -> nil
+      name -> {:spawn, name}
+    end
+  end
+
+  defp spawned({:spawn, command}, drivers) do
+    name = command |> to_string() |> String.split(" ", parts: 2) |> hd()
+    if name in drivers, do: nil, else: {:spawn, Path.basename(name)}
+  end
+
+  defp spawned(_, _), do: nil
+
+  defp drivers do
+    {:ok, names} = :erl_ddll.loaded_drivers()
+    Enum.map(names, &to_string/1)
+  end
+
+  defp kept(paths, cwd) do
+    paths
+    |> Enum.flat_map(fn
+      {:spawn, _} = spawn ->
+        [spawn]
+
+      {p, kind} ->
+        r = Path.relative_to(p, cwd)
+
+        cond do
+          Path.type(r) == :absolute -> []
+          String.starts_with?(r, ["_build/", "deps/"]) or r in ["_build", "deps"] -> []
+          kind == :listed and r == "." -> ["./"]
+          kind == :listed -> [r <> "/"]
+          true -> [r]
+        end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 end

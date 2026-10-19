@@ -23,7 +23,14 @@ pub enum Invoked {
 /// Runs `name` in `repo`. `slot` overrides the workspace slot derived from `repo`
 /// (a snapshot build passes one stable slot per repo, not one per temp dir).
 /// Every variable chg sets for an adapter command; `exec::run` removes inherited ones.
-pub const ADAPTER_ENV: [&str; 4] = ["CHG_COVER", "CHG_RECORD", "CHG_SHARD_BY", "CHG_SHA"];
+pub const ADAPTER_ENV: [&str; 6] = [
+    "CHG_COVER",
+    "CHG_NOT_READ_BY",
+    "CHG_READ",
+    "CHG_RECORD",
+    "CHG_SHARD_BY",
+    "CHG_SHA",
+];
 
 pub fn invoke(
     repo: &Path,
@@ -51,6 +58,7 @@ pub fn invoke(
     }
     // `always_all` is applied here, once for every adapter kind: a hit selects the whole
     // suite without asking the adapter. An unusable base fails closed like any breakage.
+    let mut changed = Vec::new();
     if name == CommandName::Affected {
         match git::changed_paths(repo, &values["base"]) {
             Err(e) => return Invoked::Broken(format!("cannot diff against the base: {e}")),
@@ -60,6 +68,7 @@ pub fn invoke(
                         reason: format!("{path} matches always_all `{pattern}`"),
                     }));
                 }
+                changed = paths;
             }
         }
     }
@@ -71,11 +80,41 @@ pub fn invoke(
     // Values chg hands the adapter as environment, not placeholders: the coverage files
     // (`cover.rs`), with `affected` getting the record to judge by, and `sha`, the commit a
     // snapshot build's tree holds, which has no `.git` to ask.
+    // `CHG_READ` names the changed paths matching `read_at_runtime`, since the base and,
+    // when a record is handed over, since the record: the adapter selects their readers by
+    // the record, or the whole suite without one. `CHG_NOT_READ_BY` goes with it: the
+    // commands whose subprocesses the adapter need not count as reading them.
     let mut env = Vec::new();
+    let mut reads = false;
     if name == CommandName::Affected {
         match coverage_record(repo, &manifest.always_all, &values["base"]) {
-            Ok(path) => env.push(("CHG_COVER".to_string(), path)),
+            Ok((path, since)) => {
+                env.push(("CHG_COVER".to_string(), path));
+                changed.extend(since);
+            }
             Err(why) => eprintln!("chg: not selecting by coverage: {why}"),
+        }
+        let mut read: Vec<&String> = changed
+            .iter()
+            .filter(|p| manifest.read_at_runtime.iter().any(|g| glob::matches(g, p)))
+            .collect();
+        read.sort();
+        read.dedup();
+        if let Some(p) = read.iter().find(|p| p.contains('\n')) {
+            return Invoked::Ok(Document::Affected(Affected::fail_closed(&format!(
+                "{p:?} matches read_at_runtime and cannot be named on a line"
+            ))));
+        }
+        reads = !read.is_empty();
+        if reads {
+            let lines: Vec<&str> = read.iter().map(|p| p.as_str()).collect();
+            env.push(("CHG_READ".to_string(), lines.join("\n")));
+            if !manifest.not_read_by.is_empty() {
+                env.push((
+                    "CHG_NOT_READ_BY".to_string(),
+                    manifest.not_read_by.join("\n"),
+                ));
+            }
         }
     }
     for (key, var) in [
@@ -117,6 +156,18 @@ pub fn invoke(
         let says = if failed { "failure" } else { "success" };
         return Invoked::Broken(format!("exited {code:?} but its document reports {says}"));
     }
+    // A subset that does not say it accounted for `CHG_READ` (an adapter written before
+    // `read_at_runtime`) could leave out every test that reads a changed path.
+    if reads
+        && matches!(
+            doc,
+            Document::Affected(Affected::Subset { read: false, .. })
+        )
+    {
+        return Invoked::Ok(Document::Affected(Affected::fail_closed(
+            "the adapter's subset does not account for the changed read_at_runtime paths (no \"read\":true)",
+        )));
+    }
     if failed {
         Invoked::Failed(doc)
     } else {
@@ -124,10 +175,15 @@ pub fn invoke(
     }
 }
 
-/// The record `affected` may judge by. Selection by coverage compares with the record, not
-/// the base, so an `always_all` path changed since the record rules it out: the adapter
-/// then selects from the base, where chg has already applied `always_all`.
-fn coverage_record(repo: &Path, always_all: &[String], base: &str) -> Result<String, String> {
+/// The record `affected` may judge by, and the paths changed since it. Selection by
+/// coverage compares with the record, not the base, so an `always_all` path changed since
+/// the record rules it out: the adapter then selects from the base, where chg has already
+/// applied `always_all`.
+fn coverage_record(
+    repo: &Path,
+    always_all: &[String],
+    base: &str,
+) -> Result<(String, Vec<String>), String> {
     let (sha, path) = cover::nearest(repo, base)?.ok_or_else(|| {
         "no coverage record on the base's first-parent line within reach".to_string()
     })?;
@@ -138,5 +194,5 @@ fn coverage_record(repo: &Path, always_all: &[String], base: &str) -> Result<Str
             &sha[..12]
         ));
     }
-    Ok(path.to_string_lossy().into_owned())
+    Ok((path.to_string_lossy().into_owned(), since))
 }

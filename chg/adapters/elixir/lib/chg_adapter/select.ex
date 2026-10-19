@@ -11,7 +11,9 @@ defmodule ChgAdapter.Select do
       in a source that reads a changed external resource, or to any module that
       transitively references one.
 
-  `always_all` is not applied here: `chg` applies it before calling the adapter.
+  `always_all` is not applied here: `chg` applies it before calling the adapter. Nor is
+  `read_at_runtime`: `chg` names the changed paths it matches (`read`), and with no
+  coverage record to say which tests read them, the whole suite runs.
   """
 
   alias ChgAdapter.Graph
@@ -23,10 +25,16 @@ defmodule ChgAdapter.Select do
           refs: map(),
           test_files: [String.t()],
           test_file?: (String.t() -> boolean()),
-          exists?: (String.t() -> boolean())
+          exists?: (String.t() -> boolean()),
+          read: [String.t()]
         }
 
   @spec run(input()) :: {:all, String.t()} | {:subset, String.t(), [String.t()]}
+  def run(%{read: [p | _]}),
+    do:
+      {:all,
+       "#{p} is read at run time (read_at_runtime), and no coverage record says by which tests"}
+
   def run(%{changed: changed, graph: graph, refs: refs} = input) do
     {tests_changed, others} = Enum.split_with(changed, input.test_file?)
 
@@ -78,7 +86,9 @@ defmodule ChgAdapter.Select do
           test_files: [String.t()],
           test_file?: (String.t() -> boolean()),
           test_path?: (String.t() -> boolean()),
-          impl?: (module() -> boolean())
+          impl?: (module() -> boolean()),
+          read: [String.t()],
+          not_read_by: [String.t()]
         }
 
   @doc """
@@ -95,9 +105,14 @@ defmodule ChgAdapter.Select do
   is selected when:
     * it changed since the base, or since the record (its coverage may be stale);
     * the record has no coverage for it (new, or it did not run);
-    * its recorded coverage includes an altered module.
+    * its recorded coverage includes an altered module;
+    * it read a path in `read` (the changed paths matching `read_at_runtime`), or listed
+      a directory above one (a new or deleted file changes a listing), or it started a
+      subprocess, whose reads are not recorded (one of the manifest's `not_read_by`
+      excepted).
 
-  The whole suite runs when an altered module ran outside any one test file's window (the
+  The whole suite runs when a path in `read` was read outside any one test file's window
+  (the record's `global_reads`), or a subprocess started there, when an altered module ran outside any one test file's window (the
   record's `global`: at boot, between tests), when a new module is a protocol implementation (protocol
   dispatch reaches it with no call that names it), and when a file under the test paths
   that is not a test and defines no module (test data) changed since the base or the
@@ -112,8 +127,15 @@ defmodule ChgAdapter.Select do
     snapshot = %{source_modules: %{}, external: %{}}
     %{source_modules: defines, external: readers} = input.graph
 
+    # Callers and records from before `read_at_runtime` carry none of these.
+    read = Map.get(input, :read, [])
+    ignored = Map.get(input, :not_read_by, [])
+    reads = Map.new(Map.get(record, :reads, %{}), fn {f, r} -> {f, unignored(r, ignored)} end)
+    global_reads = unignored(Map.get(record, :global_reads, []), ignored)
+
     with {:ok, _, unmapped} <- modules_of(others, input.graph, snapshot, fn _ -> true end),
-         :ok <- no_test_data(unmapped, input.test_path?) do
+         :ok <- no_test_data(unmapped -- read, input.test_path?),
+         :ok <- not_read_globally(read, global_reads) do
       sourced =
         for p <- others,
             src <- Map.get(readers, p, []),
@@ -144,12 +166,14 @@ defmodule ChgAdapter.Select do
 
           tests =
             for f <- input.test_files,
-                MapSet.member?(direct, f) or covers?(Map.get(record.cover, f), altered),
+                MapSet.member?(direct, f) or covers?(Map.get(record.cover, f), altered) or
+                  reads_any?(Map.get(reads, f), read),
                 do: f
 
           reason =
             "coverage of #{String.slice(record.sha, 0, 12)} (#{Map.get(record, :age, 0)} commit(s) behind): " <>
-              "#{MapSet.size(altered)} altered module(s), #{length(tests)} of #{length(input.test_files)} test file(s)"
+              "#{MapSet.size(altered)} altered module(s), #{length(read)} changed path(s) read at run time, " <>
+              "#{length(tests)} of #{length(input.test_files)} test file(s)"
 
           {:subset, reason, Enum.sort(tests)}
       end
@@ -160,6 +184,43 @@ defmodule ChgAdapter.Select do
 
   defp covers?(nil, _altered), do: true
   defp covers?(mods, altered), do: Enum.any?(mods, &MapSet.member?(altered, &1))
+
+  defp reads_any?(_reads, []), do: false
+  defp reads_any?(nil, _read), do: true
+  defp reads_any?(reads, read), do: spawned(reads) != nil or Enum.any?(read, &read?(reads, &1))
+
+  defp not_read_globally([], _global), do: :ok
+
+  defp not_read_globally([p | _] = read, global) do
+    cond do
+      name = spawned(global) ->
+        {:error,
+         "#{p} is read at run time, and a subprocess (#{name}) started outside any one test file (the record's global_reads)"}
+
+      q = Enum.find(read, &read?(global, &1)) ->
+        {:error, "#{q} was read outside any one test file (the record's global_reads)"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp unignored(reads, []), do: reads
+
+  defp unignored(reads, ignored),
+    do: Enum.reject(reads, fn r -> match?({:spawn, _}, r) and elem(r, 1) in ignored end)
+
+  defp spawned(reads),
+    do: Enum.find_value(reads, fn r -> match?({:spawn, _}, r) and elem(r, 1) end)
+
+  # Whether one of `reads` is `path`, or a listing (`dir/`) of a directory above it.
+  defp read?(reads, path) do
+    Enum.any?(reads, fn
+      {:spawn, _} -> false
+      "./" -> true
+      r -> r == path or (String.ends_with?(r, "/") and String.starts_with?(path, r))
+    end)
+  end
 
   defp no_test_data(unmapped, test_path?) do
     case Enum.find(unmapped, test_path?) do

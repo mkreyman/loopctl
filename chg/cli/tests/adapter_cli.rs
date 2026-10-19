@@ -475,16 +475,91 @@ fn inherited_chg_variables_never_reach_the_adapter() {
     .unwrap();
     std::fs::write(
         repo.join(".chg/probe.sh"),
-        "env | grep -E '^CHG_(SHA|COVER|RECORD|SHARD_BY)=' > probe.env\necho '{\"ok\":true,\"failures\":[]}'\n",
+        "env | grep -E '^CHG_(SHA|COVER|NOT_READ_BY|READ|RECORD|SHARD_BY)=' > probe.env\necho '{\"ok\":true,\"failures\":[]}'\n",
     )
     .unwrap();
 
     exec(repo, &["static", "--base", "HEAD"])
         .env("CHG_SHA", "0000000000000000000000000000000000000000")
         .env("CHG_COVER", "/stale.cover")
+        .env("CHG_READ", "docs/stale.md")
+        .env("CHG_NOT_READ_BY", "mix")
         .env("CHG_RECORD", "/stale.record")
         .env("CHG_SHARD_BY", "/stale.record")
         .assert()
         .success();
     assert_eq!(std::fs::read_to_string(repo.join("probe.env")).unwrap(), "");
+}
+
+#[test]
+fn affected_names_the_changed_read_at_runtime_paths_in_chg_read() {
+    let dir = fixture("elixir");
+    let repo = dir.path();
+    let manifest = std::fs::read_to_string(repo.join(".chg/adapter.toml")).unwrap();
+    let manifest = manifest.replace(
+        "always_all = [",
+        "read_at_runtime = [\"docs/**\"]\nnot_read_by = [\"mix\", \"git\"]\nalways_all = [",
+    );
+    let manifest = replace_line(
+        &manifest,
+        "affected = ",
+        "affected = \"sh .chg/probe.sh {base}\"",
+    );
+    std::fs::write(repo.join(".chg/adapter.toml"), manifest).unwrap();
+    std::fs::write(
+        repo.join(".chg/probe.sh"),
+        "printf '%s|%s' \"${CHG_READ-unset}\" \"${CHG_NOT_READ_BY-unset}\" > probe.read\necho '{\"mode\":\"subset\",\"reason\":\"probe\",\"tests\":[]}'\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("docs/a")).unwrap();
+    std::fs::write(repo.join("docs/a/old.json"), "1").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "docs"]);
+
+    exec(repo, &["affected", "--base", "HEAD"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(repo.join("probe.read")).unwrap(),
+        "unset|unset"
+    );
+
+    std::fs::write(repo.join("docs/a/new.json"), "1").unwrap();
+    std::fs::write(repo.join("docs/b.md"), "1").unwrap();
+    git(repo, &["rm", "-q", "docs/a/old.json"]);
+    std::fs::write(repo.join("README.md"), "x").unwrap();
+    // The probe's subset does not say `"read":true`, so chg runs everything.
+    exec(repo, &["affected", "--base", "HEAD"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "does not account for the changed read_at_runtime paths",
+        ));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("probe.read")).unwrap(),
+        "docs/a/new.json\ndocs/a/old.json\ndocs/b.md|mix\ngit"
+    );
+
+    // One that says so is kept.
+    let probe = std::fs::read_to_string(repo.join(".chg/probe.sh")).unwrap();
+    std::fs::write(
+        repo.join(".chg/probe.sh"),
+        probe.replace("\"tests\":[]", "\"tests\":[],\"read\":true"),
+    )
+    .unwrap();
+    git(repo, &["add", ".chg/probe.sh"]);
+    git(repo, &["commit", "-qm", "probe reads"]);
+    exec(repo, &["affected", "--base", "HEAD"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"mode\":\"subset\""));
+}
+
+/// Replaces the whole line starting with `prefix`.
+fn replace_line(text: &str, prefix: &str, line: &str) -> String {
+    text.lines()
+        .map(|l| if l.starts_with(prefix) { line } else { l })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }

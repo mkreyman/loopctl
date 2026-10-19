@@ -105,6 +105,12 @@ pub struct Manifest {
     pub artifacts: Vec<String>,
     pub inputs: Vec<String>,
     pub always_all: Vec<String>,
+    /// Paths tests read as files at run time. A change to one selects the tests a coverage
+    /// record says read it; without a record, the whole suite (`CHG_READ`).
+    pub read_at_runtime: Vec<String>,
+    /// Executables (by basename) that read no `read_at_runtime` path, so a test starting
+    /// one is not taken to read them (`CHG_NOT_READ_BY`).
+    pub not_read_by: Vec<String>,
     pub isolation_env: BTreeMap<String, String>,
     pub commands: BTreeMap<CommandName, String>,
 }
@@ -136,12 +142,14 @@ impl fmt::Display for Invalid {
 
 impl std::error::Error for Invalid {}
 
-const ADAPTER_KEYS: [&str; 6] = [
+const ADAPTER_KEYS: [&str; 8] = [
     "kind",
     "version",
     "artifacts",
     "inputs",
     "always_all",
+    "read_at_runtime",
+    "not_read_by",
     "isolation_env",
 ];
 
@@ -212,6 +220,32 @@ pub fn parse(text: &str) -> Result<Manifest, Invalid> {
     let artifacts = adapter.and_then(|a| path_list(a, "artifacts", &mut errs));
     let inputs = adapter.and_then(|a| path_list(a, "inputs", &mut errs));
     let always_all = adapter.and_then(|a| path_list(a, "always_all", &mut errs));
+    // Optional, and may be empty.
+    let read_at_runtime = adapter.and_then(|a| match a.get("read_at_runtime") {
+        None => Some(Vec::new()),
+        Some(toml::Value::Array(arr)) if arr.is_empty() => Some(Vec::new()),
+        Some(_) => path_list(a, "read_at_runtime", &mut errs),
+    });
+    let not_read_by = adapter.and_then(|a| match a.get("not_read_by") {
+        None => Some(Vec::new()),
+        Some(toml::Value::Array(arr)) => {
+            let mut out = Vec::new();
+            for item in arr {
+                match item.as_str() {
+                    Some(n) if !n.is_empty() && !n.contains(['/', '\n']) => out.push(n.to_string()),
+                    _ => errs.push(
+                        "`adapter.not_read_by` must be an array of executable names (no `/`)"
+                            .into(),
+                    ),
+                }
+            }
+            Some(out)
+        }
+        Some(_) => {
+            errs.push("`adapter.not_read_by` must be an array of executable names (no `/`)".into());
+            None
+        }
+    });
 
     let isolation_env = adapter.and_then(|a| match a.get("isolation_env") {
         None => Some(BTreeMap::new()),
@@ -278,6 +312,8 @@ pub fn parse(text: &str) -> Result<Manifest, Invalid> {
         artifacts: artifacts.expect("checked"),
         inputs: inputs.expect("checked"),
         always_all: always_all.expect("checked"),
+        read_at_runtime: read_at_runtime.expect("checked"),
+        not_read_by: not_read_by.expect("checked"),
         isolation_env: isolation_env.expect("checked"),
         commands: cmds,
     })
@@ -432,6 +468,31 @@ shard    = "mix chg.shard --of {n} --index {i}"
 
     fn errs(text: &str) -> Vec<String> {
         parse(text).expect_err("expected invalid").0
+    }
+
+    #[test]
+    fn read_at_runtime_is_optional_and_checked_like_the_other_lists() {
+        assert!(parse(VALID).unwrap().read_at_runtime.is_empty());
+        let with = VALID.replace(
+            "isolation_env",
+            "read_at_runtime = [\"docs/**\", \".github/**\"]\nisolation_env",
+        );
+        assert_eq!(
+            parse(&with).unwrap().read_at_runtime,
+            vec!["docs/**", ".github/**"]
+        );
+        let empty = VALID.replace("isolation_env", "read_at_runtime = []\nisolation_env");
+        assert!(parse(&empty).unwrap().read_at_runtime.is_empty());
+        let bad = VALID.replace(
+            "isolation_env",
+            "read_at_runtime = [\"../x\"]\nisolation_env",
+        );
+        assert_eq!(
+            errs(&bad),
+            vec![
+                "`adapter.read_at_runtime` entry \"../x\" must be relative to the repo root with no `..`"
+            ]
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ A product then adds:
 |---|---|---|
 | `mix chg.snapshot` | `snapshot` | `deps.get`, `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
 | `mix chg.refs` | (part of `snapshot`) | Compiles the test files without running them or starting the app, and records each one's module references in `_build/chg/test_refs.etf`. |
-| `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest. |
+| `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed, or that read a changed path `chg` names in `CHG_READ`. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest, and everything when `CHG_READ` names a path. |
 | `mix chg.static --base <sha>` | `static` | `format --check-formatted` and `credo --strict` on the changed files, `compile --warnings-as-errors`, `dialyzer`. |
 | `mix chg.run --tests <list>` | `run` | `mix test` on the listed paths, one result per test. |
 | `mix chg.shard --of <n> --index <i>` | `shard` | One shard of the whole suite: stable by file name, or balanced by recorded time when `CHG_SHARD_BY` names a record. With `CHG_RECORD` set, it records coverage and timings to that file. |
@@ -77,8 +77,17 @@ Recording (`CHG_RECORD`, on the verifier's whole-suite run, only when the tree i
 its own, and attributes each to the test modules running at that moment, so work handed to a
 GenServer, a Task or the Repo pool still counts. A call made while a test file compiles (a
 macro, a module attribute) counts for that file. Calls made at boot, or by a compiling process
-whose file is not known, go into a `global` set. The record also holds `ChgAdapter.Digest` of every module, and
-each test file's time. Tracing costs about 8% of the suite's time.
+whose file is not known, go into a `global` set. Files are recorded the same way: every
+`:file`/`:prim_file` call that names a path (reading, opening, stat, listing a directory, which
+covers `File` and `Path.wildcard/1`) is a read by the windows open then, and starting a
+subprocess (`System.cmd/3`, `:os.cmd/1`) is recorded as `{:spawn, name}`, because its own
+reads are not seen. Reads go to the test file whose process made them: every process a test
+module's runner starts, transitively, is that module's from the moment it starts, and so is
+every process a compiling worker starts. A read by any other process (the Repo pool, a server
+the app started) goes to the windows open then, and outside every window into `global_reads`. The record also holds
+`ChgAdapter.Digest` of every module, and each test file's time. Tracing costs about 11% of
+the suite's time: HomeCareBilling's whole suite on minis at 1191e0fe6 (2026-10-19) ran in 658 s
+recorded and 591 s not, back to back, with the load average between 22 and 41.
 
 Selecting (`mix chg.affected`) against the record `chg` hands over in `CHG_COVER`: the nearest
 on the base's first-parent line, at most `CHG_COVER_MAX_AGE` (default 100) commits back, with no
@@ -91,6 +100,11 @@ on the base's first-parent line, at most `CHG_COVER_MAX_AGE` (default 100) commi
 - test data (a file under the test paths that is not a test) changed since the base or the
   record selects the whole suite;
 - an altered module in `global`, or a new protocol implementation, selects the whole suite;
+- a changed path `chg` names in `CHG_READ` (it matches the manifest's `read_at_runtime`) selects
+  the test files that read it, listed a directory above it, or started a subprocess other than
+  one the manifest's `not_read_by` names (`CHG_NOT_READ_BY`). One read outside every test file
+  (`global_reads`), or such a subprocess started there, selects the whole suite. Such a path is
+  not test data, even under the test paths. Without a record it selects the whole suite;
 - otherwise the selection is every test file that changed since the base or the record, that the
   record has no coverage of (new), or whose recorded run executed an altered module.
 

@@ -168,7 +168,7 @@ fn check(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
 
     let t = Instant::now();
     let (mode, reason, selected, invoked) = match affected {
-        Affected::Subset { reason, tests } if tests.is_empty() => {
+        Affected::Subset { reason, tests, .. } if tests.is_empty() => {
             return Verdict {
                 verdict: Outcome::Pass,
                 reason: format!("no tests affected ({reason})"),
@@ -178,7 +178,7 @@ fn check(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
                 ..Verdict::skipped("")
             };
         }
-        Affected::Subset { reason, tests } => {
+        Affected::Subset { reason, tests, .. } => {
             let list = match tempfile::NamedTempFile::new() {
                 Ok(f) => f,
                 Err(e) => return Verdict::error(format!("cannot write the test list: {e}")),

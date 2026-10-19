@@ -59,7 +59,8 @@ defmodule ChgAdapter.Runner do
   defp stop_recording(nil, _results), do: :ok
 
   defp stop_recording(r, results) do
-    %{cover: cover, global: global} = ChgAdapter.Cover.stop(r.cover)
+    %{cover: cover, global: global, reads: reads, global_reads: global_reads} =
+      ChgAdapter.Cover.stop(r.cover)
 
     ms =
       Enum.reduce(results, %{}, fn t, acc ->
@@ -71,6 +72,8 @@ defmodule ChgAdapter.Runner do
       digests: ChgAdapter.Digest.of_modules(r.modules),
       cover: cover,
       global: global,
+      reads: reads,
+      global_reads: global_reads,
       ms: ms
     })
 

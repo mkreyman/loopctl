@@ -34,8 +34,9 @@ Every changed path, against the base and including untracked files, lands in one
 - Outside: any other path, code included. It selects everything: repo scripts outside the
   packages are often run as a subprocess by their tests, which no import graph sees.
 
-`always_all` is applied by `chg` before the adapter runs. Any error (an unknown base, a runner
-that will not list, an unknown option) gives `{"mode":"all"}` with the reason, never an empty
+`always_all` is applied by `chg` before the adapter runs. A changed path `chg` names in
+`CHG_READ` (it matches `read_at_runtime`) selects everything: this adapter records no
+reads. Any error (an unknown base, a runner that will not list, an unknown option) gives `{"mode":"all"}` with the reason, never an empty
 subset. The other commands answer an error with their failure document: `static` a failure
 with check `adapter`, `run` and `shard` an `adapter` error result. A runner that exits
 non-zero while every test it reported passed (an unhandled error after a test) adds an error

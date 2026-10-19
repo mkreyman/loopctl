@@ -10,6 +10,9 @@ defmodule ChgAdapter.Record do
     * `cover`: per test file, the project modules it executed (`ChgAdapter.Cover`);
     * `global`: modules executed outside any test's or test file compile's window (at
       boot, between tests) or by a compiling process whose file is unknown;
+    * `reads`: per test file, the paths it read and `{:spawn, name}` for each
+      subprocess (`ChgAdapter.Cover`);
+    * `global_reads`: the same, outside any test's or test file compile's window;
     * `ms`: per test file, the summed time of its tests.
 
   `chg` decides where records live and which one to use. It names the file to write in
@@ -17,7 +20,7 @@ defmodule ChgAdapter.Record do
   `CHG_COVER` (on `affected`).
   """
 
-  @vsn 1
+  @vsn 2
 
   def vsn, do: @vsn
 

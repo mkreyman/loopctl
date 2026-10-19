@@ -94,6 +94,19 @@ test("a path the graph cannot see selects its package's and its dependents' test
   assert.deepEqual(adapter("affected", "--base", "HEAD").doc.tests, ["packages/util/src/strings.test.ts"]);
 });
 
+test("a path chg names as read at run time selects everything", () => {
+  snapshot();
+  process.env.CHG_READ = "docs/a.md\ndocs/b.md";
+  try {
+    const { doc } = adapter("affected", "--base", "HEAD");
+    assert.equal(doc.mode, "all");
+    assert.match(doc.reason, /docs\/a\.md is read at run time/);
+  } finally {
+    delete process.env.CHG_READ;
+  }
+  assert.deepEqual(adapter("affected", "--base", "HEAD").doc.tests, []);
+});
+
 test("an unpackaged path, code included, selects everything unless ignored", () => {
   snapshot();
   write("notes.txt", "x\n");

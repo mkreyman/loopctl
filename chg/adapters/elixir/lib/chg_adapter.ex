@@ -124,6 +124,22 @@ defmodule ChgAdapter do
     end
   end
 
+  @doc """
+  The changed paths `chg` found matching the manifest's `read_at_runtime`, one per line in
+  `CHG_READ`: since the base, and since the coverage record when it hands one over.
+  """
+  def read_paths do
+    (System.get_env("CHG_READ") || "") |> String.split("\n", trim: true)
+  end
+
+  @doc """
+  The executables whose subprocesses read no `read_at_runtime` path (the manifest's
+  `not_read_by`), one per line in `CHG_NOT_READ_BY`.
+  """
+  def not_read_by do
+    (System.get_env("CHG_NOT_READ_BY") || "") |> String.split("\n", trim: true)
+  end
+
   def resolve(rev) do
     case System.cmd("git", ["rev-parse", "--verify", "--quiet", rev <> "^{commit}"],
            stderr_to_stdout: true

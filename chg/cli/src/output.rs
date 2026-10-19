@@ -13,7 +13,13 @@ use crate::contract::{CommandName, is_repo_relative};
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Affected {
     /// Run only these test files (repo-relative). An empty list means nothing to run.
-    Subset { reason: String, tests: Vec<String> },
+    /// `read` says the selection accounts for the paths `chg` named in `CHG_READ`.
+    Subset {
+        reason: String,
+        tests: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read: bool,
+    },
     /// Run the whole suite.
     All { reason: String },
 }
@@ -159,6 +165,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_subset_may_say_it_accounted_for_chg_read() {
+        let d = check(
+            CommandName::Affected,
+            r#"{"mode":"subset","reason":"x","tests":[],"read":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            d,
+            Document::Affected(Affected::Subset { read: true, .. })
+        ));
+        assert_eq!(
+            d.to_json(),
+            r#"{"mode":"subset","reason":"x","tests":[],"read":true}"#
+        );
+    }
+
+    #[test]
     fn affected_subset_and_all() {
         let d = check(
             CommandName::Affected,
@@ -168,6 +191,7 @@ mod tests {
         assert_eq!(
             d,
             Document::Affected(Affected::Subset {
+                read: false,
                 reason: "stale".into(),
                 tests: vec!["test/a_test.exs".into()]
             })

@@ -37,6 +37,7 @@ defmodule ChgAdapter.IntegrationTest do
       ".tool-versions",
       ".chg",
       "config",
+      "docs",
       "lib",
       "priv",
       "test"
@@ -245,7 +246,7 @@ defmodule ChgAdapter.IntegrationTest do
       end
 
     assert Enum.sort(ids) == Enum.uniq(Enum.sort(ids))
-    assert length(ids) == 5
+    assert length(ids) == 10
   end
 
   test "static passes a clean change and reports format and compile failures", ctx do
@@ -293,6 +294,24 @@ defmodule ChgAdapter.IntegrationTest do
     refute Sample.Constants in rec.global
     refute Sample.Case in rec.global
     refute Sample.Constants in rec.cover["test/sample/accounts_test.exs"]
+    # Reads: a file at run time, a directory listed while compiling (that file's alone),
+    # and a subprocess. None of them happened outside every window.
+    files = rec.reads["test/sample/files_test.exs"]
+    assert "docs/reports.md" in files
+    assert "docs/stories/" in files
+    assert {:spawn, "true"} in files
+
+    for {f, reads} <- rec.reads,
+        f != "test/sample/files_test.exs",
+        do:
+          refute("docs/stories/" in reads, "#{f} credited with another file's compile-time read")
+
+    refute Enum.any?(rec.global_reads, &match?({:spawn, _}, &1))
+    refute Enum.any?(rec.global_reads, &(&1 == "./" or String.starts_with?(&1, "docs")))
+
+    refute Enum.any?(Map.values(rec.reads), fn r ->
+             Enum.any?(r, &(is_binary(&1) and String.starts_with?(&1, ["_build", "deps", "/"])))
+           end)
 
     env = [{"CHG_COVER", record}]
     edit!(ctx, "lib/sample/reports.ex", &("# a comment shifts every line\n" <> &1))
@@ -308,6 +327,22 @@ defmodule ChgAdapter.IntegrationTest do
 
     assert "test/sample/accounts_test.exs" in tests
     assert "test/sample/billing_test.exs" in tests
+
+    # A new file under a listed directory selects its listers by the record, and the whole
+    # suite without one. (The edit to accounts.ex stays, for the dirty record below.)
+    File.write!(Path.join(ctx.dir, "docs/stories/b.json"), "{}\n")
+    read = [{"CHG_READ", "docs/stories/b.json"}]
+
+    assert {%{"mode" => "subset", "tests" => tests}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"], env ++ read)
+
+    assert "test/sample/files_test.exs" in tests
+
+    assert {%{"mode" => "all", "reason" => reason}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"], read)
+
+    assert reason =~ "docs/stories/b.json is read at run time"
+    File.rm!(Path.join(ctx.dir, "docs/stories/b.json"))
 
     # A record made at another commit is not written: the tree must be exactly HEAD.
     dirty = Path.join(history, "dirty.cover")

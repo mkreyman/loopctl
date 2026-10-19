@@ -165,7 +165,7 @@ A revision's required checks are:
 
 They run where the change was made: `chg check` in the agent's workspace (phase 1, from `pre-push`), or on the runner pool (phase 3). Either way the result is a **verdict** keyed by `(check_id, input_fingerprint)`. The fingerprint is BLAKE3 over the revision tree's declared input globs, the lockfiles, the toolchain versions (`.tool-versions`, `packageManager`) and the adapter version. A verdict anyone has recorded for that fingerprint is never recomputed: local and CI are the same job, so nothing runs twice.
 
-Affected selection is the adapter's job (3.13). It always has a fail-closed escape, which `chg` applies before calling the adapter: any changed path matching the manifest's `always_all` list (mix.exs, mix.lock, config/**, migrations, test helpers, pnpm-lock.yaml, tsconfig*, vitest/playwright configs, CI definitions) selects the whole suite.
+Affected selection is the adapter's job (3.13). It always has a fail-closed escape, which `chg` applies before calling the adapter: any changed path matching the manifest's `always_all` list (mix.exs, mix.lock, config/**, migrations, test helpers, pnpm-lock.yaml, tsconfig*, vitest/playwright configs, CI definitions) selects the whole suite. A file that only tests read at run time (story data, workflow definitions a guard test parses) goes in `read_at_runtime` instead: an adapter whose coverage record also records each test file's reads selects just its readers, and the whole suite when it has no such record (adapter-contract.md, `CHG_READ`).
 
 ### 3.8 Post-merge verification, deploy gating, bisect, revert, flakes
 
