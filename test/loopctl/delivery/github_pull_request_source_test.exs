@@ -1118,6 +1118,160 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
+  describe "create_issue/3 (US-47.4)" do
+    test "POSTs title and body to the issues collection and returns the new number" do
+      parent = self()
+
+      stub(fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:request, conn.method, conn.request_path, Jason.decode!(body)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(201, Jason.encode!(%{"number" => 88, "title" => "ignored"}))
+      end)
+
+      assert {:ok, 88} = Source.create_issue(@repo, "chg reverted", "the body")
+
+      assert_received {:request, "POST", "/repos/acme/widgets/issues",
+                       %{"title" => "chg reverted", "body" => "the body"}}
+    end
+
+    test "a created issue with no readable number is an error, never a guess" do
+      stub(fn conn -> Plug.Conn.resp(conn, 201, ~s({"id": 1})) end)
+      assert {:error, {:unreadable_issue, _}} = Source.create_issue(@repo, "t", "b")
+    end
+
+    test "a title or body GitHub would refuse is refused before the network" do
+      assert {:error, {:invalid_issue_title, _}} = Source.create_issue(@repo, "a\nb", "b")
+      assert {:error, {:invalid_issue_title, _}} = Source.create_issue(@repo, "  ", "b")
+
+      assert {:error, {:invalid_issue_title, _}} =
+               Source.create_issue(@repo, String.duplicate("t", 257), "b")
+
+      assert {:error, {:invalid_issue_body, _}} = Source.create_issue(@repo, "t", "")
+
+      assert {:error, {:invalid_issue_body, _}} =
+               Source.create_issue(@repo, "t", String.duplicate("x", 65_537))
+    end
+
+    test "a rate-limited create is transient" do
+      stub(fn conn ->
+        conn |> Plug.Conn.put_resp_header("retry-after", "30") |> Plug.Conn.resp(403, "{}")
+      end)
+
+      assert {:error, {:github_rate_limited, 403, 30} = reason} =
+               Source.create_issue(@repo, "t", "b")
+
+      assert MergePrecondition.transient?(reason)
+    end
+  end
+
+  describe "find_issue/2 (US-47.4)" do
+    @since ~U[2026-10-19 12:00:00.000000Z]
+    @search %{marker: "<!-- m -->", title_token: "[loopctl t]", since: @since}
+
+    # GitHub as the search sees it: `/user` names the credential, and the issues it opened are
+    # served `per_page` at a time from `pages` (a list of lists, page 1 first).
+    defp forge(pages, parent \\ nil) do
+      stub(fn
+        %{request_path: "/user"} = conn ->
+          json(conn, %{"login" => "loopctl-bot"})
+
+        %{request_path: "/repos/acme/widgets/issues"} = conn ->
+          query = URI.decode_query(conn.query_string)
+          if parent, do: send(parent, {:page, query})
+          json(conn, Enum.at(pages, String.to_integer(query["page"]) - 1, []))
+      end)
+    end
+
+    defp filler(from, count),
+      do: for(n <- from..(from + count - 1), do: %{"number" => n, "title" => "t", "body" => "x"})
+
+    test "reads the credential's own issues since the row, and finds the marker on page 2" do
+      parent = self()
+
+      forge(
+        [
+          filler(1, 100),
+          [
+            %{"number" => 150, "body" => "x <!-- m --> y", "pull_request" => %{}},
+            %{"number" => 151, "body" => "intro <!-- m -->"}
+          ]
+        ],
+        parent
+      )
+
+      # A pull request carrying the marker is not the issue; the issue after it is.
+      assert {:ok, 151} = Source.find_issue(@repo, @search)
+
+      assert_received {:page, %{"page" => "1"} = first}
+      assert_received {:page, %{"page" => "2"}}
+
+      assert %{
+               "creator" => "loopctl-bot",
+               "state" => "all",
+               "sort" => "created",
+               "direction" => "asc",
+               "per_page" => "100"
+             } = first
+
+      # Since the row was written, less a margin for clock skew, never later.
+      {:ok, since, 0} = DateTime.from_iso8601(first["since"])
+      assert DateTime.compare(since, @since) == :lt
+    end
+
+    test "an issue whose body was edited still matches on its title token" do
+      forge([[%{"number" => 3, "title" => "chg reverted [loopctl t]", "body" => "edited"}]])
+      assert {:ok, 3} = Source.find_issue(@repo, @search)
+    end
+
+    test "every page read and none carrying the marker is nil" do
+      forge([filler(1, 100), filler(101, 7)])
+      assert {:ok, nil} = Source.find_issue(@repo, @search)
+    end
+
+    test "the page cap reached before the list ends cannot confirm absence" do
+      parent = self()
+      forge(for(p <- 0..9, do: filler(p * 100 + 1, 100)), parent)
+
+      assert {:error, {:issue_search_inconclusive, 5}} = Source.find_issue(@repo, @search)
+
+      for page <- 1..5 do
+        expected = Integer.to_string(page)
+        assert_received {:page, %{"page" => ^expected}}
+      end
+
+      refute_received {:page, %{"page" => "6"}}
+    end
+
+    test "a list it cannot read, a login it cannot read, or a failed read, is an error — never nil" do
+      stub(fn conn ->
+        if conn.request_path == "/user",
+          do: json(conn, %{"login" => "loopctl-bot"}),
+          else: json(conn, %{"message" => "?"})
+      end)
+
+      assert {:error, {:unreadable_issues, _}} = Source.find_issue(@repo, @search)
+
+      stub(fn conn -> json(conn, %{"login" => "x&creator=other"}) end)
+      assert {:error, {:unreadable_login, _}} = Source.find_issue(@repo, @search)
+
+      stub(fn conn -> Plug.Conn.resp(conn, 502, "") end)
+      assert {:error, {:github_api_error, 502}} = Source.find_issue(@repo, @search)
+    end
+
+    test "an empty marker or token never reaches the network" do
+      assert {:error, {:invalid_issue_search, _}} =
+               Source.find_issue(@repo, %{@search | marker: ""})
+
+      assert {:error, {:invalid_issue_search, _}} =
+               Source.find_issue(@repo, %{@search | title_token: ""})
+
+      assert {:error, {:invalid_issue_search, _}} = Source.find_issue(@repo, "<!-- m -->")
+    end
+  end
+
   describe "the writes share the read path's failure classification" do
     test "a rate-limited close is transient and carries the delay" do
       stub(fn conn ->

@@ -310,6 +310,35 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-47.4: ChangeRevertIssueWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ChangeRevertIssueWorker} -> true
+          {_schedule, Loopctl.Workers.ChangeRevertIssueWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the ChangeRevertIssueWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a ChangeRevertIssueWorker crontab entry — without it a chg revert of a " <>
+               "done story records the issue it owes and nothing ever opens it (AC-47.4.5)"
+    end
+
+    test "it runs every two minutes, fleet-wide in one job", %{entry: entry} do
+      assert elem(entry, 0) == "*/2 * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "DispatchDriverWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

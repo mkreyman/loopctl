@@ -74,9 +74,8 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
     # preventing, arriving in the one situation where the forge is already struggling.
     unique: [period: 120, states: [:available, :scheduled, :executing, :retryable]]
 
-  require Logger
-
   alias Loopctl.Delivery.IssueCloser
+  alias Loopctl.ForgeOutbox
   alias Loopctl.Intake.IssueClosures
 
   @batch 20
@@ -98,36 +97,10 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
-    results = sweep(IssueClosures.due(@batch))
-
-    tally = Enum.frequencies_by(results, fn {_closure, outcome} -> outcome end)
-
-    if map_size(tally) > 0 do
-      Logger.info("IntakeIssueCloseWorker: #{inspect(tally)}")
-    end
-
-    run_result(results, Map.get(tally, :errored, 0))
+    IssueClosures.due(@batch)
+    |> sweep()
+    |> ForgeOutbox.drain_result("IntakeIssueCloseWorker")
   end
-
-  # A SYSTEMIC failure must not report as a successful job (#826 round 2, finding 2).
-  #
-  # The per-candidate rescue below is right for ONE bad row and wrong for a bad WORLD: on a
-  # connection-pool outage every candidate raises, the rescue swallows each, `perform/1`
-  # returned `:ok`, and Oban recorded a clean run. `max_attempts` never fired, no job went to
-  # `discarded`, and nothing anywhere alerted — the failure was visible only as twenty log
-  # lines nobody was watching.
-  #
-  # So: every candidate erroring is an ERROR for the job, which Oban retries and eventually
-  # discards where it can be seen. A run with some errors and some progress stays `:ok` —
-  # that is the one-bad-row case the rescue exists for, and the row's own attempt counter
-  # bounds it.
-  defp run_result([], _errored), do: :ok
-
-  defp run_result(results, errored) when errored == length(results) do
-    {:error, {:all_candidates_errored, errored}}
-  end
-
-  defp run_result(_results, _errored), do: :ok
 
   @doc false
   @spec batch_size() :: pos_integer()
@@ -142,88 +115,19 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
 
   @doc """
   One pass over `candidates`, stopping at `deadline` (a `System.monotonic_time(:millisecond)`
-  value) or at the first rate-limited result.
+  value) or at the first rate-limited result — `Loopctl.ForgeOutbox.drain/4`, which also
+  holds what one raising or exiting candidate costs and why.
 
   Public with the deadline as an argument ONLY so the budget's behaviour is falsifiable: it is
   a compile-time constant measured in tens of seconds, and a test that had to spend it in real
   time could not tell "checked before the candidate" from "checked after". Production calls
   `sweep/1`, which computes the deadline itself.
   """
-  @spec sweep([map()], integer()) :: [{map(), IssueCloser.outcome()}]
+  @spec sweep([map()], integer()) :: [{map(), IssueCloser.outcome() | :errored}]
   def sweep(candidates, deadline) do
-    candidates
-    |> Enum.reduce_while([], fn closure, acc ->
-      if System.monotonic_time(:millisecond) >= deadline do
-        {:halt, log_budget_spent(acc)}
-      else
-        after_candidate(closure, acc)
-      end
-    end)
-    |> Enum.reverse()
-  end
-
-  # `reduce_while` rather than `map`: a rate-limited forge is a reason to stop asking, not a
-  # reason to ask nineteen more times.
-  defp after_candidate(closure, acc) do
-    {outcome, retry_after} = attempt(closure)
-    acc = [{closure, outcome} | acc]
-
-    if is_integer(retry_after), do: {:halt, acc}, else: {:cont, acc}
-  end
-
-  # ONE CANDIDATE MAY NOT KILL THE RUN (#826 review, finding 5).
-  #
-  # An exception here propagates out of `perform/1`, so every remaining candidate in the batch
-  # is skipped and an Oban attempt is burned — and since `due/1` reads oldest-first, a row that
-  # raises reliably sits at the head of the next batch too. That is a fleet-wide stall caused
-  # by one issue, across every tenant.
-  #
-  # The specific way in was a length-CHECK violation inside the very write that records "never
-  # retry this", and that root cause is fixed at the bound in `Loopctl.Intake.IssueClosures`.
-  # This is the containment: whatever else can raise, it costs one candidate.
-  #
-  # It is SAFE to carry on because `claim_attempt/2` already committed before anything outward
-  # ran — the attempt is counted, and the row is scheduled forward — so a raising row waits its
-  # backoff like a transient failure and is still bounded by `max_attempts/0` rather than
-  # retrying for ever. Nothing is swallowed silently: it is logged at ERROR with the row's
-  # identity, and `perform/1` turns a whole batch of them into a failed job.
-  #
-  # EXITS are caught as well as raises (#826 round 2, finding 2). Rescue alone missed the very
-  # class this is written for: a `Finch` pool checkout timeout, a `GenServer.call` timeout and
-  # a `DBConnection` ownership failure all EXIT rather than raise, so each still killed the
-  # batch while the rescue looked like it covered them. `catch` takes both kinds.
-  defp attempt(closure) do
-    IssueCloser.close(closure)
-  rescue
-    error -> errored(closure, Exception.format(:error, error, __STACKTRACE__))
-  catch
-    # The `:exit` clause is for the MESSAGE only — `Exception.format_exit/1` renders a pool
-    # checkout timeout readably where the generic formatter does not. The catch-all below it
-    # already handles exits, so removing this clause changes no behaviour and a mutation run
-    # (2026-09-13) correctly left every test green; the falsifiable guard is the whole
-    # `catch`, whose removal does turn the suite red.
-    :exit, reason -> errored(closure, "exit: " <> Exception.format_exit(reason))
-    kind, value -> errored(closure, Exception.format(kind, value, __STACKTRACE__))
-  end
-
-  defp errored(closure, detail) do
-    Logger.error(
-      "IntakeIssueCloseWorker: candidate failed, continuing with the rest of the batch: " <>
-        "tenant_id=#{closure.tenant_id} story_id=#{closure.story_id} " <>
-        "closure_id=#{closure.id} detail=#{detail}",
-      tenant_id: closure.tenant_id,
-      story_id: closure.story_id
+    ForgeOutbox.drain(candidates, deadline, &IssueCloser.close/1,
+      label: "IntakeIssueCloseWorker",
+      id_name: "closure_id"
     )
-
-    {:errored, nil}
-  end
-
-  defp log_budget_spent(acc) do
-    Logger.info(
-      "IntakeIssueCloseWorker: wall-clock budget spent after #{length(acc)} " <>
-        "candidate(s); the rest are the next run's"
-    )
-
-    acc
   end
 end

@@ -192,7 +192,9 @@ new are control-only (never runner-reportable). `pr_open` is skipped: a chg chan
 | chg event | edge | notes |
 |---|---|---|
 | `submitted` (any revision, n ≥ 1) | `implementing → reviewing`, `:forward` (exists) | each revision after `review_findings` re-enters review this way |
-| `review_findings` | `reviewing → implementing`, `:review_findings` (exists) | |
+| `submitted`, story at `ci`, for a revision newer than any earlier `submitted` | `ci → reviewing`, **`:change_resubmitted`** (new) | a revision pushed after the story was ready re-enters review; not chained, clears the head-keyed fields the readiness set and nothing merge-keyed. One that is not newer moves nothing |
+| `review_findings` | `reviewing → implementing`, `:review_findings` (exists) | findings for a revision a later `submitted` superseded move nothing |
+| `review_findings`, story at `ci` | `ci → implementing`, **`:change_review_findings`** (new) | its own edge, because `:review_findings` is runner-reportable and `ci` is a runner source stage |
 | `review_approved` (`by: model` or `by: policy`) and `check_passed` on the same revision | `reviewing → ci`, **`:change_ready`** (new) | `ci` reads "ready to land". A policy auto-approval takes the same edge; §6 decides what it means for custody |
 | `landed` | `ci → merged`, `:forward` (exists), `merge_sha` = the landing commit | chained, like every entry into `merged` |
 | `verified` (the trunk verifier went green on a sha containing it) | none | recorded on the stage row as `trunk_verified_sha` |
@@ -206,7 +208,7 @@ example is a second `submitted` while review is still running on the first.
 
 **`:reverted` is a retraction of a merge, and it is chained like `:merge_refused`.** It goes in
 `@chained_edges`, and its `clears/3` clause clears `merge_sha` and the head- and release-keyed
-fields exactly as `merge_refused` does (`stage_machine.ex:810`). Otherwise the chain keeps saying
+fields exactly as `merge_refused` does (`stage_machine.ex:845`). Otherwise the chain keeps saying
 the story merged, and a re-land records a second merge over a stale `merge_sha`. The edge is new
 rather than a reuse of `:merge_refused` because the two claims differ: `merge_refused` says the
 merge never held, and a revert says it held and was undone.

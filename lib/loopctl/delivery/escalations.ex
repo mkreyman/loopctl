@@ -155,6 +155,88 @@ defmodule Loopctl.Delivery.Escalations do
     end
   end
 
+  @doc """
+  Escalates `story_id` on loopctl's OWN decision rather than on behalf of its claimant, over
+  the control edge named in `:edge` — one of `StageMachine.control_escalation_edges/0`
+  (US-47.4: `:change_outside_lifecycle` and `:reverted_after_verify`, both decided by a chg
+  change event). #984 deleted the single-edge version of this function along with the one
+  edge it hard-coded; it takes its edge now, so the next control escalation is a value rather
+  than a copy.
+
+  The same replay as `escalate/3`, without the claimant check — the principal deciding is not
+  the claimant — and with no `:stale_stage` to recover from: it locks the story and its row
+  first (`Stages.lock_for_control_in_tenant_transaction/2`) and decides on the locked row, in
+  the caller's transaction or in one of its own. Either way the transition goes through
+  `Stages.advance_in_tenant_transaction/4`, the only path that takes a change-protocol edge;
+  `Stages.advance/4` refuses them. The actor is recorded as control is
+  elsewhere: the caller's label, `actor_role: :agent` (which keeps every human-only edge out of
+  reach; there is no system role) and the lineage the caller attests, `[]` for a machine
+  caller holding no key.
+
+  ## Options
+
+  - `:edge` (required) — the control edge
+  - `:claim_epoch` (required) — the story's CURRENT epoch, which the fence still checks
+  - `:reason` (required), `:payload`, `:actor_label`, `:actor_lineage` (required) — as
+    `escalate/3`
+  - `:in_tenant_transaction` — `true` to run inside the CALLER'S `Loopctl.Repo.with_tenant/2`
+    transaction rather than its own (the change-events seam, whose escalation must commit with
+    the event that decided it); the return is then `{:ok, row, chain_entry}` for the caller to
+    announce after it commits. Otherwise it opens its own bounded transaction
+    (`Stages.in_control_transaction/2`), announces the entry itself and returns `{:ok, row}`.
+  """
+  @spec escalate_as_control(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, StoryStage.t()}
+          | {:ok, StoryStage.t(), Loopctl.AuditChain.Entry.t() | nil}
+          | {:error, error()}
+  def escalate_as_control(tenant_id, story_id, opts) do
+    edge = Keyword.fetch!(opts, :edge)
+
+    unless edge in StageMachine.control_escalation_edges(),
+      do: raise(ArgumentError, "escalate_as_control/3 takes a control edge, got #{inspect(edge)}")
+
+    if Keyword.get(opts, :in_tenant_transaction, false),
+      do: escalate_in_tenant_transaction(tenant_id, story_id, opts),
+      else: escalate_in_own_transaction(tenant_id, story_id, opts)
+  end
+
+  defp escalate_in_own_transaction(tenant_id, story_id, opts) do
+    Stages.in_control_transaction(tenant_id, fn ->
+      case escalate_in_tenant_transaction(tenant_id, story_id, opts) do
+        {:ok, row, entry} -> {row, entry}
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  # Inside the caller's transaction, on the row it holds locked: the replay is answered from
+  # that row, and the transition cannot be stale.
+  defp escalate_in_tenant_transaction(tenant_id, story_id, opts) do
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+
+    case Stages.lock_for_control_in_tenant_transaction(tenant_id, story_id) do
+      {:ok, %{row: nil}} ->
+        {:error, :unknown_story_stage}
+
+      {:ok, %{row: row}} ->
+        case unless_already_escalated(row, epoch) do
+          {:already, row} ->
+            {:ok, row, nil}
+
+          :continue ->
+            Stages.advance_in_tenant_transaction(
+              tenant_id,
+              story_id,
+              {row.stage, :escalated, Keyword.fetch!(opts, :edge)},
+              advance_opts(opts)
+            )
+        end
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
   defp escalate_row(tenant_id, story_id, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
@@ -221,8 +303,11 @@ defmodule Loopctl.Delivery.Escalations do
   # a runner keeps advancing would have recursed without bound.
   defp attempt(tenant_id, story_id, row, opts) do
     transition = {row.stage, :escalated, :session_escalated}
+    Stages.advance(tenant_id, story_id, transition, advance_opts(opts))
+  end
 
-    advance_opts = [
+  defp advance_opts(opts) do
+    [
       claim_epoch: Keyword.fetch!(opts, :claim_epoch),
       reason: Keyword.get(opts, :reason),
       event_data: Keyword.get(opts, :payload),
@@ -235,8 +320,6 @@ defmodule Loopctl.Delivery.Escalations do
       # and is still accepted; it just has to be stated.
       actor_lineage: Keyword.fetch!(opts, :actor_lineage)
     ]
-
-    Stages.advance(tenant_id, story_id, transition, advance_opts)
   end
 
   # A `:stale_stage` here is USUALLY not a caller error at all: the caller's own runner is
@@ -353,7 +436,7 @@ defmodule Loopctl.Delivery.Escalations do
     # route's `role: :user` plug, so a SESSION could POST `to: queued` on any escalated story:
     # the claim was released, the epoch bumped, the implementer's live credential and its
     # whole subtree revoked, the story re-contracted — and only THEN did `Stages.human?/1`
-    # (`lib/loopctl/delivery/stages.ex:1497-1500`, which requires `actor_lineage == []`)
+    # (`lib/loopctl/delivery/stages.ex:1695-1698`, which requires `actor_lineage == []`)
     # refuse it. The caller got a refusal; the implementing agent got a dead key.
     # `LoopctlWeb.StoryEscalationController` publishes that gate's purpose to callers in its
     # `escalate` operation description — "so a session cannot escalate and then resolve its

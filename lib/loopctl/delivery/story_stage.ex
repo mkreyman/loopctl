@@ -20,6 +20,9 @@ defmodule Loopctl.Delivery.StoryStage do
     verdict, because the forge was transiently unavailable or the deploy had not settled.
     MERGE-keyed rather than head-keyed, so it is cleared with `merge_sha`
     (`Loopctl.Delivery.StageMachine.merge_keyed/0`) and not with the head.
+  - `trunk_verified_sha` — the `verified/master` commit chg's trunk verifier passed on that
+    contains this story's merge (US-47.4, PRD §5: a `verified` change event). A record, not a
+    stage; merge-keyed, so it is cleared with `merge_sha`.
   - `attempts` — how many times each failure edge has been taken, keyed by edge name.
   - `escalation_reason` — why the story last escalated (required while `escalated`).
   - `lock_version` — incremented by every write, so an observer can tell two reads of the
@@ -60,6 +63,7 @@ defmodule Loopctl.Delivery.StoryStage do
     field :merge_gate_allowed_sha, :string
     field :merge_gate_unevaluated, :map
     field :post_deploy_unresolved, :map
+    field :trunk_verified_sha, :string
     field :attempts, :map, default: %{}
     field :escalation_reason, :string
     field :lock_version, :integer, default: 0

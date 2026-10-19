@@ -227,7 +227,8 @@ defmodule Loopctl.Changes.EventsTest do
       assert [_, %Event{effect: %{"effect" => "recorded"}}, _] =
                Events.list_events(ctx.tenant_id, "mkreyman/infra", "C1")
 
-      # US-47.3 moves no stage: the stage mapping is US-47.4's.
+      # The story has no stage row, so the mapping (US-47.4) has nothing to move here; it is
+      # exercised against stage rows in `Loopctl.Changes.StageMappingTest`.
       assert count(StoryStage, ctx.tenant_id) == 0
     end
 
