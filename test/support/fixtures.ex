@@ -2862,11 +2862,34 @@ defmodule Loopctl.Fixtures do
             target_epic_id: Map.get(attrs, :target_epic_id)
           },
           # By presence, as the context reads it: omitted keeps the `pr` default.
-          Map.take(attrs, [:mode, :required_checks])
+          Map.take(attrs, [:mode, :required_checks, :change_events_secret, :chg_root_dispatch_id])
         )
       )
 
     {secret, source}
+  end
+
+  # A `dispatches` row on AdminRepo shaped as chg-server's ROOT (US-47.2): parentless,
+  # orchestrator-role, unrevoked, `lineage_path == [id]`. Each override produces one of the
+  # shapes `chg_root_invalid` refuses: `:parent` (a dispatch, making this a CHILD), `:role`, and
+  # `revoked: true`. No key is minted; `Loopctl.Intake` reads only the row.
+  def fixture(:chg_root_dispatch, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    id = Ecto.UUID.generate()
+    parent = Map.get(attrs, :parent)
+    now = DateTime.utc_now()
+
+    AdminRepo.insert!(%Loopctl.Dispatches.Dispatch{
+      id: id,
+      tenant_id: tenant_id,
+      parent_dispatch_id: parent && parent.id,
+      role: Map.get(attrs, :role, :orchestrator),
+      lineage_path: if(parent, do: parent.lineage_path ++ [id], else: [id]),
+      expires_at: DateTime.add(now, 3_600),
+      revoked_at: if(Map.get(attrs, :revoked, false), do: now),
+      created_at: now
+    })
   end
 
   # An intake SOURCE + RECORD pair inserted DIRECTLY (#805), bypassing
@@ -3833,6 +3856,14 @@ defmodule Loopctl.Fixtures do
     # transaction above on purpose: these need the FK triggers the suppression turns off.
     AdminRepo.query!(
       "UPDATE stories SET implementer_dispatch_id = NULL, verifier_dispatch_id = NULL " <>
+        "WHERE tenant_id = ANY($1)",
+      [raw_ids]
+    )
+
+    # A `chg` intake source references its root dispatch (US-47.2) and is removed only by the
+    # tenant cascade below, which runs after the dispatches are gone.
+    AdminRepo.query!(
+      "UPDATE intake_sources SET mode = 'pr', chg_root_dispatch_id = NULL " <>
         "WHERE tenant_id = ANY($1)",
       [raw_ids]
     )

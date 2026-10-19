@@ -14,6 +14,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.ForgeRepo
+  alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.MockPullRequestSource
@@ -318,6 +319,43 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
 
       {key, _} = orchestrator_key(ctx)
       assert %{status: 422} = post_precondition(ctx, key)
+    end
+  end
+
+  describe "a story on a chg source (US-47.2)" do
+    test "TC-47.2.3: 409 change_protocol_enrolled naming chg submit, with no forge read", ctx do
+      root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+      [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+
+      {:ok, _} =
+        Loopctl.Intake.update_source(ctx.tenant_id, source.id, %{
+          mode: "chg",
+          change_events_secret: String.duplicate("c", 32),
+          chg_root_dispatch_id: root.id
+        })
+
+      test_pid = self()
+      Mox.stub(MockPullRequestSource, :pull_request, fn _r, _n -> send(test_pid, :forge_read) end)
+      Mox.stub(MockPullRequestSource, :repo_files, fn _r, _ref -> send(test_pid, :forge_read) end)
+
+      {key, _} = orchestrator_key(ctx)
+      body = ctx |> post_precondition(key) |> json_response(409)
+
+      assert body["error"]["code"] == "change_protocol_enrolled"
+      assert body["error"]["message"] =~ "chg submit"
+      assert body["error"]["message"] == MergePrecondition.change_protocol_message()
+      refute_received :forge_read
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+    end
+
+    test "the 409 is documented with the same message", ctx do
+      responses =
+        ctx.conn
+        |> get("/api/v1/openapi")
+        |> json_response(200)
+        |> get_in(["paths", "/api/v1/stories/{id}/merge-precondition", "post", "responses"])
+
+      assert responses["409"]["description"] =~ MergePrecondition.change_protocol_message()
     end
   end
 

@@ -72,7 +72,7 @@
  * (`lib/loopctl_web/plugs/cast_error_handler.ex:32-35`), and the body is
  * `LoopctlWeb.ErrorJSON`'s generic `{"error": {"status": 404, "message": "Not found"}}` — byte
  * for byte what `FallbackController` answers for a well-formed id naming no story
- * (`lib/loopctl_web/fallback_controller.ex:74-78`). Two opposite remedies, one answer.
+ * (`lib/loopctl_web/fallback_controller.ex:84-88`). Two opposite remedies, one answer.
  *
  * The check is `uuid()`, IMPORTED from `lib/delivery-loop.js` rather than reimplemented, so the
  * refusal a caller reads for a bad `story_id` does not depend on which tool they reached for.

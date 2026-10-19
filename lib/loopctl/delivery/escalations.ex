@@ -353,7 +353,7 @@ defmodule Loopctl.Delivery.Escalations do
     # route's `role: :user` plug, so a SESSION could POST `to: queued` on any escalated story:
     # the claim was released, the epoch bumped, the implementer's live credential and its
     # whole subtree revoked, the story re-contracted — and only THEN did `Stages.human?/1`
-    # (`lib/loopctl/delivery/stages.ex:1409-1412`, which requires `actor_lineage == []`)
+    # (`lib/loopctl/delivery/stages.ex:1497-1500`, which requires `actor_lineage == []`)
     # refuse it. The caller got a refusal; the implementing agent got a dead key.
     # `LoopctlWeb.StoryEscalationController` publishes that gate's purpose to callers in its
     # `escalate` operation description — "so a session cannot escalate and then resolve its

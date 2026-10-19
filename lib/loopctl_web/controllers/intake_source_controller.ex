@@ -10,7 +10,13 @@ defmodule LoopctlWeb.IntakeSourceController do
   Creating a source MINTS a credential — the webhook secret, which belongs to no dispatch
   lineage — so it carries the same lineage ceiling as `POST /api/v1/api_keys`: a caller whose
   own key a dispatch minted is refused with `403 api_key_mint_forbidden`
-  (`LoopctlWeb.Plugs.RequireUnlineagedCaller`).
+  (`LoopctlWeb.Plugs.RequireUnlineagedCaller`). An UPDATE that names `change_events_secret`
+  or `chg_root_dispatch_id`, or sets `mode` to `chg` (US-47.2), is held to the same ceiling,
+  refused `403 chg_registration_forbidden`: the secret is a credential chg-server's event
+  webhook authenticates with, it belongs to no lineage either, and the root is the custody
+  input that decides whose reviews a `chg` story accepts. A bare `mode: chg` is included
+  because it RE-ACTIVATES whichever secret and root the source kept from an earlier `chg`
+  stint — registering them again without naming them.
   """
 
   use LoopctlWeb, :controller
@@ -20,6 +26,7 @@ defmodule LoopctlWeb.IntakeSourceController do
   alias Loopctl.Dispatches
   alias Loopctl.Intake
   alias Loopctl.Intake.Source
+  alias LoopctlWeb.Plugs.RequireUnlineagedCaller
   alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
@@ -27,6 +34,19 @@ defmodule LoopctlWeb.IntakeSourceController do
   plug LoopctlWeb.Plugs.RequireRole, role: :user
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
   plug LoopctlWeb.Plugs.RequireUnlineagedCaller when action in [:create]
+
+  @chg_ceiling_code "chg_registration_forbidden"
+
+  @chg_ceiling_message "Your key was minted by a dispatch, so it sits inside a lineage. Making " <>
+                         "an intake source `chg` (`mode: chg`) or naming its " <>
+                         "`change_events_secret` or `chg_root_dispatch_id` registers a " <>
+                         "credential and a custody root that belong to no lineage, so only a " <>
+                         "principal outside every lineage may do it. Send this request with " <>
+                         "the tenant's operator key — a `user`-role key no dispatch minted. " <>
+                         "A key minted by a dispatch beneath yours is refused the same way."
+
+  @chg_ceiling_remedy "Retry with the tenant's operator key: a user-role key no dispatch " <>
+                        "minted (the MCP intake tools send LOOPCTL_USER_KEY)."
 
   tags(["Intake"])
 
@@ -53,6 +73,37 @@ defmodule LoopctlWeb.IntakeSourceController do
                          "that status is posted by whoever pushed, so it can never satisfy a " <>
                          "required check."
 
+  @mode_doc "How this repository's changes reach its base branch. `pr`: the merge gate reads " <>
+              "a pull request by number. `chg` (US-47.2): the change protocol lands them " <>
+              "(`chg submit`), and the merge precondition refuses every story on the source " <>
+              "with 409 `change_protocol_enrolled`. A `chg` source needs BOTH " <>
+              "`change_events_secret` and `chg_root_dispatch_id`, from the same request or " <>
+              "kept from an earlier `chg` stint; without them the write is a 422. Switching " <>
+              "back to `pr` KEEPS both and ignores them, and every write that leaves the " <>
+              "source `chg` re-checks the root. A switch to `chg` is 409 " <>
+              "`pr_route_in_flight` while a story of the project holds a merge allow it has " <>
+              "not merged on. NOT nullable: an explicit null or any other value is a 422."
+
+  @change_events_secret_doc "WRITE-ONLY. The HMAC key chg-server signs its event webhook " <>
+                              "with (`POST /api/v1/change_events/:source_id`); chg-server " <>
+                              "must hold the same value. It " <>
+                              Source.change_events_secret_rule() <>
+                              ". Encrypted at rest and NEVER returned by any response, so " <>
+                              "keep your own copy. Required when the source is `chg`; on a " <>
+                              "`pr` source an explicit null clears it. Not GitHub's " <>
+                              "`webhook_secret`, which is never reused."
+
+  @chg_root_doc "The dispatch chg-server's key was minted from (PRD §6): reviews of a `chg` " <>
+                  "story are accepted only from its children. " <>
+                  Source.chg_root_requirement() <>
+                  " Refused with 422 `chg_root_invalid` otherwise, judged whenever a " <>
+                  "request names it (on a `pr` source too) and on EVERY write that leaves " <>
+                  "the source `chg` — a secret rotation or a base-branch edit on a `chg` " <>
+                  "source whose root has since been revoked is the same 422 until a live root " <>
+                  "is named. " <>
+                  "Required when the source is `chg`; on a `pr` source an explicit null " <>
+                  "clears it."
+
   @source_schema %Schema{
     type: :object,
     required: [
@@ -62,6 +113,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       :base_branch,
       :mode,
       :required_checks,
+      :chg_root_dispatch_id,
       :target_epic_id,
       :revoked_at,
       :inserted_at
@@ -96,12 +148,14 @@ defmodule LoopctlWeb.IntakeSourceController do
         items: %Schema{type: :string},
         description: @required_checks_doc
       },
-      mode: %Schema{
+      mode: %Schema{type: :string, enum: ["pr", "chg"], description: @mode_doc},
+      chg_root_dispatch_id: %Schema{
         type: :string,
-        enum: ["pr"],
+        format: :uuid,
+        nullable: true,
         description:
-          "How this repository's changes reach its base branch. `pr`, the only mode: the " <>
-            "merge gate reads a pull request by number."
+          "The registered chg-server root dispatch; null unless one was named. " <>
+            "`change_events_secret` is never in a response."
       },
       revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
       inserted_at: %Schema{type: :string, format: :"date-time"},
@@ -122,7 +176,10 @@ defmodule LoopctlWeb.IntakeSourceController do
         "`owner/name`, an active source already binds it, or the project is missing, not a " <>
         "work project, or archived, or `target_epic_id` names an epic that is not in that " <>
         "project. The secret is encrypted at rest. `base_branch` defaults to `master` when " <>
-        "the body does not name it, and `mode` to `pr`.",
+        "the body does not name it, and `mode` to `pr`. Enrolling in mode `chg` (US-47.2) " <>
+        "also needs `change_events_secret` and `chg_root_dispatch_id` (422 naming the " <>
+        "missing field otherwise), and a root that is not a parentless, unrevoked, " <>
+        "orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`.",
     request_body:
       {"Intake source", "application/json",
        %Schema{
@@ -147,10 +204,18 @@ defmodule LoopctlWeb.IntakeSourceController do
            },
            mode: %Schema{
              type: :string,
-             enum: ["pr"],
-             description:
-               "Optional, `pr` when omitted. `pr` is the only mode. NOT nullable: an explicit null or any other " <>
-                 "value is a 422."
+             enum: ["pr", "chg"],
+             description: "Optional, `pr` when omitted. " <> @mode_doc
+           },
+           change_events_secret: %Schema{
+             type: :string,
+             writeOnly: true,
+             description: "Optional; required with `mode: chg`. " <> @change_events_secret_doc
+           },
+           chg_root_dispatch_id: %Schema{
+             type: :string,
+             format: :uuid,
+             description: "Optional; required with `mode: chg`. " <> @chg_root_doc
            },
            target_epic_id: %Schema{
              type: :string,
@@ -189,11 +254,18 @@ defmodule LoopctlWeb.IntakeSourceController do
            required: [:source, :webhook_secret, :webhook_path],
            properties: %{
              source: @source_schema,
-             webhook_secret: %Schema{type: :string, description: "The HMAC secret. Shown once."},
+             webhook_secret: %Schema{
+               type: :string,
+               description:
+                 "GitHub's HMAC secret. Shown once. (`change_events_secret` is never shown.)"
+             },
              webhook_path: %Schema{type: :string, description: "/api/v1/intake/github/<id>"}
            }
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`pr_route_in_flight`, with `story_ids`, for a `chg` enrolment: " <>
+           Intake.pr_route_in_flight_message(), "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -248,7 +320,18 @@ defmodule LoopctlWeb.IntakeSourceController do
         "the moment it does they promote on the next run with nothing lost. Revoked sources " <>
         "are 404 — revoking CLEARS the target so the epic can be deleted, and repointing one " <>
         "would restore that block on a source that will never report again. Requires user " <>
-        "role and a human-anchored tenant. 422 when the epic is not in the project.",
+        "role and a human-anchored tenant. 422 when the epic is not in the project. " <>
+        "`mode`, `change_events_secret` and `chg_root_dispatch_id` (US-47.2): switching to " <>
+        "`chg` needs both credentials on the resulting source (422 naming the missing one), " <>
+        "and the root is re-checked on every write that leaves the source `chg` (422 " <>
+        "`chg_root_invalid`); switching to `pr` keeps them. " <>
+        "A body naming `change_events_secret` or `chg_root_dispatch_id`, or setting `mode` " <>
+        "to `chg`, from a key a dispatch minted is 403 `#{@chg_ceiling_code}`: " <>
+        @chg_ceiling_message <>
+        " " <>
+        "A switch to `chg` is 409 `pr_route_in_flight` (naming `story_ids`) while a story of " <>
+        "the source's project holds a merge allow it has not merged on: " <>
+        Intake.pr_route_in_flight_message(),
     parameters: [id: [in: :path, type: :string, description: "Intake source UUID"]],
     request_body:
       {"Repoint", "application/json",
@@ -267,10 +350,20 @@ defmodule LoopctlWeb.IntakeSourceController do
            },
            mode: %Schema{
              type: :string,
-             enum: ["pr"],
-             description:
-               "Optional; omitted leaves it as it is. `pr` is the only mode. NOT nullable: an explicit null or any other " <>
-                 "value is a 422."
+             enum: ["pr", "chg"],
+             description: "Optional; omitted leaves it as it is. " <> @mode_doc
+           },
+           change_events_secret: %Schema{
+             type: :string,
+             nullable: true,
+             writeOnly: true,
+             description: "Optional; omitted leaves it as it is. " <> @change_events_secret_doc
+           },
+           chg_root_dispatch_id: %Schema{
+             type: :string,
+             format: :uuid,
+             nullable: true,
+             description: "Optional; omitted leaves it as it is. " <> @chg_root_doc
            },
            target_epic_id: %Schema{
              type: :string,
@@ -295,10 +388,11 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "(there is no unanswered state for a branch a dispatch must name), and an " <>
                  "explicit null is a 422. It must be a valid GIT BRANCH NAME, judged by the " <>
                  "same predicate as at enrolment and on `place_dispatch`: this value is " <>
-                 "handed to git on the runner. Like `mode`, it is BOUND to each implement " <>
-                 "dispatch when it is placed: a story already placed is merge-gated against " <>
-                 "the base branch its dispatch was sent with, and a change reaches only " <>
-                 "stories placed afterwards."
+                 "handed to git on the runner. It is BOUND to each implement dispatch when " <>
+                 "it is placed: a story already placed is merge-gated against the base " <>
+                 "branch its dispatch was sent with, and a change reaches only stories " <>
+                 "placed afterwards. (`mode` is not bound that way: the merge gate reads the " <>
+                 "source's CURRENT mode, so a switch reaches every story at once.)"
            }
          }
        }},
@@ -306,12 +400,22 @@ defmodule LoopctlWeb.IntakeSourceController do
       200 =>
         {"Intake source updated", "application/json",
          %Schema{type: :object, properties: %{source: @source_schema}}},
-      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Forbidden: insufficient role, `custody_tier_required`, or " <>
+           "`#{@chg_ceiling_code}` — " <> @chg_ceiling_message, "application/json",
+         Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`pr_route_in_flight`, with `story_ids`: " <> Intake.pr_route_in_flight_message(),
+         "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
+
+  @doc "The 403 message a dispatch-minted key gets for a PATCH that registers `chg` credentials."
+  @spec chg_ceiling_message() :: String.t()
+  def chg_ceiling_message, do: @chg_ceiling_message
 
   @doc "POST /api/v1/intake/sources"
   def create(conn, params) do
@@ -337,6 +441,8 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_if_present(params, "base_branch", :base_branch)
       |> put_if_present(params, "mode", :mode)
       |> put_if_present(params, "required_checks", :required_checks)
+      |> put_if_present(params, "change_events_secret", :change_events_secret)
+      |> put_if_present(params, "chg_root_dispatch_id", :chg_root_dispatch_id)
 
     with {:ok, %{source: source, webhook_secret: secret}} <-
            Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do
@@ -352,6 +458,35 @@ defmodule LoopctlWeb.IntakeSourceController do
 
   @doc "PATCH /api/v1/intake/sources/:id"
   def update(conn, %{"id" => source_id} = params) do
+    case guard_chg_credentials(conn, params) do
+      %Plug.Conn{halted: true} = refused -> refused
+      conn -> do_update(conn, source_id, params)
+    end
+  end
+
+  # The lineage ceiling `create` carries as a plug, applied here when the body names one of the
+  # two `chg` credentials OR sets `mode` to `chg`. The mode is included because a switch back to
+  # `chg` re-activates the secret and root the source KEPT from an earlier stint, which registers
+  # them exactly as naming them would — so a dispatch-minted key could otherwise restore a root
+  # it was never allowed to name. A base-branch repoint or a switch to `pr` registers nothing and
+  # stays allowed.
+  #
+  # Its own code and remedy, not the plug's API-key refusal: "mint a dispatch beneath your own"
+  # hands back another lineaged key, which this refuses again.
+  defp guard_chg_credentials(conn, params) do
+    if Map.has_key?(params, "change_events_secret") or
+         Map.has_key?(params, "chg_root_dispatch_id") or params["mode"] == "chg",
+       do:
+         RequireUnlineagedCaller.call(
+           conn,
+           code: @chg_ceiling_code,
+           message: @chg_ceiling_message,
+           remedy: @chg_ceiling_remedy
+         ),
+       else: conn
+  end
+
+  defp do_update(conn, source_id, params) do
     tenant = conn.assigns.current_tenant
 
     # PRESENCE, for both fields. A PATCH is partial by definition, and this action now carries
@@ -370,6 +505,8 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_if_present(params, "base_branch", :base_branch)
       |> put_if_present(params, "mode", :mode)
       |> put_if_present(params, "required_checks", :required_checks)
+      |> put_if_present(params, "change_events_secret", :change_events_secret)
+      |> put_if_present(params, "chg_root_dispatch_id", :chg_root_dispatch_id)
 
     case Intake.update_source(tenant.id, source_id, attrs, actor_lineage: actor_lineage(conn)) do
       {:ok, source} ->
@@ -386,8 +523,9 @@ defmodule LoopctlWeb.IntakeSourceController do
             status: 422,
             code: "nothing_to_update",
             message:
-              "Name at least one of target_epic_id (null clears it), base_branch or mode. A " <>
-                "field you do not send is left exactly as it was."
+              "Name at least one of target_epic_id (null clears it), base_branch, mode, " <>
+                "required_checks, change_events_secret or chg_root_dispatch_id. A field you " <>
+                "do not send is left exactly as it was."
           }
         })
 

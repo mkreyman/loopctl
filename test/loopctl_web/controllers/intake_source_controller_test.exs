@@ -8,6 +8,7 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
   alias Loopctl.Intake
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
+  alias LoopctlWeb.IntakeSourceController
 
   setup :verify_on_exit!
 
@@ -529,6 +530,325 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       |> json_response(404)
 
       assert AdminRepo.get!(Source, foreign.id).updated_at == foreign.updated_at
+    end
+  end
+
+  describe "mode chg (US-47.2)" do
+    @chg_secret String.duplicate("k", 48)
+
+    # chg-server's root, minted the way PRD §6 says an operator mints it: a parentless
+    # orchestrator-role dispatch from the operator key.
+    defp mint_root(conn, ctx, params \\ %{}) do
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      conn
+      |> auth(ctx.operator_key)
+      |> post(
+        ~p"/api/v1/dispatches",
+        Map.merge(%{"role" => "orchestrator", "agent_id" => agent.id}, params)
+      )
+      |> json_response(201)
+      |> get_in(["data", "dispatch", "id"])
+    end
+
+    defp chg_params(ctx, root_id, repo \\ "mkreyman/infra") do
+      ctx
+      |> create_params(repo)
+      |> Map.merge(%{
+        "mode" => "chg",
+        "change_events_secret" => @chg_secret,
+        "chg_root_dispatch_id" => root_id
+      })
+    end
+
+    test "enrols with an operator-minted root, and the secret never comes back", %{conn: conn} do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      authed = auth(conn, ctx.operator_key)
+
+      raw = authed |> post(~p"/api/v1/intake/sources", chg_params(ctx, root_id)) |> response(201)
+      refute raw =~ @chg_secret
+      refute raw =~ "change_events_secret"
+
+      body = Jason.decode!(raw)
+      assert body["source"]["mode"] == "chg"
+      assert body["source"]["chg_root_dispatch_id"] == root_id
+      id = body["source"]["id"]
+
+      # Every other response a source appears in.
+      for raw <- [
+            authed |> get(~p"/api/v1/intake/sources") |> response(200),
+            authed
+            |> patch(~p"/api/v1/intake/sources/#{id}", %{"base_branch" => "main"})
+            |> response(200),
+            authed |> delete(~p"/api/v1/intake/sources/#{id}") |> response(200)
+          ] do
+        refute raw =~ @chg_secret
+        refute raw =~ "change_events_secret"
+      end
+
+      assert AdminRepo.get!(Source, id).change_events_secret == @chg_secret
+    end
+
+    test "422 naming the missing field when chg lacks the secret or the root", %{conn: conn} do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      authed = auth(conn, ctx.operator_key)
+
+      body =
+        authed
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.delete(chg_params(ctx, root_id), "change_events_secret")
+        )
+        |> json_response(422)
+
+      assert Map.has_key?(body["error"]["details"], "change_events_secret")
+
+      body =
+        authed
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.delete(chg_params(ctx, root_id), "chg_root_dispatch_id")
+        )
+        |> json_response(422)
+
+      assert Map.has_key?(body["error"]["details"], "chg_root_dispatch_id")
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
+    test "TC-47.2.2: a child dispatch, and another tenant's root, are the same 422", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      child_id = mint_root(build_conn(), ctx, %{"parent_dispatch_id" => root_id})
+      other = operator_ctx()
+      foreign_id = mint_root(build_conn(), other)
+      authed = auth(conn, ctx.operator_key)
+
+      bodies =
+        for id <- [child_id, foreign_id, Ecto.UUID.generate()] do
+          authed
+          |> post(~p"/api/v1/intake/sources", chg_params(ctx, id))
+          |> json_response(422)
+        end
+
+      assert [%{"error" => %{"code" => "chg_root_invalid"} = first} | _] = bodies
+      assert first["message"] == Source.chg_root_requirement()
+      # Indistinguishable: an unknown id and another tenant's id answer byte for byte alike.
+      assert Enum.uniq(bodies) == [hd(bodies)]
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
+    test "TC-47.2.1: switching a pr source to chg without a secret is 422", %{conn: conn} do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "mode" => "chg",
+          "chg_root_dispatch_id" => root_id
+        })
+        |> json_response(422)
+
+      assert Map.has_key?(body["error"]["details"], "change_events_secret")
+      assert AdminRepo.get!(Source, source.id).mode == :pr
+
+      switched =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "mode" => "chg",
+          "chg_root_dispatch_id" => root_id,
+          "change_events_secret" => @chg_secret
+        })
+        |> json_response(200)
+
+      assert switched["source"]["mode"] == "chg"
+    end
+
+    test "a dispatch-minted key may not write the chg credentials, and may still rebase", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      %{"api_key" => %{"raw_key" => dispatched_key}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/dispatches", %{"role" => "user", "agent_id" => agent.id})
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      for body <- [
+            %{"change_events_secret" => @chg_secret},
+            %{"chg_root_dispatch_id" => root_id},
+            %{
+              "mode" => "chg",
+              "change_events_secret" => @chg_secret,
+              "chg_root_dispatch_id" => root_id
+            }
+          ] do
+        refused =
+          conn
+          |> auth(dispatched_key)
+          |> patch(~p"/api/v1/intake/sources/#{source.id}", body)
+          |> json_response(403)
+
+        assert refused["error"]["code"] == "chg_registration_forbidden"
+        assert refused["error"]["message"] == IntakeSourceController.chg_ceiling_message()
+        # The remedy is the operator key, never "mint a dispatch beneath yours": a key minted
+        # that way is lineaged too, and this refuses it again.
+        assert refused["error"]["remediation"]["remedy"] =~ "operator key"
+        refute refused["error"]["message"] =~ "Mint a dispatch"
+        assert is_binary(refused["error"]["remediation"]["your_dispatch_id"])
+      end
+
+      stored = AdminRepo.get!(Source, source.id)
+      assert stored.mode == :pr
+      assert stored.change_events_secret == nil
+
+      assert build_conn()
+             |> auth(dispatched_key)
+             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"base_branch" => "main"})
+             |> json_response(200)
+    end
+
+    test "a dispatch-minted key may not re-activate a kept root with a bare mode: chg", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      %{"api_key" => %{"raw_key" => dispatched_key}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/dispatches", %{"role" => "user", "agent_id" => agent.id})
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      %{"source" => %{"id" => source_id}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", chg_params(ctx, root_id))
+        |> json_response(201)
+
+      # Back to pr: the secret and the root are KEPT on the row.
+      assert build_conn()
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source_id}", %{"mode" => "pr"})
+             |> json_response(200)
+
+      refused =
+        conn
+        |> auth(dispatched_key)
+        |> patch(~p"/api/v1/intake/sources/#{source_id}", %{"mode" => "chg"})
+        |> json_response(403)
+
+      assert refused["error"]["code"] == "chg_registration_forbidden"
+      assert AdminRepo.get!(Source, source_id).mode == :pr
+
+      # The operator key may.
+      assert %{"source" => %{"mode" => "chg"}} =
+               build_conn()
+               |> auth(ctx.operator_key)
+               |> patch(~p"/api/v1/intake/sources/#{source_id}", %{"mode" => "chg"})
+               |> json_response(200)
+    end
+
+    test "a revoked root refuses a secret rotation on a chg source with chg_root_invalid", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+
+      %{"source" => %{"id" => source_id}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", chg_params(ctx, root_id))
+        |> json_response(201)
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^root_id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      refused =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source_id}", %{
+          "change_events_secret" => String.duplicate("r", 40)
+        })
+        |> json_response(422)
+
+      assert refused["error"]["code"] == "chg_root_invalid"
+      assert AdminRepo.get!(Source, source_id).change_events_secret == @chg_secret
+    end
+
+    test "the PATCH spec documents the 403 and 409 with the messages they render", %{
+      conn: conn
+    } do
+      responses =
+        conn
+        |> get("/api/v1/openapi")
+        |> json_response(200)
+        |> get_in(["paths", "/api/v1/intake/sources/{id}", "patch", "responses"])
+
+      assert responses["403"]["description"] =~ "chg_registration_forbidden"
+      assert responses["403"]["description"] =~ IntakeSourceController.chg_ceiling_message()
+      assert responses["409"]["description"] =~ "pr_route_in_flight"
+      assert responses["409"]["description"] =~ Intake.pr_route_in_flight_message()
+    end
+
+    test "the request specs document the chg fields and the secret is write-only", %{
+      conn: conn
+    } do
+      spec = conn |> get("/api/v1/openapi") |> json_response(200)
+
+      props =
+        get_in(spec, [
+          "paths",
+          "/api/v1/intake/sources",
+          "post",
+          "requestBody",
+          "content",
+          "application/json",
+          "schema",
+          "properties"
+        ])
+
+      assert props["mode"]["enum"] == ["pr", "chg"]
+      assert props["change_events_secret"]["writeOnly"] == true
+      assert props["change_events_secret"]["description"] =~ Source.change_events_secret_rule()
+      assert props["chg_root_dispatch_id"]["description"] =~ Source.chg_root_requirement()
+
+      patch_props =
+        get_in(spec, [
+          "paths",
+          "/api/v1/intake/sources/{id}",
+          "patch",
+          "requestBody",
+          "content",
+          "application/json",
+          "schema",
+          "properties"
+        ])
+
+      assert patch_props["mode"]["enum"] == ["pr", "chg"]
+      assert patch_props["change_events_secret"]["writeOnly"] == true
+      assert patch_props["chg_root_dispatch_id"]["description"] =~ "chg_root_invalid"
     end
   end
 

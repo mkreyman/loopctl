@@ -29,6 +29,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  SOURCE_MODES,
   SOURCES_PATH,
   enrollIntakeSource,
   listIntakeSources,
@@ -163,6 +164,7 @@ describe("intake_source_enroll", () => {
     // in the result at all, whatever it is called.
     assert.deepEqual(Object.keys(result.source).sort(), [
       "base_branch",
+      "chg_root_dispatch_id",
       "id",
       "inserted_at",
       "mode",
@@ -412,7 +414,7 @@ describe("intake_source_enroll", () => {
       );
 
       assert.equal(result.error, true);
-      assert.match(result.body, /`mode` must be `pr`/);
+      assert.match(result.body, /`mode` must be `pr` or `chg`/);
       assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
     }
   });
@@ -660,6 +662,259 @@ describe("intake_source_enroll", () => {
   });
 });
 
+// US-47.2 / AC-47.7.2: mode `chg` and its two credentials. The change-events secret is
+// WRITE-ONLY, so the property these tests guard is the same as the webhook secret's: it
+// appears in no tool result, however the server's row is widened.
+const CHG_SECRET = "NOT-A-SECRET-fake-change-events-hmac-for-tests-only-0000000000";
+const ROOT_ID = "5b0c2d7e-1f3a-4c6b-8d9e-0a1b2c3d4e5f";
+
+function chgCreated() {
+  const fake = created();
+  return {
+    ...fake,
+    source: {
+      ...fake.source,
+      mode: "chg",
+      chg_root_dispatch_id: ROOT_ID,
+      // As with the webhook secret: the fake models a server that WIDENED its row, so a client
+      // echoing the source verbatim would be caught.
+      change_events_secret: CHG_SECRET,
+    },
+  };
+}
+
+describe("mode chg (US-47.2)", () => {
+  test("enrol forwards mode, the secret and the root, and the secret is in no result", async () => {
+    const { calls, apiCall } = fakeApi(chgCreated());
+
+    const result = await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        secret_file: secretFileIn(),
+        mode: "chg",
+        change_events_secret: CHG_SECRET,
+        chg_root_dispatch_id: ROOT_ID,
+      },
+      deps({ apiCall }),
+    );
+
+    assert.deepEqual(calls[0].body, {
+      repo_full_name: REPO,
+      project_id: PROJECT_ID,
+      mode: "chg",
+      change_events_secret: CHG_SECRET,
+      chg_root_dispatch_id: ROOT_ID,
+    });
+    assert.equal(result.source.mode, "chg");
+    assert.equal(result.source.chg_root_dispatch_id, ROOT_ID);
+    assert.ok(!JSON.stringify(result).includes(CHG_SECRET), "the change-events secret leaked");
+    assert.ok(!("change_events_secret" in result.source));
+  });
+
+  test("the secret can come from a file, so it never passes through the transcript", async () => {
+    const file = path.join(tmpdir, "chg.secret");
+    await fs.writeFile(file, CHG_SECRET + "\n", { mode: 0o600 });
+    const { calls, apiCall } = fakeApi(chgCreated());
+
+    await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        secret_file: secretFileIn(),
+        mode: "chg",
+        change_events_secret_file: file,
+        chg_root_dispatch_id: ROOT_ID,
+      },
+      deps({ apiCall }),
+    );
+
+    // Exactly one trailing newline is stripped.
+    assert.equal(calls[0].body.change_events_secret, CHG_SECRET);
+    assert.ok(!("change_events_secret_file" in calls[0].body));
+  });
+
+  test("an unreadable or empty secret file, or both forms at once, is refused before any call", async () => {
+    const empty = path.join(tmpdir, "empty.secret");
+    await fs.writeFile(empty, "\n");
+
+    for (const [i, extra] of [
+      { change_events_secret_file: path.join(tmpdir, "missing.secret") },
+      { change_events_secret_file: empty },
+      { change_events_secret_file: "relative.secret" },
+      { change_events_secret: CHG_SECRET, change_events_secret_file: empty },
+      { change_events_secret: "" },
+    ].entries()) {
+      const { calls, apiCall } = fakeApi(chgCreated());
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          secret_file: secretFileIn(`refused-${i}.secret`),
+          mode: "chg",
+          chg_root_dispatch_id: ROOT_ID,
+          ...extra,
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true, JSON.stringify(extra));
+      assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
+      assert.ok(!result.body.includes(CHG_SECRET), "a refusal echoed the secret");
+      // Nothing was reserved, so the path is still free.
+      await assert.rejects(fs.stat(secretFileIn(`refused-${i}.secret`)));
+    }
+  });
+
+  test("enrolling chg without both credentials is refused locally, naming the 422", async () => {
+    for (const [i, extra] of [
+      { chg_root_dispatch_id: ROOT_ID },
+      { change_events_secret: CHG_SECRET },
+      {},
+    ].entries()) {
+      const { calls, apiCall } = fakeApi(chgCreated());
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          secret_file: secretFileIn(`missing-${i}.secret`),
+          mode: "chg",
+          ...extra,
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true);
+      assert.match(result.body, /mode: chg/);
+      assert.match(result.body, /422/);
+      assert.equal(calls.length, 0);
+    }
+  });
+
+  test("a malformed chg_root_dispatch_id is refused before any call", async () => {
+    const { calls, apiCall } = fakeApi(chgCreated());
+    const result = await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        secret_file: secretFileIn(),
+        mode: "chg",
+        change_events_secret: CHG_SECRET,
+        chg_root_dispatch_id: "not-a-uuid",
+      },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.error, true);
+    assert.equal(calls.length, 0);
+  });
+
+  test("a server 422 chg_root_invalid passes through, and the reservation is removed", async () => {
+    const refusal = {
+      error: true,
+      status: 422,
+      body: { error: { status: 422, code: "chg_root_invalid", message: "..." } },
+    };
+    const { apiCall } = fakeApi(refusal);
+    const secret_file = secretFileIn();
+
+    const result = await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        secret_file,
+        mode: "chg",
+        change_events_secret: CHG_SECRET,
+        chg_root_dispatch_id: ROOT_ID,
+      },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.status, 422);
+    assert.equal(result.body.error.code, "chg_root_invalid");
+    await assert.rejects(fs.stat(secret_file));
+  });
+
+  test("update forwards the credentials as named, nulls included, and never returns the secret", async () => {
+    const { calls, apiCall } = fakeApi(chgCreated());
+
+    const result = await updateIntakeSource(
+      {
+        source_id: SOURCE_ID,
+        mode: "chg",
+        change_events_secret: CHG_SECRET,
+        chg_root_dispatch_id: ROOT_ID,
+      },
+      deps({ apiCall }),
+    );
+
+    assert.deepEqual(calls[0].body, {
+      mode: "chg",
+      change_events_secret: CHG_SECRET,
+      chg_root_dispatch_id: ROOT_ID,
+    });
+    assert.ok(!JSON.stringify(result).includes(CHG_SECRET));
+
+    const cleared = fakeApi(created());
+    await updateIntakeSource(
+      { source_id: SOURCE_ID, change_events_secret: null, chg_root_dispatch_id: null },
+      deps({ apiCall: cleared.apiCall }),
+    );
+    assert.deepEqual(cleared.calls[0].body, {
+      change_events_secret: null,
+      chg_root_dispatch_id: null,
+    });
+  });
+
+  test("a switch to chg naming neither credential is the SERVER's to judge (kept values count)", async () => {
+    const { calls, apiCall } = fakeApi(chgCreated());
+    await updateIntakeSource({ source_id: SOURCE_ID, mode: "chg" }, deps({ apiCall }));
+    assert.deepEqual(calls[0].body, { mode: "chg" });
+  });
+
+  test("a credential alone is a complete update", async () => {
+    const { calls, apiCall } = fakeApi(chgCreated());
+    await updateIntakeSource(
+      { source_id: SOURCE_ID, chg_root_dispatch_id: ROOT_ID },
+      deps({ apiCall }),
+    );
+    assert.deepEqual(calls[0].body, { chg_root_dispatch_id: ROOT_ID });
+  });
+
+  test("the declarations name both credentials and the refusals, and the README rows agree", () => {
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      const tool = loadTools().find((t) => t.name === name);
+      const props = tool.inputSchema.properties;
+      for (const field of ["change_events_secret", "change_events_secret_file", "chg_root_dispatch_id"]) {
+        assert.ok(props[field], `${name} does not declare ${field}`);
+      }
+      assert.match(props.chg_root_dispatch_id.description, /chg_root_invalid/, name);
+      assert.match(tool.description, /chg_root_invalid/, name);
+      assert.match(tool.description, /change_protocol_enrolled/, name);
+      assert.match(tool.description, /write-only|never comes back|never returned/i, name);
+
+      const readmeRow =
+        README.split("\n").find((line) => line.startsWith(`| \`${name}\` |`)) ?? "";
+      assert.match(readmeRow, /chg/, `${name}'s README row does not mention chg`);
+      assert.match(readmeRow, /chg_root_invalid/, `${name}'s README row`);
+    }
+
+    const update = loadTools().find((t) => t.name === "intake_source_update");
+    const updateRow =
+      README.split("\n").find((line) => line.startsWith("| `intake_source_update` |")) ?? "";
+    for (const text of [update.description, updateRow]) {
+      // The PATCH's own lineage-ceiling refusal, not enrolment's API-key one, and the switch's
+      // in-flight refusal.
+      assert.match(text, /chg_registration_forbidden/);
+      assert.doesNotMatch(text, /api_key_mint_forbidden/);
+      assert.match(text, /operator key/);
+      assert.match(text, /pr_route_in_flight/);
+      assert.match(text, /story_ids/);
+    }
+    assert.match(update.description, /LOOPCTL_USER_KEY/);
+  });
+});
+
 describe("intake_source_list", () => {
   test("GETs the sources, with include_revoked only on request", async () => {
     const { calls, apiCall } = fakeApi({ sources: [] });
@@ -823,7 +1078,7 @@ describe("intake_source_update", () => {
       deps({ apiCall }),
     );
 
-    assert.match(result.body, /`mode` must be `pr`/);
+    assert.match(result.body, /`mode` must be `pr` or `chg`/);
     assert.equal(calls.length, 0);
   });
 
@@ -1082,7 +1337,8 @@ describe("the descriptions carry what a caller needs instead of the controller",
       const tool = loadTools().find((t) => t.name === name);
       // Copied out of the vm realm the declarations were evaluated in, so deepEqual compares
       // values and not array prototypes.
-      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], ["pr"], name);
+      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], ["pr", "chg"], name);
+      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], SOURCE_MODES, name);
     }
     for (const text of [description("intake_source_enroll"), row("intake_source_enroll")]) {
       assert.ok(!/thread/.test(text), "it still describes the retired thread mode");

@@ -368,7 +368,7 @@ describe("id validation — shared by every verb here", () => {
   // `Ecto.CastError` impl three lines above it is a different exception; pinned by
   // `cast_error_handler_test.exs:9-12`), and the body is the generic
   // `{"error": {"status": 404, "message": "Not found"}}`. The problem is that this is the
-  // IDENTICAL answer a well-formed id naming no story gets (`fallback_controller.ex:74-78`),
+  // IDENTICAL answer a well-formed id naming no story gets (`fallback_controller.ex:84-88`),
   // and the two have opposite remedies. Checking the SHAPE client-side tells them apart, and
   // costs no round trip. See the block comment over `uuid()` in lib/delivery-loop.js.
   const MALFORMED = "not-a-uuid";

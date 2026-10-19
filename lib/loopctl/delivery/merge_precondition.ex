@@ -44,8 +44,26 @@ defmodule Loopctl.Delivery.MergePrecondition do
      either is ordinary work rather than an escalation, so it goes back to `implementing`
      on `:base_moved`; it does not merge, because no CI run and no verifier saw it.
   6. **The repository is not one the loop deploys itself from** — issue #803's correction
-     11, and the only precondition decided before anything else, including a forge outage.
-     See below.
+     11, and the only precondition of the VERDICT decided before every other, including a
+     forge outage. See below. (A `chg` source is refused earlier still, but that is not a
+     verdict: no verdict is produced at all — next section.)
+
+  ## A `chg` repository has no PR route (US-47.2)
+
+  A story whose intake source is in mode `:chg` is refused with
+  `{:error, :change_protocol_enrolled}` (HTTP 409) before anything else is read: no stage
+  check, no forge call, no verdict and no escalation. It is the forcing function of Epic 47
+  (PRD §3 item 3): chg lands that repository's changes (`chg submit`), so a pull-request merge
+  there is the old route, and answering it with a verdict would be answering the wrong
+  question. `evaluate/3` and `enforce/3` share the refusal, so `enforce/3` writes nothing.
+
+  The mode is read once more where the allow is WRITTEN: `enforce/3` records an allow through
+  `Stages.record_effect/5` with a guard (`Intake.hold_pr_route/3`) that re-reads it under a
+  share lock on the source, so a switch to `chg` that lands between the evaluation and the
+  write records nothing and answers the same `{:error, :change_protocol_enrolled}`. The other
+  half is `Intake.update_source/4`, which refuses the switch (`pr_route_in_flight`) while a
+  story still holds an allow it has not merged on — the `ci -> merged` edge that consumes an
+  allow does not read the mode, so an allow recorded before the switch must not exist after it.
 
   ## The loop may not merge its own control plane
 
@@ -187,6 +205,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.DeliveryGates.GateB
   alias Loopctl.Intake
   alias Loopctl.Progress
+  alias Loopctl.Repo
   alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
@@ -218,7 +237,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
           optional(:self_deploy_excluded) => [String.t()]
         }
 
-  @type error :: :not_found | :no_stage | :wrong_stage
+  @type error :: :not_found | :no_stage | :wrong_stage | :change_protocol_enrolled
+
+  # US-47.2 (AC-47.2.3). ONE string, read by the 409 this renders as and by the endpoint's
+  # operation spec, so the refusal and its documentation cannot name different routes.
+  @change_protocol_message "This story's repository is enrolled in the change protocol " <>
+                             "(its intake source is in mode `chg`), so the pull-request " <>
+                             "route is closed for it: there is no merge to precondition. " <>
+                             "Land the change with `chg submit`; loopctl follows the " <>
+                             "story through chg's events."
 
   # The forge faults that mean "we could not tell", as opposed to a gate verdict: transport,
   # a 5xx, and a status the forge itself said to come back after. Every one clears on its
@@ -415,6 +442,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   ## Errors
 
+  `{:error, :change_protocol_enrolled}` for a story whose intake source is in mode `:chg`
+  (US-47.2): the PR route is closed for that repository, whatever the stage row says, and the
+  refusal is decided from the database alone, BEFORE any forge read and before the stage is
+  looked at — it is not a verdict about a change, it is the wrong route.
+
   `{:error, :not_found}` for a story that is not in the tenant, `{:error, :no_stage}` when
   it has no stage row, and `{:error, :wrong_stage}` when the row is not at `ci` — the only
   stage a merge is decided from, and the only one the `:merge_gate` edge leaves. These are
@@ -424,10 +456,21 @@ defmodule Loopctl.Delivery.MergePrecondition do
           {:ok, Verdict.t()} | {:error, error()}
   def evaluate(tenant_id, story_id, opts) do
     with {:ok, story} <- fetch_story(tenant_id, story_id),
+         source = source_for_story(story),
+         :ok <- pr_route_open(source),
          {:ok, stage} <- fetch_stage(tenant_id, story_id) do
-      {:ok, story |> gather(stage, opts) |> judge()}
+      {:ok, story |> gather(stage, source, opts) |> judge()}
     end
   end
+
+  @doc "The message `{:error, :change_protocol_enrolled}` is rendered and documented with."
+  @spec change_protocol_message() :: String.t()
+  def change_protocol_message, do: @change_protocol_message
+
+  # Only a RESOLVED `chg` source closes the route. A missing or ambiguous source falls through to
+  # `judge/1`, which refuses it as `repository_unresolved` — failing closed either way.
+  defp pr_route_open({:ok, %{mode: :chg}}), do: {:error, :change_protocol_enrolled}
+  defp pr_route_open(_source), do: :ok
 
   @doc """
   `evaluate/3`, and on a refusal the escalation it implies: `{:ci, :escalated, :merge_gate}`
@@ -448,8 +491,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec enforce(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, Verdict.t()} | {:error, error()}
   def enforce(tenant_id, story_id, opts) do
-    with {:ok, verdict} <- evaluate(tenant_id, story_id, opts) do
-      {:ok, act(tenant_id, story_id, verdict, opts)}
+    with {:ok, verdict} <- evaluate(tenant_id, story_id, opts),
+         %Verdict{} = acted <- act(tenant_id, story_id, verdict, opts) do
+      {:ok, acted}
     end
   end
 
@@ -910,8 +954,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # -- gathering the facts ---------------------------------------------------------------
 
-  defp gather(story, stage, opts) do
-    repo = story |> source_for_story() |> repo_of()
+  # `source` is the one `evaluate/3` resolved for the route check, so the repository judged here
+  # is the one whose mode was read: one read, one answer.
+  defp gather(story, stage, source, opts) do
+    repo = repo_of(source)
 
     # The repository with the credential every forge read below authenticates with (#936),
     # chosen per (tenant, repository). `repo` itself stays the bare name: the exclusion list
@@ -1048,6 +1094,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     case record_allow(tenant_id, story_id, verdict, opts) do
       %Verdict{decision: :allow} = allowed -> allowed
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
+      {:error, :change_protocol_enrolled} = closed -> closed
     end
   end
 
@@ -1072,8 +1119,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # lives only in the response, and an already-merged pull request cannot be told from one
   # merged around the gate — so a write that does not land turns the allow into a refusal
   # rather than a merge nobody can later account for.
+  #
+  # The guard re-reads the source's mode INSIDE the write, under a share lock, because
+  # `evaluate/3` read it before any transaction opened: a switch to `chg` committed in between
+  # answers `change_protocol_enrolled` — the route is closed, exactly as if `evaluate/3` had
+  # seen it — rather than recording an allow on a `chg` source or escalating a story whose
+  # route merely changed.
   defp record_allow(tenant_id, story_id, %Verdict{head_sha: head} = verdict, opts) do
-    write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+    write_opts =
+      opts
+      |> Keyword.take([:claim_epoch, :actor_label])
+      |> Keyword.put(:guard, fn -> Intake.hold_pr_route(Repo, tenant_id, story_id) end)
+
     write_allow(tenant_id, story_id, verdict, head, write_opts, opts)
   end
 
@@ -1081,6 +1138,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
     case Stages.record_effect(tenant_id, story_id, :merge_gate_allowed_sha, head, write_opts) do
       {:ok, _row} ->
         clear_unevaluated(tenant_id, story_id, verdict, opts)
+
+      {:error, :change_protocol_enrolled} = closed ->
+        closed
 
       {:error, reason} ->
         Logger.warning(

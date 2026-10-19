@@ -37,6 +37,10 @@
     {
       "id": "AC-47.3.6",
       "description": "An event of a kind the stage mapping does not map (review_requested, check_failed, conflict, ready, or any unknown kind) is recorded, answered 2xx, advances the change's applied event_seq, and moves no stage, so it never leaves a gap."
+    },
+    {
+      "id": "AC-47.3.7",
+      "description": "An event for a source whose chg_root_dispatch_id names a dispatch that is now revoked (or no longer a parentless orchestrator-role root of the tenant) is refused with the same 401 as AC-47.3.1 and writes nothing. US-47.2 judges the root only when a source is written, so a root revoked between writes is caught here, by the same rule (Intake's chg root check), read inside the request's transaction."
     }
   ],
   "test_cases": [
@@ -129,6 +133,25 @@
       "expected_results": [
         "seq 2 answers 2xx and is recorded",
         "seq 3 applies immediately: the story moves reviewing -> implementing"
+      ]
+    },
+    {
+      "id": "TC-47.3.6",
+      "verifies": [
+        "AC-47.3.7"
+      ],
+      "name": "a revoked root refuses the event",
+      "type": "integration",
+      "preconditions": [
+        "an enrolled :chg source",
+        "its chg_root_dispatch_id revoked after enrolment"
+      ],
+      "steps": [
+        "post a correctly signed, in-window event for the source"
+      ],
+      "expected_results": [
+        "401 with the same body as TC-47.3.1",
+        "no event row and no audit entry"
       ]
     }
   ],

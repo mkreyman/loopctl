@@ -367,6 +367,310 @@ defmodule Loopctl.IntakeTest do
     end
   end
 
+  describe "mode chg (US-47.2)" do
+    @chg_secret String.duplicate("c", 32)
+
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      root = fixture(:chg_root_dispatch, %{tenant_id: tenant.id})
+      %{tenant: tenant, project: project, root: root}
+    end
+
+    defp enrol_chg(ctx, attrs) do
+      Intake.create_source(
+        ctx.tenant.id,
+        Map.merge(
+          %{
+            repo_full_name: "mkreyman/infra",
+            project_id: ctx.project.id,
+            mode: "chg",
+            change_events_secret: @chg_secret,
+            chg_root_dispatch_id: ctx.root.id
+          },
+          attrs
+        )
+      )
+    end
+
+    test "AC-47.2.1: a chg source enrols with both, and the secret is stored encrypted", ctx do
+      assert {:ok, %{source: source}} = enrol_chg(ctx, %{})
+      assert source.mode == :chg
+      assert source.chg_root_dispatch_id == ctx.root.id
+
+      stored = AdminRepo.get!(Source, source.id)
+      assert stored.change_events_secret == @chg_secret
+
+      # Encrypted at rest: the raw column is not the plaintext.
+      %{rows: [[raw]]} =
+        AdminRepo.query!("SELECT change_events_secret FROM intake_sources WHERE id = $1", [
+          Ecto.UUID.dump!(source.id)
+        ])
+
+      refute raw == @chg_secret
+      refute raw =~ @chg_secret
+    end
+
+    test "AC-47.2.1: the secret is never serialised", ctx do
+      assert {:ok, %{source: source}} = enrol_chg(ctx, %{})
+      json = Jason.encode!(source)
+      refute json =~ @chg_secret
+      refute json =~ "change_events_secret"
+      assert json =~ ctx.root.id
+      refute inspect(source) =~ @chg_secret
+    end
+
+    test "AC-47.2.1: enrolling chg without the secret or the root is refused", ctx do
+      assert {:error, changeset} = enrol_chg(ctx, %{change_events_secret: nil})
+      assert %{change_events_secret: ["is required when mode is chg"]} = errors_on(changeset)
+
+      assert {:error, changeset} =
+               Intake.create_source(ctx.tenant.id, %{
+                 repo_full_name: "mkreyman/infra",
+                 project_id: ctx.project.id,
+                 mode: "chg"
+               })
+
+      assert %{
+               change_events_secret: ["is required when mode is chg"],
+               chg_root_dispatch_id: ["is required when mode is chg"]
+             } = errors_on(changeset)
+
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
+    test "AC-47.2.1: a secret outside the byte bounds is refused", ctx do
+      for bad <- [
+            String.duplicate("c", Source.min_change_events_secret_bytes() - 1),
+            String.duplicate("c", Source.max_change_events_secret_bytes() + 1),
+            ""
+          ] do
+        assert {:error, changeset} = enrol_chg(ctx, %{change_events_secret: bad})
+        assert %{change_events_secret: [_]} = errors_on(changeset)
+      end
+
+      assert {:ok, _} =
+               enrol_chg(ctx, %{
+                 change_events_secret:
+                   String.duplicate("c", Source.max_change_events_secret_bytes())
+               })
+    end
+
+    test "AC-47.2.2: every root that is not a root is the same chg_root_invalid", ctx do
+      child = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, parent: ctx.root})
+      revoked = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, revoked: true})
+      agent_role = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, role: :agent})
+      user_role = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, role: :user})
+      other_tenant = fixture(:tenant)
+      foreign = fixture(:chg_root_dispatch, %{tenant_id: other_tenant.id})
+
+      for id <- [
+            child.id,
+            revoked.id,
+            agent_role.id,
+            user_role.id,
+            foreign.id,
+            Ecto.UUID.generate()
+          ] do
+        assert {:error, :chg_root_invalid} = enrol_chg(ctx, %{chg_root_dispatch_id: id})
+      end
+
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
+    test "a root named on a PR source is judged too, so no cross-tenant oracle exists", ctx do
+      {_secret, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      foreign = fixture(:chg_root_dispatch, %{tenant_id: fixture(:tenant).id})
+      child = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, parent: ctx.root})
+
+      for id <- [foreign.id, Ecto.UUID.generate(), child.id] do
+        assert {:error, :chg_root_invalid} =
+                 Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: id})
+      end
+
+      assert AdminRepo.get!(Source, source.id).chg_root_dispatch_id == nil
+
+      assert {:ok, %{chg_root_dispatch_id: root_id}} =
+               Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: ctx.root.id})
+
+      assert root_id == ctx.root.id
+    end
+
+    test "TC-47.2.1: switching a pr source to chg without a secret is refused", ctx do
+      {_secret, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert {:error, changeset} =
+               Intake.update_source(ctx.tenant.id, source.id, %{
+                 mode: "chg",
+                 chg_root_dispatch_id: ctx.root.id
+               })
+
+      assert %{change_events_secret: ["is required when mode is chg"]} = errors_on(changeset)
+      assert AdminRepo.get!(Source, source.id).mode == :pr
+
+      assert {:ok, switched} =
+               Intake.update_source(ctx.tenant.id, source.id, %{
+                 mode: "chg",
+                 chg_root_dispatch_id: ctx.root.id,
+                 change_events_secret: @chg_secret
+               })
+
+      assert switched.mode == :chg
+    end
+
+    test "switching to pr keeps both; switching back re-checks the kept root", ctx do
+      {:ok, %{source: source}} = enrol_chg(ctx, %{})
+
+      assert {:ok, pr} = Intake.update_source(ctx.tenant.id, source.id, %{mode: "pr"})
+      stored = AdminRepo.get!(Source, pr.id)
+      assert stored.change_events_secret == @chg_secret
+      assert stored.chg_root_dispatch_id == ctx.root.id
+
+      # The kept root is revoked while the source is on `pr`: the switch back is refused
+      # rather than trusting the id it kept.
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^ctx.root.id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert {:error, :chg_root_invalid} =
+               Intake.update_source(ctx.tenant.id, source.id, %{mode: "chg"})
+
+      assert AdminRepo.get!(Source, source.id).mode == :pr
+
+      fresh = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id})
+
+      assert {:ok, %{mode: :chg}} =
+               Intake.update_source(ctx.tenant.id, source.id, %{
+                 mode: "chg",
+                 chg_root_dispatch_id: fresh.id
+               })
+    end
+
+    test "on a chg source an explicit null for either is refused; on pr it clears", ctx do
+      {:ok, %{source: source}} = enrol_chg(ctx, %{})
+
+      assert {:error, changeset} =
+               Intake.update_source(ctx.tenant.id, source.id, %{change_events_secret: nil})
+
+      assert %{change_events_secret: [_]} = errors_on(changeset)
+
+      assert {:error, changeset} =
+               Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: nil})
+
+      assert %{chg_root_dispatch_id: [_]} = errors_on(changeset)
+
+      assert {:ok, _} =
+               Intake.update_source(ctx.tenant.id, source.id, %{
+                 mode: "pr",
+                 change_events_secret: nil,
+                 chg_root_dispatch_id: nil
+               })
+
+      stored = AdminRepo.get!(Source, source.id)
+      assert stored.change_events_secret == nil
+      assert stored.chg_root_dispatch_id == nil
+    end
+
+    test "every write that leaves a source chg re-judges its root", ctx do
+      {:ok, %{source: source}} = enrol_chg(ctx, %{})
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^ctx.root.id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      # A rotation and an unrelated edit alike: a revoked root keeps nothing operative.
+      for attrs <- [
+            %{change_events_secret: String.duplicate("r", 40)},
+            %{base_branch: "main"},
+            %{mode: "chg"}
+          ] do
+        assert {:error, :chg_root_invalid} = Intake.update_source(ctx.tenant.id, source.id, attrs)
+      end
+
+      stored = AdminRepo.get!(Source, source.id)
+      assert stored.change_events_secret == @chg_secret
+      assert stored.base_branch == "master"
+
+      # Naming a child is no better than the revoked root.
+      child = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id, parent: ctx.root})
+
+      assert {:error, :chg_root_invalid} =
+               Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: child.id})
+
+      # Naming a live root clears it, and leaving `chg` is never blocked by the root left behind.
+      fresh = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant.id})
+
+      assert {:ok, %{chg_root_dispatch_id: fresh_id}} =
+               Intake.update_source(ctx.tenant.id, source.id, %{chg_root_dispatch_id: fresh.id})
+
+      assert fresh_id == fresh.id
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^fresh.id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert {:ok, %{mode: :pr}} = Intake.update_source(ctx.tenant.id, source.id, %{mode: "pr"})
+    end
+
+    test "the chain records the root and whether a secret is set, never the secret", ctx do
+      {:ok, %{source: source}} = enrol_chg(ctx, %{})
+
+      rotated = String.duplicate("r", 40)
+
+      assert {:ok, _} =
+               Intake.update_source(ctx.tenant.id, source.id, %{change_events_secret: rotated})
+
+      entries =
+        AdminRepo.all(
+          from e in Loopctl.AuditChain.Entry,
+            where: e.tenant_id == ^ctx.tenant.id and e.entity_id == ^source.id
+        )
+
+      assert %{payload: %{"chg_root_dispatch_id" => root_id, "change_events_secret_set" => true}} =
+               Enum.find(entries, &(&1.action == "intake_source_created"))
+
+      assert root_id == ctx.root.id
+
+      assert %{payload: %{"change_events_secret_set" => true}} =
+               Enum.find(entries, &(&1.action == "intake_source_change_events_secret_set"))
+
+      for entry <- entries do
+        refute Jason.encode!(entry.payload) =~ @chg_secret
+        refute Jason.encode!(entry.payload) =~ rotated
+      end
+    end
+
+    test "the database refuses a chg row without its credentials", ctx do
+      {_secret, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert_raise Postgrex.Error, ~r/intake_sources_chg_requires_credentials/, fn ->
+        AdminRepo.query!("UPDATE intake_sources SET mode = 'chg' WHERE id = $1", [
+          Ecto.UUID.dump!(source.id)
+        ])
+      end
+    end
+
+    test "tenant isolation: tenant B cannot switch or read tenant A's chg source", ctx do
+      {:ok, %{source: source}} = enrol_chg(ctx, %{})
+      other = fixture(:tenant)
+
+      assert {:error, :not_found} = Intake.update_source(other.id, source.id, %{mode: "pr"})
+      assert {:error, :not_found} = Intake.get_source(other.id, source.id)
+      assert Intake.list_sources(other.id) == []
+      assert AdminRepo.get!(Source, source.id).mode == :chg
+    end
+  end
+
   describe "repoint_source/4" do
     test "an active source is repointed at an epic of its project, and the act is recorded" do
       tenant = fixture(:tenant)

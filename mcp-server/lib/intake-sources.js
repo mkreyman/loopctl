@@ -74,10 +74,28 @@
  * is. The controller mounts `RequireRole, role: :user` — the HIERARCHY form, so a
  * `:superadmin` key would pass too and this package holds no such variable — plus
  * `RequireHumanAnchor` on create/update/delete and `RequireUnlineagedCaller` on create
- * (`lib/loopctl_web/controllers/intake_source_controller.ex:27-29`). That last one is why a
+ * (`lib/loopctl_web/controllers/intake_source_controller.ex:34-36`). That last one is why a
  * global `LOOPCTL_API_KEY` must not stand in: creating a source MINTS A CREDENTIAL that
  * belongs to no dispatch lineage, so a caller whose own key a dispatch minted is refused
- * `403 api_key_mint_forbidden`, exactly as it is on `POST /api/v1/api_keys`.
+ * `403 api_key_mint_forbidden`, exactly as it is on `POST /api/v1/api_keys`. An update that
+ * names a `chg` credential or sets `mode` to `chg` is held to the same ceiling under its own
+ * code, `403 chg_registration_forbidden`, whose remedy is the operator key itself.
+ *
+ * ## MODE `chg` AND ITS TWO CREDENTIALS (US-47.2, AC-47.7.2)
+ *
+ * A source in `mode: "chg"` has its changes landed by the change protocol (`chg submit`), and
+ * loopctl's merge precondition refuses every story on it with `409 change_protocol_enrolled`.
+ * It needs BOTH `change_events_secret` — the HMAC key chg-server signs its event webhook with,
+ * which the OPERATOR supplies because chg-server must hold the same value — and
+ * `chg_root_dispatch_id`, the parentless orchestrator-role dispatch chg-server's key was minted
+ * from (`422 chg_root_invalid` for anything else, another tenant's included).
+ *
+ * The secret is WRITE-ONLY on both sides: the server never serialises it, and `publicSource`
+ * below never names it, so no tool result carries it. A tool INPUT is recorded in the
+ * transcript too, so `change_events_secret_file` is offered beside it: the tool reads the
+ * value from that file and it never passes through a transcript at all. Exactly one trailing
+ * newline is stripped (what `openssl rand -hex 32 > file` writes); chg-server must hold the
+ * value without it.
  *
  * ## `repo_full_name` IS NOT SHAPE-CHECKED HERE, AND THAT IS A DECISION
  *
@@ -144,18 +162,135 @@ function epicRefusal(value, { clearable }) {
 }
 
 /**
- * The merge routes a source may take: `pr`, the default and the only one (#984 retired
- * `thread`). NOT nullable — the server answers 422 — so a null is refused here where the
- * reason can be stated.
+ * The merge routes a source may take: `pr`, the default, and `chg` (US-47.2), where the change
+ * protocol lands the repository's changes and the PR route is closed. NOT nullable — the
+ * server answers 422 — so a null is refused here where the reason can be stated.
  */
-export const SOURCE_MODES = ["pr"];
+export const SOURCE_MODES = ["pr", "chg"];
 
 export function modeRefusal(mode) {
   if (SOURCE_MODES.includes(mode)) return null;
 
   return refuse(
-    "`mode` must be `pr`, or must be left out entirely (enrolment then takes `pr`, and an " +
-      "update keeps the current value). It cannot be null.",
+    "`mode` must be `pr` or `chg`, or must be left out entirely (enrolment then takes `pr`, " +
+      "and an update keeps the current value). It cannot be null.",
+  );
+}
+
+/**
+ * The `chg` credentials a call NAMED, resolved into the request body fields, or a refusal.
+ *
+ * Resolves to `{ fields }` or `{ refusal }`. `clearable` is the update path, where an explicit
+ * null clears a credential on a `pr` source (the server refuses it on a `chg` one). No branch
+ * of this function puts the secret's value in a message.
+ */
+export async function chgCredentials(args, { clearable, fs = defaultFs, homedir = os.homedir() }) {
+  const fields = {};
+  const { change_events_secret: secret, change_events_secret_file: secretFile } = args;
+
+  if (secret !== undefined && secretFile !== undefined) {
+    return {
+      refusal: refuse(
+        "Send `change_events_secret` OR `change_events_secret_file`, not both: they are two " +
+          "ways of naming the same value.",
+      ),
+    };
+  }
+
+  if (secret !== undefined) {
+    if (secret === null && clearable) {
+      fields.change_events_secret = null;
+    } else if (typeof secret !== "string" || secret === "") {
+      return {
+        refusal: refuse(
+          "`change_events_secret` must be a non-empty string (the server holds it to " +
+            "32-256 bytes)" +
+            (clearable ? ", or null to clear it on a `pr` source." : ".") +
+            " Prefer `change_events_secret_file`, which keeps the value out of the transcript.",
+        ),
+      };
+    } else {
+      fields.change_events_secret = secret;
+    }
+  }
+
+  if (secretFile !== undefined) {
+    const read = await readSecretFile(secretFile, { fs, homedir });
+    if (read.refusal) return read;
+    fields.change_events_secret = read.secret;
+  }
+
+  const root = args.chg_root_dispatch_id;
+
+  if (root !== undefined) {
+    if (root === null && clearable) {
+      fields.chg_root_dispatch_id = null;
+    } else {
+      const badRoot = uuidRefusal(root, "chg_root_dispatch_id");
+      if (badRoot) return { refusal: badRoot };
+      fields.chg_root_dispatch_id = root;
+    }
+  }
+
+  return { fields };
+}
+
+async function readSecretFile(secretFile, { fs, homedir }) {
+  if (typeof secretFile !== "string" || secretFile.trim() === "") {
+    return {
+      refusal: refuse("`change_events_secret_file` must be a path to the file holding the secret."),
+    };
+  }
+
+  const path = expandHome(secretFile, homedir);
+  if (!nodePath.isAbsolute(path)) {
+    return {
+      refusal: refuse(
+        `change_events_secret_file must be absolute or start with ~/ (got '${secretFile}').`,
+      ),
+    };
+  }
+
+  let raw;
+  try {
+    raw = await fs.readFile(path, "utf8");
+  } catch (err) {
+    return {
+      refusal: refuse(
+        `Could not read change_events_secret_file '${path}' (${err?.code || "error"}). ` +
+          "Nothing was sent.",
+      ),
+    };
+  }
+
+  const secret = raw.replace(/\r?\n$/, "");
+  if (secret === "") {
+    return { refusal: refuse(`change_events_secret_file '${path}' is empty. Nothing was sent.`) };
+  }
+
+  return { secret };
+}
+
+/**
+ * `mode: "chg"` at ENROLMENT needs both credentials in the same call (there is no earlier
+ * stint to keep them from), so their absence is refused here, before a secret file is
+ * reserved, with the 422 the server would answer named.
+ */
+function chgEnrolmentRefusal(mode, fields) {
+  if (mode !== "chg") return null;
+
+  const missing = ["change_events_secret", "chg_root_dispatch_id"].filter(
+    (field) => fields[field] === undefined,
+  );
+
+  if (missing.length === 0) return null;
+
+  return refuse(
+    `\`mode: chg\` needs ${missing.map((f) => `\`${f}\``).join(" and ")} in the same call; ` +
+      "the server answers 422 without them. `chg_root_dispatch_id` is the parentless " +
+      "orchestrator-role dispatch chg-server's key was minted from (the operator mints it " +
+      "with `dispatch`, no parent), and the secret is the HMAC key chg-server signs its " +
+      "events with (`change_events_secret_file` keeps it out of the transcript).",
   );
 }
 
@@ -221,6 +356,8 @@ export function publicSource(source) {
     base_branch: source.base_branch,
     mode: source.mode,
     required_checks: source.required_checks,
+    // `change_events_secret` is NEVER named here: write-only (US-47.2).
+    chg_root_dispatch_id: source.chg_root_dispatch_id,
     target_epic_id: source.target_epic_id,
     revoked_at: source.revoked_at,
     inserted_at: source.inserted_at,
@@ -255,6 +392,9 @@ export async function enrollIntakeSource(
     mode,
     required_checks,
     secret_file,
+    change_events_secret,
+    change_events_secret_file,
+    chg_root_dispatch_id,
   } = {},
   { userKey, apiCall, baseUrl, fs = defaultFs, homedir = os.homedir() } = {},
 ) {
@@ -309,6 +449,16 @@ export async function enrollIntakeSource(
     if (badChecks) return badChecks;
   }
 
+  // The `chg` credentials (US-47.2), resolved and judged before a secret file is reserved.
+  const chg = await chgCredentials(
+    { change_events_secret, change_events_secret_file, chg_root_dispatch_id },
+    { clearable: false, fs, homedir },
+  );
+  if (chg.refusal) return chg.refusal;
+
+  const badChg = chgEnrolmentRefusal(mode, chg.fields);
+  if (badChg) return badChg;
+
   if (typeof secret_file !== "string" || secret_file.trim() === "") {
     return refuse(
       "`secret_file` is required: the path the webhook secret is written to (mode 0600). " +
@@ -360,6 +510,7 @@ export async function enrollIntakeSource(
   if (base_branch !== undefined) body.base_branch = base_branch;
   if (mode !== undefined) body.mode = mode;
   if (required_checks !== undefined) body.required_checks = required_checks;
+  Object.assign(body, chg.fields);
 
   let result;
   try {
@@ -514,7 +665,10 @@ export async function listIntakeSources({ include_revoked } = {}, { userKey, api
  * uses `empty_values: []` precisely so that a caller who SENT a value gets an answer about
  * the value it sent, which is a 422.
  */
-export async function updateIntakeSource(args = {}, { userKey, apiCall } = {}) {
+export async function updateIntakeSource(
+  args = {},
+  { userKey, apiCall, fs = defaultFs, homedir = os.homedir() } = {},
+) {
   if (!userKey) return refuse(MISSING_USER_KEY);
 
   const bad = uuidRefusal(args.source_id, "source_id");
@@ -553,11 +707,20 @@ export async function updateIntakeSource(args = {}, { userKey, apiCall } = {}) {
     body.required_checks = args.required_checks;
   }
 
+  // Switching to `chg` may rely on credentials an earlier `chg` stint left on the row, so their
+  // absence here is the SERVER's to judge (422 naming the missing one); only their shape is
+  // judged here.
+  const chg = await chgCredentials(args, { clearable: true, fs, homedir });
+  if (chg.refusal) return chg.refusal;
+  Object.assign(body, chg.fields);
+
   if (Object.keys(body).length === 0) {
     return refuse(
       "Nothing to update. Name at least one of `target_epic_id` (null clears it), " +
-        "`base_branch`, `mode` or `required_checks`. A body carrying none of them is refused 422 " +
-        "`nothing_to_update`, because a field you do not send is left exactly as it was.",
+        "`base_branch`, `mode`, `required_checks`, `change_events_secret` (or " +
+        "`change_events_secret_file`) or `chg_root_dispatch_id`. A body carrying none of them " +
+        "is refused 422 `nothing_to_update`, because a field you do not send is left exactly " +
+        "as it was.",
     );
   }
 

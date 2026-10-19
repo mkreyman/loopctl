@@ -84,7 +84,7 @@ function refuse(body) {
  * That 404 is the problem, not a 500. It is BYTE-IDENTICAL to the 404 for a perfectly
  * well-formed id that names no story — `FallbackController` answers `{:error, :not_found}` with
  * the same `%{error: %{status: 404, message: "Not found"}}`
- * (`lib/loopctl_web/fallback_controller.ex:74-78`) — so it cannot tell an operator which
+ * (`lib/loopctl_web/fallback_controller.ex:84-88`) — so it cannot tell an operator which
  * of the two happened, and the two have opposite remedies: re-read the argument you passed, or
  * go find the right story. The check here can tell them apart, and does it without a round trip.
  *
