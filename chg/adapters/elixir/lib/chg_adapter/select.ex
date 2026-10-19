@@ -39,25 +39,34 @@ defmodule ChgAdapter.Select do
         since = MapSet.new(Enum.filter(input.since_snapshot, input.test_file?))
         direct = MapSet.new(tests_changed)
 
-        tests =
-          for f <- input.test_files,
-              selected?(f, direct, since, refs.tests, affected),
-              do: f
+        why =
+          for f <- input.test_files, w = why(f, direct, since, refs.tests, affected), do: {f, w}
+
+        counts = Enum.frequencies_by(why, &elem(&1, 1))
+        count = &Map.get(counts, &1, 0)
 
         reason =
           "#{length(changed)} changed path(s), #{MapSet.size(modules)} changed module(s), " <>
-            "#{MapSet.size(affected)} with dependents, #{length(unmapped)} path(s) outside the module graph"
+            "#{MapSet.size(affected)} with dependents, #{length(unmapped)} path(s) outside the module graph; " <>
+            "#{length(why)} of #{length(input.test_files)} test file(s): " <>
+            "#{count.(:changed)} changed since the base, #{count.(:since_snapshot)} since the snapshot, " <>
+            "#{count.(:unreferenced)} without recorded references, " <>
+            "#{count.(:references)} referencing an affected module"
 
-        {:subset, reason, Enum.sort(tests)}
+        {:subset, reason, why |> Enum.map(&elem(&1, 0)) |> Enum.sort()}
     end
   end
 
-  defp selected?(f, direct, since, refs, affected) do
-    MapSet.member?(direct, f) or MapSet.member?(since, f) or
-      case Map.get(refs, f) do
-        refs when is_list(refs) -> Enum.any?(refs, &MapSet.member?(affected, &1))
-        _ -> true
-      end
+  # Why a test file is selected, the first reason that holds, or nil. One reason per
+  # file, so the reason's counts add up to the selection.
+  defp why(f, direct, since, refs, affected) do
+    cond do
+      MapSet.member?(direct, f) -> :changed
+      MapSet.member?(since, f) -> :since_snapshot
+      not is_list(Map.get(refs, f)) -> :unreferenced
+      Enum.any?(Map.fetch!(refs, f), &MapSet.member?(affected, &1)) -> :references
+      true -> nil
+    end
   end
 
   @type coverage_input :: %{

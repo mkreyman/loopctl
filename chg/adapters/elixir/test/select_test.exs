@@ -45,6 +45,31 @@ defmodule ChgAdapter.SelectTest do
 
   defp tests({:subset, _reason, tests}), do: tests
 
+  test "the reason gives each selected file one cause, so the counts add up to the selection" do
+    tests = Map.put(@tests, "test/new_test.exs", nil)
+
+    assert {:subset, reason, selected} =
+             select(["test/billing_test.exs", "lib/invoices.ex"],
+               since_snapshot: [
+                 "test/billing_test.exs",
+                 "test/greeting_test.exs",
+                 "test/gone_test.exs"
+               ],
+               tests: tests
+             )
+
+    assert selected == [
+             "test/billing_test.exs",
+             "test/greeting_test.exs",
+             "test/invoices_test.exs",
+             "test/new_test.exs"
+           ]
+
+    assert reason =~
+             "4 of 6 test file(s): 1 changed since the base, 1 since the snapshot, " <>
+               "1 without recorded references, 1 referencing an affected module"
+  end
+
   test "a context edit selects its tests and its dependents' tests, transitively, and nothing else" do
     assert tests(select(["lib/accounts.ex"])) ==
              ["test/accounts_test.exs", "test/billing_test.exs", "test/invoices_test.exs"]
