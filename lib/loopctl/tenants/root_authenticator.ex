@@ -69,7 +69,8 @@ defmodule Loopctl.Tenants.RootAuthenticator do
     |> unique_constraint(:credential_id,
       name: :tenant_root_authenticators_tenant_id_credential_id_index
     )
-    # A credential id is GLOBALLY unique: one authenticator never roots two tenants.
+    # A credential id is GLOBALLY unique: registration always mints a new one, so a repeat is
+    # a replayed attestation, never a second legitimate enrolment.
     |> unique_constraint(:credential_id, name: :tenant_root_authenticators_credential_id_uidx)
   end
 
