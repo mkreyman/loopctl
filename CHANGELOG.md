@@ -24,8 +24,14 @@ All notable changes to loopctl are documented here.
   `thread` intake source to `pr` with `intake_source_update` BEFORE deploying, so the change
   is on the audit chain; the migration moves any it finds, but writes no audit entry. The
   thread tables and `runner_dispatches.mode` are left in place because the previous release
-  still reads them during the rolling deploy; a later release drops them (US-47.9).
+  still reads them during the rolling deploy; `20261019120000` drops them (US-47.9).
   Irreversible.
+- **Migration `20261019120000_drop_change_thread_tables`** (contract half, US-47.9) drops
+  `thread_entries`, `thread_reviews`, `thread_issue_links`, `thread_checkpoints`,
+  `claim_routes`, `browser_sessions`, `webauthn_login_challenges` and
+  `runner_dispatches.mode`, and deletes any jobs of the retired workers again. **Deploy
+  ordering:** deploy it only after the release carrying `20261018120000` runs on every
+  machine; that release no longer reads any of them. Irreversible.
 - **Env vars no longer read:** `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
   `REVIEW_WALL_CLOCK_SECONDS`, `REVIEW_MAX_TURNS`. They can be unset (`fly secrets unset`);
   leaving them set is harmless. loopctl no longer uses GitHub App 5101362 (its fate is
