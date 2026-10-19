@@ -47,6 +47,7 @@ defmodule Loopctl.Changes.ReqChgClient do
 
   defp answer({:ok, %Req.Response{status: 200, body: body}}), do: events(body)
   defp answer({:ok, %Req.Response{status: 401}}), do: {:error, :unauthorized}
+  defp answer({:ok, %Req.Response{status: 404}}), do: {:error, :unknown_change}
   defp answer({:ok, %Req.Response{status: status}}), do: {:error, {:chg_server_error, status}}
 
   # The exception's module only (`Req.TransportError`, ...): never its message, which can
@@ -54,9 +55,9 @@ defmodule Loopctl.Changes.ReqChgClient do
   defp answer({:error, %{__struct__: module}}),
     do: {:error, {:chg_server_unreachable, module}}
 
-  # The contract says the pull "returns the change's events in order" without fixing the
-  # wrapper, so both a bare array and `{"events": [...]}` are read as that list.
-  defp events(list) when is_list(list), do: {:ok, list}
+  # mkreyman/chg#33 item 6: a 200 is always `{"events": [...], "next_after": N | null}`, at
+  # most 500 events in seq order. `next_after` is not read: the caller pages from the seq it
+  # applied, and an empty page ends the pull.
   defp events(%{"events" => list}) when is_list(list), do: {:ok, list}
   defp events(_body), do: {:error, :invalid_response}
 

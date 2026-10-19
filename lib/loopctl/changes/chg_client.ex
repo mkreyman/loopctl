@@ -18,6 +18,8 @@ defmodule Loopctl.Changes.ChgClient do
   - `{:error, :unauthorized}` — chg-server refused the signature (HTTP 401). Under a
     one-sided secret rotation this is the only signal loopctl gets, so the caller raises an
     operator alert on it.
+  - `{:error, :unknown_change}` — chg-server knows no such change (HTTP 404, answered only
+    after the signature checks out, so ids cannot be probed). Final for this attempt.
   - `{:error, reason}` — anything else that is not an answer: unreachable, a timeout, a
     non-200 status, a body that is not a list of events. Transient by assumption; the caller
     retries.

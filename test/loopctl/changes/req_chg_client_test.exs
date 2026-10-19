@@ -25,16 +25,28 @@ defmodule Loopctl.Changes.ReqChgClientTest do
       assert sig ==
                Signature.header(@secret, "#{ts}.GET./api/v1/changes/01JAXYZ/events?after=7")
 
-      Req.Test.json(conn, [%{"event_seq" => 8}])
+      Req.Test.json(conn, %{"events" => [%{"event_seq" => 8}], "next_after" => nil})
     end)
 
     assert {:ok, [%{"event_seq" => 8}]} =
              ReqChgClient.events_after("https://chg.test/", @secret, "01JAXYZ", 7)
   end
 
-  test "an {\"events\": [...]} body is the same list" do
-    Req.Test.stub(ReqChgClient, &Req.Test.json(&1, %{"events" => []}))
+  test "a caught-up pull is an empty events list; a bare array is not the contract" do
+    Req.Test.stub(ReqChgClient, &Req.Test.json(&1, %{"events" => [], "next_after" => nil}))
     assert {:ok, []} = ReqChgClient.events_after("https://chg.test", @secret, "C1", 0)
+
+    Req.Test.stub(ReqChgClient, &Req.Test.json(&1, [%{"event_seq" => 1}]))
+
+    assert {:error, :invalid_response} =
+             ReqChgClient.events_after("https://chg.test", @secret, "C1", 0)
+  end
+
+  test "404 is :unknown_change" do
+    Req.Test.stub(ReqChgClient, &Plug.Conn.send_resp(&1, 404, ~s({"error":"not_found"})))
+
+    assert {:error, :unknown_change} =
+             ReqChgClient.events_after("https://chg.test", @secret, "C1", 0)
   end
 
   test "401 is :unauthorized; any other status or body is a transient error" do
