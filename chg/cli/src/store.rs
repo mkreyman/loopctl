@@ -3,10 +3,12 @@
 //! ```text
 //! <root>/<repo-key>/
 //!   lock                       flock: shared while hydrating, exclusive for GC
-//!   build.lock                 flock: one snapshot build per repo at a time
+//!   build.lock                 flock: held for a snapshot build or a shadow check, both
+//!                              of which run at build/
 //!   snapshots/<sha>/           a source checkout plus the adapter's artifacts
 //!   snapshots/<sha>/.chg-snapshot.json
-//!   snapshots/.tmp-<sha>-<pid> a build in progress; renamed into place when done
+//!   build/                     where every snapshot is built and every shadow check runs;
+//!                              a finished build is renamed to snapshots/<sha>
 //!   leases/<sha>/<slot>        one per workspace hydrated from <sha>
 //!   history/<sha>.cover        a coverage record (`cover.rs`)
 //! ```
@@ -88,6 +90,43 @@ pub struct Store {
 /// An flock held until drop.
 pub struct Lock(#[allow(dead_code)] File);
 
+/// `op` on `dir/name`, creating both. With `LOCK_NB`: `Ok(None)` when another process
+/// holds it.
+fn flock(dir: &Path, name: &str, op: libc::c_int) -> io::Result<Option<Lock>> {
+    fs::create_dir_all(dir)?;
+    let f = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(name))?;
+    // SAFETY: flock on an fd we own; released when the File closes.
+    if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
+        let e = io::Error::last_os_error();
+        if op & libc::LOCK_NB != 0 && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        return Err(e);
+    }
+    Ok(Some(Lock(f)))
+}
+
+/// `try_once` (a non-blocking flock) polled until it takes the lock or `wait` passes.
+fn wait_lock(
+    wait: Duration,
+    try_once: impl Fn() -> io::Result<Option<Lock>>,
+) -> io::Result<Option<Lock>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Some(l) = try_once()? {
+            return Ok(Some(l));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 impl Store {
     /// The store for the repo `path` belongs to; every worktree of a repo shares one.
     pub fn for_repo(path: &Path) -> Result<Store, String> {
@@ -131,23 +170,8 @@ impl Store {
             .map(|l| l.expect("a blocking flock always returns a lock"))
     }
 
-    /// `op` with `LOCK_NB`: `Ok(None)` when another process holds it.
     fn flock(&self, name: &str, op: libc::c_int) -> io::Result<Option<Lock>> {
-        fs::create_dir_all(&self.dir)?;
-        let f = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join(name))?;
-        // SAFETY: flock on an fd we own; released when the File closes.
-        if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
-            let e = io::Error::last_os_error();
-            if op & libc::LOCK_NB != 0 && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(None);
-            }
-            return Err(e);
-        }
-        Ok(Some(Lock(f)))
+        flock(&self.dir, name, op)
     }
 
     /// Held while a workspace takes its lease and clones; GC waits for it.
@@ -159,8 +183,8 @@ impl Store {
         self.lock("lock", true)
     }
 
-    /// Held for a whole snapshot build. Builds share one workspace slot (one test
-    /// database), so two at once would run their adapters against the same database.
+    /// Held for a whole snapshot build or shadow check: both run at `build_dir()`, in one
+    /// workspace slot and test database, which this lock alone keeps from being shared.
     pub fn lock_build(&self) -> io::Result<Lock> {
         self.lock("build.lock", true)
     }
@@ -168,6 +192,20 @@ impl Store {
     /// The build lock if no build holds it now, else `None`.
     pub fn try_lock_build(&self) -> io::Result<Option<Lock>> {
         self.flock("build.lock", libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    /// The build lock, or `None` once `wait` has passed with it still held.
+    pub fn lock_build_within(&self, wait: Duration) -> io::Result<Option<Lock>> {
+        wait_lock(wait, || self.try_lock_build())
+    }
+
+    /// The one path where snapshots are built and shadow checks run. A build bakes its
+    /// path into the artifacts: Phoenix's `embed_templates` hashes absolute template paths
+    /// into `__mix_recompile__?`, and config may expand paths, so the same build reused
+    /// at another path recompiles those modules and everything compiled against them.
+    /// Building where the checks run makes a snapshot exact for them.
+    pub fn build_dir(&self) -> PathBuf {
+        self.dir.join("build")
     }
 
     /// Held for a whole job of `name` (`culprit`, `revert`) in this repo: each job owns one
@@ -186,33 +224,9 @@ impl Store {
     /// `wait` has passed with the lock still held elsewhere.
     pub fn lock_shadow(&self, wait: Duration) -> io::Result<Option<Lock>> {
         let root = root();
-        fs::create_dir_all(&root)?;
-        let f = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(root.join("shadow.lock"))?;
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            // SAFETY: flock on an fd we own; released when the File closes.
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Some(Lock(f)));
-            }
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                return Err(e);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Ok(None);
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
-
-    /// Where shadow checks put their throwaway worktrees: inside the store, so they sit
-    /// on the snapshots' filesystem and hydrate by cloning.
-    pub fn shadow_dir(&self) -> PathBuf {
-        self.dir.join("shadow")
+        wait_lock(wait, || {
+            flock(&root, "shadow.lock", libc::LOCK_EX | libc::LOCK_NB)
+        })
     }
 
     /// Complete snapshots, newest first. A directory without readable meta is a
@@ -268,7 +282,7 @@ impl Store {
 
     /// Keeps the newest `KEEP` snapshots and every snapshot with a live lease; removes the
     /// rest, every directory that is not a snapshot (missing or unreadable meta), and
-    /// abandoned builds older than a day. Returns the removed shas.
+    /// trash older than a day. Returns the removed shas.
     pub fn gc(&self) -> io::Result<Vec<String>> {
         let now = SystemTime::now();
         let mut doomed = Vec::new();
@@ -309,7 +323,7 @@ impl Store {
                     .metadata()
                     .and_then(|m| m.modified())
                     .is_ok_and(|t| now.duration_since(t).unwrap_or_default() > LEASE_TTL);
-                if (n.starts_with(".tmp-") || n.starts_with(".trash-")) && old {
+                if n.starts_with(".trash-") && old {
                     doomed.push((String::new(), e.path()));
                 }
             }
@@ -323,5 +337,53 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timed_build_lock_gives_up_after_its_wait_and_takes_a_free_lock_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            dir: dir.path().join("repo"),
+        };
+        let held = store.lock_build_within(Duration::ZERO).unwrap();
+        assert!(held.is_some(), "free, so taken at once");
+        let t = std::time::Instant::now();
+        assert!(
+            store
+                .lock_build_within(Duration::from_millis(700))
+                .unwrap()
+                .is_none()
+        );
+        assert!(t.elapsed() >= Duration::from_millis(700));
+        assert!(store.try_lock_build().unwrap().is_none(), "the same lock");
+        drop(held);
+        assert!(store.lock_build_within(Duration::ZERO).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_timed_build_lock_takes_the_lock_once_its_holder_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            dir: dir.path().join("repo"),
+        };
+        let held = store.lock_build_within(Duration::ZERO).unwrap().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            drop(held);
+        });
+        let t = std::time::Instant::now();
+        let got = store.lock_build_within(Duration::from_secs(10)).unwrap();
+        assert!(got.is_some(), "taken once the holder let go");
+        assert!(t.elapsed() >= Duration::from_millis(1_200), "it waited");
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "and did not wait out its deadline"
+        );
+        releaser.join().unwrap();
     }
 }

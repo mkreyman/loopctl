@@ -347,13 +347,20 @@ fn shadow_judges_the_commit_in_a_throwaway_worktree() {
         .map(|e| e.path())
         .find(|p| p.is_dir())
         .unwrap();
-    let ws = store.join("shadow/ws");
+    let ws = store.join("build");
     let first_dirs: Vec<String> = calls
         .lines()
         .filter(|l| l.starts_with("run "))
         .map(|l| l["run ".len()..].to_string())
         .collect();
     assert_eq!(first_dirs.len(), 1, "{calls}");
+    // The snapshot was built where the check ran, so nothing it baked in differs.
+    let built_at: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.starts_with("snapshot "))
+        .map(|l| &l["snapshot ".len()..])
+        .collect();
+    assert_eq!(built_at, vec![first_dirs[0].as_str()], "{calls}");
     env.git(&[
         "worktree",
         "add",
@@ -380,6 +387,26 @@ fn shadow_judges_the_commit_in_a_throwaway_worktree() {
     assert_eq!(again, vec![first_dirs[0].as_str()], "same path, same slot");
     assert_eq!(env.worktrees(), 1, "the leftover is gone too");
     assert!(!ws.exists());
+
+    // A snapshot build clears a killed check's worktree there the same way, its git
+    // registration included.
+    env.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        ws.to_str().unwrap(),
+        &base,
+    ]);
+    assert_eq!(env.worktrees(), 2);
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&sha)
+        .assert()
+        .success();
+    assert_eq!(env.worktrees(), 1, "the build unregistered the leftover");
+    assert!(!ws.exists(), "and renamed its own build away");
 }
 
 #[test]

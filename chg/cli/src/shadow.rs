@@ -4,11 +4,13 @@
 //!
 //! - `chg check --shadow` (from the pre-push hook) resolves the pushed commit and its
 //!   base, starts a detached copy of itself, and returns at once with exit 0.
-//! - That copy waits for this machine's shadow lock, checks the commit out into a
-//!   throwaway worktree inside the snapshot store, hydrates it, runs `chg check` there and
-//!   appends a `chg` row. The live tree is never touched: the real gate may be compiling
-//!   and testing it at the same moment, and the throwaway worktree has its own workspace
-//!   slot, so its own test database.
+//! - That copy waits for the repo's build lock and this machine's shadow lock, checks the
+//!   commit out into a throwaway worktree at the store's build path, hydrates it, runs
+//!   `chg check` there and appends a `chg` row. The live tree is never touched: the real
+//!   gate may be compiling and testing it at the same moment. Snapshots are built at that
+//!   same path, so nothing a build baked in (template hashes, expanded config paths)
+//!   differs and the check recompiles only what the commit changed. The check shares the
+//!   builds' workspace slot, so their test database; the build lock keeps them apart.
 //! - Once its row is written, that copy starts `chg snapshot refresh` of the push's base,
 //!   detached, so the next push's check starts warm. Nothing else refreshes
 //!   snapshots before S8, and a change Mix recompiles everything for (`mix.exs`, config)
@@ -45,6 +47,9 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30 * 60);
 /// The cap on the snapshot build after a check. Nobody waits on it, and a dependency
 /// change rebuilds the dialyzer PLT (42 min on nuc, 2026-10-18).
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+/// How long a shadow check waits for a snapshot build of its repo: past the longest a
+/// refresh may run, so a check after a dependency change is never skipped for it.
+const BUILD_WAIT: Duration = Duration::from_secs(REFRESH_TIMEOUT.as_secs() + 5 * 60);
 /// Logs of detached runs older than this are removed when a new one starts.
 const LOG_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
 
@@ -385,6 +390,20 @@ fn judge(repo: &Path, key: &str, sha: &str, base: &str) -> Row {
         Ok(s) => s,
         Err(e) => return skipped(format!("no snapshot store: {e}")),
     };
+    // Snapshot builds run at the same path; a refresh building there now is left to
+    // finish. Taken before the machine-wide shadow lock, so a long refresh here holds back
+    // only this repo's checks. An unwritable store says nothing about the commit:
+    // skipped, as for no snapshot.
+    let _build = match store.lock_build_within(BUILD_WAIT) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return skipped(format!(
+                "a snapshot build held this repo for {} min",
+                BUILD_WAIT.as_secs() / 60
+            ));
+        }
+        Err(e) => return skipped(format!("build lock: {e}")),
+    };
     let _lock = match store.lock_shadow(LOCK_WAIT) {
         Ok(Some(l)) => l,
         Ok(None) => {
@@ -395,14 +414,9 @@ fn judge(repo: &Path, key: &str, sha: &str, base: &str) -> Row {
         }
         Err(e) => return skipped(format!("shadow lock: {e}")),
     };
-
-    // An unwritable store says nothing about the commit: skipped, as for no snapshot.
-    if let Err(e) = fs::create_dir_all(store.shadow_dir()) {
-        return skipped(format!("creating {}: {e}", store.shadow_dir().display()));
-    }
-    // One fixed path per repo: its workspace slot, so its test database, is the same on
-    // every run (as snapshot builds share one), and the lock makes it ours alone.
-    let scratch = match Scratch::at(&git_dir, &store.shadow_dir().join("ws"), sha) {
+    // One fixed path per repo, the one snapshots are built at: its workspace slot, so its
+    // test database, is the same on every run, and the build lock makes it ours alone.
+    let scratch = match Scratch::at(&git_dir, &store.build_dir(), sha) {
         Ok(s) => s,
         Err(e) => return failed(0, e),
     };

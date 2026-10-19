@@ -10,8 +10,10 @@
 //! 3. Run the adapter's `snapshot` command in it.
 //! 4. Rename it into place atomically, then GC.
 //!
-//! A crash at any step leaves a `.tmp-*` dir that GC removes; it is never mistaken for a
-//! snapshot, because only a renamed dir with its meta file counts.
+//! Every build runs at the store's one build path, where shadow checks also run, so the
+//! paths a build bakes in are the checks' own (`Store::build_dir`). A crash at any step
+//! leaves that dir behind; the next build or check under the build lock clears it, and it
+//! is never mistaken for a snapshot, because only a renamed dir with its meta file counts.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -102,9 +104,9 @@ fn build_inner(
         return Ok(Refresh::Done(Built::Exists(m)));
     }
 
-    let tmp = store
-        .snapshots()
-        .join(format!(".tmp-{sha}-{}", std::process::id()));
+    // Whatever a killed build or check left here is ours to clear under the build lock.
+    let tmp = store.build_dir();
+    crate::scratch::clear(&git::common_dir(repo)?, &tmp);
     let mut guard = TempGuard(Some(tmp.clone()));
 
     // Chosen and cloned under the store lock, so GC cannot remove it in between. Prefer
@@ -136,20 +138,16 @@ fn build_inner(
         }
     }
 
-    // One stable slot per repo for snapshot builds, so they reuse one test database
-    // instead of creating one per temp dir; the build lock keeps them from sharing it
-    // at the same time.
-    let slot = format!(
-        "snap{}",
-        store::fnv8(store.dir.as_os_str().as_encoded_bytes())
-    );
-    // The temp dir is a plain tree with no `.git`, so the adapter cannot ask git which
+    // By its resolved path, as a check's worktree is: the slot (so the test database)
+    // and every path the build bakes in are then the same ones a check here sees.
+    let at = fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone());
+    // The build dir is a plain tree with no `.git`, so the adapter cannot ask git which
     // commit it is: it gets the sha as `CHG_SHA`.
     let doc = match adapter::invoke(
-        &tmp,
+        &at,
         CommandName::Snapshot,
         BTreeMap::from([("sha", sha.clone())]),
-        Some(slot),
+        None,
         timeout,
     ) {
         Invoked::Ok(Document::Snapshot(s)) => s,
