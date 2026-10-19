@@ -136,7 +136,14 @@ any story is read. MINTING, because an expired chg key's live lineage is `[]` an
 reviewer, so it proves only that chg-server MINTED the key — separation of the job from the
 implementer is chg-server's to construct (PRD §6). A landing whose revision (`event.sha`) no chg
 review names is escalated over the control-only `:review_missing` in the landed event's own
-transaction (`EventEffects.after_move/5`).
+transaction (`EventEffects.after_move/5`), FAIL CLOSED: a refused hold rolls the landing back
+so chg redelivers it. The verify half is ONE function every path to `verified` calls —
+verify, verify-all, bulk verify, backfill, bulk mark-complete —
+`ReviewCustody.ensure_landed_review/3`: on a chg story it refuses `review_missing_escalated`
+while the stage is escalated over `:review_missing`, and `chg_review_not_for_landed_revision`
+unless a chg review names the LANDED revision (the `sha` of the newest applied `landed` event
+of the current binding). Escalation in general does NOT block verify; only this edge does.
+Neither refusal records a custody violation.
 
 **Custody-orphan predicates are the ONLY guard for the never-dispatched case.** The DB CHECK
 `stories_reported_done_requires_agent` is satisfied whenever `implementer_dispatch_id IS NULL`, which

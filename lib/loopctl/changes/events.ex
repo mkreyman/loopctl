@@ -121,10 +121,11 @@ defmodule Loopctl.Changes.Events do
   Receives one webhook delivery for `source_id`.
 
   `opts`: `:now` (unix seconds; the clock the window is judged by), `:lock_timeout_ms`
-  (`Capacity.lock_timeout_ms/1`) and `:before_hold` (a 0-arity function run after the
+  (`Capacity.lock_timeout_ms/1`), `:before_hold` (a 0-arity function run after the
   pre-check and before the event's transaction, so a test can commit a rotation or a
-  suspension in exactly that window). All are inputs for tests only; production passes
-  nothing.
+  suspension in exactly that window) and `:escalate` (passed to
+  `Loopctl.Changes.EventEffects.apply_event/3`). All are inputs for tests only; production
+  passes nothing.
   """
   @spec receive_push(term(), push_input(), keyword()) ::
           {:ok, result()}
@@ -143,7 +144,7 @@ defmodule Loopctl.Changes.Events do
       source.tenant_id
       |> in_held_source(source, opts, fn held ->
         reauthenticate!(held, input, now)
-        ingest_one(held, envelope, "push", DateTime.utc_now())
+        ingest_one(held, envelope, "push", DateTime.utc_now(), effects_opts(opts))
       end)
       |> finish_push(source, envelope)
     end
@@ -175,7 +176,7 @@ defmodule Loopctl.Changes.Events do
 
     source.tenant_id
     |> in_held_source(source, opts, fn held ->
-      Enum.reduce(envelopes, {nil, []}, &ingest_pulled_one(held, &1, now, &2))
+      Enum.reduce(envelopes, {nil, []}, &ingest_pulled_one(held, &1, now, &2, opts))
     end)
     |> case do
       {:ok, {applied_seq, pending}} ->
@@ -191,8 +192,8 @@ defmodule Loopctl.Changes.Events do
     end
   end
 
-  defp ingest_pulled_one(source, envelope, now, {applied_seq, pending}) do
-    case ingest_one(source, envelope, "pull", now) do
+  defp ingest_pulled_one(source, envelope, now, {applied_seq, pending}, opts) do
+    case ingest_one(source, envelope, "pull", now, effects_opts(opts)) do
       {:conflict, _existing} ->
         log_conflict(source, envelope, "pull")
         {applied_seq, pending}
@@ -376,7 +377,7 @@ defmodule Loopctl.Changes.Events do
 
   # Inside the tenant transaction. Answers `{outcome, applied_seq, pending}` or
   # `{:conflict, existing}`.
-  defp ingest_one(%Source{} = source, envelope, via, now) do
+  defp ingest_one(%Source{} = source, envelope, via, now, effects_opts) do
     key = %{
       tenant_id: source.tenant_id,
       repo: repo_key(source.repo_full_name),
@@ -387,7 +388,7 @@ defmodule Loopctl.Changes.Events do
 
     case insert_event(source, key, envelope, via, now) do
       :inserted ->
-        {cursor, pending} = apply_ready(cursor, [])
+        {cursor, pending} = apply_ready(cursor, [], effects_opts)
         touch_cursor(cursor, source, now)
         outcome = if cursor.applied_seq >= envelope.event_seq, do: :applied, else: :held
         {outcome, cursor.applied_seq, pending}
@@ -468,7 +469,7 @@ defmodule Loopctl.Changes.Events do
   end
 
   # Applies the stored events from `applied_seq + 1` for as long as the next one is there.
-  defp apply_ready(%Cursor{} = cursor, pending) do
+  defp apply_ready(%Cursor{} = cursor, pending, effects_opts) do
     next = cursor.applied_seq + 1
     key = Map.take(cursor, [:tenant_id, :repo, :change_id])
 
@@ -477,13 +478,13 @@ defmodule Loopctl.Changes.Events do
         {cursor, pending}
 
       %Event{} = event ->
-        more = apply_event(event)
-        apply_ready(%{cursor | applied_seq: next}, pending ++ more)
+        more = apply_event(event, effects_opts)
+        apply_ready(%{cursor | applied_seq: next}, pending ++ more, effects_opts)
     end
   end
 
-  defp apply_event(%Event{tenant_id: tenant_id} = event) do
-    {:ok, effect, effects} = EventEffects.apply_event(tenant_id, event)
+  defp apply_event(%Event{tenant_id: tenant_id} = event, effects_opts) do
+    {:ok, effect, effects} = EventEffects.apply_event(tenant_id, event, effects_opts)
     now = DateTime.utc_now()
 
     {1, _} =
@@ -512,6 +513,9 @@ defmodule Loopctl.Changes.Events do
       {:error, reason} -> Repo.rollback(reason)
     end
   end
+
+  # What of a caller's `opts` reaches `EventEffects.apply_event/3`.
+  defp effects_opts(opts), do: Keyword.take(opts, [:escalate])
 
   defp touch_cursor(%Cursor{} = cursor, source, now) do
     {1, _} =

@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-47.6.1",
-      "description": "For a :chg source, the CI-evidence input passes only when the current binding's landed sha is an ancestor of verified/master (compare by sha), no reverted event follows it, and a review_records row names that sha."
+      "description": "For a :chg source, the CI-evidence input passes only when the current binding's landed sha is an ancestor of verified/master (compare by sha) and no reverted event follows it. That a review_records row names the landed revision is US-47.5's verify gate (AC-47.5.5, 409 chg_review_not_for_landed_revision), which already runs on every verify path; it is not re-implemented here."
     },
     {
       "id": "AC-47.6.2",

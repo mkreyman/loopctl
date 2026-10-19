@@ -2586,6 +2586,13 @@ defmodule Loopctl.Progress do
   - `{:error, :chg_root_cannot_verify}` (US-47.5) if the caller's lineage is rooted at a
     registered `chg_root_dispatch_id` (`Loopctl.Changes.ReviewCustody`), judged on
     `:caller_minting_lineage` when given, else `:verifier_lineage`, before any story is read
+  - `{:error, :review_missing_escalated}` (US-47.5) if the story is bound to a chg change and
+    its delivery stage is `escalated` over `:review_missing`: a human resolves it first
+  - `{:error, :chg_review_not_for_landed_revision}` (US-47.5) if the story is bound to a chg
+    change and no chg review names its LANDED revision — the revision commit of the newest
+    applied `landed` event of its current binding — or it has not landed
+    (`Loopctl.Changes.ReviewCustody.ensure_landed_review/3`). Both run after
+    `review_not_conducted`, so a story with no binding is answered exactly as before
   """
   @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -2648,6 +2655,9 @@ defmodule Loopctl.Progress do
       |> Multi.run(:check_review_record, fn _repo, %{lock: story} ->
         validate_review_record_exists(tenant_id, story_id, story)
       end)
+      |> Multi.run(:chg_landed_review, fn _repo, _changes ->
+        chg_landed_review(tenant_id, story_id)
+      end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_verified_status(story)
       end)
@@ -2678,6 +2688,18 @@ defmodule Loopctl.Progress do
       |> maybe_complete_epic(tenant_id, actor_id, actor_label)
 
     unwrap_verification_transaction(multi)
+  end
+
+  # US-47.5 (AC-47.5.5): a story bound to a chg change is verified only on a chg review of its
+  # LANDED revision, and never while it is held over `:review_missing`
+  # (`Loopctl.Changes.ReviewCustody.ensure_landed_review/3`). Read under the story lock, so a
+  # `landed` event — which locks the same story first — is either committed and seen here, or
+  # waits for this transaction. A no-op on every other story.
+  defp chg_landed_review(tenant_id, story_id) do
+    case ReviewCustody.ensure_landed_review(tenant_id, story_id) do
+      :ok -> {:ok, :landed_review_ok}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc """
@@ -2753,11 +2775,24 @@ defmodule Loopctl.Progress do
              | :story_rejected
              | :story_has_dispatch_lineage
              | :story_entered_lifecycle
-             | :story_in_progress}
+             | :story_in_progress
+             | :review_missing_escalated
+             | :chg_review_not_for_landed_revision}
   def ensure_mark_complete_allowed(story, lifecycle_ids) do
-    case guard_backfillable(story, lifecycle_ids) do
+    case guard_backfill(story, lifecycle_ids) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Backfill and bulk mark-complete reach `verified` with no report and no verifier, so they
+  # take the same chg landed-review gate verify does (US-47.5, AC-47.5.5) after the
+  # lifecycle guard: a chg story never reaches `verified` without a review of its landed
+  # revision, by any path.
+  defp guard_backfill(story, lookup) do
+    with {:ok, _} = ok <- guard_backfillable(story, lookup),
+         {:ok, _} <- chg_landed_review(story.tenant_id, story.id) do
+      ok
     end
   end
 
@@ -2801,6 +2836,10 @@ defmodule Loopctl.Progress do
       with no dispatch lineage yet; it is being worked, not pre-existing done work
     * `{:error, :chg_root_cannot_verify}` (US-47.5) — the caller is chg-rooted; backfill
       reaches the same `verified` state as verify, so it takes the same refusal, first
+    * `{:error, :review_missing_escalated}` / `{:error, :chg_review_not_for_landed_revision}`
+      (US-47.5) — the story is bound to a chg change and is held over `:review_missing`, or
+      no chg review names its landed revision
+      (`Loopctl.Changes.ReviewCustody.ensure_landed_review/3`), as for `verify_story/4`
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
   """
   @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -2818,6 +2857,8 @@ defmodule Loopctl.Progress do
              | :story_entered_lifecycle
              | :story_in_progress
              | :chg_root_cannot_verify
+             | :review_missing_escalated
+             | :chg_review_not_for_landed_revision
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
     reason = params |> Map.get("reason") |> normalize_string()
@@ -2876,7 +2917,7 @@ defmodule Loopctl.Progress do
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
-      |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfillable(story) end)
+      |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfill(story, :query) end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_backfill_status(story, reason, evidence_url, pr_number)
       end)
@@ -3005,9 +3046,7 @@ defmodule Loopctl.Progress do
   #     ACCURATE reason, not a false "dispatch lineage" claim.
   #
   # `lookup` is `:query` on the single-story path and a precomputed MapSet on the
-  # batch path.
-  defp guard_backfillable(story), do: guard_backfillable(story, :query)
-
+  # batch path. Both reach it through `guard_backfill/2`.
   defp guard_backfillable(%{verified_status: :verified}, _lookup),
     do: {:error, :already_verified}
 
@@ -3383,8 +3422,11 @@ defmodule Loopctl.Progress do
     |> AdminRepo.all()
   end
 
+  # The chg-root refusal already ran ONCE for the whole epic (`verify_all_in_epic/4`), so each
+  # story goes to the inner verify; every per-story gate — the chg landed-review check
+  # included — still runs there.
   defp verify_single(tenant_id, story, params, opts) do
-    case verify_story(tenant_id, story.id, params, opts) do
+    case do_verify_story(tenant_id, story.id, opts, extract_verification_params(params)) do
       {:ok, _updated} -> {:ok, story.id}
       {:error, reason} -> {:error, %{story_id: story.id, reason: inspect(reason)}}
     end

@@ -92,7 +92,17 @@ All notable changes to loopctl are documented here.
   Review records now serialise `commit_sha` and `reviewer_dispatch_id`. A chg story that
   reaches `merged` with no such review for its landed revision is escalated in the same
   transaction over a new control-only edge `review_missing` (`merged -> escalated`; the merge
-  stands) and waits for a human. Migration `20261019170000_add_chg_review_custody_to_review_records`
+  stands) and waits for a human; if that escalation cannot be written the whole `landed` event
+  rolls back (503 `busy` on contention, else 500 `change_event_failed`, logged and counted as
+  `[:loopctl, :changes, :review_hold_refused]`) and chg redelivers it, so a merge never commits
+  without its hold. Such a story is never verified: `POST /stories/:id/verify`,
+  `/epics/:id/verify-all`, `/stories/bulk/verify`, `/stories/:id/backfill` and
+  `/stories/bulk/mark-complete` refuse a story bound to a chg change with 409
+  `review_missing_escalated` while it is escalated over `review_missing` (a human resolves it
+  first), and with 409 `chg_review_not_for_landed_revision` unless a chg review names its
+  LANDED revision — the revision commit of the newest applied `landed` event of its current
+  change (verify-all and the bulk paths report either per story). Stories with no change
+  binding are answered exactly as before. Migration `20261019170000_add_chg_review_custody_to_review_records`
   adds the two nullable columns, a CHECK that they are set together, and the unique index;
   additive, no deploy ordering. MCP: loopctl-mcp-server 3.3.0.
 - **Intake-source mode `chg` (US-47.2).** `POST /api/v1/intake/sources` and `PATCH

@@ -24,6 +24,7 @@ defmodule LoopctlWeb.StoryVerificationController do
   alias Loopctl.Verification.VerificationRun
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.CustodyLineage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -62,15 +63,24 @@ defmodule LoopctlWeb.StoryVerificationController do
         "Requires a review_record to exist (call POST /stories/:id/review-complete first). " <>
         "The review_record must have been completed AFTER the story was reported done. " <>
         "A key descending from an intake source's `chg_root_dispatch_id` is refused " <>
-        "409 `chg_root_cannot_verify` (US-47.5) before any story is read.",
+        "409 `chg_root_cannot_verify` (US-47.5) before any story is read. A story BOUND TO A " <>
+        "chg CHANGE is verified only on a chg review of its LANDED revision — the revision " <>
+        "commit of the newest applied `landed` event of its current change — " <>
+        "(409 `chg_review_not_for_landed_revision`), and never while its delivery stage is " <>
+        "escalated over `review_missing` (409 `review_missing_escalated`).",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
       200 => {"Story verified", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition, a custody refusal, or `chg_root_cannot_verify` (" <>
-           Messages.chg_root_cannot_verify() <> ")", "application/json", Schemas.ErrorResponse},
+        {"Invalid transition, a custody refusal, `chg_root_cannot_verify` (" <>
+           Messages.chg_root_cannot_verify() <>
+           "), `review_missing_escalated` (" <>
+           Messages.review_missing_escalated() <>
+           ") or `chg_review_not_for_landed_revision` (" <>
+           Messages.chg_review_not_for_landed_revision() <> ")", "application/json",
+         Schemas.ErrorResponse},
       422 => {"No review record found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -117,7 +127,9 @@ defmodule LoopctlWeb.StoryVerificationController do
         "`claim` signature (gate `verify`), as for POST /stories/:id/verify. " <>
         "Requires a non-empty `reason`; `evidence_url` and `pr_number` are optional but strongly recommended. " <>
         "A key descending from an intake source's `chg_root_dispatch_id` is refused 409 " <>
-        "`chg_root_cannot_verify` (US-47.5). " <>
+        "`chg_root_cannot_verify` (US-47.5). A story bound to a chg change takes the same " <>
+        "landed-review gate verify does: 409 `review_missing_escalated` or " <>
+        "`chg_review_not_for_landed_revision`. " <>
         "Emits a `story.backfilled` webhook event on success.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
@@ -140,8 +152,13 @@ defmodule LoopctlWeb.StoryVerificationController do
         {"Insufficient role (orchestrator+ required)", "application/json", Schemas.ErrorResponse},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`chg_root_cannot_verify` (" <> Messages.chg_root_cannot_verify() <> ")",
-         "application/json", Schemas.ErrorResponse},
+        {"`chg_root_cannot_verify` (" <>
+           Messages.chg_root_cannot_verify() <>
+           "), `review_missing_escalated` (" <>
+           Messages.review_missing_escalated() <>
+           ") or `chg_review_not_for_landed_revision` (" <>
+           Messages.chg_review_not_for_landed_revision() <> ")", "application/json",
+         Schemas.ErrorResponse},
       422 =>
         {"Validation error: missing reason, already verified, already rejected, has dispatch lineage, or already entered the lifecycle",
          "application/json", Schemas.ErrorResponse},
@@ -218,7 +235,11 @@ defmodule LoopctlWeb.StoryVerificationController do
         "Requires review_type and summary in the body (same as single verify). " <>
         "Returns count of verified stories and any errors. A key descending from an intake " <>
         "source's `chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5) for " <>
-        "the whole epic, and nothing is verified.",
+        "the whole epic, and nothing is verified. A story bound to a chg change is skipped " <>
+        "into `errors` with reason `:review_missing_escalated` (" <>
+        Messages.review_missing_escalated() <>
+        ") or `:chg_review_not_for_landed_revision` (" <>
+        Messages.chg_review_not_for_landed_revision() <> ").",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
@@ -269,11 +290,9 @@ defmodule LoopctlWeb.StoryVerificationController do
           # request body), is what the L4 gate compares against the implementer's,
           # and what the signed-custody-claim audit entry records — both read it
           # under this exact key.
-          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id),
-          # US-47.5: the lineage the chg-root refusal judges — the MINTING one, revoked or
-          # not, so a chg key whose dispatch has expired is still chg's.
-          caller_minting_lineage: Dispatches.minting_lineage_for_api_key(tenant_id, api_key.id)
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
@@ -342,15 +361,21 @@ defmodule LoopctlWeb.StoryVerificationController do
         # in the hash-chained audit entry — verifying it and dropping it leaves no
         # durable residue and is half a control.
         custody_claim: conn.assigns[:custody_signed_claim],
-        verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id),
-        caller_minting_lineage: Dispatches.minting_lineage_for_api_key(tenant_id, api_key.id)
+        verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
       )
+      |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
     case Progress.backfill_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
-      {:error, reason} when reason in [:not_found, :chg_root_cannot_verify] ->
+      {:error, reason}
+      when reason in [
+             :not_found,
+             :chg_root_cannot_verify,
+             :review_missing_escalated,
+             :chg_review_not_for_landed_revision
+           ] ->
         {:error, reason}
 
       {:error, %Ecto.Changeset{} = changeset} ->
@@ -440,9 +465,9 @@ defmodule LoopctlWeb.StoryVerificationController do
           orchestrator_agent_id: api_key.agent_id,
           # Reject is a custody decision (terminal `:rejected` + auto-reset), so it
           # takes the same server-resolved caller lineage verify does.
-          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id),
-          caller_minting_lineage: Dispatches.minting_lineage_for_api_key(tenant_id, api_key.id)
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
       case Progress.reject_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
@@ -566,9 +591,9 @@ defmodule LoopctlWeb.StoryVerificationController do
           # verify-all forwards these opts to verify_story/4 per story, so omitting
           # the caller's lineage skipped the whole L4 comparison on the WIDER-blast-
           # radius path while the single-story route enforced it.
-          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id),
-          caller_minting_lineage: Dispatches.minting_lineage_for_api_key(tenant_id, api_key.id)
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
       with {:ok, result} <- Progress.verify_all_in_epic(tenant_id, epic_id, params, opts) do
         json(conn, result)

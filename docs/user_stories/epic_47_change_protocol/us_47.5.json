@@ -32,7 +32,7 @@
     },
     {
       "id": "AC-47.5.5",
-      "description": "A story that reaches merged with no review_records row for its landed revision escalates over a new control-only edge :review_missing (merged to escalated) through Escalations.escalate_as_control/3, and is never verified."
+      "description": "A story that reaches merged with no review_records row for its landed revision escalates over a new control-only edge :review_missing (merged to escalated) through Escalations.escalate_as_control/3, in the landed event's own transaction; if that escalation cannot be written the landed event rolls back (503 busy on contention, else 500 change_event_failed) so chg redelivers it. The story is never verified: verify_story, verify_all, bulk verify, backfill and bulk mark-complete refuse a story bound to a chg change with 409 review_missing_escalated while its stage is escalated over :review_missing and unresolved, and with 409 chg_review_not_for_landed_revision unless a review_records row with a reviewer dispatch names its landed revision (the sha of the newest applied landed event of its current binding). A story with no change binding is answered exactly as before."
     }
   ],
   "test_cases": [
@@ -122,6 +122,28 @@
       ],
       "expected_results": [
         "escalated over :review_missing"
+      ]
+    },
+    {
+      "id": "TC-47.5.6",
+      "verifies": [
+        "AC-47.5.5"
+      ],
+      "name": "escalated or unreviewed landing is never verified",
+      "type": "integration",
+      "preconditions": [
+        "a chg story escalated over :review_missing",
+        "a chg story whose only review names an earlier revision"
+      ],
+      "steps": [
+        "verify_story",
+        "verify_all",
+        "bulk verify",
+        "backfill"
+      ],
+      "expected_results": [
+        "409 review_missing_escalated",
+        "409 chg_review_not_for_landed_revision"
       ]
     }
   ],

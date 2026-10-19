@@ -26,6 +26,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `chg_root_dispatch_id` never certifies; the bulk paths refuse the whole call.
 - **`claim_story` and `report_story` document 409 `chg_root_review_only`**: chg-server's keys
   may only review.
+- **`verify_story`, `verify_all_in_epic` and `bulk_mark_complete` document the chg
+  landed-review gate** (AC-47.5.5): a story bound to a chg change is verified only on a chg
+  review of its LANDED revision (409 `chg_review_not_for_landed_revision`) and never while its
+  stage is escalated over `review_missing` (409 `review_missing_escalated`); the epic and bulk
+  paths report either as a per-story error.
 
 ## 3.2.0 — 2026-10-19 (change_binding_get)
 

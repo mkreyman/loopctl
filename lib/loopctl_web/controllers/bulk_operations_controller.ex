@@ -17,6 +17,7 @@ defmodule LoopctlWeb.BulkOperationsController do
   alias Loopctl.BulkOperations
   alias Loopctl.Dispatches
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.CustodyLineage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -60,7 +61,11 @@ defmodule LoopctlWeb.BulkOperationsController do
     description:
       "Orchestrator verifies multiple reported_done stories. A key descending from an " <>
         "intake source's `chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` " <>
-        "(US-47.5) for the whole batch, and nothing is verified.",
+        "(US-47.5) for the whole batch, and nothing is verified. A story bound to a chg " <>
+        "change is a per-story error whose reason leads with `review_missing_escalated` (" <>
+        Messages.review_missing_escalated() <>
+        ") or `chg_review_not_for_landed_revision` (" <>
+        Messages.chg_review_not_for_landed_revision() <> ").",
     request_body: {"Verify params", "application/json", Schemas.BulkVerifyRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
@@ -100,7 +105,9 @@ defmodule LoopctlWeb.BulkOperationsController do
         "Intended for importing pre-existing work. " <>
         "Skips the normal contract→claim→start→report→verify workflow. " <>
         "Requires orchestrator role. A key descending from an intake source's " <>
-        "`chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5).",
+        "`chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5). A story " <>
+        "bound to a chg change is a per-story error leading with `review_missing_escalated` " <>
+        "or `chg_review_not_for_landed_revision`, as on bulk verify.",
     request_body:
       {"Mark-complete params", "application/json",
        %OpenApiSpex.Schema{
@@ -157,7 +164,9 @@ defmodule LoopctlWeb.BulkOperationsController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
     agent_id = api_key.agent_id
-    audit_opts = Keyword.merge(AuditContext.from_conn(conn), chg_root_opts(api_key))
+
+    audit_opts =
+      Keyword.merge(AuditContext.from_conn(conn), CustodyLineage.chg_root_opts(api_key))
 
     case BulkOperations.bulk_claim(tenant_id, story_ids, agent_id, audit_opts) do
       {:ok, results} ->
@@ -261,7 +270,9 @@ defmodule LoopctlWeb.BulkOperationsController do
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
       orchestrator_agent_id = api_key.agent_id
-      audit_opts = Keyword.merge(AuditContext.from_conn(conn), chg_root_opts(api_key))
+
+      audit_opts =
+        Keyword.merge(AuditContext.from_conn(conn), CustodyLineage.chg_root_opts(api_key))
 
       case BulkOperations.bulk_mark_complete(
              tenant_id,
@@ -305,17 +316,8 @@ defmodule LoopctlWeb.BulkOperationsController do
     |> Keyword.merge(
       verifier_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
     )
-    |> Keyword.merge(chg_root_opts(api_key))
+    |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
   end
-
-  # US-47.5: the lineage `BulkOperations` judges the chg-root refusal on — the caller's
-  # MINTING lineage, revoked or not, resolved from the authenticating key like every other
-  # lineage on this surface, never from the request body.
-  defp chg_root_opts(api_key),
-    do: [
-      caller_minting_lineage:
-        Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id)
-    ]
 
   defp respond_with_results(conn, results) do
     has_success = Enum.any?(results, &(&1.status == "success"))

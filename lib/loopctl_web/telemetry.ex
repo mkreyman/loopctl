@@ -145,6 +145,12 @@ defmodule LoopctlWeb.Telemetry do
         tags: [:source, :reason],
         description: "chg change events refused 401, by source and reason."
       ),
+      # US-47.5: a landing whose `review_missing` hold could not be written, so the whole event
+      # rolled back and chg will redeliver it. Not contention (that is `:busy`): alert on any.
+      counter("loopctl.changes.review_hold_refused.count",
+        event_name: [:loopctl, :changes, :review_hold_refused],
+        description: "chg landed events rolled back because the review_missing hold was refused."
+      ),
       # A gap pull chg-server refused for its signature: under a one-sided secret rotation,
       # the only signal loopctl gets. Alert on any.
       counter("loopctl.changes.pull_refused.count",

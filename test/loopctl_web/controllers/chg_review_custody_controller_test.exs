@@ -100,16 +100,13 @@ defmodule LoopctlWeb.ChgReviewCustodyControllerTest do
 
   defp sha(char), do: String.duplicate(char, 40)
 
-  defp submit!(ctx, story, revision_sha) do
+  defp submit!(ctx, story, revision_sha),
+    do: push!(ctx, 1, "submitted", %{sha: revision_sha, data: %{"story_id" => story.id}})
+
+  defp push!(ctx, seq, kind, attrs) do
     raw =
       Jason.encode!(
-        build(:chg_event, %{
-          change_id: "C1",
-          event_seq: 1,
-          kind: "submitted",
-          sha: revision_sha,
-          data: %{"story_id" => story.id}
-        })
+        build(:chg_event, Map.merge(%{change_id: "C1", event_seq: seq, kind: kind}, attrs))
       )
 
     ts = Integer.to_string(System.os_time(:second))
@@ -320,6 +317,88 @@ defmodule LoopctlWeb.ChgReviewCustodyControllerTest do
     end
   end
 
+  describe "a chg story's landed-review gate on the verify routes (AC-47.5.5)" do
+    test "409 chg_review_not_for_landed_revision on verify and backfill; per-story on the " <>
+           "bulk and epic routes",
+         %{conn: conn} = ctx do
+      # Bound and landed with NO stage row, so nothing escalates; the only review on record is
+      # one recorded off the chg path, which names no revision.
+      story = reviewed(ctx)
+      :ok = submit!(ctx, story, sha("a"))
+      :ok = push!(ctx, 2, "landed", %{sha: sha("a"), data: %{"merge_sha" => sha("c")}})
+
+      error =
+        conn
+        |> auth(ctx.orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "ok"})
+        |> error_of(409)
+
+      assert error["code"] == "chg_review_not_for_landed_revision"
+      assert error["message"] == Messages.chg_review_not_for_landed_revision()
+
+      assert %{"results" => [%{"status" => "error", "reason" => reason}]} =
+               build_conn()
+               |> auth(ctx.orch_key)
+               |> post(~p"/api/v1/stories/bulk/verify", %{
+                 "stories" => [%{"story_id" => story.id}]
+               })
+               |> json_response(422)
+
+      assert reason =~ "chg_review_not_for_landed_revision"
+
+      assert %{
+               "verified_count" => 0,
+               "errors" => [%{"reason" => ":chg_review_not_for_landed_revision"}]
+             } =
+               build_conn()
+               |> auth(ctx.orch_key)
+               |> post(~p"/api/v1/epics/#{ctx.epic.id}/verify-all", %{
+                 "review_type" => "chg",
+                 "summary" => "all"
+               })
+               |> json_response(200)
+
+      pending = fixture(:story, %{tenant_id: ctx.tenant.id, epic_id: ctx.epic.id})
+      c2 = %{change_id: "C2", sha: sha("b")}
+      :ok = push!(ctx, 1, "submitted", Map.put(c2, :data, %{"story_id" => pending.id}))
+      :ok = push!(ctx, 2, "landed", Map.put(c2, :data, %{"merge_sha" => sha("d")}))
+
+      assert build_conn()
+             |> auth(ctx.orch_key)
+             |> post(~p"/api/v1/stories/#{pending.id}/backfill", %{"reason" => "pre-existing"})
+             |> error_of(409)
+             |> Map.fetch!("code") == "chg_review_not_for_landed_revision"
+
+      assert AdminRepo.get!(Story, story.id).verified_status == :unverified
+      assert AdminRepo.get!(Story, pending.id).verified_status == :unverified
+    end
+
+    test "409 review_missing_escalated while the landing's hold stands", %{conn: conn} = ctx do
+      story = reviewed(ctx)
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant.id,
+        story_id: ctx.story.id,
+        stage: :implementing
+      })
+
+      :ok = submit!(ctx, ctx.story, sha("a"))
+      :ok = push!(ctx, 2, "review_approved", %{data: %{"by" => "policy"}})
+      :ok = push!(ctx, 3, "check_passed", %{})
+      :ok = push!(ctx, 4, "landed", %{sha: sha("a"), data: %{"merge_sha" => sha("c")}})
+
+      error =
+        conn
+        |> auth(ctx.orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "ok"})
+        |> error_of(409)
+
+      assert error["code"] == "review_missing_escalated"
+      assert error["message"] == Messages.review_missing_escalated()
+      assert AdminRepo.get!(Story, story.id).verified_status == :unverified
+    end
+  end
+
   describe "chg_root_review_only on claim and report" do
     test "a chg agent-role child cannot claim, singly or in bulk", %{conn: conn} = ctx do
       contracted =
@@ -357,12 +436,36 @@ defmodule LoopctlWeb.ChgReviewCustodyControllerTest do
     end
   end
 
+  describe "one resolver for the chg-root lineage, at every custody route" do
+    test "chg_root_opts/1 resolves the MINTING lineage, an expired chg key's included", ctx do
+      1 = Dispatches.revoke_dispatch_rows(ctx.tenant.id, [ctx.chg_child.id], DateTime.utc_now())
+      key = %{tenant_id: ctx.tenant.id, id: ctx.chg_child.api_key_id}
+
+      assert LoopctlWeb.CustodyLineage.chg_root_opts(key) == [
+               caller_minting_lineage: ctx.chg_child.lineage_path
+             ]
+    end
+
+    test "no custody controller resolves it inline" do
+      for file <-
+            ~w(story_verification_controller story_status_controller bulk_operations_controller) do
+        source = File.read!("lib/loopctl_web/controllers/#{file}.ex")
+        refute source =~ "minting_lineage_for_api_key", file
+        assert source =~ "CustodyLineage.chg_root_opts(api_key)", file
+      end
+    end
+  end
+
   describe "the OpenAPI spec declares each new refusal, with the message the body carries" do
     @declared [
       {"/api/v1/stories/{id}/review-complete", 409, &Messages.chg_reviewer_required/0},
       {"/api/v1/stories/{id}/review-complete", 409, &Messages.chg_review_already_recorded/0},
       {"/api/v1/stories/{id}/review-complete", 422, &Messages.commit_sha_not_bound/0},
       {"/api/v1/stories/{id}/verify", 409, &Messages.chg_root_cannot_verify/0},
+      {"/api/v1/stories/{id}/verify", 409, &Messages.review_missing_escalated/0},
+      {"/api/v1/stories/{id}/verify", 409, &Messages.chg_review_not_for_landed_revision/0},
+      {"/api/v1/stories/{id}/backfill", 409, &Messages.review_missing_escalated/0},
+      {"/api/v1/stories/{id}/backfill", 409, &Messages.chg_review_not_for_landed_revision/0},
       {"/api/v1/stories/{id}/reject", 409, &Messages.chg_root_cannot_verify/0},
       {"/api/v1/epics/{id}/verify-all", 409, &Messages.chg_root_cannot_verify/0},
       {"/api/v1/stories/{id}/backfill", 409, &Messages.chg_root_cannot_verify/0},
@@ -381,6 +484,20 @@ defmodule LoopctlWeb.ChgReviewCustodyControllerTest do
         response = paths[path].post.responses[status]
         assert response, "#{path} does not declare #{status}"
         assert response.description =~ message.(), "#{path} #{status} does not quote the message"
+      end
+    end
+
+    test "verify-all and the bulk verify routes name the per-story landed-review codes" do
+      paths = Loopctl.ApiSpec.spec().paths
+
+      for path <- [
+            "/api/v1/epics/{id}/verify-all",
+            "/api/v1/stories/bulk/verify",
+            "/api/v1/stories/bulk/mark-complete"
+          ] do
+        description = paths[path].post.description
+        assert description =~ "review_missing_escalated", path
+        assert description =~ "chg_review_not_for_landed_revision", path
       end
     end
 

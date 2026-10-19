@@ -71,6 +71,14 @@ describe("descriptions name the US-47.5 refusals", () => {
     });
   }
 
+  for (const name of ["verify_story", "verify_all_in_epic", "bulk_mark_complete"]) {
+    test(`${name}: the chg landed-review gate (review_missing_escalated, chg_review_not_for_landed_revision)`, () => {
+      const d = tool(name).description;
+      assert.match(d, /review_missing_escalated/);
+      assert.match(d, /chg_review_not_for_landed_revision/);
+    });
+  }
+
   for (const name of ["claim_story", "report_story"]) {
     test(`${name}: 409 chg_root_review_only`, () => {
       assert.match(tool(name).description, /409 chg_root_review_only/);

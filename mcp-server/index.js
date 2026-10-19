@@ -4973,7 +4973,12 @@ const TOOLS = [
       "Transitions reported_done -> verified. Uses the ORCH key. Refused 409 " +
       "chg_root_cannot_verify when the key descends from an intake source's " +
       "chg_root_dispatch_id (loopctl US-47.5): chg-server's keys review and never verify — " +
-      "use an orchestrator key outside chg's tree.",
+      "use an orchestrator key outside chg's tree. A story BOUND TO A chg CHANGE is verified " +
+      "only on a chg review of its LANDED revision (the revision commit of the newest " +
+      "applied landed event of its current change), else 409 " +
+      "chg_review_not_for_landed_revision — have chg dispatch a review naming that sha; and " +
+      "never while its stage is escalated over review_missing, else 409 " +
+      "review_missing_escalated — a human resolves it first (resolve_escalation).",
     inputSchema: {
       type: "object",
       properties: {
@@ -5029,7 +5034,8 @@ const TOOLS = [
       "Bulk mark multiple stories as complete (backfill-only for never-dispatched work). " +
       "ADMIN USE ONLY: backfill pre-existing completed work into pending stories that never entered the dispatch lifecycle. " +
       "For dispatched stories, use the normal report/review/verify flow. Each story entry needs a story_id, summary, and review_type. Uses the ORCH key. " +
-      "Refused 409 chg_root_cannot_verify for the whole batch when the key descends from an intake source's chg_root_dispatch_id (loopctl US-47.5).",
+      "Refused 409 chg_root_cannot_verify for the whole batch when the key descends from an intake source's chg_root_dispatch_id (loopctl US-47.5). " +
+      "A story bound to a chg change is a per-story error leading with review_missing_escalated or chg_review_not_for_landed_revision, the same landed-review gate verify_story applies.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5065,7 +5071,9 @@ const TOOLS = [
       "Bulk verify all reported_done, unverified stories in an epic. " +
       "Convenience endpoint for the orchestrator after a review pass. Uses the ORCH key. " +
       "Refused 409 chg_root_cannot_verify for the whole epic, verifying nothing, when the key " +
-      "descends from an intake source's chg_root_dispatch_id (loopctl US-47.5).",
+      "descends from an intake source's chg_root_dispatch_id (loopctl US-47.5). A story bound " +
+      "to a chg change is skipped into errors with review_missing_escalated or " +
+      "chg_review_not_for_landed_revision, the same landed-review gate verify_story applies.",
     inputSchema: {
       type: "object",
       properties: {

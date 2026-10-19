@@ -274,7 +274,9 @@ PR-shaped. For a `mode: :chg` source it reads instead:
 - the bound change's `landed` sha must be an ancestor of the repo's `verified/master` (compare
   API, by sha);
 - no `reverted` event may follow it;
-- a `review_records` row must exist whose `commit_sha` is the landed revision (§6).
+- a `review_records` row must exist whose `commit_sha` is the landed revision (§6) — enforced
+  on every verify path by 47.5 (`chg_review_not_for_landed_revision`), so 47.6 adds only the
+  two trunk checks above.
 
 The verifier is whoever verifies stories in the delivery loop today. `verify_story` keeps every
 existing gate (exact `:orchestrator`, lineage, recorded separation) and adds §6's
@@ -303,7 +305,7 @@ chg must change is filed on mkreyman/chg.
 | default | where to overrule | effect of overruling |
 |---|---|---|
 | The change protocol lives in chg-server, not loopctl (chg design §5, §10) | here, or chg `docs/design.md` §10 | loopctl absorbs chg phase 2: this epic grows to ledger + lander + review dispatch, and landing inherits loopctl's outages |
-| An auto-approved story-bound change escalates `review_missing` rather than verifying | 47.5 | a story could reach `verified` with no reviewer, which is a custody gap |
+| An auto-approved story-bound change escalates `review_missing` rather than verifying, and every verify path (verify, verify-all, bulk verify, backfill, bulk mark-complete) refuses a chg story while it is escalated over `review_missing` (409 `review_missing_escalated`) and unless a chg review names its landed revision — the sha of the newest applied `landed` event of its current binding (409 `chg_review_not_for_landed_revision`) | 47.5 | a story could reach `verified` with no reviewer, which is a custody gap |
 | A root counts as chg's for `chg_root_cannot_verify` while ANY intake source of the tenant names it, live or revoked, `chg` or `pr` mode, judged on the caller's MINTING lineage (`Loopctl.Changes.ReviewCustody`) | 47.5 | narrowing to live `chg` sources lets a revoked or switched source's reviewer tree verify; judging the live lineage lets an expired chg key reject |
 | chg-rooted keys are also refused `claim`, bulk claim and `report` (`chg_root_review_only`) | 47.5 | an agent-role child of chg's root could claim a story and a sibling review it — siblings pass the lineage gate |
 | `review_complete` keeps requiring `reported_done`, so chg's reviewer must record after the implementer reports | 47.5 | a review recorded before the report is refused 422 `story_not_reported_done`, and a landing with none escalates `review_missing` |

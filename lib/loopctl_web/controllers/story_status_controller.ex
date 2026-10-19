@@ -26,6 +26,7 @@ defmodule LoopctlWeb.StoryStatusController do
   alias Loopctl.Progress
   alias Loopctl.Progress.StateMachine
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.CustodyLineage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -425,7 +426,7 @@ defmodule LoopctlWeb.StoryStatusController do
       AuditContext.from_conn(conn)
       |> Keyword.merge(agent_id: api_key.agent_id)
       |> Keyword.merge(custody_identity(api_key))
-      |> Keyword.merge(chg_root_opts(api_key))
+      |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
     case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
@@ -581,7 +582,7 @@ defmodule LoopctlWeb.StoryStatusController do
       # gate fed by :reporter_lineage above is the enforcement. :dispatch_id is
       # still resolved server-side so the reporter's dispatch is recorded.
       |> Keyword.merge(custody_identity(api_key))
-      |> Keyword.merge(chg_root_opts(api_key))
+      |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
       |> maybe_add_token_usage(params)
       |> Keyword.put(:claim_epoch, params["claim_epoch"])
 
@@ -774,14 +775,6 @@ defmodule LoopctlWeb.StoryStatusController do
   # key). `[]` is inert — it matches a cap minted for `[]` and is never a lineage
   # "match" for the custody gates (Dispatches.lineage_shares_prefix?/2), so such a
   # caller falls back to the agent-id checks rather than short-circuiting them.
-  # US-47.5: the lineage the chg-root refusal judges on claim and report — the MINTING one,
-  # revoked or not (`Loopctl.Changes.ReviewCustody`), from the authenticating key.
-  defp chg_root_opts(api_key),
-    do: [
-      caller_minting_lineage:
-        Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id)
-    ]
-
   defp custody_identity(api_key) do
     case Dispatches.dispatch_for_api_key(api_key.tenant_id, api_key.id) do
       {:ok, dispatch} -> [dispatch_id: dispatch.id, lineage: dispatch.lineage_path]

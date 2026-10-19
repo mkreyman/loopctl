@@ -47,6 +47,17 @@ defmodule Loopctl.Changes.ReviewCustody do
   who CLEARS the column on a `pr` source (an audited write, `intake_source_chg_root_set`)
   lifts the refusal for that root, which is the one way back.
 
+  ## What may be verified (AC-47.5.5)
+
+  A chg story reaches `verified` — by verify, verify-all, bulk verify, backfill or bulk
+  mark-complete — only through `ensure_landed_review/3`: never while its delivery stage is
+  `escalated` over `:review_missing` (a human resolves that first), and never without a chg
+  review naming its LANDED REVISION. The landed revision is the envelope `sha` (the revision
+  commit chg reviewed, never `data.merge_sha`, the trunk commit) of the APPLIED `landed` event
+  with the highest `event_seq` of the story's CURRENT binding's change. A story with no
+  current binding, or whose change has not landed, has no landed revision and is refused the
+  same way: nothing chg reviewed is on trunk to certify.
+
   ## Reads
 
   `AdminRepo` (or the caller's `Loopctl.Repo` tenant transaction) with an explicit `tenant_id`
@@ -61,6 +72,8 @@ defmodule Loopctl.Changes.ReviewCustody do
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
+  alias Loopctl.Delivery.StageEvent
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.GitSha
   alias Loopctl.Intake.Source
 
@@ -182,6 +195,77 @@ defmodule Loopctl.Changes.ReviewCustody do
   end
 
   def reviewed_revision?(_repo, _tenant_id, _story_id, _sha), do: false
+
+  @doc """
+  The verify-side half of AC-47.5.5, called by EVERY path that reaches `verified` (single
+  verify and verify-all through `Loopctl.Progress.verify_story/4`, bulk verify, backfill and
+  bulk mark-complete): `:ok` for a story with no change binding — untouched — and for a chg
+  story only when it is not held over `:review_missing` and a chg review names its landed
+  revision (see the moduledoc). Otherwise, in this order:
+
+    * `{:error, :review_missing_escalated}` — its stage row is `escalated`, entered over
+      `:review_missing` and not yet resolved by a human;
+    * `{:error, :chg_review_not_for_landed_revision}` — no `review_records` row with a
+      `reviewer_dispatch_id` names the landed revision, or there is no landed revision.
+
+  Reads on `repo` (default `AdminRepo`, the verify transaction's), tenant-scoped.
+  """
+  @spec ensure_landed_review(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          :ok | {:error, :review_missing_escalated | :chg_review_not_for_landed_revision}
+  def ensure_landed_review(repo \\ AdminRepo, tenant_id, story_id) do
+    case chg_story(repo, tenant_id, story_id) do
+      :not_chg ->
+        :ok
+
+      {:chg, chg} ->
+        cond do
+          review_missing_escalated?(repo, tenant_id, story_id) ->
+            {:error, :review_missing_escalated}
+
+          reviewed_revision?(repo, tenant_id, story_id, landed_revision(repo, tenant_id, chg)) ->
+            :ok
+
+          true ->
+            {:error, :chg_review_not_for_landed_revision}
+        end
+    end
+  end
+
+  # The revision commit of the newest APPLIED `landed` event of the current binding's change.
+  defp landed_revision(repo, tenant_id, %{binding: %Binding{} = binding}) do
+    repo.one(
+      from e in Event,
+        where:
+          e.tenant_id == ^tenant_id and e.repo == ^binding.repo and
+            e.change_id == ^binding.change_id and e.kind == "landed" and
+            not is_nil(e.applied_at),
+        order_by: [desc: e.event_seq],
+        limit: 1,
+        select: e.sha
+    )
+  end
+
+  defp landed_revision(_repo, _tenant_id, _chg), do: nil
+
+  # The row is `escalated` and the transition that put it there — its newest — was
+  # `:review_missing`. Nothing moves a row out of `escalated` without a transition
+  # (`:human_resolution`), so the newest transition of an escalated row is the one into it.
+  defp review_missing_escalated?(repo, tenant_id, story_id) do
+    edge =
+      repo.one(
+        from e in StageEvent,
+          join: s in StoryStage,
+          on: s.story_id == e.story_id and s.tenant_id == e.tenant_id,
+          where:
+            e.tenant_id == ^tenant_id and e.story_id == ^story_id and
+              e.event == "transitioned" and s.stage == :escalated,
+          order_by: [desc: e.inserted_at, desc: e.lock_version],
+          limit: 1,
+          select: e.edge
+      )
+
+    edge == "review_missing"
+  end
 
   @doc """
   True when `lineage`'s ROOT is a `chg_root_dispatch_id` some intake source of the tenant

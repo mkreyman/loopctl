@@ -78,4 +78,29 @@ defmodule Loopctl.ApiSpec.Messages do
       "chg_root_dispatch_id. chg-server's keys may only review: claiming or reporting a " <>
       "story from chg's tree would let one tree implement and review the same work."
   end
+
+  @doc """
+  The 409 `review_missing_escalated` message (verify, verify-all, bulk verify, backfill, bulk
+  mark-complete on a chg story held over `:review_missing`).
+  """
+  @spec review_missing_escalated() :: String.t()
+  def review_missing_escalated do
+    "This story is bound to a chg change that landed with no chg review recorded for its " <>
+      "landed revision, so its delivery stage is escalated over review_missing. It is not " <>
+      "verified until a human resolves that escalation (POST /api/v1/stories/:id/stage/" <>
+      "resolve, MCP resolve_escalation), and then only on a chg review of the landed revision."
+  end
+
+  @doc """
+  The 409 `chg_review_not_for_landed_revision` message (verify, verify-all, bulk verify,
+  backfill, bulk mark-complete on a chg story).
+  """
+  @spec chg_review_not_for_landed_revision() :: String.t()
+  def chg_review_not_for_landed_revision do
+    "This story is bound to a chg change, so it is verified only on a review a chg-minted " <>
+      "reviewer recorded for its LANDED revision: the revision commit (the envelope sha) of " <>
+      "the newest applied `landed` event of its current change. No such review exists — the " <>
+      "change has not landed, or no chg review names that revision (a review of an earlier " <>
+      "revision, or one recorded off the chg path, does not count)."
+  end
 end

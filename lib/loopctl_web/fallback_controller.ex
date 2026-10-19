@@ -52,6 +52,8 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :chg_review_already_recorded}` -> 409 (US-47.5: the chg reviewer dispatch already recorded its one verdict)
   - `{:error, :chg_root_cannot_verify}` -> 409 (US-47.5: a chg-rooted key tried to verify, reject, verify-all, bulk verify/reject, backfill or mark complete)
   - `{:error, :chg_root_review_only}` -> 409 (US-47.5: a chg-rooted key tried to claim or report)
+  - `{:error, :review_missing_escalated}` -> 409 (US-47.5: a chg story held over `:review_missing` reached a verify path; a human resolves the escalation first)
+  - `{:error, :chg_review_not_for_landed_revision}` -> 409 (US-47.5: a chg story reached a verify path with no chg review of its landed revision)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
     a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 ingest backpressure —
@@ -602,7 +604,9 @@ defmodule LoopctlWeb.FallbackController do
              :chg_reviewer_required,
              :chg_review_already_recorded,
              :chg_root_cannot_verify,
-             :chg_root_review_only
+             :chg_root_review_only,
+             :review_missing_escalated,
+             :chg_review_not_for_landed_revision
            ] do
     conn
     |> put_status(:conflict)
@@ -1368,4 +1372,8 @@ defmodule LoopctlWeb.FallbackController do
 
   defp chg_custody_message(:chg_root_cannot_verify), do: Messages.chg_root_cannot_verify()
   defp chg_custody_message(:chg_root_review_only), do: Messages.chg_root_review_only()
+  defp chg_custody_message(:review_missing_escalated), do: Messages.review_missing_escalated()
+
+  defp chg_custody_message(:chg_review_not_for_landed_revision),
+    do: Messages.chg_review_not_for_landed_revision()
 end
