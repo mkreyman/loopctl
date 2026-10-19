@@ -8,7 +8,9 @@
 //!    are rewritten, so every unchanged file keeps its mtime and the adapter's
 //!    incremental build sees only the delta.
 //! 3. Run the adapter's `snapshot` command in it.
-//! 4. Rename it into place atomically, then GC.
+//! 4. Rename it into place, then GC. Replacing a snapshot built at another path takes two
+//!    renames, old tree aside and new into place, under the store's exclusive lock; an
+//!    unlocked `list` between them sees the sha missing.
 //!
 //! Every build runs at the store's one build path, where shadow checks also run, so the
 //! paths a build bakes in are the checks' own (`Store::build_dir`). A crash at any step
@@ -84,7 +86,13 @@ fn build_inner(
     let started = Instant::now();
     let sha = git::resolve(repo, rev)?;
     let store = Store::for_repo(repo)?;
-    if let Some(m) = store.list().into_iter().find(|m| m.sha == sha) {
+    let here = store.resolved_build_dir();
+    // A snapshot built at another path is rebuilt here: reused, it would recompile in full.
+    if let Some(m) = store
+        .list()
+        .into_iter()
+        .find(|m| m.sha == sha && m.is_built_at(&here))
+    {
         return Ok(Refresh::Done(Built::Exists(m)));
     }
     fs::create_dir_all(store.snapshots()).map_err(|e| format!("creating the store: {e}"))?;
@@ -100,7 +108,11 @@ fn build_inner(
         store.lock_build().map_err(|e| format!("build lock: {e}"))?
     };
     // Another build may have finished this one while we waited for the lock.
-    if let Some(m) = store.list().into_iter().find(|m| m.sha == sha) {
+    if let Some(m) = store
+        .list()
+        .into_iter()
+        .find(|m| m.sha == sha && m.is_built_at(&here))
+    {
         return Ok(Refresh::Done(Built::Exists(m)));
     }
 
@@ -115,7 +127,9 @@ fn build_inner(
         let _lock = store
             .lock_shared()
             .map_err(|e| format!("store lock: {e}"))?;
-        let ancestor = store.nearest_ancestor(repo, &sha).map(|(m, _)| m);
+        let ancestor = store
+            .nearest_ancestor(repo, &sha, Some(&here))
+            .map(|(m, _)| m);
         if refresh && ancestor.is_none() {
             return Ok(Refresh::NoAncestor);
         }
@@ -164,6 +178,7 @@ fn build_inner(
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default(),
         ms: started.elapsed().as_millis() as u64,
+        built_in: Some(at.to_string_lossy().into_owned()),
     };
     let mut f = fs::File::create(tmp.join(META)).map_err(|e| format!("writing meta: {e}"))?;
     f.write_all(&serde_json::to_vec(&meta).expect("meta serializes"))
@@ -172,24 +187,31 @@ fn build_inner(
 
     let target = store.snapshot(&sha);
     // Under the build lock nothing else renames into `target`, and the check above found
-    // no snapshot there, so whatever is there has no readable meta: move it aside.
-    if target.symlink_metadata().is_ok() {
-        let trash = store.trash_path(&sha);
-        match fs::rename(&target, &trash) {
-            Ok(()) => {
-                let _ = fs::remove_dir_all(trash);
-            }
-            // A concurrent GC got there first.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "moving aside the unreadable {}: {e}",
-                    target.display()
-                ));
+    // no snapshot built here, so whatever is there has no readable meta or was built at
+    // another path. A hydrate may be cloning from the latter under the shared lock, so the
+    // swap takes the exclusive lock (which GC also takes). A hydrate that finished cloning
+    // reads `target` by path afterwards, so it sees the new tree and never the old one:
+    // the old one is deleted once the lock is released.
+    let replaced = {
+        let _swap = store
+            .lock_exclusive()
+            .map_err(|e| format!("store lock: {e}"))?;
+        let mut replaced = None;
+        if target.symlink_metadata().is_ok() {
+            let trash = store.trash_path(&sha);
+            match fs::rename(&target, &trash) {
+                Ok(()) => replaced = Some(trash),
+                // Removed by hand since the check above: nothing to move aside.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("moving aside {}: {e}", target.display())),
             }
         }
+        fs::rename(&tmp, &target).map_err(|e| format!("renaming the snapshot into place: {e}"))?;
+        replaced
+    };
+    if let Some(trash) = replaced {
+        let _ = fs::remove_dir_all(trash);
     }
-    fs::rename(&tmp, &target).map_err(|e| format!("renaming the snapshot into place: {e}"))?;
     guard.0 = None;
     Ok(Refresh::Done(Built::Built(meta)))
 }

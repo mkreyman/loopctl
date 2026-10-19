@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! <root>/<repo-key>/
-//!   lock                       flock: shared while hydrating, exclusive for GC
+//!   lock                       flock: shared while hydrating, exclusive for GC and for
+//!                              a build's swap into snapshots/<sha>
 //!   build.lock                 flock: held for a snapshot build or a shadow check, both
 //!                              of which run at build/
 //!   snapshots/<sha>/           a source checkout plus the adapter's artifacts
@@ -36,10 +37,24 @@ pub struct Meta {
     pub sha: String,
     /// Unix milliseconds; orders snapshots newest first.
     pub built_at_ms: u64,
-    /// The snapshot this one was cloned from, if any.
+    /// The snapshot this one was cloned from, if any. Its own sha when a snapshot built at
+    /// another path was rebuilt from that old tree of the same commit.
     pub from: Option<String>,
     pub work: String,
     pub ms: u64,
+    /// The resolved build path this snapshot was built at. A snapshot built elsewhere
+    /// (before #46, or before the store moved) recompiles in full wherever it is used, so
+    /// a build of its sha replaces it. Snapshots from before this field have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_in: Option<String>,
+}
+
+impl Meta {
+    /// Built at `dir` (a `Store::resolved_build_dir`), so reusing it there recompiles only
+    /// the delta.
+    pub fn is_built_at(&self, dir: &Path) -> bool {
+        self.built_in.as_deref() == Some(&*dir.to_string_lossy())
+    }
 }
 
 /// The store root: `CHG_STORE`, else the platform default. Linux prefers the chg XFS
@@ -208,6 +223,14 @@ impl Store {
         self.dir.join("build")
     }
 
+    /// `build_dir` with symlinks resolved, as the adapter sees it. Resolved through the
+    /// repo's store dir, because the build dir itself exists only during a build or check.
+    pub fn resolved_build_dir(&self) -> PathBuf {
+        fs::canonicalize(&self.dir)
+            .map(|d| d.join("build"))
+            .unwrap_or_else(|_| self.build_dir())
+    }
+
     /// Held for a whole job of `name` (`culprit`, `revert`) in this repo: each job owns one
     /// fixed worktree, `job_dir(name)/ws`, so one workspace slot and test database.
     pub fn lock_job(&self, name: &str) -> io::Result<Lock> {
@@ -245,13 +268,19 @@ impl Store {
     }
 
     /// The snapshot nearest to `head` among those that are its ancestors (or equal):
-    /// fewest commits between them.
-    pub fn nearest_ancestor(&self, repo: &Path, head: &str) -> Option<(Meta, u64)> {
+    /// fewest commits between them. With `at`, the resolved build path, one built there
+    /// ranks before any built elsewhere, which would recompile in full at that path.
+    pub fn nearest_ancestor(
+        &self,
+        repo: &Path,
+        head: &str,
+        at: Option<&Path>,
+    ) -> Option<(Meta, u64)> {
         self.list()
             .into_iter()
             .filter(|m| git::is_ancestor(repo, &m.sha, head))
             .filter_map(|m| git::distance(repo, &m.sha, head).ok().map(|d| (m, d)))
-            .min_by_key(|(_, d)| *d)
+            .min_by_key(|(m, d)| (at.is_some_and(|a| !m.is_built_at(a)), *d))
     }
 
     /// Records that the workspace `ws` (slot `slot`) was cloned from `sha`. Call with the

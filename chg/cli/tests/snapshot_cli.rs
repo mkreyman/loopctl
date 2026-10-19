@@ -482,6 +482,67 @@ fn concurrent_builds_take_turns() {
 }
 
 #[test]
+fn a_snapshot_built_at_another_path_is_rebuilt_in_place() {
+    let Some(e) = Env::new() else { return };
+    let one = e.head();
+    e.build(&one);
+    let meta_path = e.snap_dir(&one).join(".chg-snapshot.json");
+    let meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    let here = meta["built_in"].as_str().unwrap().to_string();
+    assert!(here.ends_with("/build"), "{here}");
+    assert_eq!(e.build(&one)["status"], "exists");
+
+    // One from before the field existed, and one built where the store used to be.
+    for stale in [Value::Null, Value::from("/elsewhere/build")] {
+        let mut m = meta.clone();
+        m["built_in"] = stale.clone();
+        fs::write(&meta_path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let builds = e.builds();
+        let b = e.build(&one);
+        assert_eq!(b["status"], "built", "built_in {stale}");
+        assert_eq!(b["from"], one.as_str(), "rebuilt from its own old tree");
+        assert_eq!(e.builds(), builds + 1);
+        assert_eq!(e.snapshots(), vec![one.clone()]);
+        let rebuilt: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        assert_eq!(rebuilt["built_in"], here.as_str());
+        assert_eq!(e.build(&one)["status"], "exists");
+    }
+    // No hydrate reads a replaced tree after the swap, so none is kept.
+    let trash = fs::read_dir(e.snap_dir(&one).parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|d| d.file_name().to_string_lossy().starts_with(".trash-"))
+        .count();
+    assert_eq!(trash, 0);
+}
+
+#[test]
+fn at_the_build_path_a_snapshot_built_there_beats_a_nearer_one_built_elsewhere() {
+    let Some(e) = Env::new() else { return };
+    let one = e.head();
+    e.build(&one);
+    let two = e.commit("two", |r| fs::write(r.join("src/version"), "2\n").unwrap());
+    e.build(&two);
+    let meta_path = e.snap_dir(&two).join(".chg-snapshot.json");
+    let mut m: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    m["built_in"] = Value::from("/elsewhere/build");
+    fs::write(&meta_path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+    // A build clones the one built here, though the other is a commit nearer.
+    let three = e.commit("three", |r| {
+        fs::write(r.join("src/version"), "3\n").unwrap()
+    });
+    assert_eq!(e.build(&three)["from"], one.as_str());
+
+    // So does a hydrate at the build path; anywhere else, nearest wins.
+    let build_dir = e.snap_dir(&one).parent().unwrap().with_file_name("build");
+    let at_build = e.cold_worktree(build_dir.to_str().unwrap(), &two);
+    assert_eq!(e.hydrate(&at_build)["snapshot"], one.as_str());
+    let elsewhere = e.cold_worktree("elsewhere", &two);
+    assert_eq!(e.hydrate(&elsewhere)["snapshot"], two.as_str());
+}
+
+#[test]
 fn a_snapshot_dir_without_readable_meta_is_rebuilt_and_collected() {
     let Some(e) = Env::new() else { return };
     let one = e.head();

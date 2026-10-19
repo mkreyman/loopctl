@@ -59,7 +59,11 @@ pub fn hydrate(ws: &Path) -> Result<Hydrated, String> {
     let lock = store
         .lock_shared()
         .map_err(|e| format!("store lock: {e}"))?;
-    let Some((snap, behind)) = store.nearest_ancestor(ws, &head) else {
+    // At the build path (a shadow check), prefer a snapshot built there: any other one
+    // recompiles in full, however near.
+    let build_dir = store.resolved_build_dir();
+    let at = fs::canonicalize(ws).is_ok_and(|w| w == build_dir);
+    let Some((snap, behind)) = store.nearest_ancestor(ws, &head, at.then_some(&*build_dir)) else {
         return Ok(Hydrated::NoSnapshot);
     };
     let snap_dir = store.snapshot(&snap.sha);
