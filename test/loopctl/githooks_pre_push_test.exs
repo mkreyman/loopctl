@@ -9,8 +9,11 @@ defmodule Loopctl.GithooksPrePushTest do
   asked. Proves the fleet's pre-push still decides the push, that chg is asked
   only once the push goes ahead, that the gate row is recorded only from a
   `mix precommit` attestation of exactly the pushed tree, that the shadow check
-  waits on the gate lock, and that `git push` reaches the hook at all once
-  `.githooks/install.sh` has pointed `core.hooksPath` at it.
+  starts in a gap between gates and runs holding no lock, that each commit is
+  recorded and checked once however often it is pushed, that every call into
+  chg is bounded, and that `git push` reaches the hook at all once
+  `.githooks/install.sh` has pointed `core.hooksPath` at its dispatcher, even
+  while the main worktree is on a commit older than `.githooks/`.
   """
   use ExUnit.Case, async: true
 
@@ -19,6 +22,8 @@ defmodule Loopctl.GithooksPrePushTest do
   @zero String.duplicate("0", 40)
   @flock System.find_executable("flock")
   @real_lock_lib Path.expand("~/.claude/hooks/lib/gate-lock-fd.sh")
+  @real_gate_run Path.expand("~/workspace/claude-config/bin/gate-run.sh")
+  @url "git@example:r.git"
   @fleet_hooks Path.expand("~/workspace/claude-config/git-hooks")
 
   setup do
@@ -32,7 +37,7 @@ defmodule Loopctl.GithooksPrePushTest do
     log = Path.join(root, "calls.log")
     lock = Path.join([repo, ".claude", "gate.lock"])
     Enum.each([repo, home, bin], &File.mkdir_p!/1)
-    on_exit(fn -> remove_when_settled!(root, lock) end)
+    on_exit(fn -> remove_when_settled!(root, log, Path.join(home, ".chg/shadow/claims")) end)
 
     git!(repo, ["init", "-q", "-b", "master"])
     File.write!(Path.join(repo, "README.md"), "base\n")
@@ -41,7 +46,10 @@ defmodule Loopctl.GithooksPrePushTest do
     base = rev!(repo, "HEAD")
     # The remote's default branch, which nearest-base.sh measures from.
     git!(repo, ["update-ref", "refs/remotes/origin/master", base])
+    git!(repo, ["remote", "add", "origin", @url])
     git!(repo, ["checkout", "-q", "-b", "feature"])
+    # gate-run.sh gates only a Mix project; untracked, as a build's files are.
+    File.write!(Path.join(repo, "mix.exs"), "")
 
     # The repository has adopted the gate lock, as `touch` in the main worktree does.
     File.mkdir_p!(Path.dirname(lock))
@@ -65,7 +73,17 @@ defmodule Loopctl.GithooksPrePushTest do
     [ "$1" = check ] || exit 2
     echo "check $2" >> "#{log}"
     [ "${FAKE_CHECK_EXIT:-0}" = 0 ] || { echo "unattested: repo root"; exit 1; }
-    printf 'fingerprint=abc\\nproject=.\\ngate=mix precommit\\nduration_s=7\\n'
+    [ -z "${FAKE_CHECK_SLEEP:-}" ] || sleep "$FAKE_CHECK_SLEEP"
+    printf 'fingerprint=abc\\nproject=.\\ngate=mix precommit\\nduration_s=%s\\n' "${FAKE_DURATION:-7}"
+    """)
+
+    # claude-config's gate-run.sh: logs how it was asked, then runs the command.
+    write_exec!(Path.join([home, "workspace/claude-config/bin", "gate-run.sh"]), """
+    #!/bin/bash
+    echo "gate-run $*" >> "#{log}"
+    while [ "$1" != -- ]; do shift; done
+    shift
+    exec "$@"
     """)
 
     # claude-config's gate-lock lib, reduced to the one function the hook calls.
@@ -74,14 +92,20 @@ defmodule Loopctl.GithooksPrePushTest do
     """)
 
     # chg: answers `chg gate` as chg does from CHG_GATE, logs every other call,
-    # and whether a check runs while the gate lock is held.
+    # and whether a check runs while the gate lock is held. FAKE_*_SLEEP hang it.
     write_exec!(Path.join(bin, "chg"), """
     #!/bin/bash
-    if [ "$1" = gate ]; then echo "${CHG_GATE:-shadow}"; exit 0; fi
+    if [ "$1" = gate ]; then
+      [ -z "${FAKE_GATE_SLEEP:-}" ] || sleep "$FAKE_GATE_SLEEP"
+      echo "${CHG_GATE:-shadow}"; exit 0
+    fi
     echo "chg $*" >> "#{log}"
+    if [ "$1" = shadow ] && [ -n "${FAKE_RECORD_SLEEP:-}" ]; then sleep "$FAKE_RECORD_SLEEP"; fi
     if [ "$1" = check ]; then
       if flock -n "#{lock}" true; then echo "chg lock free" >> "#{log}"
       else echo "chg lock held" >> "#{log}"; fi
+      echo "chg check output $*"
+      echo "chg check done" >> "#{log}"
     fi
     exit 0
     """)
@@ -92,19 +116,23 @@ defmodule Loopctl.GithooksPrePushTest do
   describe "pre-push, chg in shadow" do
     @describetag skip: @flock == nil && "flock is not on this machine's PATH"
 
-    test "the fleet hook decides first; an attested tip records the gate's pass and queues chg's check behind the lock",
+    test "the fleet hook decides first; an attested tip records the gate's pass and queues chg's check through gate-run",
          ctx do
       tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
 
       {out, status} = push(ctx, [line(tip)])
 
       assert status == 0, out
-      assert out =~ "chg shadow check of #{String.slice(tip, 0, 12)} queued behind the gate lock"
+
+      assert out =~
+               "chg shadow check of #{String.slice(tip, 0, 12)} queued for a gap between gates"
+
       shadow = await_call!(ctx, "chg check --shadow --foreground")
       assert shadow =~ ~r/ --sha #{tip} --base #{ctx.base}$/
-      await_call!(ctx, "chg lock held")
+      await_call!(ctx, "chg lock free")
 
       calls = calls(ctx)
+      assert "gate-run -w 1800 --heavy -- true" in calls
       fleet = Enum.find(calls, &String.starts_with?(&1, "fleet pre-push"))
       assert fleet =~ ~r{/\.git-hooks/pre-push origin git@example:r\.git$}
       assert "fleet stdin #{line(tip)}" in calls
@@ -220,16 +248,178 @@ defmodule Loopctl.GithooksPrePushTest do
 
     @tag skip:
            (not File.regular?(@real_lock_lib) && "claude-config's gate-lock-fd.sh is absent") ||
+             (not File.regular?(@real_gate_run) && "claude-config's gate-run.sh is absent") ||
              (@flock == nil && "flock is not on this machine's PATH")
-    test "with claude-config's real lock lib, the check queues behind this repo's lock", ctx do
+    test "with claude-config's real gate-run.sh, the check waits for a gate to finish and then holds no lock",
+         ctx do
+      # gate-run.sh finds its lib beside itself, as in claude-config.
+      cc = Path.join(ctx.home, "workspace/claude-config")
+      File.cp!(@real_gate_run, Path.join(cc, "bin/gate-run.sh"))
+      File.mkdir_p!(Path.join(cc, "hooks/lib"))
+      File.cp!(@real_lock_lib, Path.join(cc, "hooks/lib/gate-lock-fd.sh"))
       File.cp!(@real_lock_lib, Path.join([ctx.home, ".claude/hooks/lib", "gate-lock-fd.sh"]))
       tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+      gate = hold_lock!(ctx)
 
       {out, status} = push(ctx, [line(tip)])
 
       assert status == 0, out
-      assert out =~ "queued behind the gate lock"
-      await_call!(ctx, "chg lock held")
+      assert out =~ "queued for a gap between gates"
+      # A gate holds the lock: the check has not started.
+      Process.sleep(500)
+      refute Enum.any?(calls(ctx), &String.starts_with?(&1, "chg check"))
+
+      release_lock!(gate)
+      await_call!(ctx, "chg check --shadow --foreground")
+      # Running, it holds nothing a commit gate's exclusive take would wait on.
+      await_call!(ctx, "chg lock free")
+      refute "chg lock held" in calls(ctx)
+    end
+
+    test "every commit the push carries is recorded; only the tip is checked", ctx do
+      first = commit!(ctx.repo, "lib/a.ex", "defmodule A do end\n")
+      tip = commit!(ctx.repo, "lib/b.ex", "defmodule B do end\n")
+
+      {out, status} = push(ctx, [line(tip)])
+
+      assert status == 0, out
+      await_call!(ctx, "chg check done")
+      calls = calls(ctx)
+      records = Enum.filter(calls, &String.starts_with?(&1, "chg shadow record"))
+      assert Enum.sort(records) == Enum.sort([record(tip), record(first)])
+      refute Enum.any?(calls, &(&1 == "check #{ctx.base}"))
+      assert [check] = Enum.filter(calls, &String.starts_with?(&1, "chg check --shadow"))
+      assert check =~ " --sha #{tip} "
+    end
+
+    test "an update records only what it adds to the remote ref", ctx do
+      old = commit!(ctx.repo, "lib/a.ex", "defmodule A do end\n")
+      tip = commit!(ctx.repo, "lib/b.ex", "defmodule B do end\n")
+
+      {out, 0} = push(ctx, ["refs/heads/feature #{tip} refs/heads/feature #{old}"])
+
+      await_call!(ctx, "chg check done")
+      records = Enum.filter(calls(ctx), &String.starts_with?(&1, "chg shadow record"))
+      assert records == [record(tip)], out
+    end
+
+    test "a retried push of the same commit records nothing again and leaves its check's log alone",
+         ctx do
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+
+      {out, 0} = push(ctx, [line(tip)])
+      await_call!(ctx, "chg check done")
+      [_, log] = Regex.run(~r/\(log (\S+)\)/, out)
+      first = File.read!(log)
+      assert first =~ "chg check output"
+
+      {again, status} = push(ctx, [line(tip)])
+
+      assert status == 0, again
+      assert again =~ "already queued, running or done on this machine: not queued again"
+      calls = calls(ctx)
+      assert Enum.count(calls, &String.starts_with?(&1, "chg shadow record")) == 1
+      assert Enum.count(calls, &String.starts_with?(&1, "chg check --shadow")) == 1
+      assert File.read!(log) == first
+    end
+
+    test "a duration local-gate.sh did not know sends no --ms", ctx do
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+
+      {out, 0} = push(ctx, [line(tip)], [{"FAKE_DURATION", "?"}])
+
+      assert [record] = Enum.filter(calls(ctx), &String.starts_with?(&1, "chg shadow record"))
+      assert record == "chg shadow record --sha #{tip} --verdict pass --gate mix precommit", out
+    end
+
+    test "a hung chg gate is cut off and the push goes ahead with chg off", ctx do
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+      started = System.monotonic_time(:millisecond)
+
+      {out, status} =
+        push(ctx, [line(tip)], [{"FAKE_GATE_SLEEP", "20"}, {"CHG_HOOK_TIMEOUT_S", "1"}])
+
+      assert status == 0, out
+      assert System.monotonic_time(:millisecond) - started < 15_000
+      assert out =~ "chg gate timed out after 1s: chg is off for this push"
+      refute Enum.any?(calls(ctx), &String.starts_with?(&1, "chg "))
+    end
+
+    test "a hung local-gate.sh check records nothing, and the tip is still checked", ctx do
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+
+      {out, status} =
+        push(ctx, [line(tip)], [{"FAKE_CHECK_SLEEP", "20"}, {"CHG_HOOK_TIMEOUT_S", "1"}])
+
+      assert status == 0, out
+      assert out =~ "local-gate.sh check #{String.slice(tip, 0, 12)} timed out after 1s"
+      await_call!(ctx, "chg check done")
+      refute Enum.any?(calls(ctx), &String.starts_with?(&1, "chg shadow record"))
+    end
+
+    test "a hung chg shadow record is cut off and says so", ctx do
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+
+      {out, status} =
+        push(ctx, [line(tip)], [{"FAKE_RECORD_SLEEP", "20"}, {"CHG_HOOK_TIMEOUT_S", "1"}])
+
+      assert status == 0, out
+      assert out =~ "chg shadow record #{String.slice(tip, 0, 12)} timed out after 1s"
+      await_call!(ctx, "chg check done")
+    end
+
+    test "without timeout(1) on PATH, perl bounds the call", ctx do
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+      path = ctx.bin <> ":" <> path_without!(ctx, ["timeout", "gtimeout"])
+      started = System.monotonic_time(:millisecond)
+
+      {out, status} =
+        push(ctx, [line(tip)], [
+          {"PATH", path},
+          {"FAKE_GATE_SLEEP", "20"},
+          {"CHG_HOOK_TIMEOUT_S", "1"}
+        ])
+
+      assert status == 0, out
+      assert System.monotonic_time(:millisecond) - started < 15_000
+      assert out =~ "chg gate timed out after 1s"
+    end
+
+    test "a push to a URL of a configured remote uses that remote", ctx do
+      old = commit!(ctx.repo, "lib/old.ex", "defmodule Old do end\n")
+      git!(ctx.repo, ["update-ref", "refs/remotes/origin/feature", old])
+
+      {out, status} =
+        push(ctx, ["refs/heads/again #{old} refs/heads/again #{@zero}"], [], [@url, @url])
+
+      assert status == 0, out
+      # The check is queued detached, so its synchronous line is the witness.
+      refute out =~ "chg shadow"
+      refute Enum.any?(calls(ctx), &String.starts_with?(&1, "chg "))
+    end
+
+    test "a push to an unknown URL judges the remote by the ref's old value, and measures from origin",
+         ctx do
+      url = "git@elsewhere:x.git"
+      old = commit!(ctx.repo, "lib/old.ex", "defmodule Old do end\n")
+      tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
+
+      {out, status} =
+        push(
+          ctx,
+          [
+            "refs/heads/back #{old} refs/heads/back #{tip}",
+            "refs/heads/feature #{tip} refs/heads/feature #{old}"
+          ],
+          [],
+          [url, url]
+        )
+
+      assert status == 0, out
+      shadow = await_call!(ctx, "chg check --shadow --foreground")
+      assert shadow =~ ~r/ --sha #{tip} --base #{ctx.base}$/
+      records = Enum.filter(calls(ctx), &String.starts_with?(&1, "chg shadow record"))
+      assert records == [record(tip)]
     end
 
     test "CHG_GATE=off leaves the push exactly the fleet hook's", ctx do
@@ -311,25 +501,83 @@ defmodule Loopctl.GithooksPrePushTest do
   end
 
   describe "install.sh, and git reaching the hook" do
-    test "points core.hooksPath at the MAIN worktree's .githooks, from a linked worktree", ctx do
+    test "points core.hooksPath at a dispatcher in the git common dir, from a linked worktree",
+         ctx do
       main = with_githooks!(ctx.repo)
       wt = Path.join(ctx.root, "wt")
       git!(ctx.repo, ["worktree", "add", "-q", wt, "-b", "wt"])
 
       {out, 0} = install(ctx, wt)
 
-      hooks = Path.join(main, ".githooks")
+      hooks = Path.join([main, ".git", "githooks-dispatch"])
       assert out =~ "core.hooksPath -> #{hooks}"
       assert config(wt, "core.hooksPath") == hooks
       assert config(ctx.repo, "core.hooksPath") == hooks
+      assert hooks |> File.ls!() |> Enum.sort() == ["commit-msg", "pre-commit", "pre-push"]
       assert {"core.hooksPath already " <> _, 0} = install(ctx, ctx.repo)
     end
 
-    test "leaves core.hooksPath alone while the main worktree has no .githooks", ctx do
-      {out, 0} = install(ctx, ctx.repo)
+    test "hooks never vanish while the main worktree is on a commit older than .githooks", ctx do
+      main = with_githooks!(ctx.repo)
+      wt = Path.join(ctx.root, "wt")
+      git!(ctx.repo, ["worktree", "add", "-q", wt, "-b", "wt"])
+      {_, 0} = install(ctx, wt)
+      dispatch = Path.join([main, ".git", "githooks-dispatch"])
 
-      assert out =~ "core.hooksPath unchanged"
-      assert config(ctx.repo, "core.hooksPath") == ""
+      # Present: the dispatcher runs .githooks/pre-push, which shadows. (The
+      # fake lock lib finds the lock beside the worktree it is asked about.)
+      File.mkdir_p!(Path.join(wt, ".claude"))
+      File.touch!(Path.join(wt, ".claude/gate.lock"))
+      tip = commit!(wt, "lib/thing.ex", "defmodule Thing do end\n")
+      {out, 0} = run_dispatch(ctx, dispatch, "pre-push", wt, line(tip))
+      assert out =~ "queued for a gap between gates"
+      await_call!(ctx, "chg check done")
+
+      # The main worktree checks out a commit predating .githooks/.
+      File.rm_rf!(Path.join(main, ".githooks"))
+      File.rm!(ctx.log)
+
+      {out, status} =
+        System.cmd(
+          "git",
+          [
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x"
+          ],
+          cd: wt,
+          env: hook_env(ctx),
+          stderr_to_stdout: true
+        )
+
+      assert status == 0, out
+      calls = calls(ctx)
+
+      assert Enum.any?(
+               calls,
+               &String.starts_with?(&1, "fleet pre-commit #{ctx.home}/.git-hooks/pre-commit")
+             )
+
+      assert Enum.any?(
+               calls,
+               &String.starts_with?(&1, "fleet commit-msg #{ctx.home}/.git-hooks/commit-msg")
+             )
+
+      {out, 0} = run_dispatch(ctx, dispatch, "pre-push", wt, line(tip))
+      assert Enum.any?(calls(ctx), &String.starts_with?(&1, "fleet pre-push")), out
+      refute out =~ "chg shadow"
+
+      # Neither side has the hook: git's no-hook behaviour.
+      File.rm_rf!(Path.join(ctx.home, ".git-hooks"))
+      assert {_, 0} = run_dispatch(ctx, dispatch, "pre-push", wt, line(tip))
     end
 
     test "leaves core.hooksPath alone on a machine without the fleet's hooks", ctx do
@@ -349,7 +597,7 @@ defmodule Loopctl.GithooksPrePushTest do
       {_, 0} = install(ctx, ctx.repo)
       remote = Path.join(ctx.root, "remote.git")
       git!(ctx.root, ["init", "-q", "--bare", remote])
-      git!(ctx.repo, ["remote", "add", "origin", remote])
+      git!(ctx.repo, ["remote", "set-url", "origin", remote])
       tip = commit!(ctx.repo, "lib/thing.ex", "defmodule Thing do end\n")
 
       {out, status} =
@@ -386,34 +634,95 @@ defmodule Loopctl.GithooksPrePushTest do
     end
   end
 
-  # A queued check holds the gate lock until it exits, and writes into the root
-  # until then: removing the root under it fails, or leaves a file behind. So
-  # the root goes once the lock is free (at once where no check was queued).
-  defp remove_when_settled!(root, lock, deadline \\ nil) do
+  # A queued check writes into the root until it exits: removing the root under
+  # it fails, or leaves a file behind. So the root goes once every check the
+  # hook claimed has logged that it is done (at once where none was queued).
+  defp remove_when_settled!(root, log, claims, deadline \\ nil) do
     deadline = deadline || System.monotonic_time(:millisecond) + 10_000
-
-    busy? =
-      @flock != nil and File.regular?(lock) and
-        elem(System.cmd(@flock, ["-n", lock, "true"]), 1) != 0
+    claimed = Enum.count(Path.wildcard(Path.join(claims, "*.check")))
+    busy? = claimed > Enum.count(calls(%{log: log}), &(&1 == "chg check done"))
 
     if busy? and System.monotonic_time(:millisecond) < deadline do
       Process.sleep(20)
-      remove_when_settled!(root, lock, deadline)
+      remove_when_settled!(root, log, claims, deadline)
     else
       File.rm_rf!(root)
     end
+  end
+
+  # A gate holding the lock EXCLUSIVE, as the fleet's pre-commit does, until
+  # release_lock!/1.
+  defp hold_lock!(ctx) do
+    held = Path.join(ctx.root, "held")
+    release = Path.join(ctx.root, "release")
+    script = ~s(: > "$1"; while [ -e "$1" ] && [ ! -e "$2" ]; do sleep 0.05; done)
+
+    task =
+      Task.async(fn ->
+        System.cmd(@flock, ["-x", ctx.lock, "sh", "-c", script, "sh", held, release])
+      end)
+
+    # A failed assertion must not leave the holder behind: it also lets go once
+    # the root is removed.
+    wait_until!(fn -> File.exists?(held) end)
+    %{task: task, release: release}
+  end
+
+  defp release_lock!(%{task: task, release: release}) do
+    File.touch!(release)
+    {_, 0} = Task.await(task)
+  end
+
+  defp wait_until!(fun, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 10_000
+
+    cond do
+      fun.() -> :ok
+      System.monotonic_time(:millisecond) > deadline -> flunk("timed out waiting")
+      true -> Process.sleep(20) && wait_until!(fun, deadline)
+    end
+  end
+
+  defp record(sha),
+    do: "chg shadow record --sha #{sha} --verdict pass --ms 7000 --gate mix precommit"
+
+  # This machine's PATH as one directory of links, minus `names`.
+  defp path_without!(ctx, names) do
+    farm = Path.join(ctx.root, "path-farm")
+    File.mkdir_p!(farm)
+
+    for dir <- String.split(System.get_env("PATH", ""), ":", trim: true),
+        File.dir?(dir),
+        name <- File.ls!(dir),
+        name not in names,
+        not File.exists?(Path.join(farm, name)) do
+      File.ln_s!(Path.join(dir, name), Path.join(farm, name))
+    end
+
+    farm
+  end
+
+  defp run_dispatch(ctx, dispatch, hook, dir, stdin_line) do
+    stdin = Path.join(ctx.root, "stdin")
+    File.write!(stdin, stdin_line <> "\n")
+
+    System.cmd("sh", ["-c", ~s("$0" origin #{@url} < "$1"), Path.join(dispatch, hook), stdin],
+      cd: dir,
+      env: hook_env(ctx),
+      stderr_to_stdout: true
+    )
   end
 
   defp githooks, do: Path.join(File.cwd!(), ".githooks")
 
   defp line(sha), do: "refs/heads/feature #{sha} refs/heads/feature #{@zero}"
 
-  defp push(ctx, lines, extra_env \\ []) do
+  defp push(ctx, lines, extra_env \\ [], args \\ ["origin", @url]) do
     stdin = Path.join(ctx.root, "stdin")
     File.write!(stdin, Enum.join(lines, "\n") <> "\n")
     hook = Path.join(githooks(), "pre-push")
 
-    System.cmd("bash", ["-c", ~s(bash "$0" origin git@example:r.git < "$1"), hook, stdin],
+    System.cmd("bash", ["-c", ~s(bash "$0" "$2" "$3" < "$1"), hook, stdin | args],
       cd: ctx.repo,
       env: hook_env(ctx) ++ extra_env,
       stderr_to_stdout: true

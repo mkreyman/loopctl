@@ -10,7 +10,8 @@ defmodule Loopctl.ProjectRootGuardTest do
   function body included, since both expand at compile time), and any
   `File.cwd!/0`, `Path.expand/1,2`, `:code.priv_dir/1`, `Application.app_dir/2`
   or `Mix.Project` path evaluated outside a function body (a module attribute, a
-  module-level binding). Read at run time, such a path names the snapshot's
+  module-level binding, a macro body outside `quote` or inside `unquote`, which
+  run while the macro's caller compiles). Read at run time, such a path names the snapshot's
   tree, which may be gone: home_care_billing's first chg shadow check failed
   exactly so while `mix precommit` passed (home_care_billing#2540). Ask at run
   time instead (`File.cwd!/0` inside the function, a cwd-relative path, or
@@ -33,9 +34,12 @@ defmodule Loopctl.ProjectRootGuardTest do
 
   @scanned_roots ["lib", "test/support"]
 
-  # Bodies that run when called, not when the module compiles. `using` is
-  # ExUnit.CaseTemplate's __using__ body.
-  @runtime_bodies [:def, :defp, :defmacro, :defmacrop, :defguard, :defguardp, :using]
+  # Bodies that run when called, not when the module compiles. A macro body
+  # (defmacro, defmacrop, ExUnit.CaseTemplate's `using`) is not one: it runs
+  # while its CALLER compiles, so what it evaluates outside `quote`, and what
+  # `unquote` evaluates inside it, is baked into the caller. It is walked like
+  # the module body around it; only its quoted code is left to where it lands.
+  @runtime_bodies [:def, :defp, :defguard, :defguardp]
 
   # Calls whose result is an absolute path of the tree or build they run in.
   @path_calls %{
@@ -162,6 +166,49 @@ defmodule Loopctl.ProjectRootGuardTest do
                """)
     end
 
+    test "a macro body runs at its caller's compile time, inside unquote and outside quote" do
+      assert [{4, "File.cwd!/0 at compile time"}, {8, "Path.expand/1 at compile time"}] =
+               scan!(~S"""
+               defmodule M do
+                 defmacro __using__(_) do
+                   quote do
+                     @root unquote(File.cwd!())
+                   end
+                 end
+
+                 defmacro root, do: Path.expand("priv")
+               end
+               """)
+    end
+
+    test "a CaseTemplate's `using` body runs at its caller's compile time" do
+      assert [{4, "Path.expand/1 at compile time"}] =
+               scan!(~S"""
+               defmodule M do
+                 use ExUnit.CaseTemplate
+                 using do
+                   root = Path.expand("priv")
+                   quote do: @root(unquote(root))
+                 end
+               end
+               """)
+    end
+
+    test "a path call quoted, not unquoted, into a function body is not flagged" do
+      assert [] =
+               scan!(~S"""
+               defmodule M do
+                 defmacro __using__(_) do
+                   quote do
+                     def root, do: File.cwd!()
+                   end
+                 end
+
+                 defmacrop priv, do: quote(do: Application.app_dir(:loopctl, "priv"))
+               end
+               """)
+    end
+
     test "a nested module is walked too" do
       assert [{3, "__DIR__"}] =
                scan!(~S"""
@@ -192,7 +239,8 @@ defmodule Loopctl.ProjectRootGuardTest do
        when env in [:__ENV__, :__CALLER__] and is_atom(ctx),
        do: [{meta[:line], "#{env}.file"} | acc]
 
-  # Only what quote unquotes runs here; the rest runs wherever it is injected.
+  # Only what quote unquotes runs here, in the mode around the quote (a macro
+  # body's: compile time); the rest runs wherever it is injected.
   defp walk({:quote, _, args}, mode, acc), do: args |> unquoted() |> walk(mode, acc)
 
   defp walk({kind, _, args}, _mode, acc) when kind in @runtime_bodies and is_list(args),

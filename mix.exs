@@ -303,8 +303,9 @@ defmodule Loopctl.MixProject do
 
   defp aliases do
     [
-      # The first step points core.hooksPath at the main worktree's .githooks
-      # (#985: .githooks/pre-push adds chg's shadow check to the fleet's hooks).
+      # The first step points core.hooksPath at a dispatcher that runs the main
+      # worktree's .githooks (#985: .githooks/pre-push adds chg's shadow check
+      # to the fleet's hooks).
       setup: ["cmd bash .githooks/install.sh", "deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
