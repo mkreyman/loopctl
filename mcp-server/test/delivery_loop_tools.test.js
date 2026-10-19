@@ -503,6 +503,7 @@ describe("the wiring in index.js", () => {
     const wiring = {
       place_dispatch: "placeDispatch",
       story_stage: "storyStage",
+      change_binding_get: "changeBindingGet",
       resolve_escalation: "resolveEscalation",
       force_unclaim_story: "forceUnclaimStory",
       merge_precondition: "mergePreconditionTool",

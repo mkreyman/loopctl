@@ -19,6 +19,7 @@ defmodule LoopctlWeb.TenantController do
   alias Loopctl.RateLimiter
   alias Loopctl.Tenants
   alias Loopctl.Tenants.TierCapabilities
+  alias LoopctlWeb.CurrentTenant
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -114,7 +115,7 @@ defmodule LoopctlWeb.TenantController do
   Returns the current tenant profile based on the authenticated API key.
   """
   def show(conn, _params) do
-    with {:ok, tenant} <- require_tenant(conn) do
+    with {:ok, tenant} <- CurrentTenant.fetch(conn) do
       conn
       |> put_status(:ok)
       |> json(%{tenant: tenant_json(tenant)})
@@ -127,7 +128,7 @@ defmodule LoopctlWeb.TenantController do
   Updates the current tenant profile.
   """
   def update(conn, params) do
-    with {:ok, tenant} <- require_tenant(conn) do
+    with {:ok, tenant} <- CurrentTenant.fetch(conn) do
       case Tenants.update_tenant(tenant, params) do
         {:ok, updated} ->
           conn
@@ -150,7 +151,7 @@ defmodule LoopctlWeb.TenantController do
   def register_owner_key(conn, params) do
     alg = params["alg"] || "ed25519"
 
-    with {:ok, tenant} <- require_tenant(conn),
+    with {:ok, tenant} <- CurrentTenant.fetch(conn),
          {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"], alg),
          {:ok, rotation_proof} <- decode_rotation_proof(params["rotation_proof"]),
          :ok <- check_rotation_rate_limit(tenant.id) do
@@ -310,12 +311,5 @@ defmodule LoopctlWeb.TenantController do
       inserted_at: tenant.inserted_at,
       updated_at: tenant.updated_at
     }
-  end
-
-  defp require_tenant(conn) do
-    case conn.assigns[:current_tenant] do
-      %{id: _} = tenant -> {:ok, tenant}
-      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
-    end
   end
 end

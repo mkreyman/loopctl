@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Changes
   alias Loopctl.Changes.Binding, as: ChangeBinding
+  alias Loopctl.Changes.Event, as: ChangeEvent
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.Stages
@@ -3314,6 +3315,38 @@ defmodule Loopctl.Fixtures do
       )
 
     binding
+  end
+
+  # US-47.7: one stored chg event, inserted DIRECTLY rather than signed and pushed through
+  # `Loopctl.Changes.Events.receive_push/3`, so a reader test can lay out any history — gaps,
+  # held events, hundreds of events — without driving the ordering machinery. Required:
+  # `:tenant_id`, `:repo` (already canonical, i.e. downcased), `:change_id`, `:event_seq`.
+  # `:applied` (default true) sets `applied_at`; `:source_id` defaults to a fresh intake source.
+  def fixture(:change_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    now = DateTime.utc_now()
+
+    source_id =
+      Map.get_lazy(attrs, :source_id, fn ->
+        {_secret, source} = fixture(:intake_source, %{tenant_id: tenant_id})
+        source.id
+      end)
+
+    AdminRepo.insert!(%ChangeEvent{
+      tenant_id: tenant_id,
+      source_id: source_id,
+      repo: Map.fetch!(attrs, :repo),
+      change_id: Map.fetch!(attrs, :change_id),
+      event_seq: Map.fetch!(attrs, :event_seq),
+      kind: Map.get(attrs, :kind, "check_passed"),
+      revision: Map.get(attrs, :revision, 1),
+      sha: Map.get(attrs, :sha, :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)),
+      occurred_at: Map.get(attrs, :occurred_at, now),
+      data: Map.get(attrs, :data, %{}),
+      received_via: "push",
+      applied_at: if(Map.get(attrs, :applied, true), do: now)
+    })
   end
 
   # An agent and its `:agent`-role key, sandboxed. Returns `{raw_key, api_key, agent}`; the

@@ -70,6 +70,7 @@ import {
 } from "./lib/intake-sources.js";
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
+import { changeBindingGet as changeBindingGetRequest } from "./lib/change-bindings.js";
 import {
   clearGithubCredential as clearGithubCredentialRequest,
   githubCredential as githubCredentialRequest,
@@ -3427,6 +3428,22 @@ async function storyStage(args) {
 
   return toContent(
     await storyStageRequest(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, key),
+    }),
+  );
+}
+
+// US-47.7: a READ, `role: :agent` with the hierarchy, so any role's key clears the gate and
+// nothing is pinned. LOOPCTL_AGENT_KEY is passed as this tool's own key for the reason
+// storyStage gives above — `resolveKey` never reads it by name, and a session on an
+// agent-key-only config is exactly the one asking which change its story is bound to. It is an
+// OVERRIDE, not `exactKey`, so `resolveKey`'s order holds: LOOPCTL_API_KEY when set, else
+// LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY.
+async function changeBindingGet(args) {
+  const key = process.env.LOOPCTL_AGENT_KEY;
+
+  return toContent(
+    await changeBindingGetRequest(args, {
       apiCall: (method, path, body) => apiCall(method, path, body, key),
     }),
   );
@@ -8615,6 +8632,34 @@ const TOOLS = [
     },
   },
   {
+    name: "change_binding_get",
+    description:
+      "THE CHG CHANGES BOUND TO A STORY (GET /api/v1/stories/:id/changes, loopctl US-47.7): " +
+      "every change a `submitted` chg event bound to the story, OLDEST FIRST so the current " +
+      "one is last, each with `repo`, `change_id`, `current`, `superseded_at`, " +
+      "`submitter_not_claimant` and `inserted_at`, plus that change's APPLIED events in " +
+      "`event_seq` order (`event_seq`, `kind`, `revision`, `sha`, `occurred_at`, " +
+      "`applied_at`). An event held ahead of a gap is not listed, and the event `data` " +
+      "payload is never returned.\n\n" +
+      "BOUNDED by the server, and the bounds are in `meta`: at most `max_bindings` bindings " +
+      "and `max_events_per_change` events per change, the NEWEST of each, so the current " +
+      "binding is always listed. `binding_count` and each binding's `applied_event_count` / " +
+      "`events_truncated` say when more exist.\n\n" +
+      "Any key of the tenant may read it (`role: :agent` with the hierarchy), so the key is " +
+      "the usual order with LOOPCTL_AGENT_KEY as this tool's own: LOOPCTL_API_KEY when set, " +
+      "else LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY. REFUSES: 404 when the story " +
+      "is not your tenant's — another tenant's id answers exactly like an unknown one; 401 " +
+      "for no key or one that does not authenticate; 400 for a superadmin key without " +
+      "X-Impersonate-Tenant; 429 when rate limited. No 403: every key role clears the " +
+      "`role: :agent` gate, so none is refused for its role. A malformed " +
+      "`story_id` is refused locally (status 0, nothing sent).",
+    inputSchema: {
+      type: "object",
+      properties: { story_id: { type: "string", description: "The story UUID." } },
+      required: ["story_id"],
+    },
+  },
+  {
     name: "resolve_escalation",
     description:
       "MOVE AN ESCALATED STORY OFF `escalated`, as a human (POST /api/v1/stories/:id/stage/" +
@@ -10144,6 +10189,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "story_stage":
       return await storyStage(args);
+
+    case "change_binding_get":
+      return await changeBindingGet(args);
 
     case "resolve_escalation":
       return await resolveEscalation(args);
