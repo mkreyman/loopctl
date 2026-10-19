@@ -129,7 +129,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   @spec gate_a([GateAReplay.t()], map(), keyword()) :: map()
   def gate_a(replays, meta, opts \\ []) when is_list(replays) and is_map(meta) do
     detail = Keyword.get(opts, :detail, :redacted)
-    intake = Enum.filter(replays, & &1.ticket.intake?)
+    intake = intake_replays(replays)
 
     %{
       gate: "A",
@@ -392,12 +392,16 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     {chg_loop, human} = Enum.split_with(replays, & &1.ticket.chg_loop?)
 
     %{
-      intake: gate_a_stratum(Enum.filter(replays, & &1.ticket.intake?)),
+      intake: gate_a_stratum(intake_replays(replays)),
       all: gate_a_stratum(replays),
       chg_loop: gate_a_stratum(chg_loop),
       human: gate_a_stratum(human)
     }
   end
+
+  # The one definition of the intake population: the stratum and `intake_is_feature_share`
+  # both read it, so they cannot describe different tickets.
+  defp intake_replays(replays), do: Enum.filter(replays, & &1.ticket.intake?)
 
   @doc """
   Whether the intake escalation rate is measuring Gate A at all, or just the corpus split.

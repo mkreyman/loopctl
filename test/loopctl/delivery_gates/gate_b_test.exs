@@ -358,8 +358,9 @@ defmodule Loopctl.DeliveryGates.GateBTest do
     # claim, so it is pinned on the change the gate would otherwise clear — an unguarded file
     # well inside the size bound — and on the triage screen with no predicted touch at all.
     test "a repository absent from the configuration escalates every change, at triage and at merge" do
-      # The control: the same change to a configured repository clears.
+      # The control: the same change to a configured repository clears, at merge and at triage.
       assert %Result{outcome: :clear} = evaluate(:merge, %{files: ["README.md"]})
+      assert GateB.triage_screen(triggers(), input().repo, ["README.md"]) == []
 
       for repo <- ["mkreyman/claude-config", "mkreyman/chg"] do
         assert %Result{outcome: :human, reasons: [{:unknown_repo, ^repo}]} =

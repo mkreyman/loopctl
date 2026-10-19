@@ -11,8 +11,8 @@ defmodule Loopctl.DeliveryGates.Measurement.Ticket do
 
   The delivery loop's Gate A judges tickets Larisa files through the in-app chat, which stamps
   a `[Bug] <agency>: ` or `[Feature] <agency>: ` prefix at FILING time. Every other issue in
-  the repository is engineering work the loop never triages. So the corpus is reported in two
-  strata and the intake one is the headline: it is the population Gate A is for, and its
+  the repository is engineering work the loop never triages. So the `intake` stratum is the
+  headline among the report's four (`Report.gate_a_strata/1`): it is the population Gate A is for, and its
   bug/feature split was decided by the intake chat rather than by a label somebody applied
   after the outcome was known.
 

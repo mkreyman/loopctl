@@ -130,7 +130,7 @@ Gate B reads one trigger list per repository from `DELIVERY_GATES_CONFIG` (`Loop
 
 **The rule: when either repository gets an entry, its `human_paths` MUST name that repository's self-modification code**, which the loop must never change unreviewed:
 - for chg, its gate, the code that advances `verified/master`, culprit and revert, its adapters, and its CI;
-- for claude-config, the deny lists and hook wiring, the hooks that block or grant, the plugins that gate commits, merges and secrets, the commit gate and its CI.
+- for claude-config, the deny lists and hook wiring, the hooks that block or grant, the plugins that gate commits, merges and secrets, its git hooks (the commit gate) and its CI.
 
 The exact glob lists live in the operator's knowledge base (article `4a86157b`), not here: both repositories are private, and a list of their safety code does not belong in a public document. That article is a floor. Add to it, never remove from it, and re-check each glob against the repository before pasting it, because a pattern that matches no file is a stale trigger and escalates every change.
 

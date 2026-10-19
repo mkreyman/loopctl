@@ -638,10 +638,11 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
 
       assert summary =~ "intake tickets: n=1"
       assert summary =~ "all tickets: n=2"
-      assert summary =~ "chg-loop tickets: n=1"
-      assert summary =~ "human tickets: n=1"
-      assert summary =~ "  chg-loop tickets: n=1"
-      assert summary =~ "  human tickets: n=1"
+      # Each line twice: once unindented in the main strata, once indented in the sensitivity run.
+      assert summary =~ ~r/^chg-loop tickets: n=1/m
+      assert summary =~ ~r/^human tickets: n=1/m
+      assert summary =~ ~r/^  chg-loop tickets: n=1/m
+      assert summary =~ ~r/^  human tickets: n=1/m
     end
 
     test "the Gate A summary states the lower-bound bias and the design's 54%" do
