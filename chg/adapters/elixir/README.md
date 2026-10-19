@@ -13,6 +13,21 @@ A product then adds:
   a snapshot sits at a new path, and without this Mix recompiles every module because the
   manifest's cwd differs (design §3.5). Use the project option, not `mix compile --no-check-cwd`:
   `mix test` rejects that flag. `mix chg.snapshot` refuses to run without it.
+- no absolute path from compile time that the code or its tests read at run time. Every module
+  a change leaves alone keeps the snapshot's build path, which no workspace has. Two forms
+  broke HCB's first shadow runs:
+  - `__DIR__` or `__ENV__.file` read as a path. Both expand to a fixed string at compile time
+    wherever they appear, in a module attribute or a function body alike
+    (home_care_billing#2540). In test code, resolve the path from `File.cwd!()`, which `mix test`
+    sets to the project root. In application code, use `:code.priv_dir/1` or
+    `Application.app_dir/2`, since a release or another start directory has a different cwd.
+  - `module_info(:compile)[:source]` or `__info__(:compile)[:source]` read as a file path
+    (home_care_billing#2543). Map it to the project instead: the longest suffix of the recorded
+    path that exists under `File.cwd!()`.
+
+  A gate that compiles and tests in the same directory never sees either form. A guard test that
+  refuses every `__DIR__`, `__ENV__.file` and `[:source]` read outside one helper keeps them from
+  coming back (HCB's `project_root_guard_test.exs`).
 
 | Task | Contract command | What it does |
 |---|---|---|
