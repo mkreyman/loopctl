@@ -723,17 +723,21 @@ defmodule Loopctl.Intake do
   Re-reads a live `chg` source INSIDE the caller's transaction on `repo` and judges its root
   by the same rule enrolment does (`check_chg_root/2`'s `judge_chg_root/3`): `{:ok, source}`,
   `{:error, :not_chg_source}` (revoked, another tenant's, unknown, `pr`-mode or holding no
-  `change_events_secret`) or `{:error, :chg_root_invalid}`.
+  `change_events_secret`), `{:error, :tenant_inactive}` or `{:error, :chg_root_invalid}`.
 
   For the change-events webhook (US-47.3, AC-47.3.7). Enrolment judges the root only when a
   source is WRITTEN, so a root revoked between writes is caught here, on every event. Both
-  reads are `FOR SHARE`, so a concurrent revoke of the source or of its root, or a mode
-  switch, either commits first and is seen, or waits for the event to commit. `repo` is
-  `Loopctl.Repo` under the source's tenant there; the explicit `tenant_id` predicates hold on
-  any repo.
+  reads are `FOR SHARE`, so a concurrent revoke of the source or of its root, a mode switch or
+  a secret rotation either commits first and is seen, or waits for the event to commit. The
+  tenant's status is read here too, so a suspension committed since the caller's own
+  pre-check refuses the event. `repo` is `Loopctl.Repo` under the source's tenant there; the
+  explicit `tenant_id` predicates hold on any repo.
+
+  The held source is what the caller authenticates against: its `change_events_secret` is the
+  one that counts, not a copy read before the transaction.
   """
   @spec hold_chg_source(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, Source.t()} | {:error, :not_chg_source | :chg_root_invalid}
+          {:ok, Source.t()} | {:error, :not_chg_source | :tenant_inactive | :chg_root_invalid}
   def hold_chg_source(repo, tenant_id, source_id)
       when is_binary(tenant_id) and is_binary(source_id) do
     source =
@@ -745,12 +749,19 @@ defmodule Loopctl.Intake do
 
     case source do
       %Source{mode: :chg, change_events_secret: secret} = source when is_binary(secret) ->
-        with :ok <- judge_chg_root(repo, tenant_id, source.chg_root_dispatch_id),
+        with :ok <- judge_tenant_active(repo, tenant_id),
+             :ok <- judge_chg_root(repo, tenant_id, source.chg_root_dispatch_id),
              do: {:ok, source}
 
       _other ->
         {:error, :not_chg_source}
     end
+  end
+
+  defp judge_tenant_active(repo, tenant_id) do
+    if repo.exists?(from t in Tenant, where: t.id == ^tenant_id and t.status == :active),
+      do: :ok,
+      else: {:error, :tenant_inactive}
   end
 
   defp judge_chg_root(repo \\ AdminRepo, tenant_id, root_id)

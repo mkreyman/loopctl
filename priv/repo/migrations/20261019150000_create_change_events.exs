@@ -10,6 +10,10 @@ defmodule Loopctl.Repo.Migrations.CreateChangeEvents do
   (`applied_seq`), when the last one arrived, and when loopctl last pulled it. The row is also
   the per-change LOCK every ingest takes, so two events of one change never apply concurrently.
 
+  `repo` is the canonical key on both tables — the repository name downcased
+  (`Loopctl.Changes.Events.repo_key/1`) — held by a CHECK, so a spelling variant can never
+  split one change across two keys.
+
   Two new tables and nothing else, so the code running before this release keeps working
   against the new schema during Fly's rolling deploy.
   """
@@ -47,6 +51,8 @@ defmodule Loopctl.Repo.Migrations.CreateChangeEvents do
 
     create constraint(:change_events, :change_events_event_seq_positive, check: "event_seq >= 1")
 
+    create constraint(:change_events, :change_events_repo_canonical, check: "repo = lower(repo)")
+
     create constraint(:change_events, :change_events_received_via,
              check: "received_via IN ('push', 'pull')"
            )
@@ -76,6 +82,10 @@ defmodule Loopctl.Repo.Migrations.CreateChangeEvents do
 
     create constraint(:change_cursors, :change_cursors_applied_seq_non_negative,
              check: "applied_seq >= 0"
+           )
+
+    create constraint(:change_cursors, :change_cursors_repo_canonical,
+             check: "repo = lower(repo)"
            )
 
     enable_rls(:change_cursors)

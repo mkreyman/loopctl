@@ -33,6 +33,9 @@ defmodule LoopctlWeb.ChangeEventController do
   @max_body_bytes Events.max_body_bytes()
   @window_seconds Signature.window_seconds()
 
+  # The 500's message, held here for the response and the operation spec alike.
+  @apply_failed_message "The event could not be recorded. Redeliver it."
+
   operation(:create,
     summary: "Receive a chg change event (chg-server only)",
     description:
@@ -120,6 +123,9 @@ defmodule LoopctlWeb.ChangeEventController do
          Schemas.ErrorResponse},
       413 => {"`payload_too_large`", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`change_event_failed`: nothing was recorded. #{@apply_failed_message}",
+         "application/json", Schemas.ErrorResponse},
       503 => {"`busy`: redeliver after `retry-after`", "application/json", Schemas.ErrorResponse}
     }
   )
@@ -173,7 +179,7 @@ defmodule LoopctlWeb.ChangeEventController do
         {:error, :busy}
 
       {:error, _reason} ->
-        error(conn, 500, "change_event_failed", "The event could not be recorded. Redeliver it.")
+        error(conn, 500, "change_event_failed", @apply_failed_message)
     end
   end
 

@@ -11,13 +11,20 @@ defmodule Loopctl.Changes.Events do
   source or one holding no `change_events_secret`, a missing or wrong `X-Chg-Signature`, an
   `X-Chg-Timestamp` outside the window (`Loopctl.Changes.Signature`), an envelope naming
   another repository, and a source whose `chg_root_dispatch_id` is no longer a valid chg root
-  (AC-47.3.7). The last is judged INSIDE the event's transaction by Intake's own rule
-  (`Loopctl.Intake.hold_chg_source/3`), because enrolment judges the root only when a source is
-  written. Every refusal writes nothing, and is logged and counted (`event_refused/3`) with
-  the reason, the source id when the source is known, and never the secret or the body.
+  (AC-47.3.7). Every refusal writes nothing, and is logged and counted (`event_refused/3`)
+  with the reason, the source id when the source is known, and never the secret or the body.
 
   The source is found by the id in the URL, never by searching for a repository named in an
   unauthenticated body. The body is parsed only after its signature checks out.
+
+  **The decision that counts is made inside the event's transaction.** The signature is first
+  checked against the source as read before it, so a forged request is refused without
+  opening a transaction or parsing the body. That check is only a cheap refusal: the
+  transaction re-reads the source `FOR SHARE` (`Loopctl.Intake.hold_chg_source/3`, which also
+  re-judges the tenant's status and the root by Intake's own rule) and verifies the signature
+  AGAIN against the HELD row's `change_events_secret`. So a secret rotation, a revoke, a mode
+  switch or a tenant suspension that commits between the two reads refuses the event with the
+  same 401, writing nothing, rather than letting an event signed with the old secret apply.
 
   ## Idempotency
 
@@ -28,8 +35,14 @@ defmodule Loopctl.Changes.Events do
   chg's `event_seq` is immutable, so that is a chg fault to surface, not a redelivery to
   answer as accepted (the rule `threads.ex` applied to its keys, PRD §10).
 
-  `repo` is stored as the SOURCE's `repo_full_name`, not the envelope's spelling, so a
-  case-variant of one repository can never mint a second key for the same event.
+  `repo` is the CANONICAL repository key (`repo_key/1`: the source's `repo_full_name`,
+  downcased), never the envelope's spelling or the source's as stored. GitHub names are
+  case-insensitive and the pull resolves the source that way
+  (`Loopctl.Intake.chg_source_for_repo/2`), so a case-variant envelope, or the repository
+  re-enrolled under another spelling, keys the SAME events and the SAME cursor. Every place a
+  change is keyed derives it with `repo_key/1` — the events, the cursor, the binding a
+  `submitted` event makes (`Loopctl.Changes.EventEffects`), and the pull
+  (`Loopctl.Changes.Reconcile`) — and both tables CHECK `repo = lower(repo)`.
 
   ## Ordering
 
@@ -97,10 +110,21 @@ defmodule Loopctl.Changes.Events do
   def max_body_bytes, do: @max_body_bytes
 
   @doc """
+  The canonical repository key a change is stored under: `repo_full_name` downcased. The one
+  derivation every change-keyed read and write uses.
+  """
+  @spec repo_key(String.t()) :: String.t()
+  def repo_key(repo_full_name) when is_binary(repo_full_name),
+    do: String.downcase(repo_full_name)
+
+  @doc """
   Receives one webhook delivery for `source_id`.
 
-  `opts`: `:now` (unix seconds; the clock the window is judged by) and `:lock_timeout_ms`
-  (`Capacity.lock_timeout_ms/1`). Both are inputs for tests only; production passes nothing.
+  `opts`: `:now` (unix seconds; the clock the window is judged by), `:lock_timeout_ms`
+  (`Capacity.lock_timeout_ms/1`) and `:before_hold` (a 0-arity function run after the
+  pre-check and before the event's transaction, so a test can commit a rotation or a
+  suspension in exactly that window). All are inputs for tests only; production passes
+  nothing.
   """
   @spec receive_push(term(), push_input(), keyword()) ::
           {:ok, result()}
@@ -114,12 +138,23 @@ defmodule Loopctl.Changes.Events do
          {:ok, envelope} <- decode(raw_body),
          :ok <- same_repository(source, envelope) do
       Logger.metadata(tenant_id: source.tenant_id)
+      Keyword.get(opts, :before_hold, fn -> :ok end).()
 
       source.tenant_id
       |> in_held_source(source, opts, fn held ->
+        reauthenticate!(held, input, now)
         ingest_one(held, envelope, "push", DateTime.utc_now())
       end)
       |> finish_push(source, envelope)
+    end
+  end
+
+  # The authoritative check: the signature against the secret of the row HELD in this
+  # transaction. A refusal rolls back to the same `{:refused, reason}` the hold answers.
+  defp reauthenticate!(%Source{change_events_secret: secret}, input, now) do
+    case Signature.verify(secret, input[:timestamp], input.raw_body, input[:signature], now) do
+      :ok -> :ok
+      {:error, reason} -> Repo.rollback({:refused, reason})
     end
   end
 
@@ -167,10 +202,15 @@ defmodule Loopctl.Changes.Events do
     end
   end
 
-  @doc "The tenant's stored events of one change, in `event_seq` order. `[]` for another tenant's."
+  @doc """
+  The tenant's stored events of one change, in `event_seq` order. `[]` for another tenant's.
+  `repo` is matched by `repo_key/1`, so any spelling of the repository reads the same change.
+  """
   @spec list_events(Ecto.UUID.t(), String.t(), String.t()) :: [Event.t()]
   def list_events(tenant_id, repo, change_id)
       when is_binary(tenant_id) and is_binary(repo) and is_binary(change_id) do
+    repo = repo_key(repo)
+
     {:ok, events} =
       Repo.with_tenant(tenant_id, fn ->
         Repo.all(
@@ -183,10 +223,15 @@ defmodule Loopctl.Changes.Events do
     events
   end
 
-  @doc "The tenant's cursor for one change, or `nil` (another tenant's included)."
+  @doc """
+  The tenant's cursor for one change, or `nil` (another tenant's included). `repo` is matched
+  by `repo_key/1`.
+  """
   @spec get_cursor(Ecto.UUID.t(), String.t(), String.t()) :: Cursor.t() | nil
   def get_cursor(tenant_id, repo, change_id)
       when is_binary(tenant_id) and is_binary(repo) and is_binary(change_id) do
+    repo = repo_key(repo)
+
     {:ok, cursor} =
       Repo.with_tenant(tenant_id, fn ->
         Repo.one(
@@ -256,15 +301,16 @@ defmodule Loopctl.Changes.Events do
   # An envelope for another repository is refused like a bad signature: the source's secret
   # authenticates deliveries ABOUT its repository and nothing else.
   defp same_repository(%Source{repo_full_name: repo} = source, %{repo: named}) do
-    if String.downcase(named) == String.downcase(repo),
+    if repo_key(named) == repo_key(repo),
       do: :ok,
       else: refuse(source.id, source, :repository_mismatch)
   end
 
   # ── the transaction ─────────────────────────────────────────────────────────
 
-  # The source is re-read FOR SHARE and its root judged in the same transaction that writes,
-  # so a revoke of either commits first and refuses this event, or waits for it.
+  # The source is re-read FOR SHARE, and its tenant and root judged, in the same transaction
+  # that writes, so a revoke, rotation or suspension commits first and refuses this event, or
+  # waits for it.
   defp in_held_source(tenant_id, %Source{id: source_id}, opts, fun) do
     Stages.answering_busy(tenant_id, [:loopctl, :changes, :event_busy], "change event", fn ->
       Repo.with_tenant(tenant_id, fn -> held_source_body(tenant_id, source_id, opts, fun) end)
@@ -333,7 +379,7 @@ defmodule Loopctl.Changes.Events do
   defp ingest_one(%Source{} = source, envelope, via, now) do
     key = %{
       tenant_id: source.tenant_id,
-      repo: source.repo_full_name,
+      repo: repo_key(source.repo_full_name),
       change_id: envelope.change_id
     }
 

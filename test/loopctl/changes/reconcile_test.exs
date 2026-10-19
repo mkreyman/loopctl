@@ -29,6 +29,26 @@ defmodule Loopctl.Changes.ReconcileTest do
     %{secret: secret, source: source, root: root, tenant_id: source.tenant_id}
   end
 
+  # Every query this test process sends to the change tables, on either repo (AdminRepo is
+  # routed onto Repo's sandbox connection in test, so both event names are watched). The
+  # handler runs in the querying process, so filtering on the pid keeps other tests out.
+  defp capture_change_queries do
+    parent = self()
+    id = "change-queries-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach_many(
+      id,
+      [[:loopctl, :repo, :query], [:loopctl, :admin_repo, :query]],
+      fn _event, _measurements, metadata, _ ->
+        if self() == parent and metadata[:source] in ["change_events", "change_cursors"],
+          do: send(parent, {:change_query, metadata.source})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
   defp push(ctx, event) do
     raw = Jason.encode!(event)
     ts = Integer.to_string(System.os_time(:second))
@@ -172,11 +192,39 @@ defmodule Loopctl.Changes.ReconcileTest do
 
     test "with CHG_SERVER_URL unset the sweep enqueues nothing", ctx do
       assert {:ok, %{outcome: :held}} = push(ctx, event("C1", 2))
+      warned_in = :ets.new(:sweep_warned, [:public])
 
       Oban.Testing.with_testing_mode(:manual, fn ->
-        assert :ok = ChangeReconcileSweepWorker.sweep(later(11 * 60), nil)
+        assert :ok = ChangeReconcileSweepWorker.sweep(later(11 * 60), nil, warned_in: warned_in)
         assert reconcile_jobs(ctx.tenant_id) == []
       end)
+    end
+
+    test "with CHG_SERVER_URL unset the sweep reads no candidate and warns once", ctx do
+      assert {:ok, %{outcome: :held}} = push(ctx, event("C1", 2))
+      warned_in = :ets.new(:sweep_warned, [:public])
+      capture_change_queries()
+
+      first =
+        ExUnit.CaptureLog.capture_log([level: :warning], fn ->
+          assert :ok = ChangeReconcileSweepWorker.sweep(later(11 * 60), nil, warned_in: warned_in)
+        end)
+
+      second =
+        ExUnit.CaptureLog.capture_log([level: :warning], fn ->
+          assert :ok = ChangeReconcileSweepWorker.sweep(later(16 * 60), nil, warned_in: warned_in)
+        end)
+
+      assert first =~ "CHG_SERVER_URL is unset"
+      refute second =~ "CHG_SERVER_URL is unset"
+      refute_received {:change_query, _}
+
+      # Configured, the same sweep does read the candidates: the probe is live.
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = ChangeReconcileSweepWorker.sweep(later(11 * 60), @url)
+      end)
+
+      assert_received {:change_query, _}
     end
   end
 
@@ -222,7 +270,12 @@ defmodule Loopctl.Changes.ReconcileTest do
         assert payload["alert"] == "changes.pull_unauthorized"
         assert payload["source_id"] == ctx.source.id
         assert payload["tenant_id"] == ctx.tenant_id
+        assert payload["change_id"] == "C1"
         refute inspect(payload) =~ ctx.secret
+
+        # The operator plane carries ids, never tenant content such as the repository name.
+        refute Map.has_key?(payload, "repo")
+        refute inspect(payload) =~ @repo
       end)
 
       # Stamped, so the next sweep does not ask again inside the interval.
@@ -264,6 +317,35 @@ defmodule Loopctl.Changes.ReconcileTest do
 
       assert [%Event{event_seq: 2, applied_at: nil}] =
                Events.list_events(ctx.tenant_id, @repo, "C1")
+    end
+
+    test "after re-enrolment under another spelling, the pull advances the same cursor", ctx do
+      # Setup holds seq 2; apply 1 and 3..6 under the old spelling.
+      for seq <- [1, 3, 4, 5, 6], do: assert({:ok, _} = push(ctx, event("C1", seq)))
+      assert %Cursor{applied_seq: 6} = Events.get_cursor(ctx.tenant_id, @repo, "C1")
+
+      {:ok, _} = Loopctl.Intake.revoke_source(ctx.tenant_id, ctx.source.id)
+
+      %{secret: secret, source: source} =
+        fixture(:chg_source, %{tenant_id: ctx.tenant_id, repo_full_name: "MKreyman/Infra"})
+
+      ctx = %{ctx | secret: secret, source: source}
+      assert {:ok, %{outcome: :held, applied_seq: 6}} = push(ctx, event("C1", 8))
+
+      expect(Loopctl.MockChgClient, :events_after, fn @url, ^secret, "C1", 6 ->
+        {:ok, [event("C1", 7, %{repo: "MKreyman/Infra"})]}
+      end)
+
+      expect(Loopctl.MockChgClient, :events_after, fn @url, ^secret, "C1", 8 -> {:ok, []} end)
+
+      assert {:ok, %{applied_seq: 8}} =
+               Reconcile.pull(ctx.tenant_id, "MKreyman/Infra", "C1", base_url: @url)
+
+      assert [%Cursor{repo: @repo, applied_seq: 8, last_pulled_at: %DateTime{}}] =
+               AdminRepo.all(from(c in Cursor, where: c.tenant_id == ^ctx.tenant_id))
+
+      assert AdminRepo.aggregate(from(e in Event, where: e.tenant_id == ^ctx.tenant_id), :count) ==
+               8
     end
 
     test "tenant isolation: another tenant cannot pull this tenant's change", ctx do

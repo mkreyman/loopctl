@@ -160,6 +160,7 @@ defmodule Loopctl.Changes.Reconcile do
   # asked again only after the interval rather than on every sweep.
   defp mark_pulled(tenant_id, repo, change_id) do
     now = DateTime.utc_now()
+    repo = Events.repo_key(repo)
 
     {:ok, cursor} =
       Repo.with_tenant(tenant_id, fn ->
@@ -236,7 +237,7 @@ defmodule Loopctl.Changes.Reconcile do
     Enum.flat_map(raw, fn item ->
       with {:ok, envelope} <- Envelope.validate(item),
            true <- envelope.change_id == cursor.change_id,
-           true <- String.downcase(envelope.repo) == String.downcase(source.repo_full_name) do
+           true <- Events.repo_key(envelope.repo) == Events.repo_key(source.repo_full_name) do
         [envelope]
       else
         _ ->
@@ -261,7 +262,10 @@ defmodule Loopctl.Changes.Reconcile do
     )
 
     # The shared operator-alert contract (`%{alert, metric, value, threshold,
-    # window_seconds, at}`), ids only — never the secret or an event body.
+    # window_seconds, at}`), ids only — never the secret, an event body or the repository
+    # name: the operator plane carries metric names and thresholds, not tenant content
+    # (`ScaleAlertDeliveryWorker`, docs/egress-guard.md). The ids resolve to the repository
+    # on the operator's side.
     payload = %{
       "alert" => "changes.pull_unauthorized",
       "metric" => "changes.pull_unauthorized",
@@ -270,7 +274,6 @@ defmodule Loopctl.Changes.Reconcile do
       "window_seconds" => 0,
       "tenant_id" => source.tenant_id,
       "source_id" => source.id,
-      "repo" => source.repo_full_name,
       "change_id" => cursor.change_id,
       "at" => DateTime.utc_now() |> DateTime.to_iso8601()
     }

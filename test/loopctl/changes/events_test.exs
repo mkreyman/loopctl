@@ -39,7 +39,7 @@ defmodule Loopctl.Changes.EventsTest do
     Events.receive_push(
       Keyword.get(opts, :source_id, ctx.source.id),
       %{raw_body: raw, timestamp: ts, signature: signature},
-      Keyword.take(opts, [:now])
+      Keyword.take(opts, [:now, :before_hold])
     )
   end
 
@@ -120,15 +120,52 @@ defmodule Loopctl.Changes.EventsTest do
       assert [_one_entry] = applied_entries(ctx.tenant_id)
     end
 
-    test "the repository is keyed by the source's spelling, not the envelope's", ctx do
+    test "the repository is keyed canonically, not by the envelope's spelling", ctx do
       e = event("C1", 1)
       assert {:ok, %{outcome: :applied}} = push(ctx, e)
 
       # A case-variant of the same repository is the same key, so this is a redelivery.
       assert {:ok, %{outcome: :duplicate}} = push(ctx, Map.put(e, "repo", "MKreyman/Infra"))
 
-      assert [_one] = Events.list_events(ctx.tenant_id, "mkreyman/infra", "C1")
-      assert Events.list_events(ctx.tenant_id, "MKreyman/Infra", "C1") == []
+      assert [%Event{repo: "mkreyman/infra"}] =
+               AdminRepo.all(from(r in Event, where: r.tenant_id == ^ctx.tenant_id))
+
+      # Any spelling reads the one change.
+      assert [_one] = Events.list_events(ctx.tenant_id, "MKreyman/Infra", "C1")
+    end
+  end
+
+  describe "one canonical repository key across re-enrolment" do
+    test "re-enrolled under another spelling, the change keeps one cursor and one binding",
+         ctx do
+      story = fixture(:story, %{tenant_id: ctx.tenant_id})
+      submitted = event("C1", 1, %{kind: "submitted", data: %{"story_id" => story.id}})
+      assert {:ok, %{outcome: :applied}} = push(ctx, submitted)
+
+      for seq <- 2..6, do: assert({:ok, %{outcome: :applied}} = push(ctx, event("C1", seq)))
+
+      {:ok, _} = Loopctl.Intake.revoke_source(ctx.tenant_id, ctx.source.id)
+
+      %{secret: secret, source: source} =
+        fixture(:chg_source, %{tenant_id: ctx.tenant_id, repo_full_name: "MKreyman/Infra"})
+
+      ctx = %{ctx | secret: secret, source: source}
+      seven = event("C1", 7, %{repo: "MKreyman/Infra"})
+      assert {:ok, %{outcome: :applied, applied_seq: 7}} = push(ctx, seven)
+
+      # A redelivery of an event applied under the old spelling is still a duplicate.
+      assert {:ok, %{outcome: :duplicate, applied_seq: 7}} =
+               push(ctx, Map.put(submitted, "repo", "MKreyman/Infra"))
+
+      assert [%Cursor{repo: "mkreyman/infra", applied_seq: 7, source_id: source_id}] =
+               AdminRepo.all(from(c in Cursor, where: c.tenant_id == ^ctx.tenant_id))
+
+      assert source_id == source.id
+      assert length(applied_entries(ctx.tenant_id)) == 7
+      assert count(Event, ctx.tenant_id) == 7
+
+      assert %Changes.Binding{repo: "mkreyman/infra", change_id: "C1"} =
+               Changes.current_binding(ctx.tenant_id, story.id)
     end
   end
 
@@ -373,6 +410,37 @@ defmodule Loopctl.Changes.EventsTest do
         )
 
       assert {:error, :unauthorized} = push(ctx, event("C1", 1))
+      assert_nothing_written(ctx)
+    end
+
+    test "a secret rotated after the pre-check refuses the event signed with the old one", ctx do
+      new_secret = "chg-rotated-" <> Base.encode16(:crypto.strong_rand_bytes(16))
+
+      rotate = fn ->
+        {:ok, _} =
+          Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{
+            change_events_secret: new_secret
+          })
+      end
+
+      assert {:error, :unauthorized} = push(ctx, event("C1", 1), before_hold: rotate)
+      source_id = ctx.source.id
+      assert_receive {:refused, _, %{source: ^source_id, reason: :bad_signature}}
+      assert_nothing_written(ctx)
+
+      # The new secret is the one that now authenticates.
+      assert {:ok, %{outcome: :applied}} = push(ctx, event("C1", 1), secret: new_secret)
+    end
+
+    test "a tenant suspended after the pre-check refuses the event", ctx do
+      suspend = fn ->
+        {:ok, tenant} = Loopctl.Tenants.get_tenant(ctx.tenant_id)
+        {:ok, _} = Loopctl.Tenants.suspend_tenant(tenant)
+      end
+
+      assert {:error, :unauthorized} = push(ctx, event("C1", 1), before_hold: suspend)
+      source_id = ctx.source.id
+      assert_receive {:refused, _, %{source: ^source_id, reason: :tenant_inactive}}
       assert_nothing_written(ctx)
     end
 

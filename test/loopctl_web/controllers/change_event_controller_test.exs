@@ -208,12 +208,17 @@ defmodule LoopctlWeb.ChangeEventControllerTest do
   end
 
   describe "AC-47.3.5: the operation spec" do
-    test "documents the 401, the duplicate answer and the body cap from the one attribute" do
+    test "documents the 401, the 500, the duplicate answer and the body cap" do
       spec = Loopctl.ApiSpec.spec()
       op = spec.paths["/api/v1/change_events/{source_id}"].post
 
       assert Map.has_key?(op.responses, 401)
       assert Map.has_key?(op.responses, 413)
+
+      # The 500 a failed apply answers, with the message the response carries.
+      assert %{description: failed} = op.responses[500]
+      assert failed =~ "change_event_failed"
+      assert failed =~ "The event could not be recorded. Redeliver it."
       assert op.description =~ "duplicate: true"
       assert op.description =~ "at most #{Events.max_body_bytes()} bytes"
       assert op.security == []
