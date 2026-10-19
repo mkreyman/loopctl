@@ -6,7 +6,10 @@ defmodule Loopctl.Verification.CiTarget do
 
   - the REPOSITORY is the story's project's intake source (`Intake.source_for_project/2`),
     the one derivation the merge gate and the dispatcher use. No live source is
-    `no_intake_source`, more than one `ambiguous_intake_source`
+    `no_intake_source`, more than one `ambiguous_intake_source`. A `mode: :chg` source is
+    `chg_landed_on_trunk`: chg lands the change, not a pull request, so no story branch
+    carries CI to read, and verify already required the landing on verified/master
+    (US-47.6, `Loopctl.Changes.TrunkEvidence`)
   - the REQUIRED CHECKS are that source's `required_checks`. None (after
     dropping `local-gate`, which is never trusted) is `no_required_checks`: the opt-in
   - the BRANCH is the one the story's placement recorded: the branch the claim's dispatch put
@@ -82,6 +85,9 @@ defmodule Loopctl.Verification.CiTarget do
 
   defp source(tenant_id, story) do
     case Intake.source_for_project(tenant_id, story.project_id) do
+      {:ok, %{mode: :chg}} ->
+        {:unconfigured, "chg_landed_on_trunk"}
+
       {:ok, source} ->
         {:ok, source}
 
