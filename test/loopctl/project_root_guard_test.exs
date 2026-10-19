@@ -11,7 +11,8 @@ defmodule Loopctl.ProjectRootGuardTest do
   `File.cwd!/0`, `Path.expand/1,2`, `:code.priv_dir/1`, `Application.app_dir/2`
   or `Mix.Project` path evaluated outside a function body (a module attribute, a
   module-level binding, a macro body outside `quote` or inside `unquote`, which
-  run while the macro's caller compiles). Read at run time, such a path names the snapshot's
+  run while the macro's caller compiles, and all of what `__using__` or a
+  CaseTemplate's `using` quotes into the caller's module body). Read at run time, such a path names the snapshot's
   tree, which may be gone: home_care_billing's first chg shadow check failed
   exactly so while `mix precommit` passed (home_care_billing#2540). Ask at run
   time instead (`File.cwd!/0` inside the function, a cwd-relative path, or
@@ -152,14 +153,15 @@ defmodule Loopctl.ProjectRootGuardTest do
                """)
     end
 
-    test "inside quote only the unquoted part runs at the defining module's compile time" do
-      assert [{5, "__DIR__"}] =
+    test "a quote __using__ injects runs at the caller's compile time, unquoted or not" do
+      assert [{4, "__DIR__"}, {5, "__DIR__"}, {6, "File.cwd!/0 at compile time"}] =
                scan!(~S"""
                defmodule M do
                  defmacro __using__(_) do
                    quote do
                      @from_caller __DIR__
                      @baked_here unquote(__DIR__)
+                     @root File.cwd!()
                    end
                  end
                end
@@ -239,18 +241,29 @@ defmodule Loopctl.ProjectRootGuardTest do
        when env in [:__ENV__, :__CALLER__] and is_atom(ctx),
        do: [{meta[:line], "#{env}.file"} | acc]
 
-  # Only what quote unquotes runs here, in the mode around the quote (a macro
-  # body's: compile time); the rest runs wherever it is injected.
+  # `__using__` and a CaseTemplate's `using` inject their quote into the CALLER's
+  # module body, so the quoted code runs while the caller compiles (#998): walk it
+  # as a module body, where a `def` inside it is run time again.
+  defp walk({:defmacro, _, [{:__using__, _, _} | _] = args}, _mode, acc),
+    do: walk(args, :using, acc)
+
+  defp walk({:using, _, args}, _mode, acc) when is_list(args), do: walk(args, :using, acc)
+
+  defp walk({:quote, _, args}, :using, acc), do: walk(args, :compile, acc)
+
+  # Any other quote lands wherever its macro is called, often a function body, so
+  # only what it unquotes runs here, in the mode around the quote.
   defp walk({:quote, _, args}, mode, acc), do: args |> unquoted() |> walk(mode, acc)
 
   defp walk({kind, _, args}, _mode, acc) when kind in @runtime_bodies and is_list(args),
     do: walk(args, :runtime, acc)
 
-  defp walk({{:., meta, [mod, fun]}, _, args} = call, :compile, acc) when is_list(args) do
-    acc = walk(args, :compile, acc)
+  defp walk({{:., meta, [mod, fun]}, _, args} = call, mode, acc)
+       when mode in [:compile, :using] and is_list(args) do
+    acc = walk(args, mode, acc)
 
     case path_call(mod, fun) do
-      nil -> walk(elem(call, 0), :compile, acc)
+      nil -> walk(elem(call, 0), mode, acc)
       name -> [{meta[:line], "#{name}/#{length(args)} at compile time"} | acc]
     end
   end
