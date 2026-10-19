@@ -129,6 +129,58 @@ by searching every tenant for a repo named in an unauthenticated body.
   (`events after N`): reconciliation, not trust in delivery.
 - Every applied event is appended to the audit chain with the change id and sha.
 
+**The wire contract, as chg emits it** (confirmed by the chg session on 2026-10-19; record:
+mkreyman/chg#33, comments 6257372489 and 6257451658, the later one winning):
+
+- Headers `X-Chg-Timestamp` and `X-Chg-Signature`; the HMAC is over `"<timestamp>.<raw body>"`
+  keyed by `change_events_secret`. chg signs at send time, so a retry carries a fresh
+  timestamp and stays inside the 5-minute window.
+- Envelope: `{v, repo, change_id, event_seq, kind, revision, sha, occurred_at, data}`.
+  `event_seq` is per change, starts at 1 and has no gaps on chg's side.
+- Delivery is at-least-once with backoff for up to 24 h. A `401`'d event stays in chg's outbox,
+  in order. After 3 consecutive 401s, or 15 min of nothing else, chg marks the source
+  `auth_failing`, probes hourly with the oldest pending event for 7 days, and alerts on its
+  own surfaces (dashboard, Fly error log, Mark's email), never through loopctl. When the secret
+  is fixed the outbox drains in order, so nothing under 7 days old is lost. On loopctl's side,
+  a gap only reveals a lost event when a LATER event arrives, so it cannot catch a bad secret
+  or a dropped final event. loopctl therefore also runs a STALENESS reconcile: a bound change whose story is not terminal and that has had no event
+  for 6 h is pulled from `after=<last applied seq>`. A pull refused for its signature raises
+  an operator alert, because under a one-sided secret rotation it is the only signal loopctl
+  gets. Each refused delivery is also logged and counted per source.
+- The envelope `sha` is ALWAYS the revision commit (the head of `refs/chg/<id>/<n>`), and
+  `revision` is the revision the event is about.
+- `data` per kind:
+  - `submitted` → `story_id` (or null)
+  - `review_findings` → `{findings, round, dispatch_key}`, about the envelope's revision
+  - `review_approved` → `by` (`model` | `policy`)
+  - `check_passed` → `{checks, ms}`, informational
+  - `landed` → `merge_sha`, the NEW trunk commit (the squash onto the tip at the time), which
+    differs from the envelope `sha` whenever trunk moved. It is what the stage row records as
+    `merge_sha`
+  - `verified` → `sha`, the `verified/master` commit whose full run passed. It contains
+    `merge_sha` and may be later. It is what the stage row records as `trunk_verified_sha`
+  - `reverted` → `{landed_sha, revert_sha, revert_change_id, failures, verification_id}`, with
+    the envelope's revision and `sha` naming the reverted revision
+  - `deployed` is NOT emitted in v1: chg runs no deploys before its Phase 3, so loopctl's own
+    post-deploy detection keeps driving `merged → deployed`. If chg emits it later, its data
+    is `{sha, app, release}`
+- `story_id` comes from a `Story:` commit trailer that `chg submit --story` writes. chg treats
+  it as opaque and never calls loopctl, so loopctl is not on chg's merge path.
+- chg also emits `review_requested`, `check_failed`, `conflict` and `ready`. loopctl RECORDS
+  any kind the stage mapping does not map, answers `2xx`, and moves no stage. Recording it is
+  what keeps ordering whole: the event's `event_seq` is now present, so the next event is not
+  held behind a gap that would never fill. chg can add kinds without a loopctl release.
+- The gap pull is `GET /api/v1/changes/:change_id/events?after=N` on chg-server, HMAC-signed
+  with the same secret over `"<timestamp>.GET.<path>?<query>"` exactly as sent (the query
+  carries only `after`), inside the same 5-minute window. `change_id` is GLOBALLY unique (a
+  client ULID with a unique index across every repo in chg-server), so the URL needs no repo;
+  loopctl's `(repo, change_id)` keys stay as a redundant guard.
+- chg-server is chg's Phase 2 and is not running yet (mkreyman/chg#35). Until then, 47.3 is
+  built and tested against this contract but receives no real events.
+- GitHub App 5101362 is ADOPTED by chg as chg-server's lander (renamed chg-lander, given a new
+  key). loopctl holds none of its credentials: `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`
+  were unset from loopctl's Fly app on 2026-10-19 (release v736).
+
 **The stage mapping.** It uses the stages `Delivery.StageMachine` already has. The edges marked
 new are control-only (never runner-reportable). `pr_open` is skipped: a chg change has no PR.
 
@@ -228,15 +280,15 @@ existing gate (exact `:orchestrator`, lineage, recorded separation) and adds §6
 |---|---|---|
 | 47.1 | `change_bindings` and the binding rules (§4), with tenant isolation | — |
 | 47.2 | Intake `mode: :chg` (beside `:pr`; #984 removes `:thread`): `change_events_secret`, `chg_root_dispatch_id`, and the merge gate refusing the PR route | — |
-| 47.3 | `POST /change_events/:source_id`: HMAC, idempotency, per-change ordering, gap reconciliation (§5) | 47.1, 47.2, chg phase 2's event schema |
+| 47.3 | `POST /change_events/:source_id`: HMAC, idempotency, per-change ordering, gap and staleness reconciliation (§5) | 47.1, 47.2 |
 | 47.4 | The stage mapping, with the `:change_ready`, `:reverted` (chained), `:reverted_after_verify` and `:change_outside_lifecycle` edges and revert-after-done intake (§5) | 47.3 |
 | 47.5 | Review custody for chg-dispatched reviews: the chg-reviewer check, `review_records.commit_sha`, `:review_missing`, `chg_root_cannot_verify` (§6) | 47.2, 47.4 |
 | 47.6 | Story verification from `verified/master` (§7) | 47.4, 47.5 |
 | 47.7 | MCP: `change_binding_get`, plus `mode: chg`, the events secret and the chg root in `intake_source_enroll` / `intake_source_update` | 47.1, 47.2 |
 | 47.8 | Pilot on the first repo that chg phase 2 enrolls and that has a loopctl intake source | all |
 
-47.1 and 47.2 can start now. 47.3 starts when chg phase 2 publishes its event schema
-(mkreyman/chg#33 states what loopctl expects). No story in this epic writes chg code: anything
+47.1 and 47.2 can start now, and 47.3 once they land: its contract is confirmed on
+mkreyman/chg#33. No story in this epic writes chg code: anything
 chg must change is filed on mkreyman/chg.
 
 ## 9. Decisions Mark may overrule
@@ -270,8 +322,8 @@ calls it today.
 | `thread_*` MCP tools, `mcp-server/lib/threads.js`, `test/threads_tool.test.js`, thread mode in `claim_story` and intake-source tool text | **delete** | Their endpoints go |
 | `intake_sources.mode` | **keep the column, drop `:thread`** | 47.2 adds `:chg` to the same enum |
 | `forge.ex`, `forge_outbox.ex` | **keep** | Used by intake, verification credentials and `Intake.IssueClosures` |
-| `loopctl-merge` GitHub App (id 5101362), Fly secrets `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY` | **loopctl stops using it; do not delete the App in #984** | Nothing in loopctl but the executor reads it. chg's enrollment needs exactly such an App as trunk's only pusher (chg §3.6), so the App goes to chg phase 2 to adopt (re-key into chg-server) or delete; filed as mkreyman/chg#33. #984 removes the two Fly secrets and their `deploy/FLY_SECRETS.md` rows |
-| infra `.loopctl/mode`, `loop/**` CI trigger, thread-only rulesets; loopctl-runner `review_prompt.ex`, `loop-push`, thread dispatch | **delete** (in those repos) | Thread-only. infra's master ruleset 24087505 names App 5101362 as its only bypass; that bypass goes when the App leaves loopctl (PR merges are unaffected, since the ruleset still admits them) |
+| `loopctl-merge` GitHub App (id 5101362), Fly secrets `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY` | **loopctl stops using it; do not delete the App in #984** | Nothing in loopctl but the executor reads it. chg's enrollment needs exactly such an App as trunk's only pusher (chg §3.6), so the App goes to chg. chg ADOPTED it (mkreyman/chg#33, 2026-10-19) as chg-server's lander, renamed chg-lander with a new key. #984 removed the `deploy/FLY_SECRETS.md` rows, and the two Fly secrets were unset on 2026-10-19 |
+| infra `.loopctl/mode`, `loop/**` CI trigger, thread-only rulesets; loopctl-runner `review_prompt.ex`, `loop-push`, thread dispatch | **delete** (in those repos) | Thread-only. infra's master ruleset 24087505 names App 5101362 as its only bypass, and that bypass STAYS: it is chg-lander's push path (infra#318) |
 
 ## 11. Success criteria (from Epic 45's, restated for the split)
 

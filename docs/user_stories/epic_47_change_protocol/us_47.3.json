@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-47.3.1",
-      "description": "POST /api/v1/change_events/:source_id verifies an HMAC over timestamp + raw body with that source's change_events_secret. An unknown source id, a revoked or non-:chg source, a bad signature and a timestamp outside 5 minutes all return the same 401 and write nothing."
+      "description": "POST /api/v1/change_events/:source_id verifies X-Chg-Signature, an HMAC over \"<X-Chg-Timestamp>.<raw body>\" with that source's change_events_secret. An unknown source id, a revoked or non-:chg source, a bad signature and a timestamp outside 5 minutes all return the same 401, write nothing, and are logged and counted per source."
     },
     {
       "id": "AC-47.3.2",
@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-47.3.3",
-      "description": "Events apply in event_seq order per change. An event ahead of a gap is stored and applied when the gap fills; a gap older than 10 minutes enqueues one reconciliation job per change (Oban, unique on change) that pulls the missing events from chg."
+      "description": "Events apply in event_seq order per change. An event ahead of a gap is stored and applied when the gap fills; a gap older than 10 minutes enqueues one reconciliation job per change (Oban, unique on change) that pulls the missing events from chg. A bound change whose story is not terminal and that has had no event for 6 hours is pulled the same way, and a pull refused for its signature raises an operator alert."
     },
     {
       "id": "AC-47.3.4",
@@ -33,6 +33,10 @@
     {
       "id": "AC-47.3.5",
       "description": "The request makes no outbound call. Its operation/2 spec documents the 401, the duplicate answer and the body cap, which one module attribute holds for both the guard and the spec."
+    },
+    {
+      "id": "AC-47.3.6",
+      "description": "An event of a kind the stage mapping does not map (review_requested, check_failed, conflict, ready, or any unknown kind) is recorded, answered 2xx, advances the change's applied event_seq, and moves no stage, so it never leaves a gap."
     }
   ],
   "test_cases": [
@@ -108,11 +112,29 @@
         "one reconciliation job",
         "seq 2 fetched, both applied"
       ]
+    },
+    {
+      "id": "TC-47.3.5",
+      "verifies": [
+        "AC-47.3.6"
+      ],
+      "name": "unmapped kind keeps ordering whole",
+      "type": "integration",
+      "preconditions": [
+        "a bound change"
+      ],
+      "steps": [
+        "deliver submitted (seq 1), review_requested (seq 2), review_findings (seq 3)"
+      ],
+      "expected_results": [
+        "seq 2 answers 2xx and is recorded",
+        "seq 3 applies immediately: the story moves reviewing -> implementing"
+      ]
     }
   ],
   "technical_notes": [
     "The chg client is a behaviour resolved from config (Loopctl.Changes.ChgClient), mocked in test/support/mocks.ex.",
-    "Build against chg phase 2's published event schema (mkreyman/chg#33), not a guess."
+    "Build against PRD \u00a75's wire contract, confirmed on mkreyman/chg#33 (headers, signed strings for POST and the gap-pull GET, envelope, per-kind data)."
   ],
   "dependencies": [
     "US-47.1",
