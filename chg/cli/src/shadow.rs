@@ -9,6 +9,10 @@
 //!   appends a `chg` row. The live tree is never touched: the real gate may be compiling
 //!   and testing it at the same moment, and the throwaway worktree has its own workspace
 //!   slot, so its own test database.
+//! - Once its row is written, that copy starts `chg snapshot refresh` of the push's base,
+//!   detached, so the next push's check starts warm. Nothing else refreshes
+//!   snapshots before S8, and a change Mix recompiles everything for (`mix.exs`, config)
+//!   would otherwise cost every later check a full compile.
 //! - `chg shadow record` (from the same hook, after the real gate) appends a `gate` row.
 //!   `chg shadow report --ci-check <name>` fills in a commit no local gate judged (a push
 //!   the hook let CI judge) from that check run on GitHub.
@@ -35,6 +39,9 @@ use crate::ws::{self, Hydrated};
 pub const ROW_VERSION: u32 = 1;
 /// How long a shadow check waits for an earlier one on this machine before skipping.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30 * 60);
+/// The cap on the snapshot build after a check. Nobody waits on it, and a dependency
+/// change rebuilds the dialyzer PLT (42 min on nuc, 2026-10-18).
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 /// Logs of detached runs older than this are removed when a new one starts.
 const LOG_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
 
@@ -280,7 +287,50 @@ pub fn run_foreground(repo: &Path, sha: &str, base: &str) -> Result<Row, String>
     let key = git::repo_key(repo);
     let row = judge(repo, &key, sha, base);
     append(&log_path(&key), &row)?;
+    refresh(repo, base);
     Ok(row)
+}
+
+/// Start `chg snapshot refresh` of `base`, detached, once the row is written, so the
+/// next push's check starts from it. Detached because the hook runs this check holding
+/// the repo's gate lock: a refresh can take as long as a dependency change's PLT build,
+/// and must not hold the next gate back for it. So it runs at nice 19 with every
+/// inherited descriptor closed, the gate lock's among them. The refresh decides the rest
+/// under the build lock: never cold, never queued behind another build, then GC.
+fn refresh(repo: &Path, base: &str) {
+    let spawned = (|| {
+        let git_dir = git::common_dir(repo)?;
+        let exe = std::env::current_exe().map_err(|e| format!("locating chg: {e}"))?;
+        let mut c = Command::new(exe);
+        c.args(["snapshot", "refresh"])
+            .arg(&git_dir)
+            .arg(base)
+            .arg("--timeout-secs")
+            .arg(REFRESH_TIMEOUT.as_secs().to_string())
+            .current_dir(&git_dir)
+            .stdin(Stdio::null());
+        for v in git::HOOK_ENV {
+            c.env_remove(v);
+        }
+        // SAFETY: only async-signal-safe calls (setsid, setpriority, fcntl) between fork
+        // and exec. Marking every descriptor above stderr close-on-exec drops the
+        // inherited gate lock at exec, and leaves std's own exec-error pipe working.
+        unsafe {
+            c.pre_exec(|| {
+                libc::setsid();
+                libc::setpriority(libc::PRIO_PROCESS as _, 0, 19);
+                let max = libc::sysconf(libc::_SC_OPEN_MAX).clamp(256, 65_536) as libc::c_int;
+                for fd in 3..max {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                Ok(())
+            });
+        }
+        c.spawn().map_err(|e| format!("starting it: {e}"))
+    })();
+    if let Err(e) = spawned {
+        eprintln!("chg: shadow could not refresh the snapshot of {base}: {e}");
+    }
 }
 
 fn judge(repo: &Path, key: &str, sha: &str, base: &str) -> Row {

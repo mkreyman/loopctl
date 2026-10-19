@@ -44,18 +44,62 @@ impl Drop for TempGuard {
     }
 }
 
+/// What `refresh` did.
+pub enum Refresh {
+    Done(Built),
+    /// Another build held the build lock.
+    Busy,
+    /// No snapshot is an ancestor of the commit; a refresh never builds cold.
+    NoAncestor,
+}
+
 pub fn build(repo: &Path, rev: &str, timeout: Duration) -> Result<Built, String> {
+    match build_inner(repo, rev, timeout, false)? {
+        Refresh::Done(b) => Ok(b),
+        Refresh::Busy | Refresh::NoAncestor => unreachable!("only a refresh skips"),
+    }
+}
+
+/// Build the snapshot of `rev` from an older snapshot of its own history, then GC. Unlike
+/// `build` it never waits for another build and never builds cold: it is the background
+/// job after a shadow check, and the next push refreshes again.
+pub fn refresh(repo: &Path, rev: &str, timeout: Duration) -> Result<Refresh, String> {
+    let r = build_inner(repo, rev, timeout, true)?;
+    if let Refresh::Done(Built::Built(_)) = r {
+        Store::for_repo(repo)?
+            .gc()
+            .map_err(|e| format!("gc: {e}"))?;
+    }
+    Ok(r)
+}
+
+fn build_inner(
+    repo: &Path,
+    rev: &str,
+    timeout: Duration,
+    refresh: bool,
+) -> Result<Refresh, String> {
     let started = Instant::now();
     let sha = git::resolve(repo, rev)?;
     let store = Store::for_repo(repo)?;
     if let Some(m) = store.list().into_iter().find(|m| m.sha == sha) {
-        return Ok(Built::Exists(m));
+        return Ok(Refresh::Done(Built::Exists(m)));
     }
     fs::create_dir_all(store.snapshots()).map_err(|e| format!("creating the store: {e}"))?;
-    let _build = store.lock_build().map_err(|e| format!("build lock: {e}"))?;
+    let _build = if refresh {
+        match store
+            .try_lock_build()
+            .map_err(|e| format!("build lock: {e}"))?
+        {
+            Some(l) => l,
+            None => return Ok(Refresh::Busy),
+        }
+    } else {
+        store.lock_build().map_err(|e| format!("build lock: {e}"))?
+    };
     // Another build may have finished this one while we waited for the lock.
     if let Some(m) = store.list().into_iter().find(|m| m.sha == sha) {
-        return Ok(Built::Exists(m));
+        return Ok(Refresh::Done(Built::Exists(m)));
     }
 
     let tmp = store
@@ -69,10 +113,11 @@ pub fn build(repo: &Path, rev: &str, timeout: Duration) -> Result<Built, String>
         let _lock = store
             .lock_shared()
             .map_err(|e| format!("store lock: {e}"))?;
-        let base = store
-            .nearest_ancestor(repo, &sha)
-            .map(|(m, _)| m)
-            .or_else(|| store.list().into_iter().next());
+        let ancestor = store.nearest_ancestor(repo, &sha).map(|(m, _)| m);
+        if refresh && ancestor.is_none() {
+            return Ok(Refresh::NoAncestor);
+        }
+        let base = ancestor.or_else(|| store.list().into_iter().next());
         if let Some(b) = &base {
             clone_tree(&store.snapshot(&b.sha), &tmp)
                 .map_err(|e| format!("cloning snapshot {}: {e}", b.sha))?;
@@ -148,7 +193,7 @@ pub fn build(repo: &Path, rev: &str, timeout: Duration) -> Result<Built, String>
     }
     fs::rename(&tmp, &target).map_err(|e| format!("renaming the snapshot into place: {e}"))?;
     guard.0 = None;
-    Ok(Built::Built(meta))
+    Ok(Refresh::Done(Built::Built(meta)))
 }
 
 /// Brings `dir`, a clone of the snapshot of `from`, to commit `to`. The paths that
@@ -210,7 +255,8 @@ fn differing(repo: &Path, sha: &str, dir: &Path) -> Result<Vec<String>, String> 
         .collect())
 }
 
-/// Writes the files of commit `sha` (all, or only `paths`) into `dir` with
+/// Writes the files of commit `sha` (all, or only `paths`) into `dir`, which must be
+/// absolute, with
 /// `checkout-index`, which applies the same filters as a worktree checkout and, unlike
 /// `git archive`, ignores `export-ignore`.
 fn checkout(repo: &Path, sha: &str, dir: &Path, paths: Option<&[String]>) -> Result<(), String> {
@@ -222,13 +268,12 @@ fn checkout(repo: &Path, sha: &str, dir: &Path, paths: Option<&[String]>) -> Res
         .args(["read-tree", sha]);
     git::run(rt)?;
 
-    let mut prefix = dir.as_os_str().to_owned();
-    prefix.push("/");
+    // `dir` as the work tree rather than a `--prefix`: checkout-index refuses to run
+    // without one, and the detached shadow check reaches the repo by its git dir.
     let mut co = git::cmd(repo);
     co.env("GIT_INDEX_FILE", &index_path)
-        .arg("checkout-index")
-        .arg("-f")
-        .arg(format!("--prefix={}", prefix.to_string_lossy()));
+        .env("GIT_WORK_TREE", dir)
+        .args(["checkout-index", "-f"]);
     match paths {
         None => {
             co.arg("-a");

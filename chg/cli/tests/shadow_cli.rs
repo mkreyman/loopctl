@@ -38,7 +38,8 @@ const ADAPTER: &str = r#"#!/bin/sh
 cmd=$1; shift
 echo "$cmd $(pwd)" >> "$CALLS"
 case "$cmd" in
-  snapshot) mkdir -p _build; echo built > _build/marker; echo '{"work":"full","ms":1}' ;;
+  snapshot) [ -n "$SNAP_SLEEP" ] && sleep "$SNAP_SLEEP"
+            mkdir -p _build; echo built > _build/marker; echo '{"work":"full","ms":1}' ;;
   static)   if ! git rev-parse --verify --quiet "$1^{commit}" >/dev/null; then
               echo '{"ok":false,"failures":[{"check":"git","message":"base not in this repo"}]}'; exit 1
             fi
@@ -379,6 +380,108 @@ fn shadow_judges_the_commit_in_a_throwaway_worktree() {
     assert_eq!(again, vec![first_dirs[0].as_str()], "same path, same slot");
     assert_eq!(env.worktrees(), 1, "the leftover is gone too");
     assert!(!ws.exists());
+}
+
+#[test]
+fn after_its_row_a_shadow_builds_the_snapshot_of_its_base_from_an_older_one() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let old = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&old)
+        .assert()
+        .success();
+    let base = env.commit("lib/a.ex", "two\n");
+    env.commit("lib/a.ex", "three\n");
+
+    // As the hook runs it: holding the gate lock, which the refresh must not inherit.
+    let gate_lock = env.repo.join("gate.lock");
+    fs::write(&gate_lock, "").unwrap();
+    let has_flock = Std::new("flock").arg("-V").output().is_ok();
+    let chg = assert_cmd::cargo::cargo_bin("chg");
+    let mut c = if has_flock {
+        let mut c = Std::new("flock");
+        c.arg(&gate_lock).arg(chg);
+        c
+    } else {
+        Std::new(chg)
+    };
+    // Output to null, not captured: a captured pipe would be held open by the detached
+    // refresh, and reading it to EOF would wait for the refresh to finish.
+    let status = c
+        .current_dir(&env.repo)
+        .env("CHG_HOME", &env.home)
+        .env("CHG_STORE", &env.store)
+        .env("CALLS", &env.calls)
+        .env_remove("CHG_GATE")
+        .env("SNAP_SLEEP", "3")
+        .args(["check", "--shadow", "--foreground", "--base", &base])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(env.rows()[0]["verdict"], "pass", "{:?}", env.rows());
+    if has_flock {
+        let free = Std::new("flock")
+            .args(["-n"])
+            .arg(&gate_lock)
+            .arg("true")
+            .status()
+            .unwrap();
+        assert!(free.success(), "the running refresh holds the gate lock");
+        let out = env
+            .chg()
+            .args(["snapshot", "list"])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            String::from_utf8(out).unwrap().lines().count(),
+            1,
+            "the refresh had already finished, so the lock check proves nothing"
+        );
+    }
+    // The refresh runs detached: wait for its snapshot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let listed = loop {
+        let out = env
+            .chg()
+            .args(["snapshot", "list"])
+            .output()
+            .unwrap()
+            .stdout;
+        let metas: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        if metas.len() == 2 || std::time::Instant::now() > deadline {
+            break metas;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let shas: Vec<&str> = listed.iter().map(|m| m["sha"].as_str().unwrap()).collect();
+    assert_eq!(shas, vec![base.as_str(), old.as_str()], "{listed:?}");
+    assert_eq!(
+        listed[0]["from"],
+        old.as_str(),
+        "warm, from the older snapshot"
+    );
+
+    // The same base again: already built, so no second snapshot build runs.
+    fs::remove_file(&env.calls).unwrap();
+    env.chg()
+        .args(["check", "--shadow", "--foreground", "--base", &base])
+        .assert()
+        .success();
+    assert!(
+        !env.calls().lines().any(|l| l.starts_with("snapshot")),
+        "{}",
+        env.calls()
+    );
 }
 
 #[test]

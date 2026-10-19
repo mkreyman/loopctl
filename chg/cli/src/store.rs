@@ -46,7 +46,9 @@ pub struct Meta {
 /// root-owned dir) is not mistaken for it.
 pub fn root() -> PathBuf {
     if let Some(r) = std::env::var_os("CHG_STORE") {
-        return PathBuf::from(r);
+        // Absolute, because git resolves GIT_WORK_TREE against its own `-C` dir.
+        let r = PathBuf::from(r);
+        return std::path::absolute(&r).unwrap_or(r);
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
     if cfg!(target_os = "macos") {
@@ -120,22 +122,32 @@ impl Store {
     }
 
     fn lock(&self, name: &str, exclusive: bool) -> io::Result<Lock> {
+        let op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        self.flock(name, op)
+            .map(|l| l.expect("a blocking flock always returns a lock"))
+    }
+
+    /// `op` with `LOCK_NB`: `Ok(None)` when another process holds it.
+    fn flock(&self, name: &str, op: libc::c_int) -> io::Result<Option<Lock>> {
         fs::create_dir_all(&self.dir)?;
         let f = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(self.dir.join(name))?;
-        let op = if exclusive {
-            libc::LOCK_EX
-        } else {
-            libc::LOCK_SH
-        };
         // SAFETY: flock on an fd we own; released when the File closes.
         if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            if op & libc::LOCK_NB != 0 && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(e);
         }
-        Ok(Lock(f))
+        Ok(Some(Lock(f)))
     }
 
     /// Held while a workspace takes its lease and clones; GC waits for it.
@@ -151,6 +163,11 @@ impl Store {
     /// database), so two at once would run their adapters against the same database.
     pub fn lock_build(&self) -> io::Result<Lock> {
         self.lock("build.lock", true)
+    }
+
+    /// The build lock if no build holds it now, else `None`.
+    pub fn try_lock_build(&self) -> io::Result<Option<Lock>> {
+        self.flock("build.lock", libc::LOCK_EX | libc::LOCK_NB)
     }
 
     /// Held for a whole job of `name` (`culprit`, `revert`) in this repo: each job owns one

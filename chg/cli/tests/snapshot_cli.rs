@@ -689,3 +689,49 @@ fn a_zero_timeout_is_refused_before_any_work() {
         .stderr(predicate::str::contains("--timeout-secs"));
     assert_eq!(e.builds(), 0, "no adapter run");
 }
+
+#[test]
+fn refresh_builds_only_from_an_ancestor_and_never_waits_for_another_build() {
+    use std::os::unix::io::AsRawFd;
+    let Some(e) = Env::new() else { return };
+    // Through the git dir, as the detached shadow check calls it.
+    let git_dir = e.repo.join(".git");
+    let refresh = |sha: &str| -> Value {
+        let out = e
+            .chg()
+            .args(["snapshot", "refresh"])
+            .arg(&git_dir)
+            .arg(sha)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap()
+    };
+    let one = e.head();
+    assert_eq!(refresh(&one)["status"], "no-ancestor", "never cold");
+    assert_eq!(e.builds(), 0);
+
+    e.build(&one);
+    let two = e.commit("two", |r| fs::write(r.join("src/version"), "2\n").unwrap());
+    let key = e
+        .snap_dir(&one)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let held = fs::File::create(key.join("build.lock")).unwrap();
+    // SAFETY: flock on a file this test owns; released when it closes.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    assert_eq!(refresh(&two)["status"], "busy", "skipped, not queued");
+    drop(held);
+    assert_eq!(e.builds(), 1);
+
+    let built = refresh(&two);
+    assert_eq!(built["status"], "built", "{built}");
+    assert_eq!(built["from"], one.as_str());
+    assert_eq!(e.snapshots(), vec![two.clone(), one]);
+    assert_eq!(refresh(&two)["status"], "exists");
+}

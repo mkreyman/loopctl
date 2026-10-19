@@ -64,7 +64,6 @@ impl<'a> Searcher<'a> {
             // Unlike the shadow, nothing here competes with a gate: build the snapshot of
             // `good` once, and every candidate after it hydrates from it.
             Hydrated::NoSnapshot if !self.built => {
-                // Built through this worktree: a snapshot checks out with a work tree.
                 snapshot::build(&s.path, good, self.snapshot_timeout)?;
                 drop(s);
                 self.built = true;

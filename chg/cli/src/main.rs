@@ -13,7 +13,7 @@ use chg::gate::{self, Mode};
 use chg::git;
 use chg::output::{Affected, Document};
 use chg::shadow;
-use chg::snapshot::{self, Built};
+use chg::snapshot::{self, Built, Refresh};
 use chg::store::Store;
 use chg::ws::{self, Hydrated};
 use chg::{culprit, revert, verify};
@@ -252,6 +252,15 @@ enum SnapshotCmd {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
+    /// Build the snapshot of <sha> only from an older snapshot of its history, skipping
+    /// when another build is running, then GC. Never builds cold. <repo> may be a git dir.
+    /// Exit 0 built, present or skipped (the JSON line says which), 1 failed.
+    Refresh {
+        repo: PathBuf,
+        sha: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
+    },
     /// List this repo's snapshots, newest first, as JSON lines.
     List {
         #[arg(long)]
@@ -332,6 +341,11 @@ fn main() -> ExitCode {
                 let timeout = exec::cap(CommandName::Snapshot, timeout_secs);
                 with_worktree(Some(repo), |r| snapshot_build(r, &sha, timeout))
             }
+            SnapshotCmd::Refresh {
+                repo,
+                sha,
+                timeout_secs,
+            } => snapshot_refresh(&repo, &sha, exec::cap(CommandName::Snapshot, timeout_secs)),
             SnapshotCmd::List { repo } => with_worktree(repo, snapshot_list),
             SnapshotCmd::Gc { repo } => with_worktree(repo, snapshot_gc),
         },
@@ -658,6 +672,25 @@ fn snapshot_build(repo: &Path, sha: &str, timeout: Duration) -> ExitCode {
     {
         eprintln!("chg: gc removed {}", removed.join(", "));
     }
+    ExitCode::SUCCESS
+}
+
+fn snapshot_refresh(repo: &Path, sha: &str, timeout: Duration) -> ExitCode {
+    let status = match snapshot::refresh(repo, sha, timeout) {
+        Ok(Refresh::Done(Built::Exists(m))) => {
+            serde_json::json!({"snapshot": m.sha, "status": "exists"})
+        }
+        Ok(Refresh::Done(Built::Built(m))) => {
+            serde_json::json!({"snapshot": m.sha, "status": "built", "from": m.from, "work": m.work, "ms": m.ms})
+        }
+        Ok(Refresh::Busy) => serde_json::json!({"sha": sha, "status": "busy"}),
+        Ok(Refresh::NoAncestor) => serde_json::json!({"sha": sha, "status": "no-ancestor"}),
+        Err(e) => {
+            eprintln!("chg: snapshot refresh failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("{status}");
     ExitCode::SUCCESS
 }
 
