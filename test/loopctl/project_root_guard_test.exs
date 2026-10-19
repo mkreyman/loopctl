@@ -11,7 +11,8 @@ defmodule Loopctl.ProjectRootGuardTest do
   `File.cwd!/0`, `Path.expand/1,2`, `:code.priv_dir/1`, `Application.app_dir/2`
   or `Mix.Project` path evaluated outside a function body (a module attribute, a
   module-level binding, a macro body outside `quote` or inside `unquote`, which
-  run while the macro's caller compiles). Read at run time, such a path names the snapshot's
+  run while the macro's caller compiles, and all of what `__using__` or a
+  CaseTemplate's `using` quotes into the caller's module body). Read at run time, such a path names the snapshot's
   tree, which may be gone: home_care_billing's first chg shadow check failed
   exactly so while `mix precommit` passed (home_care_billing#2540). Ask at run
   time instead (`File.cwd!/0` inside the function, a cwd-relative path, or
@@ -38,7 +39,11 @@ defmodule Loopctl.ProjectRootGuardTest do
   # (defmacro, defmacrop, ExUnit.CaseTemplate's `using`) is not one: it runs
   # while its CALLER compiles, so what it evaluates outside `quote`, and what
   # `unquote` evaluates inside it, is baked into the caller. It is walked like
-  # the module body around it; only its quoted code is left to where it lands.
+  # the module body around it. Quoted code is judged where it LANDS: the quote a
+  # `__using__`/`using` body returns lands in the caller's module body (compile
+  # time, #998); any other quote lands wherever its macro is called, which the
+  # walk cannot see, so only `__DIR__`/`__ENV__.file` (which expand wherever they
+  # land) are judged in it.
   @runtime_bodies [:def, :defp, :defguard, :defguardp]
 
   # Calls whose result is an absolute path of the tree or build they run in.
@@ -152,14 +157,15 @@ defmodule Loopctl.ProjectRootGuardTest do
                """)
     end
 
-    test "inside quote only the unquoted part runs at the defining module's compile time" do
-      assert [{5, "__DIR__"}] =
+    test "a quote __using__ injects runs at the caller's compile time, unquoted or not" do
+      assert [{4, "__DIR__"}, {5, "__DIR__"}, {6, "File.cwd!/0 at compile time"}] =
                scan!(~S"""
                defmodule M do
                  defmacro __using__(_) do
                    quote do
                      @from_caller __DIR__
                      @baked_here unquote(__DIR__)
+                     @root File.cwd!()
                    end
                  end
                end
@@ -209,6 +215,76 @@ defmodule Loopctl.ProjectRootGuardTest do
                """)
     end
 
+    test "unquote inside a def inside a __using__ quote runs at the caller's compile time" do
+      assert [{4, "File.cwd!/0 at compile time"}] =
+               scan!(~S"""
+               defmodule M do
+                 defmacro __using__(_) do
+                   quote do
+                     def root, do: unquote(File.cwd!())
+                   end
+                 end
+               end
+               """)
+    end
+
+    test "a guarded __using__ head is judged the same way" do
+      assert [{4, "File.cwd!/0 at compile time"}] =
+               scan!(~S"""
+               defmodule M do
+                 defmacro __using__(opts) when is_list(opts) do
+                   quote do
+                     @root File.cwd!()
+                   end
+                 end
+               end
+               """)
+    end
+
+    test "a CaseTemplate `using` quote is the caller's module body" do
+      assert [{4, "Path.expand/1 at compile time"}] =
+               scan!(~S"""
+               defmodule M do
+                 use ExUnit.CaseTemplate
+                 using do
+                   quote do: @root(Path.expand("priv"))
+                 end
+               end
+               """)
+    end
+
+    test "a quote bound in a __using__ body and spliced into a def is not module body" do
+      assert [] =
+               scan!(~S"""
+               defmodule M do
+                 defmacro __using__(_) do
+                   body = quote do: File.cwd!()
+                   quote do
+                     def root, do: unquote(body)
+                   end
+                 end
+               end
+               """)
+    end
+
+    test "any macro's quoted __DIR__ expands where it lands, so it is flagged" do
+      assert [{2, "__DIR__"}] =
+               scan!(~S"""
+               defmodule M do
+                 defmacro root, do: quote(do: __DIR__)
+               end
+               """)
+    end
+
+    test "a `using` call inside a function body is not a CaseTemplate block" do
+      assert [] =
+               scan!(~S"""
+               defmodule M do
+                 def f, do: using(File.cwd!())
+               end
+               """)
+    end
+
     test "a nested module is walked too" do
       assert [{3, "__DIR__"}] =
                scan!(~S"""
@@ -239,9 +315,23 @@ defmodule Loopctl.ProjectRootGuardTest do
        when env in [:__ENV__, :__CALLER__] and is_atom(ctx),
        do: [{meta[:line], "#{env}.file"} | acc]
 
-  # Only what quote unquotes runs here, in the mode around the quote (a macro
-  # body's: compile time); the rest runs wherever it is injected.
-  defp walk({:quote, _, args}, mode, acc), do: args |> unquoted() |> walk(mode, acc)
+  # `__using__` (bare or guarded head) and a CaseTemplate's module-level `using`
+  # block return a quote that lands in the CALLER's module body.
+  defp walk({:defmacro, _, [head, body]}, :compile, acc) when is_list(body) do
+    if using_head?(head),
+      do: walk_using_body(body[:do], acc),
+      else: walk([head, body], :compile, acc)
+  end
+
+  defp walk({:using, _, args}, :compile, acc) when is_list(args) and args != [] do
+    case List.last(args) do
+      [do: body] -> walk_using_body(body, walk(Enum.drop(args, -1), :compile, acc))
+      _other -> walk(args, :compile, acc)
+    end
+  end
+
+  # Any other quote lands where its macro is called.
+  defp walk({:quote, _, args}, mode, acc), do: walk_quoted(args, :unknown, mode, acc)
 
   defp walk({kind, _, args}, _mode, acc) when kind in @runtime_bodies and is_list(args),
     do: walk(args, :runtime, acc)
@@ -260,11 +350,68 @@ defmodule Loopctl.ProjectRootGuardTest do
   defp walk(list, mode, acc) when is_list(list), do: Enum.reduce(list, acc, &walk(&1, mode, &2))
   defp walk(_leaf, _mode, acc), do: acc
 
-  defp unquoted({:unquote, _, [expr]}), do: [expr]
-  defp unquoted({a, _meta, c}) when is_list(c), do: unquoted(a) ++ unquoted(c)
-  defp unquoted({a, b}), do: unquoted(a) ++ unquoted(b)
-  defp unquoted(list) when is_list(list), do: Enum.flat_map(list, &unquoted/1)
-  defp unquoted(_leaf), do: []
+  defp using_head?({:when, _, [head | _]}), do: using_head?(head)
+  defp using_head?({:__using__, _, _}), do: true
+  defp using_head?(_head), do: false
+
+  # The macro body runs at the caller's compile time; its RESULT is what lands in
+  # the caller's module body. Only a quote in result position is judged as module
+  # body: a quote bound earlier (`body = quote do: File.cwd!()`) is spliced
+  # wherever its `unquote` puts it, often a function body.
+  defp walk_using_body(body, acc) do
+    {init, last} =
+      case body do
+        {:__block__, _, exprs} when exprs != [] -> {Enum.drop(exprs, -1), List.last(exprs)}
+        expr -> {[], expr}
+      end
+
+    acc = walk(init, :compile, acc)
+
+    case last do
+      {:quote, _, args} -> walk_quoted(args, :compile, :compile, acc)
+      other -> walk(other, :compile, acc)
+    end
+  end
+
+  # Quoted code: `land` is the mode it runs in where it lands (`:unknown` when the
+  # walk cannot tell), `outer` the mode of the code around the quote, in which an
+  # `unquote` is evaluated whatever the quoted code around it does.
+  defp walk_quoted({unq, _, [expr]}, _land, outer, acc) when unq in [:unquote, :unquote_splicing],
+    do: walk(expr, outer, acc)
+
+  defp walk_quoted({:__DIR__, meta, ctx}, _land, _outer, acc) when is_atom(ctx),
+    do: [{meta[:line], "__DIR__"} | acc]
+
+  defp walk_quoted({{:., meta, [{env, _, ctx}, :file]}, _, []}, _land, _outer, acc)
+       when env in [:__ENV__, :__CALLER__] and is_atom(ctx),
+       do: [{meta[:line], "#{env}.file"} | acc]
+
+  defp walk_quoted({kind, _, args}, land, outer, acc)
+       when kind in @runtime_bodies and is_list(args) do
+    land = if land == :unknown, do: :unknown, else: :runtime
+    walk_quoted(args, land, outer, acc)
+  end
+
+  defp walk_quoted({{:., meta, [mod, fun]}, _, args} = call, :compile, outer, acc)
+       when is_list(args) do
+    acc = walk_quoted(args, :compile, outer, acc)
+
+    case path_call(mod, fun) do
+      nil -> walk_quoted(elem(call, 0), :compile, outer, acc)
+      name -> [{meta[:line], "#{name}/#{length(args)} at compile time"} | acc]
+    end
+  end
+
+  defp walk_quoted({a, _meta, c}, land, outer, acc) when is_list(c),
+    do: walk_quoted(c, land, outer, walk_quoted(a, land, outer, acc))
+
+  defp walk_quoted({a, b}, land, outer, acc),
+    do: walk_quoted(b, land, outer, walk_quoted(a, land, outer, acc))
+
+  defp walk_quoted(list, land, outer, acc) when is_list(list),
+    do: Enum.reduce(list, acc, &walk_quoted(&1, land, outer, &2))
+
+  defp walk_quoted(_leaf, _land, _outer, acc), do: acc
 
   defp path_call({:__aliases__, _, parts}, fun) do
     mod = Module.concat(parts)
