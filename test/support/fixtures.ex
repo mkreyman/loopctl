@@ -144,6 +144,27 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # US-47.3: a chg event envelope (v1, string keys, as chg-server sends it — Epic 47 PRD §5).
+  # Defaults to `check_passed` seq 1, revision 1 of `mkreyman/infra`.
+  def build(:chg_event, attrs) do
+    attrs = Enum.into(attrs, %{}, fn {k, v} -> {to_string(k), v} end)
+
+    Map.merge(
+      %{
+        "v" => 1,
+        "repo" => "mkreyman/infra",
+        "change_id" => "01JA" <> Base.encode32(:crypto.strong_rand_bytes(10), padding: false),
+        "event_seq" => 1,
+        "kind" => "check_passed",
+        "revision" => 1,
+        "sha" => :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower),
+        "occurred_at" => "2026-10-18T23:59:59.000000Z",
+        "data" => %{}
+      },
+      attrs
+    )
+  end
+
   def build(:tenant, attrs) do
     Map.merge(
       %{
@@ -2890,6 +2911,30 @@ defmodule Loopctl.Fixtures do
       revoked_at: if(Map.get(attrs, :revoked, false), do: now),
       created_at: now
     })
+  end
+
+  # US-47.3: an enrolled `chg` intake source with its root dispatch, through
+  # `Loopctl.Intake.create_source/3` like `fixture(:intake_source)`. Returns
+  # `%{secret: change_events_secret, source: source, root: root_dispatch}`. Optional:
+  # `:tenant_id`, `:repo_full_name`, `:secret` (at least 32 bytes).
+  def fixture(:chg_source, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:tenant).id end)
+    root = fixture(:chg_root_dispatch, %{tenant_id: tenant_id})
+
+    secret =
+      Map.get(attrs, :secret, "chg-secret-" <> Base.encode16(:crypto.strong_rand_bytes(16)))
+
+    {_webhook_secret, source} =
+      fixture(:intake_source, %{
+        tenant_id: tenant_id,
+        repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/infra"),
+        mode: "chg",
+        change_events_secret: secret,
+        chg_root_dispatch_id: root.id
+      })
+
+    %{secret: secret, source: source, root: root}
   end
 
   # An intake SOURCE + RECORD pair inserted DIRECTLY (#805), bypassing

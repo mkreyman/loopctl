@@ -971,6 +971,18 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "signature, or a payload whose repository.full_name does not match — so Recent " <>
             "Deliveries cannot tell you which."
       },
+      %{
+        method: "POST",
+        path: "/api/v1/change_events/:source_id",
+        description:
+          "chg-server's change-event webhook for a mode chg intake source — called by " <>
+            "chg-server, not by you, and there is no MCP tool. Authenticated by X-Chg-Signature, " <>
+            "an HMAC over \"<X-Chg-Timestamp>.<raw body>\" with the source's " <>
+            "change_events_secret, never by an API key. Every refusal is the SAME 401 " <>
+            "invalid_signature — unknown, revoked or pr-mode source, wrong signature, stale " <>
+            "timestamp, another repository, or a revoked chg root. Idempotent per " <>
+            "(repo, change_id, event_seq); events apply in event_seq order per change."
+      },
 
       # Agent delivery loop — runners, placement and the merge gate (#878, epic 44 US-44.7).
       # The rest of bringing a runner online once intake exists: enrol it, see it connect,

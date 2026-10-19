@@ -40,6 +40,31 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **chg-server's change-events webhook (US-47.3): `POST /api/v1/change_events/:source_id`.**
+  For a `chg` intake source. No API key: authenticated by `X-Chg-Signature: sha256=<hex>`, an
+  HMAC-SHA256 over `"<X-Chg-Timestamp>.<raw body>"` with the source's `change_events_secret`,
+  the timestamp in unix seconds within 300 s of loopctl's clock. An unknown, revoked or `pr`
+  source, a wrong signature, a stale timestamp, an envelope for another repository and a source
+  whose `chg_root_dispatch_id` has since been revoked (or is no longer a parentless
+  orchestrator root) all answer the same 401 `invalid_signature` and write nothing; each is
+  counted in `loopctl.changes.event_refused.count` by source and reason. Body cap 262144 bytes
+  (413). Idempotent on `(repo, change_id, event_seq)`: a redelivery is 200 `duplicate: true`;
+  the same key with different content is 409 `event_conflict`. Events apply in `event_seq`
+  order per change (an event ahead of a gap answers `held`); every applied event is appended
+  to the tenant's audit chain as `change_event_applied`. A `submitted` event naming a story of
+  the tenant binds the change to it (US-47.1). No stage moves yet: the stage mapping is US-47.4.
+  Lock contention is 503 `busy` with `retry-after`. Throttled per IP like the GitHub intake
+  webhook.
+- **Gap and staleness reconciliation (US-47.3).** `ChangeReconcileSweepWorker` (every 5 min)
+  pulls `GET <CHG_SERVER_URL>/api/v1/changes/:change_id/events?after=N` from chg-server, signed
+  over `"<timestamp>.GET.<path>?<query>"` with the same secret, for a change whose events have
+  had a gap for 10 min or that is bound to a non-terminal story and has been quiet for 6 h —
+  one job per change. **New env var `CHG_SERVER_URL`** (unset: nothing is pulled; see
+  `deploy/FLY_SECRETS.md`). A pull chg-server refuses 401 raises the
+  `changes.pull_unauthorized` operator alert (the scale-alert webhook) and counts
+  `loopctl.changes.pull_refused.count`.
+- **Migration `20261019150000_create_change_events`**: two new tables, `change_events` and
+  `change_cursors`, RLS-enabled. Additive; no deploy ordering.
 - **Intake-source mode `chg` (US-47.2).** `POST /api/v1/intake/sources` and `PATCH
   /api/v1/intake/sources/:id` accept `mode: "chg"` beside `pr`, plus two fields a `chg`
   source must carry: `change_events_secret` (the HMAC key chg-server will sign its event

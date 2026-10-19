@@ -699,6 +699,12 @@ defmodule Loopctl.ObanConfig do
            # only, no forge call. Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.StoryCompletionWorker},
+           # US-47.3: finds chg changes with an event held ahead of a gap for 10 minutes, or
+           # bound to a non-terminal story and quiet for 6 hours, and enqueues ONE pull job
+           # per change (unique on the change). Every five minutes: the shorter threshold is
+           # ten, so a gap is pulled at 10-15 minutes. Local reads only; the pull is the job's.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.ChangeReconcileSweepWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.

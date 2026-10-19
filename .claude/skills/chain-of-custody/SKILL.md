@@ -344,6 +344,14 @@ secret), and a `PATCH /api/v1/intake/sources/:id` that names `change_events_secr
 custody root the source kept — under its own code, `403 chg_registration_forbidden`, whose
 remedy is the operator key: a dispatch minted beneath the caller would be refused again.
 
+The registered `chg_root_dispatch_id` is judged again on EVERY change event, not only when the
+source is written: `POST /api/v1/change_events/:source_id` (US-47.3) re-reads the source and its
+root `FOR SHARE` inside the event's own transaction (`Loopctl.Intake.hold_chg_source/3`, the
+same rule as enrolment) and answers a revoked or reshaped root with the same 401 as a bad
+signature. That webhook holds no API key, so it carries no lineage and can perform no custody
+act; a `submitted` event's binding is always `submitter_not_claimant` and never writes
+`assigned_agent_id` or `implementer_dispatch_id`.
+
 All three refusals are logged (`lineage_ceiling_refused`) and emit
 `[:loopctl, :custody, :lineage_ceiling_refused]`. A 403 body carries the caller's own
 `your_dispatch_id` when it HAS one — the remediation says "mint under your own dispatch", and

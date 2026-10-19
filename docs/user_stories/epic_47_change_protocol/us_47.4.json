@@ -152,6 +152,25 @@
       "expected_results": [
         "no new edge present"
       ]
+    },
+    {
+      "id": "TC-47.4.7",
+      "verifies": [
+        "AC-47.4.1"
+      ],
+      "name": "an unmapped kind between mapped ones",
+      "type": "integration",
+      "preconditions": [
+        "a :chg story at implementing, bound to its change"
+      ],
+      "steps": [
+        "deliver submitted (seq 1), review_requested (seq 2), review_findings (seq 3)"
+      ],
+      "expected_results": [
+        "after seq 1 the stage is reviewing",
+        "seq 2 moves nothing",
+        "after seq 3 the stage is implementing over :review_findings"
+      ]
     }
   ],
   "technical_notes": [

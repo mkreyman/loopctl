@@ -136,6 +136,23 @@ defmodule LoopctlWeb.Telemetry do
         description: "Runner-supplied ledger writes Postgres refused as data."
       ),
 
+      # The change-events webhook (US-47.3). Every refusal is the same 401 on the wire, so
+      # this is where an operator can tell a bad secret from a revoked root. `source` is the
+      # source id only when the source is KNOWN (enrolled sources are few) and "unknown"
+      # otherwise, so an attacker choosing ids cannot grow the tag set; `reason` is a fixed set.
+      counter("loopctl.changes.event_refused.count",
+        event_name: [:loopctl, :changes, :event_refused],
+        tags: [:source, :reason],
+        description: "chg change events refused 401, by source and reason."
+      ),
+      # A gap pull chg-server refused for its signature: under a one-sided secret rotation,
+      # the only signal loopctl gets. Alert on any.
+      counter("loopctl.changes.pull_refused.count",
+        event_name: [:loopctl, :changes, :pull_refused],
+        tags: [:source],
+        description: "Signed gap pulls chg-server refused 401, by source."
+      ),
+
       # Contract 1.6.0. A runner that DECLARED a kind on join and then answered
       # `kind_not_supported` for it is contradicting itself, which is a bug on the runner.
       # loopctl suppresses that kind for the rest of the connection, and that bound is
