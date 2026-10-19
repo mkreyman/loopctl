@@ -79,6 +79,22 @@ describe("descriptions name the US-47.5 refusals", () => {
     });
   }
 
+  // loopctl US-47.6: the trunk-evidence gate, on every tool that reaches `verified`.
+  for (const name of ["verify_story", "verify_all_in_epic", "bulk_mark_complete", "backfill_story"]) {
+    test(`${name}: the chg trunk-evidence gate (US-47.6)`, () => {
+      const d = tool(name).description;
+      assert.match(d, /chg_landing_not_trunk_verified/);
+      assert.match(d, /chg_landing_reverted/);
+      assert.match(d, /chg_trunk_unevaluated/);
+    });
+  }
+
+  test("verify_story: the unevaluated answer is a 503 with Retry-After, never a pass", () => {
+    const d = tool("verify_story").description;
+    assert.match(d, /503 chg_trunk_unevaluated with Retry-After/);
+    assert.match(d, /verified\/master/);
+  });
+
   for (const name of ["claim_story", "report_story"]) {
     test(`${name}: 409 chg_root_review_only`, () => {
       assert.match(tool(name).description, /409 chg_root_review_only/);

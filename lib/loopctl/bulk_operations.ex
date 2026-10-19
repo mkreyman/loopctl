@@ -23,6 +23,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
   alias Loopctl.Changes.ReviewCustody
+  alias Loopctl.Changes.TrunkEvidence
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
@@ -129,7 +130,10 @@ defmodule Loopctl.BulkOperations do
         orch_id: orchestrator_agent_id,
         actor_id: actor_id,
         actor_label: actor_label,
-        caller_lineage: caller_lineage(tenant_id, opts)
+        caller_lineage: caller_lineage(tenant_id, opts),
+        # US-47.6: the chg stories' forge reads, made BEFORE the locking transaction, and
+        # only for a story the landed-review gate would let through.
+        trunk: TrunkEvidence.assess_many(tenant_id, sorted_ids, &landed_review_ok?(tenant_id, &1))
       }
 
       AdminRepo.transaction(fn ->
@@ -251,7 +255,10 @@ defmodule Loopctl.BulkOperations do
         tenant_id: tenant_id,
         orch_id: orchestrator_agent_id,
         actor_id: actor_id,
-        actor_label: actor_label
+        actor_label: actor_label,
+        # US-47.6: the chg stories' forge reads, made BEFORE the locking transaction, and
+        # only for a story the landed-review gate would let through.
+        trunk: TrunkEvidence.assess_many(tenant_id, sorted_ids, &landed_review_ok?(tenant_id, &1))
       }
 
       AdminRepo.transaction(fn ->
@@ -291,7 +298,7 @@ defmodule Loopctl.BulkOperations do
       actor_label: actor_label
     } = ctx
 
-    with :ok <- Progress.ensure_mark_complete_allowed(story, ctx.lifecycle_ids),
+    with :ok <- Progress.ensure_mark_complete_allowed(story, ctx.lifecycle_ids, ctx.trunk),
          {:ok, updated} <- apply_mark_complete(story) do
       create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params)
 
@@ -418,6 +425,11 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
+  # A story the landed-review gate refuses is refused again under the lock, so asking the
+  # forge about it would spend a credentialed call on an answer nobody reads.
+  defp landed_review_ok?(tenant_id, story_id),
+    do: ReviewCustody.ensure_landed_review(tenant_id, story_id) == :ok
+
   defp process_verify(story, params, ctx) do
     %{
       tenant_id: tenant_id,
@@ -432,6 +444,10 @@ defmodule Loopctl.BulkOperations do
          # US-47.5 (AC-47.5.5): the SAME gate `Progress.verify_story/4` runs, on the locked
          # story — a chg story is verified only on a review of its landed revision.
          :ok <- ReviewCustody.ensure_landed_review(tenant_id, story.id),
+         # US-47.6 (AC-47.6.1): the SAME trunk-evidence gate, applied to the landing the
+         # pre-transaction assessment was made for.
+         :ok <-
+           TrunkEvidence.ensure_trunk_verified(tenant_id, story.id, Map.get(ctx.trunk, story.id)),
          {:ok, updated} <- apply_verification(story) do
       create_verification_result(tenant_id, story, orchestrator_agent_id, params)
       audit_verification(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -1000,6 +1016,18 @@ defmodule Loopctl.BulkOperations do
 
   defp format_reason(:chg_review_not_for_landed_revision),
     do: "chg_review_not_for_landed_revision: " <> Messages.chg_review_not_for_landed_revision()
+
+  # US-47.6: each leads with its code, so a bulk caller can branch on it.
+  defp format_reason(:chg_landing_not_trunk_verified),
+    do: "chg_landing_not_trunk_verified: " <> Messages.chg_landing_not_trunk_verified()
+
+  defp format_reason(:chg_landing_reverted),
+    do: "chg_landing_reverted: " <> Messages.chg_landing_reverted()
+
+  defp format_reason({:chg_trunk_unevaluated, reason, retry_after}),
+    do:
+      "chg_trunk_unevaluated: #{reason}; retry after #{retry_after} seconds. " <>
+        Messages.chg_trunk_unevaluated()
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"

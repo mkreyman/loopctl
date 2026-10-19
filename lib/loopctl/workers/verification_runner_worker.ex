@@ -16,7 +16,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
      #936, or an allowlist entry; `credential_unavailable`), before any read of the story, so
      a tenant with neither costs one indexed existence check and none of the story reads; the
      story's repository, required checks and branch (`Loopctl.Verification.CiTarget`;
-     `no_intake_source`, `ambiguous_intake_source`, `no_required_checks`, `no_story_branch`);
+     `no_intake_source`, `ambiguous_intake_source`, `chg_landed_on_trunk`, `no_required_checks`,
+     `no_story_branch`);
      and the credential for that tenant AND that repository (`Credential.for_read/2`;
      `credential_unavailable`), before any forge read. So a tenant with no token and no
      allowlist entry records `credential_unavailable` even when its source names no required

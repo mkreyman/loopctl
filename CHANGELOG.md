@@ -105,6 +105,26 @@ All notable changes to loopctl are documented here.
   binding are answered exactly as before. Migration `20261019170000_add_chg_review_custody_to_review_records`
   adds the two nullable columns, a CHECK that they are set together, and the unique index;
   additive, no deploy ordering. MCP: loopctl-mcp-server 3.3.0.
+- **A chg story's CI evidence is `verified/master` (US-47.6).** On a story bound to a chg
+  change, every path that reaches `verified` (`POST /stories/:id/verify`,
+  `/epics/:id/verify-all`, `/stories/bulk/verify`, `/stories/:id/backfill`,
+  `/stories/bulk/mark-complete`) now also asks GitHub whether the trunk commit of the newest
+  applied `landed` event (`data.merge_sha`) is an ancestor of, or equal to, the repository's
+  `refs/heads/verified/master` (`GET /repos/:repo/compare/<merge_sha>...verified/master`),
+  read before the verify transaction with the same bounded timeouts as the other forge reads.
+  409 `chg_landing_not_trunk_verified` when it is not (or the landing named no valid trunk
+  commit); 409 `chg_landing_reverted` when an applied `reverted` event follows the landing;
+  503 `chg_trunk_unevaluated` with `Retry-After` and an `error.reason` when nothing could be
+  decided — a timeout, an unreachable forge, a 5xx or rate limit (the forge's own delay), a
+  401/403/422, a missing `verified/master` ref or commit (404, `trunk_ref_not_found`), no
+  credential for the repository (`credential_unavailable`, Retry-After 3600), or a new landing
+  in between (`landing_changed`). verify-all and the bulk paths report each per story. Stories
+  with no change binding are answered exactly as before and never reach the forge.
+  **Operator action:** the tenant's forge token (or the operator `GITHUB_TOKEN` lent through
+  `VERIFICATION_OPERATOR_TOKEN_TENANTS`) must be able to read the chg repository's commits —
+  a classic token's `repo` scope for a private repository, or a fine-grained token's
+  `Contents: read`; without it every chg verify answers 503 `forge_forbidden`/`trunk_ref_not_found`.
+  No migration. MCP: loopctl-mcp-server 3.4.0.
 - **Intake-source mode `chg` (US-47.2).** `POST /api/v1/intake/sources` and `PATCH
   /api/v1/intake/sources/:id` accept `mode: "chg"` beside `pr`, plus two fields a `chg`
   source must carry: `change_events_secret` (the HMAC key chg-server will sign its event

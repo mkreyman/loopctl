@@ -16,11 +16,11 @@
   "acceptance_criteria": [
     {
       "id": "AC-47.6.1",
-      "description": "For a :chg source, the CI-evidence input passes only when the current binding's landed sha is an ancestor of verified/master (compare by sha) and no reverted event follows it. That a review_records row names the landed revision is US-47.5's verify gate (AC-47.5.5, 409 chg_review_not_for_landed_revision), which already runs on every verify path; it is not re-implemented here."
+      "description": "For a :chg source, the CI-evidence input passes only when the current binding's landed sha \u2014 the TRUNK commit of its newest applied `landed` event, `data.merge_sha`, never the envelope `sha` (the revision commit, which is US-47.5's to certify) \u2014 is an ancestor of, or equal to, verified/master (compare by sha) and no reverted event follows it. That a review_records row names the landed revision is US-47.5's verify gate (AC-47.5.5, 409 chg_review_not_for_landed_revision), which already runs on every verify path; it is not re-implemented here."
     },
     {
       "id": "AC-47.6.2",
-      "description": "A compare call that times out or errors answers unevaluated with Retry-After; it is never read as a pass."
+      "description": "A compare call that times out or errors answers unevaluated with Retry-After; it is never read as a pass. A 404 (no verified/master ref yet, or the trunk commit not on the forge yet) is unevaluated too, never a refusal: chg has not verified it yet, which is not a failure of the story."
     },
     {
       "id": "AC-47.6.3",
@@ -81,7 +81,9 @@
     }
   ],
   "technical_notes": [
-    "Every forge call authenticates with the tenant's own GitHub token (#936)."
+    "Every forge call authenticates with the tenant's own GitHub token (#936).",
+    "The ancestor check reuses `PullRequestSource.contains?/3` (`GET /repos/:repo/compare/<merge_sha>...verified/master`): the status describes the HEAD relative to the BASE, so `ahead` or `identical` means merge_sha is an ancestor of verified/master, and `behind` or `diverged` means it is not.",
+    "The forge read runs BEFORE the verify transaction; the answer is applied under the story lock only to the landing it was made for (a newer landing in between is unevaluated `landing_changed`). A local `trunk_verified_sha == merge_sha` is not taken as the answer: the ref is."
   ],
   "dependencies": [
     "US-47.4",

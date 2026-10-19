@@ -64,8 +64,14 @@ defmodule LoopctlWeb.BulkOperationsController do
         "(US-47.5) for the whole batch, and nothing is verified. A story bound to a chg " <>
         "change is a per-story error whose reason leads with `review_missing_escalated` (" <>
         Messages.review_missing_escalated() <>
-        ") or `chg_review_not_for_landed_revision` (" <>
-        Messages.chg_review_not_for_landed_revision() <> ").",
+        "), `chg_review_not_for_landed_revision` (" <>
+        Messages.chg_review_not_for_landed_revision() <>
+        "), `chg_landing_not_trunk_verified` (" <>
+        Messages.chg_landing_not_trunk_verified() <>
+        "), `chg_landing_reverted` (" <>
+        Messages.chg_landing_reverted() <>
+        ") or `chg_trunk_unevaluated` (US-47.6; " <>
+        Messages.chg_trunk_unevaluated() <> ").",
     request_body: {"Verify params", "application/json", Schemas.BulkVerifyRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
@@ -107,7 +113,9 @@ defmodule LoopctlWeb.BulkOperationsController do
         "Requires orchestrator role. A key descending from an intake source's " <>
         "`chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5). A story " <>
         "bound to a chg change is a per-story error leading with `review_missing_escalated` " <>
-        "or `chg_review_not_for_landed_revision`, as on bulk verify.",
+        "or `chg_review_not_for_landed_revision`, or with US-47.6's " <>
+        "`chg_landing_not_trunk_verified`, `chg_landing_reverted` or `chg_trunk_unevaluated`, " <>
+        "as on bulk verify.",
     request_body:
       {"Mark-complete params", "application/json",
        %OpenApiSpex.Schema{

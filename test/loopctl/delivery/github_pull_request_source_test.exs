@@ -712,6 +712,31 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
                Source.contains?(@repo, @head, @merge_base)
     end
 
+    # US-47.6: a chg story's trunk evidence asks `contains?(repo, merge_sha, "verified/master")`.
+    # The slash-bearing branch name goes into the path as it is (GitHub resolves it as the
+    # branch `refs/heads/verified/master`), the landed commit is the BASE, and the verdict is
+    # the same `status` reading: `ahead`/`identical` is an ancestor, `behind`/`diverged` is not.
+    test "US-47.6: the verified/master ref is the HEAD of the comparison, the commit its BASE" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/compare/#{@head}...verified/master"
+        json(conn, %{"status" => "ahead", "ahead_by" => 3, "behind_by" => 0})
+      end)
+
+      assert {:ok, true} = Source.contains?(@repo, @head, "verified/master")
+    end
+
+    test "US-47.6: a missing ref is a 404 and an unreachable forge is :github_unreachable" do
+      stub(fn conn -> Plug.Conn.resp(conn, 404, ~s({"message":"Not Found"})) end)
+
+      assert {:error, {:github_api_error, 404}} =
+               Source.contains?(@repo, @head, "verified/master")
+
+      stub(fn conn -> Req.Test.transport_error(conn, :timeout) end)
+
+      assert {:error, {:github_unreachable, _}} =
+               Source.contains?(@repo, @head, "verified/master")
+    end
+
     test "both refs are validated: either one is spliced into the URL path" do
       stub(fn conn -> flunk("must not reach the forge: #{conn.request_path}") end)
 

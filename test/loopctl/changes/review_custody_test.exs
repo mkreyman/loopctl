@@ -857,6 +857,14 @@ defmodule Loopctl.Changes.ReviewCustodyTest do
     defp unverified!(story),
       do: assert(AdminRepo.get!(Story, story.id).verified_status == :unverified)
 
+    # US-47.6: a chg story that clears this gate still needs its landing in verified/master.
+    # These tests are about the landed-review gate, so the forge says it is.
+    defp trunk_verified!,
+      do:
+        stub(Loopctl.MockPullRequestSource, :contains?, fn _, _, "verified/master" ->
+          {:ok, true}
+        end)
+
     test "TC-47.5.6: escalated over review_missing — refused on every path, even once a chg " <>
            "review of the landed revision exists; a human's resolution lifts it",
          ctx do
@@ -887,6 +895,7 @@ defmodule Loopctl.Changes.ReviewCustodyTest do
                  actor_lineage: []
                )
 
+      trunk_verified!()
       assert {:ok, %Story{verified_status: :verified}} = verify(ctx, story)
     end
 
@@ -906,6 +915,7 @@ defmodule Loopctl.Changes.ReviewCustodyTest do
       unverified!(story)
 
       assert {:ok, _} = review(ctx, story, child(ctx).lineage_path, %{"commit_sha" => sha("b")})
+      trunk_verified!()
       assert {:ok, %Story{verified_status: :verified}} = verify(ctx, story)
     end
 
