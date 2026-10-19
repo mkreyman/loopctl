@@ -22,6 +22,31 @@ defmodule Loopctl.TelemetryHelpers do
   @default_timeout 1_000
 
   @doc """
+  Metadata for a SYNTHETIC repo query event (`[:loopctl, :repo | :admin_repo |
+  :heavy_read_repo, :query]`), shaped like the event Ecto emits: a real one always carries
+  `:query`, and every handler a test attaches to those names pattern-matches on it.
+
+  The event name is VM-wide, so a synthetic emission reaches every concurrently attached
+  handler. Emitted without `:query` it raised `function_clause` in another test's handler,
+  telemetry DETACHED that handler, and the other test failed (CI run 39188596361). The
+  default query text is a SQL comment so no handler's regex counts it as a statement.
+  `test/loopctl/telemetry/synthetic_repo_event_hygiene_test.exs` refuses a synthetic repo
+  query emission that does not build its metadata here.
+  """
+  @spec repo_query_metadata(map()) :: map()
+  def repo_query_metadata(overrides \\ %{}) do
+    Map.merge(
+      %{
+        type: :ecto_sql_query,
+        query: "-- synthetic telemetry event (test)",
+        params: [],
+        source: nil
+      },
+      overrides
+    )
+  end
+
+  @doc """
   Attaches a handler for `events` that forwards ONLY the emissions this test caused, and
   returns the ref the forwarded messages carry.
 

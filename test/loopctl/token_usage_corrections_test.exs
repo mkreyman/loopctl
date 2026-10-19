@@ -699,7 +699,7 @@ defmodule Loopctl.TokenUsageCorrectionsTest do
         handler_id,
         [:loopctl, :admin_repo, :query],
         fn _event, _measurements, %{query: query}, _config ->
-          if query =~ "pg_advisory_xact_lock" do
+          if self() == test_pid and query =~ "pg_advisory_xact_lock" do
             send(test_pid, {:advisory_lock_query, query})
           end
         end,
