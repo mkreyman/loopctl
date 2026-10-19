@@ -38,6 +38,8 @@ use crate::store::{Store, now_ms};
 use crate::ws::{self, Hydrated};
 
 pub const ROW_VERSION: u32 = 1;
+/// The `source` of a gate row filled in from a CI check run (`--ci-check`).
+const CI_SOURCE: &str = "ci";
 /// How long a shadow check waits for an earlier one on this machine before skipping.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30 * 60);
 /// The cap on the snapshot build after a check. Nobody waits on it, and a dependency
@@ -149,6 +151,12 @@ impl Row {
             source: Some(source.into()),
             ..Row::new("gate", repo, sha, verdict)
         }
+    }
+}
+
+impl Row {
+    fn is_ci(&self) -> bool {
+        self.source.as_deref() == Some(CI_SOURCE)
     }
 }
 
@@ -424,6 +432,9 @@ pub struct Pair {
     pub selected: Option<usize>,
     pub chg_ms: u64,
     pub gate_ms: u64,
+    /// Every gate verdict on this commit came from CI (`--ci-check`), so it has no gate
+    /// time (`gate_ms` 0) and stays out of the time figures.
+    pub gate_ci: bool,
     /// For a miss: the gate's failures that chg did select (it ran them and they passed,
     /// so likely a flake), and those it did not (a real miss).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -457,6 +468,8 @@ pub struct Report {
     pub reruns: usize,
     pub median_chg_ms: Option<u64>,
     pub median_gate_ms: Option<u64>,
+    /// Pushes with a local gate time, which the gate and saved figures cover.
+    pub timed: usize,
     pub median_saved_ms: Option<i64>,
     pub total_saved_ms: i64,
     pub disagreements: Vec<Pair>,
@@ -570,7 +583,13 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
             mode: c.mode.clone(),
             selected: c.selected.as_ref().map(Vec::len),
             chg_ms: c.ms,
-            gate_ms: latest.ms,
+            // Rows logged before CI rows dropped their `ms` still carry one: not a gate time.
+            gate_ms: g
+                .iter()
+                .filter(|r| !r.is_ci())
+                .max_by_key(|r| r.at_ms)
+                .map_or(0, |r| r.ms),
+            gate_ci: g.iter().all(|r| r.is_ci()),
             failing_selected,
             failing_unselected,
         });
@@ -634,6 +653,7 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
         reruns,
         median_chg_ms,
         median_gate_ms,
+        timed: timed.len(),
         median_saved_ms: median(saved.clone()),
         total_saved_ms: saved.iter().sum(),
         disagreements: pairs
@@ -694,13 +714,14 @@ impl Report {
         line(
             &mut o,
             format!(
-                "time: median chg {}, median gate {}, median saved {}, total saved {}",
+                "time: median chg {}, median gate {}, median saved {}, total saved {} (gate times from {} local gate(s))",
                 opt(self.median_chg_ms),
                 opt(self.median_gate_ms),
                 self.median_saved_ms
                     .map(fmt_signed)
                     .unwrap_or_else(|| "-".into()),
-                fmt_signed(self.total_saved_ms)
+                fmt_signed(self.total_saved_ms),
+                self.timed
             ),
         );
         if !self.disagreements.is_empty() {
@@ -735,7 +756,11 @@ impl Report {
                         class,
                         sel,
                         fmt_ms(p.chg_ms),
-                        fmt_ms(p.gate_ms)
+                        if p.gate_ci {
+                            CI_SOURCE.to_string()
+                        } else {
+                            fmt_ms(p.gate_ms)
+                        }
                     ),
                 );
                 for f in &p.failing_unselected {
@@ -830,7 +855,7 @@ pub fn resolve_ci(repo: &Path, key: &str, rows: &[Row], check: &str, log: &Path)
             .args(["-f", &format!("check_name={check}"), "-f", "per_page=100"])
             .args([
                 "--jq",
-                "[.check_runs[] | {status, conclusion, started_at, completed_at}]",
+                "[.check_runs[] | {status, conclusion, completed_at}]",
             ])
             .output();
         let runs: Vec<serde_json::Value> = match out {
@@ -863,7 +888,7 @@ pub fn resolve_ci(repo: &Path, key: &str, rows: &[Row], check: &str, log: &Path)
 /// The (sha, completion time) of every CI verdict already recorded.
 fn ci_recorded(rows: &[Row]) -> BTreeSet<(&str, u64)> {
     rows.iter()
-        .filter(|r| r.kind == "gate" && r.source.as_deref() == Some("ci"))
+        .filter(|r| r.kind == "gate" && r.is_ci())
         .map(|r| (r.sha.as_str(), r.at_ms))
         .collect()
 }
@@ -873,7 +898,7 @@ fn ci_recorded(rows: &[Row]) -> BTreeSet<(&str, u64)> {
 fn ci_wanted<'a>(key: &str, rows: &'a [Row], now: u64) -> BTreeSet<&'a str> {
     let judged_locally: BTreeSet<&str> = rows
         .iter()
-        .filter(|r| r.kind == "gate" && r.source.as_deref() != Some("ci"))
+        .filter(|r| r.kind == "gate" && !r.is_ci())
         .filter(|r| matches!(r.verdict, Outcome::Pass | Outcome::Fail))
         .map(|r| r.sha.as_str())
         .collect();
@@ -908,13 +933,11 @@ pub fn ci_rows(key: &str, sha: &str, check: &str, runs: &[serde_json::Value]) ->
                 _ => return None,
             };
             let done = parse_rfc3339_s(r["completed_at"].as_str().unwrap_or(""))?;
-            let ms = match parse_rfc3339_s(r["started_at"].as_str().unwrap_or("")) {
-                Some(a) if done >= a => (done - a) * 1000,
-                _ => 0,
-            };
+            // No `ms`: one check's duration is that job's, not the gate's (HCB's `Tests`
+            // aggregate runs 11 s after its partitions).
             Some(Row {
                 at_ms: done * 1000,
-                ..Row::gate(key, sha, verdict, ms, check, "ci", vec![])
+                ..Row::gate(key, sha, verdict, 0, check, CI_SOURCE, vec![])
             })
         })
         .collect()
@@ -985,8 +1008,11 @@ mod tests {
             chg("e", "m1", Outcome::Pass, 60_000, &[]),
             Row::from_check("r", "f", "base", 0, Verdict::skipped("no snapshot")),
             // "g" on m2, judged twice and in any log order: one push, chg red because one
-            // of its runs failed while the gate passed.
-            gate("g", Outcome::Pass, 500_000, &[]),
+            // of its runs failed while the gate passed. Its gate is a CI check.
+            Row {
+                source: Some(CI_SOURCE.into()),
+                ..gate("g", Outcome::Pass, 11_000, &[])
+            },
             Row {
                 at_ms: 2,
                 ..chg("g", "m2", Outcome::Fail, 70_000, &[])
@@ -1003,6 +1029,12 @@ mod tests {
         );
         assert_eq!((r.unpaired, r.skipped, r.errors, r.reruns), (1, 1, 0, 1));
         let g = r.disagreements.iter().find(|p| p.sha == "g").unwrap();
+        // A CI check's time is not a gate time: "g" (11 s of CI, 70 s of chg) would take
+        // 59 s off the four local gates' 4 x 440 s saved.
+        assert_eq!((r.total_saved_ms, r.timed), (1_760_000, 4));
+        let text = r.render();
+        let g_line = text.lines().find(|l| l.starts_with("g ")).unwrap();
+        assert!(g_line.ends_with("  ci"), "{g_line}");
         assert_eq!(
             (g.class, g.chg_ms),
             (Class::ChgRed, 70_000),
@@ -1018,10 +1050,33 @@ mod tests {
         assert_eq!(miss.failing_unselected, vec!["test/z_test.exs:9"]);
         assert_eq!(r.median_saved_ms, Some(440_000));
         assert!(!r.ready);
-        let text = r.render();
         assert!(text.contains("MISS"), "{text}");
         assert!(text.contains("not selected, failed in the gate: test/z_test.exs:9"));
         assert!(text.contains("not ready to cut over"));
+    }
+
+    #[test]
+    fn a_local_gate_time_wins_over_a_later_ci_verdict_and_an_old_ci_ms() {
+        let ci = |at_ms, ms| Row {
+            at_ms,
+            source: Some(CI_SOURCE.into()),
+            ..gate("x", Outcome::Pass, ms, &[])
+        };
+        let local = Row {
+            at_ms: 1,
+            ..gate("x", Outcome::Pass, 600_000, &[])
+        };
+        // The CI row finished last, and was logged before CI rows dropped their ms.
+        let rows = vec![
+            chg("x", "m1", Outcome::Pass, 60_000, &[]),
+            local,
+            ci(u64::MAX, 11_000),
+        ];
+        let r = report("r", &rows);
+        assert_eq!((r.median_gate_ms, r.timed), (Some(600_000), 1));
+        let only_ci = vec![chg("x", "m1", Outcome::Pass, 60_000, &[]), ci(5, 11_000)];
+        let r = report("r", &only_ci);
+        assert_eq!((r.pushes, r.median_gate_ms, r.timed), (1, None, 0));
     }
 
     #[test]
@@ -1102,11 +1157,11 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (Outcome::Fail, 570_000, 1_792_145_370_000),
-                (Outcome::Pass, 480_000, 1_792_148_880_000)
+                (Outcome::Fail, 0, 1_792_145_370_000),
+                (Outcome::Pass, 0, 1_792_148_880_000)
             ]
         );
-        assert!(r.iter().all(|r| r.source.as_deref() == Some("ci")));
+        assert!(r.iter().all(Row::is_ci));
         let rows = [r, vec![chg("s", "h", Outcome::Pass, 1_000, &[])]].concat();
         assert_eq!(report("r", &rows).gate_flaky, 1);
         // Asked again while the newest CI verdict is recent; settled after CI_RECHECK; never
