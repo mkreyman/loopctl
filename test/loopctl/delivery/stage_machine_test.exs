@@ -384,7 +384,9 @@ defmodule Loopctl.Delivery.StageMachineTest do
         :change_review_findings,
         :reverted,
         :reverted_after_verify,
-        :change_outside_lifecycle
+        :change_outside_lifecycle,
+        # US-47.5
+        :review_missing
       ]
 
       assert Enum.sort(StageMachine.change_protocol_edges()) == Enum.sort(new_edges)
@@ -471,9 +473,9 @@ defmodule Loopctl.Delivery.StageMachineTest do
       assert StageMachine.chained?(:ci, :escalated, :change_outside_lifecycle)
     end
 
-    test "the control escalations are exactly the two a change event decides" do
+    test "the control escalations are exactly the three a change event decides" do
       assert Enum.sort(StageMachine.control_escalation_edges()) ==
-               [:change_outside_lifecycle, :reverted_after_verify]
+               [:change_outside_lifecycle, :reverted_after_verify, :review_missing]
 
       for edge <- StageMachine.control_escalation_edges() do
         assert Enum.all?(StageMachine.transitions(), fn {_f, t, e} ->
@@ -482,6 +484,27 @@ defmodule Loopctl.Delivery.StageMachineTest do
 
         refute StageMachine.human_only?(edge)
       end
+    end
+  end
+
+  describe "the :review_missing edge (US-47.5, AC-47.5.5)" do
+    test "it is merged -> escalated and nothing else, chained, and clears nothing" do
+      assert [{:merged, :escalated, :review_missing}] ==
+               for({_f, _t, :review_missing} = t <- StageMachine.transitions(), do: t)
+
+      # Entering `escalated` is chained and needs a reason; the merge HELD, so nothing
+      # merge-keyed is cleared — trunk still has it.
+      assert StageMachine.chained?(:merged, :escalated, :review_missing)
+      assert StageMachine.reason_required?(:escalated, :review_missing)
+      assert StageMachine.clears(:merged, :escalated, :review_missing) == []
+      refute StageMachine.human_only?(:review_missing)
+    end
+
+    test "no runner can report it, and it is a control escalation" do
+      refute Enum.any?(StageMachine.runner_transitions(), &match?({_, _, :review_missing}, &1))
+      refute :review_missing in StageMachine.runner_reportable_edges()
+      assert :review_missing in StageMachine.control_escalation_edges()
+      assert :review_missing in StageMachine.change_protocol_edges()
     end
   end
 

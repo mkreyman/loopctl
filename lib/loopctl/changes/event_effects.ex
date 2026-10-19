@@ -29,7 +29,7 @@ defmodule Loopctl.Changes.EventEffects do
   | `review_findings` | `reviewing -> implementing`, `:review_findings` |
   | `review_findings`, at `ci` | `ci -> implementing`, `:change_review_findings` |
   | `review_approved` (`by: model` or `policy`) and `check_passed` on the same revision | `reviewing -> ci`, `:change_ready` |
-  | `landed` | `ci -> merged`, `:forward`, `merge_sha` = `data.merge_sha` (the new trunk commit) |
+  | `landed` | `ci -> merged`, `:forward`, `merge_sha` = `data.merge_sha` (the new trunk commit); then `merged -> escalated`, `:review_missing`, when no chg review names the landed revision (US-47.5) |
   | `deployed` | `merged -> deployed`, `:forward` |
   | `verified` | none: `trunk_verified_sha` = `data.sha` on the stage row |
   | `reverted`, at `merged` or `deployed` | `-> implementing`, `:reverted`, keeping the claim |
@@ -94,6 +94,7 @@ defmodule Loopctl.Changes.EventEffects do
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
   alias Loopctl.Changes.RevertIssues
+  alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
@@ -120,9 +121,16 @@ defmodule Loopctl.Changes.EventEffects do
 
   @type pending :: [{:bind, Changes.pending_bind()} | {:entry, AuditChain.Entry.t()}]
 
-  @doc "Applies `event` for `tenant_id`, inside the caller's tenant transaction."
-  @spec apply_event(Ecto.UUID.t(), Event.t()) :: {:ok, map(), pending()}
-  def apply_event(tenant_id, %Event{} = event) do
+  @doc """
+  Applies `event` for `tenant_id`, inside the caller's tenant transaction.
+
+  `opts`: `:escalate` — the 3-arity escalation writer, default
+  `Loopctl.Delivery.Escalations.escalate_as_control/3`; an input for tests only (a refusal
+  injected where production would need a broken chain or a vanished row), production passes
+  nothing.
+  """
+  @spec apply_event(Ecto.UUID.t(), Event.t(), keyword()) :: {:ok, map(), pending()}
+  def apply_event(tenant_id, %Event{} = event, opts \\ []) do
     story_id = target_story_id(tenant_id, event)
     locked = lock_target(tenant_id, story_id)
     {effect, pending} = bind(tenant_id, event)
@@ -132,6 +140,9 @@ defmodule Loopctl.Changes.EventEffects do
         {:ok, effect, pending}
 
       %{} = target ->
+        target =
+          Map.put(target, :escalate, Keyword.get(opts, :escalate, &escalate_as_control/3))
+
         {stage, more} = stage_effect(tenant_id, event, target)
         {:ok, Map.put(effect, "stage", stage), pending ++ more}
     end
@@ -432,7 +443,13 @@ defmodule Loopctl.Changes.EventEffects do
     {%{"outcome" => "reverted_after_done", "issue" => Atom.to_string(issue)}, []}
   end
 
-  defp move(tenant_id, event, %{story_id: story_id, claim_epoch: epoch}, transition, effects) do
+  defp move(
+         tenant_id,
+         event,
+         %{story_id: story_id, claim_epoch: epoch} = target,
+         transition,
+         effects
+       ) do
     {_from, to, edge} = transition
 
     opts =
@@ -441,14 +458,80 @@ defmodule Loopctl.Changes.EventEffects do
 
     case Stages.advance_in_tenant_transaction(tenant_id, story_id, transition, opts) do
       {:ok, _row, entry} ->
-        {%{"outcome" => "moved", "to" => Atom.to_string(to), "edge" => Atom.to_string(edge)},
-         entries(entry)}
+        moved = %{
+          "outcome" => "moved",
+          "to" => Atom.to_string(to),
+          "edge" => Atom.to_string(edge)
+        }
+
+        after_move(tenant_id, event, target, to, {moved, entries(entry)})
 
       # Only a refusal decided before the database comes back here (an effect value the
       # machine will not store); the event is recorded with it rather than lost.
       {:error, reason} ->
         {%{"outcome" => "refused", "reason" => Atom.to_string(reason)}, []}
     end
+  end
+
+  # ── review custody at the landing (US-47.5, AC-47.5.5) ─────────────────────────────────────
+
+  # A landing is where a missing review becomes a fact: chg lands on its own authority, so the
+  # merge stands, but a story whose landed revision no chg reviewer recorded a verdict on is
+  # held for a human over `:review_missing` and never verified without one. Decided HERE, in
+  # the transaction that entered `merged`, on the revision the event names (`event.sha`, the
+  # revision commit — never `data.merge_sha`, the trunk commit a review never saw), so the
+  # merge and its escalation commit together or not at all. A review that commits after this
+  # read is too late for this landing: the escalation stands and a human resolves it.
+  #
+  # FAIL CLOSED: unlike the other escalations here, a refused hold is never folded into the
+  # event's outcome, because a merged story with no hold is one a later verify would read as
+  # unremarkable. The whole event rolls back instead — contention as `:busy` (a 503 chg
+  # redelivers after `retry-after`), anything else as `{:review_hold_refused, reason}`, which
+  # `Loopctl.Changes.Events` answers `change_event_failed` ("Redeliver it."). That one is
+  # also logged at error and counted under `[:loopctl, :changes, :review_hold_refused]`,
+  # because chg will keep redelivering an event that cannot apply until an operator looks.
+  defp after_move(tenant_id, %Event{kind: "landed"} = event, target, :merged, {moved, pending}) do
+    if ReviewCustody.reviewed_revision?(Repo, tenant_id, target.story_id, event.sha) do
+      {Map.put(moved, "review", "recorded"), pending}
+    else
+      case escalate_raw(tenant_id, event, target, :review_missing, review_missing_reason(event)) do
+        {:ok, _row, entry} ->
+          escalation = %{"outcome" => "escalated", "edge" => "review_missing"}
+
+          {Map.merge(moved, %{"review" => "missing", "review_missing" => escalation}),
+           pending ++ entries(entry)}
+
+        {:error, reason} ->
+          review_hold_refused(tenant_id, event, target, reason)
+      end
+    end
+  end
+
+  defp after_move(_tenant_id, _event, _target, _to, result), do: result
+
+  defp review_hold_refused(_tenant_id, _event, _target, :busy), do: Repo.rollback(:busy)
+
+  defp review_hold_refused(tenant_id, event, target, reason) do
+    Logger.error(
+      "review_missing hold refused; the landing rolled back and chg will redeliver it: " <>
+        "tenant_id=#{tenant_id} story_id=#{target.story_id} change_id=#{event.change_id} " <>
+        "event_seq=#{event.event_seq} reason=#{inspect(reason)}"
+    )
+
+    :telemetry.execute([:loopctl, :changes, :review_hold_refused], %{count: 1}, %{
+      tenant_id: tenant_id,
+      reason: reason
+    })
+
+    Repo.rollback({:review_hold_refused, reason})
+  end
+
+  defp review_missing_reason(%Event{} = event) do
+    "review_missing: chg landed change #{RevertIssues.safe_id(event.change_id)} revision " <>
+      "#{event.revision} (#{RevertIssues.safe_sha(event.sha)}) with no review recorded for " <>
+      "that revision by a reviewer chg-server minted — a policy auto-approval, or a review " <>
+      "loopctl never accepted. The merge stands; a human decides what the story is now, " <>
+      "and it is not verified without one."
   end
 
   # An edge the machine does not allow from here: a human decides what the story is now.
@@ -467,12 +550,8 @@ defmodule Loopctl.Changes.EventEffects do
     end
   end
 
-  defp escalate(tenant_id, event, %{story_id: story_id, claim_epoch: epoch}, edge, reason) do
-    opts =
-      control_opts(event, epoch) ++
-        [edge: edge, reason: reason, payload: event_data(event), in_tenant_transaction: true]
-
-    case Escalations.escalate_as_control(tenant_id, story_id, opts) do
+  defp escalate(tenant_id, event, target, edge, reason) do
+    case escalate_raw(tenant_id, event, target, edge, reason) do
       {:ok, _row, entry} ->
         {%{"outcome" => "escalated", "edge" => Atom.to_string(edge)}, entries(entry)}
 
@@ -480,6 +559,23 @@ defmodule Loopctl.Changes.EventEffects do
         {%{"outcome" => "refused", "reason" => inspect(reason)}, []}
     end
   end
+
+  defp escalate_raw(
+         tenant_id,
+         event,
+         %{story_id: story_id, claim_epoch: epoch} = target,
+         edge,
+         reason
+       ) do
+    opts =
+      control_opts(event, epoch) ++
+        [edge: edge, reason: reason, payload: event_data(event), in_tenant_transaction: true]
+
+    Map.get(target, :escalate, &escalate_as_control/3).(tenant_id, story_id, opts)
+  end
+
+  defp escalate_as_control(tenant_id, story_id, opts),
+    do: Escalations.escalate_as_control(tenant_id, story_id, opts)
 
   defp entries(nil), do: []
   defp entries(entry), do: [{:entry, entry}]

@@ -29,6 +29,10 @@
     {
       "id": "AC-47.8.4",
       "description": "The result, with the 20 story ids, is recorded as a KB finding and posted on the loopctl channel."
+    },
+    {
+      "id": "AC-47.8.5",
+      "description": "The pilot's implementing session reports the story done (report_story) when it runs chg submit, before chg dispatches review: review_complete requires reported_done (PRD section 9, US-47.5), so a review chg records before the report is refused 422 story_not_reported_done and the landing then escalates review_missing. The pilot measures how many landings escalate review_missing and why."
     }
   ],
   "test_cases": [

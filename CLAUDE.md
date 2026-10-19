@@ -124,10 +124,10 @@ does NOT clear a 403 there:
 
 | Endpoint | Gate | Consequence |
 |----------|------|-------------|
-| `verify` / `reject` / `force_unclaim` / `verify_all` | `exact_role: :orchestrator` (`lib/loopctl_web/controllers/story_verification_controller.ex:28-29`) | a `:user` or `:superadmin` key CANNOT verify |
-| `contract` / `report` | `exact_role: [:agent, :orchestrator]` (`lib/loopctl_web/controllers/story_status_controller.ex:26-30`) | a human `:user` key CANNOT report |
-| `claim` / `start` / `request-review` / `unclaim` | `exact_role: :agent` (`:32-33`) | orchestrator/user keys cannot claim or start |
-| `review-complete` | `exact_role: [:orchestrator, :user]` (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`) | an `:agent` key is 403'd BEFORE any controller logic runs |
+| `verify` / `reject` / `force_unclaim` / `verify_all` | `exact_role: :orchestrator` (`lib/loopctl_web/controllers/story_verification_controller.ex:30-31`) | a `:user` or `:superadmin` key CANNOT verify |
+| `contract` / `report` | `exact_role: [:agent, :orchestrator]` (`lib/loopctl_web/controllers/story_status_controller.ex:48-52`) | a human `:user` key CANNOT report |
+| `claim` / `start` / `request-review` / `unclaim` | `exact_role: :agent` (`:58-60`) | orchestrator/user keys cannot claim or start |
+| `review-complete` | `exact_role: [:orchestrator, :user]` (`lib/loopctl_web/controllers/review_record_controller.ex:24-25`) | an `:agent` key is 403'd BEFORE any controller logic runs |
 
 **Anti-pattern: never convert an `exact_role` custody gate to `role:`.** That is precisely what
 lets one high-privilege key both implement and report/verify — the failure the product exists to
@@ -176,9 +176,9 @@ in order:
    story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:732-779`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:755-802`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:784`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:807`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 
@@ -203,11 +203,11 @@ user-role key also carries no `agent_id`, and permitting on nil alone let an ANC
 implementer rubber-stamp its own subtree without the lineage ever being read. That permit has
 THREE parts which must change together:
 1. the `exact_role: [:orchestrator, :user]` plug
-   (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`), which 403s an `:agent` key
+   (`lib/loopctl_web/controllers/review_record_controller.ex:24-25`), which 403s an `:agent` key
    before any controller code runs — so the `:agent` branch of the controller cond below is
    unreachable today;
 2. `LoopctlWeb.ReviewRecordController.create/2`
-   (`lib/loopctl_web/controllers/review_record_controller.ex:92-116`), which rejects an
+   (`lib/loopctl_web/controllers/review_record_controller.ex:125-151`), which rejects an
    orchestrator key carrying no `agent_id` and passes a literal `nil` (there is NO "human
    operator" sentinel) for a user key;
 3. the `Progress` permit itself.
@@ -230,6 +230,46 @@ cleared. **It is a column, not a `metadata` key, because `metadata` is cast
 and whole-map-replaced by `PATCH /api/v1/stories/:id`** — one ordinary request erased the
 marker and restored the claim → force-unclaim → backfill-to-verified launder. Never add
 `:lifecycle_entered_at` to a changeset `cast` list.
+
+**chg-dispatched reviews (US-47.5)** — `Loopctl.Changes.ReviewCustody`
+(`lib/loopctl/changes/review_custody.ex`). A story with a change binding is a chg story, and
+its chg root is the `chg_root_dispatch_id` of the one intake source that delivered the bound
+change's events (any other count: no root, nobody qualifies). On such a story
+`record_review/4` runs `chg_review/4` (`lib/loopctl/progress.ex:2458`) AFTER
+`validate_not_self_review/3`, never instead: the reviewer's LIVE lineage must be a STRICT
+descendant of the root (`chg_reviewer_required`, the root's own key included), then
+`commit_sha` must be the sha of an APPLIED `submitted` event of the CURRENT binding
+(`commit_sha_not_bound`); one reviewer dispatch records one verdict, held by the unique index
+`review_records_reviewer_dispatch_uidx` (`chg_review_already_recorded`). On any other story
+`commit_sha` is not stored, so a review recorded before binding never counts as a chg review.
+The other half: a caller whose MINTING lineage (`Dispatches.minting_lineage_for_api_key/2`,
+revoked or not — an expired chg key's live lineage is `[]`, which reject would accept) is
+rooted at a `chg_root_dispatch_id` ANY intake source of the tenant names, live or revoked,
+either mode, is refused `chg_root_cannot_verify` by verify, reject, verify-all, bulk
+verify/reject, backfill and bulk mark-complete (`refuse_chg_root_verifier/2`,
+`progress.ex:2611`; `BulkOperations.refuse_chg_root/3`, `bulk_operations.ex:389`) and
+`chg_root_review_only` by claim, bulk claim and report (`refuse_chg_root_actor/3`,
+`progress.ex:272`). Both halves read the lineage through ONE function,
+`ReviewCustody.caller_lineage/2` (minting lineage, else the call's live one), and the
+controllers resolve it through ONE helper, `LoopctlWeb.CustodyLineage.chg_root_opts/1`. The refusal is judged before any story is read, so no other caller's
+answer changes, and it records no custody violation. What the chg gate does NOT prove: every
+chg reviewer key sits under chg's root and outside every implementer's chain, so lineage
+always passes it — loopctl proves chg-server minted the key, and chg-server is trusted to run
+the job apart from the implementer (PRD §6). A landing with no chg review for its landed
+revision (`event.sha`, the revision commit — never `data.merge_sha`) is escalated in the
+landed event's own transaction over the control-only edge `:review_missing`
+(`EventEffects.after_move/5`, `lib/loopctl/changes/event_effects.ex:493`), and that hold
+fails CLOSED: a refused escalation rolls the whole landing back (`:busy`, or
+`change_event_failed`, logged and counted) so chg redelivers it — the merge never commits
+without its hold. Such a story is never verified: every path that reaches `verified` —
+verify and verify-all through `chg_landed_review/2` (`progress.ex:2698`), bulk verify
+through `process_verify/3` (`bulk_operations.ex:421`), backfill and bulk mark-complete
+through `guard_backfill/2` (`progress.ex:2792`) — calls one function,
+`ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:215`). It refuses a chg story with
+`review_missing_escalated` while its stage is escalated over `:review_missing` (a human
+resolves it) and with `chg_review_not_for_landed_revision` unless a chg review names its
+LANDED revision: the `sha` of the newest APPLIED `landed` event of its current binding. A
+story with no binding passes untouched.
 
 **The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
 

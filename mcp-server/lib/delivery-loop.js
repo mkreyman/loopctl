@@ -21,7 +21,7 @@
  *   - `resolve_escalation` is the HUMAN half of the escalation pair: a `:user` key no dispatch
  *     minted. The agent key that raises an escalation is 403'd on it by design.
  *   - `force_unclaim_story` is gated `exact_role: :orchestrator`
- *     (`story_verification_controller.ex:29-30`), so it needs an ORCHESTRATOR-ROLE key and a
+ *     (`story_verification_controller.ex:30-31`), so it needs an ORCHESTRATOR-ROLE key and a
  *     higher-privileged one does NOT substitute: `RequireRole`'s exact-role clause tests
  *     `api_key.role == exact_role` (`require_role.ex:65-75`), so a `:user` or `:superadmin`
  *     key is 403'd there exactly as an agent key is. That is a chain-of-custody gate, not an
@@ -293,7 +293,7 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * No request body — the story is named in the path.
  *
  * ORCHESTRATOR ROLE, and exactly that: the action is `exact_role: :orchestrator`
- * (`story_verification_controller.ex:29-30`), so a user or superadmin key is refused —
+ * (`story_verification_controller.ex:30-31`), so a user or superadmin key is refused —
  * `RequireRole`'s exact-role clause tests `api_key.role == exact_role`
  * (`require_role.ex:65-75`).
  *

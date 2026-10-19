@@ -5,6 +5,33 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.3.0 — 2026-10-19 (chg review custody)
+
+### Added
+
+- **`review_complete` takes `commit_sha`** (loopctl US-47.5, AC-47.5.2): the reviewed chg
+  revision, forwarded as given. REQUIRED on a story bound to a chg change, where it must be
+  the sha of a submitted revision of the story's current change (422 `commit_sha_not_bound`
+  otherwise); ignored and not stored on any other story.
+
+### Changed
+
+- **`review_complete` documents the chg review gates** (AC-47.5.1): on a story bound to a chg
+  change only a key chg-server minted for the review — a strict descendant of the intake
+  source's `chg_root_dispatch_id` — may record it (409 `chg_reviewer_required`, the root key
+  included), and one reviewer dispatch records one verdict (409
+  `chg_review_already_recorded`). They run after the existing custody gates, never instead.
+- **`verify_story`, `reject_story`, `verify_all_in_epic` and `bulk_mark_complete` document 409
+  `chg_root_cannot_verify`** (AC-47.5.4): a key descending from a registered
+  `chg_root_dispatch_id` never certifies; the bulk paths refuse the whole call.
+- **`claim_story` and `report_story` document 409 `chg_root_review_only`**: chg-server's keys
+  may only review.
+- **`verify_story`, `verify_all_in_epic` and `bulk_mark_complete` document the chg
+  landed-review gate** (AC-47.5.5): a story bound to a chg change is verified only on a chg
+  review of its LANDED revision (409 `chg_review_not_for_landed_revision`) and never while its
+  stage is escalated over `review_missing` (409 `review_missing_escalated`); the epic and bulk
+  paths report either as a per-story error.
+
 ## 3.2.0 — 2026-10-19 (change_binding_get)
 
 ### Added

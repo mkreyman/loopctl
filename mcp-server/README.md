@@ -259,7 +259,7 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 | Tool | Description |
 |---|---|
 | `contract_story` | Agent acknowledges a story's acceptance criteria. Transitions pending -> contracted. Refused 409 `story_held` when the story's delivery stage is `escalated`, `done` or `failed` — it is not available to agents even when it reads `pending`; an escalated story becomes available again only after `resolve_escalation` sends it to `queued`. |
-| `claim_story` | Agent claims a contracted story with pessimistic locking. Transitions contracted -> assigned. On a loopctl with claim leases the result leads with the claim's `claim_epoch` and `claimed_until`; keep the epoch for `renew_story_claim`. Both are absent on an older server. Refused 409 `story_held` when the story's delivery stage is `escalated`, `done` or `failed` — even when it reads `pending` or `contracted`; an escalated story is claimable again only after `resolve_escalation` sends it to `queued`, a done or failed one never is. |
+| `claim_story` | Agent claims a contracted story with pessimistic locking. Transitions contracted -> assigned. On a loopctl with claim leases the result leads with the claim's `claim_epoch` and `claimed_until`; keep the epoch for `renew_story_claim`. Both are absent on an older server. Refused 409 `story_held` when the story's delivery stage is `escalated`, `done` or `failed` — even when it reads `pending` or `contracted`; an escalated story is claimable again only after `resolve_escalation` sends it to `queued`, a done or failed one never is. Refused 409 `chg_root_review_only` when the key descends from an intake source's `chg_root_dispatch_id`: chg-server's keys may only review. |
 | `renew_story_claim` | Renew your claim's lease (`POST /stories/:id/renew-claim`, agent key). A claim not renewed before `claimed_until` (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) is released back to `pending` under you, so renew well inside it on any story held longer. A driver-placed claim — one a placement took for a runner dispatch — is capped at its dispatch deadline (`claim_lease_cap`: placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` at the claim, sent to the runner as `deadline_at`; moved forward to a resume's time or the runner's acceptance + `wall_clock_seconds` + the grace, only while the claim is live; never earlier than a `deadline_at` already sent), and its `claimed_until` already IS that cap: renewing it writes nothing and returns the claim as it stands, never moving `claimed_until` past it. Required: `story_id`, `claim_epoch` (from the claim). Refusals pass through: 400 epoch missing or malformed, 422 `not_claimed`, 409 `stale_claim_epoch` (the claim has ended: stop working it), 409 `not_claimant`, 409 `lease_cap_reached` (a driver-placed claim already at its cap: nothing is renewed, stop working it). Needs a loopctl server with claim leases. |
 | `escalate_story` | Park a story you hold for a HUMAN and stop (`POST /stories/:id/escalate`, agent key). This is what an unattended session calls INSTEAD of asking a question — a headless run has no way to ask, so escalating is the affordance. Use it when the request contradicts an existing story, KB decision or documented behaviour, when it inverts or removes behaviour a previous story deliberately added, when it is a workflow change rather than a defect fix, or when it needs a business call — not for an ordinary blocker. ONE-WAY from your side: only a human moves the story off `escalated`, so on success STOP and report. Required: `story_id`, `claim_epoch`, `reason` (verbatim, treated as untrusted data, length capped by the server in codepoints — a 400 names the bound); optional `payload` object. Idempotent under the same epoch. Refusals pass through: 409 `stale_claim_epoch`, 409 `not_claimant`, 404 `unknown_story_stage`, 400 for a malformed epoch or reason. An orchestrator or user key is 403'd on purpose. |
 | `start_story` | Agent starts work on a claimed story. Transitions assigned -> implementing. |
@@ -269,22 +269,22 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 
 | Tool | Description |
 |---|---|
-| `report_story` | Reviewer confirms the implementation is done. Transitions implementing -> reported_done. Accepts optional `token_usage` object. Under the LCP-1 §9.3 signed profile, pass the `claim` from `custody_sign_claim`. |
-| `review_complete` | Record that a review has been completed for a story. Required before verify. Under the signed profile, pass the `claim` from `custody_sign_claim`. |
+| `report_story` | Reviewer confirms the implementation is done. Transitions implementing -> reported_done. Accepts optional `token_usage` object. Under the LCP-1 §9.3 signed profile, pass the `claim` from `custody_sign_claim`. Refused 409 `chg_root_review_only` for a key descending from an intake source's `chg_root_dispatch_id`. |
+| `review_complete` | Record that a review has been completed for a story. Required before verify. Under the signed profile, pass the `claim` from `custody_sign_claim`. On a story bound to a chg change (loopctl US-47.5), after the existing custody gates: only a key chg-server minted for the review — a strict descendant of the intake source's `chg_root_dispatch_id` — may record it (409 `chg_reviewer_required`, the root key included); `commit_sha` is REQUIRED and must be the sha of a submitted revision of the story's current change (422 `commit_sha_not_bound`); one reviewer dispatch records one verdict (409 `chg_review_already_recorded`). `commit_sha` is ignored on any other story. |
 
 ### Verification Tools (orchestrator key)
 
 | Tool | Description |
 |---|---|
-| `verify_story` | Orchestrator verifies a reported_done story. Transitions reported_done -> verified. Under the signed profile, pass the `claim` from `custody_sign_claim`. |
-| `reject_story` | Orchestrator rejects a story with a reason. The reject releases the claim, and a delivery story may be re-contracted or escalated in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain entry was refused) means the WHOLE call rolled back: the story is unchanged, and a re-run meets the same server-side condition until an operator acts. |
+| `verify_story` | Orchestrator verifies a reported_done story. Transitions reported_done -> verified. Under the signed profile, pass the `claim` from `custody_sign_claim`. Refused 409 `chg_root_cannot_verify` for a key descending from an intake source's `chg_root_dispatch_id` (loopctl US-47.5). |
+| `reject_story` | Orchestrator rejects a story with a reason. The reject releases the claim, and a delivery story may be re-contracted or escalated in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain entry was refused) means the WHOLE call rolled back: the story is unchanged, and a re-run meets the same server-side condition until an operator acts. Refused 409 `chg_root_cannot_verify` for a key descending from an intake source's `chg_root_dispatch_id` (loopctl US-47.5). |
 
 ### Bulk Tools (orchestrator key)
 
 | Tool | Description |
 |---|---|
-| `bulk_mark_complete` | **Backfill-only.** Bulk-marks pre-existing, never-dispatched stories (pending, unassigned, no dispatch lineage) as complete in a single call. Dispatched stories are refused — they must go through the normal report → review → verify flow. |
-| `verify_all_in_epic` | Bulk verify all reported_done, unverified stories in an epic. |
+| `bulk_mark_complete` | **Backfill-only.** Bulk-marks pre-existing, never-dispatched stories (pending, unassigned, no dispatch lineage) as complete in a single call. Dispatched stories are refused — they must go through the normal report → review → verify flow. Refused 409 `chg_root_cannot_verify` for the whole batch for a chg-rooted key (loopctl US-47.5). |
+| `verify_all_in_epic` | Bulk verify all reported_done, unverified stories in an epic. Refused 409 `chg_root_cannot_verify` for the whole epic for a chg-rooted key (loopctl US-47.5). |
 
 ### Token Efficiency Tools
 
@@ -663,6 +663,8 @@ loopctl enforces that nobody marks their own work as done. The API returns `409`
 - `verify_story` -- 409 `self_verify_blocked`
 
 The implementer's final action is `request_review`. All subsequent steps (report, review, verify) must come from different agents.
+
+On a story bound to a chg change (loopctl US-47.5) the review comes from chg-server: `review_complete` takes it only from a key chg-server minted beneath its registered `chg_root_dispatch_id` (409 `chg_reviewer_required`), naming the reviewed revision as `commit_sha` (422 `commit_sha_not_bound`), one verdict per reviewer dispatch (409 `chg_review_already_recorded`). chg-server's keys never certify or implement: `verify_story`, `reject_story`, `verify_all_in_epic` and `bulk_mark_complete` answer 409 `chg_root_cannot_verify`, `claim_story` and `report_story` 409 `chg_root_review_only`. A chg story that lands with no review for its landed revision is escalated over `review_missing` and is not verified without a human.
 
 ## Witness protocol (STH)
 

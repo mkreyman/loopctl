@@ -1372,12 +1372,15 @@ async function reportStory({ story_id, artifact_type, artifact_path, token_usage
   return toContent(result);
 }
 
-async function reviewComplete({ story_id, review_type, findings_count, fixes_count, disproved_count, summary, claim }) {
+async function reviewComplete({ story_id, review_type, findings_count, fixes_count, disproved_count, summary, commit_sha, claim }) {
   const body = { review_type };
   if (findings_count != null) body.findings_count = findings_count;
   if (fixes_count != null) body.fixes_count = fixes_count;
   if (disproved_count != null) body.disproved_count = disproved_count;
   if (summary) body.summary = summary;
+  // loopctl US-47.5: the reviewed chg revision. Forwarded as given and judged server-side
+  // (422 commit_sha_not_bound), so a malformed value reaches the one place that can say why.
+  if (commit_sha != null) body.commit_sha = commit_sha;
   if (claim) body.claim = claim;
 
   const result = await apiCall(
@@ -1400,7 +1403,7 @@ async function verifyStory({ story_id, summary, review_type, claim }) {
   if (review_type) body.review_type = review_type;
   if (claim) body.claim = claim;
 
-  // `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`). When
+  // `exact_role: :orchestrator` (`story_verification_controller.ex:30-31`). When
   // LOOPCTL_ORCH_KEY is set it is sent EXACTLY, because `resolveKey` would otherwise
   // discard it in favour of a global LOOPCTL_API_KEY on the very calls it was set for.
   // When it is NOT set, the global key still goes — see lib/custody-key.js for why the
@@ -1418,7 +1421,7 @@ async function verifyStory({ story_id, summary, review_type, claim }) {
 }
 
 async function rejectStory({ story_id, reason }) {
-  // `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`) — see
+  // `exact_role: :orchestrator` (`story_verification_controller.ex:30-31`) — see
   // lib/custody-key.js.
   const orch = orchestratorKeyArgs();
 
@@ -1436,7 +1439,7 @@ async function rejectStory({ story_id, reason }) {
 
 async function bulkMarkComplete({ stories }) {
   // stories: [{story_id, summary, review_type}]
-  // `exact_role: :orchestrator` (`bulk_operations_controller.ex:24-25`) — see
+  // `exact_role: :orchestrator` (`bulk_operations_controller.ex:25-26`) — see
   // lib/custody-key.js.
   const orch = orchestratorKeyArgs();
 
@@ -1451,7 +1454,7 @@ async function bulkMarkComplete({ stories }) {
 }
 
 async function verifyAllInEpic({ epic_id, review_type, summary }) {
-  // `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`, `:verify_all`) —
+  // `exact_role: :orchestrator` (`story_verification_controller.ex:30-31`, `:verify_all`) —
   // see lib/custody-key.js.
   const orch = orchestratorKeyArgs();
 
@@ -3454,7 +3457,7 @@ async function resolveEscalation(args) {
 }
 
 // #846: force-unclaim is `exact_role: :orchestrator`
-// (`story_verification_controller.ex:29-30`), so this is the one delivery-loop verb that wants
+// (`story_verification_controller.ex:30-31`), so this is the one delivery-loop verb that wants
 // the ORCH key. Same selection as the other four custody verbs: when LOOPCTL_ORCH_KEY is set it
 // is sent EXACTLY, because `resolveKey` (`index.js:132-138`) would otherwise discard it for a
 // global LOOPCTL_API_KEY on the one call it was set for; when it is not set, a global key still
@@ -4725,7 +4728,9 @@ const TOOLS = [
       "reads pending or contracted — move on. An escalated story is claimable again only " +
       "after resolve_escalation sends it to queued; a done or failed one never is. Refused " +
       "409 dependencies_not_met when a story it depends on, or one in an epic its epic " +
-      "depends on, is not verified: list_blocked_stories names them.",
+      "depends on, is not verified: list_blocked_stories names them. Refused 409 " +
+      "chg_root_review_only when the key descends from an intake source's " +
+      "chg_root_dispatch_id: chg-server's keys may only review.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4871,7 +4876,9 @@ const TOOLS = [
     description:
       "Reviewer (a DIFFERENT agent from the implementer) confirms the implementation is done. " +
       "Chain-of-custody: the implementing agent cannot call this. " +
-      "Transitions implementing -> reported_done. Uses the ORCH key.",
+      "Transitions implementing -> reported_done. Uses the ORCH key. Refused 409 " +
+      "chg_root_review_only when the key descends from an intake source's " +
+      "chg_root_dispatch_id: chg-server's keys may only review.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4906,7 +4913,16 @@ const TOOLS = [
     name: "review_complete",
     description:
       "Record that a review has been completed for a story. " +
-      "Must be called before verify_story. Uses the ORCH key.",
+      "Must be called before verify_story. Uses the ORCH key. " +
+      "On a story BOUND TO A chg CHANGE (loopctl US-47.5) three more rules apply, after the " +
+      "existing custody gates (self_review_blocked, caller_lineage_required, " +
+      "unresolvable_dispatch_lineage), never instead of them: the key must be one chg-server " +
+      "minted for the review — a strict descendant of the intake source's " +
+      "chg_root_dispatch_id — else 409 chg_reviewer_required (chg-server's root key is " +
+      "refused too); commit_sha is REQUIRED and must be the sha of a submitted revision of " +
+      "the story's current change, else 422 commit_sha_not_bound; and one reviewer dispatch " +
+      "records one verdict, a second is 409 chg_review_already_recorded. On any other story " +
+      "commit_sha is ignored and not stored.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4935,6 +4951,13 @@ const TOOLS = [
           type: "string",
           description: "Optional: summary of the review outcome.",
         },
+        commit_sha: {
+          type: "string",
+          description:
+            "REQUIRED on a story bound to a chg change: the reviewed revision commit, 40 or " +
+            "64 lowercase hex characters, the sha of a submitted revision of the story's " +
+            "current change (422 commit_sha_not_bound otherwise). Ignored on any other story.",
+        },
         claim: CLAIM_SCHEMA,
       },
       required: ["story_id", "review_type"],
@@ -4947,7 +4970,15 @@ const TOOLS = [
     description:
       "Orchestrator verifies a reported_done story. " +
       "Requires a review_record to exist (call review_complete first). " +
-      "Transitions reported_done -> verified. Uses the ORCH key.",
+      "Transitions reported_done -> verified. Uses the ORCH key. Refused 409 " +
+      "chg_root_cannot_verify when the key descends from an intake source's " +
+      "chg_root_dispatch_id (loopctl US-47.5): chg-server's keys review and never verify — " +
+      "use an orchestrator key outside chg's tree. A story BOUND TO A chg CHANGE is verified " +
+      "only on a chg review of its LANDED revision (the revision commit of the newest " +
+      "applied landed event of its current change), else 409 " +
+      "chg_review_not_for_landed_revision — have chg dispatch a review naming that sha; and " +
+      "never while its stage is escalated over review_missing, else 409 " +
+      "review_missing_escalated — a human resolves it first (resolve_escalation).",
     inputSchema: {
       type: "object",
       properties: {
@@ -4976,7 +5007,10 @@ const TOOLS = [
       "The reject releases the claim, and a delivery story may be re-contracted or escalated " +
       "in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain " +
       "entry was refused) means the WHOLE call rolled back: the story is unchanged, and a " +
-      "re-run meets the same server-side condition until an operator acts.",
+      "re-run meets the same server-side condition until an operator acts. Refused 409 " +
+      "chg_root_cannot_verify when the key descends from an intake source's " +
+      "chg_root_dispatch_id (loopctl US-47.5): reject is a custody decision chg-server's " +
+      "keys never make.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4999,7 +5033,9 @@ const TOOLS = [
     description:
       "Bulk mark multiple stories as complete (backfill-only for never-dispatched work). " +
       "ADMIN USE ONLY: backfill pre-existing completed work into pending stories that never entered the dispatch lifecycle. " +
-      "For dispatched stories, use the normal report/review/verify flow. Each story entry needs a story_id, summary, and review_type. Uses the ORCH key.",
+      "For dispatched stories, use the normal report/review/verify flow. Each story entry needs a story_id, summary, and review_type. Uses the ORCH key. " +
+      "Refused 409 chg_root_cannot_verify for the whole batch when the key descends from an intake source's chg_root_dispatch_id (loopctl US-47.5). " +
+      "A story bound to a chg change is a per-story error leading with review_missing_escalated or chg_review_not_for_landed_revision, the same landed-review gate verify_story applies.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5033,7 +5069,11 @@ const TOOLS = [
     name: "verify_all_in_epic",
     description:
       "Bulk verify all reported_done, unverified stories in an epic. " +
-      "Convenience endpoint for the orchestrator after a review pass. Uses the ORCH key.",
+      "Convenience endpoint for the orchestrator after a review pass. Uses the ORCH key. " +
+      "Refused 409 chg_root_cannot_verify for the whole epic, verifying nothing, when the key " +
+      "descends from an intake source's chg_root_dispatch_id (loopctl US-47.5). A story bound " +
+      "to a chg change is skipped into errors with review_missing_escalated or " +
+      "chg_review_not_for_landed_revision, the same landed-review gate verify_story applies.",
     inputSchema: {
       type: "object",
       properties: {

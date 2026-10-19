@@ -47,6 +47,13 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :missing_assigned_agent}` -> 409 (reported_done story has no assigned agent/dispatch lineage; custody chain broken)
   - `{:error, :unresolvable_dispatch_lineage}` -> 409 (a dispatch the story references — implementer, or verifier on verify — could not be resolved; custody gate failed closed on an integrity error, tenant NOT halted)
   - `{:error, :caller_lineage_required}` -> 409 (a key no dispatch minted tried to report/review/verify dispatch-minted work; a configuration refusal, tenant NOT halted)
+  - `{:error, :chg_reviewer_required}` -> 409 (US-47.5: review-complete on a story bound to a chg change by a key that is not a strict descendant of its chg root)
+  - `{:error, :commit_sha_not_bound}` -> 422 (US-47.5: that review named no submitted revision of the story's current binding)
+  - `{:error, :chg_review_already_recorded}` -> 409 (US-47.5: the chg reviewer dispatch already recorded its one verdict)
+  - `{:error, :chg_root_cannot_verify}` -> 409 (US-47.5: a chg-rooted key tried to verify, reject, verify-all, bulk verify/reject, backfill or mark complete)
+  - `{:error, :chg_root_review_only}` -> 409 (US-47.5: a chg-rooted key tried to claim or report)
+  - `{:error, :review_missing_escalated}` -> 409 (US-47.5: a chg story held over `:review_missing` reached a verify path; a human resolves the escalation first)
+  - `{:error, :chg_review_not_for_landed_revision}` -> 409 (US-47.5: a chg story reached a verify path with no chg review of its landed revision)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
     a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 ingest backpressure —
@@ -585,6 +592,42 @@ defmodule LoopctlWeb.FallbackController do
             "lineages — and your key was not minted by a dispatch, so it has none. Call " <>
             "again with an ephemeral key from POST /api/v1/dispatches.",
         remediation: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+      }
+    })
+  end
+
+  # US-47.5 (Epic 47 PRD §6). None records a custody violation: each refuses a principal for
+  # being chg-server's, which is a structural fact about the key, not a byzantine self-claim,
+  # and a misconfigured chg-server would otherwise arm the tenant-wide halt on every retry.
+  def call(conn, {:error, code})
+      when code in [
+             :chg_reviewer_required,
+             :chg_review_already_recorded,
+             :chg_root_cannot_verify,
+             :chg_root_review_only,
+             :review_missing_escalated,
+             :chg_review_not_for_landed_revision
+           ] do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: Atom.to_string(code),
+        message: chg_custody_message(code),
+        remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
+  def call(conn, {:error, :commit_sha_not_bound}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "commit_sha_not_bound",
+        message: Messages.commit_sha_not_bound()
       }
     })
   end
@@ -1320,4 +1363,17 @@ defmodule LoopctlWeb.FallbackController do
   # is a struct and therefore matches neither clause's map pattern.
   defp story_id_param(%Plug.Conn{params: %{"id" => id}}) when is_binary(id), do: id
   defp story_id_param(%Plug.Conn{}), do: nil
+
+  # US-47.5: the 409 messages of the chg custody refusals, from `Loopctl.ApiSpec.Messages`.
+  defp chg_custody_message(:chg_reviewer_required), do: Messages.chg_reviewer_required()
+
+  defp chg_custody_message(:chg_review_already_recorded),
+    do: Messages.chg_review_already_recorded()
+
+  defp chg_custody_message(:chg_root_cannot_verify), do: Messages.chg_root_cannot_verify()
+  defp chg_custody_message(:chg_root_review_only), do: Messages.chg_root_review_only()
+  defp chg_custody_message(:review_missing_escalated), do: Messages.review_missing_escalated()
+
+  defp chg_custody_message(:chg_review_not_for_landed_revision),
+    do: Messages.chg_review_not_for_landed_revision()
 end

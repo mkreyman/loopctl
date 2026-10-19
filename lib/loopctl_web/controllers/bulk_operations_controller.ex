@@ -12,10 +12,12 @@ defmodule LoopctlWeb.BulkOperationsController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.BulkOperations
   alias Loopctl.Dispatches
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.CustodyLineage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -39,10 +41,16 @@ defmodule LoopctlWeb.BulkOperationsController do
 
   operation(:claim,
     summary: "Bulk claim stories",
-    description: "Agent claims multiple pending stories. Partial-success semantics.",
+    description:
+      "Agent claims multiple pending stories. Partial-success semantics. A key descending " <>
+        "from an intake source's `chg_root_dispatch_id` is refused 409 " <>
+        "`chg_root_review_only` (US-47.5) for the whole batch.",
     request_body: {"Claim params", "application/json", Schemas.BulkClaimRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      409 =>
+        {"`chg_root_review_only` (" <> Messages.chg_root_review_only() <> ")", "application/json",
+         Schemas.ErrorResponse},
       422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -50,10 +58,20 @@ defmodule LoopctlWeb.BulkOperationsController do
 
   operation(:verify,
     summary: "Bulk verify stories",
-    description: "Orchestrator verifies multiple reported_done stories.",
+    description:
+      "Orchestrator verifies multiple reported_done stories. A key descending from an " <>
+        "intake source's `chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` " <>
+        "(US-47.5) for the whole batch, and nothing is verified. A story bound to a chg " <>
+        "change is a per-story error whose reason leads with `review_missing_escalated` (" <>
+        Messages.review_missing_escalated() <>
+        ") or `chg_review_not_for_landed_revision` (" <>
+        Messages.chg_review_not_for_landed_revision() <> ").",
     request_body: {"Verify params", "application/json", Schemas.BulkVerifyRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      409 =>
+        {"`chg_root_cannot_verify` (" <> Messages.chg_root_cannot_verify() <> ")",
+         "application/json", Schemas.ErrorResponse},
       422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -61,10 +79,16 @@ defmodule LoopctlWeb.BulkOperationsController do
 
   operation(:reject,
     summary: "Bulk reject stories",
-    description: "Orchestrator rejects multiple stories with reasons.",
+    description:
+      "Orchestrator rejects multiple stories with reasons. A key descending from an intake " <>
+        "source's `chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5) " <>
+        "for the whole batch, and nothing is rejected.",
     request_body: {"Reject params", "application/json", Schemas.BulkRejectRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      409 =>
+        {"`chg_root_cannot_verify` (" <> Messages.chg_root_cannot_verify() <> ")",
+         "application/json", Schemas.ErrorResponse},
       422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
@@ -80,7 +104,10 @@ defmodule LoopctlWeb.BulkOperationsController do
       "ADMIN USE ONLY. Marks multiple stories as both reported_done AND verified in one step. " <>
         "Intended for importing pre-existing work. " <>
         "Skips the normal contract→claim→start→report→verify workflow. " <>
-        "Requires orchestrator role.",
+        "Requires orchestrator role. A key descending from an intake source's " <>
+        "`chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5). A story " <>
+        "bound to a chg change is a per-story error leading with `review_missing_escalated` " <>
+        "or `chg_review_not_for_landed_revision`, as on bulk verify.",
     request_body:
       {"Mark-complete params", "application/json",
        %OpenApiSpex.Schema{
@@ -120,6 +147,9 @@ defmodule LoopctlWeb.BulkOperationsController do
        }},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      409 =>
+        {"`chg_root_cannot_verify` (" <> Messages.chg_root_cannot_verify() <> ")",
+         "application/json", Schemas.ErrorResponse},
       422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -134,11 +164,16 @@ defmodule LoopctlWeb.BulkOperationsController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
     agent_id = api_key.agent_id
-    audit_opts = AuditContext.from_conn(conn)
+
+    audit_opts =
+      Keyword.merge(AuditContext.from_conn(conn), CustodyLineage.chg_root_opts(api_key))
 
     case BulkOperations.bulk_claim(tenant_id, story_ids, agent_id, audit_opts) do
       {:ok, results} ->
         respond_with_results(conn, results)
+
+      {:error, :chg_root_review_only} = error ->
+        error
 
       {:error, :empty_batch} ->
         {:error, :unprocessable_entity, "story_ids must not be empty"}
@@ -168,6 +203,9 @@ defmodule LoopctlWeb.BulkOperationsController do
       case BulkOperations.bulk_verify(tenant_id, stories, orchestrator_agent_id, audit_opts) do
         {:ok, results} ->
           respond_with_results(conn, results)
+
+        {:error, :chg_root_cannot_verify} = error ->
+          error
 
         {:error, :empty_batch} ->
           {:error, :unprocessable_entity, "stories must not be empty"}
@@ -199,6 +237,9 @@ defmodule LoopctlWeb.BulkOperationsController do
         {:ok, results} ->
           respond_with_results(conn, results)
 
+        {:error, :chg_root_cannot_verify} = error ->
+          error
+
         {:error, :empty_batch} ->
           {:error, :unprocessable_entity, "stories must not be empty"}
 
@@ -229,7 +270,9 @@ defmodule LoopctlWeb.BulkOperationsController do
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
       orchestrator_agent_id = api_key.agent_id
-      audit_opts = AuditContext.from_conn(conn)
+
+      audit_opts =
+        Keyword.merge(AuditContext.from_conn(conn), CustodyLineage.chg_root_opts(api_key))
 
       case BulkOperations.bulk_mark_complete(
              tenant_id,
@@ -239,6 +282,9 @@ defmodule LoopctlWeb.BulkOperationsController do
            ) do
         {:ok, results} ->
           respond_with_results(conn, results)
+
+        {:error, :chg_root_cannot_verify} = error ->
+          error
 
         {:error, :empty_batch} ->
           {:error, :unprocessable_entity, "stories must not be empty"}
@@ -265,9 +311,12 @@ defmodule LoopctlWeb.BulkOperationsController do
   # would move the custody gate with it. The lineage is never read from the request
   # body.
   defp custody_opts(conn, api_key) do
-    Keyword.merge(AuditContext.from_conn(conn),
+    conn
+    |> AuditContext.from_conn()
+    |> Keyword.merge(
       verifier_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
     )
+    |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
   end
 
   defp respond_with_results(conn, results) do

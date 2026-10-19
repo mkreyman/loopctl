@@ -19,8 +19,10 @@ defmodule Loopctl.BulkOperations do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
@@ -56,7 +58,8 @@ defmodule Loopctl.BulkOperations do
   @spec bulk_claim(Ecto.UUID.t(), [Ecto.UUID.t()], Ecto.UUID.t(), keyword()) ::
           {:ok, [map()]} | {:error, atom()}
   def bulk_claim(tenant_id, story_ids, agent_id, opts \\ []) do
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_review_only) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       sorted_ids = Enum.sort(story_ids)
@@ -108,7 +111,8 @@ defmodule Loopctl.BulkOperations do
   def bulk_verify(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
     story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
 
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
 
@@ -162,7 +166,8 @@ defmodule Loopctl.BulkOperations do
   def bulk_reject(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
     story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
 
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
 
@@ -229,7 +234,8 @@ defmodule Loopctl.BulkOperations do
   def bulk_mark_complete(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
     story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
 
-    with :ok <- validate_batch_size(story_ids) do
+    with :ok <- validate_batch_size(story_ids),
+         :ok <- refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
 
@@ -373,6 +379,29 @@ defmodule Loopctl.BulkOperations do
     end)
   end
 
+  # US-47.5 (AC-47.5.4): chg-server's keys review and never certify or implement. The WHOLE
+  # batch is refused, before any story is locked: it is the caller that may not act, on every
+  # story alike, so a per-story error list would only repeat it. The lineage judged is
+  # `ReviewCustody.caller_lineage/2`'s — the SAME function, with the SAME fallback, as the
+  # single-story path that refusal mirrors (`:verifier_lineage` for verify, reject and
+  # mark-complete as on `Progress.verify_story/4`; `:lineage` for claim as on
+  # `Progress.claim_story/3`) — so both halves judge one principal identically.
+  defp refuse_chg_root(tenant_id, opts, :chg_root_cannot_verify = refusal),
+    do:
+      ReviewCustody.refuse_chg_root(
+        tenant_id,
+        ReviewCustody.caller_lineage(opts, [:verifier_lineage]),
+        refusal
+      )
+
+  defp refuse_chg_root(tenant_id, opts, :chg_root_review_only = refusal),
+    do:
+      ReviewCustody.refuse_chg_root(
+        tenant_id,
+        ReviewCustody.caller_lineage(opts, [:lineage]),
+        refusal
+      )
+
   # ===================================================================
   # Private: Individual Story Processing
   # ===================================================================
@@ -400,6 +429,9 @@ defmodule Loopctl.BulkOperations do
     with :ok <- validate_verify_preconditions(story),
          :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id, ctx.caller_lineage),
          :ok <- Progress.ensure_review_conducted(tenant_id, story.id, story),
+         # US-47.5 (AC-47.5.5): the SAME gate `Progress.verify_story/4` runs, on the locked
+         # story — a chg story is verified only on a review of its landed revision.
+         :ok <- ReviewCustody.ensure_landed_review(tenant_id, story.id),
          {:ok, updated} <- apply_verification(story) do
       create_verification_result(tenant_id, story, orchestrator_agent_id, params)
       audit_verification(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -961,6 +993,13 @@ defmodule Loopctl.BulkOperations do
       "story_held: its delivery stage is escalated, done or failed. An escalated story is " <>
         "claimable again once a human resolves it to queued (resolve_escalation); a done or " <>
         "failed one never is"
+
+  # US-47.5: each leads with its code, so a bulk caller can branch on it.
+  defp format_reason(:review_missing_escalated),
+    do: "review_missing_escalated: " <> Messages.review_missing_escalated()
+
+  defp format_reason(:chg_review_not_for_landed_revision),
+    do: "chg_review_not_for_landed_revision: " <> Messages.chg_review_not_for_landed_revision()
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"
