@@ -52,10 +52,14 @@ const BUILD_WAIT: Duration = Duration::from_secs(REFRESH_TIMEOUT.as_secs() + 5 *
 /// Logs of detached runs older than this are removed when a new one starts.
 const LOG_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
 
-/// Cutover criteria (issue #18).
+/// Cutover criteria (issue #18). The median check time is reported, not required: Mark
+/// dropped it on 2026-10-19, when whole-suite checks (migrations, config) kept it near 4m45s
+/// while every check already took about half the gate's time.
 pub const MIN_PUSHES: usize = 200;
 pub const MIN_MACHINES: usize = 3;
-pub const MAX_MEDIAN_MS: u64 = 3 * 60 * 1000;
+
+/// The `source` of a chg row that judged a past commit, not a push.
+pub const REPLAY: &str = "replay";
 
 /// One line of the shadow log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +97,9 @@ pub struct Row {
     // gate rows
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
-    /// `local` (the hook ran it) or `ci` (read from a GitHub check run).
+    /// Gate rows: `local` (the hook ran it) or `ci` (read from a GitHub check run). chg
+    /// rows: `replay` for a check of a past commit (`chg check --shadow --replay`), absent
+    /// for a push's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -320,12 +326,21 @@ fn prune_logs(dir: &Path) {
 }
 
 /// The shadow check itself (`--foreground`): judge `sha` against `base` in a throwaway
-/// worktree and append a `chg` row. Returns the row it wrote.
-pub fn run_foreground(repo: &Path, sha: &str, base: &str) -> Result<Row, String> {
+/// worktree and append a `chg` row, marked `replay` when it judges a past commit rather
+/// than a push. Returns the row it wrote. A push's check then refreshes `base`, so the
+/// next push starts warm. A replay does not: its base is history no push will start from,
+/// and building it would cost a snapshot per replay and push the live bases out of GC's
+/// keep set.
+pub fn run_foreground(repo: &Path, sha: &str, base: &str, replay: bool) -> Result<Row, String> {
     let key = git::repo_key(repo);
-    let row = judge(repo, &key, sha, base);
+    let mut row = judge(repo, &key, sha, base);
+    if replay {
+        row.source = Some(REPLAY.into());
+    }
     append(&log_path(&key), &row)?;
-    refresh(repo, base, false);
+    if !replay {
+        refresh(repo, base, false);
+    }
     Ok(row)
 }
 
@@ -478,6 +493,9 @@ pub struct Pair {
     pub selected: Option<usize>,
     pub chg_ms: u64,
     pub gate_ms: u64,
+    /// Every chg run of this commit on this machine was a replay: no push judged it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub replay: bool,
     /// Every gate verdict on this commit came from CI (`--ci-check`), so it has no gate
     /// time (`gate_ms` 0) and stays out of the time figures.
     pub gate_ci: bool,
@@ -501,6 +519,11 @@ pub struct Criterion {
 pub struct Report {
     pub repo: String,
     pub pushes: usize,
+    /// Of `pushes`, the ones judged only by replays (counted like a push, issue #18).
+    pub replayed: usize,
+    /// How many distinct commits the pushes judged: one commit on three machines is three
+    /// pushes and one commit.
+    pub commits: usize,
     pub machines: Vec<String>,
     pub agree: usize,
     pub misses: usize,
@@ -532,8 +555,8 @@ fn median(mut v: Vec<i64>) -> Option<i64> {
     if n % 2 == 1 {
         return Some(v[n / 2]);
     }
-    // The mean of the two middle values, rounded up: the 3-minute criterion must not
-    // pass on the faster half of an even sample.
+    // The mean of the two middle values, rounded up, so an even sample is not reported
+    // on its faster half.
     let (a, b) = (v[n / 2 - 1], v[n / 2]);
     Some(a + (b - a + 1) / 2)
 }
@@ -629,6 +652,7 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
             mode: c.mode.clone(),
             selected: c.selected.as_ref().map(Vec::len),
             chg_ms: c.ms,
+            replay: runs.iter().all(|r| r.source.as_deref() == Some(REPLAY)),
             // Rows logged before CI rows dropped their `ms` still carry one: not a gate time.
             gate_ms: g
                 .iter()
@@ -676,18 +700,18 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
             got: misses.to_string(),
             met: misses == 0,
         },
-        Criterion {
-            name: "median chg check time".into(),
-            want: format!("<= {}", fmt_ms(MAX_MEDIAN_MS)),
-            got: median_chg_ms.map(fmt_ms).unwrap_or_else(|| "-".into()),
-            met: median_chg_ms.is_some_and(|m| m <= MAX_MEDIAN_MS),
-        },
     ];
     let ready = criteria.iter().all(|c| c.met);
 
     Report {
         repo: repo.into(),
         pushes: pairs.len(),
+        replayed: pairs.iter().filter(|p| p.replay).count(),
+        commits: pairs
+            .iter()
+            .map(|p| p.sha.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
         machines,
         agree: count(Class::Agree),
         misses,
@@ -739,8 +763,10 @@ impl Report {
         line(
             &mut o,
             format!(
-                "pushes {} on {} machine(s) [{}]: agree {}, chg green/gate red {}, chg red/gate green {}, gate flaky {}",
+                "pushes {} ({} replayed, {} distinct commits) on {} machine(s) [{}]: agree {}, chg green/gate red {}, chg red/gate green {}, gate flaky {}",
                 self.pushes,
+                self.replayed,
+                self.commits,
                 self.machines.len(),
                 self.machines.join(", "),
                 self.agree,
@@ -1205,18 +1231,53 @@ mod tests {
             .collect();
         assert!(!report("r", &two).ready);
 
-        // A slow median blocks it.
+        // A slow median is reported and blocks nothing.
         let slow: Vec<Row> = rows
             .iter()
             .cloned()
             .map(|mut r| {
                 if r.kind == "chg" {
-                    r.ms = MAX_MEDIAN_MS + 1;
+                    r.ms = 10 * 60 * 1000;
                 }
                 r
             })
             .collect();
-        assert!(!report("r", &slow).ready);
+        let s = report("r", &slow);
+        assert!(s.ready, "{}", s.render());
+        assert_eq!(s.median_chg_ms, Some(10 * 60 * 1000));
+        assert!(!s.render().contains("median chg check time"));
+    }
+
+    #[test]
+    fn replays_count_as_pushes_and_are_shown() {
+        let mut rows = Vec::new();
+        for i in 0..3 {
+            let sha = format!("{i:040}");
+            let mut c = chg(&sha, "m1", Outcome::Pass, 1, &[]);
+            if i > 0 {
+                c.source = Some(REPLAY.into());
+            }
+            rows.push(c);
+            rows.push(gate(&sha, Outcome::Pass, 2, &[]));
+        }
+        // The first commit replayed on a second machine too: another push, not another commit.
+        let mut again = chg(&format!("{:040}", 1), "m2", Outcome::Pass, 1, &[]);
+        again.source = Some(REPLAY.into());
+        rows.push(again);
+        let r = report("r", &rows);
+        assert_eq!((r.pushes, r.replayed, r.commits), (4, 3, 3));
+        assert!(
+            r.render()
+                .contains("pushes 4 (3 replayed, 3 distinct commits) on 2 machine(s)")
+        );
+        assert!(r.disagreements.is_empty());
+
+        // A commit a push also judged on that machine is not counted as replayed, whichever
+        // ran first.
+        let mut push = chg(&format!("{:040}", 2), "m1", Outcome::Pass, 1, &[]);
+        push.at_ms = 9;
+        rows.push(push);
+        assert_eq!(report("r", &rows).replayed, 2);
     }
 
     #[test]

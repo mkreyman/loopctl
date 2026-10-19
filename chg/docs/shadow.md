@@ -22,6 +22,8 @@ A repo moves its push gate to `chg check` in three modes, chosen by `chg gate`:
   The detached copy works through the repo's shared git dir, not the pushing worktree, which may be removed before the check is done.
 
   Its output goes to `~/.chg/shadow/logs/<repo>-<sha12>.log` (kept 14 days). `CHG_HOME` moves `~/.chg`.
+
+  `--foreground` runs the same check in this process instead and prints its verdict. `--replay` (with `--foreground`) marks the row `"source":"replay"`: a check of a past commit, not a push, which does not refresh `B`'s snapshot afterwards (see Replays).
 - `chg shadow record --verdict pass|fail [--sha S] [--ms N] [--gate NAME] [--failures-file F]`: appends the authoritative gate's verdict for `S` as a `gate` row. `F` lists failing test ids, one per line; the report uses them to tell a missed test from a flake.
 - `chg shadow report [--file F]... [--hosts a,b,c] [--ci-check NAME] [--json]`: pairs each push (one commit on one machine, however many `chg` runs judged it there; the extra runs are counted as reruns) with the gate's verdict for its commit, prints the disagreements and the cutover criteria, and exits 0 only when every criterion is met. `--hosts` reads each machine's log over ssh. `--ci-check NAME` fills in a commit no local gate judged from GitHub check runs named `NAME` on that commit: every completed run that passed or failed becomes a `gate` row, so a failed run and its passing rerun make the commit gate-flaky. A CI row has no gate time, since one check's duration is not the gate's: such a push shows `ci` in the gate-time column and stays out of the gate and saved figures, whose line says how many local gates they cover. A commit is asked about again until its newest CI verdict is 72 hours old.
 
@@ -39,10 +41,31 @@ A repo moves its push gate to `chg check` in three modes, chosen by `chg gate`:
 A `skipped` or `error` chg row, or one whose commit has no gate verdict yet, is counted but not paired.
 
 Cutover criteria (issue #18), all required:
-- at least 200 paired pushes;
+- at least 200 paired pushes, replays included;
 - on at least 3 machines;
-- zero MISS;
-- median `chg check` time at most 3 min. This is the check alone (`ms`), not the hydrate (`hydrate_ms`): after cutover the check runs in the agent's own worktree, which is already hydrated.
+- zero MISS.
+
+The report also prints the median `chg check` time (`ms`, the check without its hydrate) against the gate's. It is not a criterion: Mark dropped the 3-minute median on 2026-10-19. On HCB, about 40% of master commits change a path in `always_all` (migrations, config, `test/support`), so their checks run the whole suite and held the median near 4m45s, while the median gate took 10m41s.
+
+## Replays
+
+A replay judges a past commit the way a push would have been judged, and the report counts it like one: `pushes N (M replayed, K distinct commits)`. A push counts as replayed only when no push judged that commit on that machine. Mark allowed replays to count on 2026-10-19 so cutover need not wait for organic pushes. Master commits are nearly all green, so replays test agreement and chg-red more than they test MISS; live pushes keep testing both. One commit judged on three machines is three pushes and one commit, which is why the report prints both.
+
+Only commits that carry the repo's enrollment can be replayed: `.chg/adapter.toml`, and whatever the adapter needs (`elixirc_options: [check_cwd: false]` for Elixir). A replay judges the commit as committed, manifest included.
+
+A check starts from a snapshot that is an ancestor of the commit, and a replay does not refresh its base (history no push starts from; one build per replay would also push the live bases out of GC's keep set). So build one snapshot of the oldest commit's parent first, then walk forward; each check hydrates from it and compiles the difference.
+
+```bash
+# On each machine, in a clone whose origin is the repo, with its own slice of commits:
+first=$(head -1 slice); chg snapshot build . "$first^1"
+while read -r sha; do
+  chg check --shadow --foreground --replay --sha "$sha" --base "$sha^1"
+done < slice
+# Once, anywhere: record CI's verdict for every commit no local gate judged.
+chg shadow report --hosts <hosts> --ci-check Tests
+```
+
+A replay row's gate verdict is CI's check run on that commit, recorded by `--ci-check`.
 
 ## Wiring a pre-push hook
 

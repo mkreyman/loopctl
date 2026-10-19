@@ -76,6 +76,10 @@ enum Top {
         /// With --shadow: run in this process instead of detaching (tests, debugging).
         #[arg(long, requires = "shadow")]
         foreground: bool,
+        /// With --shadow --foreground: mark the row as a replay of a past commit, not a
+        /// push. The report counts it like a push and shows how many were replays.
+        #[arg(long, requires = "foreground")]
+        replay: bool,
     },
     /// Which gate judges a push: prints `on`, `shadow` or `off` and where that came from
     /// (`CHG_GATE` beats `.chg/policy.toml` `[gate] mode`; default `shadow`). Always exit 0;
@@ -376,10 +380,11 @@ fn main() -> ExitCode {
             shadow,
             sha,
             foreground,
+            replay,
         } => {
             let root = repo_root(repo);
             if shadow {
-                shadow_check(&root, base, sha, foreground)
+                shadow_check(&root, base, sha, foreground, replay)
             } else {
                 check_cmd(&root, base, sha, all)
             }
@@ -892,6 +897,7 @@ fn shadow_check(
     base: Option<String>,
     sha: Option<String>,
     foreground: bool,
+    replay: bool,
 ) -> ExitCode {
     let mode = gate::resolve(repo);
     if mode.mode == Mode::Off {
@@ -908,7 +914,7 @@ fn shadow_check(
         }
     };
     if foreground {
-        match shadow::run_foreground(repo, &sha, &base) {
+        match shadow::run_foreground(repo, &sha, &base, replay) {
             Ok(row) => eprintln!(
                 "chg: shadow {} {} in {}: {}",
                 &sha[..12.min(sha.len())],

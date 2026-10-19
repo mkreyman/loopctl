@@ -438,6 +438,41 @@ fn shadow_without_a_snapshot_is_skipped_not_cold_built() {
 }
 
 #[test]
+fn a_replay_is_marked_and_only_with_a_foreground_shadow() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let base = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&base)
+        .assert()
+        .success();
+    let sha = env.commit("lib/a.ex", "two\n");
+    env.chg()
+        .args([
+            "check",
+            "--shadow",
+            "--foreground",
+            "--replay",
+            "--sha",
+            &sha,
+        ])
+        .args(["--base", &base])
+        .assert()
+        .success();
+    let rows = env.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["source"], "replay");
+    assert_eq!(rows[0]["sha"], sha.as_str());
+    assert_eq!(rows[0]["verdict"], "pass");
+    env.chg()
+        .args(["check", "--shadow", "--replay"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn shadow_judges_the_commit_in_a_throwaway_worktree() {
     let Some(dir) = cow_tempdir() else { return };
     let env = Env::new(dir);
@@ -466,6 +501,10 @@ fn shadow_judges_the_commit_in_a_throwaway_worktree() {
     assert_eq!(r["selected"].as_array().unwrap().len(), 2);
     assert!(r["host"].as_str().is_some_and(|h| !h.is_empty()));
     assert!(r["hydrate_ms"].is_u64());
+    assert!(
+        r.get("source").is_none(),
+        "a push's row is not a replay: {r}"
+    );
 
     // Every adapter call ran outside the live tree.
     let calls = env.calls();
@@ -772,7 +811,9 @@ fn record_and_report_pair_verdicts_by_commit() {
         .args(["shadow", "report"])
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("pushes 1 on 1 machine(s) [m1]"))
+        .stdout(predicate::str::contains(
+            "pushes 1 (0 replayed, 1 distinct commits) on 1 machine(s) [m1]",
+        ))
         .stdout(predicate::str::contains("MISS"))
         .stdout(predicate::str::contains(
             "not selected, failed in the gate: test/z_test.exs:9",
@@ -789,7 +830,8 @@ fn record_and_report_pair_verdicts_by_commit() {
         .clone();
     let r: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(r["misses"], 1);
-    assert_eq!(r["criteria"].as_array().unwrap().len(), 4);
+    assert_eq!(r["criteria"].as_array().unwrap().len(), 3);
+    assert_eq!(r["replayed"], 0);
 
     env.chg()
         .args(["shadow", "record", "--verdict", "maybe"])
@@ -819,7 +861,9 @@ fn report_reads_extra_logs_and_dedups_them() {
         .arg(&other)
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("pushes 3 on 3 machine(s)"))
+        .stdout(predicate::str::contains(
+            "pushes 3 (0 replayed, 3 distinct commits) on 3 machine(s)",
+        ))
         .stdout(predicate::str::contains("[x] machines: 3"))
         .stdout(predicate::str::contains(
             "[ ] shadow pushes with both verdicts: 3",
