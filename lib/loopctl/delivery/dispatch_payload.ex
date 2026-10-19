@@ -183,10 +183,10 @@ defmodule Loopctl.Delivery.DispatchPayload do
   end
 
   @doc """
-  The ROUTE `story`'s current claim was dispatched on: the `base_branch` it was placed under and
-  the branch it named, read from the newest implement row of the story's CURRENT `claim_epoch`
-  that its runner ACCEPTED (`Loopctl.Runners.DispatchLedger.claim_route_query/2`, which owns
-  those rules).
+  The ROUTE the claim of `claim_epoch` was dispatched on: the `base_branch` it was placed under
+  and the branch it named, read from the newest implement row of that claim that its runner
+  ACCEPTED (`Loopctl.Runners.DispatchLedger.claim_route_query/3`, which owns those rules). A
+  caller reads the CURRENT claim by passing `story.claim_epoch`.
 
   Every field is a RECORDED fact, never a derivation; a caller that needs a fallback applies
   it, and one that does not need a field never pays for resolving it:
@@ -200,35 +200,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   `{:error, :busy}` for contention a caller retries out of
   (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
   `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that. Its wait is
-  `Capacity.lock_timeout_ms/0`; `dispatch_route/4` takes `opts` for another wait.
-  """
-  @spec dispatch_route(Ecto.UUID.t(), Story.t()) ::
-          {:ok,
-           %{
-             branch: String.t() | nil,
-             base_branch: String.t() | nil
-           }}
-          | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story),
-    do: dispatch_route(tenant_id, story, story.claim_epoch, [])
-
-  @doc """
-  `dispatch_route/2` for the claim of `claim_epoch` rather than the current one. Same lock
-  bound, same `:busy`.
-  """
-  @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer()) ::
-          {:ok,
-           %{
-             branch: String.t() | nil,
-             base_branch: String.t() | nil
-           }}
-          | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story, claim_epoch),
-    do: dispatch_route(tenant_id, story, claim_epoch, [])
-
-  @doc """
-  `dispatch_route/3` with `opts`: its wait is `Capacity.lock_timeout_ms(opts)`. A caller
-  holding `opts` reads the CURRENT claim by passing `story.claim_epoch`.
+  `Capacity.lock_timeout_ms(opts)`.
   """
   @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer(), keyword()) ::
           {:ok,

@@ -1,0 +1,58 @@
+{
+  "id": "US-47.9",
+  "title": "Contract #984: drop the change-thread tables and runner_dispatches.mode once no release reads them",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "operator",
+    "i_want_to": "have the tables and column Epic 45 left behind dropped in a release after #984's is live on every machine",
+    "so_that": "the rolling deploy that removed the code never ran against a schema its predecessor could not read"
+  },
+  "rationale": "#984 shipped as the EXPAND half: its migration (20261018120000_retire_change_thread_modes) only narrows CHECKs, because Fly's release_command runs before a rolling deploy and the previous release's DispatchRecord still selects and inserts runner_dispatches.mode and its thread crons still read the thread tables. Once that release is gone, nothing reads them.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.9.1",
+      "description": "A migration drops thread_entries, thread_reviews, thread_issue_links, thread_checkpoints, claim_routes, browser_sessions and webauthn_login_challenges, in FK order, IF EXISTS."
+    },
+    {
+      "id": "AC-47.9.2",
+      "description": "The same migration drops the runner_dispatches_mode CHECK and the runner_dispatches.mode column."
+    },
+    {
+      "id": "AC-47.9.3",
+      "description": "It deletes oban_jobs of ThreadMergeWorker, ThreadMergeSweepWorker, ThreadIssueLinkWorker and ReviewCeilingWorker again, catching any the previous release's crons enqueued during the #984 rollout."
+    },
+    {
+      "id": "AC-47.9.4",
+      "description": "It merges only after the #984 release is the only one running in production (fly status shows every machine on that image or later)."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.9.1",
+      "verifies": [
+        "AC-47.9.1",
+        "AC-47.9.2",
+        "AC-47.9.3"
+      ],
+      "name": "contract migration",
+      "type": "integration",
+      "preconditions": [
+        "a database migrated to 20261018120000"
+      ],
+      "steps": [
+        "run the migration"
+      ],
+      "expected_results": [
+        "the seven tables and runner_dispatches.mode no longer exist",
+        "no oban_jobs row names a retired worker"
+      ]
+    }
+  ],
+  "technical_notes": "down raises: nothing reads the dropped tables. CHANGELOG entry lists the dropped tables (operator-facing migration).",
+  "dependencies": []
+}

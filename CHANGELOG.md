@@ -13,16 +13,19 @@ All notable changes to loopctl are documented here.
   and `/threads/:story_id` are gone (404). The claim response carries no `route`. The merge
   gate is pull-request only, and its answer no longer carries `mode`, `checkpoint_id`,
   `checkpoint_sha`, `base_sha` or `ci_evidence`. `thread` is no longer an intake-source
-  `mode` (422): **the migration moves any source still on `thread` to `pr`.** Runner contract
+  `mode` (422). Runner contract
   **1.23.0** (minor: the server answers the retired `checkpoint`, `thread_entry`,
   `review_finding` and `review_verdict` events `unknown_event`, and `review` is no longer a
   dispatchable kind, which a joining runner may still declare). MCP: loopctl-mcp-server
   3.0.0 drops the `thread_*` tools.
-- **Migration `20261018120000_drop_change_threads`** drops `thread_entries`,
-  `thread_reviews`, `thread_issue_links`, `thread_checkpoints`, `claim_routes`,
-  `browser_sessions` and `webauthn_login_challenges`, drops `runner_dispatches.mode`,
-  removes `review` from the dispatch `kind` CHECK, and deletes queued jobs of the four
-  retired workers. Irreversible; no manual step.
+- **Migration `20261018120000_retire_change_thread_modes`** (expand half) removes `thread`
+  from the intake-source `mode` CHECK and `review` from the dispatch `kind` CHECK, and deletes
+  queued jobs of the four retired workers. **Deploy ordering, operator action:** move every
+  `thread` intake source to `pr` with `intake_source_update` BEFORE deploying, so the change
+  is on the audit chain; the migration moves any it finds, but writes no audit entry. The
+  thread tables and `runner_dispatches.mode` are left in place because the previous release
+  still reads them during the rolling deploy; a later release drops them (US-47.9).
+  Irreversible.
 - **Env vars no longer read:** `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
   `REVIEW_WALL_CLOCK_SECONDS`, `REVIEW_MAX_TURNS`. They can be unset (`fly secrets unset`);
   leaving them set is harmless. loopctl no longer uses GitHub App 5101362 (its fate is

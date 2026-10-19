@@ -1,6 +1,6 @@
 defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
   @moduledoc """
-  `Loopctl.Delivery.DispatchPayload.dispatch_route/2`: the base branch and branch a story's
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/4`: the base branch and branch a story's
   CURRENT claim was placed under, read from the implement ledger row of that claim its runner
   accepted. Story verification judges a story on this route, so a later source change, a
   triage row, or a dispatch that never ran must not change it.
@@ -45,7 +45,10 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     row
   end
 
-  defp route(ctx), do: DispatchPayload.dispatch_route(ctx.story.tenant_id, ctx.story)
+  defp route(ctx), do: route(ctx.story.tenant_id, ctx.story, ctx.story.claim_epoch)
+
+  defp route(tenant_id, story, epoch),
+    do: DispatchPayload.dispatch_route(tenant_id, story, epoch, [])
 
   @t1 ~U[2026-09-26 10:00:00.000000Z]
   @t2 ~U[2026-09-26 11:00:00.000000Z]
@@ -58,7 +61,7 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{base_branch: "trunk"}} = route(ctx)
   end
 
-  test "dispatch_route/4 reads the claim of the epoch it is given, not the current one ",
+  test "dispatch_route/4 reads the claim of the epoch it is given, not the current one",
        ctx do
     earlier = ctx.story.claim_epoch
     record(ctx, @t1, base_branch: "release-1", claim_epoch: earlier)
@@ -66,13 +69,13 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
 
     story = %{ctx.story | claim_epoch: earlier + 1}
 
-    assert {:ok, %{base_branch: "main"}} = DispatchPayload.dispatch_route(story.tenant_id, story)
+    assert {:ok, %{base_branch: "main"}} = route(story.tenant_id, story, story.claim_epoch)
 
     assert {:ok, %{base_branch: "release-1"}} =
-             DispatchPayload.dispatch_route(story.tenant_id, story, earlier)
+             route(story.tenant_id, story, earlier)
 
     assert {:ok, %{base_branch: nil}} =
-             DispatchPayload.dispatch_route(story.tenant_id, story, earlier + 7)
+             route(story.tenant_id, story, earlier + 7)
   end
 
   test "NO row is all nil, for the caller's source fallback", ctx do
@@ -105,6 +108,6 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     other = fixture(:stage_story, %{})
 
     assert {:ok, %{branch: nil}} =
-             DispatchPayload.dispatch_route(other.tenant_id, ctx.story)
+             route(other.tenant_id, ctx.story, ctx.story.claim_epoch)
   end
 end

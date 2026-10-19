@@ -251,14 +251,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `unknown_dispatch`. It is optional: a runner that never sends it gets exactly the behaviour
   before 1.16.0.
 
-  **A REVIEW SESSION (since 1.21.0)** ends the same way, whatever `reason`: send it when the
-  session stops without a verdict (superseded, closed, crashed, out of budget) or after one. A
-  review holds no claim, so the report does ONE thing — it frees the runner's slot for the
-  dispatch. No stage moves and nothing is counted against the retry ceiling. It is fenced on
-  the dispatch alone: its `claim_epoch` is the one the dispatch was sent under, and it was
-  accepted, however the implementer's claim has moved since. The ack is `kind: "review"` and
-  `replayed`, with no stage row; recorded once, as for an implement session.
-
   **RECORDED ONCE PER DISPATCH, AND RESENDING IS SAFE.** A byte-identical resend is answered
   `ok` with `replayed: true` and the row as it now stands — EVEN AFTER the release its first
   copy caused has moved the story's `claim_epoch` on, because the resend is matched on its
@@ -3084,8 +3076,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   defp story_errors(%{story: story, kind: kind, story_id: story_id}) do
     cond do
-      kind not in ["implement", "review"] ->
-        ["story is only allowed when kind is implement or review"]
+      kind != "implement" ->
+        ["story is only allowed when kind is implement"]
 
       Map.get(story, :id) != story_id ->
         ["story.id must be the dispatch's story_id"]

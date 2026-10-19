@@ -927,17 +927,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   @route_statuses ["accepted"]
 
   @doc """
-  The query for the ROUTE `story`'s current claim was dispatched on: the newest implement row
-  of the story's CURRENT `claim_epoch` that its runner ACCEPTED, selecting the `branch` and
-  `base_branch` recorded at the first push. The ledger's rules for "the current claim's
-  accepted implement row" live here, with the other readers of this table;
-  `Loopctl.Delivery.DispatchPayload.dispatch_route/2` runs it under a bounded lock wait.
+  The query for the ROUTE the claim of `claim_epoch` was dispatched on: the newest implement
+  row of that claim that its runner ACCEPTED, selecting the `branch` and `base_branch` recorded
+  at the first push. The ledger's rules for "a claim's accepted implement row" live here, with
+  the other readers of this table; `Loopctl.Delivery.DispatchPayload.dispatch_route/4` runs it
+  under a bounded lock wait.
   """
-  @spec claim_route_query(Ecto.UUID.t(), Story.t()) :: Ecto.Query.t()
-  def claim_route_query(tenant_id, %Story{} = story),
-    do: claim_route_query(tenant_id, story.id, story.claim_epoch)
-
-  @doc "`claim_route_query/2` for the claim of `claim_epoch`, current or ended. One copy of the rule."
   @spec claim_route_query(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) :: Ecto.Query.t()
   def claim_route_query(tenant_id, story_id, claim_epoch) do
     from(r in DispatchRecord,

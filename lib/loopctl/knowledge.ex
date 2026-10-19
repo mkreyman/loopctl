@@ -8903,34 +8903,6 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  The title, category and status of each of `article_ids` the caller can read, keyed by id:
-  one of `tenant_id`'s articles visible to the caller (#163), or a published system canonical,
-  the set `get_article/3` resolves. An id that is neither is absent from the map.
-
-  For a surface that shows WHICH article an id names without serving the article: a change
-  thread decides which articles an entry may cite with it, and its review titles them, so the
-  two cannot disagree (#978). The title is agent-written text and is as untrusted as an entry
-  body.
-  """
-  @spec article_refs(Ecto.UUID.t(), [Ecto.UUID.t()], String.t() | nil) :: %{
-          optional(Ecto.UUID.t()) => %{title: String.t(), category: atom(), status: atom()}
-        }
-  def article_refs(_tenant_id, [], _vis), do: %{}
-
-  def article_refs(tenant_id, article_ids, vis) do
-    ids = Enum.filter(article_ids, &valid_uuid?/1)
-
-    from(a in Article,
-      where: a.id in ^ids,
-      select: {a.id, %{title: a.title, category: a.category, status: a.status}}
-    )
-    |> visible_article_scope(tenant_id)
-    |> maybe_filter_by_visibility(vis)
-    |> AdminRepo.all()
-    |> Map.new()
-  end
-
-  @doc """
   Whether `article_id` exists in `tenant_id` AND is visible to the caller (#163).
 
   Fails CLOSED: an article that does not exist (or is not visible to `vis`)
