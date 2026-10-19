@@ -233,7 +233,7 @@ defmodule Loopctl.Delivery.CompletionTest do
       assert to == :done
     end
 
-    test "this is the only edge out of verified that anything WRITES" do
+    test "this is the only edge out of verified that anything WRITES but an escalation" do
       # The assertion that would have caught the original defect, and it has to say "writes"
       # rather than "declares" because `verified` declares two.
       #
@@ -248,13 +248,26 @@ defmodule Loopctl.Delivery.CompletionTest do
       # So a reader counting declared edges out of `verified` finds two and concludes it was
       # never absorbing. It was: one of the two has no writer, and this test is where that is
       # written down.
+      #
+      # US-47.4 added the two CONTROL escalations a chg change event decides: a revert of a
+      # verified story (`:reverted_after_verify`) and an event the stage cannot take
+      # (`:change_outside_lifecycle`). Both are written, by
+      # `Loopctl.Delivery.Escalations.escalate_as_control/3`, and both hand the story to a
+      # human rather than finishing it — so this module's edge is still the only way FORWARD.
       out = Enum.filter(StageMachine.transitions(), fn {from, _, _} -> from == :verified end)
+      escalations = StageMachine.control_escalation_edges()
 
       assert Enum.sort(out) ==
-               Enum.sort([{:verified, :done, :forward}, {:verified, :failed, :budget_exceeded}]),
+               Enum.sort([
+                 {:verified, :done, :forward},
+                 {:verified, :failed, :budget_exceeded},
+                 {:verified, :escalated, :reverted_after_verify},
+                 {:verified, :escalated, :change_outside_lifecycle}
+               ]),
              "verified's declared edges changed; found #{inspect(out)}"
 
-      writable = Enum.reject(out, fn {_, _, edge} -> edge == :budget_exceeded end)
+      writable =
+        Enum.reject(out, fn {_, _, edge} -> edge == :budget_exceeded or edge in escalations end)
 
       assert [Completion.transition()] == writable,
              "the only WRITABLE edge out of verified must be the one this module writes"

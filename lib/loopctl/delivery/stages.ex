@@ -113,8 +113,8 @@ defmodule Loopctl.Delivery.Stages do
   ## The audit chain
 
   Only the custody-critical transitions (`StageMachine.chained?/3`: into `claimed`,
-  `merged` or `escalated`, out of `escalated`, and the `:merge_refused` retraction of a
-  merge) are appended to the hash chain, inside the transition's own transaction via
+  `merged` or `escalated`, out of `escalated`, and the `:merge_refused` and `:reverted`
+  retractions of a merge) are appended to the hash chain, inside the transition's own transaction via
   `AuditChain.append_in_tenant_transaction/2` — or, for the escalation a claim release decides,
   inside the release's `AdminRepo` transaction via `AuditChain.append_in_admin_transaction/2`.
   Either way the entry is announced only after that transaction commits. Every transition and
@@ -137,6 +137,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth.Role
+  alias Loopctl.Changes.Binding
   alias Loopctl.Delivery.RetryCeiling
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
@@ -436,6 +437,165 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  `advance/4` INSIDE the caller's `Loopctl.Repo.with_tenant/2` transaction for `tenant_id`,
+  for a control writer whose transition must commit or roll back with the rest of its own
+  transaction — the chg change-events seam (US-47.4, `Loopctl.Changes.EventEffects`), where an
+  event applies with its stage effect and its audit entry or not at all.
+
+  The same refusals as `advance/4`, from the same code, with two differences a caller has to
+  design for:
+
+  - **A refusal decided BEFORE the database** (`precheck/2`'s) is returned as
+    `{:error, reason}` and writes nothing. **One decided IN the transaction** —
+    `:stale_stage`, `:stale_claim_epoch`, `:wrong_stage`, `:effect_conflict`,
+    `:audit_chain_append_failed` — ROLLS BACK THE CALLER'S TRANSACTION, because Ecto has no
+    savepoint to unwind to. So a caller reads the row under its locks first
+    (`lock_for_control_in_tenant_transaction/2`) and asks only for a transition that row allows;
+    then the in-transaction refusals are unreachable except as faults.
+  - **The lock and statement bounds are the CALLER'S** (it set them when it opened the
+    transaction); this sets none of its own.
+
+  Returns `{:ok, row, chain_entry}` — `chain_entry` is `nil` for an unchained transition — and
+  the caller announces the entry (`Loopctl.AuditChain.announce_entry/1`) once it has COMMITTED,
+  never before. Raises outside a `Loopctl.Repo` transaction.
+
+  It never takes `:session_dispatch`: no runner slot is a control writer's to release.
+  """
+  @spec advance_in_tenant_transaction(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          {StageMachine.stage(), StageMachine.stage()} | StageMachine.transition(),
+          keyword()
+        ) :: {:ok, StoryStage.t(), Entry.t() | nil} | {:error, advance_error()}
+  def advance_in_tenant_transaction(tenant_id, story_id, {from, to}, opts),
+    do: advance_in_tenant_transaction(tenant_id, story_id, {from, to, :forward}, opts)
+
+  def advance_in_tenant_transaction(tenant_id, story_id, {from, to, edge}, opts) do
+    unless Repo.in_transaction?(),
+      do: raise(ArgumentError, "advance_in_tenant_transaction/4 needs a Loopctl.Repo transaction")
+
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+    opts = Keyword.delete(opts, :session_dispatch)
+
+    with {:ok, effects} <- precheck_effects({from, to, edge}, opts) do
+      {row, entry} =
+        transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
+
+      {:ok, row, entry}
+    end
+  end
+
+  @doc """
+  Locks a story and its stage row for a CONTROL writer inside the caller's
+  `Loopctl.Repo.with_tenant/2` transaction, and returns what a transition out of that row would
+  be fenced on: `{:ok, %{claim_epoch: story_epoch, row: row}}`, where `row` is `nil` for a story
+  with no stage row, or `{:error, :not_found}` for a story not in the tenant.
+
+  The story is taken `FOR NO KEY UPDATE` and the row `FOR UPDATE`, in the moduledoc's order,
+  BEFORE anything the caller appends to the audit chain — so a later `advance_in_tenant_transaction/4`
+  on the same story re-takes locks this transaction already holds and decides on a row nothing
+  else can move. `NO KEY UPDATE` rather than `advance/4`'s `FOR SHARE` because the change-events
+  seam may go on to BIND a change to this story (`Loopctl.Changes.bind_in_tenant_transaction/3`
+  takes the story `FOR NO KEY UPDATE`), and upgrading a share lock another transaction also
+  holds is a deadlock; taking the stronger lock first is not.
+  """
+  @spec lock_for_control_in_tenant_transaction(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, %{claim_epoch: non_neg_integer(), row: StoryStage.t() | nil}}
+          | {:error, :not_found}
+  def lock_for_control_in_tenant_transaction(tenant_id, story_id) do
+    unless Repo.in_transaction?(),
+      do:
+        raise(
+          ArgumentError,
+          "lock_for_control_in_tenant_transaction/2 needs a Loopctl.Repo transaction"
+        )
+
+    from(s in Story,
+      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+      lock: "FOR NO KEY UPDATE",
+      select: s.claim_epoch
+    )
+    |> Repo.one()
+    |> case do
+      nil -> {:error, :not_found}
+      epoch -> {:ok, %{claim_epoch: epoch, row: lock_row(tenant_id, story_id)}}
+    end
+  end
+
+  @doc """
+  Records chg's trunk verification of a story's merge (US-47.4, PRD §5: a `verified` event) on
+  its stage row as `trunk_verified_sha`, inside the caller's `Loopctl.Repo.with_tenant/2`
+  transaction. Writes NO edge: the verification is chg's verdict on trunk, not a stage of the
+  story, and `verified` the STAGE stays post-deploy verification's to reach.
+
+  Only on a row that holds a merge (`merge_sha` set): a verification with no merge on the row
+  verifies nothing this story recorded. Merge-keyed (`StageMachine.merge_keyed/0`), so a revert
+  or a human re-queue clears it with the merge.
+
+  - `{:ok, :recorded, row}` — written, with an `effect_recorded` stage event
+  - `{:ok, :unchanged, row}` — already recorded with this sha (a replay)
+  - `{:ok, :kept, row}` — already recorded with a DIFFERENT sha, which is kept: the first
+    verification of a merge is the one that verified it
+  - `{:ok, :no_merge, row}` — the row holds no merge, so nothing is written
+  - `{:error, :invalid_effect}` — not a git sha
+  - `{:error, :not_found}` — no stage row
+
+  The row must already be locked by `lock_for_control_in_tenant_transaction/2`.
+  """
+  @spec record_trunk_verified_in_tenant_transaction(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t(),
+          keyword()
+        ) ::
+          {:ok, :recorded | :unchanged | :kept | :no_merge, StoryStage.t()}
+          | {:error, :invalid_effect | :not_found}
+  def record_trunk_verified_in_tenant_transaction(tenant_id, story_id, sha, opts) do
+    unless Repo.in_transaction?(),
+      do:
+        raise(
+          ArgumentError,
+          "record_trunk_verified_in_tenant_transaction/4 needs a Loopctl.Repo transaction"
+        )
+
+    if is_binary(sha) and GitSha.valid?(sha) do
+      case lock_row(tenant_id, story_id) do
+        nil -> {:error, :not_found}
+        row -> put_trunk_verified(row, sha, opts)
+      end
+    else
+      {:error, :invalid_effect}
+    end
+  end
+
+  defp put_trunk_verified(%StoryStage{merge_sha: nil} = row, _sha, _opts),
+    do: {:ok, :no_merge, row}
+
+  defp put_trunk_verified(%StoryStage{trunk_verified_sha: sha} = row, sha, _opts),
+    do: {:ok, :unchanged, row}
+
+  defp put_trunk_verified(%StoryStage{trunk_verified_sha: nil} = row, sha, opts) do
+    {1, [row]} =
+      from(s in StoryStage,
+        where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+        select: s,
+        update: [
+          set: [trunk_verified_sha: ^sha, updated_at: ^DateTime.utc_now()],
+          inc: [lock_version: 1]
+        ]
+      )
+      |> Repo.update_all([])
+
+    data =
+      note(nil, opts) |> Map.merge(%{"effect" => "trunk_verified_sha", "value" => sha})
+
+    insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
+    {:ok, :recorded, row}
+  end
+
+  defp put_trunk_verified(%StoryStage{} = row, _sha, _opts), do: {:ok, :kept, row}
+
+  @doc """
   Every refusal `advance/4` decides BEFORE it opens a transaction, asked WITHOUT advancing
   anything — the authorization half of a transition, available to a caller that has
   irreversible work to do first.
@@ -506,6 +666,14 @@ defmodule Loopctl.Delivery.Stages do
 
     if to == :claimed and story.agent_status not in @claimed_statuses,
       do: Repo.rollback(:not_claimed)
+
+    # A STORY ON THE CHANGE PROTOCOL NEVER ENTERS `pr_open` (US-47.4, AC-47.4.2): a chg change
+    # has no pull request, and its stage moves `reviewing -> ci` over `:change_ready` instead.
+    # A story is on the protocol once a change is bound to it, which happens when chg reports
+    # it `submitted` — before review, so before anything could ask for `pr_open`. Read only on
+    # this one transition, so no other pays for it.
+    if to == :pr_open and change_bound?(tenant_id, story_id),
+      do: Repo.rollback(:invalid_transition)
 
     # The PRE-IMAGE, under the stage row's own lock, so a chained retraction can record the
     # identity it retracts: the compare-and-set below returns the row AFTER the edge cleared
@@ -589,6 +757,10 @@ defmodule Loopctl.Delivery.Stages do
     else
       _not_a_session_end -> :ok
     end
+  end
+
+  defp change_bound?(tenant_id, story_id) do
+    Repo.exists?(from b in Binding, where: b.tenant_id == ^tenant_id and b.story_id == ^story_id)
   end
 
   defp lock_row(tenant_id, story_id) do
@@ -1719,6 +1891,7 @@ defmodule Loopctl.Delivery.Stages do
 
   # A retraction is named for what it retracts, not for where the story went next.
   defp chain_action(:merged, :implementing, :merge_refused), do: "story_stage_merge_retracted"
+  defp chain_action(_from, :implementing, :reverted), do: "story_stage_merge_reverted"
   defp chain_action(:escalated, _to, _edge), do: "story_stage_escalation_resolved"
   defp chain_action(_from, to, _edge), do: "story_stage_" <> Atom.to_string(to)
 

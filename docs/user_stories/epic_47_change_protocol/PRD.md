@@ -206,7 +206,7 @@ example is a second `submitted` while review is still running on the first.
 
 **`:reverted` is a retraction of a merge, and it is chained like `:merge_refused`.** It goes in
 `@chained_edges`, and its `clears/3` clause clears `merge_sha` and the head- and release-keyed
-fields exactly as `merge_refused` does (`stage_machine.ex:810`). Otherwise the chain keeps saying
+fields exactly as `merge_refused` does (`stage_machine.ex:821`). Otherwise the chain keeps saying
 the story merged, and a re-land records a second merge over a stale `merge_sha`. The edge is new
 rather than a reuse of `:merge_refused` because the two claims differ: `merge_refused` says the
 merge never held, and a revert says it held and was undone.

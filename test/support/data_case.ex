@@ -408,6 +408,16 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-47.4: a revert after `done` opens an issue. Fail-closed for the same reason as the
+    # three writes above — an unstubbed test must never open a real issue.
+    Mox.stub(Loopctl.MockPullRequestSource, :create_issue, fn _repo, _title, _body ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :find_issue, fn _repo, _marker ->
+      {:error, :not_stubbed}
+    end)
+
     # Shape MUST match `Loopctl.HealthCheck.Default.check/0`. It notably carries NO
     # `version` key: #461 item 5 removed the app version from this response on purpose,
     # because /health is the highest-frequency unauthenticated probe and there is no

@@ -1977,7 +1977,10 @@ defmodule Loopctl.Delivery.StagesTest do
                "merge_gate_unevaluated" => nil,
                # Merge-keyed alongside `merge_sha` (#803 §9): post-deploy verification's
                # unresolved count is kept per MERGE, so a retracted merge takes it too.
-               "post_deploy_unresolved" => nil
+               "post_deploy_unresolved" => nil,
+               # The release and chg's trunk verification are merge-keyed too (US-47.4).
+               "release_id" => nil,
+               "trunk_verified_sha" => nil
              }
 
       # And the next attempt can record its own head again.

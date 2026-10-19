@@ -96,6 +96,16 @@ defmodule Loopctl.Delivery.PullRequestSource do
   They are the only WRITE callbacks here. Everything above reads. That asymmetry is why the
   closer, and not this behaviour, carries the at-most-once machinery: a read may be repeated
   freely and a close may not.
+
+  ## `create_issue/3` and `find_issue/2` — a revert after `done` (US-47.4)
+
+  A chg revert that reaches a story loopctl already closed opens a NEW issue on the repository,
+  which intake then triages like any other report (Epic 47 PRD §5).
+  `Loopctl.Changes.RevertIssueOpener` is the caller. Creating is not idempotent at the forge —
+  a second call is a second issue — so the caller writes a MARKER into the body and, on any
+  attempt after its first, asks `find_issue/2` whether an earlier attempt already opened it
+  before creating again: a crash between the create and the record of it costs a read, never a
+  duplicate issue.
   """
 
   alias Loopctl.Delivery.ForgeRepo
@@ -291,6 +301,20 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback close_issue(repo(), pos_integer(), :completed | :not_planned) ::
               :ok | {:error, term()}
 
+  @doc """
+  OPENS an issue with `title` and `body`, returning its number. Not idempotent: see the
+  moduledoc for how the caller makes it so.
+  """
+  @callback create_issue(repo(), String.t(), String.t()) ::
+              {:ok, pos_integer()} | {:error, term()}
+
+  @doc """
+  The number of the NEWEST issue among the repository's most recent ones whose body contains
+  `marker`, or `nil` when none does. `{:error, reason}` when the forge could not say — never
+  read as "none", because the caller would then create a duplicate.
+  """
+  @callback find_issue(repo(), String.t()) :: {:ok, pos_integer() | nil} | {:error, term()}
+
   # -- the checked entry points (#936) -------------------------------------------------------
   #
   # Every caller goes through THESE, never `impl/0` directly: each one takes only a
@@ -333,4 +357,10 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @doc false
   def close_issue(%ForgeRepo{} = repo, a, b), do: impl().close_issue(repo, a, b)
+
+  @doc false
+  def create_issue(%ForgeRepo{} = repo, a, b), do: impl().create_issue(repo, a, b)
+
+  @doc false
+  def find_issue(%ForgeRepo{} = repo, a), do: impl().find_issue(repo, a)
 end

@@ -705,6 +705,12 @@ defmodule Loopctl.ObanConfig do
            # ten, so a gap is pulled at 10-15 minutes. Local reads only; the pull is the job's.
            # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
            {"*/5 * * * *", Loopctl.Workers.ChangeReconcileSweepWorker},
+           # US-47.4: drains the revert-issue outbox — opens the GitHub issue a chg revert of
+           # a `done` story owes, so the revert is triaged as a new report. Every two minutes,
+           # like the issue-closure drainer, and for its reason: up to two bounded GitHub calls
+           # a candidate (a marker read and a create), bounded per run. Keep in sync with the
+           # crontab assertion in oban_plugins_config_test.exs.
+           {"*/2 * * * *", Loopctl.Workers.ChangeRevertIssueWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.

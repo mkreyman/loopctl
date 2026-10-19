@@ -4,6 +4,22 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **chg change events move the story's stage (US-47.4).** A story bound to a chg change now
+  moves on that change's events: `submitted` to `reviewing`, `review_findings` back to
+  `implementing`, `review_approved` plus `check_passed` on one revision to `ci` (new edge
+  `change_ready`; `pr_open` is never entered for a bound story, by any writer), `landed` to
+  `merged`, and `reverted` back to `implementing` (new chained edge `reverted`). A revert of a
+  `verified` story escalates (`reverted_after_verify`); an event the stage cannot take
+  escalates (`change_outside_lifecycle`). A revert of a `done` story OPENS A GITHUB ISSUE on
+  the repository for triage, so the tenant's forge credential for a chg repository needs
+  `issues: write` — the same scope issue closing already needs. New cron worker
+  `ChangeRevertIssueWorker` (every two minutes). Migration
+  `20261019160000_add_change_stage_mapping` adds `story_stages.trunk_verified_sha` and the
+  `change_revert_issues` table; additive, no deploy ordering. Each chained stage retraction now
+  also names `release_id` and `trunk_verified_sha` under `retracted`.
+
 ### Removed
 
 - **Epic 45's change threads are deleted (#984).** BREAKING for anything still calling them:

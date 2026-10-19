@@ -165,6 +165,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # would fail a close that has no other reason to fail.
   @max_comment_bytes 8_192
 
+  # The largest issue this will OPEN (US-47.4). GitHub's own body limit is 65,536 characters;
+  # bounded in BYTES here, which is never more characters than that, so a body GitHub would
+  # refuse for size is refused before the network instead of failing an attempt there.
+  @max_issue_body_bytes 65_536
+  @max_issue_title_chars 256
+
+  # How many of the repository's newest issues `find_issue/2` reads for its marker. The issue
+  # it looks for was opened by an earlier attempt of the same outbox row, at most a few backoff
+  # windows ago, so it is among the newest; a page is one request.
+  @find_issue_page 50
+
   # Statuses read per deployment. More than one because `state` (the latest) and
   # `succeeded?` (did `success` EVER appear) are different questions, and it is the second
   # that says whether the commit shipped — GitHub writes `inactive` over a perfectly good
@@ -536,6 +547,70 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     do: {:error, {:invalid_state_reason, state_reason}}
 
   def close_issue(_repo, number, _state_reason), do: {:error, {:invalid_issue_number, number}}
+
+  @impl true
+  def create_issue(repo, title, body) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, title} <- issue_title(title),
+         {:ok, body} <- issue_body(body),
+         {:ok, response} <- post(repo, "/issues", %{title: title, body: body}) do
+      created_number(response)
+    end
+  end
+
+  @impl true
+  def find_issue(repo, marker) when is_binary(marker) and marker != "" do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, issues} <-
+           get(repo, "/issues?state=all&sort=created&direction=desc&per_page=#{@find_issue_page}") do
+      marked_issue(issues, marker)
+    end
+  end
+
+  def find_issue(_repo, marker), do: {:error, {:invalid_marker, shape(marker)}}
+
+  # The NUMBER of what GitHub created, and nothing else of the payload.
+  defp created_number(%{"number" => number}) when is_integer(number) and number > 0,
+    do: {:ok, number}
+
+  defp created_number(body), do: {:error, {:unreadable_issue, shape(body)}}
+
+  # The newest issue whose body carries the marker. Pull requests share the endpoint and are
+  # skipped: a marker the outbox wrote is only ever in an issue it opened. A list this module
+  # cannot read is an error, never "none", because "none" is what makes the caller create.
+  defp marked_issue(issues, marker) when is_list(issues) do
+    found =
+      Enum.find_value(issues, fn
+        %{"number" => number, "body" => body} = issue
+        when is_integer(number) and is_binary(body) ->
+          if not Map.has_key?(issue, "pull_request") and String.contains?(body, marker),
+            do: number
+
+        _other ->
+          nil
+      end)
+
+    {:ok, found}
+  end
+
+  defp marked_issue(body, _marker), do: {:error, {:unreadable_issues, shape(body)}}
+
+  defp issue_title(title) when is_binary(title) do
+    if String.valid?(title) and String.trim(title) != "" and not Regex.match?(@control, title) and
+         title |> String.to_charlist() |> length() <= @max_issue_title_chars,
+       do: {:ok, title},
+       else: {:error, {:invalid_issue_title, printable(title)}}
+  end
+
+  defp issue_title(title), do: {:error, {:invalid_issue_title, shape(title)}}
+
+  defp issue_body(body) when is_binary(body) do
+    if String.valid?(body) and body != "" and byte_size(body) <= @max_issue_body_bytes,
+      do: {:ok, body},
+      else: {:error, {:invalid_issue_body, byte_size(body)}}
+  end
+
+  defp issue_body(body), do: {:error, {:invalid_issue_body, shape(body)}}
 
   # ONLY the two fields the closer judges on. The rest of an issue payload is reporter-
   # controlled text (`Loopctl.Intake.Record`'s untrusted boundary) and nothing here needs it,
