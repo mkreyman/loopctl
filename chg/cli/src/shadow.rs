@@ -241,11 +241,10 @@ pub fn spawn(repo: &Path, key: &str, sha: &str, base: &str) -> Result<PathBuf, S
     let err = out
         .try_clone()
         .map_err(|e| format!("{}: {e}", log.display()))?;
-    let exe = std::env::current_exe().map_err(|e| format!("locating chg: {e}"))?;
     // The shared git dir, not this worktree: the pushing worktree may be removed before
     // the detached check is done with it.
     let git_dir = git::common_dir(repo)?;
-    let mut c = Command::new(exe);
+    let mut c = chg_command()?;
     c.arg("check")
         .arg("--shadow")
         .arg("--foreground")
@@ -268,9 +267,35 @@ pub fn spawn(repo: &Path, key: &str, sha: &str, base: &str) -> Result<PathBuf, S
             Ok(())
         });
     }
-    c.spawn()
-        .map_err(|e| format!("starting the shadow check: {e}"))?;
+    c.spawn().map_err(|e| {
+        format!(
+            "starting the shadow check ({}): {e}",
+            Path::new(c.get_program()).display()
+        )
+    })?;
     Ok(log)
+}
+
+/// This binary's path, for the detached copies it starts. A reinstall while a check runs
+/// renames a new binary over the old one, and Linux then names this process's executable
+/// `<path> (deleted)`: start the binary that now lives at `<path>` instead. Every
+/// detached copy starts from this command.
+fn chg_command() -> Result<Command, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating chg: {e}"))?;
+    Ok(Command::new(live_path(exe)))
+}
+
+fn live_path(exe: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    if exe.is_file() {
+        return exe;
+    }
+    match exe.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        Some(p) if Path::new(std::ffi::OsStr::from_bytes(p)).is_file() => {
+            PathBuf::from(std::ffi::OsStr::from_bytes(p))
+        }
+        _ => exe,
+    }
 }
 
 fn prune_logs(dir: &Path) {
@@ -309,8 +334,7 @@ pub fn run_foreground(repo: &Path, sha: &str, base: &str) -> Result<Row, String>
 fn refresh(repo: &Path, base: &str) {
     let spawned = (|| {
         let git_dir = git::common_dir(repo)?;
-        let exe = std::env::current_exe().map_err(|e| format!("locating chg: {e}"))?;
-        let mut c = Command::new(exe);
+        let mut c = chg_command()?;
         c.args(["snapshot", "refresh"])
             .arg(&git_dir)
             .arg(base)
@@ -335,7 +359,8 @@ fn refresh(repo: &Path, base: &str) {
                 Ok(())
             });
         }
-        c.spawn().map_err(|e| format!("starting it: {e}"))
+        c.spawn()
+            .map_err(|e| format!("starting {}: {e}", Path::new(c.get_program()).display()))
     })();
     if let Err(e) = spawned {
         eprintln!("chg: shadow could not refresh the snapshot of {base}: {e}");
@@ -1077,6 +1102,50 @@ mod tests {
         let only_ci = vec![chg("x", "m1", Outcome::Pass, 60_000, &[]), ci(5, 11_000)];
         let r = report("r", &only_ci);
         assert_eq!((r.pushes, r.median_gate_ms, r.timed), (1, None, 0));
+    }
+
+    #[test]
+    fn a_binary_replaced_while_running_resolves_to_its_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let chg = dir.path().join("chg");
+        let deleted = dir.path().join("chg (deleted)");
+        assert_eq!(
+            live_path(deleted.clone()),
+            deleted,
+            "nothing at the path yet"
+        );
+        fs::create_dir(&chg).unwrap();
+        assert_eq!(
+            live_path(deleted.clone()),
+            deleted,
+            "a directory is no binary"
+        );
+        fs::remove_dir(&chg).unwrap();
+        fs::write(&chg, "").unwrap();
+        assert_eq!(live_path(deleted), chg);
+        assert_eq!(live_path(chg.clone()), chg);
+
+        // Only Linux names a replaced executable this way, and APFS refuses a name that
+        // is not UTF-8.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"chg-\xff");
+            let odd = dir.path().join(raw);
+            fs::write(&odd, "").unwrap();
+            let odd_deleted = dir
+                .path()
+                .join(std::ffi::OsStr::from_bytes(b"chg-\xff (deleted)"));
+            assert_eq!(live_path(odd_deleted), odd, "a path that is not UTF-8");
+        }
+
+        let c = chg_command().unwrap();
+        let me = std::env::current_exe().unwrap();
+        assert_eq!(
+            Path::new(c.get_program()),
+            me,
+            "detached copies start this binary"
+        );
     }
 
     #[test]
