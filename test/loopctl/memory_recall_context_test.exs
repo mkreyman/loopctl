@@ -653,32 +653,41 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert first.meta.diversity.dropped_already_seen == 0
     end
 
-    # The selection property itself — lambda 1.0 takes the top-N in the order given — is
-    # pinned at unit level in `Loopctl.Knowledge.DiversityTest`, on one fixed pool. This
-    # test pins only the WIRING through recall_context/2, from ONE search: comparing two
-    # independent vector searches for equality failed whenever their candidate pools
-    # differed at the cut (#1002), which is the search's nondeterminism, not the selector's.
-    test "lambda 1.0 with the dedup stages off reaches the selector and drops nothing", ctx do
+    test "lambda 1.0 with the dedup stages off reproduces the pre-#792 selection exactly",
+         ctx do
       marker = "lambda#{System.unique_integer([:positive])}"
 
       for i <- 1..4, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 23))
 
+      # A near-duplicate of a1 (cosine ~1.0): the default threshold would drop it, so it
+      # surviving proves `diversity_near_dup_threshold: 2.0` reached the selector.
+      twin = embedded_article(ctx.tenant.id, "#{marker} a1 twin", spiked(23))
+
+      off = Memory.recall_context(ctx.scope, query: marker, limit: 5, diversity_enabled: false)
+
       pure =
         Memory.recall_context(ctx.scope,
           query: marker,
-          limit: 3,
+          limit: 5,
           diversity_lambda: 1.0,
           diversity_near_dup_threshold: 2.0
         )
 
-      assert length(knowledge_result_ids(pure)) == 3
-      assert pure.meta.diversity.lambda == 1.0
+      assert knowledge_result_ids(pure) == knowledge_result_ids(off)
+      assert Enum.map(pure.results, & &1.score) == Enum.map(off.results, & &1.score)
+      assert twin.id in knowledge_result_ids(pure)
       assert pure.meta.diversity.dropped_near_duplicates == 0
-      assert pure.meta.diversity.dropped_exact_duplicates == 0
-      assert pure.meta.diversity.dropped_already_seen == 0
-
-      off = Memory.recall_context(ctx.scope, query: marker, limit: 3, diversity_enabled: false)
+      assert pure.meta.diversity.lambda == 1.0
       assert off.meta.diversity.enabled == false
+    end
+
+    test "a score tie at the cut is broken by id, whatever order the search returned (#1002)" do
+      pool = for id <- ~w(c a d b), do: %{score: 0.5, article: %{id: id}}
+      top = %{score: 0.9, article: %{id: "z"}}
+
+      ordered = Memory.diversity_pool_order(Enum.reverse([top | pool]))
+
+      assert Enum.map(ordered, & &1.article.id) == ~w(z a b c d)
     end
 
     test "selection does not decide render order — the merged list is still score DESC", ctx do

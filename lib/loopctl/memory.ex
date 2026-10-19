@@ -1967,12 +1967,23 @@ defmodule Loopctl.Memory do
 
     {selected, stats} =
       candidates
+      |> diversity_pool_order()
       |> Enum.map(&to_diversity_candidate(&1, vectors))
       |> Diversity.select(limit, diversity_opts, exclude_ids: exclude)
       |> then(fn {selected, stats} -> {Enum.map(selected, & &1.item), stats} end)
 
     {Enum.sort_by(selected, &merge_order_key/1), stats}
   end
+
+  # `Diversity.select/4` breaks a score tie by input position, and the pool arrives in
+  # the search's order, which an approximate scan does not hold fixed between calls
+  # (#1002). Sorting score DESC, id ASC first leaves every untied pick unchanged and makes
+  # a tie at the cut pick the same row on every call. Public only so that order is
+  # testable: the database decides which order a test's tied rows arrive in.
+  @doc false
+  @spec diversity_pool_order([map()]) :: [map()]
+  def diversity_pool_order(candidates),
+    do: Enum.sort_by(candidates, &{-&1.score, knowledge_candidate_id(&1)})
 
   # `Diversity` works on a flat `%{id, score, embedding, content_hash}` shape and carries
   # the merged item through untouched under `:item`, so the selector never has to know what
