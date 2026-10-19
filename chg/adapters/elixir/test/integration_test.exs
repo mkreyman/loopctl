@@ -163,6 +163,50 @@ defmodule ChgAdapter.IntegrationTest do
     assert {%{"results" => [%{"status" => "error"}]}, 1} = chg(ctx, ["chg.run", "--tests", list])
   end
 
+  test "a test file that does not compile is an error, and the document is still last", ctx do
+    # A module that loads first runs while the broken one still compiles, so the
+    # formatter has printed its dot, with no newline, when `mix test` gives up. The broken
+    # file waits for the quick test's marker so that order does not rest on a sleep.
+    marker = Path.join(ctx.dir, "quick.ran")
+
+    File.write!(Path.join(ctx.dir, "test/sample/a_quick_test.exs"), """
+    defmodule Sample.AQuickTest do
+      use ExUnit.Case, async: true
+      test "runs before the compile error", do: File.write!(#{inspect(marker)}, "")
+    end
+    """)
+
+    File.write!(Path.join(ctx.dir, "test/sample/broken_test.exs"), """
+    defmodule Sample.BrokenTest do
+      use ExUnit.Case
+      Enum.find(1..100, fn _ -> File.exists?(#{inspect(marker)}) or Process.sleep(100) end)
+      Process.sleep(200)
+      Code.require_file("missing.ex", "/nonexistent")
+      test "never", do: :ok
+    end
+    """)
+
+    list = Path.join(ctx.dir, "tests.txt")
+
+    File.write!(
+      list,
+      "test/sample/a_quick_test.exs\ntest/sample/billing_test.exs\ntest/sample/broken_test.exs\n"
+    )
+
+    broken = %{"id" => "test/sample/broken_test.exs", "status" => "error", "ms" => 0}
+
+    for args <- [["chg.run", "--tests", list], ["chg.shard", "--of", "1", "--index", "1"]] do
+      File.rm(marker)
+      {out, 1} = sh("mix", args, ctx.dir, [{"MIX_ARCHIVES", ctx.archives}])
+      assert out =~ ~r/\.\n\{"results"/, "a dot ended the progress mid-line: #{out}"
+
+      %{"results" => results} =
+        out |> String.split("\n", trim: true) |> List.last() |> JSON.decode!()
+
+      assert broken in results
+    end
+  end
+
   test "shards are disjoint and together cover the suite", ctx do
     ids =
       for i <- 1..3, reduce: [] do

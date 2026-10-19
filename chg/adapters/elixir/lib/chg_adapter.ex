@@ -53,8 +53,12 @@ defmodule ChgAdapter do
     end
   end
 
-  @doc "Prints the contract document as the last stdout line."
-  def emit(doc), do: IO.puts(JSON.encode!(doc))
+  @doc """
+  Prints the contract document as the last stdout line, on a line of its own: the
+  progress before it can end mid-line, as the formatter's dots do when `mix test` stops
+  on a test file that does not compile.
+  """
+  def emit(doc), do: IO.puts(["\n", JSON.encode!(doc)])
 
   @doc "Exits the task with `status` after the document is out."
   def halt(0), do: :ok
