@@ -56,6 +56,20 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   tags(["Progress"])
 
+  # US-47.6: the 503 a chg story's trunk-evidence read answers when nothing was decided.
+  @chg_trunk_unevaluated_response {
+    "`chg_trunk_unevaluated` (" <>
+      Messages.chg_trunk_unevaluated() <>
+      ") — always with a `Retry-After` header: the forge's own delay when it named one, " <>
+      "else #{Loopctl.Changes.TrunkEvidence.default_retry_after_seconds()} seconds " <>
+      "(#{Loopctl.Verification.Credential.configuration_retry_seconds()} for " <>
+      "`credential_unavailable`). `error.reason` is one of `forge_unavailable`, " <>
+      "`trunk_ref_not_found`, `forge_unauthorized`, `forge_forbidden`, `forge_rejected`, " <>
+      "`forge_unreadable`, `credential_unavailable`, `landing_changed`.",
+    "application/json",
+    Schemas.ErrorResponse
+  }
+
   operation(:verify,
     summary: "Verify story",
     description:
@@ -67,7 +81,15 @@ defmodule LoopctlWeb.StoryVerificationController do
         "chg CHANGE is verified only on a chg review of its LANDED revision — the revision " <>
         "commit of the newest applied `landed` event of its current change — " <>
         "(409 `chg_review_not_for_landed_revision`), and never while its delivery stage is " <>
-        "escalated over `review_missing` (409 `review_missing_escalated`).",
+        "escalated over `review_missing` (409 `review_missing_escalated`). Its CI evidence " <>
+        "is chg's trunk verifier (US-47.6): the trunk commit of that landing (`data.merge_sha`) " <>
+        "must be an ancestor of, or equal to, the repository's `verified/master`, asked of " <>
+        "GitHub by sha with the tenant's own forge credential (409 " <>
+        "`chg_landing_not_trunk_verified` when it is not), and no applied `reverted` event may " <>
+        "follow the landing (409 `chg_landing_reverted`). A forge read that times out or " <>
+        "fails, a missing `verified/master` ref or commit, or no credential for the " <>
+        "repository is 503 `chg_trunk_unevaluated` with `Retry-After` — never a pass. A story " <>
+        "with no change binding takes exactly the gates it took before.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
@@ -78,11 +100,15 @@ defmodule LoopctlWeb.StoryVerificationController do
            Messages.chg_root_cannot_verify() <>
            "), `review_missing_escalated` (" <>
            Messages.review_missing_escalated() <>
-           ") or `chg_review_not_for_landed_revision` (" <>
-           Messages.chg_review_not_for_landed_revision() <> ")", "application/json",
-         Schemas.ErrorResponse},
+           "), `chg_review_not_for_landed_revision` (" <>
+           Messages.chg_review_not_for_landed_revision() <>
+           "), `chg_landing_not_trunk_verified` (" <>
+           Messages.chg_landing_not_trunk_verified() <>
+           ") or `chg_landing_reverted` (" <>
+           Messages.chg_landing_reverted() <> ")", "application/json", Schemas.ErrorResponse},
       422 => {"No review record found", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 => @chg_trunk_unevaluated_response
     }
   )
 
@@ -129,7 +155,9 @@ defmodule LoopctlWeb.StoryVerificationController do
         "A key descending from an intake source's `chg_root_dispatch_id` is refused 409 " <>
         "`chg_root_cannot_verify` (US-47.5). A story bound to a chg change takes the same " <>
         "landed-review gate verify does: 409 `review_missing_escalated` or " <>
-        "`chg_review_not_for_landed_revision`. " <>
+        "`chg_review_not_for_landed_revision` — and the same trunk-evidence gate (US-47.6): " <>
+        "409 `chg_landing_not_trunk_verified` or `chg_landing_reverted`, 503 " <>
+        "`chg_trunk_unevaluated` with `Retry-After`. " <>
         "Emits a `story.backfilled` webhook event on success.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
@@ -156,9 +184,13 @@ defmodule LoopctlWeb.StoryVerificationController do
            Messages.chg_root_cannot_verify() <>
            "), `review_missing_escalated` (" <>
            Messages.review_missing_escalated() <>
-           ") or `chg_review_not_for_landed_revision` (" <>
-           Messages.chg_review_not_for_landed_revision() <> ")", "application/json",
-         Schemas.ErrorResponse},
+           "), `chg_review_not_for_landed_revision` (" <>
+           Messages.chg_review_not_for_landed_revision() <>
+           "), `chg_landing_not_trunk_verified` (" <>
+           Messages.chg_landing_not_trunk_verified() <>
+           ") or `chg_landing_reverted` (" <>
+           Messages.chg_landing_reverted() <> ")", "application/json", Schemas.ErrorResponse},
+      503 => @chg_trunk_unevaluated_response,
       422 =>
         {"Validation error: missing reason, already verified, already rejected, has dispatch lineage, or already entered the lifecycle",
          "application/json", Schemas.ErrorResponse},
@@ -238,8 +270,14 @@ defmodule LoopctlWeb.StoryVerificationController do
         "the whole epic, and nothing is verified. A story bound to a chg change is skipped " <>
         "into `errors` with reason `:review_missing_escalated` (" <>
         Messages.review_missing_escalated() <>
-        ") or `:chg_review_not_for_landed_revision` (" <>
-        Messages.chg_review_not_for_landed_revision() <> ").",
+        "), `:chg_review_not_for_landed_revision` (" <>
+        Messages.chg_review_not_for_landed_revision() <>
+        "), `:chg_landing_not_trunk_verified` (" <>
+        Messages.chg_landing_not_trunk_verified() <>
+        "), `:chg_landing_reverted` (" <>
+        Messages.chg_landing_reverted() <>
+        ") or `{:chg_trunk_unevaluated, reason, retry_after_seconds}` (" <>
+        Messages.chg_trunk_unevaluated() <> ").",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
@@ -374,9 +412,14 @@ defmodule LoopctlWeb.StoryVerificationController do
              :not_found,
              :chg_root_cannot_verify,
              :review_missing_escalated,
-             :chg_review_not_for_landed_revision
+             :chg_review_not_for_landed_revision,
+             :chg_landing_not_trunk_verified,
+             :chg_landing_reverted
            ] ->
         {:error, reason}
+
+      {:error, {:chg_trunk_unevaluated, _reason, _retry_after}} = unevaluated ->
+        unevaluated
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}

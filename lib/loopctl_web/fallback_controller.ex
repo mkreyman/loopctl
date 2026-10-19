@@ -54,6 +54,8 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :chg_root_review_only}` -> 409 (US-47.5: a chg-rooted key tried to claim or report)
   - `{:error, :review_missing_escalated}` -> 409 (US-47.5: a chg story held over `:review_missing` reached a verify path; a human resolves the escalation first)
   - `{:error, :chg_review_not_for_landed_revision}` -> 409 (US-47.5: a chg story reached a verify path with no chg review of its landed revision)
+  - `{:error, :chg_landing_not_trunk_verified}` / `{:error, :chg_landing_reverted}` -> 409 (US-47.6: a chg story's landing is not in `verified/master`, or was reverted)
+  - `{:error, {:chg_trunk_unevaluated, reason, retry_after}}` -> 503 with `Retry-After` (US-47.6: the trunk-evidence read could not be made)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
     a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 ingest backpressure —
@@ -606,7 +608,9 @@ defmodule LoopctlWeb.FallbackController do
              :chg_root_cannot_verify,
              :chg_root_review_only,
              :review_missing_escalated,
-             :chg_review_not_for_landed_revision
+             :chg_review_not_for_landed_revision,
+             :chg_landing_not_trunk_verified,
+             :chg_landing_reverted
            ] do
     conn
     |> put_status(:conflict)
@@ -616,6 +620,25 @@ defmodule LoopctlWeb.FallbackController do
         code: Atom.to_string(code),
         message: chg_custody_message(code),
         remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
+  # US-47.6 (AC-47.6.2): a chg story's trunk evidence could not be established. Nothing was
+  # decided, so it is a 503 with `Retry-After`, never a pass and never a refusal.
+  def call(conn, {:error, {:chg_trunk_unevaluated, reason, retry_after}})
+      when is_binary(reason) and is_integer(retry_after) and retry_after > 0 do
+    conn
+    |> put_resp_header("retry-after", Integer.to_string(retry_after))
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "chg_trunk_unevaluated",
+        decision: "unevaluated",
+        reason: reason,
+        message: Messages.chg_trunk_unevaluated(),
+        retry_after_seconds: retry_after
       }
     })
   end
@@ -1376,4 +1399,9 @@ defmodule LoopctlWeb.FallbackController do
 
   defp chg_custody_message(:chg_review_not_for_landed_revision),
     do: Messages.chg_review_not_for_landed_revision()
+
+  defp chg_custody_message(:chg_landing_not_trunk_verified),
+    do: Messages.chg_landing_not_trunk_verified()
+
+  defp chg_custody_message(:chg_landing_reverted), do: Messages.chg_landing_reverted()
 end

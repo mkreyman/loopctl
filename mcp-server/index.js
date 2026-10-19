@@ -4278,7 +4278,10 @@ const TOOLS = [
       "REFUSED for stories that have any loopctl dispatch lineage — non-pending agent_status, assigned_agent_id, implementer_dispatch_id, " +
       "or verifier_dispatch_id set. Also refused for stories already `:verified` (idempotent no-op when the same payload is sent) or `:rejected`. " +
       "Records a provenance marker in `metadata.backfill` plus an audit event and a `story.backfilled` webhook. " +
-      "REQUIRES `reason`. Strongly recommend passing `evidence_url` (http/https, no credentials in userinfo) and `pr_number`.",
+      "REQUIRES `reason`. Strongly recommend passing `evidence_url` (http/https, no credentials in userinfo) and `pr_number`. " +
+      "A story bound to a chg change takes verify_story's chg gates too: 409 review_missing_escalated, " +
+      "chg_review_not_for_landed_revision, chg_landing_not_trunk_verified or chg_landing_reverted, and 503 " +
+      "chg_trunk_unevaluated with Retry-After (loopctl US-47.6).",
     inputSchema: {
       type: "object",
       properties: {
@@ -4978,7 +4981,15 @@ const TOOLS = [
       "applied landed event of its current change), else 409 " +
       "chg_review_not_for_landed_revision — have chg dispatch a review naming that sha; and " +
       "never while its stage is escalated over review_missing, else 409 " +
-      "review_missing_escalated — a human resolves it first (resolve_escalation).",
+      "review_missing_escalated — a human resolves it first (resolve_escalation). " +
+      "Its CI evidence is chg's trunk verifier (loopctl US-47.6): the trunk commit of that " +
+      "landing (data.merge_sha) must be an ancestor of the repo's verified/master, else 409 " +
+      "chg_landing_not_trunk_verified (retry once chg has verified it), and no reverted event " +
+      "may follow the landing, else 409 chg_landing_reverted. A forge read that times out or " +
+      "fails, a missing verified/master ref, or no forge credential for the repo is 503 " +
+      "chg_trunk_unevaluated with Retry-After (error.reason names which) — nothing was " +
+      "decided; retry after that many seconds. The forge credential (the tenant's own GitHub " +
+      "token) needs read access to the repo's contents.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5035,7 +5046,8 @@ const TOOLS = [
       "ADMIN USE ONLY: backfill pre-existing completed work into pending stories that never entered the dispatch lifecycle. " +
       "For dispatched stories, use the normal report/review/verify flow. Each story entry needs a story_id, summary, and review_type. Uses the ORCH key. " +
       "Refused 409 chg_root_cannot_verify for the whole batch when the key descends from an intake source's chg_root_dispatch_id (loopctl US-47.5). " +
-      "A story bound to a chg change is a per-story error leading with review_missing_escalated or chg_review_not_for_landed_revision, the same landed-review gate verify_story applies.",
+      "A story bound to a chg change is a per-story error leading with review_missing_escalated or chg_review_not_for_landed_revision, the same landed-review gate verify_story applies, " +
+      "or with chg_landing_not_trunk_verified, chg_landing_reverted or chg_trunk_unevaluated, the same trunk-evidence gate (loopctl US-47.6).",
     inputSchema: {
       type: "object",
       properties: {
@@ -5073,7 +5085,9 @@ const TOOLS = [
       "Refused 409 chg_root_cannot_verify for the whole epic, verifying nothing, when the key " +
       "descends from an intake source's chg_root_dispatch_id (loopctl US-47.5). A story bound " +
       "to a chg change is skipped into errors with review_missing_escalated or " +
-      "chg_review_not_for_landed_revision, the same landed-review gate verify_story applies.",
+      "chg_review_not_for_landed_revision, the same landed-review gate verify_story applies, " +
+      "or with chg_landing_not_trunk_verified, chg_landing_reverted or chg_trunk_unevaluated " +
+      "(the trunk-evidence gate verify_story applies, loopctl US-47.6).",
     inputSchema: {
       type: "object",
       properties: {

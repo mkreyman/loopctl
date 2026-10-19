@@ -23,6 +23,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
   alias Loopctl.Changes.ReviewCustody
+  alias Loopctl.Changes.TrunkEvidence
   alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
@@ -2593,9 +2594,16 @@ defmodule Loopctl.Progress do
     applied `landed` event of its current binding — or it has not landed
     (`Loopctl.Changes.ReviewCustody.ensure_landed_review/3`). Both run after
     `review_not_conducted`, so a story with no binding is answered exactly as before
+  - `{:error, :chg_landing_not_trunk_verified}` / `{:error, :chg_landing_reverted}` /
+    `{:error, {:chg_trunk_unevaluated, reason, retry_after_seconds}}` (US-47.6) — a chg story's
+    CI-evidence input: its landing's trunk commit is not in `verified/master`, a revert follows
+    the landing, or the forge read could not establish it
+    (`Loopctl.Changes.TrunkEvidence`). The forge is read BEFORE the transaction; the answer is
+    applied after the landed-review gate, under the story lock
   """
   @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
+          {:ok, Story.t()}
+          | {:error, atom() | {:invalid_transition, map()} | TrunkEvidence.refusal()}
   def verify_story(tenant_id, story_id, params, opts \\ []) do
     verification_params = extract_verification_params(params)
 
@@ -2638,6 +2646,10 @@ defmodule Loopctl.Progress do
     # story's recorded verifier; the caller comparison binds the principal that
     # actually makes the call, on EVERY path including the one that skips the
     # optional request-review.
+    # US-47.6: a chg story's CI evidence is read from the forge HERE, before the transaction,
+    # so no story lock is held across a network read. It is applied under the lock below.
+    trunk = TrunkEvidence.assess(tenant_id, story_id)
+
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
@@ -2657,6 +2669,9 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:chg_landed_review, fn _repo, _changes ->
         chg_landed_review(tenant_id, story_id)
+      end)
+      |> Multi.run(:chg_trunk_evidence, fn _repo, _changes ->
+        chg_trunk_evidence(tenant_id, story_id, trunk)
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_verified_status(story)
@@ -2698,6 +2713,18 @@ defmodule Loopctl.Progress do
   defp chg_landed_review(tenant_id, story_id) do
     case ReviewCustody.ensure_landed_review(tenant_id, story_id) do
       :ok -> {:ok, :landed_review_ok}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # US-47.6 (AC-47.6.1): a story bound to a chg change passes its CI-evidence input only when
+  # its landing's trunk commit is in `verified/master` and no revert follows it
+  # (`Loopctl.Changes.TrunkEvidence`). `trunk` is the assessment made before the transaction;
+  # it is applied here, under the story lock, only to the landing it was made for. A no-op on
+  # every other story.
+  defp chg_trunk_evidence(tenant_id, story_id, trunk) do
+    case TrunkEvidence.ensure_trunk_verified(tenant_id, story_id, trunk) do
+      :ok -> {:ok, :trunk_verified}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -2767,8 +2794,12 @@ defmodule Loopctl.Progress do
   `lifecycle_ids` is the batch's precomputed lifecycle-history set (see
   `stories_with_lifecycle_history/2`), so a 50-story batch costs one audit query
   rather than 50 inside the locking transaction.
+
+  `trunk` is the batch's `Loopctl.Changes.TrunkEvidence.assess_many/2` map, made BEFORE the
+  transaction (US-47.6). A chg story missing from it is unevaluated (`landing_changed`), never
+  passed, so the default only serves a caller whose batch holds no chg story.
   """
-  @spec ensure_mark_complete_allowed(Story.t(), MapSet.t()) ::
+  @spec ensure_mark_complete_allowed(Story.t(), MapSet.t(), map()) ::
           :ok
           | {:error,
              :already_verified
@@ -2777,9 +2808,10 @@ defmodule Loopctl.Progress do
              | :story_entered_lifecycle
              | :story_in_progress
              | :review_missing_escalated
-             | :chg_review_not_for_landed_revision}
-  def ensure_mark_complete_allowed(story, lifecycle_ids) do
-    case guard_backfill(story, lifecycle_ids) do
+             | :chg_review_not_for_landed_revision
+             | TrunkEvidence.refusal()}
+  def ensure_mark_complete_allowed(story, lifecycle_ids, trunk \\ %{}) do
+    case guard_backfill(story, lifecycle_ids, Map.get(trunk, story.id)) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -2788,10 +2820,11 @@ defmodule Loopctl.Progress do
   # Backfill and bulk mark-complete reach `verified` with no report and no verifier, so they
   # take the same chg landed-review gate verify does (US-47.5, AC-47.5.5) after the
   # lifecycle guard: a chg story never reaches `verified` without a review of its landed
-  # revision, by any path.
-  defp guard_backfill(story, lookup) do
+  # revision, by any path — nor (US-47.6) without its landing in `verified/master`.
+  defp guard_backfill(story, lookup, trunk) do
     with {:ok, _} = ok <- guard_backfillable(story, lookup),
-         {:ok, _} <- chg_landed_review(story.tenant_id, story.id) do
+         {:ok, _} <- chg_landed_review(story.tenant_id, story.id),
+         {:ok, _} <- chg_trunk_evidence(story.tenant_id, story.id, trunk) do
       ok
     end
   end
@@ -2840,6 +2873,9 @@ defmodule Loopctl.Progress do
       (US-47.5) — the story is bound to a chg change and is held over `:review_missing`, or
       no chg review names its landed revision
       (`Loopctl.Changes.ReviewCustody.ensure_landed_review/3`), as for `verify_story/4`
+    * `{:error, :chg_landing_not_trunk_verified | :chg_landing_reverted}` /
+      `{:error, {:chg_trunk_unevaluated, reason, retry_after_seconds}}` (US-47.6) — the same
+      trunk-evidence gate as `verify_story/4`
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
   """
   @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -2859,6 +2895,7 @@ defmodule Loopctl.Progress do
              | :chg_root_cannot_verify
              | :review_missing_escalated
              | :chg_review_not_for_landed_revision
+             | TrunkEvidence.refusal()
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
     reason = params |> Map.get("reason") |> normalize_string()
@@ -2914,10 +2951,13 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
+    # US-47.6: the forge read happens before the transaction, as on verify.
+    trunk = TrunkEvidence.assess(tenant_id, story_id)
+
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
-      |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfill(story, :query) end)
+      |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfill(story, :query, trunk) end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_backfill_status(story, reason, evidence_url, pr_number)
       end)
@@ -3046,7 +3086,7 @@ defmodule Loopctl.Progress do
   #     ACCURATE reason, not a false "dispatch lineage" claim.
   #
   # `lookup` is `:query` on the single-story path and a precomputed MapSet on the
-  # batch path. Both reach it through `guard_backfill/2`.
+  # batch path. Both reach it through `guard_backfill/3`.
   defp guard_backfillable(%{verified_status: :verified}, _lookup),
     do: {:error, :already_verified}
 

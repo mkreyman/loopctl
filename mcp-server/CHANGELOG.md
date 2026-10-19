@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.4.0 — 2026-10-19 (chg trunk evidence)
+
+### Changed
+
+- **`verify_story`, `verify_all_in_epic`, `bulk_mark_complete` and `backfill_story` document the
+  chg trunk-evidence gate** (loopctl US-47.6): a story bound to a chg change is verified only
+  when the trunk commit of its newest landing (`data.merge_sha`) is an ancestor of the repo's
+  `verified/master` (409 `chg_landing_not_trunk_verified` otherwise) and no `reverted` event
+  follows the landing (409 `chg_landing_reverted`). A forge read that cannot answer is 503
+  `chg_trunk_unevaluated` with `Retry-After`, never a pass; the bulk paths report each as a
+  per-story error.
+
 ## 3.3.0 — 2026-10-19 (chg review custody)
 
 ### Added

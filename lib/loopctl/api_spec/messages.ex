@@ -103,4 +103,40 @@ defmodule Loopctl.ApiSpec.Messages do
       "change has not landed, or no chg review names that revision (a review of an earlier " <>
       "revision, or one recorded off the chg path, does not count)."
   end
+
+  @doc """
+  The 409 `chg_landing_not_trunk_verified` message (US-47.6; verify, verify-all, bulk verify,
+  backfill, bulk mark-complete on a chg story).
+  """
+  @spec chg_landing_not_trunk_verified() :: String.t()
+  def chg_landing_not_trunk_verified do
+    "This story is bound to a chg change, so its CI evidence is chg's trunk verifier: the " <>
+      "trunk commit its newest applied `landed` event names (data.merge_sha) must be an " <>
+      "ancestor of, or equal to, the repository's verified/master. The forge says it is not " <>
+      "(chg has not verified that commit yet), or the landing named no valid trunk commit. " <>
+      "Retry once chg's `verified` event for a commit containing the landing has arrived."
+  end
+
+  @doc """
+  The 409 `chg_landing_reverted` message (US-47.6; every verify path, on a chg story).
+  """
+  @spec chg_landing_reverted() :: String.t()
+  def chg_landing_reverted do
+    "This story is bound to a chg change whose newest landing was reverted: an applied " <>
+      "`reverted` event follows it. A reverted landing is never verified; the story is " <>
+      "verifiable again only after the change lands anew."
+  end
+
+  @doc """
+  The 503 `chg_trunk_unevaluated` message (US-47.6; every verify path, on a chg story).
+  """
+  @spec chg_trunk_unevaluated() :: String.t()
+  def chg_trunk_unevaluated do
+    "This story is bound to a chg change, and whether its landing is in verified/master " <>
+      "could not be established: the forge timed out, failed, was rate-limited, refused the " <>
+      "credential, has no verified/master ref (or no such commit) yet, no credential reads " <>
+      "the repository, or a new landing arrived while this call ran. Nothing was decided and " <>
+      "nothing changed. `reason` names which; retry after `retry_after_seconds` (the " <>
+      "Retry-After header)."
+  end
 end

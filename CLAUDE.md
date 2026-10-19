@@ -247,7 +247,7 @@ revoked or not — an expired chg key's live lineage is `[]`, which reject would
 rooted at a `chg_root_dispatch_id` ANY intake source of the tenant names, live or revoked,
 either mode, is refused `chg_root_cannot_verify` by verify, reject, verify-all, bulk
 verify/reject, backfill and bulk mark-complete (`refuse_chg_root_verifier/2`,
-`progress.ex:2611`; `BulkOperations.refuse_chg_root/3`, `bulk_operations.ex:389`) and
+`progress.ex:2619`; `BulkOperations.refuse_chg_root/3`, `bulk_operations.ex:394`) and
 `chg_root_review_only` by claim, bulk claim and report (`refuse_chg_root_actor/3`,
 `progress.ex:272`). Both halves read the lineage through ONE function,
 `ReviewCustody.caller_lineage/2` (minting lineage, else the call's live one), and the
@@ -262,9 +262,9 @@ landed event's own transaction over the control-only edge `:review_missing`
 fails CLOSED: a refused escalation rolls the whole landing back (`:busy`, or
 `change_event_failed`, logged and counted) so chg redelivers it — the merge never commits
 without its hold. Such a story is never verified: every path that reaches `verified` —
-verify and verify-all through `chg_landed_review/2` (`progress.ex:2698`), bulk verify
-through `process_verify/3` (`bulk_operations.ex:421`), backfill and bulk mark-complete
-through `guard_backfill/2` (`progress.ex:2792`) — calls one function,
+verify and verify-all through `chg_landed_review/2` (`progress.ex:2713`), bulk verify
+through `process_verify/3` (`bulk_operations.ex:426`), backfill and bulk mark-complete
+through `guard_backfill/3` (`progress.ex:2824`) — calls one function,
 `ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:215`). It refuses a chg story with
 `review_missing_escalated` while its stage is escalated over `:review_missing` (a human
 resolves it) and with `chg_review_not_for_landed_revision` unless a chg review names its
