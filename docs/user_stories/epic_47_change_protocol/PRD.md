@@ -132,7 +132,8 @@ by searching every tenant for a repo named in an unauthenticated body.
 **The wire contract, as chg emits it** (confirmed by the chg session on 2026-10-19; record:
 mkreyman/chg#33, comments 6257372489 and 6257451658, the later one winning):
 
-- Headers `X-Chg-Timestamp` and `X-Chg-Signature`; the HMAC is over `"<timestamp>.<raw body>"`
+- Headers `X-Chg-Timestamp: <unix seconds>` and `X-Chg-Signature: sha256=<hex HMAC-SHA256>`
+  (mkreyman/chg#33, the first comment); the HMAC is over `"<timestamp>.<raw body>"`
   keyed by `change_events_secret`. chg signs at send time, so a retry carries a fresh
   timestamp and stays inside the 5-minute window.
 - Envelope: `{v, repo, change_id, event_seq, kind, revision, sha, occurred_at, data}`.
@@ -174,7 +175,9 @@ mkreyman/chg#33, comments 6257372489 and 6257451658, the later one winning):
   with the same secret over `"<timestamp>.GET.<path>?<query>"` exactly as sent (the query
   carries only `after`), inside the same 5-minute window. `change_id` is GLOBALLY unique (a
   client ULID with a unique index across every repo in chg-server), so the URL needs no repo;
-  loopctl's `(repo, change_id)` keys stay as a redundant guard.
+  loopctl's `(repo, change_id)` keys stay as a redundant guard. The pull carries the same two
+  headers. The contract does not fix the response's wrapper, so 47.3 reads a bare JSON array
+  of envelopes or `{"events": [...]}` as the same list.
 - chg-server is chg's Phase 2 and is not running yet (mkreyman/chg#35). Until then, 47.3 is
   built and tested against this contract but receives no real events.
 - GitHub App 5101362 is ADOPTED by chg as chg-server's lander (renamed chg-lander, given a new

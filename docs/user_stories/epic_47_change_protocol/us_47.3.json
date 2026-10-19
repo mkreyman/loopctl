@@ -132,7 +132,8 @@
       ],
       "expected_results": [
         "seq 2 answers 2xx and is recorded",
-        "seq 3 applies immediately: the story moves reviewing -> implementing"
+        "seq 3 applies immediately, not held behind seq 2: the change's applied event_seq is 3",
+        "no stage moves: the review_findings stage edge (reviewing -> implementing) is US-47.4's, verified by TC-47.4.7"
       ]
     },
     {
@@ -157,7 +158,10 @@
   ],
   "technical_notes": [
     "The chg client is a behaviour resolved from config (Loopctl.Changes.ChgClient), mocked in test/support/mocks.ex.",
-    "Build against PRD \u00a75's wire contract, confirmed on mkreyman/chg#33 (headers, signed strings for POST and the gap-pull GET, envelope, per-kind data)."
+    "Build against PRD \u00a75's wire contract, confirmed on mkreyman/chg#33 (headers, signed strings for POST and the gap-pull GET, envelope, per-kind data).",
+    "Event application goes through ONE seam, Loopctl.Changes.EventEffects.apply_event/2, called in event_seq order inside the transaction that holds the change's cursor lock, marks the event applied and appends it to the audit chain. In this story it binds a submitted event's story (PRD \u00a74, Loopctl.Changes.bind_in_tenant_transaction/3) and records every other kind; US-47.4 fills it with the stage mapping.",
+    "AC-47.3.7's root check is Loopctl.Intake.hold_chg_source/3: the source and its root read FOR SHARE inside the event's own transaction, by the same rule enrolment uses.",
+    "chg-server's base URL is the deployment env var CHG_SERVER_URL (one chg-server serves every enrolled repo); unset, events are still received and applied but nothing is pulled."
   ],
   "dependencies": [
     "US-47.1",

@@ -172,6 +172,19 @@ defmodule LoopctlWeb.Router do
     post "/intake/github/:source_id", GithubIntakeController, :deliver
   end
 
+  # US-47.3 — chg-server's change-events webhook. Authenticated like the GitHub intake one, by
+  # an HMAC over the raw body (captured by the same LoopctlWeb.Plugs.IntakeRawBody), so it
+  # sits outside `:authenticated` too, behind the same per-IP throttle on a bucket of its own.
+  pipeline :change_events do
+    plug LoopctlWeb.Plugs.GithubIntakeThrottle, bucket: "change_events_ip"
+  end
+
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api, :change_events]
+
+    post "/change_events/:source_id", ChangeEventController, :create
+  end
+
   scope "/swaggerui" do
     get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end

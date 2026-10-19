@@ -603,9 +603,9 @@ defmodule Loopctl.Intake do
   # across tenants.
   #
   # This guards the REGISTRATION only. Nothing here stops a source whose root is revoked between
-  # writes from staying `chg`; the change-events webhook (US-47.3, AC-47.3.6) must refuse an event
-  # for a source whose root is revoked, and every later gate that reads the root must judge it
-  # the same way.
+  # writes from staying `chg`; the change-events webhook (US-47.3, AC-47.3.7) refuses an event
+  # for a source whose root is revoked (`hold_chg_source/3`), and every later gate that reads
+  # the root must judge it the same way.
   #
   # INSIDE the write's transaction and `FOR SHARE`, so a concurrent `Dispatches.revoke/3` of the
   # root either commits first (and this read sees `revoked_at`) or waits for this write to
@@ -719,9 +719,45 @@ defmodule Loopctl.Intake do
     if :chg in modes, do: {:error, :change_protocol_enrolled}, else: :ok
   end
 
-  defp judge_chg_root(tenant_id, root_id) when is_binary(root_id) do
+  @doc """
+  Re-reads a live `chg` source INSIDE the caller's transaction on `repo` and judges its root
+  by the same rule enrolment does (`check_chg_root/2`'s `judge_chg_root/3`): `{:ok, source}`,
+  `{:error, :not_chg_source}` (revoked, another tenant's, unknown, `pr`-mode or holding no
+  `change_events_secret`) or `{:error, :chg_root_invalid}`.
+
+  For the change-events webhook (US-47.3, AC-47.3.7). Enrolment judges the root only when a
+  source is WRITTEN, so a root revoked between writes is caught here, on every event. Both
+  reads are `FOR SHARE`, so a concurrent revoke of the source or of its root, or a mode
+  switch, either commits first and is seen, or waits for the event to commit. `repo` is
+  `Loopctl.Repo` under the source's tenant there; the explicit `tenant_id` predicates hold on
+  any repo.
+  """
+  @spec hold_chg_source(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Source.t()} | {:error, :not_chg_source | :chg_root_invalid}
+  def hold_chg_source(repo, tenant_id, source_id)
+      when is_binary(tenant_id) and is_binary(source_id) do
+    source =
+      repo.one(
+        from s in live_sources_query(tenant_id),
+          where: s.id == ^source_id,
+          lock: "FOR SHARE"
+      )
+
+    case source do
+      %Source{mode: :chg, change_events_secret: secret} = source when is_binary(secret) ->
+        with :ok <- judge_chg_root(repo, tenant_id, source.chg_root_dispatch_id),
+             do: {:ok, source}
+
+      _other ->
+        {:error, :not_chg_source}
+    end
+  end
+
+  defp judge_chg_root(repo \\ AdminRepo, tenant_id, root_id)
+
+  defp judge_chg_root(repo, tenant_id, root_id) when is_binary(root_id) do
     dispatch =
-      AdminRepo.one(
+      repo.one(
         from d in Dispatch,
           where: d.id == ^root_id and d.tenant_id == ^tenant_id,
           lock: "FOR SHARE"
@@ -731,7 +767,7 @@ defmodule Loopctl.Intake do
   end
 
   # `validate_mode/1` already required it, so a nil here is a caller bypassing the changeset.
-  defp judge_chg_root(_tenant_id, _root_id), do: {:error, :chg_root_invalid}
+  defp judge_chg_root(_repo, _tenant_id, _root_id), do: {:error, :chg_root_invalid}
 
   # `lineage_path == [id]` is what a parentless dispatch carries (`Loopctl.Dispatches`); a row
   # where the two disagree is not trusted as a root.
@@ -1193,6 +1229,36 @@ defmodule Loopctl.Intake do
         _ = Signature.valid?(@timing_key, raw_body, signature)
         {:error, :unauthorized}
     end
+  end
+
+  @doc """
+  The live source a delivery to `source_id` addresses, on an active tenant, or `nil` — the one
+  cross-tenant read (by id) a webhook makes before it knows its tenant. Any `source_id` that is
+  not a UUID is `nil` too, so an unknown, a revoked, a malformed and another deployment's id are
+  one answer. Shared by the GitHub intake webhook and the change-events webhook (US-47.3).
+  """
+  @spec delivery_source(term()) :: Source.t() | nil
+  def delivery_source(source_id), do: active_source(source_id)
+
+  @doc """
+  The tenant's live `chg` source for `repo_full_name` (case-insensitively, as GitHub names
+  are), or `nil`. What a change-events gap pull signs with: the source live NOW, so a
+  re-enrolled repository's new secret is the one used (US-47.3).
+  """
+  @spec chg_source_for_repo(Ecto.UUID.t(), String.t()) :: Source.t() | nil
+  def chg_source_for_repo(tenant_id, repo_full_name)
+      when is_binary(tenant_id) and is_binary(repo_full_name) do
+    name = String.downcase(repo_full_name)
+
+    AdminRepo.one(
+      from s in live_sources_query(tenant_id),
+        join: t in Tenant,
+        on: t.id == s.tenant_id,
+        where:
+          s.mode == :chg and fragment("lower(?)", s.repo_full_name) == ^name and
+            t.status == :active,
+        limit: 1
+    )
   end
 
   defp active_source(source_id) do

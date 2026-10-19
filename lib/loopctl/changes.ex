@@ -4,8 +4,9 @@ defmodule Loopctl.Changes do
   change protocol need.
 
   A story may bind several changes over its life (a revert, a re-submit); exactly one is
-  CURRENT, the newest not superseded. The writer is the change-events webhook (US-47.3); the
-  reader tool is US-47.7. Neither exists yet, so this module has no route and no MCP tool.
+  CURRENT, the newest not superseded. The writer is the change-events webhook (US-47.3,
+  `Loopctl.Changes.Events`, through `bind_in_tenant_transaction/3` when a `submitted` event
+  applies); the reader tool is US-47.7.
 
   ## What a bind refuses, and what it never reveals
 
@@ -118,6 +119,56 @@ defmodule Loopctl.Changes do
     |> after_commit(tenant_id, input)
   end
 
+  @typedoc """
+  What `bind_in_tenant_transaction/3` did, for `after_bind_commit/1` to finish once the
+  caller's transaction commits: `{outcome, tenant_id, input}`.
+  """
+  @type pending_bind ::
+          {{:bound, Binding.t(), Entry.t()}
+           | {:existing, Binding.t()}
+           | {:unbound, Entry.t() | nil}
+           | {:refused, bind_error()}, Ecto.UUID.t(), map()}
+
+  @doc """
+  `bind/4` INSIDE the caller's `Loopctl.Repo.with_tenant/2` transaction for `tenant_id` — for
+  the change-events webhook (US-47.3), whose bind must commit or roll back with the event that
+  carried it, under the lock it already holds on the change.
+
+  A refusal that wrote nothing (`:change_bound_to_other_story`, `:change_superseded`, an
+  invalid input) is RETURNED, inside `{:ok, pending}`, so the caller can record it and keep
+  its own transaction; the lock-wait bound is the caller's. A failure after a write (the
+  supersede already made) rolls the CALLER's transaction back, because nothing short of that
+  undoes it. Pass the result to `after_bind_commit/1` after the caller commits: that is where
+  the audit entry is announced and the unbound warning logged, as `bind/4` does.
+
+  Raises outside a `Loopctl.Repo` transaction.
+  """
+  @spec bind_in_tenant_transaction(Ecto.UUID.t(), map(), submitter()) :: {:ok, pending_bind()}
+  def bind_in_tenant_transaction(tenant_id, attrs, %{agent_id: agent_id} = submitter)
+      when is_binary(tenant_id) and is_map(attrs) and (is_nil(agent_id) or is_binary(agent_id)) do
+    unless Repo.in_transaction?(),
+      do: raise(ArgumentError, "bind_in_tenant_transaction/3 needs a Loopctl.Repo transaction")
+
+    lineage = Map.get(submitter, :actor_lineage, [])
+
+    case validate_input(attrs) do
+      {:ok, input} ->
+        {:ok, {bind_in_transaction(tenant_id, input, agent_id, lineage), tenant_id, input}}
+
+      {:error, changeset} ->
+        {:ok, {{:refused, changeset}, tenant_id, attrs}}
+    end
+  end
+
+  @doc """
+  Finishes a `bind_in_tenant_transaction/3` after the caller's transaction committed, and
+  answers what `bind/4` would have: `{:ok, binding}`, `{:ok, :unbound}` or `{:error, reason}`.
+  """
+  @spec after_bind_commit(pending_bind()) ::
+          {:ok, Binding.t() | :unbound} | {:error, bind_error()}
+  def after_bind_commit({outcome, tenant_id, input}),
+    do: after_commit({:ok, outcome}, tenant_id, input)
+
   @doc "The story's current binding — the newest not superseded — or `nil`."
   @spec current_binding(Ecto.UUID.t(), Ecto.UUID.t()) :: Binding.t() | nil
   def current_binding(tenant_id, story_id) when is_binary(tenant_id) and is_binary(story_id) do
@@ -212,11 +263,13 @@ defmodule Loopctl.Changes do
       %Binding{story_id: story_id, superseded_at: nil} = binding when story_id == story.id ->
         {:existing, binding}
 
+      # Refused before anything is written, so the answer is returned rather than raised: a
+      # caller inside its own transaction (`bind_in_tenant_transaction/3`) keeps it.
       %Binding{story_id: story_id} when story_id == story.id ->
-        Repo.rollback(:change_superseded)
+        {:refused, :change_superseded}
 
       %Binding{} ->
-        Repo.rollback(:change_bound_to_other_story)
+        {:refused, :change_bound_to_other_story}
 
       nil ->
         insert_binding(tenant_id, story, input, agent_id, lineage)
@@ -338,7 +391,7 @@ defmodule Loopctl.Changes do
 
     case Ecto.Changeset.apply_action(changeset, :insert) do
       {:ok, event} -> insert_unbound(tenant_id, input, event, agent_id, lineage)
-      {:error, reason} -> Repo.rollback(reason)
+      {:error, reason} -> {:refused, reason}
     end
   end
 
@@ -384,6 +437,7 @@ defmodule Loopctl.Changes do
   end
 
   defp after_commit({:ok, {:existing, binding}}, _tenant_id, _input), do: {:ok, binding}
+  defp after_commit({:ok, {:refused, reason}}, _tenant_id, _input), do: {:error, reason}
 
   defp after_commit({:ok, {:unbound, entry}}, tenant_id, input) do
     if entry do

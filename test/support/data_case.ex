@@ -391,6 +391,11 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-47.3: the gap pull. Not stubbed means a transient failure, never events.
+    Mox.stub(Loopctl.MockChgClient, :events_after, fn _url, _secret, _change_id, _after ->
+      {:error, :not_stubbed}
+    end)
+
     Mox.stub(Loopctl.MockPullRequestSource, :label_issue, fn _repo, _number, _label ->
       {:error, :not_stubbed}
     end)

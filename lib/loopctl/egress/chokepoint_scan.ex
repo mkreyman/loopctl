@@ -85,6 +85,11 @@ defmodule Loopctl.Egress.ChokepointScan do
         "intake source, never from a tenant-supplied URL. The writes carry NO tenant and NO " <>
         "reporter content outbound: the comment body is one of two compile-time constants " <>
         "in Loopctl.Delivery.Resolution, and the label is one of two constants beside them.",
+    "Loopctl.Changes.ReqChgClient" =>
+      "The change protocol's signed gap pull (US-47.3): one GET to chg-server, the " <>
+        "operator's own service, at the deployment-configured CHG_SERVER_URL, never a " <>
+        "tenant-supplied URL. Carries no tenant content outbound: the path is a change id " <>
+        "and the query is a sequence number. redirect: false.",
     "Loopctl.Secrets.FlyAdapter" =>
       "Operator-plane secret management against the Fly GraphQL API. Fixed host, not " <>
         "tenant-content egress, and never reachable from a tenant-supplied URL.",

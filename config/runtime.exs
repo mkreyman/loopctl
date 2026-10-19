@@ -182,6 +182,15 @@ case System.get_env("RUNNER_MAX_IN_FLIGHT_SESSIONS") &&
   _ -> :ok
 end
 
+# US-47.3: chg-server's base URL, for the signed gap pull (Loopctl.Changes.ReqChgClient). One
+# chg-server serves every enrolled repository, so this is deployment config, not a per-source
+# field. Unset: change events are still received, applied and audited; no gap or staleness pull
+# is attempted, and the reconcile sweep logs what it could not enqueue.
+case System.get_env("CHG_SERVER_URL") do
+  url when is_binary(url) and url != "" -> config :loopctl, :chg_server_url, String.trim(url)
+  _ -> :ok
+end
+
 # #803: the unattended dispatch driver (Loopctl.Delivery.DispatchDriver). OPT-IN — anything
 # but "true"/"1" leaves it off, including a typo, because this is the component that spends
 # money and runs code on someone's machines with nobody watching.
