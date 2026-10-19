@@ -84,6 +84,14 @@ defmodule ChgAdapter.IntegrationTest do
 
   test "snapshot builds once, then does no work in under 10 s", ctx do
     assert snapshot!(ctx) == "full"
+    lock = Path.join(ctx.dir, "mix.lock")
+    digest = :crypto.hash(:sha256, if(File.exists?(lock), do: File.read!(lock), else: ""))
+    marker = Path.join(ctx.dir, "deps/.chg_lock")
+    assert File.read!(marker) == Base.encode16(digest, case: :lower)
+    # A snapshot from before the marker gets one without building again.
+    File.rm!(marker)
+    assert snapshot!(ctx) == "none"
+    assert File.exists?(marker)
     started = System.monotonic_time(:millisecond)
     assert snapshot!(ctx) == "none"
     assert System.monotonic_time(:millisecond) - started < 10_000

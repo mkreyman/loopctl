@@ -3,6 +3,9 @@ defmodule Mix.Tasks.Chg.Static do
   @moduledoc """
   Runs the static checks for the difference between `--base` and the working tree:
 
+    * first, `mix deps.get` when `mix.lock` is not the one the deps directory was fetched
+      for (`ChgAdapter.sync_deps/0`, which every task runs); a failed fetch is the one
+      failure reported;
     * `mix format --check-formatted` on the changed Elixir files;
     * `mix credo --strict` on the changed Elixir files, when credo is a dependency, in an
       env it is declared for;
@@ -31,7 +34,12 @@ defmodule Mix.Tasks.Chg.Static do
         {:error, why} -> Mix.raise(why)
       end
 
-    failures = format(changed) ++ credo(changed) ++ compile() ++ dialyzer()
+    failures =
+      case ChgAdapter.deps_result() do
+        :ok -> format(changed) ++ credo(changed) ++ compile() ++ dialyzer()
+        # Every check would fail on the same missing deps: the fetch is the one failure.
+        {:error, out} -> [%{check: "deps", message: ChgAdapter.tail(out)}]
+      end
 
     ChgAdapter.emit(%{ok: failures == [], failures: failures})
     ChgAdapter.halt(if failures == [], do: 0, else: 1)

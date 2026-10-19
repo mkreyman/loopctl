@@ -43,11 +43,13 @@ A product then adds:
 
 | Task | Contract command | What it does |
 |---|---|---|
-| `mix chg.snapshot` | `snapshot` | `deps.get`, `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
+| `mix chg.snapshot` | `snapshot` | `deps.get` (recording `mix.lock`'s hash in `deps/.chg_lock`), `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
 | `mix chg.refs` | (part of `snapshot`) | Compiles the test files without running them or starting the app, and records each one's module references in `_build/chg/test_refs.etf`. |
 | `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed, or that read a changed path `chg` names in `CHG_READ`. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest, and everything when `CHG_READ` names a path. |
 | `mix chg.static --base <sha>` | `static` | `format --check-formatted` and `credo --strict` on the changed files, `compile --warnings-as-errors`, `dialyzer`. |
 | `mix chg.run --tests <list>` | `run` | `mix test` on the listed paths, one result per test. |
+
+Every task but `snapshot` first runs `mix deps.get` when `mix.lock` differs from the hash in `deps/.chg_lock`, and records the lock as the fetch left it: a tree hydrated from a snapshot holds the snapshot's deps, and a commit that bumps a dependency would otherwise stop on Mix's "lock mismatch". `static` reports a failed fetch as its one failure.
 | `mix chg.shard --of <n> --index <i>` | `shard` | One shard of the whole suite: stable by file name, or balanced by recorded time when `CHG_SHARD_BY` names a record. With `CHG_RECORD` set, it records coverage and timings to that file. |
 
 ## Why the selection does not use `mix test --stale --dry-run`

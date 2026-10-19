@@ -60,6 +60,10 @@ defmodule Mix.Tasks.Chg.Snapshot do
       ChgAdapter.write_atomic!(marker, key)
     end
 
+    # A snapshot built before deps/.chg_lock existed: its key covers mix.lock, so the deps
+    # it holds are the lock's.
+    if work == "none" and not File.exists?(ChgAdapter.lock_marker()), do: ChgAdapter.record_lock()
+
     ChgAdapter.emit(%{work: work, ms: ChgAdapter.ms_since(started)})
   end
 
@@ -92,13 +96,11 @@ defmodule Mix.Tasks.Chg.Snapshot do
   end
 
   defp key do
-    lock = if File.exists?("mix.lock"), do: File.read!("mix.lock"), else: ""
-
     Enum.join(
       [
         ChgAdapter.head!(),
         File.cwd!(),
-        Base.encode16(:crypto.hash(:sha256, lock), case: :lower),
+        ChgAdapter.lock_digest(),
         System.version(),
         System.otp_release()
       ],
@@ -108,6 +110,7 @@ defmodule Mix.Tasks.Chg.Snapshot do
 
   defp build! do
     step!("mix", ["deps.get"], [])
+    ChgAdapter.record_lock()
 
     for env <- ["dev", "test"] do
       step!("mix", ["compile"], [{"MIX_ENV", env}])

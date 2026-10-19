@@ -41,6 +41,7 @@ defmodule ChgAdapter do
   """
   def in_test_env(task, args, fun) do
     if Mix.env() == :test do
+      Process.put(:chg_deps, sync_deps())
       fun.()
     else
       {_, status} =
@@ -51,6 +52,48 @@ defmodule ChgAdapter do
 
       halt(status)
     end
+  end
+
+  @doc "The hash of the tree's `mix.lock` (of the empty string when it has none)."
+  def lock_digest do
+    lock = if File.exists?("mix.lock"), do: File.read!("mix.lock"), else: ""
+    Base.encode16(:crypto.hash(:sha256, lock), case: :lower)
+  end
+
+  @doc "The file recording the `lock_digest/0` the deps directory was last fetched for."
+  def lock_marker, do: Path.join(Mix.Project.deps_path(), ".chg_lock")
+
+  @doc """
+  Runs `mix deps.get` when `marker` does not hold the hash of the tree's `mix.lock`, then
+  records the hash of the lock as the fetch left it. A hydrated tree holds its snapshot's
+  deps, so without this a commit that bumps a dependency stops every task on Mix's "lock
+  mismatch". `in_test_env/3` runs it before each task; `deps_result/0` reads the outcome.
+  Returns `:ok` or `{:error, output}`.
+  """
+  def sync_deps(marker \\ lock_marker(), digest \\ &lock_digest/0, fetch \\ &fetch_deps/0) do
+    if File.read(marker) == {:ok, digest.()} do
+      :ok
+    else
+      case fetch.() do
+        {_, 0} ->
+          record_lock(marker, digest.())
+          :ok
+
+        {out, _} ->
+          {:error, out}
+      end
+    end
+  end
+
+  defp fetch_deps, do: capture("mix", ["deps.get"])
+
+  @doc "What `sync_deps/0` returned for this task: `:ok` or `{:error, output}`."
+  def deps_result, do: Process.get(:chg_deps, :ok)
+
+  @doc "Records `digest` in `marker`, creating the deps directory a project without deps lacks."
+  def record_lock(marker \\ lock_marker(), digest \\ lock_digest()) do
+    File.mkdir_p!(Path.dirname(marker))
+    File.write!(marker, digest)
   end
 
   @doc """

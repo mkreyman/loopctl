@@ -227,6 +227,7 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
 - **Elixir adapter:**
   - `snapshot`: `mix deps.get`, `mix compile` for dev and test (with `check_cwd: false`), a PLT build, then `mix chg.refs`, which compiles every test file without running it and records its module references.
   - `affected`: the `--stale` selection without running anything. `mix test --stale --dry-run` cannot do it: on 1.20.4 `--dry-run` turns `--stale` off, and the stale manifest is only written after a green run. So the adapter reads Mix's compile manifest for the module graph and its own reference cache for the tests, and applies `--stale`'s rule: a changed module plus every module referencing it, transitively, selects the test files with a compile or runtime reference into that set. Runtime-only dispatch (string module names, Oban args) can escape it, which is why the post-merge full suite exists.
+  - Every task but `snapshot` first runs `mix deps.get` when `mix.lock` is not the lock the hydrated deps were fetched for (recorded in `deps/.chg_lock` by the snapshot and by each fetch).
   - `static`: format and credo on changed files, `compile --warnings-as-errors` (incremental), dialyzer against the warm PLT.
   - `shard`: test files split by a stable hash of their path; not `mix test --partitions`, because `MIX_TEST_PARTITION` already isolates each workspace's test database.
 - **TS (pnpm) adapter:**
