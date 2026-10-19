@@ -127,10 +127,24 @@ need a `def cli` entry for an archive's tasks.
 ebin. Each task therefore loads all of its modules before it compiles, and `run` calls
 `mix test` in the same VM so its formatter stays loaded.
 
+The build path checks commits from every branch against one test database, and a branch's
+migration stays there after the next commit, which lacks it, is checked out: `ecto.migrate` cannot
+roll back a migration the tree does not have. Before `run` and `shard` start `mix test`, they read
+`schema_migrations` for each repo in `:ecto_repos` whose compiled module uses
+`Ecto.Adapters.Postgres` (config from `config/*.exs`, `config/runtime.exs` and `:url`). A database
+version that no migration file in `priv/**/*migrations/`, the repo's `priv` or its
+`migrations_paths` has, and that is newer than the tree's oldest migration, makes the database
+ahead. An ahead database is dropped when the `test` alias runs a task before `test` (the product's
+setup, which builds it again for this tree), and reported on stderr otherwise. A check that cannot
+run is reported and changes nothing. On HCB, a test database carrying one migration from beyond
+master failed `follow_ups_test.exs` with 53 `not_null_violation` lines under plain `mix test`, and
+passed under `mix chg.run` (minis, 2026-10-19).
+
 ## Tests
 
     mix test test/select_test.exs test/static_test.exs test/runner_test.exs test/snapshot_test.exs \
-      test/chg_adapter_test.exs test/digest_test.exs test/shard_test.exs
+      test/chg_adapter_test.exs test/digest_test.exs test/shard_test.exs test/head_test.exs \
+      test/record_test.exs test/test_db_test.exs
     CHG_BIN=$PWD/../../target/debug/chg mix test test/integration_test.exs
 
 The integration test builds the archive, installs it into a private `MIX_ARCHIVES`, and drives

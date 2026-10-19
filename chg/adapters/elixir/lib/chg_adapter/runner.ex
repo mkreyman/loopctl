@@ -14,6 +14,7 @@ defmodule ChgAdapter.Runner do
       Path.join(System.tmp_dir!(), "chg-results-#{System.unique_integer([:positive])}.jsonl")
 
     System.put_env("CHG_RESULTS", results_file)
+    if present != [], do: ChgAdapter.TestDb.reset_ahead()
     recording = start_recording(present)
     status = if present == [], do: 0, else: mix_test(present)
     results = read(results_file)
