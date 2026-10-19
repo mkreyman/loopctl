@@ -6,9 +6,10 @@ defmodule Mix.Tasks.Chg.Static do
     * first, `mix deps.get` when `mix.lock` is not the one the deps directory was fetched
       for (`ChgAdapter.sync_deps/0`, which every task runs); a failed fetch is the one
       failure reported;
-    * `mix format --check-formatted` on the changed Elixir files;
-    * `mix credo --strict` on the changed Elixir files, when credo is a dependency, in an
-      env it is declared for;
+    * `mix format --check-formatted` on the changed Elixir files among `.formatter.exs`'s
+      inputs;
+    * `mix credo --strict` on the changed Elixir files among `.credo.exs`'s, when credo is
+      a dependency, in an env it is declared for;
     * `mix compile --warnings-as-errors`, incremental from the snapshot's `_build`;
     * `mix dialyzer` against the snapshot's PLT, when dialyxir is a dependency.
 
@@ -36,9 +37,13 @@ defmodule Mix.Tasks.Chg.Static do
 
     failures =
       case ChgAdapter.deps_result() do
-        :ok -> format(changed) ++ credo(changed) ++ compile() ++ dialyzer()
+        :ok ->
+          format(format_inputs(changed)) ++
+            credo(credo_inputs(changed)) ++ compile() ++ dialyzer()
+
         # Every check would fail on the same missing deps: the fetch is the one failure.
-        {:error, out} -> [%{check: "deps", message: ChgAdapter.tail(out)}]
+        {:error, out} ->
+          [%{check: "deps", message: ChgAdapter.tail(out)}]
       end
 
     ChgAdapter.emit(%{ok: failures == [], failures: failures})
@@ -46,6 +51,141 @@ defmodule Mix.Tasks.Chg.Static do
   end
 
   defp elixir_file?(p), do: Path.extname(p) in [".ex", ".exs", ".heex"]
+
+  # The gate runs `mix format --check-formatted` and `mix credo --strict` without paths, so
+  # each checks only the files its config names. A path given on the command line is
+  # checked whatever the config says, so the changed files are narrowed to those first.
+  # A config that cannot be read, or has a shape this does not know, leaves the files
+  # checked as given.
+
+  @doc "The `files` (relative to `dir`) that `mix format` with no paths would check."
+  def format_inputs(files, dir \\ ".") do
+    case formatter_files(dir) do
+      {:ok, inputs} -> Enum.filter(files, &MapSet.member?(inputs, Path.expand(&1, dir)))
+      _ -> files
+    end
+  end
+
+  # Like mix format, a subdirectory without its own .formatter.exs adds no files.
+  defp formatter_files(dir) do
+    case eval(Path.join(dir, ".formatter.exs")) do
+      {:ok, opts} when is_list(opts) ->
+        own =
+          for glob <- List.wrap(opts[:inputs]),
+              f <- Path.wildcard(Path.join(dir, glob), match_dot: true),
+              do: Path.expand(f)
+
+        opts[:subdirectories]
+        |> List.wrap()
+        |> Enum.flat_map(&Path.wildcard(Path.join(dir, &1)))
+        |> Enum.reduce_while({:ok, MapSet.new(own)}, fn sub, {:ok, acc} ->
+          case formatter_files(sub) do
+            {:ok, more} -> {:cont, {:ok, MapSet.union(acc, more)}}
+            :missing -> {:cont, {:ok, acc}}
+            :error -> {:halt, :error}
+          end
+        end)
+
+      {:ok, _} ->
+        :error
+
+      other ->
+        other
+    end
+  end
+
+  @credo_default %{
+    included: [
+      "lib/",
+      "src/",
+      "test/",
+      "web/",
+      "apps/*/lib/",
+      "apps/*/src/",
+      "apps/*/test/",
+      "apps/*/web/"
+    ],
+    excluded: [~r"/_build/", ~r"/deps/", ~r"/node_modules/"]
+  }
+
+  @doc "The `files` (relative to `dir`) that `mix credo` with no paths would check."
+  def credo_inputs(files, dir \\ ".") do
+    with {:ok, %{included: inc, excluded: exc}} <- credo_files(dir),
+         {:ok, inc} <- expand_entries(inc, dir),
+         {:ok, exc} <- expand_entries(exc, dir) do
+      Enum.filter(files, fn f ->
+        Enum.any?(inc, &credo_match?(f, &1, dir)) and
+          not Enum.any?(exc, &credo_match?(f, &1, dir))
+      end)
+    else
+      _ -> files
+    end
+  end
+
+  # Credo reads .credo.exs or config/.credo.exs and uses the config named "default", or its
+  # built-in one when there is none. Both files present means merged settings, which this
+  # does not reproduce, so the files are checked as given.
+  defp credo_files(dir) do
+    found =
+      for name <- [".credo.exs", "config/.credo.exs"],
+          (r = eval(Path.join(dir, name))) != :missing,
+          do: r
+
+    case found do
+      [] ->
+        {:ok, @credo_default}
+
+      [{:ok, %{configs: configs}}] when is_list(configs) ->
+        files =
+          case Enum.find(configs, &(is_map(&1) and &1[:name] == "default")) do
+            %{files: %{} = f} -> f
+            _ -> %{}
+          end
+
+        {:ok, Map.merge(@credo_default, Map.take(files, [:included, :excluded]))}
+
+      _ ->
+        :error
+    end
+  end
+
+  # Each entry as a Regex, or as the expanded paths it names: itself, or a glob's matches.
+  defp expand_entries(entries, dir) when is_list(entries) do
+    Enum.reduce_while(entries, {:ok, []}, fn
+      %Regex{} = r, {:ok, acc} ->
+        {:cont, {:ok, [r | acc]}}
+
+      e, {:ok, acc} when is_binary(e) ->
+        paths =
+          if String.contains?(e, ["*", "?", "[", "{"]),
+            do: Enum.map(Path.wildcard(Path.join(dir, e)), &Path.expand/1),
+            else: [Path.expand(e, dir)]
+
+        {:cont, {:ok, [{:paths, paths} | acc]}}
+
+      _, _ ->
+        {:halt, :error}
+    end)
+  end
+
+  defp expand_entries(_, _), do: :error
+
+  # A regex is matched against the path as credo sees it, relative to the project.
+  defp credo_match?(f, %Regex{} = r, _dir), do: Regex.match?(r, f)
+
+  defp credo_match?(f, {:paths, paths}, dir),
+    do: Enum.any?(paths, &under?(Path.expand(f, dir), &1))
+
+  defp under?(f, path),
+    do: f == path or String.starts_with?(f, String.trim_trailing(path, "/") <> "/")
+
+  defp eval(path) do
+    if File.regular?(path), do: {:ok, path |> Code.eval_file() |> elem(0)}, else: :missing
+  rescue
+    e ->
+      IO.puts(:standard_error, "chg: #{path} not read: #{Exception.message(e)}")
+      :error
+  end
 
   @doc false
   def format([]), do: []
