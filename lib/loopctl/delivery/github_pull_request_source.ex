@@ -526,6 +526,28 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   def label_issue(_repo, number, _label), do: {:error, {:invalid_issue_number, number}}
 
+  # The label goes in the URL PATH here, which `label/1`'s comment says a label never does
+  # elsewhere. It is percent-encoded as a whole segment (`URI.char_unreserved?/1`), so a `/`,
+  # `?`, `#` or `..` in a name cannot address another resource. A 404 is SUCCESS: GitHub
+  # answers it for a label the issue does not carry, and that is the state asked for. A 404
+  # for an issue that is gone reads as success too. The closer's next call, `label_issue/3`,
+  # gets the same 404 and abandons there.
+  @impl true
+  def remove_label(repo, number, label) when is_integer(number) and number > 0 do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, label} <- label(label) do
+      segment = URI.encode(label, &URI.char_unreserved?/1)
+
+      case delete(repo, "/issues/#{number}/labels/#{segment}") do
+        {:ok, _body} -> :ok
+        {:error, {:github_api_error, 404}} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  def remove_label(_repo, number, _label), do: {:error, {:invalid_issue_number, number}}
+
   @impl true
   def comment_issue(repo, number, body) when is_integer(number) and number > 0 do
     with {:ok, repo} <- repo_name(repo),
@@ -1015,7 +1037,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  # The two WRITE verbs (#805). Same options as `get/2` — the same bounded timeouts, the same
+  # The WRITE verbs (#805; DELETE for US-47.10). Same options as `get/2` — the same bounded timeouts, the same
   # `retry: false`, the same `redirect: false` — so a write is no less bounded than a read and
   # a renamed repository cannot silently redirect one onto somebody else's issue.
   #
@@ -1024,18 +1046,26 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # made underneath it.
   defp post(repo, path, body), do: write(&Req.post/2, repo, path, body)
   defp patch(repo, path, body), do: write(&Req.patch/2, repo, path, body)
+  defp delete(repo, path), do: write(&Req.delete/2, repo, path, nil)
 
-  # GitHub answers 200 or 201 to the three writes here. Every other status goes through the
-  # SAME `failure/1` a read does, so a rate limit stays transient and a 403 the headers do not
+  # GitHub answers 200 or 201 to the POST and PATCH writes here, and 200 or 204 to the
+  # DELETE, which carries no body (`nil`). Every other status goes through the SAME
+  # `failure/1` a read does, so a rate limit stays transient and a 403 the headers do not
   # call a limit stays a permanent permission problem — one classification for the whole
   # client, which is why these live on this module rather than a second one.
   defp write(verb, repo, path, body) do
-    url = url(repo, path)
+    opts =
+      if body == nil, do: req_options(repo), else: Keyword.put(req_options(repo), :json, body)
 
-    case verb.(url, Keyword.put(req_options(repo), :json, body)) do
-      {:ok, %Req.Response{status: status, body: body}} when status in [200, 201] -> {:ok, body}
-      {:ok, %Req.Response{} = response} -> {:error, failure(response)}
-      {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
+    case verb.(url(repo, path), opts) do
+      {:ok, %Req.Response{status: status, body: body}} when status in [200, 201, 204] ->
+        {:ok, body}
+
+      {:ok, %Req.Response{} = response} ->
+        {:error, failure(response)}
+
+      {:error, reason} ->
+        {:error, {:github_unreachable, shape(reason)}}
     end
   end
 

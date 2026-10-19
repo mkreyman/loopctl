@@ -192,9 +192,16 @@ defmodule Loopctl.Delivery.TriageTrigger do
   # LOOPCTL'S OWN FACTS ONLY — the repository and the issue number. Not the reporter's title,
   # which is what a stub would naturally borrow and is exactly what design §10 forbids
   # reaching an implementer. Triage replaces this with the drafted title.
-  defp stub_title(%Record{issue_number: number}, %Source{repo_full_name: repo}) do
-    "Triage pending: #{repo}##{number}"
-  end
+  #
+  # A later generation (US-47.10) says so, from loopctl's own counter, so the reopened issue's
+  # second story is not a twin of the first in the epic's list.
+  defp stub_title(%Record{issue_number: number, generation: 1}, %Source{repo_full_name: repo}),
+    do: "Triage pending: #{repo}##{number}"
+
+  defp stub_title(%Record{issue_number: number, generation: generation}, %Source{
+         repo_full_name: repo
+       }),
+       do: "Triage pending: #{repo}##{number} (reopened, generation #{generation})"
 
   # `EPIC.SEQUENCE`, which is the convention every other story in this codebase follows —
   # story `43.1` is the first story of epic 43 — and NOT a scheme of this module's own.

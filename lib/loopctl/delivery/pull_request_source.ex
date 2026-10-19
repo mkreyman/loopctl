@@ -85,9 +85,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
   can be an ancestor of what is deployed rather than equal to it, and that IS shipped.
   The forge answers whether `sha` is reachable from `ref`.
 
-  ## `issue/2`, `label_issue/3`, `comment_issue/3` and `close_issue/3` — the reporter's side (#805)
+  ## `issue/2`, `label_issue/3`, `remove_label/3`, `comment_issue/3` and `close_issue/3` — the reporter's side (#805)
 
-  The four calls `Loopctl.Delivery.IssueCloser` makes to tell the person who filed a GitHub
+  The five calls `Loopctl.Delivery.IssueCloser` makes to tell the person who filed a GitHub
   issue what happened to it. They live on THIS behaviour for the same reason the deployment
   pair does: one config-resolved forge client for the whole delivery loop, with one set of
   bounded timeouts and one rate-limit classification, rather than a second client with its
@@ -284,6 +284,16 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback label_issue(repo(), pos_integer(), String.t()) :: :ok | {:error, term()}
 
   @doc """
+  REMOVES one label from an issue, leaving every other label alone.
+
+  The closer uses it for one thing: taking an EARLIER generation's resolution label off a
+  reopened issue before it applies its own (US-47.10), so a close never carries two
+  resolution labels. Idempotent: removing a label the issue does not carry is `:ok`, because
+  the state the caller asked for already holds.
+  """
+  @callback remove_label(repo(), pos_integer(), String.t()) :: :ok | {:error, term()}
+
+  @doc """
   Posts one comment on an issue.
 
   The ONLY callback here that is not naturally idempotent — a second call is a second comment
@@ -365,6 +375,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @doc false
   def label_issue(%ForgeRepo{} = repo, a, b), do: impl().label_issue(repo, a, b)
+
+  @doc false
+  def remove_label(%ForgeRepo{} = repo, a, b), do: impl().remove_label(repo, a, b)
 
   @doc false
   def comment_issue(%ForgeRepo{} = repo, a, b), do: impl().comment_issue(repo, a, b)

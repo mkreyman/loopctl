@@ -1099,6 +1099,52 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
+  describe "remove_label/3" do
+    test "DELETEs the one label, percent-encoded as a single path segment" do
+      parent = self()
+
+      stub(fn conn ->
+        send(parent, {:request, conn.method, conn.request_path})
+        json(conn, [])
+      end)
+
+      assert :ok = Source.remove_label(@repo, 7, "loopctl:resolution-shipped")
+      assert_received {:request, "DELETE", "/repos/acme/widgets/issues/7/labels/" <> segment}
+      assert segment == "loopctl%3Aresolution-shipped"
+
+      # A slash cannot address another resource.
+      assert :ok = Source.remove_label(@repo, 7, "a/../b")
+      assert_received {:request, "DELETE", "/repos/acme/widgets/issues/7/labels/a%2F..%2Fb"}
+    end
+
+    test "a 404 is success: the label is already absent" do
+      stub(fn conn -> Plug.Conn.resp(conn, 404, ~s({"message":"Label does not exist"})) end)
+      assert :ok = Source.remove_label(@repo, 7, "loopctl:resolution-shipped")
+    end
+
+    test "a 5xx and a rate limit are errors, classified as every other write's are" do
+      stub(fn conn -> Plug.Conn.resp(conn, 502, "{}") end)
+      assert {:error, {:github_api_error, 502} = reason} = Source.remove_label(@repo, 7, "x")
+      assert MergePrecondition.transient?(reason)
+
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.resp(403, "{}")
+      end)
+
+      assert {:error, {:github_rate_limited, 403, _}} = Source.remove_label(@repo, 7, "x")
+
+      stub(fn conn -> Plug.Conn.resp(conn, 403, "{}") end)
+      assert {:error, {:github_api_error, 403} = denied} = Source.remove_label(@repo, 7, "x")
+      refute MergePrecondition.transient?(denied)
+    end
+
+    test "a label carrying a control character is refused before the network" do
+      assert {:error, {:invalid_label, _}} = Source.remove_label(@repo, 7, "bad\nlabel")
+    end
+  end
+
   describe "comment_issue/3" do
     test "POSTs the body to the comments sub-resource" do
       parent = self()

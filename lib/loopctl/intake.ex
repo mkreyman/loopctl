@@ -75,6 +75,56 @@ defmodule Loopctl.Intake do
     stored content as possibly one event behind. The flag clears on the next strictly
     newer delivery, which settles the order.
 
+  An issue's deliveries are ordered against its NEWEST generation (below), and only that one.
+  A delivery older than the newest generation's content is dropped there like any other
+  older delivery. It is not applied to an earlier generation either, because an earlier
+  generation is never written again.
+
+  ## Generations
+
+  An issue has one record per generation (`Loopctl.Intake.Record`, `generation`), unique on
+  `(tenant_id, source_id, issue_number, generation)`. Every delivery applies to the NEWEST
+  generation. chg closes an issue it filed once the failure has been quiet for a while after
+  the merge, and reopens it if the failure comes back. A `reopened` delivery whose newest
+  record has reached the end of the loop therefore starts generation N+1 and applies its
+  content there. The new record sits at `pending_triage`, and the triage drain takes it like
+  any new issue. A record has reached the end of the loop (`loop_ended?/1`) when it has an
+  issue-closure row, or when its story's stage is one of `generation_end_stages/0`.
+
+  The bump has to be a delivery that WOULD be applied, newer than the record (or the same
+  second with different content). A reopen that is older than what the record already holds
+  starts nothing, so a late reopen cannot fork the issue after a newer close.
+
+  Nothing else starts a generation. A reopen of a record whose story is still in flight, or
+  that has no story yet, is applied to that record as before. The earlier generation's
+  record, story and closure are never written again.
+
+  A new generation inherits its predecessor's escalation (status, reasons, `escalated_at`).
+  An escalation is never cleared by a later delivery, and a reopen is a later delivery: a
+  reopen must not launder a flagged issue back into the triage queue. The inherited reasons
+  get their own `intake_escalated` entry on the new record, naming the generation they came
+  from.
+
+  **Which record is newest is decided under the lock, not before it.** `SELECT ... ORDER BY
+  generation DESC LIMIT 1 FOR UPDATE` picks its row from the statement's snapshot BEFORE it
+  waits. A delivery that queues behind a bump therefore gets generation N once the bump
+  commits, although N+1 now exists, because the bump never changes N's row. So after the
+  lock is taken, a FRESH statement asks whether a newer generation exists, and if one does
+  the delivery locks that one instead, until the row it holds is the newest
+  (`newest_locked/2`). It holds every row it passed on the way. A bump holds N's lock while
+  it inserts N+1, so a delivery that has the lock on N and has seen no N+1 cannot be
+  overtaken. That covers every action: an `edited` lands on N+1, and a second reopen finds
+  N+1 with no story and starts nothing. The unique index on the generation stays as a
+  backstop. A conflict there would mean a bump without the lock, and it raises rather than
+  being absorbed. A replayed delivery never gets this far: step 4's delivery index stops it
+  first.
+
+  An earlier generation's closure that is still pending when a later generation starts is
+  abandoned by `Loopctl.Delivery.IssueCloser` as `superseded_by_generation`, before any
+  forge call. Its story may have ended the loop at `merged`, before its verdict wrote the
+  closure. Closing the reopened issue with the old fix's message would answer a report
+  that is being triaged again.
+
   ## Isolation
 
   `AdminRepo` with an explicit `tenant_id` predicate on every query, as `Loopctl.Runners`
@@ -93,6 +143,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
+  alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
@@ -109,6 +160,15 @@ defmodule Loopctl.Intake do
   @max_body_bytes 1_048_576
 
   @issue_actions ~w(opened edited reopened closed labeled unlabeled)
+
+  # The stages at which a story's change has LANDED (`Loopctl.Delivery.StageMachine`). From
+  # `merged` on the fix is on trunk, so a recurrence is a new problem for a new triage, not
+  # more work on this story. Not `escalated` or `failed`. `escalated` is waiting for a human,
+  # who may send it back to `queued` (`:human_resolution`), so the issue is still that
+  # story's. A `failed` story shipped nothing. When it failed over `:triage_reject`, the
+  # verdict wrote a closure and the closure clause covers it. When it failed over
+  # `:budget_exceeded`, nothing in `lib/` writes that edge today.
+  @generation_end_stages [:merged, :deployed, :verified, :done]
 
   # Retention (see "Retention" in the moduledoc). DELIBERATELY an order of magnitude below the
   # trace pruner's, because this half runs on `AdminRepo`, whose pool is 3 connections that
@@ -143,6 +203,10 @@ defmodule Loopctl.Intake do
   @doc "The largest webhook body, in bytes, the intake route reads."
   @spec max_body_bytes() :: pos_integer()
   def max_body_bytes, do: @max_body_bytes
+
+  @doc "The story stages at which a reopen starts an issue's next generation (see Generations)."
+  @spec generation_end_stages() :: [atom()]
+  def generation_end_stages, do: @generation_end_stages
 
   @doc "The `issues` actions that update an intake record."
   @spec issue_actions() :: [String.t()]
@@ -1380,15 +1444,12 @@ defmodule Loopctl.Intake do
   defp apply_plan(_source, _delivery_id, {:ignored, _action}), do: :ignored
 
   defp apply_plan(source, delivery_id, {:issue, action, issue}) do
-    record = ensure_record(source, issue.number)
     extraction = TicketFacts.extract(issue.title, issue.body)
+    {record, content} = target_record(source, action, issue, extraction, delivery_id)
     new_reasons = scan(issue, extraction) -- record.escalation_reasons
     now = DateTime.utc_now()
 
-    changes =
-      record
-      |> content_changes(issue, extraction, action, delivery_id)
-      |> Map.merge(escalation_changes(record, new_reasons, now))
+    changes = Map.merge(content, escalation_changes(record, new_reasons, now))
 
     with {:ok, updated} <- AdminRepo.update(Record.apply_changeset(record, changes)),
          :ok <- escalate(updated, new_reasons, delivery_id) do
@@ -1398,8 +1459,99 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # Insert-or-nothing, then lock: two deliveries for a new issue cannot both create it,
-  # and the second waits for the first's changes before it merges its own.
+  # The record this delivery applies to and the content changes it makes there: the issue's
+  # newest generation, or a new one (see "Generations" in the moduledoc).
+  #
+  # The changes are computed against the NEWEST record before a new one is started, and they
+  # are what goes onto the new record. That keeps the same-second case honest: a reopen
+  # stamped with the same second as the close it follows is applied with `order_ambiguous`
+  # set, on the new record too, so triage re-reads the live issue.
+  defp target_record(source, action, issue, extraction, delivery_id) do
+    newest = ensure_record(source, issue.number)
+    content = content_changes(newest, issue, extraction, action, delivery_id)
+
+    if starts_generation?(newest, action, content) do
+      {insert_generation(source, newest, delivery_id), content}
+    else
+      {newest, content}
+    end
+  end
+
+  # Only a reopen, only one that would be applied (an older or restating one changes
+  # nothing, so it starts nothing), and only on a record whose story has reached the end.
+  defp starts_generation?(_record, _action, content) when content == %{}, do: false
+  defp starts_generation?(record, "reopened", _content), do: loop_ended?(record)
+  defp starts_generation?(_record, _action, _content), do: false
+
+  @doc """
+  Whether `record` has reached the end of the delivery loop: it has an issue-closure row,
+  or its story's stage is in `generation_end_stages/0`. A `reopened` delivery starts the
+  issue's next generation only then (see "Generations" in the moduledoc).
+
+  Read on `AdminRepo` with the record's tenant on every source. Committed state, unlocked:
+  a story that moves out of the set afterwards (a revert, `merged -> implementing`) leaves
+  the new generation in place. The two are separate work items for the same issue, and
+  either can be resolved without the other.
+  """
+  @spec loop_ended?(Record.t()) :: boolean()
+  def loop_ended?(%Record{tenant_id: tenant_id, id: record_id}) do
+    AdminRepo.exists?(
+      from c in IssueClosure,
+        where: c.tenant_id == ^tenant_id and c.intake_record_id == ^record_id
+    ) or
+      AdminRepo.exists?(
+        from s in Story,
+          join: st in StoryStage,
+          on: st.story_id == s.id and st.tenant_id == s.tenant_id,
+          where: s.tenant_id == ^tenant_id and s.intake_record_id == ^record_id,
+          where: st.stage in ^@generation_end_stages
+      )
+  end
+
+  # The issue's next generation, inheriting the predecessor's escalation (see the moduledoc).
+  # A plain insert: the caller holds `previous` locked and has seen no newer generation
+  # (`newest_locked/2`), so nothing else can be inserting this one. The unique index is the
+  # backstop, and a conflict there raises.
+  defp insert_generation(source, %Record{} = previous, delivery_id) do
+    now = DateTime.utc_now()
+
+    row = %{
+      id: Ecto.UUID.generate(),
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      project_id: source.project_id,
+      issue_number: previous.issue_number,
+      generation: previous.generation + 1,
+      status: previous.status,
+      escalation_reasons: previous.escalation_reasons,
+      escalated_at: previous.escalated_at,
+      inserted_at: now,
+      updated_at: now
+    }
+
+    {1, [fresh]} = AdminRepo.insert_all(Record, [row], returning: true)
+
+    Logger.info(
+      "intake: issue ##{fresh.issue_number} of source #{fresh.source_id} reopened after " <>
+        "its loop ended; generation #{fresh.generation} is record #{fresh.id} " <>
+        "(previous #{previous.id})"
+    )
+
+    inherited = %{
+      "inherited_from_generation" => previous.generation,
+      "inherited_from_record_id" => previous.id
+    }
+
+    case escalate(fresh, fresh.escalation_reasons, delivery_id, inherited) do
+      :ok -> fresh
+      {:error, reason} -> AdminRepo.rollback(reason)
+    end
+  end
+
+  # Insert-or-nothing of generation 1, then lock the NEWEST generation: two deliveries for a
+  # new issue cannot both create it, and the second waits for the first's changes before it
+  # merges its own. When a later generation exists the insert conflicts on generation 1 and
+  # the newest is still the one read.
   defp ensure_record(source, number) do
     now = DateTime.utc_now()
 
@@ -1412,20 +1564,35 @@ defmodule Loopctl.Intake do
           source_id: source.id,
           project_id: source.project_id,
           issue_number: number,
+          generation: 1,
           inserted_at: now,
           updated_at: now
         }
       ],
       on_conflict: :nothing,
-      conflict_target: [:tenant_id, :source_id, :issue_number]
+      conflict_target: [:tenant_id, :source_id, :issue_number, :generation]
     )
 
-    AdminRepo.one!(
+    newest_locked(source, number)
+  end
+
+  # Locks the newest generation, deciding "newest" AFTER the lock: see "Generations" in the
+  # moduledoc. The existence check is a new statement, so it sees a generation committed
+  # while this one waited.
+  defp newest_locked(source, number) do
+    issue =
       from r in Record,
         where: r.tenant_id == ^source.tenant_id,
-        where: r.source_id == ^source.id and r.issue_number == ^number,
-        lock: "FOR UPDATE"
-    )
+        where: r.source_id == ^source.id and r.issue_number == ^number
+
+    locked =
+      AdminRepo.one!(
+        from r in issue, order_by: [desc: r.generation], limit: 1, lock: "FOR UPDATE"
+      )
+
+    if AdminRepo.exists?(from r in issue, where: r.generation > ^locked.generation),
+      do: newest_locked(source, number),
+      else: locked
   end
 
   # Everything the detector and the fact extractor read is the UNCAPPED payload text.
@@ -1580,9 +1747,11 @@ defmodule Loopctl.Intake do
     }
   end
 
-  defp escalate(_record, [], _delivery_id), do: :ok
+  defp escalate(record, new_reasons, delivery_id, detail \\ %{})
 
-  defp escalate(record, new_reasons, delivery_id) do
+  defp escalate(_record, [], _delivery_id, _detail), do: :ok
+
+  defp escalate(record, new_reasons, delivery_id, detail) do
     Logger.warning(
       "intake: escalated issue ##{record.issue_number} of source #{record.source_id} " <>
         "(record #{record.id}): #{Enum.join(new_reasons, ", ")}"
@@ -1593,13 +1762,16 @@ defmodule Loopctl.Intake do
            actor_lineage: [],
            entity_type: "intake_record",
            entity_id: record.id,
-           payload: %{
-             "source_id" => record.source_id,
-             "issue_number" => record.issue_number,
-             "github_delivery_id" => delivery_id,
-             "signals" => new_reasons,
-             "escalation_reasons" => record.escalation_reasons
-           }
+           payload:
+             %{
+               "source_id" => record.source_id,
+               "issue_number" => record.issue_number,
+               "generation" => record.generation,
+               "github_delivery_id" => delivery_id,
+               "signals" => new_reasons,
+               "escalation_reasons" => record.escalation_reasons
+             }
+             |> Map.merge(detail)
          }) do
       {:ok, _entry} -> :ok
       {:error, reason} -> {:error, reason}
