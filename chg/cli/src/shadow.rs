@@ -17,7 +17,8 @@
 //!   `chg shadow report --ci-check <name>` fills in a commit no local gate judged (a push
 //!   the hook let CI judge) from that check run on GitHub.
 //! - `chg shadow report` pairs the rows by commit and prints the disagreements and the
-//!   cutover criteria.
+//!   cutover criteria. A push is one commit on one machine, however many chg runs judged
+//!   it there; the extra runs are reruns, and any one that disagrees with the gate counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -452,6 +453,8 @@ pub struct Report {
     pub unpaired: usize,
     pub skipped: usize,
     pub errors: usize,
+    /// Later verdicts on a commit and machine that already had one.
+    pub reruns: usize,
     pub median_chg_ms: Option<u64>,
     pub median_gate_ms: Option<u64>,
     pub median_saved_ms: Option<i64>,
@@ -496,40 +499,51 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
             gates.entry(r.sha.as_str()).or_default().push(r);
         }
     }
-    let chg: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.kind == "chg" && r.repo == repo)
-        .collect();
+    // One push is one commit on one machine. A second check of it there (by hand, or
+    // against another base) is a rerun, not another push. Which run was the hook's is
+    // not recorded, so no run is preferred: a push counts as a miss if any of its chg
+    // runs passed while the gate failed, and as chg red if any failed while it passed.
+    let mut pushes: BTreeMap<(&str, &str), Vec<&Row>> = BTreeMap::new();
+    let (mut unpaired, mut skipped, mut errors, mut reruns) = (0, 0, 0, 0);
+    for r in rows.iter().filter(|r| r.kind == "chg" && r.repo == repo) {
+        match r.verdict {
+            Outcome::Skipped => skipped += 1,
+            Outcome::Error => errors += 1,
+            Outcome::Pass | Outcome::Fail => pushes
+                .entry((r.sha.as_str(), r.host.as_str()))
+                .or_default()
+                .push(r),
+        }
+    }
 
     let mut pairs = Vec::new();
-    let (mut unpaired, mut skipped, mut errors) = (0, 0, 0);
-    for c in &chg {
-        match c.verdict {
-            Outcome::Skipped => {
-                skipped += 1;
-                continue;
-            }
-            Outcome::Error => {
-                errors += 1;
-                continue;
-            }
-            Outcome::Pass | Outcome::Fail => {}
-        }
-        let Some(g) = gates.get(c.sha.as_str()) else {
+    for ((sha, _), runs) in &pushes {
+        reruns += runs.len() - 1;
+        let Some(g) = gates.get(sha) else {
             unpaired += 1;
             continue;
         };
         let verdicts: BTreeSet<&str> = g.iter().map(|r| r.verdict.as_str()).collect();
         let latest = g.iter().max_by_key(|r| r.at_ms).expect("non-empty");
-        let class = if verdicts.len() > 1 {
-            Class::GateFlaky
-        } else if c.verdict == latest.verdict {
-            Class::Agree
-        } else if c.verdict == Outcome::Pass {
-            Class::Miss
-        } else {
-            Class::ChgRed
+        let first = |want: &dyn Fn(&Row) -> bool| {
+            runs.iter()
+                .copied()
+                .filter(|r| want(r))
+                .min_by_key(|r| r.at_ms)
         };
+        let (class, c) = if verdicts.len() > 1 {
+            (Class::GateFlaky, first(&|_| true))
+        } else if let Some(c) = first(&|r| r.verdict != latest.verdict) {
+            let class = if c.verdict == Outcome::Pass {
+                Class::Miss
+            } else {
+                Class::ChgRed
+            };
+            (class, Some(c))
+        } else {
+            (Class::Agree, first(&|_| true))
+        };
+        let c = c.expect("a push has a run");
         let selected: Option<BTreeSet<&str>> = c
             .selected
             .as_ref()
@@ -617,6 +631,7 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
         unpaired,
         skipped,
         errors,
+        reruns,
         median_chg_ms,
         median_gate_ms,
         median_saved_ms: median(saved.clone()),
@@ -671,8 +686,8 @@ impl Report {
         line(
             &mut o,
             format!(
-                "not counted: {} awaiting a gate verdict, {} skipped, {} errored",
-                self.unpaired, self.skipped, self.errors
+                "not counted: {} awaiting a gate verdict, {} skipped, {} errored, {} rerun(s)",
+                self.unpaired, self.skipped, self.errors, self.reruns
             ),
         );
         let opt = |m: Option<u64>| m.map(fmt_ms).unwrap_or_else(|| "-".into());
@@ -969,13 +984,30 @@ mod tests {
             gate("d", Outcome::Pass, 500_000, &[]),
             chg("e", "m1", Outcome::Pass, 60_000, &[]),
             Row::from_check("r", "f", "base", 0, Verdict::skipped("no snapshot")),
+            // "g" on m2, judged twice and in any log order: one push, chg red because one
+            // of its runs failed while the gate passed.
+            gate("g", Outcome::Pass, 500_000, &[]),
+            Row {
+                at_ms: 2,
+                ..chg("g", "m2", Outcome::Fail, 70_000, &[])
+            },
+            Row {
+                at_ms: 1,
+                ..chg("g", "m2", Outcome::Pass, 60_000, &[])
+            },
         ];
         let r = report("r", &rows);
         assert_eq!(
             (r.pushes, r.agree, r.misses, r.chg_red, r.gate_flaky),
-            (4, 1, 1, 1, 1)
+            (5, 1, 1, 2, 1)
         );
-        assert_eq!((r.unpaired, r.skipped, r.errors), (1, 1, 0));
+        assert_eq!((r.unpaired, r.skipped, r.errors, r.reruns), (1, 1, 0, 1));
+        let g = r.disagreements.iter().find(|p| p.sha == "g").unwrap();
+        assert_eq!(
+            (g.class, g.chg_ms),
+            (Class::ChgRed, 70_000),
+            "the failing run"
+        );
         assert_eq!(r.machines, vec!["m1", "m2", "m3"]);
         let miss = r
             .disagreements
