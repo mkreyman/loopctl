@@ -1,3 +1,4 @@
 /target/
 /.claude/worktrees/
 /.claude/tmp/
+__pycache__/

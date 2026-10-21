@@ -11,3 +11,7 @@ resolving conflicts, intent review) on git storage. Elixir and TypeScript repos 
 
 Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeScript),
 `server/` (Elixir/Phoenix control plane, phase 2).
+
+## KB write-back (S13, phase-1 form)
+
+`bin/chg-kb-sync.py --repo owner/name --project-id <loopctl project>` writes each lesson the master verifier recorded on GitHub (merged `auto-revert` PRs, `test-flakiness` issues) to the loopctl KB as one `finding`, tagged `chg`, the repo and the kind. It runs from cron (minis: daily 06:17 for home_care_billing), never on the merge path, and a rerun writes nothing twice. It needs claude-config's `skills/_shared/loopctl_client_core.py`, and makes its own venv for `requests` under `~/.chg/kb-venv` on first use. Test: `python3 tests/kb-sync-test.py`.
