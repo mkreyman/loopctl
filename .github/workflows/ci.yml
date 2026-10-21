@@ -51,7 +51,7 @@ env:
   # mix.exs `~> 1.18`); only the OTP line moves forward to a working, current patch.
   OTP_VERSION: "28.5.0.2"
 
-# SELF-HOSTED SPLIT (runners on beelink). lint / test /
+# SELF-HOSTED SPLIT (runners on the fleet-ci pool: beelink, minis, x1). lint / test /
 # security / dialyzer / scale-test moved; the rest
 # stay on ubuntu-latest for specific reasons, not by omission. Measured job times
 # (2026-07-30) are recorded per entry, because the whole point of the split is
@@ -130,7 +130,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     # FORK-PR GUARD (#881): a fork PR never runs on the shared self-hosted pool — its job
     # code runs as the github-runner uid every pool slot shares, with read access to other
     # slots' live JIT config and secrets. On a fork PR this job is SKIPPED (a skipped job
@@ -300,7 +300,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
@@ -324,8 +324,8 @@ jobs:
       # Safe as a non-integer: this job does not pass `mix test --partitions`, which is
       # the only thing that validates the variable as a bare 1..N.
       MIX_TEST_PARTITION: ci${{ github.run_id }}
-      # The CI-only Postgres, NOT the instance on 5432 -- which, now that the runners
-      # are back on beelink, holds Mark's development databases.
+      # The CI-only Postgres, NOT the instance on 5432 -- which, on every fleet-ci host
+      # (beelink, minis, x1), holds a developer's databases.
       TEST_DB_PORT: "5433"
       # The psql steps below use libpq directly; PGPORT is what points THEM at the
       # same instance the Ecto repos use. Setting only one of the two is the bug
@@ -510,7 +510,7 @@ jobs:
 
   retrieval-eval:
     name: Retrieval Eval
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
@@ -741,7 +741,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
@@ -831,7 +831,7 @@ jobs:
 
   dialyzer:
     name: Dialyzer
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
@@ -934,7 +934,7 @@ jobs:
     # included GitHub-hosted minutes. It keeps its OWN Postgres service container, on a host
     # port Docker picks, so its committed corpus, its role bootstrap and its index builds
     # never touch the CI Postgres the Test job runs against.
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 30
     if: >
       (github.event_name == 'schedule' ||
@@ -944,7 +944,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository)
     services:
       postgres:
-        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.7,
+        # Pinned by DIGEST to the image every fleet-ci host's CI Postgres already runs (pgvector 0.8.7,
         # tag 0.8.7-pg16-trixie), so the job never pulls a floating tag from Docker Hub: a
         # present digest is not re-pulled. Above the 0.8.4 floor (#965), so the insert/VACUUM
         # race is gone. Moved with the host instances under mkreyman/infra#280 (#977); the
@@ -1304,7 +1304,7 @@ jobs:
     # other's ANALYZE results any more than two containers could. What a shared cluster
     # DOES share is CPU, shared_buffers and disk — which affects timing, not the plan
     # CHOICE these tests assert on, and the matrix runs serially on one runner anyway.
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     # MANUAL DISPATCH, PLUS THE WEEKLY CRON ONLY. Not every-PR (the 80k seed per file is far
     # too slow for every push) and no longer every night. The enforced pre-merge step for a
     # Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>` or the local
