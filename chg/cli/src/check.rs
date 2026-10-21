@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -89,19 +89,37 @@ impl Verdict {
 
 /// Runs the check in `repo` against `base` (a commit). `all` skips selection.
 pub fn run(repo: &Path, base: &str, all: bool) -> Verdict {
-    run_recording(repo, base, all, None)
+    run_recording(
+        repo,
+        base,
+        all,
+        None,
+        exec::default_timeout(CommandName::Shard),
+    )
 }
 
 /// `run`, and when the whole suite runs, the adapter also writes a coverage record of it
-/// to `record` (`cover.rs`).
-pub fn run_recording(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
+/// to `record` (`cover.rs`). `shard_cap` bounds the whole-suite run.
+pub fn run_recording(
+    repo: &Path,
+    base: &str,
+    all: bool,
+    record: Option<&Path>,
+    shard_cap: Duration,
+) -> Verdict {
     let started = Instant::now();
-    let mut v = check(repo, base, all, record);
+    let mut v = check(repo, base, all, record, shard_cap);
     v.ms = started.elapsed().as_millis() as u64;
     v
 }
 
-fn check(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
+fn check(
+    repo: &Path,
+    base: &str,
+    all: bool,
+    record: Option<&Path>,
+    shard_cap: Duration,
+) -> Verdict {
     let values = |pairs: &[(&'static str, String)]| -> BTreeMap<&'static str, String> {
         pairs.iter().cloned().collect()
     };
@@ -200,13 +218,7 @@ fn check(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
             if let Some(r) = record {
                 v.insert("record", r.to_string_lossy().into_owned());
             }
-            let invoked = adapter::invoke(
-                repo,
-                CommandName::Shard,
-                v,
-                None,
-                exec::default_timeout(CommandName::Shard),
-            );
+            let invoked = adapter::invoke(repo, CommandName::Shard, v, None, shard_cap);
             ("all", reason, vec![], invoked)
         }
     };

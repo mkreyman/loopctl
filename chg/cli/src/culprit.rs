@@ -178,7 +178,8 @@ fn covers(failed: &[String], id: &str) -> bool {
 /// Finds the commit after `good` on `bad`'s first-parent line that broke the tests
 /// failing on `bad`. `tests` are those tests if known (the ids a CI run reported); else
 /// the whole suite runs on `bad` to find them. `reruns` is how many times each failing
-/// test is rerun on `bad` before it counts as a real failure.
+/// test is rerun on `bad` before it counts as a real failure. `tests_timeout` caps that
+/// whole-suite run.
 pub fn find(
     repo: &Path,
     good: &str,
@@ -186,6 +187,7 @@ pub fn find(
     tests: Option<Vec<String>>,
     reruns: u32,
     snapshot_timeout: Duration,
+    tests_timeout: Duration,
 ) -> Result<Found, String> {
     // Revisions as the caller's worktree sees them (its HEAD); shared state by git dir.
     let good = git::resolve(repo, good)?;
@@ -248,7 +250,7 @@ pub fn find(
                     .into_iter()
                     .collect(),
                 None,
-                exec::default_timeout(CommandName::Shard),
+                tests_timeout,
             );
             drop(scratch);
             let (verdict, failing, reason) = match invoked {

@@ -6,7 +6,7 @@ Every command works through the repo's adapter (`.chg/adapter.toml`), so it serv
 
 ## Commands
 
-- `chg verify [--sha S] [--ref verified/master] [--remote origin] [--no-run] [--no-push] [--failures-out F]` runs `static` and then the whole suite (`shard 1/1`) on `S` (default HEAD) in this tree, which must be exactly `S`. On green it pushes `S` to `refs/heads/<ref>` on the remote:
+- `chg verify [--sha S] [--ref verified/master] [--remote origin] [--no-run] [--no-push] [--failures-out F] [--tests-timeout-secs N]` runs `static` and then the whole suite (`shard 1/1`) on `S` (default HEAD) in this tree, which must be exactly `S`. The whole-suite run is capped at `N` seconds (default `exec::SUITE_TIMEOUT_SECS`, 2700, above `chg check`'s 1200: a verifier shares a CI runner, where contention stretches a normal run past 20 minutes); a run that hits the cap is an `error` verdict and holds the ref. `chg culprit` takes the same flag for its whole-suite run on `<bad>`. On green it pushes `S` to `refs/heads/<ref>` on the remote:
   - **Forward only.** The ref moves only to a commit that descends from where it is. The push is never forced, so the remote refuses anything else.
   - **Already there:** nothing runs (`already`).
   - **A newer commit is already verified:** nothing runs (`superseded`). The same applies when a racing verifier moved the ref first.

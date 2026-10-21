@@ -32,7 +32,8 @@ fn cow_tempdir() -> Option<TempDir> {
 /// A stand-in adapter. A test fails where the commit's `.chg/broken` lists its entry; the
 /// test named by `$FLAKY` fails the first time it runs and passes after. `$TS_IDS` reports
 /// ids the TypeScript adapter's way (`file > name`). A commit with `.chg/break-run` breaks
-/// the contract on `run`; one with `.chg/static-red` fails static checks. Each call is
+/// the contract on `run`; one with `.chg/static-red` fails static checks; one with
+/// `.chg/slow-shard` makes `shard` sleep 30 s. Each call is
 /// logged to `$CALLS` with the directory it ran in, and to `$ENVLOG` with the coverage
 /// variables chg gave it. `shard` writes a record to `$CHG_RECORD` when asked.
 const ADAPTER: &str = r#"#!/bin/sh
@@ -64,7 +65,8 @@ case "$cmd" in
   affected) echo '{"mode":"all","reason":"stand-in"}' ;;
   run)      [ -f .chg/break-run ] && exit 3
             results < "$1" ;;
-  shard)    [ -n "$CHG_RECORD" ] && echo "record of $(git rev-parse HEAD)" > "$CHG_RECORD"
+  shard)    [ -f .chg/slow-shard ] && sleep 30
+            [ -n "$CHG_RECORD" ] && echo "record of $(git rev-parse HEAD)" > "$CHG_RECORD"
             ls test/*_test.exs | sed 's/$/:1/' | results ;;
 esac
 "#;
@@ -543,6 +545,76 @@ fn flaky_tests_get_one_open_issue_and_one_comment_per_run() {
     let log = env.gh_log();
     assert_eq!(log.matches("issue create").count(), 1, "{log}");
     assert_eq!(log.matches("issue comment").count(), 1, "{log}");
+}
+
+#[test]
+fn the_whole_suite_runs_under_the_tests_timeout() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    env.commit(".chg/slow-shard", "x\n");
+    let started = std::time::Instant::now();
+    let out = env
+        .chg()
+        .args(["verify", "--tests-timeout-secs", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "the cap did not stop the run"
+    );
+    let r = json(&out);
+    assert_eq!(
+        (out.status.code(), r["outcome"].as_str()),
+        (Some(2), Some("held")),
+        "{r}"
+    );
+    assert!(
+        r["verdict"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("timed out after 1s"),
+        "{r}"
+    );
+    assert_eq!(env.remote_ref("verified/master"), None);
+}
+
+#[test]
+fn the_ci_whole_suite_runs_default_to_2700_seconds() {
+    for cmd in ["verify", "culprit"] {
+        let out = Command::cargo_bin("chg")
+            .unwrap()
+            .args([cmd, "--help"])
+            .output()
+            .unwrap();
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            help.contains("--tests-timeout-secs") && help.contains("[default: 2700]"),
+            "{cmd}: {help}"
+        );
+    }
+}
+
+#[test]
+fn culprit_runs_the_whole_suite_under_the_tests_timeout() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let good = env.head();
+    let bad = env.commit(".chg/slow-shard", "x\n");
+    let started = std::time::Instant::now();
+    let out = env
+        .chg()
+        .args(["culprit", &good, &bad, "--tests-timeout-secs", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "the cap did not stop the run"
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("timed out after 1s"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

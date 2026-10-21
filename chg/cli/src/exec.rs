@@ -23,8 +23,14 @@ pub fn default_timeout(name: CommandName) -> Duration {
     })
 }
 
+/// The whole-suite cap of `chg verify` and `chg culprit` (`--tests-timeout-secs`). Above
+/// the shard cap: they run on a shared CI runner, where contention stretches a normal
+/// 15-minute suite past 20, and the job's own timeout bounds the run anyway.
+pub const SUITE_TIMEOUT_SECS: u64 = 45 * 60;
+
 /// The cap a command runs under: `override_secs` when given (`--timeout-secs`), else the
-/// per-kind default. Every caller resolves its cap here.
+/// per-kind default. Every caller resolves its cap here, except the CI whole-suite runs,
+/// which take `--tests-timeout-secs` (default `SUITE_TIMEOUT_SECS`).
 pub fn cap(name: CommandName, override_secs: Option<u64>) -> Duration {
     override_secs
         .map(Duration::from_secs)

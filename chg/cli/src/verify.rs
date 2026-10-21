@@ -12,6 +12,7 @@
 //! record, which is sound only if the test passed there.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -58,6 +59,8 @@ pub struct Options<'a> {
     /// Advance only: the suite already passed on this commit elsewhere (a CI job).
     pub no_run: bool,
     pub push: bool,
+    /// Wall-clock cap of the whole-suite run (`--tests-timeout-secs`).
+    pub tests_timeout: Duration,
 }
 
 /// The commit `refs/heads/<name>` points at on `remote`, if the ref exists.
@@ -140,7 +143,7 @@ pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
             std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             Ok(cover::record_path(&s, &sha))
         });
-        let v = check::run_recording(repo, &base, true, record.as_deref().ok());
+        let v = check::run_recording(repo, &base, true, record.as_deref().ok(), o.tests_timeout);
         let v = match git::is_exactly(repo, &sha) {
             Ok(()) => v,
             Err(e) => Verdict {

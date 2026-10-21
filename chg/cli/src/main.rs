@@ -124,6 +124,10 @@ enum Top {
         /// when static checks failed: those are not tests to search with.
         #[arg(long)]
         failures_out: Option<PathBuf>,
+        /// The wall-clock cap of the whole-suite run.
+        #[arg(long, default_value_t = exec::SUITE_TIMEOUT_SECS,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        tests_timeout_secs: u64,
     },
     /// Find the first commit on <bad>'s first-parent line after <good> at which the tests
     /// failing on <bad> fail (story S8). Each failing test is rerun on <bad> first, and
@@ -146,6 +150,10 @@ enum Top {
         /// snapshot exists yet.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         snapshot_timeout_secs: Option<u64>,
+        /// The wall-clock cap of the whole-suite run on <bad> when no --tests is given.
+        #[arg(long, default_value_t = exec::SUITE_TIMEOUT_SECS,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        tests_timeout_secs: u64,
     },
     /// File one open issue per flaky test (`chg culprit`'s `flaky`), or comment on the
     /// one already open; idempotent per run id (story S8). Prints the issue URLs.
@@ -449,6 +457,7 @@ fn main() -> ExitCode {
             no_run,
             no_push,
             failures_out,
+            tests_timeout_secs,
         } => verify_cmd(
             &repo_root(repo),
             sha.as_deref().unwrap_or("HEAD"),
@@ -457,6 +466,7 @@ fn main() -> ExitCode {
                 ref_name: &ref_name,
                 no_run,
                 push: !no_push,
+                tests_timeout: Duration::from_secs(tests_timeout_secs),
             },
             failures_out,
         ),
@@ -467,6 +477,7 @@ fn main() -> ExitCode {
             tests,
             reruns,
             snapshot_timeout_secs,
+            tests_timeout_secs,
         } => culprit_cmd(
             &repo_root(repo),
             &good,
@@ -474,6 +485,7 @@ fn main() -> ExitCode {
             tests,
             reruns,
             exec::cap(CommandName::Snapshot, snapshot_timeout_secs),
+            Duration::from_secs(tests_timeout_secs),
         ),
         Top::Flaky {
             tests,
@@ -1117,6 +1129,7 @@ fn culprit_cmd(
     tests: Option<PathBuf>,
     reruns: u32,
     snapshot_timeout: Duration,
+    tests_timeout: Duration,
 ) -> ExitCode {
     let tests = match tests.map(|t| read_ids(&t)).transpose() {
         Ok(t) => t,
@@ -1125,7 +1138,15 @@ fn culprit_cmd(
             return ExitCode::from(2);
         }
     };
-    match culprit::find(repo, good, bad, tests, reruns, snapshot_timeout) {
+    match culprit::find(
+        repo,
+        good,
+        bad,
+        tests,
+        reruns,
+        snapshot_timeout,
+        tests_timeout,
+    ) {
         Ok(f) => {
             println!("{}", serde_json::to_string(&f).expect("reports serialize"));
             eprintln!("chg: culprit: {}", f.reason);
