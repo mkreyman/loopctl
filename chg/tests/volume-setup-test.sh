@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Idempotence and refusal test for bin/chg-volume-setup.sh. Linux, as root through sudo
-# (CI runs it on a hosted runner). Everything lives under a temp dir: its own image,
+# (CI runs it as root in a privileged container). Everything lives under a temp dir: its own image,
 # mount dir, fstab and repos; /etc/fstab and /srv/chg are never touched.
 
 set -euo pipefail

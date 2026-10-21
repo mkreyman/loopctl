@@ -3,8 +3,8 @@
 #
 #   scripts/install.sh [--dest DIR] [--release TAG]
 #
-# --release TAG  download the release artifact for this OS/arch (needs `gh` with access to
-#                mkreyman/chg) and check its sha256; without it, build from this checkout.
+# --release TAG  download the release artifact (Linux x86_64 only; needs `gh` with access
+#                to mkreyman/chg) and check its sha256; without it, build from this checkout.
 # --dest DIR     where `chg` goes (default: ~/.local/bin).
 #
 # Idempotent: an identical binary already at DEST is left alone. The new binary is written
@@ -31,6 +31,11 @@ esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+# Releases carry no macOS artifact (release.yml has no macOS runner): Macs build from source.
+if [ -n "$tag" ] && [ "$target" != x86_64-unknown-linux-musl ]; then
+  echo "install.sh: releases carry no $target build; run without --release to build it" >&2
+  exit 1
+fi
 if [ -n "$tag" ]; then
   gh release download "$tag" -R mkreyman/chg -D "$work" \
     -p "chg-$target" -p "chg-$target.sha256"

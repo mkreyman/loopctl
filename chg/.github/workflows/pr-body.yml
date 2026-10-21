@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   pr-body:
-    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
+    runs-on: [self-hosted, beelink]
     timeout-minutes: 3
     steps:
       - name: Body has Testing, Risk and How to revert

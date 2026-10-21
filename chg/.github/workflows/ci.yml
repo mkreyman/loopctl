@@ -15,6 +15,11 @@ concurrency:
 permissions:
   contents: read
 
+# Every job runs on beelink's runner pool (chg is in its INFRA_POOL_REPOS, capped at 3
+# slots; infra runbooks/ci-runner-setup.md), never on GitHub-hosted minutes. Jobs share
+# one persistent account there, so nothing below writes per-user state such as
+# `git config --global` or `rustup default`.
+
 jobs:
   rust:
     name: rust (${{ matrix.os }})
@@ -22,53 +27,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # chg has no self-hosted registration and is not in either host's
-          # INFRA_POOL_REPOS (infra runbooks/ci-runner-setup.md). Setting the repo
-          # variable CI_RUNNER to '["self-hosted","beelink"]' moves the Linux leg there,
-          # provided that host has rustup or asdf (the toolchain step uses either).
           - os: linux
-            runner: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
-          # The APFS clonefile(2) path (design §3.5) only compiles on macOS.
+          # The APFS clonefile(2) path (design §3.5) only compiles for macOS. The repo
+          # variable CI_RUNNER_MACOS (a JSON label list, e.g. mac-mini's self-hosted
+          # runner) runs this leg natively, tests included. Unset, it runs on beelink and
+          # cross-checks the Macs' target with clippy, no link and no tests: never a
+          # hosted macOS runner, which bills 10x.
           - os: macos
-            runner: macos-latest
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os == 'macos' && vars.CI_RUNNER_MACOS && fromJSON(vars.CI_RUNNER_MACOS) || fromJSON('["self-hosted","beelink"]') }}
+    env:
+      CROSS: ${{ matrix.os == 'macos' && !vars.CI_RUNNER_MACOS && '--target aarch64-apple-darwin' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: Toolchain from .tool-versions
-        # Pins the toolchain for this job only (RUSTUP_TOOLCHAIN), never `rustup default`,
-        # which is per-user state shared by every job on a persistent runner.
-        run: |
-          ver=$(awk '$1=="rust"{print $2}' .tool-versions)
-          if command -v rustup >/dev/null; then
-            rustup toolchain install "$ver" --profile minimal --component rustfmt,clippy
-          elif command -v asdf >/dev/null; then
-            asdf plugin list | grep -qx rust || asdf plugin add rust
-            asdf install rust "$ver"
-            echo "$HOME/.asdf/shims" >> "$GITHUB_PATH"
-          else
-            echo "::error::runner has neither rustup nor asdf; provision one to build chg"
-            exit 1
-          fi
-          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
-      # The Linux clone path needs reflink; the hosted image's ext4 has none, so the
-      # clone tests run on an XFS loop image (the same setup as bin/chg-volume-setup.sh).
-      - name: XFS reflink scratch volume
-        if: matrix.os == 'linux' && runner.environment == 'github-hosted'
-        run: |
-          sudo apt-get update -q && sudo apt-get install -yq xfsprogs >/dev/null
-          truncate -s 2G "$RUNNER_TEMP/xfs.img"
-          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/xfs.img"
-          sudo mkdir -p /mnt/chg-xfs
-          sudo mount -o loop "$RUNNER_TEMP/xfs.img" /mnt/chg-xfs
-          sudo chown "$(id -u):$(id -g)" /mnt/chg-xfs
-          echo "CHG_TEST_REFLINK_DIR=/mnt/chg-xfs" >> "$GITHUB_ENV"
-      # A self-hosted Linux runner tests on its chg volume (S5). Without one the clone
-      # tests fail rather than skip: CI=true makes a missing CHG_TEST_REFLINK_DIR an error.
-      - name: chg volume on a self-hosted runner
-        if: matrix.os == 'linux' && runner.environment == 'self-hosted'
+        run: scripts/ci-rust-toolchain.sh --component rustfmt --component clippy $CROSS
+      # The Linux clone tests need reflink: beelink's chg volume (S5) is XFS with reflink.
+      # Without it they fail rather than skip: CI=true makes a missing
+      # CHG_TEST_REFLINK_DIR an error.
+      - name: chg volume
+        if: matrix.os == 'linux'
         run: |
           # ci-tmp is 1777 (bin/chg-volume-setup.sh), so the runner account can write it.
           if [ -d /srv/chg/ci-tmp ] && [ -w /srv/chg/ci-tmp ]; then
@@ -76,27 +56,40 @@ jobs:
           fi
       - uses: Swatinem/rust-cache@v2
         with:
+          # Not CARGO: the per-job CARGO_HOME (scripts/ci-rust-toolchain.sh) is a slot's
+          # path and would split the key per slot. RUST still keys RUSTUP_TOOLCHAIN.
+          env-vars: "CC CFLAGS CXX CMAKE RUST"
           # Hosted and self-hosted runs must never share a cache entry
           # (infra runbooks/ci-runner-setup.md: keys include runner.environment).
-          key: ${{ runner.environment }}
+          key: ${{ runner.environment }}-${{ matrix.os }}
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+        if: matrix.os == 'linux'
+      - run: cargo clippy --all-targets --locked $CROSS -- -D warnings
       # No --all-targets: that flag excludes doctests.
       - run: cargo test --locked
+        if: env.CROSS == ''
 
-  # bin/chg-volume-setup.sh mounts and writes fstab, so its test needs root and a
-  # throwaway machine: a hosted runner, never a self-hosted one.
+  # bin/chg-volume-setup.sh mounts and writes fstab, so its test needs root. The runner
+  # account has no sudo, so the test runs in a --privileged container through the docker
+  # group, through sudo as its contract says. That container is not isolation: it sees the
+  # host's devices (a test killed mid-run can leave a loop device attached), and the
+  # docker group is root-equivalent on beelink. Its fstab and mounts are the container's,
+  # which is what keeps the test off the host's /etc/fstab and /srv/chg.
   volume-setup:
     name: volume-setup (linux)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: sudo apt-get update -q && sudo apt-get install -yq xfsprogs shellcheck >/dev/null
-      - run: shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh
-      - run: sudo bash tests/volume-setup-test.sh
+      - name: shellcheck, and the volume setup test as root in a container
+        run: |
+          docker run --rm --privileged -v "$PWD:/w:ro" -w /w ubuntu:24.04 bash -euc '
+            apt-get update -q >/dev/null && apt-get install -yq xfsprogs git sudo shellcheck >/dev/null
+            shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh scripts/ci-rust-toolchain.sh
+            useradd -m ci && echo "ci ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/ci
+            sudo -u ci sudo bash tests/volume-setup-test.sh'
 
   # The Mix adapter (adapters/elixir): its unit tests, and an integration test that
   # installs it as an archive and drives a fixture project through every task, including
@@ -112,8 +105,13 @@ jobs:
           - name: elixir-adapter (linux)
           - name: elixir-adapter (linux, elixir 1.19)
             elixir: "1.19.5"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     timeout-minutes: 20
+    env:
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@localhost
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@localhost
     defaults:
       run:
         working-directory: adapters/elixir
@@ -140,17 +138,16 @@ jobs:
           version-type: strict
       - name: Rust toolchain from .tool-versions
         working-directory: .
-        run: |
-          ver=$(awk '$1=="rust"{print $2}' .tool-versions)
-          rustup toolchain install "$ver" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+        run: scripts/ci-rust-toolchain.sh
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.elixir || 'pinned' }}
+          # Not CARGO: the per-job CARGO_HOME (scripts/ci-rust-toolchain.sh) is a slot's
+          # path and would split the key per slot. RUST still keys RUSTUP_TOOLCHAIN.
+          env-vars: "CC CFLAGS CXX CMAKE RUST"
+          key: ${{ runner.environment }}-${{ matrix.elixir || 'pinned' }}
       - name: Build chg
         working-directory: .
         run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
-      - run: git config --global user.name ci && git config --global user.email ci@localhost
       # The formatter's output differs across versions: checked on the pinned one only.
       - run: mix format --check-formatted
         if: ${{ !matrix.elixir }}
@@ -161,8 +158,13 @@ jobs:
   # a fixture workspace through every command, including `chg adapter exec` (CHG_BIN).
   typescript-adapter:
     name: typescript-adapter (linux)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     timeout-minutes: 20
+    env:
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@localhost
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@localhost
     defaults:
       run:
         working-directory: adapters/typescript
@@ -178,13 +180,14 @@ jobs:
           version: 12.11.2
       - name: Rust toolchain from .tool-versions
         working-directory: .
-        run: |
-          ver=$(awk '$1=="rust"{print $2}' .tool-versions)
-          rustup toolchain install "$ver" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+        run: scripts/ci-rust-toolchain.sh
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Not CARGO: the per-job CARGO_HOME (scripts/ci-rust-toolchain.sh) is a slot's
+          # path and would split the key per slot. RUST still keys RUSTUP_TOOLCHAIN.
+          env-vars: "CC CFLAGS CXX CMAKE RUST"
+          key: ${{ runner.environment }}
       - name: Build chg
         working-directory: .
         run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
-      - run: git config --global user.name ci && git config --global user.email ci@localhost
       - run: node --test test/unit.test.mjs test/integration.test.mjs
