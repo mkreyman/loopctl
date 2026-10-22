@@ -471,7 +471,8 @@ matters rather than from a number here:
     gh api repos/:owner/:repo/branches/master/protection/required_status_checks --jq .contexts
 
 Why: every update restarts the whole suite on a new head, and the required set takes minutes —
-five of its contexts run on the single self-hosted runner, the rest on `ubuntu-latest`. The
+five of its contexts run on the self-hosted `fleet-ci` pool (beelink, minis, x1), the rest
+on `ubuntu-latest`. The
 saving is real but is not the whole of a PR's CI bill: review-fix pushes restart it too, and
 `ci.yml`'s `concurrency` group is keyed per REF with `cancel-in-progress` off for master, so a
 push cancels that branch's own in-flight run and never another PR's. Concurrent PRs do not
