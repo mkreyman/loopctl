@@ -147,6 +147,44 @@ class GenericAdapter(unittest.TestCase):
         self.assertEqual(doc["results"], [{"id": "tests/a-canary.sh", "status": "pass", "ms": 2000},
                                           {"id": "tests/b-canary.sh", "status": "fail", "ms": 1000}])
 
+    def run_lines(self, *lines, extra=(), rc=0, tests=("tests/a-canary.sh",)):
+        script = "".join("printf '%%s\\n' '%s'; " % l for l in lines) + "exit %d" % rc
+        return self.adapter("run", "--tests", self.list_file(*tests), "--runner", script,
+                            "--suite-dir", "tests", *extra)
+
+    def test_a_skip_word_is_skip_only_when_the_manifest_names_it(self):
+        # The line exactly as claude-config's bin/run-canaries.sh prints a suite with an allowed skip.
+        line = "SKIP a-canary.sh (1s, nothing else in it ran) \u2014 == live check SKIPPED (CANARY_NO_LIVE=1) =="
+        self.write("tests/b-canary.sh", "exit 0\n")
+        both = ("tests/a-canary.sh", "tests/b-canary.sh")
+        code, doc, _ = self.run_lines(line, "PASS b-canary.sh (2s)", tests=both)
+        self.assertEqual((code, doc["results"][0]["status"]), (1, "fail"), "without --skip a SKIP fails")
+        code, doc, _ = self.run_lines(line, "PASS b-canary.sh (2s)", tests=both, extra=("--skip", "SKIP"))
+        self.assertEqual((code, doc["results"]), (0, [{"id": "tests/a-canary.sh", "status": "skip", "ms": 1000},
+                                                      {"id": "tests/b-canary.sh", "status": "pass", "ms": 2000}]))
+        code, doc, _ = self.run_lines(line, "PASS b-canary.sh (2s)", tests=both, rc=3, extra=("--skip", "SKIP"))
+        self.assertEqual([r["status"] for r in doc["results"]], ["skip", "pass", "error"],
+                         "a runner exiting non-zero after only skips and passes is still an error")
+        custom = ("--result", r"^(?P<name>\S+): (?P<status>\w+)$")
+        code, doc, _ = self.run_lines("a-canary.sh: SKIPPED", extra=custom)
+        self.assertEqual(doc["results"][0]["status"], "fail", "a custom runner's skip word fails unless named")
+
+    def test_a_run_where_every_suite_skipped_a_named_word_is_judged_as_the_gate_judges_it(self):
+        # run-canaries.sh exits 0 on an all-SKIP selection; reading it as an error made chg red where
+        # the gate is green. Without --skip the same run fails.
+        code, doc, _ = self.run_lines("SKIP a-canary.sh (1s, nothing else in it ran)", extra=("--skip", "SKIP"))
+        self.assertEqual((code, [r["status"] for r in doc["results"]]), (0, ["skip"]))
+        code, doc, _ = self.run_lines("SKIP a-canary.sh (1s, nothing else in it ran)")
+        self.assertEqual((code, [r["status"] for r in doc["results"]]), (1, ["fail"]))
+
+    def test_the_seconds_are_the_last_whole_number_in_the_parentheses(self):
+        for line, ms in (("FAIL a-canary.sh (rc=1, 3s) \u2014 self-skipped: x", 3000),
+                         ("FAIL a-canary.sh (TIMED OUT after 600s, raise CANARY_TIMEOUT=900s)", 900000),
+                         ("FAIL a-canary.sh (rc=1, retried after 2s, 45s)", 45000),
+                         ("FAIL a-canary.sh (v2s)", 0)):
+            code, doc, _ = self.run_lines(line)
+            self.assertEqual(doc["results"][0]["ms"], ms, line)
+
     def test_run_errors_on_what_the_runner_did_not_report(self):
         code, doc, _ = self.adapter("run", "--tests", self.list_file("tests/a-canary.sh"),
                                     "--runner", "echo nothing", "--suite-dir", "tests")

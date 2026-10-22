@@ -5,14 +5,16 @@ The repo supplies the two things only it knows, as shell commands in .chg/adapte
   --select  prints which test suites a change can reach: the word ALL, or suite names one per
             line. It runs with CHG_CHANGED naming a file of the changed paths and CHG_BASE set.
   --runner  runs the suites named in CHG_SUITES (space-separated names) and prints one line
-            per suite that --result matches (default `PASS <name>` / `FAIL <name>`).
+            per suite that --result matches (default `PASS|FAIL|SKIP <name>`). PASS/OK pass; a word
+            --skip names is `skip`, which fails no verdict, even when every suite skipped: the
+            manifest names a word only when the repo's gate accepts it. Any other word fails.
 A suite is a file under --suite-dir; its id is that repo-relative path.
 
   snapshot [--cmd SH]
   static   --base B [--check NAME=SH]...
   affected --base B --select SH --suite-dir D
-  run      --tests FILE --runner SH --suite-dir D [--result RE]
-  shard    --of N --index I --runner SH --suite-dir D --suite-glob G [--result RE]
+  run      --tests FILE --runner SH --suite-dir D [--result RE] [--skip WORD]...
+  shard    --of N --index I --runner SH --suite-dir D --suite-glob G [--result RE] [--skip WORD]...
 
 Every command prints its JSON document as the last line of stdout; everything else goes to
 stderr. `affected` never fails: any doubt prints {"mode":"all"} with the reason (fails closed).
@@ -29,7 +31,11 @@ import tempfile
 import threading
 import time
 
-DEFAULT_RESULT = r"^(?P<status>PASS|FAIL)\s+(?P<name>\S+)(?:\s+\((?:[^)]*?)(?P<secs>\d+(?:\.\d+)?)s\))?"
+# The words a runner's status may take: PASS/OK pass, anything else fails unless --skip names it.
+PASS_WORDS = {"PASS": "pass", "OK": "pass"}
+# The seconds are the LAST `<N>s` in the parentheses, a whole number not the tail of a word:
+# `(12s)`, `(rc=1, 3s)`, `(1s, nothing else in it ran)`, `(TIMED OUT after 600s, ...=600s)`.
+DEFAULT_RESULT = r"^(?P<status>PASS|FAIL|SKIP)\s+(?P<name>\S+)(?:\s+\((?:[^)]*[^\w.])?(?P<secs>\d+(?:\.\d+)?)s\b[^)]*\))?"
 TAIL_LINES = 40
 
 
@@ -168,19 +174,25 @@ def run_suites(a, ids):
     t0 = time.monotonic()
     rc, out = shell(a.runner, env_with(CHG_SUITES=" ".join(names)))
     pat = re.compile(a.result)
+    # `skip` fails no verdict, so only the manifest may say which status word means it: a runner's
+    # SKIP is "passed with an allowed skipped layer" for run-canaries.sh, and "never started" for others.
+    # A named word is one the repo's gate accepts, so a run of nothing but skips is judged as the gate
+    # judges it (run-canaries.sh passes one on purpose), not as an error.
+    skips = {w.upper() for w in (a.skip or [])}
     seen = {}
     for line in out.splitlines():
         m = pat.search(line)
         if not m or m.group("name") not in by_name:
             continue
         secs = m.groupdict().get("secs")
-        seen[m.group("name")] = ("pass" if m.group("status").upper() in ("PASS", "OK") else "fail",
-                                 int(float(secs) * 1000) if secs else 0)
+        word = m.group("status").upper()
+        status = dict(PASS_WORDS, **{w: "skip" for w in skips}).get(word, "fail")
+        seen[m.group("name")] = (status, int(float(secs) * 1000) if secs else 0)
     results = []
     for n in names:
         status, ms = seen.get(n, ("error", 0))
         results.append({"id": by_name[n], "status": status, "ms": ms})
-    if rc != 0 and all(r["status"] == "pass" for r in results):
+    if rc != 0 and all(r["status"] in ("pass", "skip") for r in results):
         # Attached to a real suite, so the id starts with a test file as the contract requires
         # and `chg culprit` can rerun it.
         results.append({"id": "%s > runner exited %d" % (ids[-1], rc), "status": "error", "ms": ms_since(t0)})
@@ -244,6 +256,7 @@ def main():
         p.add_argument("--runner", required=True)
         p.add_argument("--suite-dir", required=True)
         p.add_argument("--result", default=DEFAULT_RESULT)
+        p.add_argument("--skip", action="append")
         if name == "run":
             p.add_argument("--tests", required=True)
         else:
