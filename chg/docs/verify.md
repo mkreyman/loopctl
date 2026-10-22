@@ -43,6 +43,8 @@ Every command works through the repo's adapter (`.chg/adapter.toml`), so it serv
 
 `gh` must be authenticated for the repo. `CHG_GH` names another binary.
 
+A CI runner that runs as its own user (`github-runner`) gets chg from `scripts/install-system.sh`, run once per host by an account that has the toolchains: `/usr/local/bin/chg`, the Elixir adapter archive and the TypeScript adapter at `/usr/local/share/chg/typescript/chg-adapter.mjs`. A TypeScript job sets `CHG_TS_ADAPTER_DIR=/usr/local/share/chg/typescript` so the manifest's commands run that copy (adapters/typescript/README.md). On Linux the binary is static (musl), so a job running in a container can mount and run it whatever the container's glibc.
+
 ## A trunk workflow
 
 ```yaml

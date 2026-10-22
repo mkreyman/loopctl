@@ -22,7 +22,9 @@ trap 'rm -rf "$work" "$old"' EXIT
 src="$root/adapters/typescript"
 cp "$src/chg-adapter.mjs" "$src/.tool-versions" "$work/"
 cp -R "$src/lib" "$work/lib"
-chmod 755 "$work"
+# Readable by every user whatever the umask (a CI runner user reads a copy root installed).
+find "$work" -type d -exec chmod 755 {} +
+find "$work" -type f -exec chmod 644 {} +
 
 if [ -e "$dest" ]; then mv "$dest" "$old"; fi
 mv "$work" "$dest"

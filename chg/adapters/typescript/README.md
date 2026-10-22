@@ -7,6 +7,11 @@ own pnpm, `vitest`, `playwright`, `eslint` and `tsc`, so their versions are the 
 
     scripts/install-typescript-adapter.sh      # once per machine: ~/.local/share/chg/typescript
 
+A CI runner that runs as its own user has no copy in its home. `scripts/install-system.sh` puts
+one at `/usr/local/share/chg/typescript` for every user, and the job sets
+`CHG_TS_ADAPTER_DIR=/usr/local/share/chg/typescript`, which the template's commands read in
+place of the per-user path.
+
 A product then adds `.chg/adapter.toml`, copied from [adapter.toml](adapter.toml) (fleet-holding
 shaped) with its globs, `--generate`, `--tsconfig` and `--check` lines adjusted.
 

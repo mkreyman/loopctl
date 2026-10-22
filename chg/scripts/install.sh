@@ -7,6 +7,11 @@
 #                to mkreyman/chg) and check its sha256; without it, build from this checkout.
 # --dest DIR     where `chg` goes (default: ~/.local/bin).
 #
+# On Linux x86_64 both paths give the static musl binary, so a CI job running in a container
+# with an older glibc than the build host (node:22-bookworm has 2.36) can run the mounted
+# /usr/local/bin/chg. The source build adds the musl target to the pinned toolchain; it links
+# with musl's self-contained CRT through the host cc, so no musl-tools package is needed.
+#
 # Idempotent: an identical binary already at DEST is left alone. The new binary is written
 # beside the old one and renamed over it, so a running `chg` never sees a half-written file.
 set -euo pipefail
@@ -17,7 +22,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dest) dest=$2; shift 2 ;;
     --release) tag=$2; shift 2 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -43,8 +48,14 @@ if [ -n "$tag" ]; then
   bin="$work/chg-$target"
 else
   root=$(cd "$(dirname "$0")/.." >/dev/null && pwd -P)
-  cargo build --release --locked -p chg --manifest-path "$root/Cargo.toml" >&2
-  bin="${CARGO_TARGET_DIR:-$root/target}/release/chg"
+  if [ "$target" = x86_64-unknown-linux-musl ]; then
+    (cd "$root" && rustup target add "$target" >&2)
+    (cd "$root" && cargo build --release --locked -p chg --target "$target" >&2)
+    bin="${CARGO_TARGET_DIR:-$root/target}/$target/release/chg"
+  else
+    cargo build --release --locked -p chg --manifest-path "$root/Cargo.toml" >&2
+    bin="${CARGO_TARGET_DIR:-$root/target}/release/chg"
+  fi
 fi
 
 chmod +x "$bin"
