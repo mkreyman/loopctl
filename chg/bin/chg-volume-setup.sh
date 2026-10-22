@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # chg-volume-setup.sh: the Linux reflink volume for chg (design §3.5, story S5).
 #
-# minis, nuc and beelink are ext4 on LVM with no free extents, so ext4 gives no reflink
+# minis, x1, nuc and beelink are ext4 on LVM with no free extents, so ext4 gives no reflink
 # and there is no room for a new logical volume. This script puts a sparse image file on
 # the existing ext4, formats it XFS with reflink, loop-mounts it at /srv/chg from fstab,
 # and points each enrolled repo's .claude/worktrees at /srv/chg/ws/<repo>. The snapshot
@@ -121,7 +121,7 @@ group=$(id -gn "$owner")
 
 if [ -z "$size" ]; then
   case $(hostname -s) in
-    minis | beelink) size=300G ;;
+    minis | x1 | beelink) size=300G ;;
     nuc) size=120G ;;
     *) refuse "no default size for $(hostname -s); pass --size" ;;
   esac

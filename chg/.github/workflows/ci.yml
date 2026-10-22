@@ -15,8 +15,10 @@ concurrency:
 permissions:
   contents: read
 
-# Every job runs on beelink's runner pool (chg is in its INFRA_POOL_REPOS, capped at 3
-# slots; infra runbooks/ci-runner-setup.md), never on GitHub-hosted minutes. Jobs share
+# Every job runs on the fleet-ci runner pool (beelink, minis and x1, each serving chg from
+# its INFRA_POOL_REPOS; infra decisions/0021, runbooks/ci-runner-setup.md), never on
+# GitHub-hosted minutes. beelink takes a job first; minis and x1 take it after it has
+# queued 45 s and only while their measured CPU leaves room. Jobs share
 # one persistent account there, so nothing below writes per-user state such as
 # `git config --global` or `rustup default`.
 
@@ -30,11 +32,11 @@ jobs:
           - os: linux
           # The APFS clonefile(2) path (design §3.5) only compiles for macOS. The repo
           # variable CI_RUNNER_MACOS (a JSON label list, e.g. mac-mini's self-hosted
-          # runner) runs this leg natively, tests included. Unset, it runs on beelink and
+          # runner) runs this leg natively, tests included. Unset, it runs on fleet-ci and
           # cross-checks the Macs' target with clippy, no link and no tests: never a
           # hosted macOS runner, which bills 10x.
           - os: macos
-    runs-on: ${{ matrix.os == 'macos' && vars.CI_RUNNER_MACOS && fromJSON(vars.CI_RUNNER_MACOS) || fromJSON('["self-hosted","beelink"]') }}
+    runs-on: ${{ matrix.os == 'macos' && vars.CI_RUNNER_MACOS && fromJSON(vars.CI_RUNNER_MACOS) || fromJSON('["self-hosted","fleet-ci"]') }}
     env:
       CROSS: ${{ matrix.os == 'macos' && !vars.CI_RUNNER_MACOS && '--target aarch64-apple-darwin' || '' }}
     timeout-minutes: 20
@@ -44,7 +46,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain from .tool-versions
         run: scripts/ci-rust-toolchain.sh --component rustfmt --component clippy $CROSS
-      # The Linux clone tests need reflink: beelink's chg volume (S5) is XFS with reflink.
+      # The Linux clone tests need reflink: each fleet-ci host's chg volume (S5) is XFS with reflink.
       # Without it they fail rather than skip: CI=true makes a missing
       # CHG_TEST_REFLINK_DIR an error.
       - name: chg volume
@@ -73,11 +75,11 @@ jobs:
   # account has no sudo, so the test runs in a --privileged container through the docker
   # group, through sudo as its contract says. That container is not isolation: it sees the
   # host's devices (a test killed mid-run can leave a loop device attached), and the
-  # docker group is root-equivalent on beelink. Its fstab and mounts are the container's,
+  # docker group is root-equivalent on every fleet-ci host. Its fstab and mounts are the container's,
   # which is what keeps the test off the host's /etc/fstab and /srv/chg.
   volume-setup:
     name: volume-setup (linux)
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +107,7 @@ jobs:
           - name: elixir-adapter (linux)
           - name: elixir-adapter (linux, elixir 1.19)
             elixir: "1.19.5"
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 20
     env:
       GIT_AUTHOR_NAME: ci
@@ -158,7 +160,7 @@ jobs:
   # a fixture workspace through every command, including `chg adapter exec` (CHG_BIN).
   typescript-adapter:
     name: typescript-adapter (linux)
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 20
     env:
       GIT_AUTHOR_NAME: ci

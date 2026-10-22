@@ -3,7 +3,7 @@
 # in .tool-versions for one CI job: RUSTUP_TOOLCHAIN in $GITHUB_ENV, never `rustup default`,
 # which is per-user state shared by every job on a persistent runner.
 #
-# chg's CI runs on beelink's runner pool (infra runbooks/ci-runner-setup.md), whose account
+# chg's CI runs on the fleet-ci runner pool (infra runbooks/ci-runner-setup.md), whose account
 # carries no Rust, so the first job installs rustup into that account's home and later jobs
 # reuse it. Pool jobs run concurrently under that one account, so installs take a lock there.
 set -euo pipefail

@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   pr-body:
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 3
     steps:
       - name: Body has Testing, Risk and How to revert

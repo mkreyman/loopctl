@@ -2,7 +2,7 @@ name: release
 
 # Builds the Linux fleet artifact on a version tag and attaches it to the GitHub release:
 # chg-x86_64-unknown-linux-musl (minis, nuc, beelink; static, so no glibc to keep in step
-# across machines). It runs on beelink's runner pool, never GitHub-hosted minutes. No
+# across machines). It runs on the fleet-ci runner pool, never GitHub-hosted minutes. No
 # macOS artifact: there is no macOS runner, and the Macs build chg from source
 # (scripts/install.sh), as every host does.
 on:
@@ -22,7 +22,7 @@ jobs:
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl]
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, fleet-ci]
     permissions:
       contents: write
     steps:
