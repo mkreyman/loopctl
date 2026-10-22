@@ -158,8 +158,10 @@ test("run reports each test, and exits 1 exactly when one failed or a path is mi
   r = adapter("run", "--tests", list);
   assert.equal(r.status, 1);
   assert.deepEqual(r.doc.results, [{ id: "packages/nope.test.ts", status: "error", ms: 0 }]);
-  // Every test passes, then an unhandled rejection makes Vitest exit 1.
-  write("packages/util/src/late.test.ts", 'import { test } from "vitest";\ntest("passes", () => { setTimeout(() => Promise.reject(new Error("late")), 0); });\n');
+  // Every test passes, then an unhandled rejection makes Vitest exit 1. The rejection is
+  // created inside the test, so it is unhandled before the worker reports: a timer would
+  // race the worker's teardown, and Vitest exits 0 when teardown wins (#66).
+  write("packages/util/src/late.test.ts", 'import { test } from "vitest";\ntest("passes", () => { Promise.reject(new Error("late")); });\n');
   writeFileSync(list, "packages/util/src/late.test.ts\n");
   r = adapter("run", "--tests", list);
   assert.equal(r.status, 1);
