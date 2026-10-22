@@ -9,7 +9,7 @@ resolving conflicts, intent review) on git storage. Elixir and TypeScript repos 
 - Shadow phase and the gate switch (`chg check`, `chg gate`, `chg shadow`): [docs/shadow.md](docs/shadow.md)
 - Trunk verification, culprits and auto-revert (`chg verify`, `chg culprit`, `chg revert`, `chg flaky`): [docs/verify.md](docs/verify.md)
 
-Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeScript),
+Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeScript, and generic for a repo with no build),
 `server/` (Elixir/Phoenix control plane, phase 2).
 
 ## KB write-back (S13, phase-1 form)

@@ -6,9 +6,9 @@
 
 | Key | Type | Rule |
 |---|---|---|
-| `adapter.kind` | string | `elixir` or `pnpm` |
+| `adapter.kind` | string | `elixir`, `pnpm` or `generic` (a repo with no build, [adapters/generic](../adapters/generic/README.md)) |
 | `adapter.version` | string | must equal the contract version |
-| `adapter.artifacts` | non-empty list | repo-relative paths/globs cloned from a snapshot into a workspace |
+| `adapter.artifacts` | non-empty list; for `generic`, optional and may be empty | repo-relative paths/globs cloned from a snapshot into a workspace |
 | `adapter.inputs` | non-empty list | repo-relative globs hashed into a check's input fingerprint |
 | `adapter.always_all` | non-empty list | repo-relative globs; touching one selects the whole suite |
 | `adapter.read_at_runtime` | list, optional | repo-relative globs of files tests read at run time; touching one selects the tests a coverage record says read it, or the whole suite without one (`CHG_READ`) |

@@ -16,6 +16,9 @@ pub const MANIFEST_PATH: &str = ".chg/adapter.toml";
 pub enum Kind {
     Elixir,
     Pnpm,
+    /// A repo with no build: its commands come from the repo itself, through
+    /// adapters/generic. Its `artifacts` may be empty or left out.
+    Generic,
 }
 
 impl Kind {
@@ -23,6 +26,7 @@ impl Kind {
         match s {
             "elixir" => Some(Kind::Elixir),
             "pnpm" => Some(Kind::Pnpm),
+            "generic" => Some(Kind::Generic),
             _ => None,
         }
     }
@@ -31,6 +35,7 @@ impl Kind {
         match self {
             Kind::Elixir => "elixir",
             Kind::Pnpm => "pnpm",
+            Kind::Generic => "generic",
         }
     }
 }
@@ -190,7 +195,7 @@ pub fn parse(text: &str) -> Result<Manifest, Invalid> {
         }
         Some(toml::Value::String(s)) => Kind::parse(s).or_else(|| {
             errs.push(format!(
-                "`adapter.kind` is \"{s}\"; expected \"elixir\" or \"pnpm\""
+                "`adapter.kind` is \"{s}\"; expected \"elixir\", \"pnpm\" or \"generic\""
             ));
             None
         }),
@@ -217,7 +222,12 @@ pub fn parse(text: &str) -> Result<Manifest, Invalid> {
         errs.push(version_mismatch(v));
     }
 
-    let artifacts = adapter.and_then(|a| path_list(a, "artifacts", &mut errs));
+    // A generic repo builds nothing, so it may have nothing to clone from a snapshot.
+    let artifacts = adapter.and_then(|a| match (kind, a.get("artifacts")) {
+        (Some(Kind::Generic), None) => Some(Vec::new()),
+        (Some(Kind::Generic), Some(toml::Value::Array(arr))) if arr.is_empty() => Some(Vec::new()),
+        _ => path_list(a, "artifacts", &mut errs),
+    });
     let inputs = adapter.and_then(|a| path_list(a, "inputs", &mut errs));
     let always_all = adapter.and_then(|a| path_list(a, "always_all", &mut errs));
     // Optional, and may be empty.
@@ -493,6 +503,26 @@ shard    = "mix chg.shard --of {n} --index {i}"
                 "`adapter.read_at_runtime` entry \"../x\" must be relative to the repo root with no `..`"
             ]
         );
+    }
+
+    #[test]
+    fn a_generic_repo_may_have_no_artifacts_and_no_other_kind_may() {
+        let generic = VALID.replace("kind = \"elixir\"", "kind = \"generic\"");
+        let m = parse(&generic.replace("artifacts = [\"deps\", \"_build\", \"priv/plts\"]\n", ""))
+            .unwrap();
+        assert_eq!((m.kind, m.artifacts.len()), (Kind::Generic, 0));
+        let empty = generic.replace("[\"deps\", \"_build\", \"priv/plts\"]", "[]");
+        assert!(parse(&empty).unwrap().artifacts.is_empty());
+        assert_eq!(parse(&generic).unwrap().artifacts.len(), 3);
+        let bad = generic.replace("[\"deps\", \"_build\", \"priv/plts\"]", "[\"../x\"]");
+        assert_eq!(
+            errs(&bad),
+            vec![
+                "`adapter.artifacts` entry \"../x\" must be relative to the repo root with no `..`"
+            ]
+        );
+        let elixir = VALID.replace("[\"deps\", \"_build\", \"priv/plts\"]", "[]");
+        assert_eq!(errs(&elixir), vec!["`adapter.artifacts` is empty"]);
     }
 
     #[test]

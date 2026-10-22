@@ -12,6 +12,8 @@
 #   /usr/local/share/chg/typescript/        the TypeScript adapter (chg-adapter.mjs and lib/),
 #                                           files 644 in 755 dirs, through
 #                                           scripts/install-typescript-adapter.sh
+#   /usr/local/share/chg/generic/           the generic adapter (chg-adapter.py), file 644 in a
+#                                           755 dir, through scripts/install-generic-adapter.sh
 #
 # A job then installs the archive into its own MIX_HOME:
 #   mix archive.install /usr/local/share/chg/chg_adapter.ez --force
@@ -53,10 +55,11 @@ printf '%s\n' "$toolchain" > "$work/toolchain"
 share=/usr/local/share/chg
 sudo install -d -m 755 "$share"
 sudo "$root/scripts/install-typescript-adapter.sh" "$share/typescript" >&2
+sudo "$root/scripts/install-generic-adapter.sh" "$share/generic" >&2
 sudo install -m 755 "$bin" "/usr/local/bin/.chg.new.$$"
 sudo install -m 644 "$work/chg_adapter.ez" "$share/.chg_adapter.ez.new.$$"
 sudo install -m 644 "$work/toolchain" "$share/.chg_adapter.ez.toolchain.new.$$"
 sudo mv -f "$share/.chg_adapter.ez.new.$$" "$share/chg_adapter.ez"
 sudo mv -f "$share/.chg_adapter.ez.toolchain.new.$$" "$share/chg_adapter.ez.toolchain"
 sudo mv -f "/usr/local/bin/.chg.new.$$" /usr/local/bin/chg
-echo "installed: /usr/local/bin/chg ($(/usr/local/bin/chg --version)), $share/chg_adapter.ez (built with $toolchain), $share/typescript/chg-adapter.mjs"
+echo "installed: /usr/local/bin/chg ($(/usr/local/bin/chg --version)), $share/chg_adapter.ez (built with $toolchain), $share/typescript/chg-adapter.mjs, $share/generic/chg-adapter.py"

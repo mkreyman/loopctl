@@ -193,3 +193,24 @@ jobs:
         working-directory: .
         run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
       - run: node --test test/unit.test.mjs test/integration.test.mjs
+
+  # The generic adapter (a repo with no build: claude-config) in a throwaway repo with a fake
+  # selector and runner, including `chg adapter exec` (CHG_BIN).
+  generic-adapter:
+    name: generic-adapter (linux)
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Rust toolchain from .tool-versions
+        run: scripts/ci-rust-toolchain.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # As in typescript-adapter: CARGO_HOME is a slot's path and would split the key.
+          env-vars: "CC CFLAGS CXX CMAKE RUST"
+          key: ${{ runner.environment }}
+      - name: Build chg
+        run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
+      - run: python3 adapters/generic/test/test_adapter.py -v
