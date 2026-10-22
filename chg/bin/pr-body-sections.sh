@@ -10,7 +10,8 @@
 # A section is a markdown heading of any level whose text starts with the name (case-insensitive),
 # e.g. `## Testing`, `### Risk: low`, `## How to revert`. Its content is everything up to the next
 # heading (ATX `#`, indented up to 3 spaces, or setext text underlined with = or -). Fenced code
-# counts as content and never opens a heading; inline code and HTML comments are blanked. After
+# counts as content and never opens a heading; HTML comments are blanked, inline code keeps its
+# text but opens nothing, and CRLF line endings read as LF. After
 # placeholders (N/A, none, TBD, todo, not applicable) are dropped, at least 10 letters or digits must
 # remain, so "N/A" or "None. None." fails while "N/A: docs only, nothing executes" passes.
 set -u
@@ -29,6 +30,7 @@ for name in "Testing" "Risk" "How to revert"; do
     BEGIN { want = tolower(want); in_c = 0; fence = ""; on = 0; lvl = 0; acc = ""; prev_on = 0; prev_len = -1; prev = "" }
     {
       line = $0
+      sub(/\r$/, "", line)  # a body edited in the GitHub web form ends its lines in CRLF
       # Fenced code: its lines are content, never headings or comments.
       if (fence != "") {
         if (line ~ ("^( |  |   )?" fence)) fence = ""
@@ -36,9 +38,15 @@ for name in "Testing" "Risk" "How to revert"; do
         prev_len = -1; next
       }
       if (match(line, /^( |  |   )?(```|~~~)/)) { fence = substr(line, RSTART + RLENGTH - 3, 3); prev_len = -1; next }
-      # Inline code spans are blanked, so a quoted comment marker opens nothing and an empty
-      # span adds nothing to the count.
-      gsub(/`[^`]*`/, " ", line)
+      # An inline code span keeps its text (a Testing line naming its command counts), loses any
+      # comment marker inside it, and is wrapped in dots so a span at line start never reads as a
+      # heading or a setext underline. An empty span adds nothing.
+      t = ""
+      while (match(line, /`[^`]*`/)) {
+        sp = substr(line, RSTART + 1, RLENGTH - 2); gsub(/<!--|-->/, " ", sp)
+        t = t substr(line, 1, RSTART - 1) "." sp "."; line = substr(line, RSTART + RLENGTH)
+      }
+      line = t line
       out = ""
       while (length(line) > 0) {
         if (in_c) {
