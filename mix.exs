@@ -36,46 +36,24 @@ defmodule Loopctl.MixProject do
       # declined fix from arriving silently.
       hex: [
         ignore_advisories: [
-          # cowlib 2.20.0 — no patched release exists for either advisory below:
-          # each is introduced at an old version with no `fixed` event, and as of
-          # 2026-09-28 2.20.0 (which fixed CVE-2026-43971) is the newest cowlib on hex.
-          # cowlib is compiled in as a hard transitive of telemetry_metrics_prometheus
-          # (via plug_cowboy and cowboy), but the ONLY Cowboy listener is that
-          # reporter on the internal :9568 metrics port (prod-only, Fly private 6PN);
-          # the public API serves on Bandit (config/config.exs, Bandit.PhoenixAdapter).
-          # Recheck when cowlib > 2.20.0.
+          # cowlib 2.21.0 (2026-10-08) fixed CVE-2026-43969 (cow_cookie:cookie/1
+          # client-side encoder; nothing in the release calls it — no gun, no
+          # cowlib-based HTTP client), so that ignore is gone with the bump.
           # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting in
-          # cow_http_struct_hd:escape_string/2. The metrics endpoint emits no
-          # structured headers built from untrusted input.
+          # cow_http_struct_hd:escape_string/2 — still no patched release: OSV shows
+          # it introduced at 2.9.0 with no `fixed` event, and 2.21.0 is the newest
+          # cowlib on hex. cowlib is compiled in as a hard transitive of
+          # telemetry_metrics_prometheus (via plug_cowboy and cowboy), but the ONLY
+          # Cowboy listener is that reporter on the internal :9568 metrics port
+          # (prod-only, Fly private 6PN); the public API serves on Bandit
+          # (config/config.exs, Bandit.PhoenixAdapter). The metrics endpoint emits no
+          # structured headers built from untrusted input. Recheck when cowlib > 2.21.0.
           "CVE-2026-43966",
-          # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): Cookie REQUEST header injection
-          # in cow_cookie:cookie/1, the client-side encoder. Nothing in the release
-          # calls it: there is no cowlib-based HTTP client (no gun).
-          "CVE-2026-43969",
-          # mint 1.10.1 — the fix, 1.11.0, is DECLINED and pinned out in deps/0.
-          # 1.11.0 stopped closing a connection on a receive timeout, and Finch 0.23.0
-          # (the newest as of 2026-09-28) returns that connection to its pool, so the
-          # next request on it crashes with a CaseClauseError on the late response
-          # (test/loopctl/net/finch_timeout_reuse_test.exs pins it). That would turn
-          # every outbound timeout into a crash. Recheck when a Finch release closes a
-          # connection on a receive timeout: that test then passes on mint >= 1.11.0.
-          # CVE-2026-91043 (HIGH): HTTP/2 HPACK cookie fields bypass
-          # max_header_list_size. HTTP/2 only; Req's Finch pools fall back to
-          # `protocols: [:http1]` and no Req call opts into :http2
-          # (test/loopctl/net/no_outbound_http2_test.exs fails if one does).
-          "CVE-2026-91043",
-          # CVE-2026-92103 (MEDIUM): HTTP/2 oversized frames buffered before
-          # max_frame_size is enforced. HTTP/2 only, as above.
-          "CVE-2026-92103",
-          # CVE-2026-94194 (MEDIUM): HTTP/1 chunked framing when chunked is not the
-          # final coding, enabling response smuggling THROUGH AN INTERMEDIARY. That is
-          # REACHABLE in principle: a tenant's webhook URL may sit behind a CDN or a
-          # relay that other tenants' URLs share (one Finch pool per host). The
-          # impact is bounded to the delivery log: a webhook response is recorded
-          # (status and body, `Loopctl.Webhooks.ReqDelivery`) and never acted on, so a
-          # smuggled response can at worst put one tenant's relay response in
-          # another's delivery record. Accepted against the crash above.
-          "CVE-2026-94194",
+          # No mint ignores remain: 1.10.2 (2026-09-29) backported the fixes for all
+          # three advisories 1.11.0 carried (CVE-2026-91043 HIGH, CVE-2026-92103,
+          # CVE-2026-94194), so the pin below 1.11.0 in deps/0 costs no security.
+          # The HTTP/1-only posture is still pinned by
+          # test/loopctl/net/no_outbound_http2_test.exs.
           # bandit moved to 1.13.1 (2026-10-17), which OSV reports clean of every
           # advisory 1.12.5 carried (1.13.0 fixed CVE-2026-105660, the HTTP/1
           # request-target authority issue), so no bandit ignore remains.
@@ -185,8 +163,12 @@ defmodule Loopctl.MixProject do
 
       # HTTP client
       {:req, "~> 0.5"},
-      # Pinned below 1.11.0: see the mint entry in hex ignore_advisories above.
-      {:mint, ">= 1.10.1 and < 1.11.0"},
+      # Pinned below 1.11.0: mint 1.11.0 stopped closing a connection on a receive
+      # timeout and Finch 0.23.0 returns that connection to its pool, so the next
+      # request on it crashes (test/loopctl/net/finch_timeout_reuse_test.exs).
+      # 1.10.2 carries every advisory 1.11.0 fixed, so the pin costs no security;
+      # recheck it when a Finch release closes the connection on a receive timeout.
+      {:mint, ">= 1.10.2 and < 1.11.0"},
 
       # Background jobs
       {:oban, "~> 2.19"},

@@ -490,6 +490,19 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Dependency security bumps: plug_crypto 2.2.1, mint 1.10.2, cowlib 2.21.0.** CI's
+  Security job failed on 2026-10-24 on EEF-CVE-2026-105963 (plug_crypto: the secret key
+  base lands in stack-trace arguments on a wrong-typed argument, reachable through
+  `Phoenix.Token.verify/4`; fixed in 2.2.1). mint 1.10.2 backports the fixes for all
+  three advisories 1.11.0 carried (EEF-CVE-2026-91043 HIGH, -92103, -94194), so the pin
+  below 1.11.0 — the Finch 0.23.0 receive-timeout crash, pinned by
+  `test/loopctl/net/finch_timeout_reuse_test.exs` — costs no security, and the three
+  mint `ignore_advisories` entries are gone. cowlib 2.21.0 fixes EEF-CVE-2026-43969 and
+  that entry goes too. The remaining ignores — cowlib CVE-2026-43966 and cloak
+  CVE-2026-95105 / CVE-2026-94206 — have no upstream release to fix them and are
+  unreachable from loopctl's code, each pinned by
+  `test/loopctl/vault/cloak_advisory_reachability_test.exs` or the mix.exs comment.
+
 - **chg-server's keys never certify or implement (US-47.5).** A key whose MINTING lineage
   (revoked or not) is rooted at a dispatch any intake source of the tenant registers as
   `chg_root_dispatch_id` — live or revoked source, either mode — is refused 409
