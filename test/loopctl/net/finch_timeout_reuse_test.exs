@@ -1,14 +1,15 @@
 defmodule Loopctl.Net.FinchTimeoutReuseTest do
   @moduledoc """
-  PINS why mint stays below 1.11.0 (mix.exs, `hex: ignore_advisories`, PR #926).
+  PINS why mint stays below 1.11.0 (mix.exs, `deps/0`, PR #926; the reasoning moved from
+  `hex: ignore_advisories` to the pin comment in PR #1013).
 
   mint 1.11.0 stopped closing a connection on a receive timeout, and Finch 0.23.0 returns an
   open connection to its pool, so the NEXT request on it reads the late response of the one
-  that timed out and crashes with a CaseClauseError. On mint 1.10.1 the timed-out connection
+  that timed out and crashes with a CaseClauseError. On mint < 1.11.0 the timed-out connection
   is closed and the next request gets a fresh one. A pool of ONE forces the reuse.
 
   This fails on mint >= 1.11.0 until Finch closes the connection itself; when it passes on a
-  newer mint, the pin and the mint advisory entries can go.
+  newer mint, the pin can go — the mint advisory entries already did (1.10.2 fixed them).
   """
 
   use ExUnit.Case, async: true
