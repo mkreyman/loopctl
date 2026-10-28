@@ -128,7 +128,7 @@ fn build_inner(
             .lock_shared()
             .map_err(|e| format!("store lock: {e}"))?;
         let ancestor = store
-            .nearest_ancestor(repo, &sha, Some(&here))
+            .nearest_ancestor(repo, &sha, Some(&here))?
             .map(|(m, _)| m);
         if refresh && ancestor.is_none() {
             return Ok(Refresh::NoAncestor);

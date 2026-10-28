@@ -253,7 +253,7 @@ fn push_revert(
             &format!("refs/heads/{}", o.base),
         ],
     )?;
-    if !git::is_ancestor(git_dir, sha, &base_sha) {
+    if !git::is_ancestor(git_dir, sha, &base_sha)? {
         return Err(format!("{sha} is not on {}/{}", o.remote, o.base));
     }
     let parents = git::text(git_dir, &["rev-list", "--parents", "-n", "1", sha])?

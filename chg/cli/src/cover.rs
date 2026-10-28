@@ -90,6 +90,17 @@ pub fn publish(repo: &Path, remote: &str, sha: &str, record: &Path) -> Result<()
         .arg(format!("+{commit}:{REF_PREFIX}{sha}"));
     git::run(push).map_err(|e| format!("publishing the coverage record: {e}"))?;
 
+    // Pruning is housekeeping: the record is out, so a failure here (choosing the stale
+    // records or deleting them) never makes the publish fail, and a later one retries it.
+    if let Err(e) = prune(repo, remote, sha) {
+        eprintln!("chg: pruning old coverage records: {e}");
+    }
+    Ok(())
+}
+
+/// Deletes the remote's records on `sha`'s line more than `max_age()` first-parent commits
+/// behind it.
+fn prune(repo: &Path, remote: &str, sha: &str) -> Result<(), String> {
     let reach: Vec<String> = git::text(
         repo,
         &[
@@ -105,19 +116,17 @@ pub fn publish(repo: &Path, remote: &str, sha: &str, record: &Path) -> Result<()
     .collect();
     // Only this line's: a record that is not an ancestor of `sha` (another verified line,
     // or a commit this clone has never seen) belongs to a line whose own publishes prune it.
-    let stale: Vec<String> = remote_records(repo, remote)?
-        .into_iter()
-        .filter(|s| !reach.contains(s) && git::is_ancestor(repo, s, sha))
-        .map(|s| format!(":{REF_PREFIX}{s}"))
-        .collect();
+    let mut stale = Vec::new();
+    for s in remote_records(repo, remote)? {
+        if !reach.contains(&s) && git::is_ancestor_if_present(repo, &s, sha)? {
+            stale.push(format!(":{REF_PREFIX}{s}"));
+        }
+    }
     if !stale.is_empty() {
         let mut del = git::cmd(repo);
         del.args(["-c", "core.hooksPath=/dev/null", "push", "-q", remote])
             .args(&stale);
-        // Pruning is housekeeping: the record is out, and a later publish retries this.
-        if let Err(e) = git::run(del) {
-            eprintln!("chg: pruning old coverage records: {e}");
-        }
+        git::run(del)?;
     }
     Ok(())
 }

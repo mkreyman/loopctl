@@ -670,6 +670,31 @@ fn culprit_takes_typescript_ids_and_the_worktree_head() {
     assert_eq!(f["flaky"], serde_json::json!([]));
 }
 
+/// fleet-holding's culprit job (2026-10-21) trusted the worktree but not its `.git`, where
+/// chg asks about ancestry. git refused to open it, and chg reported a true ancestor as
+/// "not an ancestor". git's own refusal must come through instead.
+#[test]
+fn culprit_reports_git_refusing_the_git_dir_not_a_false_answer() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    let good = env.head();
+    let bad = env.commit("lib/a.ex", "c1\n");
+    let trusted = fs::canonicalize(&env.repo).unwrap();
+    let out = env
+        .chg()
+        .args(["culprit", &good, &bad])
+        // Every repo looks foreign; only the worktree is trusted, as in that job.
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "safe.directory")
+        .env("GIT_CONFIG_VALUE_0", &trusted)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("dubious ownership"), "{err}");
+    assert!(!err.contains("is not an ancestor"), "{err}");
+}
+
 #[test]
 fn culprit_stops_when_a_probe_cannot_run_and_blames_nothing_red_at_good() {
     let Some(dir) = cow_tempdir() else { return };

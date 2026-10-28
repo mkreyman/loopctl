@@ -193,7 +193,7 @@ pub fn find(
     let good = git::resolve(repo, good)?;
     let bad = git::resolve(repo, bad)?;
     let git_dir = git::common_dir(repo)?;
-    if !git::is_ancestor(&git_dir, &good, &bad) {
+    if !git::is_ancestor(&git_dir, &good, &bad)? {
         return Err(format!("{good} is not an ancestor of {bad}"));
     }
     let candidates: Vec<String> = git::text(

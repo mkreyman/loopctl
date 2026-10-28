@@ -275,12 +275,19 @@ impl Store {
         repo: &Path,
         head: &str,
         at: Option<&Path>,
-    ) -> Option<(Meta, u64)> {
-        self.list()
+    ) -> Result<Option<(Meta, u64)>, String> {
+        // A snapshot of a commit this clone never fetched is not an ancestor; any other
+        // git failure is an error, not "no snapshot".
+        let mut ancestors = Vec::new();
+        for m in self.list() {
+            if git::is_ancestor_if_present(repo, &m.sha, head)? {
+                let d = git::distance(repo, &m.sha, head)?;
+                ancestors.push((m, d));
+            }
+        }
+        Ok(ancestors
             .into_iter()
-            .filter(|m| git::is_ancestor(repo, &m.sha, head))
-            .filter_map(|m| git::distance(repo, &m.sha, head).ok().map(|d| (m, d)))
-            .min_by_key(|(m, d)| (at.is_some_and(|a| !m.is_built_at(a)), *d))
+            .min_by_key(|(m, d)| (at.is_some_and(|a| !m.is_built_at(a)), *d)))
     }
 
     /// Records that the workspace `ws` (slot `slot`) was cloned from `sha`. Call with the

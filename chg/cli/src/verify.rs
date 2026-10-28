@@ -114,7 +114,7 @@ pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
             ));
         }
         fetch_ref(repo, o.remote, o.ref_name, b)?;
-        if !git::is_ancestor(repo, b, &sha) {
+        if !git::is_ancestor(repo, b, &sha)? {
             return Ok(report(
                 RefOutcome::Superseded,
                 Verdict::skipped(format!(
