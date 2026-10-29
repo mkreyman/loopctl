@@ -952,6 +952,7 @@ fn gate_at_build(repo: &Path, sha: &str, base: &str, all: bool) -> Option<Verdic
         Ok(s) => s,
         Err(e) => return fallback(format!("no snapshot store: {e}")),
     };
+    base_snapshot_first(repo, &store, sha, base);
     let lock = match store.try_lock_build() {
         Ok(Some(l)) => l,
         Ok(None) => {
@@ -970,6 +971,80 @@ fn gate_at_build(repo: &Path, sha: &str, base: &str, all: bool) -> Option<Verdic
     // As after a shadow check: the next push starts from a snapshot of this base.
     shadow::refresh(repo, base, true);
     Some(v)
+}
+
+/// Builds the snapshot of `base` before a gate-mode check when the snapshot the check
+/// would hydrate from is older than `base` across an `always_all` path (config, the
+/// dependency lock, the build file): hydrated from that one, the check's static step would
+/// recompile everything inside its own budget (on HCB, 2757 files and a dialyzer PLT,
+/// past static's 900 s). The build runs under the snapshot budget, as `chg snapshot
+/// refresh` does (never waiting for the build lock), and says so; a busy path or a failed
+/// build leaves the check to run as before.
+fn base_snapshot_first(repo: &Path, store: &Store, sha: &str, base: &str) {
+    let here = store.resolved_build_dir();
+    let stale = (|| -> Result<Option<(String, String, String)>, String> {
+        if store
+            .list()
+            .iter()
+            .any(|m| m.sha == base && m.is_built_at(&here))
+        {
+            return Ok(None);
+        }
+        let Some((near, _)) = store.nearest_ancestor(repo, sha, Some(&here))? else {
+            return Ok(None);
+        };
+        // Hydrate picks an ancestor of `sha`: a base that is not one (a rebased or
+        // diverged branch's remote tip) could never be hydrated from, so building it would
+        // only make the push wait.
+        if near.sha == base
+            || !git::is_ancestor(repo, base, sha)?
+            || !git::is_ancestor(repo, &near.sha, base)?
+        {
+            return Ok(None);
+        }
+        let manifest = contract::load(repo).map_err(|e| e.to_string())?;
+        let changed: Vec<String> = git::text(repo, &["diff", "--name-only", &near.sha, base])?
+            .lines()
+            .map(String::from)
+            .collect();
+        Ok(chg::glob::first_hit(&manifest.always_all, &changed)
+            .map(|(p, g)| (near.sha.clone(), p.to_string(), g.to_string())))
+    })();
+    let (near, path, pattern) = match stale {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("chg: not checking whether the base's snapshot is needed first: {e}");
+            return;
+        }
+    };
+    let budget = exec::default_timeout(CommandName::Snapshot);
+    eprintln!(
+        "chg: the nearest snapshot ({}) is behind the base {} across {path} (always_all `{pattern}`), \
+         so the check would rebuild everything in static's budget; building the base's \
+         snapshot first, under its own {} s budget",
+        &near[..12.min(near.len())],
+        &base[..12.min(base.len())],
+        budget.as_secs()
+    );
+    let started = std::time::Instant::now();
+    // A refresh never waits for the build lock, as the gate never does.
+    match snapshot::refresh(repo, base, budget) {
+        Ok(Refresh::Done(_)) => eprintln!(
+            "chg: built the snapshot of {} in {}",
+            &base[..12.min(base.len())],
+            shadow::fmt_ms(started.elapsed().as_millis() as u64)
+        ),
+        Ok(Refresh::Busy) => {
+            eprintln!(
+                "chg: another build holds the build path; checking without the base's snapshot"
+            )
+        }
+        Ok(Refresh::NoAncestor) => {
+            eprintln!("chg: no snapshot to build the base's from; checking as before")
+        }
+        Err(e) => eprintln!("chg: building the base's snapshot failed ({e}); checking as before"),
+    }
 }
 
 /// Never fails: a shadow that cannot start says why on stderr and exits 0, because the

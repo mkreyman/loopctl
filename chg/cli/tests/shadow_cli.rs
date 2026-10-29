@@ -47,8 +47,10 @@ cmd=$1; shift
 echo "$cmd $(pwd)" >> "$CALLS"
 case "$cmd" in
   snapshot) [ -n "$SNAP_SLEEP" ] && sleep "$SNAP_SLEEP"
-            mkdir -p _build; echo built > _build/marker; echo '{"work":"full","ms":1}' ;;
-  static)   if ! git rev-parse --verify --quiet "$1^{commit}" >/dev/null; then
+            mkdir -p _build; echo built > _build/marker; printf %s "$CHG_SHA" > _build/sha
+            echo '{"work":"full","ms":1}' ;;
+  static)   cat _build/sha > "$CALLS.hydrated-from" 2>/dev/null
+            if ! git rev-parse --verify --quiet "$1^{commit}" >/dev/null; then
               echo '{"ok":false,"failures":[{"check":"git","message":"base not in this repo"}]}'; exit 1
             fi
             echo '{"ok":true,"failures":[]}' ;;
@@ -484,6 +486,111 @@ fn a_gate_mode_check_judges_the_commit_where_snapshots_are_built() {
         cold.calls().lines().all(|l| l.ends_with(&live)),
         "{}",
         cold.calls()
+    );
+}
+
+/// A base past the nearest snapshot across an always_all path (here mix.exs) would make
+/// the check's static step rebuild everything inside its own budget: the base's snapshot
+/// is built first, under the snapshot budget, and the check hydrates from it.
+#[test]
+fn a_gate_mode_check_builds_the_bases_snapshot_first_across_an_always_all_change() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let old = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&old)
+        .assert()
+        .success();
+    let base = env.commit("mix.exs", "deps changed\n");
+    env.commit("lib/a.ex", "two\n");
+    fs::remove_file(&env.calls).unwrap();
+
+    let out = env
+        .chg()
+        .args(["check", "--base", &base])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "is behind the base {} across mix.exs (always_all `mix.exs`)",
+            &base[..12]
+        )) && err.contains("building the base's snapshot first, under its own 1800 s budget"),
+        "{err}"
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["verdict"], "pass", "{v}");
+    assert!(!err.contains("checking the live tree"), "{err}");
+    // The snapshot was built before static ran, at the build path, and the check hydrated
+    // from it: static ran there and found the base's build.
+    let calls = env.calls();
+    let order: Vec<&str> = calls
+        .lines()
+        .filter_map(|l| l.split(' ').next())
+        .filter(|c| ["snapshot", "static"].contains(c))
+        .collect();
+    assert_eq!(order.first(), Some(&"snapshot"), "{calls}");
+    let at = |cmd: &str| {
+        calls
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{cmd} ")).map(String::from))
+            .unwrap_or_else(|| panic!("no {cmd} call: {calls}"))
+    };
+    assert_eq!(at("static"), at("snapshot"), "{calls}");
+    assert_eq!(
+        fs::read_to_string(env.calls.with_extension("hydrated-from")).unwrap(),
+        base,
+        "{calls}"
+    );
+    let list = env
+        .chg()
+        .args(["snapshot", "list", "--repo"])
+        .arg(&env.repo)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains(&base[..12]),
+        "{}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}
+
+/// A base that is not an ancestor of the commit (the remote tip of a rebased branch) is
+/// never built first: the check could not hydrate from it, so the push would only wait.
+#[test]
+fn a_gate_mode_check_never_builds_a_base_it_cannot_hydrate_from() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let old = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&old)
+        .assert()
+        .success();
+    env.git(&["checkout", "-q", "-b", "side"]);
+    let side = env.commit("mix.exs", "deps changed\n");
+    env.git(&["checkout", "-q", "master"]);
+    env.commit("lib/a.ex", "two\n");
+    fs::remove_file(&env.calls).unwrap();
+
+    let out = env
+        .chg()
+        .args(["check", "--base", &side])
+        .env("SNAP_SLEEP", "15")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("snapshot first"), "{err}");
+    let calls = env.calls();
+    assert_eq!(
+        calls.lines().find_map(|l| l.split(' ').next()),
+        Some("static"),
+        "no snapshot build before the check: {calls}"
     );
 }
 
