@@ -210,9 +210,9 @@ enum Top {
 #[derive(Subcommand)]
 enum CoverCmd {
     /// Mirror the remote's coverage records (`refs/chg/cover/*`); each is unpacked into
-    /// this machine's store when it is first used. Run it before `chg check` and before
-    /// balanced shards; it is cheap when nothing is new. Prints how many were new. Exit 0,
-    /// or 2 when the fetch failed (selection then uses whatever records are already here).
+    /// this machine's store when it is first used. Run it before balanced shards; `chg
+    /// check` fetches the one record it selects by itself. Prints how many were new. Exit
+    /// 0, or 2 when the fetch failed (selection then uses whatever records are already here).
     Fetch {
         #[arg(long)]
         repo: Option<PathBuf>,

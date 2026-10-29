@@ -1,8 +1,12 @@
 //! Shelling out to `git` (design §5: git is the merge engine and object store; wrapping it
 //! beats re-implementing it).
 
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 /// The variables git exports to a hook. Anything started from a hook that runs git in
 /// another directory must drop them, or its git calls act on the hook's repository.
@@ -37,6 +41,128 @@ pub fn run(mut c: Command) -> Result<Output, String> {
         ));
     }
     Ok(out)
+}
+
+/// How long a stopped git gets after SIGTERM to remove its lock and temp files.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// The signal `run_bounded` caught while it waited, or 0.
+static CAUGHT: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn catch(sig: libc::c_int) {
+    CAUGHT.store(sig, Ordering::SeqCst);
+}
+
+/// The signals that end chg, held while `run_bounded` waits and restored on drop. git runs
+/// in its own process group, so a Ctrl-C at the terminal no longer reaches it: chg catches
+/// the signal, stops the group, then dies of the same signal. Handlers are process-wide:
+/// `run_bounded` is never called from two threads at once (every remote call is on chg's
+/// main thread).
+struct Forwarding([(libc::c_int, libc::sighandler_t); 3]);
+
+impl Forwarding {
+    fn install() -> Self {
+        CAUGHT.store(0, Ordering::SeqCst);
+        let handler = catch as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // A signal chg was started with ignored (a CI runner ignores SIGINT) stays ignored:
+        // chg would not have died of it, so neither does the wait.
+        Forwarding([libc::SIGINT, libc::SIGTERM, libc::SIGHUP].map(|sig| {
+            // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+            let old = unsafe { libc::signal(sig, handler) };
+            if old == libc::SIG_IGN {
+                // SAFETY: puts back the ignore that was there.
+                unsafe { libc::signal(sig, libc::SIG_IGN) };
+            }
+            (sig, old)
+        }))
+    }
+}
+
+impl Drop for Forwarding {
+    fn drop(&mut self) {
+        for (sig, old) in self.0 {
+            // SAFETY: puts back the disposition `install` replaced.
+            unsafe { libc::signal(sig, old) };
+        }
+    }
+}
+
+/// Stops the process group `child` leads: SIGTERM, so git removes its `.lock` and
+/// `tmp_pack_*` files, then SIGKILL for whatever is left (an ssh that ignored it).
+fn stop_group(child: &mut std::process::Child) {
+    let group = -(child.id() as libc::pid_t);
+    // SAFETY: kill(2) on the process group our own child leads.
+    unsafe { libc::kill(group, libc::SIGTERM) };
+    let start = Instant::now();
+    while start.elapsed() < STOP_GRACE {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: as above; ESRCH once the group is empty is harmless.
+    unsafe { libc::kill(group, libc::SIGKILL) };
+    let _ = child.wait();
+}
+
+/// `run`, stopped after `timeout`: for git calls that reach a remote, which a slow network
+/// or an ssh prompt nobody answers would otherwise hold forever. git and the ssh it starts
+/// run in their own process group, so stopping it takes both.
+pub fn run_bounded(mut c: Command, timeout: Duration) -> Result<Output, String> {
+    let shown = format!("{c:?}");
+    // Files, not pipes: nothing has to drain them while we wait.
+    let (out, err) = match (tempfile::tempfile(), tempfile::tempfile()) {
+        (Ok(o), Ok(e)) => (o, e),
+        (Err(e), _) | (_, Err(e)) => return Err(format!("cannot run {shown}: {e}")),
+    };
+    let read = |mut f: std::fs::File| {
+        let mut buf = Vec::new();
+        let _ = f
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| f.read_to_end(&mut buf));
+        buf
+    };
+    let forwarding = Forwarding::install();
+    let mut child = c
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(out.try_clone().map_err(|e| format!("{shown}: {e}"))?)
+        .stderr(err.try_clone().map_err(|e| format!("{shown}: {e}"))?)
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("cannot run {shown}: {e}"))?;
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if CAUGHT.load(Ordering::SeqCst) != 0 => {
+                let sig = CAUGHT.load(Ordering::SeqCst);
+                stop_group(&mut child);
+                drop(forwarding);
+                // SAFETY: re-raises the signal under chg's own disposition, so chg ends
+                // as it would have without the wait.
+                unsafe { libc::raise(sig) };
+                return Err(format!("{shown} interrupted by signal {sig}"));
+            }
+            Ok(None) if start.elapsed() >= timeout => {
+                stop_group(&mut child);
+                return Err(format!("{shown} timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(format!("waiting on {shown}: {e}")),
+        }
+    };
+    let output = Output {
+        status,
+        stdout: read(out),
+        stderr: read(err),
+    };
+    if !status.success() {
+        return Err(format!(
+            "{shown} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output)
 }
 
 /// Trimmed stdout of a git command that must succeed.

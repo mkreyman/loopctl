@@ -920,6 +920,175 @@ fn coverage_records_travel_from_the_verifier_to_other_machines() {
     );
 }
 
+/// Dev machines never ran `chg cover fetch`, so every HCB gate selected without coverage
+/// (0 of 92 published records in minis's clone, 2026-10-28). `chg check` fetches the one
+/// record its selection needs, bounded, and a failed fetch costs only coverage.
+#[test]
+fn check_fetches_the_record_its_selection_needs_and_only_that_one() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    let c1 = env.head();
+    assert_eq!(
+        json(&env.chg().arg("verify").output().unwrap())["cover"],
+        "published"
+    );
+    let c2 = env.commit("lib/a.ex", "two\n");
+    assert_eq!(
+        json(&env.chg().arg("verify").output().unwrap())["cover"],
+        "published"
+    );
+    env.git(&["push", "-q", "origin", "master"]);
+
+    let other = env.root.join("other");
+    assert!(
+        Std::new("git")
+            .args(["clone", "-q"])
+            .arg(&env.remote)
+            .arg(&other)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let refs = || {
+        let out = Std::new("git")
+            .arg("-C")
+            .arg(&other)
+            .args(["for-each-ref", "--format=%(refname)", "refs/chg/cover/"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(refs(), "");
+    let check = |extra: &[(&str, &str)]| {
+        fs::write(env.root.join("envlog"), "").unwrap();
+        let mut c = env.chg();
+        c.current_dir(&other).args(["check", "--base", "HEAD"]);
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{err}");
+        (err, fs::read_to_string(env.root.join("envlog")).unwrap())
+    };
+
+    // The nearest record (c2's) is fetched and handed to `affected`; c1's is not.
+    let (err, log) = check(&[]);
+    assert!(
+        err.contains(&format!("fetched the coverage record of {}", &c2[..12])),
+        "{err}"
+    );
+    assert_eq!(refs(), format!("refs/chg/cover/{c2}"));
+    assert!(!refs().contains(&c1));
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with("affected cover=") && l.contains(&format!("{c2}.cover"))),
+        "{log}"
+    );
+    // Already here: nothing more is fetched.
+    let (err, _) = check(&[]);
+    assert!(!err.contains("fetched the coverage record"), "{err}");
+
+    // A base with no record of its own asks the remote. One that hangs is cut off at the
+    // bound, and the check still judges, with the record already here.
+    let git_other = |args: &[&str]| {
+        assert!(
+            Std::new("git")
+                .arg("-C")
+                .arg(&other)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git_other(&["commit", "-q", "--allow-empty", "-m", "c3"]);
+    git_other(&["remote", "set-url", "origin", "ssh://chg.invalid/r.git"]);
+    let started = std::time::Instant::now();
+    let (err, log) = check(&[
+        ("GIT_SSH_COMMAND", "sh -c 'sleep 30' --"),
+        ("CHG_COVER_FETCH_SECS", "1"),
+    ]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(err.contains("timed out after 1s"), "{err}");
+    assert!(err.contains("coverage records not fetched"), "{err}");
+    assert!(log.contains(&format!("{c2}.cover")), "{log}");
+
+    // A change that already runs the whole suite (always_all) never asks the remote.
+    fs::write(other.join("mix.exs"), "changed\n").unwrap();
+    let started = std::time::Instant::now();
+    let (err, _) = check(&[
+        ("GIT_SSH_COMMAND", "sh -c 'sleep 30' --"),
+        ("CHG_COVER_FETCH_SECS", "10"),
+    ]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{err}"
+    );
+    assert!(!err.contains("coverage records not fetched"), "{err}");
+    fs::remove_file(other.join("mix.exs")).ok();
+    git_other(&["checkout", "-q", "--", "."]);
+
+    // A signal to chg while the remote hangs stops the remote call too, not only chg.
+    // SIGTERM, not SIGINT: a CI runner starts jobs with SIGINT ignored, and chg keeps that.
+    let pidfile = env.root.join("ssh.pid");
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_chg"));
+    c.current_dir(&other)
+        .args(["check", "--base", "HEAD"])
+        .env(
+            "GIT_SSH_COMMAND",
+            format!("sh -c 'echo $$ > {}; exec sleep 30' --", pidfile.display()),
+        )
+        .env("CHG_COVER_FETCH_SECS", "60")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // `env.chg()` is assert_cmd's, which cannot be signalled while it runs.
+    for (k, v) in [
+        ("CHG_HOME", "chg-home"),
+        ("CHG_STORE", "store"),
+        ("ENVLOG", "envlog"),
+    ] {
+        c.env(k, env.root.join(v));
+    }
+    c.env("CALLS", &env.calls).env_remove("CHG_GATE");
+    let mut chg = c.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let ssh_pid = loop {
+        if let Ok(p) = fs::read_to_string(&pidfile)
+            && !p.trim().is_empty()
+        {
+            break p.trim().to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the remote call never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Std::new("kill")
+        .args(["-TERM", &chg.id().to_string()])
+        .status()
+        .unwrap();
+    let status = chg.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(15),
+        "chg ends by the SIGTERM it was sent"
+    );
+    let alive = || {
+        Std::new("kill")
+            .args(["-0", &ssh_pid])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!alive(), "the remote's ssh outlived chg");
+}
+
 #[test]
 fn publishing_prunes_only_this_lines_old_records() {
     let env = Env::new(tempfile::tempdir().unwrap());

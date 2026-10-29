@@ -8,7 +8,8 @@
 //!
 //! The verifier runs on one machine and a gate on another, so records travel through the
 //! remote: `publish` pushes each as a parentless commit holding one file at
-//! `refs/chg/cover/<sha>`, and `fetch` mirrors those refs. A record is unpacked into the
+//! `refs/chg/cover/<sha>`, `fetch` mirrors those refs, and `fetch_nearest` fetches the one
+//! a gate's selection needs. A record is unpacked into the
 //! history only when it is used, so the history is a cache of `KEEP_LOCAL` files. A record
 //! more than `MAX_AGE` first-parent commits behind the newest one on its line is deleted
 //! from the remote when the newer one is published.
@@ -16,6 +17,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::git;
 use crate::store::Store;
@@ -88,7 +90,8 @@ pub fn publish(repo: &Path, remote: &str, sha: &str, record: &Path) -> Result<()
     let mut push = git::cmd(repo);
     push.args(["-c", "core.hooksPath=/dev/null", "push", "-q", remote])
         .arg(format!("+{commit}:{REF_PREFIX}{sha}"));
-    git::run(push).map_err(|e| format!("publishing the coverage record: {e}"))?;
+    git::run_bounded(push, transfer_timeout())
+        .map_err(|e| format!("publishing the coverage record: {e}"))?;
 
     // Pruning is housekeeping: the record is out, so a failure here (choosing the stale
     // records or deleting them) never makes the publish fail, and a later one retries it.
@@ -117,7 +120,7 @@ fn prune(repo: &Path, remote: &str, sha: &str) -> Result<(), String> {
     // Only this line's: a record that is not an ancestor of `sha` (another verified line,
     // or a commit this clone has never seen) belongs to a line whose own publishes prune it.
     let mut stale = Vec::new();
-    for s in remote_records(repo, remote)? {
+    for s in remote_records(repo, remote, fetch_timeout())? {
         if !reach.contains(&s) && git::is_ancestor_if_present(repo, &s, sha)? {
             stale.push(format!(":{REF_PREFIX}{s}"));
         }
@@ -126,19 +129,104 @@ fn prune(repo: &Path, remote: &str, sha: &str) -> Result<(), String> {
         let mut del = git::cmd(repo);
         del.args(["-c", "core.hooksPath=/dev/null", "push", "-q", remote])
             .args(&stale);
-        git::run(del)?;
+        git::run_bounded(del, transfer_timeout())?;
     }
     Ok(())
 }
 
-fn remote_records(repo: &Path, remote: &str) -> Result<Vec<String>, String> {
+fn remote_records(repo: &Path, remote: &str, timeout: Duration) -> Result<Vec<String>, String> {
+    let mut ls = git::cmd(repo);
+    ls.args(["ls-remote", "--refs", remote, &format!("{REF_PREFIX}*")]);
+    Ok(record_shas(&String::from_utf8_lossy(
+        &git::run_bounded(ls, timeout)?.stdout,
+    )))
+}
+
+/// The shas of `ls-remote`'s record refs.
+fn record_shas(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|l| l.split('\t').nth(1))
+        .filter_map(|r| r.strip_prefix(REF_PREFIX))
+        .map(String::from)
+        .collect()
+}
+
+/// How long a listing of the remote's records, or the fetch of one record, may take
+/// (`CHG_COVER_FETCH_SECS` overrides it).
+pub const FETCH_SECS: u64 = 30;
+/// How long a push or a mirror of every record may take (`CHG_COVER_TRANSFER_SECS`).
+pub const TRANSFER_SECS: u64 = 600;
+
+pub fn fetch_timeout() -> Duration {
+    secs_from_env("CHG_COVER_FETCH_SECS", FETCH_SECS)
+}
+
+fn transfer_timeout() -> Duration {
+    secs_from_env("CHG_COVER_TRANSFER_SECS", TRANSFER_SECS)
+}
+
+fn secs_from_env(var: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default),
+    )
+}
+
+/// Makes sure the record `nearest` would choose for `base` is in this clone. A gate runs
+/// this before selecting: records are published by the verifier, on another machine, and
+/// a clone that never fetched them selects without coverage. It lists the remote's
+/// records and fetches only the nearest one on `base`'s first-parent line, when the clone
+/// lacks it and has no nearer one (a record is megabytes; mirroring every one cost
+/// HCB's first fetch 19 s). Each remote call is stopped after `timeout` (`git::run_bounded`
+/// lets git remove its locks first). Returns the sha fetched, or None when nothing was
+/// needed. On a failure selection uses the records already here, and with none, selects
+/// without coverage.
+pub fn fetch_nearest(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
+    let store = Store::for_repo(repo)?;
+    let known = local_records(repo)?;
+    let line = first_parent_line(repo, base)?;
+    let here = |sha: &String| record_path(&store, sha).exists() || known.contains(sha);
+    // The base's own record is here: none can be nearer, so the remote need not be asked.
+    if line.first().is_some_and(here) {
+        return Ok(None);
+    }
+    let published = remote_records(repo, remote, timeout)?;
+    for sha in &line {
+        if here(sha) {
+            return Ok(None);
+        }
+        if published.contains(sha) {
+            let mut f = git::cmd(repo);
+            f.args(["fetch", "-q", "--no-tags", remote])
+                .arg(format!("+{REF_PREFIX}{sha}:{REF_PREFIX}{sha}"));
+            git::run_bounded(f, timeout)?;
+            return Ok(Some(sha.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// `base` and the first-parent commits behind it that a record may be judged from.
+fn first_parent_line(repo: &Path, base: &str) -> Result<Vec<String>, String> {
     Ok(git::text(
         repo,
-        &["ls-remote", "--refs", remote, &format!("{REF_PREFIX}*")],
+        &[
+            "rev-list",
+            "--first-parent",
+            "-n",
+            &(max_age() + 1).to_string(),
+            base,
+        ],
     )?
     .lines()
-    .filter_map(|l| l.split('\t').nth(1))
-    .filter_map(|r| r.strip_prefix(REF_PREFIX))
     .map(String::from)
     .collect())
 }
@@ -146,17 +234,10 @@ fn remote_records(repo: &Path, remote: &str) -> Result<Vec<String>, String> {
 /// Mirrors the remote's record refs. Returns how many are new here.
 pub fn fetch(repo: &Path, remote: &str) -> Result<usize, String> {
     let before = local_records(repo)?;
-    git::text(
-        repo,
-        &[
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--prune",
-            remote,
-            &format!("+{REF_PREFIX}*:{REF_PREFIX}*"),
-        ],
-    )?;
+    let mut f = git::cmd(repo);
+    f.args(["fetch", "-q", "--no-tags", "--prune", remote])
+        .arg(format!("+{REF_PREFIX}*:{REF_PREFIX}*"));
+    git::run_bounded(f, transfer_timeout())?;
     Ok(local_records(repo)?
         .iter()
         .filter(|s| !before.contains(*s))
@@ -196,23 +277,12 @@ pub fn materialize(repo: &Path, store: &Store, sha: &str) -> Result<Option<PathB
 /// at most `max_age()` commits behind it. Returns its sha and file, or None.
 pub fn nearest(repo: &Path, base: &str) -> Result<Option<(String, PathBuf)>, String> {
     let store = Store::for_repo(repo)?;
-    let max = max_age();
     let known = local_records(repo)?;
-    let line = git::text(
-        repo,
-        &[
-            "rev-list",
-            "--first-parent",
-            "-n",
-            &(max + 1).to_string(),
-            base,
-        ],
-    )?;
-    for sha in line.lines() {
-        if (record_path(&store, sha).exists() || known.iter().any(|k| k == sha))
-            && let Some(path) = materialize(repo, &store, sha)?
+    for sha in first_parent_line(repo, base)? {
+        if (record_path(&store, &sha).exists() || known.contains(&sha))
+            && let Some(path) = materialize(repo, &store, &sha)?
         {
-            return Ok(Some((sha.to_string(), path)));
+            return Ok(Some((sha, path)));
         }
     }
     Ok(None)

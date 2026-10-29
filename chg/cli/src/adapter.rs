@@ -183,6 +183,28 @@ pub fn invoke(
     }
 }
 
+/// The remote the verifier publishes coverage records to.
+const RECORD_REMOTE: &str = "origin";
+
+/// Brings the coverage record selection would use for `base` into this clone
+/// (`cover::fetch_nearest`). The verifier publishes records from another machine, and a
+/// clone that never fetched them selected without coverage on every check. It runs only
+/// once a change has passed always_all, so a whole-suite check never asks the remote. A
+/// failure costs only coverage: selection then uses the records already here, or none.
+/// A repo without the remote has nothing to fetch.
+fn fetch_record(repo: &Path, base: &str) {
+    if git::text(repo, &["remote", "get-url", RECORD_REMOTE]).is_err() {
+        return;
+    }
+    match cover::fetch_nearest(repo, RECORD_REMOTE, base, cover::fetch_timeout()) {
+        Ok(Some(sha)) => eprintln!("chg: fetched the coverage record of {}", &sha[..12]),
+        Ok(None) => {}
+        Err(e) => eprintln!(
+            "chg: coverage records not fetched ({e}); selecting with the ones already here"
+        ),
+    }
+}
+
 /// The record `affected` may judge by, and the paths changed since it. Selection by
 /// coverage compares with the record, not the base, so an `always_all` path changed since
 /// the record rules it out: the adapter then selects from the base, where chg has already
@@ -192,6 +214,7 @@ fn coverage_record(
     always_all: &[String],
     base: &str,
 ) -> Result<(String, Vec<String>), String> {
+    fetch_record(repo, base);
     let (sha, path) = cover::nearest(repo, base)?.ok_or_else(|| {
         "no coverage record on the base's first-parent line within reach".to_string()
     })?;
