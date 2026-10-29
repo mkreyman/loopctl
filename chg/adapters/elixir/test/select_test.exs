@@ -3,18 +3,21 @@ defmodule ChgAdapter.SelectTest do
 
   alias ChgAdapter.{Graph, Select}
 
-  # Accounts <- Billing <- Invoices (runtime references); Reports stands alone;
-  # Greeting reads priv/greeting.txt.
+  # Accounts <- Billing <- Invoices (runtime references), and Invoices expands a Billing
+  # struct at compile time; Reports stands alone; Greeting reads priv/greeting.txt; Boot
+  # runs at application start.
   @graph %Graph{
     source_modules: %{
       "lib/accounts.ex" => [Accounts],
       "lib/billing.ex" => [Billing],
       "lib/invoices.ex" => [Invoices],
       "lib/reports.ex" => [Reports],
-      "lib/greeting.ex" => [Greeting]
+      "lib/greeting.ex" => [Greeting],
+      "lib/boot.ex" => [Boot]
     },
     external: %{"priv/greeting.txt" => ["lib/greeting.ex"]},
-    dependents: %{Accounts => [Billing], Billing => [Invoices]}
+    dependents: %{Accounts => [Billing], Billing => [Invoices]},
+    compile_dependents: %{Billing => [Invoices]}
   }
 
   @tests %{
@@ -193,6 +196,102 @@ defmodule ChgAdapter.SelectTest do
                ["test/billing_test.exs", "test/invoices_test.exs"]
     end
 
+    test "a digest that differs with nothing changed that can reach it alters nothing" do
+      # Two compiles of one commit: map-ordered code comes out reordered.
+      flapped = now(%{Reports => "r2", Greeting => "g2", Boot => "x2"})
+      assert {:subset, reason, []} = cover([], flapped)
+      assert reason =~ "0 module(s) compared, 0 altered module(s)"
+
+      # lib/accounts.ex changed: Billing and Invoices reach Accounts, and Invoices expands
+      # Billing at compile time, so Accounts and Invoices are compared and Invoices is
+      # altered; the flapped Reports, Greeting and Boot are not compared.
+      assert {:subset, reason, tests} =
+               cover(["lib/accounts.ex"], Map.put(flapped, Invoices, "i2"))
+
+      assert reason =~ "2 module(s) compared, 1 altered module(s)"
+      assert tests == ["test/invoices_test.exs"]
+    end
+
+    test "a module reached only at run time is not compared, one reached at compile time is" do
+      # Invoices references Accounts only through Billing at run time: a changed Accounts
+      # cannot change Billing's code, so a flapped Billing is no evidence.
+      graph = %{@graph | compile_dependents: %{}}
+
+      assert tests(
+               Select.by_coverage(%{
+                 changed: ["lib/accounts.ex"],
+                 since_record: [],
+                 record: @record,
+                 digests: now(%{Billing => "b2"}),
+                 graph: graph,
+                 test_files: Map.keys(@record.cover),
+                 test_file?: &String.ends_with?(&1, "_test.exs"),
+                 test_path?: &String.starts_with?(&1, "test/"),
+                 impl?: fn _ -> false end,
+                 read: [],
+                 not_read_by: []
+               })
+             ) == []
+
+      # With Invoices expanding Billing at compile time, a changed Accounts reaches
+      # Invoices' code through Billing, so Invoices is compared and its digest counts.
+      assert tests(cover(["lib/accounts.ex"], now(%{Invoices => "i2"}))) ==
+               ["test/invoices_test.exs"]
+    end
+
+    test "a deleted module's compile dependents are compared" do
+      # lib/accounts.ex no longer defines Legacy; Reports checked for it at compile time
+      # (`Code.ensure_loaded?(Legacy)` in its body), so Mix recompiled it.
+      record = %{
+        @record
+        | digests: Map.put(@record.digests, Legacy, "l1"),
+          cover: Map.put(@record.cover, "test/legacy_test.exs", [Legacy])
+      }
+
+      graph = %{
+        @graph
+        | compile_dependents: Map.put(@graph.compile_dependents, Legacy, [Reports])
+      }
+
+      assert {:subset, _, tests} =
+               Select.by_coverage(%{
+                 changed: ["lib/accounts.ex"],
+                 since_record: [],
+                 record: record,
+                 digests: now(%{Reports => "r2"}),
+                 graph: graph,
+                 test_files: Map.keys(record.cover),
+                 test_file?: &String.ends_with?(&1, "_test.exs"),
+                 test_path?: &String.starts_with?(&1, "test/"),
+                 impl?: fn _ -> false end,
+                 read: [],
+                 not_read_by: []
+               })
+
+      assert tests == ["test/legacy_test.exs", "test/reports_test.exs"]
+    end
+
+    test "a changed source the module graph does not map compares every digest" do
+      # A macro in an in-repo path dependency, a script, an undeclared template.
+      for p <- ["shared/lib/shared.ex", "priv/repo/seeds.exs", "lib/web/page.html.heex"] do
+        assert {:subset, reason, tests} = cover([p], now(%{Reports => "r2"}))
+        assert reason =~ "every module compared (#{p} changed)"
+        assert tests == ["test/reports_test.exs"]
+      end
+
+      # An external resource a module declares stays gated: only its readers are compared.
+      assert {:subset, reason, _} = cover(["priv/greeting.txt"], now(%{Reports => "r2"}))
+      assert reason =~ "1 module(s) compared"
+    end
+
+    test "config, deps or the toolchain changed: every digest is compared" do
+      for p <- ["config/config.exs", "mix.lock", "mix.exs", ".tool-versions", "deps/x/lib/x.ex"] do
+        assert {:subset, reason, tests} = cover([p], now(%{Reports => "r2"}))
+        assert reason =~ "every module compared (#{p} changed)"
+        assert tests == ["test/reports_test.exs"]
+      end
+    end
+
     test "a source edit that leaves the compiled code as the record has it alters nothing" do
       # A comment, a line shift, or a revert to the record's code: those tests passed.
       assert tests(cover(["lib/reports.ex"], now(%{}))) == []
@@ -304,7 +403,7 @@ defmodule ChgAdapter.SelectTest do
     end
 
     test "a module that ran outside any one test file (global) selects everything" do
-      assert {:all, reason} = cover([], now(%{Boot => "x2"}))
+      assert {:all, reason} = cover(["lib/boot.ex"], now(%{Boot => "x2"}))
       assert reason =~ "Boot"
     end
 

@@ -5,16 +5,19 @@ defmodule ChgAdapter.Graph do
 
   Dependents follow compile, export and runtime references transitively, exactly as
   `mix test --stale` does (`Mix.Compilers.Test.find_all_dependent_on/4`).
+  `compile_dependents` keeps only compile and export references: the modules Mix
+  recompiles when what they reference changes.
   """
 
   require Mix.Compilers.Elixir, as: CE
 
-  defstruct source_modules: %{}, external: %{}, dependents: %{}
+  defstruct source_modules: %{}, external: %{}, dependents: %{}, compile_dependents: %{}
 
   @type t :: %__MODULE__{
           source_modules: %{String.t() => [module()]},
           external: %{String.t() => [String.t()]},
-          dependents: %{module() => [module()]}
+          dependents: %{module() => [module()]},
+          compile_dependents: %{module() => [module()]}
         }
 
   @doc """
@@ -50,18 +53,21 @@ defmodule ChgAdapter.Graph do
         end)
       end)
 
-    dependents =
+    by = fn refs_of ->
       Enum.reduce(sources, %{}, fn {src, rec}, acc ->
         defined = Map.get(source_modules, rel(src), [])
-
-        refs =
-          CE.source(rec, :compile_references) ++
-            CE.source(rec, :export_references) ++ CE.source(rec, :runtime_references)
-
-        Enum.reduce(refs, acc, &Map.update(&2, &1, defined, fn ds -> defined ++ ds end))
+        Enum.reduce(refs_of.(rec), acc, &Map.update(&2, &1, defined, fn ds -> defined ++ ds end))
       end)
+    end
 
-    %__MODULE__{source_modules: source_modules, external: external, dependents: dependents}
+    compile = &(CE.source(&1, :compile_references) ++ CE.source(&1, :export_references))
+
+    %__MODULE__{
+      source_modules: source_modules,
+      external: external,
+      dependents: by.(&(compile.(&1) ++ CE.source(&1, :runtime_references))),
+      compile_dependents: by.(compile)
+    }
   end
 
   # Elixir 1.19 and 1.20 record an external resource as `{path, {mtime, size}, digest}`.

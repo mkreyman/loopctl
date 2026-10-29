@@ -53,7 +53,7 @@ A product then adds:
 |---|---|---|
 | `mix chg.snapshot` | `snapshot` | `deps.get` (recording `mix.lock`'s hash in `deps/.chg_lock`), `chg.compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
 | `mix chg.refs` | (part of `snapshot`) | Compiles the test files without running them or starting the app, and records each one's module references in `_build/chg/test_refs.etf`. |
-| `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed, or that read a changed path `chg` names in `CHG_READ`. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest, and everything when `CHG_READ` names a path. |
+| `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module that is new, gone, or whose compiled code changed where a change can reach it (a module in a changed source, reading a changed external resource, or depending at compile time on one; every module after a change to config, deps, the toolchain or a source the graph does not map), or that read a changed path `chg` names in `CHG_READ`. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest, and everything when `CHG_READ` names a path. |
 | `mix chg.static --base <sha>` | `static` | `format --check-formatted` and `credo --strict` on the changed files their configs name (`.formatter.exs` inputs, `.credo.exs` default files), `compile --warnings-as-errors`, `dialyzer`. |
 | `mix chg.run --tests <list>` | `run` | `mix test` on the listed paths, one result per test. |
 | `mix chg.compile [args]` | (every task's compile) | `mix compile args` in a fresh VM that first makes the project's atoms in one sorted order (`ChgAdapter.Atoms`), so two builds of one commit digest alike. |
@@ -104,9 +104,15 @@ Selecting (`mix chg.affected`) against the record `chg` hands over in `CHG_COVER
 on the base's first-parent line, at most `CHG_COVER_MAX_AGE` (default 100) commits back, with no
 `always_all` path changed since it:
 
-- the altered modules are those whose digest differs between the record and the current build
-  (new and deleted ones included), plus the readers of an `@external_resource` that changed since
-  the base or the record. Everything is compared with the record's green run, not the base, so a
+- the altered modules are the new and deleted ones, the readers of an `@external_resource` that
+  changed since the base or the record, and those whose digest differs between the record and the
+  current build among the modules a change can reach at compile time: those defined in a changed
+  source or deleted, and those with a compile or export reference to a module that reaches one
+  through any reference (Mix's own recompile rule). A change to `config/`, `mix.exs`, `mix.lock`,
+  `.tool-versions` or `deps/`, or to a source no module in the graph is defined in or declares
+  as an `@external_resource` (an in-repo path dependency, a script), compares every module. Two
+  builds of one commit still differ in a few modules, which this keeps from counting unless a
+  change reaches them. Everything is compared with the record's green run, not the base, so a
   comment, a line shift or a revert to the record's code alters nothing;
 - test data (a file under the test paths that is not a test) changed since the base or the
   record selects the whole suite;
