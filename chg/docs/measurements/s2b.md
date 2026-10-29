@@ -123,6 +123,16 @@ the next: the same 40 standard atoms in one map give two key orders in two
 identical `elixir` runs, and preloading the atoms from a boot script, before the
 kernel starts, left the same 6 differing.
 
+## Follow-up: deterministic boot
+
+The 6 were not a per-run hash. They were the atoms the VM makes while booting,
+made in a different order on every multi-scheduler boot. The compiling VM now
+boots on one scheduler of each kind (`+S N:1 +SDcpu N:1 +SDio 1`), and
+`ChgAdapter.Atoms.preload` brings the schedulers back before compiling (chg#90).
+Two clean builds now give one digest on all 9 bases of an 11-PR HCB replay on
+minis (2026-10-29), with HCB's compile-time random `CLOAK_KEY` fixed; clean
+compiles take ~1 s longer (72.5 s against 71.5 s median).
+
 ## The digest walk itself
 
 204 of 204 commits digested (`/tmp/chg-digests` on mac-mini, ~35 s/commit

@@ -37,6 +37,48 @@ defmodule ChgAdapter.AtomsTest do
     end
   end
 
+  # Atoms the VM makes while booting (`:state`, `:name`) get their indices in a different
+  # order on every multi-scheduler boot, which reorders maps they key. Booted with
+  # `boot_flags/1`, three VMs agree, and preload brings every scheduler back online.
+  test "a VM booted with boot_flags orders boot atoms the same way and gets every scheduler back" do
+    n = System.schedulers()
+    paths = Enum.flat_map(:code.get_path(), &[~c"-pa", &1])
+
+    # As `env/0` passes them, in ERL_ZFLAGS, past an ERL_FLAGS like the CI runner pool's,
+    # which the VM reads after the command line and would otherwise win.
+    env = [
+      {~c"ERL_FLAGS", ~c"+S #{n}:#{n}"},
+      {~c"ERL_ZFLAGS", String.to_charlist(Atoms.boot_flags(n))}
+    ]
+
+    keys = ~w(id name email phone address city state zip country status type value key data
+              error ok module function line file reason message source target count size
+              length list map tuple atom binary integer float pid port ref node time date
+              first last min max)a
+
+    boot = fn ->
+      {:ok, peer, _} = :peer.start_link(%{connection: :standard_io, args: paths, env: env})
+
+      try do
+        assert :peer.call(peer, :erlang, :system_info, [:schedulers_online]) == 1
+        assert :peer.call(peer, :erlang, :system_info, [:dirty_io_schedulers]) == 1
+        order = :peer.call(peer, :maps, :keys, [:peer.call(peer, :maps, :from_keys, [keys, 1])])
+        assert :peer.call(peer, Atoms, :preload, []) == :ok
+        assert :peer.call(peer, :erlang, :system_info, [:schedulers_online]) == n
+
+        assert :peer.call(peer, :erlang, :system_info, [:dirty_cpu_schedulers_online]) ==
+                 :peer.call(peer, :erlang, :system_info, [:dirty_cpu_schedulers])
+
+        order
+      after
+        :peer.stop(peer)
+      end
+    end
+
+    [first | rest] = for _ <- 1..3, do: boot.()
+    assert Enum.all?(rest, &(&1 == first))
+  end
+
   # The parallel compiler meets atoms in a different order on every build, and OTP 26+
   # iterates a map's atom keys in the order the VM made them: code a macro generates from
   # a map differs between two builds of one source, unless both VMs preloaded the atoms.

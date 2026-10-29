@@ -16,20 +16,58 @@ defmodule ChgAdapter.Atoms do
   before anything else: each VM then makes those atoms first, in the same order, from the
   same starting table. Two atoms both on the list are ordered the same way in every
   build, even when the lists differ (a commit added a literal), so only atoms a compile
-  invents (`:"\#{name}_id"`) still vary. A map of more than 32 keys is ordered by a hash
-  that differs from one VM run to the next whatever the atoms' indices, so code generated
-  from one still varies; coverage selection compares only the digests a change can reach.
+  invents (`:"\#{name}_id"`) still vary.
+
+  The atoms the VM makes while it boots (`:state`, `:temporary`, most struct field names)
+  come before the list, and a VM booting on many schedulers makes them in a different
+  order each time, which reorders any map they key and so the code generated from it
+  (minis, 2026-10-29: 44 such keys gave 21 distinct digests in 80 compiles). So the
+  compiling VM boots on one scheduler, one dirty CPU and one dirty IO scheduler
+  (`+S N:1 +SDcpu N:1 +SDio 1`), which makes the order the same every time, and
+  `preload/0` brings every scheduler and dirty CPU scheduler back online before the
+  compile starts. The dirty IO schedulers cannot be brought online later, so the compile
+  runs with one. The flags go in `ERL_ZFLAGS`, which the VM reads after the command line
+  and `ERL_FLAGS`: a CI runner's `ERL_FLAGS=+S 2:2` (the fleet's runner pool sets one)
+  would otherwise boot on every scheduler and undo it. The scheduler count stays the one
+  that environment gave `mix` itself.
   """
 
   @env "CHG_ATOMS"
 
   @doc """
-  Makes the atoms in the file `CHG_ATOMS` names, in order. Run by the VM before Elixir
-  starts (`-s Elixir.ChgAdapter.Atoms preload`), so it uses only Erlang, and never fails:
-  a missing, unreadable or malformed file makes no atom and leaves the build as it would
-  have been.
+  Makes the atoms in the file `CHG_ATOMS` names, in order, then brings every scheduler and
+  dirty CPU scheduler online. Run by the VM before Elixir starts
+  (`-s Elixir.ChgAdapter.Atoms preload`), so it uses only Erlang, and never fails: a
+  missing, unreadable or malformed file makes no atom and leaves the build as it would
+  have been, on every scheduler.
   """
   def preload do
+    make_atoms()
+    :erlang.system_flag(:schedulers_online, :erlang.system_info(:schedulers))
+    all_dirty_cpu_online(200)
+  end
+
+  # The flag returns before every dirty CPU scheduler is up: under load the count read back
+  # lagged (11 of 16 on minis, 2026-10-29). Set it and wait, 5 ms at a time, until it holds;
+  # after `tries` the compile starts anyway, on fewer dirty CPU schedulers, never failing.
+  defp all_dirty_cpu_online(tries) do
+    want = :erlang.system_info(:dirty_cpu_schedulers)
+    :erlang.system_flag(:dirty_cpu_schedulers_online, want)
+
+    cond do
+      :erlang.system_info(:dirty_cpu_schedulers_online) == want ->
+        :ok
+
+      tries > 0 ->
+        :timer.sleep(5)
+        all_dirty_cpu_online(tries - 1)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp make_atoms do
     case :os.getenv(~c"CHG_ATOMS") do
       false ->
         :ok
@@ -51,7 +89,8 @@ defmodule ChgAdapter.Atoms do
 
   @doc """
   The environment for a `mix compile` that preloads this project's atoms: writes the list
-  under the build path and returns `CHG_ATOMS` and an `ERL_AFLAGS` that runs `preload/0`.
+  under the build path and returns `CHG_ATOMS`, an `ERL_AFLAGS` that runs `preload/0` and
+  an `ERL_ZFLAGS` with `boot_flags/1`, each after what the environment already holds.
   Empty when the adapter's own code sits at a path `ERL_AFLAGS` cannot carry (a space).
   """
   def env do
@@ -63,10 +102,22 @@ defmodule ChgAdapter.Atoms do
       file = Path.join(Mix.Project.build_path(), "chg_atoms.etf")
       File.mkdir_p!(Path.dirname(file))
       ChgAdapter.write_atomic!(file, :erlang.term_to_binary(list()))
-      flags = "-pa #{ebin} -s Elixir.ChgAdapter.Atoms preload"
-      [{@env, file}, {"ERL_AFLAGS", String.trim("#{System.get_env("ERL_AFLAGS")} #{flags}")}]
+
+      [
+        {@env, file},
+        {"ERL_AFLAGS", after_env("ERL_AFLAGS", "-pa #{ebin} -s Elixir.ChgAdapter.Atoms preload")},
+        {"ERL_ZFLAGS", after_env("ERL_ZFLAGS", boot_flags(System.schedulers()))}
+      ]
     end
   end
+
+  defp after_env(var, flags), do: String.trim("#{System.get_env(var)} #{flags}")
+
+  @doc """
+  The emulator flags that make a VM with `n` schedulers boot on one of each kind, so the
+  atoms it makes while booting are made in the same order every time.
+  """
+  def boot_flags(n), do: "+S #{n}:1 +SDcpu #{n}:1 +SDio 1"
 
   @doc "The atoms to preload, as sorted binaries."
   def list do
