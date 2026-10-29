@@ -51,11 +51,12 @@ A product then adds:
 
 | Task | Contract command | What it does |
 |---|---|---|
-| `mix chg.snapshot` | `snapshot` | `deps.get` (recording `mix.lock`'s hash in `deps/.chg_lock`), `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
+| `mix chg.snapshot` | `snapshot` | `deps.get` (recording `mix.lock`'s hash in `deps/.chg_lock`), `chg.compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock`, the toolchain and the tree's absolute path match its marker; a tree moved to another path builds again there. |
 | `mix chg.refs` | (part of `snapshot`) | Compiles the test files without running them or starting the app, and records each one's module references in `_build/chg/test_refs.etf`. |
 | `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed, or that read a changed path `chg` names in `CHG_READ`. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest, and everything when `CHG_READ` names a path. |
 | `mix chg.static --base <sha>` | `static` | `format --check-formatted` and `credo --strict` on the changed files their configs name (`.formatter.exs` inputs, `.credo.exs` default files), `compile --warnings-as-errors`, `dialyzer`. |
 | `mix chg.run --tests <list>` | `run` | `mix test` on the listed paths, one result per test. |
+| `mix chg.compile [args]` | (every task's compile) | `mix compile args` in a fresh VM that first makes the project's atoms in one sorted order (`ChgAdapter.Atoms`), so two builds of one commit digest alike. |
 
 Every task but `snapshot` first runs `mix deps.get` when `mix.lock` differs from the hash in `deps/.chg_lock`, and records the lock as the fetch left it: a tree hydrated from a snapshot holds the snapshot's deps, and a commit that bumps a dependency would otherwise stop on Mix's "lock mismatch". `static` reports a failed fetch as its one failure.
 | `mix chg.shard --of <n> --index <i>` | `shard` | One shard of the whole suite: stable by file name, or balanced by recorded time when `CHG_SHARD_BY` names a record. With `CHG_RECORD` set, it records coverage and timings to that file. |
@@ -118,9 +119,15 @@ on the base's first-parent line, at most `CHG_COVER_MAX_AGE` (default 100) commi
 - otherwise the selection is every test file that changed since the base or the record, that the
   record has no coverage of (new), or whose recorded run executed an altered module.
 
-A digest hashes the compiled code with the project root taken out of its literals and its line
-table left out, so it is equal across checkouts and catches a change that reaches a module only
-at compile time (a macro, a struct default, a module attribute). A new module needs no coverage
+A digest hashes the disassembled code, with what two builds of one commit vary made canonical
+(the project root in literals, line numbers, label and lambda numbering, the order of a map
+instruction's pairs, LiveView fingerprints), so it is equal across checkouts and machines and
+catches a change that reaches a module only at compile time (a macro, a struct default, a module
+attribute). Every compile the adapter runs goes through `mix chg.compile`, which starts the
+compiling VM with the project's atoms already made in one order (`ChgAdapter.Atoms`): OTP orders
+a map's atom keys by when the VM first saw each atom, so code a macro generates from a map
+otherwise comes out differently in each build. Records of an older digest form are not compared;
+until a new record is published, the graph selection runs. A new module needs no coverage
 entry: nothing ran it, so only its own tests and the tests of what now calls it (whose callers
 changed and so differ in digest) can observe it. With no usable record (none fetched, too old,
 an `always_all` path changed since it, another Elixir or OTP) the graph selection runs, and its
@@ -154,7 +161,7 @@ passed under `mix chg.run` (minis, 2026-10-19).
 
     mix test test/select_test.exs test/static_test.exs test/runner_test.exs test/snapshot_test.exs \
       test/chg_adapter_test.exs test/digest_test.exs test/shard_test.exs test/head_test.exs \
-      test/record_test.exs test/test_db_test.exs
+      test/record_test.exs test/test_db_test.exs test/atoms_test.exs
     CHG_BIN=$PWD/../../target/debug/chg mix test test/integration_test.exs
 
 The integration test builds the archive, installs it into a private `MIX_ARCHIVES`, and drives

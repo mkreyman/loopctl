@@ -108,21 +108,20 @@ would report ~1 altered module and select ~30 files, like `4babacfb37` and
 `2ad8ae29d2` did when the flap happened not to fire. The selector is not the
 problem; the digest is.
 
-## Follow-up: digest v4 (new story)
+## Follow-up: digest v4
 
-Normalize the two volatile constructs before hashing, and bump
-`ChgAdapter.Digest.@version`:
-
-1. In the Code chunk, zero the fun-uniq immediate of `make_fun3` instructions
-   (fixed operand position; same normalisation FunT already gets).
-2. In literal lists, zero an integer literal immediately following
-   `{atom, fingerprint}` — the shape `Phoenix.LiveView.Rendered` is built with.
-   Any module whose *data* genuinely holds that shape also normalises, which
-   only ever selects more.
-
-Gate for the story: the same commit compiled twice on two machines must yield
-zero digest differences across all modules; then re-walk the 204 commits and
-re-run `coverage_replay.exs`. Acceptance stays issue #24's done-when.
+Done in the adapter as digest form 4 (chg#78, chg#31). The two constructs above
+were only part of it: OTP 26+ orders a map's atom keys by atom index, so code a
+macro generates from a map differs between builds too. `mix chg.compile` now
+starts every compiling VM with the project's atoms made in sorted order
+(`ChgAdapter.Atoms`), and the digest canonicalises labels, generated function
+names, map instruction pairs and LiveView fingerprints, and leaves out
+`__mix_recompile__?/0`. Two clean builds of HCB 52a7d2088b at two paths on
+minis: 6 of 2849 modules differ (v3: 467 of 2995 at e2b7741e). The 6 are maps
+of more than 32 keys, which OTP orders by a hash that differs from one VM run to
+the next: the same 40 standard atoms in one map give two key orders in two
+identical `elixir` runs, and preloading the atoms from a boot script, before the
+kernel starts, left the same 6 differing.
 
 ## The digest walk itself
 

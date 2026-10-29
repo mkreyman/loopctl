@@ -113,7 +113,7 @@ defmodule Mix.Tasks.Chg.Snapshot do
     ChgAdapter.record_lock()
 
     for env <- ["dev", "test"] do
-      step!("mix", ["compile"], [{"MIX_ENV", env}])
+      step!("mix", ["chg.compile"], [{"MIX_ENV", env}])
     end
 
     if env = ChgAdapter.dep_env(:dialyxir) do

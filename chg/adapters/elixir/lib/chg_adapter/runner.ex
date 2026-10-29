@@ -39,7 +39,7 @@ defmodule ChgAdapter.Runner do
   defp start_recording(_present) do
     with path when is_binary(path) and path != "" <- System.get_env("CHG_RECORD"),
          {:ok, sha} <- clean_head() do
-      Mix.Task.run("compile")
+      ChgAdapter.compile!()
       {:ok, graph} = ChgAdapter.Graph.read()
       modules = graph.source_modules |> Map.values() |> List.flatten() |> Enum.uniq()
       %{path: path, sha: sha, modules: modules, cover: ChgAdapter.Cover.start(modules)}

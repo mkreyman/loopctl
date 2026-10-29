@@ -10,7 +10,8 @@ defmodule Mix.Tasks.Chg.Static do
       inputs;
     * `mix credo --strict` on the changed Elixir files among `.credo.exs`'s, when credo is
       a dependency, in an env it is declared for;
-    * `mix compile --warnings-as-errors`, incremental from the snapshot's `_build`;
+    * `mix compile --warnings-as-errors` (through `mix chg.compile`), incremental from the
+      snapshot's `_build`;
     * `mix dialyzer` against the snapshot's PLT, when dialyxir is a dependency.
 
       mix chg.static --base <sha>
@@ -252,7 +253,7 @@ defmodule Mix.Tasks.Chg.Static do
   end
 
   defp compile do
-    {out, status} = ChgAdapter.capture("mix", ["compile", "--warnings-as-errors"])
+    {out, status} = ChgAdapter.capture("mix", ["chg.compile", "--warnings-as-errors"])
     if status == 0, do: [], else: compile_failures(out)
   end
 

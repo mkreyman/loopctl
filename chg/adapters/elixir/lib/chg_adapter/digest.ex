@@ -1,32 +1,49 @@
 defmodule ChgAdapter.Digest do
   @moduledoc """
-  A digest of a compiled module's behaviour, equal for the same source compiled at two
-  paths.
+  A digest of a compiled module's behaviour, equal for the same source compiled twice, at
+  two paths, on two machines.
 
   Coverage selection compares these, not source files, so a change that alters a module
   only through compile time (a macro expanded into it, a struct default, a module
   attribute, an `@external_resource`) still counts as changing it. `beam_lib:md5/1` is not
-  enough: `__ENV__.file`, which `Logger` and `raise` put in literals, is absolute, so every
-  module would differ between the verifier's checkout and a hydrated workspace. This hashes
-  the chunks that define behaviour, with the project root in literals replaced by a token
-  and the fun table's code hash (which covers those literals) left out.
+  enough: two builds of one commit differ in ways that change nothing a test can see, and
+  every module that differs is selected as if it had changed. So the digest is taken over
+  the disassembled code, with what a build varies made canonical:
 
-  A line shift alone does not change what a module does, so the line table is left out,
-  and so is the line of a source location in a literal: a map or keyword list holding both
-  `file` and an integer `line`, as Logger metadata and Ecto query expressions do. A `line`
-  without a `file` beside it may be data, and stays. A line number compiled into code
-  rather than a literal still counts, which only ever selects more.
+    * the project root in literals (`__ENV__.file`, which `Logger` and `raise` put there)
+      is replaced by a token;
+    * `__mix_recompile__?/0`, which only Mix calls, is left out: Phoenix's
+      `embed_templates` puts a hash of the templates' absolute paths in it;
+    * a line shift does not change what a module does, so line instructions are dropped,
+      and so is the line of a source location in a literal: a map or keyword list holding
+      both `file` and an integer `line`, as Logger metadata and Ecto query expressions do.
+      A `line` without a `file` beside it may be data, and stays;
+    * labels are numbered within their function, and functions are taken in name order;
+    * compiler-generated functions (lambdas, comprehensions) are numbered in the order
+      the compiler emits them, which moves with everything below, so each is named by its
+      own content, and the fun table's index and hash of the module are dropped;
+    * the key/value pairs a map instruction builds or matches are sorted by key: OTP 26+
+      orders a map's atom keys by atom index, the order the VM first saw each atom, which
+      the parallel compiler varies from build to build;
+    * a LiveView fingerprint (an integer hash of the template's compile-time structure,
+      which carries per-compile counters) is zeroed; the template's static parts, which
+      it fingerprints, still count;
+    * literals are encoded `:deterministic`, so a map literal is the same bytes whatever
+      order its keys' atoms were made in.
 
-  Literals are encoded `:deterministic`: plainly, a map with atom keys is written in atom
-  table order, which differs between the run that records digests and the run that
-  compares with them. A compile that iterates such a map (an attribute built with
-  `Map.keys/1`) can still lay a module out differently in another VM; that module then
-  looks altered, which only selects more.
+  Code a compile generates by iterating a map can still come out in another order;
+  `ChgAdapter.Atoms` makes the atom order itself the same in every compiling VM, which
+  removes most of that. What still differs looks altered, which only selects more.
   """
 
-  # Bump when normalisation changes, so a cache of the old digests is not reused.
-  @version 3
-  @chunks [~c"AtU8", ~c"Code", ~c"StrT", ~c"ImpT", ~c"ExpT", ~c"FunT", ~c"LitT"]
+  # Bump when normalisation changes, so a cache of the old digests is not reused and a
+  # record of the old ones is not compared.
+  @version 4
+
+  # Functions only Mix calls, which no test can observe. Phoenix's `embed_templates`
+  # compiles into `__mix_recompile__?/0` a hash of the templates' absolute paths, which
+  # no root token can stand in for: every such module would differ between two checkouts.
+  @unseen [{:__mix_recompile__?, 0}]
 
   @doc "The form of digest this adapter makes; a record keeps it, and only equal forms compare."
   def version, do: @version
@@ -40,14 +57,25 @@ defmodule ChgAdapter.Digest do
     old = read_cache(cache, root)
 
     entries =
-      for m <- modules, path = beam(m), path != nil, {:ok, bin} <- [File.read(path)], into: %{} do
-        key = :crypto.hash(:md5, bin)
+      for(m <- modules, path = beam(m), path != nil, do: {m, path})
+      |> Task.async_stream(
+        fn {m, path} ->
+          with {:ok, bin} <- File.read(path) do
+            key = :crypto.hash(:md5, bin)
 
-        case old do
-          %{^m => {^key, d}} -> {m, {key, d}}
-          _ -> {m, {key, of_file(path, root)}}
-        end
-      end
+            case old do
+              %{^m => {^key, d}} -> {m, {key, d}}
+              _ -> {m, {key, of_file(path, root)}}
+            end
+          end
+        end,
+        timeout: :infinity
+      )
+      |> Enum.flat_map(fn
+        {:ok, {_m, {_key, _d}} = entry} -> [entry]
+        {:ok, {:error, _}} -> []
+      end)
+      |> Map.new()
 
     if cache,
       do: ChgAdapter.write_atomic!(cache, :erlang.term_to_binary({@version, root, entries}))
@@ -75,42 +103,153 @@ defmodule ChgAdapter.Digest do
     end
   end
 
-  @doc "The digest of the beam at `path`; nil when it cannot be read."
+  @doc "The digest of the beam at `path` (a charlist); nil when it cannot be read."
   def of_file(path, root) do
-    case :beam_lib.chunks(path, @chunks, [:allow_missing_chunks]) do
-      {:ok, {_, chunks}} ->
-        parts = for {id, data} <- chunks, is_binary(data), do: [id, normalize(id, data, root)]
-        :crypto.hash(:md5, :erlang.term_to_binary(parts, [:deterministic]))
+    case :beam_disasm.file(path) do
+      {:beam_file, _module, exports, _attributes, _info, code} ->
+        exports =
+          for({name, arity, _label} <- exports, {name, arity} not in @unseen, do: {name, arity})
+          |> Enum.sort()
+
+        :crypto.hash(
+          :md5,
+          :erlang.term_to_binary({exports, functions(code, root)}, [:deterministic])
+        )
 
       {:error, _, _} ->
         nil
     end
   end
 
-  # LitT: a 4-byte uncompressed size (0 when stored uncompressed), then the zlib'd table:
-  # a count, and per literal a 4-byte size and its external term format.
-  defp normalize(~c"LitT", <<0::32, table::binary>>, root), do: literals(table, root)
+  defp functions(code, root) do
+    funs =
+      for {:function, name, arity, _entry, ins} <- code,
+          {name, arity} not in @unseen,
+          do: {name, arity, local(ins, root)}
 
-  defp normalize(~c"LitT", <<_::32, z::binary>>, root),
-    do: literals(:zlib.uncompress(z), root)
+    names = rename(funs)
 
-  # FunT: a count, then six words per fun; the last (old_uniq) hashes the module's code
-  # with its literals, so it carries the path too. The rest stays.
-  defp normalize(~c"FunT", <<n::32, entries::binary>>, _root) do
-    funs = for <<f::binary-size(20), _uniq::32 <- entries>>, into: <<>>, do: f
-    <<n::32, funs::binary>>
+    funs
+    |> Enum.map(fn {name, arity, ins} ->
+      {Map.get(names, {name, arity}, name), arity, rewrite(ins, names, nil)}
+    end)
+    |> Enum.sort()
   end
 
-  defp normalize(_, data, _), do: data
+  # One function's instructions, without what varies between builds of the same source.
+  defp local(ins, root) do
+    ins = Enum.reject(ins, &(match?({:line, _}, &1) or match?({:executable_line, _, _}, &1)))
+    labels = for({:label, l} <- ins, do: l) |> Enum.with_index() |> Map.new()
 
-  defp literals(<<n::32, rest::binary>>, root) do
-    {terms, _} =
-      Enum.map_reduce(1..n//1, rest, fn _, <<s::32, t::binary-size(s), r::binary>> ->
-        {t |> :erlang.binary_to_term() |> walk(root), r}
-      end)
-
-    :erlang.term_to_binary(terms, [:deterministic])
+    Enum.map(ins, fn
+      {:label, l} -> {:label, Map.fetch!(labels, l)}
+      i -> i |> instruction(labels, root) |> maps()
+    end)
   end
+
+  defp instruction({:f, l}, labels, _root) when is_map_key(labels, l), do: {:f, labels[l]}
+  defp instruction({:literal, t}, _labels, root), do: {:literal, walk(t, root)}
+
+  defp instruction({:make_fun3, f, _index, _uniq, dst, free}, labels, root),
+    do: {:make_fun3, f, 0, 0, instruction(dst, labels, root), instruction(free, labels, root)}
+
+  defp instruction(t, labels, root) when is_tuple(t),
+    do: t |> Tuple.to_list() |> Enum.map(&instruction(&1, labels, root)) |> List.to_tuple()
+
+  defp instruction(l, labels, root) when is_list(l),
+    do: Enum.map(l, &instruction(&1, labels, root))
+
+  defp instruction(x, _labels, _root), do: x
+
+  defp maps({op, f, src, dst, live, {:list, kv}}) when op in [:put_map_assoc, :put_map_exact],
+    do: {op, f, src, dst, live, {:list, pairs(kv)}}
+
+  defp maps({:get_map_elements, f, src, {:list, kv}}),
+    do: {:get_map_elements, f, src, {:list, pairs(kv)}}
+
+  defp maps({:has_map_fields, f, src, {:list, keys}}),
+    do: {:has_map_fields, f, src, {:list, Enum.sort(keys)}}
+
+  defp maps(i), do: i
+
+  defp pairs(kv) do
+    pairs = Enum.chunk_every(kv, 2)
+
+    pairs =
+      if Enum.any?(pairs, &match?([{:atom, :static}, _], &1)),
+        do: Enum.map(pairs, &fingerprint/1),
+        else: pairs
+
+    # Sorting cannot merge two pairs into one meaning: beam_validator refuses a map
+    # instruction of more than one pair unless every key is a literal (`literal_required`),
+    # so the compiler gives a key in a register an instruction of its own.
+    pairs |> Enum.sort() |> Enum.concat()
+  end
+
+  defp fingerprint([{:atom, :fingerprint}, {:integer, _}]),
+    do: [{:atom, :fingerprint}, {:integer, 0}]
+
+  defp fingerprint(pair), do: pair
+
+  # Generated functions (their names start with "-") named by their content, refined until
+  # the naming stops changing: a lambda that calls another is named by the other's name.
+  defp rename(funs) do
+    generated = for {name, arity, _} <- funs, generated?(name), do: {name, arity}
+    start = Map.new(generated, &{&1, :generated})
+
+    Enum.reduce_while(1..20, start, fn _, names ->
+      next =
+        for {name, arity, ins} <- funs, generated?(name), into: %{} do
+          hash =
+            :crypto.hash(
+              :md5,
+              :erlang.term_to_binary(rewrite(ins, names, {name, arity}), [:deterministic])
+            )
+
+          {{name, arity}, :"-generated-#{Base.encode16(hash, case: :lower)}-"}
+        end
+
+      if classes(next) == classes(names), do: {:halt, next}, else: {:cont, next}
+    end)
+  end
+
+  defp generated?(name), do: match?("-" <> _, Atom.to_string(name))
+
+  defp classes(names) do
+    names
+    |> Enum.group_by(&elem(&1, 1), &elem(&1, 0))
+    |> Map.values()
+    |> Enum.map(&Enum.sort/1)
+    |> Enum.sort()
+  end
+
+  # Every reference to a generated function (a call, a fun, its own func_info) by the
+  # function's name in `names`; `self`'s own references by `:self`.
+  defp rewrite(ins, names, self) do
+    name = fn n, a ->
+      cond do
+        {n, a} == self -> :self
+        is_map_key(names, {n, a}) -> names[{n, a}]
+        true -> n
+      end
+    end
+
+    deep(ins, fn
+      {:func_info, m, {:atom, n}, a} -> {:func_info, m, {:atom, name.(n, a)}, a}
+      {m, n, a} when is_atom(m) and is_atom(n) and is_integer(a) -> {m, name.(n, a), a}
+      x -> x
+    end)
+  end
+
+  defp deep(t, f) when is_tuple(t) do
+    case f.(t) do
+      ^t -> t |> Tuple.to_list() |> Enum.map(&deep(&1, f)) |> List.to_tuple()
+      other -> other
+    end
+  end
+
+  defp deep(l, f) when is_list(l), do: Enum.map(l, &deep(&1, f))
+  defp deep(x, f), do: f.(x)
 
   defp walk(b, root) when is_binary(b), do: :binary.replace(b, root, "<root>", [:global])
 
@@ -130,6 +269,11 @@ defmodule ChgAdapter.Digest do
     m =
       if :maps.is_key(:file, m) and is_integer(:maps.get(:line, m, nil)),
         do: %{m | line: 0},
+        else: m
+
+    m =
+      if :maps.is_key(:static, m) and is_integer(:maps.get(:fingerprint, m, nil)),
+        do: %{m | fingerprint: 0},
         else: m
 
     m |> :maps.to_list() |> walk_list(root) |> :maps.from_list()

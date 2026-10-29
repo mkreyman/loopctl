@@ -19,6 +19,16 @@ defmodule ChgAdapter do
   """
   def preload_and_compile! do
     preload!()
+    compile!()
+  end
+
+  @doc """
+  Compiles the project through `mix chg.compile`, whose VM preloads the project's atoms
+  (`ChgAdapter.Atoms`), with its output on stderr; then `mix compile` here finds nothing
+  stale and only loads the result. A failed compile is reported by that second one.
+  """
+  def compile! do
+    _ = stream("mix", ["chg.compile"])
     Mix.Task.run("compile")
   end
 

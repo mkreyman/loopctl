@@ -106,6 +106,32 @@ defmodule ChgAdapter.DigestTest do
     assert run.(Enum.reverse(keys)) == d
   end
 
+  test "a LiveView fingerprint is left out, the template it fingerprints is not", %{root: r} do
+    rendered = &"%{static: [\"#{&1}\"], fingerprint: #{&2}, dynamic: fn _ -> [] end}"
+    assert digest(r, "a", rendered.("<p>", 123)) == digest(r, "b", rendered.("<p>", 456))
+    refute digest(r, "c", rendered.("<p>", 123)) == digest(r, "d", rendered.("<b>", 123))
+  end
+
+  test "a recompile check hashing the absolute path is left out", %{root: r} do
+    check =
+      "nil\n  @hash :erlang.md5(__ENV__.file)\n  def __mix_recompile__?, do: :erlang.md5(System.get_env(\"X\", \"\")) != @hash"
+
+    assert digest(r, "a", check) == digest(r, "elsewhere-longer", check)
+  end
+
+  test "map pairs with keys in registers keep their order, literal keys do not", %{root: r} do
+    # With k1 == k2 at run time, the later pair wins: the two orders are different code. The
+    # compiler puts each key in a register in an instruction of its own, so sorting the
+    # pairs inside one instruction cannot hide the reorder.
+    var = &"nil\n  def build(k1, k2, a, b), do: #{&1}"
+
+    refute digest(r, "a", var.("%{k1 => a, k2 => b}")) ==
+             digest(r, "b", var.("%{k2 => b, k1 => a}"))
+
+    lit = &"nil\n  def build(a, b), do: #{&1}"
+    assert digest(r, "c", lit.("%{x: a, y: b}")) == digest(r, "d", lit.("%{y: b, x: a}"))
+  end
+
   test "an unreadable beam has no digest" do
     assert Digest.of_file(~c"/nonexistent.beam", "/") == nil
   end
