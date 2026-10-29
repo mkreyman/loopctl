@@ -72,7 +72,24 @@ fn version_prints_the_contract_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("(adapter contract 1)"));
+        .stdout(predicate::str::contains("(adapter contract 1, commit "));
+}
+
+/// A Mac builds `chg` from source, so the binary must say which commit it is.
+#[test]
+fn version_names_the_commit_it_was_built_from() {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_eq!(head.len(), 12);
+    chg()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("commit {head}")));
 }
 
 #[test]

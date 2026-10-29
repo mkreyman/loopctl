@@ -20,15 +20,23 @@ pub mod store;
 pub mod verify;
 pub mod ws;
 
-/// `chg --version` output: the binary version and the adapter contract it implements.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (adapter contract ", "1", ")");
+/// `chg --version` output: the binary version, the adapter contract it implements, and the
+/// commit it was built from (`build.rs`).
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (adapter contract ",
+    "1",
+    ", commit ",
+    env!("CHG_BUILD_SHA"),
+    ")"
+);
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn version_names_the_contract() {
-        assert!(super::VERSION.ends_with(&format!(
-            "(adapter contract {})",
+        assert!(super::VERSION.contains(&format!(
+            "(adapter contract {}, commit ",
             super::contract::CONTRACT_VERSION
         )));
     }

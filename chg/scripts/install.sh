@@ -12,6 +12,12 @@
 #                them (scripts/install-elixir-adapter.sh --all-installed): archives are per
 #                Elixir, and a repo on an Elixir without one has no gate.
 #
+# macOS has no release artifact, so a Mac always builds from this checkout: check out the
+# commit to install (a clean tree: uncommitted changes make the version say `-dirty`) and
+# run this script with no --release. A source build, on either system, uses the Rust that
+# .tool-versions names (asdf reads it from the checkout; with rustup, RUSTUP_TOOLCHAIN is
+# set to it), and `chg --version` names the commit it was built from.
+#
 # On Linux x86_64 both paths give the static musl binary, so a CI job running in a container
 # with an older glibc than the build host (node:22-bookworm has 2.36) can run the mounted
 # /usr/local/bin/chg. The source build adds the musl target to the pinned toolchain; it links
@@ -29,7 +35,7 @@ while [ $# -gt 0 ]; do
     --dest) dest=$2; shift 2 ;;
     --release) tag=$2; shift 2 ;;
     --no-elixir-adapter) elixir_adapter=false; shift ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -55,12 +61,15 @@ if [ -n "$tag" ]; then
   bin="$work/chg-$target"
 else
   root=$(cd "$(dirname "$0")/.." >/dev/null && pwd -P)
+  # From the checkout, so asdf's cargo shim reads its .tool-versions; rustup is told.
+  rust=$(awk '$1 == "rust" { print $2 }' "$root/.tool-versions")
+  if [ -n "$rust" ] && command -v rustup >/dev/null 2>&1; then export RUSTUP_TOOLCHAIN=$rust; fi
   if [ "$target" = x86_64-unknown-linux-musl ]; then
     (cd "$root" && rustup target add "$target" >&2)
     (cd "$root" && cargo build --release --locked -p chg --target "$target" >&2)
     bin="${CARGO_TARGET_DIR:-$root/target}/$target/release/chg"
   else
-    cargo build --release --locked -p chg --manifest-path "$root/Cargo.toml" >&2
+    (cd "$root" && cargo build --release --locked -p chg >&2)
     bin="${CARGO_TARGET_DIR:-$root/target}/release/chg"
   fi
 fi

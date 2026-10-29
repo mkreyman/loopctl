@@ -12,6 +12,17 @@ resolving conflicts, intent review) on git storage. Elixir and TypeScript repos 
 Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeScript, and generic for a repo with no build),
 `server/` (Elixir/Phoenix control plane, phase 2).
 
+## Install
+
+    scripts/install.sh                     # build this checkout, install ~/.local/bin/chg
+    scripts/install.sh --release vX.Y.Z    # Linux x86_64 only: the release's static binary
+
+A Mac has no release binary, so it always builds from source: check out the commit to install
+(`git -C ~/workspace/chg pull` on master, with a clean tree) and run `scripts/install.sh`. The
+build uses the Rust that `.tool-versions` names, and `chg --version` ends with
+`commit <sha12>` (`-dirty` when the tree had uncommitted changes), so every machine says which
+commit it runs. CI runners also need `scripts/install-system.sh` (docs/verify.md).
+
 ## KB write-back (S13, phase-1 form)
 
 `bin/chg-kb-sync.py --repo owner/name --project-id <loopctl project>` writes each lesson the master verifier recorded on GitHub (merged `auto-revert` PRs, `test-flakiness` issues) to the loopctl KB as one `finding`, tagged `chg`, the repo and the kind. It runs from cron (minis: daily 06:17 for home_care_billing), never on the merge path, and a rerun writes nothing twice. It needs claude-config's `skills/_shared/loopctl_client_core.py`, and makes its own venv for `requests` under `~/.chg/kb-venv` on first use. Test: `python3 tests/kb-sync-test.py`.
