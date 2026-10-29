@@ -233,7 +233,7 @@ enum ShadowCmd {
         /// Default HEAD.
         #[arg(long)]
         sha: Option<String>,
-        /// pass | fail
+        /// pass | fail, and with `--source hook` also error.
         #[arg(long)]
         verdict: String,
         /// How long the gate took.
@@ -249,14 +249,22 @@ enum ShadowCmd {
         /// gate time, so `--ms` is refused, and stays out of the gate-time figures). A replay
         /// of a commit with chg's enrollment overlaid records the original commit's CI
         /// verdict this way, for the synthetic commit it judged.
-        #[arg(long, default_value = shadow::LOCAL_SOURCE, value_parser = [shadow::LOCAL_SOURCE, shadow::CI_SOURCE])]
+        /// `hook`: the pre-push hook's final decision on a gate-mode push. With
+        /// `--gate "chg check"` it overrides the verdict of the gate-mode check of that
+        /// commit it followed (within 15 minutes); with any other gate (the hook's own,
+        /// after exit 3) it is a check of its own. It never pairs with a shadow check.
+        #[arg(long, default_value = shadow::LOCAL_SOURCE, value_parser = [shadow::LOCAL_SOURCE, shadow::CI_SOURCE, shadow::HOOK_SOURCE])]
         source: String,
+        /// Why the gate decided as it did; with `--source hook`, why it overrode chg.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Pair chg's verdicts with the gate's by commit: disagreements, time saved, and the
     /// cutover criteria. Gate-mode `chg check` verdicts (logged with `source: gate` once
-    /// `chg check` is the gate) are summarised per host: count, pass/fail, the subset
-    /// share, median and p90 time, and the top reasons the whole suite ran. Exit 0 when
-    /// every criterion is met, 1 when not.
+    /// `chg check` is the gate), as the hook's `source: hook` rows decided them, are
+    /// summarised per host: count, pass/fail, the subset share, median and p90 time, the
+    /// top reasons the whole suite ran, and how many verdicts the hook overrode and why.
+    /// Exit 0 when every criterion is met, 1 when not.
     Report {
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -447,14 +455,18 @@ fn main() -> ExitCode {
                 gate,
                 failures_file,
                 source,
+                reason,
             } => shadow_record(
                 &repo_root(repo),
                 sha,
                 &verdict,
                 ms,
-                &gate,
+                GateArgs {
+                    name: &gate,
+                    source: &source,
+                    reason,
+                },
                 failures_file,
-                &source,
             ),
             ShadowCmd::Report {
                 repo,
@@ -864,8 +876,10 @@ fn check_cmd(repo: &Path, base: Option<String>, sha: Option<String>, all: bool) 
     // What the push waited for: the worktree and hydrate of a check at the build path,
     // or what was spent there before falling back to the live tree.
     v.ms = started.elapsed().as_millis() as u64;
-    // chg is the gate here, so no `chg shadow record` follows: the verdict is logged by the
-    // check itself. A log that cannot be written never changes the verdict.
+    // chg is the gate here, so the check logs its own verdict. The hook then records its
+    // final decision on it (`chg shadow record --source hook --gate "chg check"`), which
+    // the report takes over this row's verdict. A log that cannot be written never changes
+    // the verdict.
     if mode.mode == Mode::On {
         let key = git::repo_key(repo);
         let row = shadow::Row::from_gate_check(&key, &sha, &base, v.clone());
@@ -1107,24 +1121,33 @@ fn shadow_check(
     ExitCode::SUCCESS
 }
 
+/// Which gate `chg shadow record` records, from where, and why it decided so.
+struct GateArgs<'a> {
+    name: &'a str,
+    source: &'a str,
+    reason: Option<String>,
+}
+
 fn shadow_record(
     repo: &Path,
     sha: Option<String>,
     verdict: &str,
     ms: u64,
-    gate_name: &str,
+    gate: GateArgs,
     failures_file: Option<PathBuf>,
-    source: &str,
 ) -> ExitCode {
     let verdict = match verdict {
         "pass" => Outcome::Pass,
         "fail" => Outcome::Fail,
+        "error" if gate.source == shadow::HOOK_SOURCE => Outcome::Error,
         other => {
-            eprintln!("chg: --verdict must be pass or fail, got `{other}`");
+            eprintln!(
+                "chg: --verdict must be pass or fail (or error with --source hook), got `{other}`"
+            );
             return ExitCode::from(1);
         }
     };
-    if source == shadow::CI_SOURCE && ms != 0 {
+    if gate.source == shadow::CI_SOURCE && ms != 0 {
         eprintln!("chg: --ms has no meaning with --source ci: a CI verdict has no gate time");
         return ExitCode::from(1);
     }
@@ -1149,7 +1172,10 @@ fn shadow_record(
         }
     };
     let key = git::repo_key(repo);
-    let row = shadow::Row::gate(&key, &sha, verdict, ms, gate_name, source, failures);
+    let row = shadow::Row {
+        reason: gate.reason.unwrap_or_default(),
+        ..shadow::Row::gate(&key, &sha, verdict, ms, gate.name, gate.source, failures)
+    };
     match shadow::append(&shadow::log_path(&key), &row) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

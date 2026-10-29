@@ -1090,6 +1090,32 @@ fn record_and_report_pair_verdicts_by_commit() {
         .args(["shadow", "record", "--verdict", "pass", "--source", "other"])
         .assert()
         .failure();
+
+    // The hook's final decision on a gate-mode push: error is allowed there and only
+    // there, and the reason is kept.
+    env.chg()
+        .args(["shadow", "record", "--verdict", "error", "--source", "hook"])
+        .args([
+            "--gate",
+            "chg check",
+            "--ms",
+            "7",
+            "--reason",
+            "core.bare flipped",
+        ])
+        .assert()
+        .success();
+    let rows = env.rows();
+    let last = rows.last().unwrap();
+    assert_eq!(last["source"], "hook");
+    assert_eq!(last["verdict"], "error");
+    assert_eq!(last["reason"], "core.bare flipped");
+    assert_eq!(last["ms"], 7);
+    env.chg()
+        .args(["shadow", "record", "--verdict", "error"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("or error with --source hook"));
 }
 
 #[test]

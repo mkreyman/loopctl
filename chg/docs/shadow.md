@@ -24,8 +24,8 @@ A repo moves its push gate to `chg check` in three modes, chosen by `chg gate`:
   Its output goes to `~/.chg/shadow/logs/<repo>-<sha12>.log` (kept 14 days). `CHG_HOME` moves `~/.chg`.
 
   `--foreground` runs the same check in this process instead and prints its verdict. `--replay` (with `--foreground`) marks the row `"source":"replay"`: a check of a past commit, not a push, which does not refresh `B`'s snapshot afterwards (see Replays).
-- `chg shadow record --verdict pass|fail [--sha S] [--ms N] [--gate NAME] [--failures-file F] [--source local|ci]`: appends the authoritative gate's verdict for `S` as a `gate` row. `--source ci` (default `local`) marks a CI verdict recorded by hand, as a replay with enrollment overlaid does for its synthetic commit (see Replays); a CI row has no gate time, so `--ms` is refused with it, and stays out of the gate-time figures. `F` lists failing test ids, one per line; the report uses them to tell a missed test from a flake.
-- `chg shadow report [--file F]... [--hosts a,b,c] [--ci-check NAME] [--json]`: pairs each push (one commit on one machine, however many `chg` runs judged it there; the extra runs are counted as reruns) with the gate's verdict for its commit, prints the disagreements and the cutover criteria, and exits 0 only when every criterion is met. `--hosts` reads each machine's log over ssh. `--ci-check NAME` fills in a commit no local gate judged from GitHub check runs named `NAME` on that commit: every completed run that passed or failed becomes a `gate` row, so a failed run and its passing rerun make the commit gate-flaky. A CI row has no gate time, since one check's duration is not the gate's: such a push shows `ci` in the gate-time column and stays out of the gate and saved figures, whose line says how many local gates they cover. A commit is asked about again until its newest CI verdict is 72 hours old. Gate-mode rows (`"source":"gate"`) are never paired: the report summarises them per host, and for all hosts together, as the check count, pass, fail and error, how many ran a subset, the median and p90 time, and the five most frequent reasons the whole suite ran (an `always_all` hit counts by its glob, not its path).
+- `chg shadow record --verdict pass|fail [--sha S] [--ms N] [--gate NAME] [--failures-file F] [--source local|ci|hook] [--reason WHY]`: appends the authoritative gate's verdict for `S` as a `gate` row. `--source ci` (default `local`) marks a CI verdict recorded by hand, as a replay with enrollment overlaid does for its synthetic commit (see Replays); a CI row has no gate time, so `--ms` is refused with it, and stays out of the gate-time figures. `--source hook` is the pre-push hook's final decision on a gate-mode push, which may differ from chg's: the hook fails a push chg passed when the log shows test failures, the repo's config flipped or the tree moved during the gate, and runs its own gate when `chg check` exits 3. It also takes `--verdict error`. `WHY` goes in the row's `reason`. `F` lists failing test ids, one per line; the report uses them to tell a missed test from a flake.
+- `chg shadow report [--file F]... [--hosts a,b,c] [--ci-check NAME] [--json]`: pairs each push (one commit on one machine, however many `chg` runs judged it there; the extra runs are counted as reruns) with the gate's verdict for its commit, prints the disagreements and the cutover criteria, and exits 0 only when every criterion is met. `--hosts` reads each machine's log over ssh. `--ci-check NAME` fills in a commit no local gate judged from GitHub check runs named `NAME` on that commit: every completed run that passed or failed becomes a `gate` row, so a failed run and its passing rerun make the commit gate-flaky. A CI row has no gate time, since one check's duration is not the gate's: such a push shows `ci` in the gate-time column and stays out of the gate and saved figures, whose line says how many local gates they cover. A commit is asked about again until its newest CI verdict is 72 hours old. Gate-mode rows (`"source":"gate"`) and hook rows (`"source":"hook"`) are never paired, and no CI verdict is fetched for a hook row's sha. A hook row with `--gate "chg check"` replaces the verdict of the nearest gate-mode check of its sha on its host at or before it that no other hook row has taken, within 15 minutes (`HOOK_PAIR_WINDOW_MS`), keeping that check's mode, selection and time, so each retry of a push pairs with its own check. A hook row with any other gate (the hook's own gate after exit 3, `--gate "mix precommit"`), or with no such check, counts as a check of its own, so an interrupted push's check is never overwritten. The report summarises gate-mode checks, as the hook decided them, per host, and for all hosts together, as the check count, pass, fail and error, how many ran a subset, the median and p90 time, the five most frequent reasons the whole suite ran (an `always_all` hit counts by its glob, not its path), and how many verdicts the hook overrode, with its reasons.
 
 `<repo>` is the origin's repository name (`home_care_billing`), the same in every worktree.
 
@@ -98,14 +98,29 @@ A push the hook does not gate locally, because CI judges it, gets only the `chg 
 Cutover (one PR in the product repo, after the report says ready): set `[gate] mode = "on"` in `.chg/policy.toml`, and make the hook ask chg which gate to run:
 
 ```bash
+started=$SECONDS
 case "$(chg gate 2>/dev/null || echo off)" in
-  on) chg check --sha "$GATE_SHA" --base "$BASE_SHA"; status=$? ;
+  on) gate="chg check" reason=""
+      chg check --sha "$GATE_SHA" --base "$BASE_SHA"; status=$?
       # 3 = the gate was switched off between the two calls: run the old one. 2 (no
       # verdict; or, when chg had to check the live tree, that tree is not exactly
       # $GATE_SHA) blocks the push like a failure.
-      [ "$status" -eq 3 ] && { run_the_existing_gate; status=$?; } ;;
+      if [ "$status" -eq 3 ]; then
+        gate="mix precommit" reason="chg check exit 3"
+        run_the_existing_gate; status=$?
+      fi
+      # The hook's own checks may overrule chg here (failures in the log despite exit 0,
+      # a flipped core.bare, a tree that moved): set status and reason accordingly.
+      verdict=pass
+      [ "$status" -eq 1 ] && verdict=fail
+      [ "$status" -ne 0 ] && [ "$status" -ne 1 ] && verdict=error
+      chg shadow record --source hook --sha "$GATE_SHA" --verdict "$verdict" \
+        --gate "$gate" --ms "$(( (SECONDS - started) * 1000 ))" \
+        ${reason:+--reason "$reason"} </dev/null || true ;;
   *)  run_the_existing_gate; status=$? ;;
 esac
 ```
+
+`--gate` must be exactly `chg check` when the hook decides on chg's verdict, and the name of its own gate (here `mix precommit`) when that gate decided the push.
 
 Rollback is `CHG_GATE=off git push` for one push, or `mode = "off"` in the policy for everyone. Neither needs a code change.

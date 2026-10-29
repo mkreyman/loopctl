@@ -16,6 +16,10 @@
 //!   snapshots before S8, and a change Mix recompiles everything for (`mix.exs`, config)
 //!   would otherwise cost every later check a full compile.
 //! - `chg shadow record` (from the same hook, after the real gate) appends a `gate` row.
+//!   Once chg is the gate, the hook records its final decision instead (`--source hook`):
+//!   with `--gate "chg check"` it overrides the gate-mode check's verdict in the report's
+//!   gate-mode summary (`HOOK_CHECK_GATE`), and with its own gate after exit 3 it counts
+//!   as a check of its own. Neither pairs with a shadow check.
 //!   `chg shadow report --ci-check <name>` fills in a commit no local gate judged (a push
 //!   the hook let CI judge) from that check run on GitHub.
 //! - `chg shadow report` pairs the rows by commit and prints the disagreements and the
@@ -44,6 +48,20 @@ pub const LOCAL_SOURCE: &str = "local";
 /// The `source` of a gate row filled in from a CI check run (`--ci-check`, or by hand with
 /// `chg shadow record --source ci`).
 pub const CI_SOURCE: &str = "ci";
+/// The `source` of a gate row holding the pre-push hook's final decision in gate mode. It
+/// overrides the verdict of the gate-mode check it followed: the hook fails a push chg
+/// passed when the log shows test failures, the repo's config flipped or the tree moved,
+/// and it runs its own gate when `chg check` cannot decide (exit 3).
+pub const HOOK_SOURCE: &str = "hook";
+/// The `--gate` of a hook row deciding on a gate-mode `chg check`'s verdict: only such a
+/// row overrides a check. Any other gate (the hook's own, run when `chg check` exited 3,
+/// e.g. `mix precommit`) is a check of its own and never pairs.
+pub const HOOK_CHECK_GATE: &str = "chg check";
+/// How long after a gate-mode check's row a hook row may still decide on it. The check
+/// writes its row when its verdict is in, and the hook decides at once from that verdict
+/// and the log; 15 minutes covers a slow inspection, while an interrupted push's check
+/// (hours old, or a row from before hook rows existed) stays out of reach.
+pub const HOOK_PAIR_WINDOW_MS: u64 = 15 * 60 * 1000;
 /// How long a shadow check waits for an earlier one on this machine before skipping.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30 * 60);
 /// The cap on the snapshot build after a check. Nobody waits on it, and a dependency
@@ -106,7 +124,8 @@ pub struct Row {
     // gate rows
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
-    /// Gate rows: `local` (the hook ran it) or `ci` (read from a GitHub check run). chg
+    /// Gate rows: `local` (the hook ran it), `ci` (read from a GitHub check run) or
+    /// `hook` (the hook's final decision on a gate-mode push). chg
     /// rows: `replay` for a check of a past commit (`chg check --shadow --replay`), `gate`
     /// for a gate-mode `chg check`, absent for a shadow check of a push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,6 +206,12 @@ impl Row {
 impl Row {
     fn is_ci(&self) -> bool {
         self.source.as_deref() == Some(CI_SOURCE)
+    }
+
+    /// The hook's final decision on a gate-mode push: part of gate mode, never a gate
+    /// verdict to pair a shadow check with.
+    fn is_hook(&self) -> bool {
+        self.kind == "gate" && self.source.as_deref() == Some(HOOK_SOURCE)
     }
 
     /// A chg row from a shadow check, a push's or a replay's: not a gate-mode check.
@@ -589,6 +614,10 @@ pub struct GateHost {
     /// Why the whole suite ran, most frequent first (at most `TOP_WIDENING`), as
     /// `widening_key` groups them.
     pub widening: Vec<(String, usize)>,
+    /// Checks whose verdict the hook's final decision changed.
+    pub overridden: usize,
+    /// The hook's reasons for those, most frequent first.
+    pub override_reasons: Vec<(String, usize)>,
 }
 
 /// How many widening reasons the report lists per host.
@@ -634,7 +663,7 @@ fn percentile_ms(mut v: Vec<u64>, p: usize) -> Option<u64> {
     Some(v[rank - 1])
 }
 
-fn gate_host(host: &str, rows: &[&Row]) -> GateHost {
+fn gate_host(host: &str, rows: &[&Row], overrides: &[&str]) -> GateHost {
     let n = |o: Outcome| rows.iter().filter(|r| r.verdict == o).count();
     let mut widening: BTreeMap<String, usize> = BTreeMap::new();
     for r in rows.iter().filter(|r| r.mode.as_deref() == Some("all")) {
@@ -645,6 +674,15 @@ fn gate_host(host: &str, rows: &[&Row]) -> GateHost {
     widening.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     widening.truncate(TOP_WIDENING);
     let ms: Vec<u64> = rows.iter().map(|r| r.ms).collect();
+    let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+    for why in overrides {
+        *reasons.entry(why).or_default() += 1;
+    }
+    let mut override_reasons: Vec<(String, usize)> = reasons
+        .into_iter()
+        .map(|(w, n)| (w.to_string(), n))
+        .collect();
+    override_reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     GateHost {
         host: host.into(),
         checks: rows.len(),
@@ -658,22 +696,85 @@ fn gate_host(host: &str, rows: &[&Row]) -> GateHost {
         median_ms: median_ms(ms.iter().copied()),
         p90_ms: percentile_ms(ms, 90),
         widening,
+        overridden: overrides.len(),
+        override_reasons,
     }
 }
 
-/// Gate-mode checks per host, then all hosts together when there is more than one.
+/// One host's gate-mode pushes as the hook decided them: a hook row with gate
+/// `HOOK_CHECK_GATE` replaces the verdict of the nearest unpaired gate-mode check of the
+/// same commit at or before it, within `HOOK_PAIR_WINDOW_MS`, keeping the check's mode,
+/// selection and time. Any other hook row (its own gate decided the push), or one with no
+/// such check, counts as a check of its own. Returns the checks and the hook's reason for
+/// each verdict it changed.
+fn as_decided<'a>(rows: &[&'a Row]) -> (Vec<Row>, Vec<&'a str>) {
+    let mut by_sha: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+    for r in rows {
+        by_sha.entry(r.sha.as_str()).or_default().push(r);
+    }
+    let mut out = Vec::new();
+    let mut overrides = Vec::new();
+    for mut rs in by_sha.into_values() {
+        // At equal times the check comes first: the hook decides after it.
+        rs.sort_by_key(|r| (r.at_ms, r.is_hook()));
+        let mut unpaired: Vec<Row> = Vec::new();
+        for r in rs {
+            if !r.is_hook() {
+                unpaired.push(r.clone());
+                continue;
+            }
+            let pairs = r.gate.as_deref() == Some(HOOK_CHECK_GATE)
+                && unpaired
+                    .last()
+                    .is_some_and(|c| r.at_ms.saturating_sub(c.at_ms) <= HOOK_PAIR_WINDOW_MS);
+            match if pairs { unpaired.pop() } else { None } {
+                Some(mut check) => {
+                    if check.verdict != r.verdict {
+                        overrides.push(if r.reason.is_empty() {
+                            "no reason given"
+                        } else {
+                            r.reason.as_str()
+                        });
+                        check.verdict = r.verdict;
+                    }
+                    out.push(check);
+                }
+                None => out.push(r.clone()),
+            }
+        }
+        out.extend(unpaired);
+    }
+    (out, overrides)
+}
+
+/// Gate-mode checks per host, as the hook decided them, then all hosts together when
+/// there is more than one.
 pub fn gate_mode(repo: &str, rows: &[Row]) -> Vec<GateHost> {
     let mut by_host: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
-    for r in rows
-        .iter()
-        .filter(|r| r.kind == "chg" && r.repo == repo && r.source.as_deref() == Some(GATE_CHECK))
-    {
+    for r in rows.iter().filter(|r| {
+        r.repo == repo
+            && ((r.kind == "chg" && r.source.as_deref() == Some(GATE_CHECK)) || r.is_hook())
+    }) {
         by_host.entry(r.host.as_str()).or_default().push(r);
     }
-    let mut out: Vec<GateHost> = by_host.iter().map(|(h, rs)| gate_host(h, rs)).collect();
-    if by_host.len() > 1 {
-        let all: Vec<&Row> = by_host.into_values().flatten().collect();
-        out.push(gate_host("all", &all));
+    let decided: Vec<(&str, Vec<Row>, Vec<&str>)> = by_host
+        .iter()
+        .map(|(h, rs)| {
+            let (checks, overrides) = as_decided(rs);
+            (*h, checks, overrides)
+        })
+        .collect();
+    let mut out: Vec<GateHost> = decided
+        .iter()
+        .map(|(h, checks, overrides)| gate_host(h, &checks.iter().collect::<Vec<_>>(), overrides))
+        .collect();
+    if decided.len() > 1 {
+        let all: Vec<&Row> = decided.iter().flat_map(|(_, c, _)| c).collect();
+        let overrides: Vec<&str> = decided
+            .iter()
+            .flat_map(|(_, _, o)| o.iter().copied())
+            .collect();
+        out.push(gate_host("all", &all, &overrides));
     }
     out
 }
@@ -708,7 +809,10 @@ pub fn dedup(rows: Vec<Row>) -> Vec<Row> {
 
 pub fn report(repo: &str, rows: &[Row]) -> Report {
     let mut gates: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
-    for r in rows.iter().filter(|r| r.kind == "gate" && r.repo == repo) {
+    for r in rows
+        .iter()
+        .filter(|r| r.kind == "gate" && !r.is_hook() && r.repo == repo)
+    {
         if matches!(r.verdict, Outcome::Pass | Outcome::Fail) {
             gates.entry(r.sha.as_str()).or_default().push(r);
         }
@@ -1008,6 +1112,18 @@ impl Report {
                 );
             }
             for g in &self.gate_mode {
+                if g.overridden == 0 {
+                    continue;
+                }
+                line(
+                    &mut o,
+                    format!("  overridden by the hook on {}: {}", g.host, g.overridden),
+                );
+                for (why, n) in &g.override_reasons {
+                    line(&mut o, format!("    {n:>4}  {why}"));
+                }
+            }
+            for g in &self.gate_mode {
                 if g.widening.is_empty() {
                     continue;
                 }
@@ -1143,7 +1259,7 @@ fn ci_recorded(rows: &[Row]) -> BTreeSet<(&str, u64)> {
 fn ci_wanted<'a>(key: &str, rows: &'a [Row], now: u64) -> BTreeSet<&'a str> {
     let judged_locally: BTreeSet<&str> = rows
         .iter()
-        .filter(|r| r.kind == "gate" && !r.is_ci())
+        .filter(|r| r.kind == "gate" && !r.is_ci() && !r.is_hook())
         .filter(|r| matches!(r.verdict, Outcome::Pass | Outcome::Fail))
         .map(|r| r.sha.as_str())
         .collect();
@@ -1517,6 +1633,159 @@ mod tests {
 
         // One host: no "all" line.
         assert_eq!(report("r", &rows[..4]).gate_mode.len(), 1);
+    }
+
+    fn check_at(sha: &str, at_ms: u64, v: Outcome, ms: u64) -> Row {
+        Row {
+            sha: sha.into(),
+            at_ms,
+            ..gate_check("m1", v, ms, "subset", "coverage of x")
+        }
+    }
+
+    fn hook(sha: &str, at_ms: u64, v: Outcome, ms: u64, gate: &str, why: &str) -> Row {
+        Row {
+            host: "m1".into(),
+            at_ms,
+            reason: why.into(),
+            ..Row::gate("r", sha, v, ms, gate, HOOK_SOURCE, vec![])
+        }
+    }
+
+    #[test]
+    fn the_hooks_decision_overrides_the_check_it_followed() {
+        let rows = vec![
+            check_at("a", 10, Outcome::Pass, 1000),
+            hook(
+                "a",
+                11,
+                Outcome::Fail,
+                1100,
+                HOOK_CHECK_GATE,
+                "ExUnit failures in the log",
+            ),
+            // Agreeing with chg overrides nothing.
+            check_at("b", 20, Outcome::Pass, 2000),
+            hook("b", 21, Outcome::Pass, 2100, HOOK_CHECK_GATE, ""),
+        ];
+        let r = report("r", &rows);
+        let m1 = &r.gate_mode[0];
+        assert_eq!((m1.checks, m1.pass, m1.fail), (2, 1, 1));
+        // The check's mode and time are kept.
+        assert_eq!(m1.subset, 2);
+        assert_eq!(m1.median_ms, Some(1500));
+        assert_eq!(m1.overridden, 1);
+        assert_eq!(
+            m1.override_reasons,
+            vec![("ExUnit failures in the log".to_string(), 1)]
+        );
+        let text = r.render();
+        assert!(text.contains("overridden by the hook on m1: 1"), "{text}");
+        assert!(text.contains("ExUnit failures in the log"), "{text}");
+    }
+
+    #[test]
+    fn a_hook_row_without_a_check_is_a_check_of_its_own() {
+        let rows = vec![hook(
+            "a",
+            10,
+            Outcome::Pass,
+            90_000,
+            "mix precommit",
+            "chg check exit 3",
+        )];
+        let m1 = &report("r", &rows).gate_mode[0];
+        assert_eq!((m1.checks, m1.pass, m1.subset), (1, 1, 0));
+        assert_eq!(m1.median_ms, Some(90_000));
+        assert_eq!(m1.overridden, 0);
+    }
+
+    #[test]
+    fn retries_on_one_commit_pair_each_hook_row_with_its_own_check() {
+        let rows = vec![
+            // Retry 1: chg passed, the hook failed it (the tree moved).
+            check_at("a", 10, Outcome::Pass, 1000),
+            hook("a", 11, Outcome::Fail, 1000, HOOK_CHECK_GATE, "tree moved"),
+            // Retry 2: chg failed, the hook agreed.
+            check_at("a", 20, Outcome::Fail, 2000),
+            hook("a", 21, Outcome::Fail, 2000, HOOK_CHECK_GATE, ""),
+            // Retry 3: exit 3, so no check row; the hook's own gate passed.
+            hook(
+                "a",
+                30,
+                Outcome::Pass,
+                3000,
+                "mix precommit",
+                "chg check exit 3",
+            ),
+            // Retry 4: a check with no hook decision yet keeps its verdict.
+            check_at("a", 40, Outcome::Pass, 4000),
+        ];
+        let m1 = &report("r", &rows).gate_mode[0];
+        assert_eq!((m1.checks, m1.pass, m1.fail), (4, 2, 2));
+        assert_eq!(m1.overridden, 1);
+        assert_eq!(m1.override_reasons, vec![("tree moved".to_string(), 1)]);
+    }
+
+    /// Only a hook row deciding on `chg check` pairs, and only with a check within the
+    /// window: the hook's own gate after exit 3 never takes an older check's place, and
+    /// neither does a decision long after the check (an interrupted push's, or one logged
+    /// before hook rows existed).
+    #[test]
+    fn a_fallback_gate_or_a_late_hook_row_never_takes_an_older_check() {
+        let rows = vec![
+            // An interrupted push: its check has no hook decision.
+            check_at("a", 10, Outcome::Pass, 1000),
+            // The retry exited 3 and the hook's own gate failed it.
+            hook(
+                "a",
+                20,
+                Outcome::Fail,
+                3000,
+                "mix precommit",
+                "chg check exit 3",
+            ),
+            // A check, then a chg-check decision past the window.
+            check_at("b", 10, Outcome::Pass, 1000),
+            hook(
+                "b",
+                10 + HOOK_PAIR_WINDOW_MS + 1,
+                Outcome::Fail,
+                1000,
+                HOOK_CHECK_GATE,
+                "late",
+            ),
+        ];
+        let m1 = &report("r", &rows).gate_mode[0];
+        assert_eq!((m1.checks, m1.pass, m1.fail), (4, 2, 2));
+        assert_eq!(m1.overridden, 0);
+    }
+
+    #[test]
+    fn hook_rows_never_pair_with_a_shadow_check_nor_want_ci() {
+        let sha = "1".repeat(40);
+        let rows = vec![
+            chg(&sha, "m1", Outcome::Pass, 1000, &[]),
+            hook(
+                &sha,
+                10,
+                Outcome::Fail,
+                1000,
+                HOOK_CHECK_GATE,
+                "core.bare flipped",
+            ),
+        ];
+        let r = report("r", &rows);
+        assert_eq!(
+            (r.pushes, r.unpaired),
+            (0, 1),
+            "the shadow check stays unpaired"
+        );
+        assert_eq!(
+            ci_wanted("r", &rows, now_ms()),
+            BTreeSet::from([sha.as_str()]),
+            "a hook row is not a local gate verdict"
+        );
     }
 
     #[test]
