@@ -81,6 +81,13 @@ enum Top {
         #[arg(long, requires = "foreground")]
         replay: bool,
     },
+    /// Check that this machine can run the repo's gate: the adapter manifest loads and, for
+    /// an Elixir repo, the `mix chg.*` tasks are installed for the Elixir it runs. Prints one
+    /// line per check. Exit 0 when every check passes, 1 when one does not.
+    Doctor {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Which gate judges a push: prints `on`, `shadow` or `off` and where that came from
     /// (`CHG_GATE` beats `.chg/policy.toml` `[gate] mode`; default `shadow`). Always exit 0;
     /// anything unreadable prints `off`, so a hook falls back to the old gate.
@@ -403,6 +410,7 @@ fn main() -> ExitCode {
                 check_cmd(&root, base, sha, all)
             }
         }
+        Top::Doctor { repo } => doctor(&repo_root(repo)),
         Top::Gate { repo } => {
             let r = gate::resolve(&repo_root(repo));
             println!("{}", r.mode);
@@ -610,6 +618,32 @@ fn with_worktree(arg: Option<PathBuf>, f: impl FnOnce(&Path) -> ExitCode) -> Exi
             ExitCode::from(1)
         }
     }
+}
+
+fn doctor(repo: &Path) -> ExitCode {
+    println!("ok: chg {}", chg::VERSION);
+    let manifest = match contract::load(repo) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("FAIL: adapter manifest: {}", e.to_string().trim_end());
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "ok: {} adapter, contract {}",
+        manifest.kind.as_str(),
+        manifest.version
+    );
+    if manifest.kind == contract::Kind::Elixir {
+        match adapter::elixir_tasks(repo) {
+            Ok(at) => println!("ok: mix chg.* tasks installed in {at}"),
+            Err(e) => {
+                println!("FAIL: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn validate(repo: &Path) -> ExitCode {

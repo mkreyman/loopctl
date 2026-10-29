@@ -563,3 +563,83 @@ fn replace_line(text: &str, prefix: &str, line: &str) -> String {
         .join("\n")
         + "\n"
 }
+
+/// ryzen's first gated push on Elixir 1.20.4 (2026-10-26) had no adapter archive for that
+/// Elixir: `mix` said only that the task "chg.static" could not be found, and chg that
+/// static "printed no JSON document". The error now says what is missing and how to
+/// install it, and `chg doctor` finds it before a push does.
+#[test]
+fn a_missing_elixir_adapter_archive_is_named_with_its_install_command() {
+    let dir = fixture("elixir");
+    let manifest = dir.path().join(".chg/adapter.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        "static   = \"sh .chg/fake-adapter.sh static {base}\"",
+        "static   = \"mix chg.static --base {base}\"",
+    );
+    std::fs::write(&manifest, text).unwrap();
+    git(dir.path(), &["commit", "-qam", "static through mix"]);
+    let bin = tempfile::tempdir().unwrap();
+    let mix = bin.path().join("mix");
+    std::fs::write(
+        &mix,
+        "#!/bin/sh\n[ -n \"$MIX_BROKEN\" ] && { echo '** (Mix) Could not load mix.exs' >&2; exit 1; }\ncase \"$1\" in\n  archive) [ -n \"$HAS_ADAPTER\" ] && echo '* chg_adapter'; echo '* hex-2.5.1'; echo 'Archives installed at: /fake/elixir/1.20.4/.mix/archives' ;;\n  *) echo \"** (Mix) The task \\\"$1\\\" could not be found\" >&2; exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &mix,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let install = format!(
+        "scripts/install-elixir-adapter.sh --repo {}",
+        std::fs::canonicalize(dir.path()).unwrap().display()
+    );
+
+    exec(dir.path(), &["static", "--base", "HEAD"])
+        .env("PATH", &path)
+        .env_remove("HAS_ADAPTER")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("printed no JSON document"))
+        .stderr(predicate::str::contains(
+            "lists no chg_adapter in /fake/elixir/1.20.4/.mix/archives",
+        ))
+        .stderr(predicate::str::contains(install.clone()));
+    chg()
+        .args(["doctor", "--repo"])
+        .arg(dir.path())
+        .env("PATH", &path)
+        .env_remove("HAS_ADAPTER")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "FAIL: the Elixir adapter is not installed",
+        ))
+        .stdout(predicate::str::contains(install));
+    chg()
+        .args(["doctor", "--repo"])
+        .arg(dir.path())
+        .env("PATH", &path)
+        .env("HAS_ADAPTER", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ok: mix chg.* tasks installed in /fake/elixir/1.20.4/.mix/archives",
+        ));
+    // A `mix archive` that fails itself is reported as that, not as a missing adapter.
+    chg()
+        .args(["doctor", "--repo"])
+        .arg(dir.path())
+        .env("PATH", &path)
+        .env("HAS_ADAPTER", "1")
+        .env("MIX_BROKEN", "1")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("FAIL: `mix archive` failed in"))
+        .stdout(predicate::str::contains("not installed").not());
+}

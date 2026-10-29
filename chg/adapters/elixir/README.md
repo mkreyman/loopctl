@@ -4,16 +4,24 @@ The `mix chg.*` tasks behind a Mix project's `.chg/adapter.toml` (contract v1,
 [docs/adapter-contract.md](../../docs/adapter-contract.md)). They ship as a Mix archive, so a
 product repo needs no dependency and no `mix.lock` line:
 
-    scripts/install-elixir-adapter.sh      # once per machine and Elixir version
-    ASDF_ELIXIR_VERSION=1.19.5-otp-28 scripts/install-elixir-adapter.sh   # another version
+    scripts/install-elixir-adapter.sh --all-installed   # every asdf Elixir that can run it
+    scripts/install-elixir-adapter.sh --repo ~/workspace/home_care_billing   # the Elixir it names
+    scripts/install-elixir-adapter.sh      # the Elixir adapters/elixir selects
 
-A CI runner that runs as its own user, with its own Elixir and MIX_HOME, cannot use either of
+Archives are per Elixir install, so a repo whose `.tool-versions` moves to a new Elixir has no
+`mix chg.*` tasks until the adapter is installed for that one. `scripts/install.sh` runs
+`--all-installed` after installing `chg`, so re-running it after `asdf install elixir <v>`
+covers the new version. `chg doctor` says whether the tasks are installed for the Elixir a
+repo runs, and a gate that finds them missing names the `--repo` command above.
+
+A CI runner that runs as its own user, with its own Elixir and MIX_HOME, cannot use any of
 those. `scripts/install-system.sh` puts `chg` at `/usr/local/bin/chg` and the archive at
-`/usr/local/share/chg/chg_adapter.ez` for every user. The job then runs
-`mix archive.install /usr/local/share/chg/chg_adapter.ez --force` and
+`/usr/local/share/chg/chg_adapter.ez` for every user, and one built by each asdf-installed
+Elixir at `/usr/local/share/chg/elixir/<elixir>-otp-<otp>/chg_adapter.ez`. The job then runs
+`mix archive.install /usr/local/share/chg/chg_adapter.ez --force` (or its Elixir's copy) and
 `mix local.hex --if-missing --force`. Without Hex, Mix's install prompt would replace the
 adapter's JSON output. The job's Elixir and OTP must match the ones that built the archive,
-which `/usr/local/share/chg/chg_adapter.ez.toolchain` names.
+which the `chg_adapter.ez.toolchain` beside it names.
 
 It needs Elixir 1.19.5 or later (`check_cwd: false` exists since 1.19.2), and CI runs its tests
 on 1.19.5 and on the version in [.tool-versions](.tool-versions).

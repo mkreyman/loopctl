@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::contract::{self, CommandName};
+use crate::contract::{self, CommandName, Kind};
 use crate::exec::{self, Outcome};
 use crate::output::{self, Affected, Document, Status};
 use crate::{cover, git, glob};
@@ -136,7 +136,15 @@ pub fn invoke(
     };
 
     let doc = match document.map(|l| output::check(name, &l)) {
-        None => return Invoked::Broken(format!("printed no JSON document (exit {code:?})")),
+        None => {
+            let mut why = format!("printed no JSON document (exit {code:?})");
+            if manifest.kind == Kind::Elixir
+                && let Err(missing) = elixir_tasks(repo)
+            {
+                why = format!("{why}: {missing}");
+            }
+            return Invoked::Broken(why);
+        }
         Some(Err(e)) => return Invoked::Broken(e),
         Some(Ok(doc)) => doc,
     };
@@ -195,4 +203,72 @@ fn coverage_record(
         ));
     }
     Ok((path.to_string_lossy().into_owned(), since))
+}
+
+/// How long `elixir_tasks` waits on `mix archive`.
+const ARCHIVE_PROBE: Duration = Duration::from_secs(30);
+
+/// `Ok` with where the archives are when the `mix chg.*` tasks are installed for the Elixir
+/// `repo` runs, else why not, naming the command that installs them. Archives are per
+/// Elixir install, so a repo that moves to a new Elixir has no tasks until the adapter is
+/// installed for it, and then `mix` prints only `The task "chg.static" could not be found`
+/// (ryzen, 2026-10-26, Elixir 1.20.4).
+pub fn elixir_tasks(repo: &Path) -> Result<String, String> {
+    let mut c = std::process::Command::new("mix");
+    c.arg("archive")
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    for v in git::HOOK_ENV {
+        c.env_remove(v);
+    }
+    let mut child = c
+        .spawn()
+        .map_err(|e| format!("cannot run `mix archive` in {}: {e}", repo.display()))?;
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() >= ARCHIVE_PROBE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`mix archive` did not answer in {}s",
+                    ARCHIVE_PROBE.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(format!("waiting on `mix archive`: {e}")),
+        }
+    };
+    // A probe that fails itself (a broken mix.exs, a shim with no Elixir for this repo)
+    // says nothing about the archive: sending the user to reinstall it would mislead.
+    if !status.success() {
+        return Err(format!(
+            "`mix archive` failed in {} ({status}); fix mix before judging the adapter",
+            repo.display()
+        ));
+    }
+    let mut out = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut so, &mut out);
+    }
+    let at = out
+        .lines()
+        .find_map(|l| l.strip_prefix("Archives installed at: "))
+        .unwrap_or("its MIX_HOME")
+        .to_string();
+    // `* chg_adapter`, or `* chg_adapter-<vsn>` for an archive built with a version.
+    if out
+        .lines()
+        .map(str::trim)
+        .any(|l| l == "* chg_adapter" || l.starts_with("* chg_adapter-"))
+    {
+        return Ok(at);
+    }
+    Err(format!(
+        "the Elixir adapter is not installed for this repo's Elixir (`mix archive` lists no chg_adapter in {at}); install it with `scripts/install-elixir-adapter.sh --repo {}` in a chg checkout",
+        repo.display()
+    ))
 }

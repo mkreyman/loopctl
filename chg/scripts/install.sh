@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Install the chg binary for this machine.
 #
-#   scripts/install.sh [--dest DIR] [--release TAG]
+#   scripts/install.sh [--dest DIR] [--release TAG] [--no-elixir-adapter]
 #
 # --release TAG  download the release artifact (Linux x86_64 only; needs `gh` with access
 #                to mkreyman/chg) and check its sha256; without it, build from this checkout.
 # --dest DIR     where `chg` goes (default: ~/.local/bin).
+# --no-elixir-adapter
+#                skip the Elixir adapter. Otherwise, where asdf has Elixir installed, the
+#                adapter's `mix chg.*` tasks are installed for every Elixir that can run
+#                them (scripts/install-elixir-adapter.sh --all-installed): archives are per
+#                Elixir, and a repo on an Elixir without one has no gate.
 #
 # On Linux x86_64 both paths give the static musl binary, so a CI job running in a container
 # with an older glibc than the build host (node:22-bookworm has 2.36) can run the mounted
@@ -18,11 +23,13 @@ set -euo pipefail
 
 dest="$HOME/.local/bin"
 tag=""
+elixir_adapter=true
 while [ $# -gt 0 ]; do
   case "$1" in
     --dest) dest=$2; shift 2 ;;
     --release) tag=$2; shift 2 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    --no-elixir-adapter) elixir_adapter=false; shift ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -63,8 +70,12 @@ chmod +x "$bin"
 mkdir -p "$dest"
 if [ -f "$dest/chg" ] && cmp -s "$bin" "$dest/chg"; then
   echo "unchanged: $dest/chg ($("$dest/chg" --version))"
-  exit 0
+else
+  cp "$bin" "$dest/.chg.new.$$"
+  mv -f "$dest/.chg.new.$$" "$dest/chg"
+  echo "installed: $dest/chg ($("$dest/chg" --version))"
 fi
-cp "$bin" "$dest/.chg.new.$$"
-mv -f "$dest/.chg.new.$$" "$dest/chg"
-echo "installed: $dest/chg ($("$dest/chg" --version))"
+
+if $elixir_adapter && command -v asdf >/dev/null 2>&1 && [ -n "$(asdf list elixir 2>/dev/null)" ]; then
+  "$(cd "$(dirname "$0")" >/dev/null && pwd -P)/install-elixir-adapter.sh" --all-installed
+fi
