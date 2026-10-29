@@ -373,6 +373,102 @@ fn worktree_add_hydrates_from_the_nearest_ancestor_snapshot() {
     assert_eq!(again["paths"], serde_json::json!([]));
 }
 
+/// A temp dir on another filesystem than `of`, or None (with why) where the machine has
+/// no second one to offer.
+fn other_fs_tempdir(of: &Path) -> Option<TempDir> {
+    use std::os::unix::fs::MetadataExt;
+    let t = tempfile::tempdir().unwrap();
+    let dev = |p: &Path| fs::metadata(p).unwrap().dev();
+    if dev(t.path()) == dev(of) {
+        eprintln!("skipped: the default temp dir shares a filesystem with the reflink dir");
+        return None;
+    }
+    Some(t)
+}
+
+/// The store on the reflink volume and the worktree elsewhere (fix-hcb on minis: the store
+/// on /srv/chg, the worktrees on the root LV): hydrate copies, says what it cost, and the
+/// tree is as a clone would have left it. `chg doctor` names the problem and the fix.
+#[test]
+fn hydrate_across_filesystems_copies_and_doctor_names_it() {
+    let Some(e) = Env::new() else { return };
+    let Some(other) = other_fs_tempdir(&e.root) else {
+        return;
+    };
+    let one = e.head();
+    e.build(&one);
+    let ws = fs::canonicalize(other.path()).unwrap().join("ws");
+    let st = Std::new("git")
+        .arg("-C")
+        .arg(&e.repo)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+        ])
+        .arg(&ws)
+        .arg(&one)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let out = e
+        .chg()
+        .args(["ws", "hydrate", "--repo"])
+        .arg(&ws)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("byte by byte"))
+        .stderr(predicate::str::contains("chg doctor"))
+        .get_output()
+        .clone();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["snapshot"], one.as_str(), "{v}");
+    let snap = e.snap_dir(&one);
+    let mtime = |p: PathBuf| fs::metadata(p).unwrap().modified().unwrap();
+    for p in [
+        "deps/lib/dep.txt",
+        "_build/version",
+        "apps/web/node_modules/m.js",
+    ] {
+        assert_eq!(
+            fs::read(ws.join(p)).unwrap(),
+            fs::read(snap.join(p)).unwrap(),
+            "{p}"
+        );
+        assert_eq!(mtime(ws.join(p)), mtime(snap.join(p)), "{p}");
+    }
+    assert_eq!(mtime(ws.join("deps/lib")), mtime(snap.join("deps/lib")));
+
+    // doctor: .claude/worktrees on the other filesystem is a FAIL with the fix; on the
+    // store's volume it is ok.
+    let wts = e.repo.join(".claude/worktrees");
+    fs::create_dir_all(e.repo.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(other.path(), &wts).unwrap();
+    e.chg()
+        .args(["doctor", "--repo"])
+        .arg(&e.repo)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "cannot be cloned into from the snapshot store",
+        ))
+        .stdout(predicate::str::contains("chg-volume-setup.sh --enroll"));
+    fs::remove_file(&wts).unwrap();
+    let on_volume = e.root.join("ws-volume");
+    fs::create_dir_all(&on_volume).unwrap();
+    std::os::unix::fs::symlink(&on_volume, &wts).unwrap();
+    e.chg()
+        .args(["doctor", "--repo"])
+        .arg(&e.repo)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("share a filesystem that clones"));
+}
+
 #[test]
 fn hydrate_fills_in_around_tracked_files_and_resolves_the_worktree_root() {
     let Some(e) = Env::new() else { return };

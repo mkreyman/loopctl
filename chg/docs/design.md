@@ -382,6 +382,7 @@ All stories ship in both repos unless marked otherwise. "Baseline" means the 202
 - p50 time from `git worktree add` to tests-runnable is under 15 s on HCB and fleet-holding, on mac-mini and minis, measured over 10 runs each and recorded.
 - In HCB, when HEAD equals the snapshot sha, the first `mix test <file>` prints no `Compiling` line for project modules. In fleet-holding, no install or build runs.
 - No snapshot: `ws hydrate` exits 3 with a message and the worktree falls back to today's cold path. It is never left half-hydrated.
+- No clone possible (the worktree on another filesystem than the store, or a filesystem without reflink): `ws hydrate` copies the snapshot byte by byte and prints the size, the time and the fix. A slow hydrate still beats a cold build. `chg doctor` clones a probe file from the store into the repo's `.claude/worktrees` and fails until that works (`bin/chg-volume-setup.sh --enroll`); it decides by the clone, not by device numbers, which differ between btrfs subvolumes that clone. A repo whose adapter names no artifacts hydrates nothing and passes. Snapshot builds inside the store never copy.
 
 **S5. Linux reflink volume (minis, x1, nuc, beelink).**
 - `bin/chg-volume-setup.sh` creates a sparse image file (300 GB on minis, x1 and beelink, 120 GB on nuc), `mkfs.xfs -m reflink=1`, an fstab loop-mount at `/srv/chg` and a `.claude/worktrees` symlink per enrolled repo.

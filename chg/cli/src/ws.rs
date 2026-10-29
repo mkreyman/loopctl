@@ -1,5 +1,7 @@
 //! `chg ws hydrate` (design §3.5, story S4): clone the adapter's artifact paths from the
-//! nearest-ancestor snapshot into a fresh worktree.
+//! nearest-ancestor snapshot into a fresh worktree. Where the worktree's filesystem cannot
+//! clone from the store's (another filesystem, or one without reflinks), it copies them
+//! byte by byte instead, with a warning; `chg doctor` names the cause.
 //!
 //! Only what the worktree lacks is cloned: a file it already has wins, and an artifact
 //! dir it already has (`priv/plts` holding a tracked `.gitkeep`) is filled in around
@@ -25,7 +27,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::clone::clone_tree;
+use crate::clone::{clone_tree, copy_tree, no_reflink};
 use crate::contract;
 use crate::exec;
 use crate::git;
@@ -260,13 +262,41 @@ fn stage_and_move(
     lock: crate::store::Lock,
     journal_path: &Path,
 ) -> Result<(), String> {
+    // Once a clone proves impossible here (the store and the worktree on different
+    // filesystems, or one that cannot clone), the rest is copied byte by byte: slower, and
+    // said so, but a hydrated tree still beats a cold build.
+    let mut copied: Option<(String, u64, Instant)> = None;
     for p in paths {
         let to = staging.join(p);
         fs::create_dir_all(to.parent().expect("staged path has a parent"))
             .map_err(|e| format!("staging {p}: {e}"))?;
-        clone_tree(&snap.join(p), &to).map_err(|e| format!("cloning {p}: {e}"))?;
+        if let Some((_, bytes, _)) = &mut copied {
+            *bytes += copy_tree(&snap.join(p), &to).map_err(|e| format!("copying {p}: {e}"))?;
+            continue;
+        }
+        match clone_tree(&snap.join(p), &to) {
+            Ok(()) => {}
+            Err(e) if no_reflink(&e) => {
+                let started = Instant::now();
+                let _ = fs::remove_dir_all(&to);
+                let _ = fs::remove_file(&to);
+                let bytes =
+                    copy_tree(&snap.join(p), &to).map_err(|e| format!("copying {p}: {e}"))?;
+                copied = Some((e.to_string(), bytes, started));
+            }
+            Err(e) => return Err(format!("cloning {p}: {e}")),
+        }
     }
     drop(lock); // the clones are ours now; GC may proceed
+    if let Some((why, bytes, started)) = copied {
+        eprintln!(
+            "chg: hydrate copied {} MB byte by byte in {:.1} s instead of cloning ({why}). \
+             A clone takes well under a second and no disk; put the worktrees on the \
+             snapshot store's filesystem (`chg doctor` checks it).",
+            bytes / 1_000_000,
+            started.elapsed().as_secs_f64()
+        );
+    }
 
     let mut journal = File::create(journal_path)
         .map_err(|e| format!("creating {}: {e}", journal_path.display()))?;

@@ -83,9 +83,11 @@ enum Top {
         #[arg(long, requires = "foreground")]
         replay: bool,
     },
-    /// Check that this machine can run the repo's gate: the adapter manifest loads and, for
-    /// an Elixir repo, the `mix chg.*` tasks are installed for the Elixir it runs. Prints one
-    /// line per check. Exit 0 when every check passes, 1 when one does not.
+    /// Check that this machine can run the repo's gate: the adapter manifest loads, for
+    /// an Elixir repo the `mix chg.*` tasks are installed for the Elixir it runs, and the
+    /// repo's `.claude/worktrees` shares a filesystem that clones with its snapshot store
+    /// (else every hydrate copies byte by byte). Prints one line per check. Exit 0 when
+    /// every check passes, 1 when one does not.
     Doctor {
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -646,6 +648,17 @@ fn doctor(repo: &Path) -> ExitCode {
                 println!("FAIL: {e}");
                 return ExitCode::from(1);
             }
+        }
+    }
+    match chg::doctor::worktrees_and_store(repo, &manifest.artifacts) {
+        Ok(f) if f.ok => println!("ok: {}", f.text),
+        Ok(f) => {
+            println!("FAIL: {}", f.text);
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            println!("FAIL: worktrees and the snapshot store: {e}");
+            return ExitCode::from(1);
         }
     }
     ExitCode::SUCCESS

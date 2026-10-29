@@ -7,11 +7,71 @@
 //!   (`cp --reflink=always`), recreating directories and symlinks and keeping modes and
 //!   mtimes, which `mix` reads.
 //!
-//! Neither ever falls back to a byte copy: a tree too big to copy is exactly the case
-//! cloning exists for, so an unsupported filesystem is an error naming the fix.
+//! Neither ever falls back to a byte copy on its own: a tree too big to copy is exactly
+//! the case cloning exists for, so an unsupported filesystem is an error naming the fix,
+//! marked `NoReflink` so a caller that must work anyway (`chg ws hydrate`) can copy with
+//! `copy_tree` and say what it cost.
 
+use std::fs::{self, File, FileTimes};
 use std::io;
 use std::path::Path;
+
+/// The payload of a clone error that only a byte copy can get past: source and target on
+/// different filesystems, or a filesystem that cannot clone.
+#[derive(Debug)]
+pub struct NoReflink(pub String);
+
+impl std::fmt::Display for NoReflink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoReflink {}
+
+/// Whether `e` is a clone that failed because cloning is impossible there.
+pub fn no_reflink(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<NoReflink>())
+}
+
+/// Copies `src` (a directory, file or symlink) to `dst` byte by byte, keeping modes and
+/// mtimes as `clone_tree` does. Returns the bytes copied. `dst` must not exist.
+pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<u64> {
+    let meta = fs::symlink_metadata(src)?;
+    let t = meta.file_type();
+    if t.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+        return Ok(0);
+    }
+    if t.is_file() {
+        let n = fs::copy(src, dst)?;
+        // Read-only: the copy has the source's mode, which may forbid writing (0444).
+        File::open(dst)?.set_times(
+            FileTimes::new()
+                .set_accessed(meta.accessed()?)
+                .set_modified(meta.modified()?),
+        )?;
+        return Ok(n);
+    }
+    if !t.is_dir() {
+        return Ok(0); // sockets, fifos and devices are not build artifacts
+    }
+    fs::create_dir(dst)?;
+    let mut n = 0;
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        n += copy_tree(&e.path(), &dst.join(e.file_name()))?;
+    }
+    // Last: writing the entries changed the directory's mtime, and a read-only mode would
+    // have blocked them.
+    File::open(dst)?.set_times(
+        FileTimes::new()
+            .set_accessed(meta.accessed()?)
+            .set_modified(meta.modified()?),
+    )?;
+    fs::set_permissions(dst, meta.permissions())?;
+    Ok(n)
+}
 
 /// Clones `src` (a directory, file or symlink) to `dst`, which must not exist and whose
 /// parent must exist on the same filesystem. On error `dst` may be partly written; the
@@ -54,14 +114,17 @@ mod imp {
             Some(libc::ENOTSUP) => " (the volume is not APFS)",
             _ => "",
         };
-        Err(io::Error::new(
-            e.kind(),
-            format!(
-                "clonefile {} -> {}: {e}{hint}",
-                src.display(),
-                dst.display()
-            ),
-        ))
+        let msg = format!(
+            "clonefile {} -> {}: {e}{hint}",
+            src.display(),
+            dst.display()
+        );
+        match e.raw_os_error() {
+            Some(libc::EXDEV) | Some(libc::ENOTSUP) => {
+                Err(io::Error::new(e.kind(), super::NoReflink(msg)))
+            }
+            _ => Err(io::Error::new(e.kind(), msg)),
+        }
     }
 }
 
@@ -127,10 +190,13 @@ mod imp {
                 }
                 _ => "",
             };
-            return Err(io::Error::new(
-                e.kind(),
-                format!("FICLONE {} -> {}: {e}{hint}", src.display(), dst.display()),
-            ));
+            let msg = format!("FICLONE {} -> {}: {e}{hint}", src.display(), dst.display());
+            return Err(match e.raw_os_error() {
+                Some(libc::EXDEV) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => {
+                    io::Error::new(e.kind(), super::NoReflink(msg))
+                }
+                _ => io::Error::new(e.kind(), msg),
+            });
         }
         to.set_permissions(meta.permissions())?;
         to.set_times(times(&meta)?)
@@ -251,6 +317,30 @@ mod tests {
         // Copy-on-write: writing the clone leaves the source alone.
         fs::write(dst.join("a/b/f.beam"), b"changed").unwrap();
         assert_eq!(fs::read(src.join("a/b/f.beam")).unwrap(), b"beam");
+    }
+
+    /// A read-only file (0444, as `deps` holds) copies with its mode and mtime: setting the
+    /// times must not need write access to the copy.
+    #[test]
+    fn copies_a_read_only_file_with_its_mtime() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("ro.beam"), b"beam").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(86_400 * 30);
+        fs::File::options()
+            .write(true)
+            .open(src.join("ro.beam"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        fs::set_permissions(src.join("ro.beam"), fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dst = t.path().join("dst");
+        assert_eq!(copy_tree(&src, &dst).unwrap(), 4);
+        let m = fs::metadata(dst.join("ro.beam")).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o444);
+        assert_eq!(m.modified().unwrap(), old);
     }
 
     #[test]
