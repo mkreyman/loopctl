@@ -12,7 +12,9 @@
 //! a gate's selection needs. A record is unpacked into the
 //! history only when it is used, so the history is a cache of `KEEP_LOCAL` files. A record
 //! more than `MAX_AGE` first-parent commits behind the newest one on its line is deleted
-//! from the remote when the newer one is published.
+//! from the remote when the newer one is published, unless another verified line of the
+//! same family (`chg/verified/master` beside `chg/verified/epic/<name>`) still reaches it.
+//! A line protects its reach for as long as its ref exists, merged or not.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +51,15 @@ pub fn record_path(store: &Store, sha: &str) -> PathBuf {
 
 /// Pushes the record of `sha` to `remote`, then deletes the remote's records that no gate
 /// can use any more. Re-publishing a sha replaces its record.
-pub fn publish(repo: &Path, remote: &str, sha: &str, record: &Path) -> Result<(), String> {
+/// `line` is the verified ref `sha` was verified for (`chg verify --ref`): records that
+/// another verified line of the same family still reaches are never pruned by this one.
+pub fn publish(
+    repo: &Path,
+    remote: &str,
+    sha: &str,
+    record: &Path,
+    line: &str,
+) -> Result<(), String> {
     let path = record
         .to_str()
         .ok_or_else(|| format!("{} is not UTF-8", record.display()))?;
@@ -95,28 +105,38 @@ pub fn publish(repo: &Path, remote: &str, sha: &str, record: &Path) -> Result<()
 
     // Pruning is housekeeping: the record is out, so a failure here (choosing the stale
     // records or deleting them) never makes the publish fail, and a later one retries it.
-    if let Err(e) = prune(repo, remote, sha) {
+    if let Err(e) = prune(repo, remote, sha, line) {
         eprintln!("chg: pruning old coverage records: {e}");
     }
     Ok(())
 }
 
-/// Deletes the remote's records on `sha`'s line more than `max_age()` first-parent commits
-/// behind it.
-fn prune(repo: &Path, remote: &str, sha: &str) -> Result<(), String> {
-    let reach: Vec<String> = git::text(
-        repo,
-        &[
-            "rev-list",
-            "--first-parent",
-            "-n",
-            &(max_age() + 1).to_string(),
-            sha,
-        ],
-    )?
-    .lines()
-    .map(String::from)
-    .collect();
+/// Deletes the remote's records behind `sha` that no live verified line of `line`'s family
+/// can still be judged from: each line (this one at `sha`, every other at its tip) protects
+/// its own first-parent commits, `max_age()` deep. Ancestry says nothing about whether a
+/// line is finished (an epic merges master in, master merges a still-used epic), so a line
+/// protects its reach for as long as its ref exists.
+fn prune(repo: &Path, remote: &str, sha: &str, line: &str) -> Result<(), String> {
+    let mut reach = first_parent_line(repo, sha)?;
+    for (tip, name) in other_lines(repo, remote, line)? {
+        let here = git::text(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{tip}^{{commit}}"),
+            ],
+        );
+        // A tip this clone lacks cannot be judged, so nothing is pruned this time.
+        if here.is_err() {
+            eprintln!(
+                "chg: not pruning coverage records: {name} is at {tip}, which this clone lacks"
+            );
+            return Ok(());
+        }
+        reach.extend(first_parent_line(repo, &tip)?);
+    }
     // Only this line's: a record that is not an ancestor of `sha` (another verified line,
     // or a commit this clone has never seen) belongs to a line whose own publishes prune it.
     let mut stale = Vec::new();
@@ -132,6 +152,39 @@ fn prune(repo: &Path, remote: &str, sha: &str) -> Result<(), String> {
         git::run_bounded(del, transfer_timeout())?;
     }
     Ok(())
+}
+
+/// The family a verified ref belongs to: everything up to and including `verified/`
+/// (`chg/verified/master` and `chg/verified/epic/billing` are one family), or the ref's
+/// directory when it has no `verified/`.
+fn family(line: &str) -> &str {
+    match line.find("verified/") {
+        Some(i) => &line[..i + "verified/".len()],
+        None => line.rfind('/').map_or("", |i| &line[..=i]),
+    }
+}
+
+/// The tips of the remote's other verified lines of `line`'s family, with their names.
+fn other_lines(repo: &Path, remote: &str, line: &str) -> Result<Vec<(String, String)>, String> {
+    let family = family(line);
+    if family.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ls = git::cmd(repo);
+    ls.args([
+        "ls-remote",
+        "--heads",
+        remote,
+        &format!("refs/heads/{family}*"),
+    ]);
+    let listing =
+        String::from_utf8_lossy(&git::run_bounded(ls, fetch_timeout())?.stdout).into_owned();
+    Ok(listing
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter_map(|(tip, r)| Some((tip.to_string(), r.strip_prefix("refs/heads/")?.to_string())))
+        .filter(|(_, name)| name != line && name.starts_with(family))
+        .collect())
 }
 
 fn remote_records(repo: &Path, remote: &str, timeout: Duration) -> Result<Vec<String>, String> {

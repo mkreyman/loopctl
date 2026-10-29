@@ -168,7 +168,7 @@ pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
                 "no record: the adapter wrote none (see its stderr)".into()
             }
             (Ok(_), _) if !o.push => "recorded".into(),
-            (Ok(r), _) => match cover::publish(repo, o.remote, &sha, r) {
+            (Ok(r), _) => match cover::publish(repo, o.remote, &sha, r, o.ref_name) {
                 Ok(()) => "published".into(),
                 Err(e) => format!("recorded, not published: {e}"),
             },

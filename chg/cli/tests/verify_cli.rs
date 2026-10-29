@@ -1151,6 +1151,161 @@ fn publishing_prunes_only_this_lines_old_records() {
     env.commit("lib/a.ex", "two\n");
     let c3 = env.commit("lib/a.ex", "three\n");
     verify(&[]);
-    // c1 is two first-parent commits behind c3, past the reach of 1; s1 is another line's.
-    assert_eq!(remote_records(), sorted(vec![s1, c3]));
+    // c1 is two first-parent commits behind c3, past the reach of 1, but the side line
+    // still reaches it; s1 is another line's.
+    assert_eq!(
+        remote_records(),
+        sorted(vec![c1.clone(), s1.clone(), c3.clone()])
+    );
+
+    // Merged, side's line still protects its reach while its ref exists.
+    env.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+    let m = env.head();
+    verify(&[]);
+    assert_eq!(
+        remote_records(),
+        sorted(vec![c1.clone(), s1.clone(), c3.clone(), m.clone()])
+    );
+
+    // Once its ref is gone, c1 and s1 go, as past master's reach.
+    delete_remote_line(&env, "verified/side");
+    let c5 = env.commit("lib/a.ex", "five\n");
+    verify(&[]);
+    assert_eq!(remote_records(), sorted(vec![m, c5]));
+}
+
+/// Deletes the verified line `name` from the test remote, as deleting its branch does.
+fn delete_remote_line(env: &Env, name: &str) {
+    let out = Std::new("git")
+        .arg("--git-dir")
+        .arg(&env.remote)
+        .args(["update-ref", "-d", &format!("refs/heads/{name}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn an_epic_lines_publish_keeps_the_records_master_still_reaches() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    let verify = |args: &[&str]| {
+        let out = env
+            .chg()
+            .env("CHG_COVER_MAX_AGE", "1")
+            .arg("verify")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(json(&out)["cover"], "published", "{}", json(&out));
+    };
+    let remote_records = || {
+        let out = Std::new("git")
+            .arg("--git-dir")
+            .arg(&env.remote)
+            .args([
+                "for-each-ref",
+                "--format=%(refname:lstrip=3)",
+                "refs/chg/cover/",
+            ])
+            .output()
+            .unwrap();
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+        v.sort();
+        v
+    };
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    let c1 = env.head();
+    verify(&["--ref", "chg/verified/master"]);
+    let c2 = env.commit("lib/a.ex", "two\n");
+    verify(&["--ref", "chg/verified/master"]);
+    env.git(&["checkout", "-q", "-b", "epic/billing"]);
+    env.commit("lib/e.ex", "e1\n");
+    env.commit("lib/e.ex", "e2\n");
+    let e3 = env.commit("lib/e.ex", "e3\n");
+    verify(&["--ref", "chg/verified/epic/billing"]);
+    // c1 and c2 are behind e3 and past its reach, but master still reaches both.
+    assert_eq!(
+        remote_records(),
+        sorted(vec![c1.clone(), c2.clone(), e3.clone()])
+    );
+
+    // The epic merges into master but its line is still in use: its stories still look up
+    // e3's record, so master's next publish keeps it and prunes only c1, which no line
+    // reaches any more.
+    env.git(&["checkout", "-q", "master"]);
+    env.git(&["merge", "-q", "--no-ff", "-m", "merge epic", "epic/billing"]);
+    let m = env.head();
+    verify(&["--ref", "chg/verified/master"]);
+    assert_eq!(remote_records(), sorted(vec![c2, e3, m]));
+}
+
+/// An epic that merges master in contains master's tip, but master is not finished: the
+/// epic's publish must keep master's newest records.
+#[test]
+fn an_epic_that_merges_master_in_keeps_masters_newest_records() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    let verify = |args: &[&str]| {
+        let out = env
+            .chg()
+            .env("CHG_COVER_MAX_AGE", "1")
+            .arg("verify")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(json(&out)["cover"], "published", "{}", json(&out));
+    };
+    let remote_records = || {
+        let out = Std::new("git")
+            .arg("--git-dir")
+            .arg(&env.remote)
+            .args([
+                "for-each-ref",
+                "--format=%(refname:lstrip=3)",
+                "refs/chg/cover/",
+            ])
+            .output()
+            .unwrap();
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+        v.sort();
+        v
+    };
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    let c1 = env.head();
+    verify(&["--ref", "chg/verified/master"]);
+    env.git(&["checkout", "-q", "-b", "epic/billing"]);
+    let e1 = env.commit("lib/e.ex", "e1\n");
+    verify(&["--ref", "chg/verified/epic/billing"]);
+    env.git(&["checkout", "-q", "master"]);
+    env.commit("lib/a.ex", "two\n");
+    let c3 = env.commit("lib/a.ex", "three\n");
+    verify(&["--ref", "chg/verified/master"]);
+    let c4 = env.commit("lib/a.ex", "four\n");
+    verify(&["--ref", "chg/verified/master"]);
+    // c1 is past master's reach of 1 but still the epic's (e1, c1).
+    assert_eq!(
+        remote_records(),
+        sorted(vec![c1.clone(), e1.clone(), c3.clone(), c4.clone()])
+    );
+
+    // The epic syncs master in: x = merge(e1, c4). Its reach is x and e1; master's is c4
+    // and c3, and master's line is as live as before.
+    env.git(&["checkout", "-q", "epic/billing"]);
+    env.git(&["merge", "-q", "--no-ff", "-m", "sync master", "master"]);
+    let x = env.head();
+    verify(&["--ref", "chg/verified/epic/billing"]);
+    assert_eq!(remote_records(), sorted(vec![e1, c3, c4, x]));
 }
