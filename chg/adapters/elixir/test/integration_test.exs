@@ -47,9 +47,14 @@ defmodule ChgAdapter.IntegrationTest do
     %{dir: dir, root: root, archives: archives, base: git!(dir, ["rev-parse", "HEAD"])}
   end
 
+  # The machine's git config stays out of the fixture's repos, for this test's git calls
+  # and every git a task runs: a global core.hooksPath would run the developer's own
+  # pre-commit hook on the fixture's commits.
+  @isolated_git [{"GIT_CONFIG_GLOBAL", "/dev/null"}, {"GIT_CONFIG_NOSYSTEM", "1"}]
+
   defp sh(cmd, args, dir, env) do
     # The parent `mix test` exports MIX_ENV=test; the child must choose its own.
-    env = [{"MIX_ENV", nil}, {"MIX_BUILD_PATH", nil} | env]
+    env = [{"MIX_ENV", nil}, {"MIX_BUILD_PATH", nil} | @isolated_git] ++ env
     System.cmd(cmd, args, cd: dir, env: env, stderr_to_stdout: false)
   end
 
@@ -59,6 +64,7 @@ defmodule ChgAdapter.IntegrationTest do
         "git",
         ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" | args],
         cd: dir,
+        env: @isolated_git,
         stderr_to_stdout: true
       )
 
@@ -377,7 +383,7 @@ defmodule ChgAdapter.IntegrationTest do
         run = fn ->
           {out, 0} =
             System.cmd(bin, ["adapter", "exec", "affected", "--base", "HEAD", "--repo", ctx.dir],
-              env: [{"MIX_ENV", nil}, {"MIX_ARCHIVES", ctx.archives}]
+              env: [{"MIX_ENV", nil}, {"MIX_ARCHIVES", ctx.archives} | @isolated_git]
             )
 
           JSON.decode!(out)
@@ -385,7 +391,7 @@ defmodule ChgAdapter.IntegrationTest do
 
         assert {_, 0} =
                  System.cmd(bin, ["adapter", "exec", "snapshot", "--repo", ctx.dir],
-                   env: [{"MIX_ENV", nil}, {"MIX_ARCHIVES", ctx.archives}]
+                   env: [{"MIX_ENV", nil}, {"MIX_ARCHIVES", ctx.archives} | @isolated_git]
                  )
 
         edit!(ctx, "lib/sample/reports.ex", &(&1 <> "\n"))

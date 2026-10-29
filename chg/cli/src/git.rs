@@ -404,7 +404,10 @@ mod tests {
                 "one",
             ][..],
         ] {
+            // The machine's git config (a global core.hooksPath) stays out of the test repo.
             let ok = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .arg("-C")
                 .arg(t.path())
                 .args(args)

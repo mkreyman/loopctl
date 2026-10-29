@@ -13,6 +13,14 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The machine's git config stays out of the fixture repos, for the tests' own git calls
+/// and every git `chg` runs: a global `core.hooksPath` would run the developer's hooks on
+/// the fixtures' commits and pushes.
+const GIT_ISOLATED: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
 /// Clone-capable on macOS (APFS); on Linux only under `CHG_TEST_REFLINK_DIR`.
 fn cow_tempdir() -> Option<TempDir> {
     if cfg!(target_os = "macos") {
@@ -106,6 +114,7 @@ impl Env {
 
     fn git(&self, args: &[&str]) -> String {
         let out = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("-C")
             .arg(&self.repo)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -134,7 +143,8 @@ impl Env {
 
     fn chg(&self) -> Command {
         let mut c = Command::cargo_bin("chg").unwrap();
-        c.current_dir(&self.repo)
+        c.envs(GIT_ISOLATED)
+            .current_dir(&self.repo)
             .env("CHG_HOME", &self.home)
             .env("CHG_STORE", &self.store)
             .env("CALLS", &self.calls)
@@ -428,6 +438,7 @@ fn a_gate_mode_check_judges_the_commit_where_snapshots_are_built() {
     let next = env.commit("lib/c.ex", "c\n");
     fs::remove_file(&env.calls).unwrap();
     let mut build = Std::new(assert_cmd::cargo::cargo_bin("chg"))
+        .envs(GIT_ISOLATED)
         .current_dir(&env.repo)
         .env("CHG_HOME", &env.home)
         .env("CHG_STORE", &env.store)
@@ -506,6 +517,7 @@ fn shadow_never_fails_the_push() {
     let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("chg")
         .unwrap()
+        .envs(GIT_ISOLATED)
         .current_dir(dir.path())
         .env("CHG_HOME", dir.path().join("h"))
         .args(["check", "--shadow"])
@@ -709,6 +721,7 @@ fn after_its_row_a_shadow_builds_the_snapshot_of_its_base_from_an_older_one() {
     // Output to null, not captured: a captured pipe would be held open by the detached
     // refresh, and reading it to EOF would wait for the refresh to finish.
     let status = c
+        .envs(GIT_ISOLATED)
         .current_dir(&env.repo)
         .env("CHG_HOME", &env.home)
         .env("CHG_STORE", &env.store)

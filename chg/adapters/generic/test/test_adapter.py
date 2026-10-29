@@ -55,6 +55,11 @@ run      = "python3 {adapter} run --tests {{file}} --runner 'sh bin/runner.sh' -
 shard    = "python3 {adapter} shard --of {{n}} --index {{i}} --runner 'sh bin/runner.sh' --suite-dir tests --suite-glob '*-canary.sh'"
 """
 
+# The machine's git config stays out of the fixture repos, for these tests' git calls and
+# every git the adapter and chg run: a global core.hooksPath would run the developer's own
+# hooks on the fixture's commits, and a global commit.gpgsign would sign them.
+os.environ.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+
 
 class GenericAdapter(unittest.TestCase):
     def setUp(self):

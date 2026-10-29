@@ -10,6 +10,14 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The machine's git config stays out of the fixture repos, for the tests' own git calls
+/// and every git `chg` runs: a global `core.hooksPath` would run the developer's hooks on
+/// the fixtures' commits and pushes.
+const GIT_ISOLATED: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
 /// A temp dir that supports cloning: APFS on macOS; on Linux only where
 /// `CHG_TEST_REFLINK_DIR` points (CI mounts an XFS loop image there).
 fn cow_tempdir() -> Option<TempDir> {
@@ -121,6 +129,7 @@ impl Env {
 
     fn git(&self, args: &[&str]) -> String {
         let out = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("-C")
             .arg(&self.repo)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -149,7 +158,9 @@ impl Env {
 
     fn chg(&self) -> Command {
         let mut c = Command::cargo_bin("chg").unwrap();
-        c.env("CHG_STORE", &self.store).env("SNAP_LOG", &self.log);
+        c.envs(GIT_ISOLATED)
+            .env("CHG_STORE", &self.store)
+            .env("SNAP_LOG", &self.log);
         c
     }
 
@@ -197,6 +208,7 @@ impl Env {
     fn cold_worktree(&self, name: &str, rev: &str) -> PathBuf {
         let path = self.root.join(name);
         let st = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("-C")
             .arg(&self.repo)
             .args(["worktree", "add", "-q", "--detach"])
@@ -211,6 +223,7 @@ impl Env {
 
     fn git_in(&self, dir: &Path, args: &[&str]) -> String {
         let out = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -463,6 +476,7 @@ fn concurrent_builds_take_turns() {
     let two = e.commit("two", |r| fs::write(r.join("src/version"), "2\n").unwrap());
     let spawn = |sha: &str| {
         Std::new(assert_cmd::cargo::cargo_bin("chg"))
+            .envs(GIT_ISOLATED)
             .args(["snapshot", "build"])
             .arg(&e.repo)
             .arg(sha)
@@ -621,6 +635,7 @@ fn a_failed_move_rolls_back_every_artifact() {
     });
     let ws = e.root.join("ws");
     Std::new("git")
+        .envs(GIT_ISOLATED)
         .arg("-C")
         .arg(&e.repo)
         .args([

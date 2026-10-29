@@ -30,6 +30,8 @@ defmodule ChgAdapter.HeadTest do
           "git",
           ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" | args],
           cd: repo,
+          # The machine's git config (a global core.hooksPath) stays out of the test repo.
+          env: [{"GIT_CONFIG_GLOBAL", "/dev/null"}, {"GIT_CONFIG_NOSYSTEM", "1"}],
           stderr_to_stdout: true
         )
 

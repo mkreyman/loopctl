@@ -13,6 +13,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ADAPTER = join(HERE, "..", "chg-adapter.mjs");
 const FIXTURE = join(HERE, "..", "fixtures", "sample");
 const CHG_BIN = process.env.CHG_BIN;
+// The machine's git config stays out of the fixture repos, for this test's git calls and
+// every git the adapter and chg run: a global core.hooksPath would run the developer's own
+// hooks on the fixture's commits.
+Object.assign(process.env, { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" });
 const roots = [];
 let dir;
 

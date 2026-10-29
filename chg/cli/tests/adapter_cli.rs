@@ -6,6 +6,14 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// The machine's git config stays out of the fixture repos, for the tests' own git calls
+/// and every git `chg` runs: a global `core.hooksPath` would run the developer's hooks on
+/// the fixtures' commits and pushes.
+const GIT_ISOLATED: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
 const KINDS: [&str; 2] = ["elixir", "pnpm"];
 
 /// Copies a fixture into a temp dir so tests can edit it freely.
@@ -23,6 +31,7 @@ fn fixture(kind: &str) -> TempDir {
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = std::process::Command::new("git")
+        .envs(GIT_ISOLATED)
         .args([
             "-c",
             "user.name=t",
@@ -54,7 +63,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn chg() -> Command {
-    Command::cargo_bin("chg").unwrap()
+    let mut c = Command::cargo_bin("chg").unwrap();
+    c.envs(GIT_ISOLATED);
+    c
 }
 
 fn exec(repo: &Path, args: &[&str]) -> Command {
@@ -247,6 +258,7 @@ fn committed_and_deleted_always_all_paths_count_too() {
     let repo = fixture("elixir");
     let base = String::from_utf8(
         std::process::Command::new("git")
+            .envs(GIT_ISOLATED)
             .args(["-C"])
             .arg(repo.path())
             .args(["rev-parse", "HEAD"])

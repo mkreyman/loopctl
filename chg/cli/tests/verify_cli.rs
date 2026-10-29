@@ -10,6 +10,14 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The machine's git config stays out of the fixture repos, for the tests' own git calls
+/// and every git `chg` runs: a global `core.hooksPath` would run the developer's hooks on
+/// the fixtures' commits and pushes.
+const GIT_ISOLATED: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
 /// Clone-capable on macOS (APFS); on Linux only under `CHG_TEST_REFLINK_DIR`.
 fn cow_tempdir() -> Option<TempDir> {
     if cfg!(target_os = "macos") {
@@ -143,6 +151,7 @@ impl Env {
             _t: dir,
         };
         Std::new("git")
+            .envs(GIT_ISOLATED)
             .args(["init", "-q", "--bare", "-b", "master"])
             .arg(&env.remote)
             .status()
@@ -162,6 +171,7 @@ impl Env {
 
     fn git(&self, args: &[&str]) -> String {
         let out = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("-C")
             .arg(&self.repo)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -192,6 +202,7 @@ impl Env {
 
     fn remote_ref(&self, name: &str) -> Option<String> {
         let out = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("--git-dir")
             .arg(&self.remote)
             .args(["rev-parse", "-q", "--verify", &format!("refs/heads/{name}")])
@@ -204,7 +215,8 @@ impl Env {
 
     fn chg(&self) -> Command {
         let mut c = Command::cargo_bin("chg").unwrap();
-        c.current_dir(&self.repo)
+        c.envs(GIT_ISOLATED)
+            .current_dir(&self.repo)
             .env("CHG_HOME", self.root.join("chg-home"))
             .env("CHG_STORE", self.root.join("store"))
             .env("CHG_GH", self.root.join("gh.sh"))
@@ -777,6 +789,7 @@ fn coverage_records_travel_from_the_verifier_to_other_machines() {
     env.git(&["push", "-q", "origin", "master"]);
     let other = env.root.join("other");
     let st = Std::new("git")
+        .envs(GIT_ISOLATED)
         .args(["clone", "-q"])
         .arg(&env.remote)
         .arg(&other)
@@ -881,6 +894,7 @@ fn coverage_records_travel_from_the_verifier_to_other_machines() {
             .any(|p| p.ends_with(format!("{c2}.cover")))
     );
     let remote_refs = Std::new("git")
+        .envs(GIT_ISOLATED)
         .arg("--git-dir")
         .arg(&env.remote)
         .args(["for-each-ref", "--format=%(refname)", "refs/chg/cover/"])
@@ -1104,6 +1118,7 @@ fn publishing_prunes_only_this_lines_old_records() {
     };
     let remote_records = || {
         let out = Std::new("git")
+            .envs(GIT_ISOLATED)
             .arg("--git-dir")
             .arg(&env.remote)
             .args([
