@@ -15,7 +15,8 @@ defmodule Mix.Tasks.Chg.Affected do
   Prints `{"mode":"subset","reason":…,"tests":[…]}` (with `"read":true` when `CHG_READ`
   is set), or `{"mode":"all","reason":…}` when the selection cannot be trusted: no cache,
   an unreadable compile manifest, a deleted source the cache does not know, a change to a
-  module every test runs, or a path in `CHG_READ` with no record to say which tests read
+  module every test runs, a change under a path dependency or umbrella sibling in the
+  project (whose modules nothing records), or a path in `CHG_READ` with no record to say which tests read
   it, or read outside any one test file. `always_all` is applied by `chg adapter exec affected`
   before this task runs; called directly, this task does not apply it.
   """
@@ -35,6 +36,7 @@ defmodule Mix.Tasks.Chg.Affected do
 
     doc =
       with {:ok, changed} <- ChgAdapter.changed_paths(base),
+           :ok <- ChgAdapter.path_dep_change(base),
            {:ok, graph} <- Graph.read() do
         case by_coverage(base, changed, graph) do
           {:error, why} -> by_graph(changed, graph, why)
@@ -48,7 +50,8 @@ defmodule Mix.Tasks.Chg.Affected do
   # Coverage selection when `chg` handed over a usable record.
   defp by_coverage(base, changed, graph) do
     with {:ok, record} <- Record.given(base),
-         {:ok, since} <- ChgAdapter.changed_paths(record.sha) do
+         {:ok, since} <- ChgAdapter.changed_paths(record.sha),
+         :ok <- ChgAdapter.path_dep_change(record.sha) do
       modules = graph.source_modules |> Map.values() |> List.flatten() |> Enum.uniq()
 
       Select.by_coverage(%{
@@ -74,7 +77,8 @@ defmodule Mix.Tasks.Chg.Affected do
   # The module graph's selection: what `mix test --stale` would run.
   defp by_graph(changed, graph, no_coverage) do
     with {:ok, refs} <- Refs.read(),
-         {:ok, since} <- ChgAdapter.changed_paths(refs.sha) do
+         {:ok, since} <- ChgAdapter.changed_paths(refs.sha),
+         :ok <- ChgAdapter.path_dep_change(refs.sha) do
       case Select.run(%{
              changed: changed,
              since_snapshot: since,

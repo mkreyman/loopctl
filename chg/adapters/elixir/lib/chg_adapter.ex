@@ -178,6 +178,47 @@ defmodule ChgAdapter do
   end
 
   @doc """
+  `{:all, reason}` when a file changed since `rev` (committed, in the working tree, or
+  untracked) under a path dependency or umbrella sibling inside the repository
+  (`Mix.SCM.Path`), else `:ok`; the reason names the file relative to the repository. Such a dependency's modules are in no coverage record digest
+  and no module graph, so no selection accounts for a change to them. Its directory may lie
+  outside the project (an umbrella child's `../sibling`), so this asks git about that
+  directory, not the project-relative `changed_paths/1`.
+  """
+  def path_dep_change(rev) do
+    # The top from the working directory, as Mix's paths are: --show-toplevel resolves
+    # symlinks (macOS /var is /private/var), and every dependency would look outside it.
+    with {:ok, sha} <- resolve(rev),
+         {:ok, cdup} <- git_z(["rev-parse", "--show-cdup"]) do
+      top = Path.expand(cdup |> Enum.join() |> String.trim(), File.cwd!())
+      scms = Mix.Project.deps_scms()
+
+      Mix.Project.deps_paths()
+      |> Enum.filter(fn {dep, _} -> scms[dep] == Mix.SCM.Path end)
+      |> Enum.map(fn {dep, path} -> {dep, Path.relative_to(Path.expand(path), top)} end)
+      |> Enum.filter(fn {_, dir} -> Path.type(dir) == :relative and dir != "." end)
+      |> Enum.find_value(:ok, &dep_changed(&1, sha))
+    end
+  end
+
+  defp dep_changed({dep, dir}, sha) do
+    spec = ":(top)" <> dir
+
+    with {:ok, diff} <- git_z(["diff", "--no-renames", "--name-only", "-z", sha, "--", spec]),
+         {:ok, new} <- git_z(["ls-files", "--others", "--exclude-standard", "-z", "--", spec]) do
+      case diff ++ new do
+        [] ->
+          nil
+
+        [p | _] ->
+          {:all,
+           "#{p} is in the path dependency " <>
+             "#{dep} (#{dir}/), whose modules no coverage record or module graph covers"}
+      end
+    end
+  end
+
+  @doc """
   The changed paths `chg` found matching the manifest's `read_at_runtime`, one per line in
   `CHG_READ`: since the base, and since the coverage record when it hands one over.
   """

@@ -355,18 +355,29 @@ defmodule ChgAdapter.IntegrationTest do
              chg(ctx, ["chg.affected", "--base", "HEAD"], env)
 
     edit!(ctx, "lib/sample/scanned.ex", &String.replace(&1, ":denied", ":allowed"))
-    # A path dependency's source, named by read_at_runtime, selects the test that read
-    # its build (and files_test, whose subprocess may read anything).
+    # A path dependency's modules are in no record: a change under it runs everything,
+    # named by read_at_runtime or not, with coverage or from the module graph.
     edit!(ctx, "apps/shared/lib/shared.ex", &String.replace(&1, ":shared", ":changed"))
     read_shared = [{"CHG_READ", "apps/shared/lib/shared.ex"}]
 
-    assert {%{"mode" => "subset", "tests" => tests}, 0} =
-             chg(ctx, ["chg.affected", "--base", "HEAD"], env ++ read_shared)
+    for extra <- [[], read_shared], given <- [env, []] do
+      assert {%{"mode" => "all", "reason" => reason}, 0} =
+               chg(ctx, ["chg.affected", "--base", "HEAD"], given ++ extra)
 
-    assert "test/sample/shared_reads_test.exs" in tests
-    refute "test/sample/build_reads_test.exs" in tests
+      assert reason =~ "apps/shared/lib/shared.ex is in the path dependency shared (apps/shared/)"
+    end
 
-    edit!(ctx, "apps/shared/lib/shared.ex", &String.replace(&1, ":changed", ":shared"))
+    # Committed since the record (and the snapshot), with nothing changed since the base.
+    git!(ctx.dir, ["commit", "-qam", "shared"])
+
+    for given <- [env, []] do
+      assert {%{"mode" => "all", "reason" => reason}, 0} =
+               chg(ctx, ["chg.affected", "--base", "HEAD"], given)
+
+      assert reason =~ "in the path dependency shared"
+    end
+
+    git!(ctx.dir, ["reset", "-q", "--hard", "HEAD~1"])
     read_priv = [{"CHG_READ", "priv/greeting.txt"}]
 
     assert {%{"mode" => "subset", "tests" => tests}, 0} =
@@ -422,6 +433,39 @@ defmodule ChgAdapter.IntegrationTest do
     assert "priv/greeting.txt" in rec.reads[built]
     assert "apps/shared/" in rec.reads[shared]
     assert "apps/shared/priv/note.txt" in rec.reads[shared]
+  end
+
+  test "a change to an umbrella sibling outside the project selects every test", ctx do
+    # The project as an umbrella child (apps/sample) whose sibling is apps/shared: the
+    # sibling is outside the project's directory but inside the repository.
+    umbrella = Path.join(ctx.root, "umbrella-#{System.unique_integer([:positive])}")
+    project = Path.join(umbrella, "apps/sample")
+    File.mkdir_p!(Path.join(umbrella, "apps"))
+    File.cp_r!(ctx.dir, project)
+    File.rm_rf!(Path.join(project, ".git"))
+    File.rename!(Path.join(project, "apps/shared"), Path.join(umbrella, "apps/shared"))
+    File.rm_rf!(Path.join(project, "apps"))
+
+    edit!(
+      %{dir: project},
+      "mix.exs",
+      &String.replace(&1, ~s(path: "apps/shared"), ~s(path: "../shared"))
+    )
+
+    git!(umbrella, ["init", "-q"])
+    git!(umbrella, ["add", "apps"])
+    git!(umbrella, ["commit", "-qm", "umbrella"])
+
+    edit!(
+      %{dir: umbrella},
+      "apps/shared/lib/shared.ex",
+      &String.replace(&1, ":shared", ":changed")
+    )
+
+    assert {%{"mode" => "all", "reason" => reason}, 0} =
+             chg(%{ctx | dir: project}, ["chg.affected", "--base", "HEAD"])
+
+    assert reason =~ "apps/shared/lib/shared.ex is in the path dependency shared (apps/shared/)"
   end
 
   describe "through chg" do

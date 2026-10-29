@@ -75,7 +75,12 @@ recorded references (new, or it does not compile without `test_helper.exs`), or 
 compile or runtime reference to an affected module (the two `--stale` matches on). A changed path maps to modules through the sources that define
 them, the sources that read it as an `@external_resource`, and, for a deleted source, the
 snapshot's record of what it defined. A deleted source the snapshot does not know selects every
-test. `always_all` is applied by `chg` before the adapter runs.
+test. So does a change under a path dependency or umbrella sibling in the repository (`path:`
+or `in_umbrella:` in `deps`, inside the project or beside it), whether since the base, the
+snapshot or the coverage record: its modules are in neither the module graph nor a record, and
+the reason names the path. At an umbrella root, where every app is such a dependency, any change
+to an app selects everything. `always_all`
+is applied by `chg` before the adapter runs.
 
 ## Coverage selection
 
@@ -100,8 +105,9 @@ A read under the build (`Mix.Project.build_path/0`, so `build_path` and `MIX_BUI
 count) is recorded as what it was compiled from. A project module's beam (a guard test
 scanning compiled code) counts as executing that module. A file under the app's built `priv`
 (`:code.priv_dir/1`) is a read of `priv/<path>`. A path dependency's build in the repo is a
-read of its directory (its `priv` of the same path under it); a fetched dependency's is a read
-of `mix.lock`. Anything else there (a path dependency outside the repo, another `_build` env, consolidated protocols, the `.app` file, the
+read of its directory (its `priv` of the same path under it), recorded for when its modules are
+digested: today any change there selects everything first (above). A fetched dependency's is a
+read of `mix.lock`. Anything else there (a path dependency outside the repo, another `_build` env, consolidated protocols, the `.app` file, the
 manifests) leaves the test file out of the coverage, so selection always runs it. The record also holds
 `ChgAdapter.Digest` of every module, and each test file's time. Tracing costs about 11% of
 the suite's time: HomeCareBilling's whole suite on minis at 1191e0fe6 (2026-10-19) ran in 658 s
