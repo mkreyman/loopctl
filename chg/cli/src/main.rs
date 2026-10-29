@@ -49,7 +49,9 @@ enum Top {
         command: HookCmd,
     },
     /// Static checks plus the affected tests of a commit against its base, run where the
-    /// repo's snapshots are built (under its build lock), else in the live tree. Exit 0 pass, 1 fail, 2 no verdict (the adapter broke the contract), 3 the gate is
+    /// repo's snapshots are built (under its build lock), else in the live tree. When chg
+    /// is the gate (`chg gate` says `on`), the verdict is also appended to
+    /// ~/.chg/shadow/<repo>.jsonl with `source: gate`, for `chg shadow report`. Exit 0 pass, 1 fail, 2 no verdict (the adapter broke the contract), 3 the gate is
     /// off (`CHG_GATE=off` or `.chg/policy.toml`): run the repo's old gate instead.
     /// Prints the verdict as one JSON line.
     Check {
@@ -249,7 +251,10 @@ enum ShadowCmd {
         source: String,
     },
     /// Pair chg's verdicts with the gate's by commit: disagreements, time saved, and the
-    /// cutover criteria. Exit 0 when every criterion is met, 1 when not.
+    /// cutover criteria. Gate-mode `chg check` verdicts (logged with `source: gate` once
+    /// `chg check` is the gate) are summarised per host: count, pass/fail, the subset
+    /// share, median and p90 time, and the top reasons the whole suite ran. Exit 0 when
+    /// every criterion is met, 1 when not.
     Report {
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -839,53 +844,22 @@ fn check_cmd(repo: &Path, base: Option<String>, sha: Option<String>, all: bool) 
         );
         return ExitCode::from(3);
     }
-    let pinned = match sha.as_deref().map(|s| git::resolve(repo, s)).transpose() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("chg: {e}");
-            return ExitCode::from(2);
+    let started = std::time::Instant::now();
+    // Every outcome, a commit or base that cannot be resolved included, ends in one
+    // verdict, so the one exit path below logs every push this gate judged or blocked.
+    let (sha, base, mut v) = gate_verdict(repo, base, sha, all);
+    // What the push waited for: the worktree and hydrate of a check at the build path,
+    // or what was spent there before falling back to the live tree.
+    v.ms = started.elapsed().as_millis() as u64;
+    // chg is the gate here, so no `chg shadow record` follows: the verdict is logged by the
+    // check itself. A log that cannot be written never changes the verdict.
+    if mode.mode == Mode::On {
+        let key = git::repo_key(repo);
+        let row = shadow::Row::from_gate_check(&key, &sha, &base, v.clone());
+        if let Err(e) = shadow::append(&shadow::log_path(&key), &row) {
+            eprintln!("chg: the verdict was not logged: {e}");
         }
-    };
-    let base = match base_for(repo, base, pinned.as_deref().unwrap_or("HEAD")) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("chg: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let sha = match pinned
-        .clone()
-        .map_or_else(|| git::resolve(repo, "HEAD"), Ok)
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("chg: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let v = match gate_at_build(repo, &sha, &base, all) {
-        Some(v) => v,
-        None => {
-            // A gate asked to judge a commit must judge that commit, not whatever the
-            // tree holds.
-            if let Some(sha) = &pinned
-                && let Err(e) = git::is_exactly(repo, sha)
-            {
-                eprintln!("chg: no verdict for {sha}: {e}");
-                return ExitCode::from(2);
-            }
-            let mut v = check::run(repo, &base, all);
-            if let Some(sha) = &pinned
-                && let Err(e) = git::is_exactly(repo, sha)
-            {
-                v = Verdict {
-                    ms: v.ms,
-                    ..Verdict::error(format!("the tree moved while the check ran: {e}"))
-                };
-            }
-            v
-        }
-    };
+    }
     println!("{}", serde_json::to_string(&v).expect("verdicts serialize"));
     let selected = match v.mode.as_deref() {
         Some("all") => "the whole suite".to_string(),
@@ -908,6 +882,56 @@ fn check_cmd(repo: &Path, base: Option<String>, sha: Option<String>, all: bool) 
     }
 }
 
+/// The commit a gate judges, its base, and the verdict. A commit or base that cannot be
+/// resolved, or a pinned commit the live tree does not hold, is an error verdict with
+/// whatever of the two is known (empty when not).
+fn gate_verdict(
+    repo: &Path,
+    base: Option<String>,
+    sha: Option<String>,
+    all: bool,
+) -> (String, String, Verdict) {
+    let pinned = match sha.as_deref().map(|s| git::resolve(repo, s)).transpose() {
+        Ok(p) => p,
+        Err(e) => return (sha.unwrap_or_default(), String::new(), Verdict::error(e)),
+    };
+    let sha = match pinned
+        .clone()
+        .map_or_else(|| git::resolve(repo, "HEAD"), Ok)
+    {
+        Ok(s) => s,
+        Err(e) => return (String::new(), String::new(), Verdict::error(e)),
+    };
+    let base = match base_for(repo, base, &sha) {
+        Ok(b) => b,
+        Err(e) => return (sha, String::new(), Verdict::error(e)),
+    };
+    let v = match gate_at_build(repo, &sha, &base, all) {
+        Some(v) => v,
+        None => {
+            // A gate asked to judge a commit must judge that commit, not whatever the
+            // tree holds.
+            if pinned.is_some()
+                && let Err(e) = git::is_exactly(repo, &sha)
+            {
+                let why = format!("no verdict for {sha}: {e}");
+                return (sha, base, Verdict::error(why));
+            }
+            let mut v = check::run(repo, &base, all);
+            if pinned.is_some()
+                && let Err(e) = git::is_exactly(repo, &sha)
+            {
+                v = Verdict {
+                    ms: v.ms,
+                    ..Verdict::error(format!("the tree moved while the check ran: {e}"))
+                };
+            }
+            v
+        }
+    };
+    (sha, base, v)
+}
+
 /// Checks the commit `sha` where snapshots are built, under the build lock, as a shadow
 /// check does: a check in the pushing worktree recompiles what the snapshot baked in at
 /// another path (on HCB, 933 of 945 files). `None` when that cannot run, and the caller
@@ -916,7 +940,6 @@ fn check_cmd(repo: &Path, base: Option<String>, sha: Option<String>, all: bool) 
 /// fails. A busy path never makes the gate wait: a snapshot build there can take as long
 /// as a PLT build, and another worktree's gate holds it for a whole check.
 fn gate_at_build(repo: &Path, sha: &str, base: &str, all: bool) -> Option<Verdict> {
-    let started = std::time::Instant::now();
     let fallback = |why: String| {
         eprintln!("chg: checking the live tree: {why}");
         None
@@ -936,7 +959,7 @@ fn gate_at_build(repo: &Path, sha: &str, base: &str, all: bool) -> Option<Verdic
         }
         Err(e) => return fallback(format!("build lock: {e}")),
     };
-    let mut v = match scratch::check_at_build(&git_dir, &store, sha, base, all) {
+    let v = match scratch::check_at_build(&git_dir, &store, sha, base, all) {
         AtBuild::Checked { verdict, .. } => verdict,
         AtBuild::NoSnapshot { .. } => {
             return fallback(format!("no snapshot is an ancestor of {sha}"));
@@ -944,8 +967,6 @@ fn gate_at_build(repo: &Path, sha: &str, base: &str, all: bool) -> Option<Verdic
         AtBuild::Failed { why, .. } => return fallback(why),
     };
     drop(lock);
-    // What the push waited for, the worktree and its hydrate included.
-    v.ms = started.elapsed().as_millis() as u64;
     // As after a shadow check: the next push starts from a snapshot of this base.
     shadow::refresh(repo, base, true);
     Some(v)

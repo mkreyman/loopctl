@@ -63,6 +63,9 @@ pub const MIN_MACHINES: usize = 3;
 
 /// The `source` of a chg row that judged a past commit, not a push.
 pub const REPLAY: &str = "replay";
+/// The `source` of a chg row from a gate-mode `chg check`: chg was the gate, so no other
+/// gate's verdict pairs with it, and the report summarises these rows on their own.
+pub const GATE_CHECK: &str = "gate";
 
 /// One line of the shadow log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +92,9 @@ pub struct Row {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<Vec<String>>,
+    /// Why selection chose what it did (`Verdict::selection`); for `all`, the widening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydrate_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,8 +107,8 @@ pub struct Row {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
     /// Gate rows: `local` (the hook ran it) or `ci` (read from a GitHub check run). chg
-    /// rows: `replay` for a check of a past commit (`chg check --shadow --replay`), absent
-    /// for a push's.
+    /// rows: `replay` for a check of a past commit (`chg check --shadow --replay`), `gate`
+    /// for a gate-mode `chg check`, absent for a shadow check of a push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -123,6 +129,7 @@ impl Row {
             base: None,
             mode: None,
             selected: None,
+            selection: None,
             hydrate_ms: None,
             static_ms: None,
             affected_ms: None,
@@ -140,11 +147,21 @@ impl Row {
             base: Some(base.into()),
             selected: v.mode.as_deref().map(|_| v.selected),
             mode: v.mode,
+            selection: v.selection,
             hydrate_ms: Some(hydrate_ms),
             static_ms: Some(v.static_ms),
             affected_ms: Some(v.affected_ms),
             tests_ms: Some(v.tests_ms),
             ..Row::new("chg", repo, sha, v.verdict)
+        }
+    }
+
+    /// A gate-mode `chg check`'s verdict. Its `ms` is what the push waited for.
+    pub fn from_gate_check(repo: &str, sha: &str, base: &str, v: Verdict) -> Row {
+        Row {
+            hydrate_ms: None,
+            source: Some(GATE_CHECK.into()),
+            ..Row::from_check(repo, sha, base, 0, v)
         }
     }
 
@@ -170,6 +187,11 @@ impl Row {
 impl Row {
     fn is_ci(&self) -> bool {
         self.source.as_deref() == Some(CI_SOURCE)
+    }
+
+    /// A chg row from a shadow check, a push's or a replay's: not a gate-mode check.
+    fn is_shadow(&self) -> bool {
+        self.kind == "chg" && self.source.as_deref() != Some(GATE_CHECK)
     }
 }
 
@@ -547,6 +569,113 @@ pub struct Report {
     pub disagreements: Vec<Pair>,
     pub criteria: Vec<Criterion>,
     pub ready: bool,
+    /// Gate-mode `chg check` verdicts, per host and then for all hosts together.
+    pub gate_mode: Vec<GateHost>,
+}
+
+/// What gate-mode checks did on one host (`host` "all": every host together).
+#[derive(Debug, Clone, Serialize)]
+pub struct GateHost {
+    pub host: String,
+    pub checks: usize,
+    pub pass: usize,
+    pub fail: usize,
+    /// No verdict: the adapter broke the contract or the check could not run.
+    pub error: usize,
+    /// Checks that ran a subset, not the whole suite.
+    pub subset: usize,
+    pub median_ms: Option<u64>,
+    pub p90_ms: Option<u64>,
+    /// Why the whole suite ran, most frequent first (at most `TOP_WIDENING`), as
+    /// `widening_key` groups them.
+    pub widening: Vec<(String, usize)>,
+}
+
+/// How many widening reasons the report lists per host.
+pub const TOP_WIDENING: usize = 5;
+
+/// A widening reason without what varies per push, so the same cause counts once: the
+/// glob of an `always_all` hit (not the path), and shas.
+pub fn widening_key(reason: &str) -> String {
+    if let Some(i) = reason.find("matches always_all `") {
+        return reason[i + "matches ".len()..].to_string();
+    }
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in reason.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        out.push_str(if is_sha(&word) { "<sha>" } else { &word });
+        word.clear();
+        out.push(c);
+    }
+    out.pop();
+    out
+}
+
+/// A whole word that reads as an abbreviated or full sha: 7 to 40 lowercase hex digits
+/// with both a digit and a letter, so neither a number ("1200000") nor a word is one.
+fn is_sha(w: &str) -> bool {
+    (7..=40).contains(&w.len())
+        && w.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        && w.chars().any(|c| c.is_ascii_digit())
+        && w.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// The nearest-rank `p` percentile (0 < p <= 100).
+fn percentile_ms(mut v: Vec<u64>, p: usize) -> Option<u64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let rank = (p * v.len()).div_ceil(100).max(1);
+    Some(v[rank - 1])
+}
+
+fn gate_host(host: &str, rows: &[&Row]) -> GateHost {
+    let n = |o: Outcome| rows.iter().filter(|r| r.verdict == o).count();
+    let mut widening: BTreeMap<String, usize> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.mode.as_deref() == Some("all")) {
+        let why = r.selection.as_deref().unwrap_or(&r.reason);
+        *widening.entry(widening_key(why)).or_default() += 1;
+    }
+    let mut widening: Vec<(String, usize)> = widening.into_iter().collect();
+    widening.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    widening.truncate(TOP_WIDENING);
+    let ms: Vec<u64> = rows.iter().map(|r| r.ms).collect();
+    GateHost {
+        host: host.into(),
+        checks: rows.len(),
+        pass: n(Outcome::Pass),
+        fail: n(Outcome::Fail),
+        error: n(Outcome::Error),
+        subset: rows
+            .iter()
+            .filter(|r| r.mode.as_deref() == Some("subset"))
+            .count(),
+        median_ms: median_ms(ms.iter().copied()),
+        p90_ms: percentile_ms(ms, 90),
+        widening,
+    }
+}
+
+/// Gate-mode checks per host, then all hosts together when there is more than one.
+pub fn gate_mode(repo: &str, rows: &[Row]) -> Vec<GateHost> {
+    let mut by_host: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+    for r in rows
+        .iter()
+        .filter(|r| r.kind == "chg" && r.repo == repo && r.source.as_deref() == Some(GATE_CHECK))
+    {
+        by_host.entry(r.host.as_str()).or_default().push(r);
+    }
+    let mut out: Vec<GateHost> = by_host.iter().map(|(h, rs)| gate_host(h, rs)).collect();
+    if by_host.len() > 1 {
+        let all: Vec<&Row> = by_host.into_values().flatten().collect();
+        out.push(gate_host("all", &all));
+    }
+    out
 }
 
 fn median(mut v: Vec<i64>) -> Option<i64> {
@@ -590,7 +719,7 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
     // runs passed while the gate failed, and as chg red if any failed while it passed.
     let mut pushes: BTreeMap<(&str, &str), Vec<&Row>> = BTreeMap::new();
     let (mut unpaired, mut skipped, mut errors, mut reruns) = (0, 0, 0, 0);
-    for r in rows.iter().filter(|r| r.kind == "chg" && r.repo == repo) {
+    for r in rows.iter().filter(|r| r.is_shadow() && r.repo == repo) {
         match r.verdict {
             Outcome::Skipped => skipped += 1,
             Outcome::Error => errors += 1,
@@ -735,6 +864,7 @@ pub fn report(repo: &str, rows: &[Row]) -> Report {
             .collect(),
         criteria,
         ready,
+        gate_mode: gate_mode(repo, rows),
     }
 }
 
@@ -846,6 +976,44 @@ impl Report {
                         &mut o,
                         format!("    selected and passed in chg, failed in the gate: {f}"),
                     );
+                }
+            }
+        }
+        if !self.gate_mode.is_empty() {
+            line(&mut o, String::new());
+            line(&mut o, "gate-mode checks (`chg check` as the gate):".into());
+            line(
+                &mut o,
+                format!(
+                    "  {:<14}  {:>6}  {:>5}  {:>5}  {:>5}  {:>12}  {:>8}  {:>8}",
+                    "host", "checks", "pass", "fail", "error", "subset", "median", "p90"
+                ),
+            );
+            let opt = |m: Option<u64>| m.map(fmt_ms).unwrap_or_else(|| "-".into());
+            for g in &self.gate_mode {
+                let share = (g.subset * 100).checked_div(g.checks).unwrap_or(0);
+                line(
+                    &mut o,
+                    format!(
+                        "  {:<14}  {:>6}  {:>5}  {:>5}  {:>5}  {:>12}  {:>8}  {:>8}",
+                        g.host,
+                        g.checks,
+                        g.pass,
+                        g.fail,
+                        g.error,
+                        format!("{} ({share}%)", g.subset),
+                        opt(g.median_ms),
+                        opt(g.p90_ms)
+                    ),
+                );
+            }
+            for g in &self.gate_mode {
+                if g.widening.is_empty() {
+                    continue;
+                }
+                line(&mut o, format!("  whole suite on {}, why:", g.host));
+                for (why, n) in &g.widening {
+                    line(&mut o, format!("    {n:>4}  {why}"));
                 }
             }
         }
@@ -994,8 +1162,9 @@ fn ci_wanted<'a>(key: &str, rows: &'a [Row], now: u64) -> BTreeSet<&'a str> {
             .max();
         newest.is_some_and(|at| at < stale_before || !pushed.contains(sha))
     };
+    // A gate-mode check was the gate: there is nothing to pair it with.
     rows.iter()
-        .filter(|r| r.kind == "chg" && r.repo == key)
+        .filter(|r| r.is_shadow() && r.repo == key)
         .filter(|r| matches!(r.verdict, Outcome::Pass | Outcome::Fail))
         .map(|r| r.sha.as_str())
         .filter(|sha| !judged_locally.contains(sha) && !settled(sha))
@@ -1256,6 +1425,98 @@ mod tests {
         assert!(s.ready, "{}", s.render());
         assert_eq!(s.median_chg_ms, Some(10 * 60 * 1000));
         assert!(!s.render().contains("median chg check time"));
+    }
+
+    fn gate_check(host: &str, v: Outcome, ms: u64, mode: &str, why: &str) -> Row {
+        Row {
+            host: host.into(),
+            ms,
+            mode: Some(mode.into()),
+            selection: Some(why.into()),
+            source: Some(GATE_CHECK.into()),
+            ..Row::new("chg", "r", "s", v)
+        }
+    }
+
+    #[test]
+    fn widening_keys_drop_shas_and_keep_numbers_and_words() {
+        assert_eq!(
+            widening_key("lib/a.ex changed since the record of 3c9ef6f0a1b2"),
+            "lib/a.ex changed since the record of <sha>"
+        );
+        assert_eq!(
+            widening_key("no snapshot of 7935afd8e1c2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"),
+            "no snapshot of <sha>"
+        );
+        assert_eq!(
+            widening_key("shard over its 1200000 ms cap"),
+            "shard over its 1200000 ms cap"
+        );
+        assert_eq!(
+            widening_key("needs v1234567 or a defaced cache"),
+            "needs v1234567 or a defaced cache"
+        );
+        assert_eq!(
+            widening_key("mix.exs matches always_all `mix.exs`"),
+            "always_all `mix.exs`"
+        );
+    }
+
+    #[test]
+    fn gate_mode_checks_are_summarised_per_host_and_never_paired() {
+        let mut rows = vec![
+            gate_check("m1", Outcome::Pass, 1000, "subset", "coverage of x"),
+            gate_check(
+                "m1",
+                Outcome::Pass,
+                2000,
+                "all",
+                "a/x.js matches always_all `a/**`",
+            ),
+            gate_check(
+                "m1",
+                Outcome::Fail,
+                3000,
+                "all",
+                "a/y.js matches always_all `a/**`",
+            ),
+            gate_check(
+                "m1",
+                Outcome::Error,
+                4000,
+                "all",
+                "no record of 1234567abcdef",
+            ),
+            gate_check("m2", Outcome::Pass, 5000, "subset", "coverage of y"),
+        ];
+        rows.push(gate("s", Outcome::Pass, 9000, &[]));
+        let r = report("r", &rows);
+        // Gate-mode rows are no shadow pushes, paired or not.
+        assert_eq!((r.pushes, r.unpaired, r.errors), (0, 0, 0));
+        assert_eq!(r.gate_mode.len(), 3, "two hosts and all");
+        let m1 = &r.gate_mode[0];
+        assert_eq!(m1.host, "m1");
+        assert_eq!((m1.checks, m1.pass, m1.fail, m1.error), (4, 2, 1, 1));
+        assert_eq!(m1.subset, 1);
+        assert_eq!(m1.median_ms, Some(2500));
+        assert_eq!(m1.p90_ms, Some(4000));
+        assert_eq!(
+            m1.widening,
+            vec![
+                ("always_all `a/**`".to_string(), 2),
+                ("no record of <sha>".to_string(), 1)
+            ]
+        );
+        let all = &r.gate_mode[2];
+        assert_eq!((all.host.as_str(), all.checks, all.subset), ("all", 5, 2));
+        assert_eq!(all.p90_ms, Some(5000));
+        let text = r.render();
+        assert!(text.contains("gate-mode checks"), "{text}");
+        assert!(text.contains("2 (40%)"), "{text}");
+        assert!(text.contains("whole suite on m1, why:"), "{text}");
+
+        // One host: no "all" line.
+        assert_eq!(report("r", &rows[..4]).gate_mode.len(), 1);
     }
 
     #[test]

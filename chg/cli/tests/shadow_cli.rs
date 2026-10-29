@@ -244,6 +244,98 @@ fn check_runs_static_then_the_affected_tests() {
         .stdout(predicate::str::contains("test/a_test.exs:3"));
 }
 
+/// After cutover no `chg shadow record` follows a push, so HCB recorded nothing for 34
+/// gated pushes on mac-mini. A gate-mode check logs its own verdict; a check run while
+/// chg only shadows the gate does not.
+#[test]
+fn a_gate_mode_check_logs_its_verdict_and_selection() {
+    let env = Env::plain();
+    let base = env.head();
+    let sha = env.commit("lib/a.ex", "two\n");
+    env.chg()
+        .args(["check", "--base", &base])
+        .assert()
+        .success();
+    assert!(env.rows().is_empty(), "{:?}", env.rows());
+
+    env.chg()
+        .args(["check", "--base", &base])
+        .env("CHG_GATE", "on")
+        .assert()
+        .success();
+    fs::write(env.repo.join(".chg/fail"), "").unwrap();
+    env.chg()
+        .args(["check", "--base", &base])
+        .env("CHG_GATE", "on")
+        .assert()
+        .code(1);
+    let rows = env.rows();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for r in &rows {
+        assert_eq!(r["kind"], "chg");
+        assert_eq!(r["source"], "gate");
+        assert_eq!(r["sha"], sha.as_str());
+        assert_eq!(r["base"], base.as_str());
+        assert_eq!(r["mode"], "subset");
+        assert!(
+            r["selection"].as_str().is_some_and(|s| !s.is_empty()),
+            "{r}"
+        );
+        assert!(r["host"].as_str().is_some_and(|h| !h.is_empty()));
+    }
+    assert_eq!(rows[0]["verdict"], "pass");
+    assert_eq!(rows[1]["verdict"], "fail");
+    assert_eq!(rows[1]["reason"], "1 test(s) failed");
+
+    // The report summarises them apart from the shadow pairing.
+    let out = env
+        .chg()
+        .args(["shadow", "report", "--json"])
+        .output()
+        .unwrap();
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["pushes"], 0, "{r}");
+    assert_eq!(r["unpaired"], 0, "{r}");
+    let g = &r["gate_mode"][0];
+    assert_eq!(g["checks"], 2, "{r}");
+    assert_eq!(g["pass"], 1);
+    assert_eq!(g["fail"], 1);
+    assert_eq!(g["subset"], 2);
+    let text = env.chg().args(["shadow", "report"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("gate-mode checks"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
+    // A push the gate blocks without judging is logged too: a base that does not resolve,
+    // and a pinned commit the live tree does not hold.
+    env.chg()
+        .args(["check", "--base", "no-such-ref"])
+        .env("CHG_GATE", "on")
+        .assert()
+        .code(2);
+    env.chg()
+        .args(["check", "--base", &base, "--sha", &base])
+        .env("CHG_GATE", "on")
+        .assert()
+        .code(2);
+    let rows = env.rows();
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(rows[2]["verdict"], "error", "{}", rows[2]);
+    assert_eq!(rows[2]["sha"], sha.as_str());
+    assert_eq!(rows[2]["base"], "");
+    assert_eq!(rows[3]["verdict"], "error", "{}", rows[3]);
+    assert_eq!(rows[3]["sha"], base.as_str());
+    assert!(
+        rows[3]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with(&format!("no verdict for {base}"))),
+        "{}",
+        rows[3]
+    );
+}
+
 #[test]
 fn a_gate_mode_check_judges_the_commit_where_snapshots_are_built() {
     let Some(dir) = cow_tempdir() else { return };

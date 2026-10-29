@@ -52,6 +52,11 @@ pub struct Verdict {
     /// The test files run, for a `subset`.
     #[serde(default)]
     pub selected: Vec<String>,
+    /// What selection said: the subset's reason, or why the whole suite ran. A failure's
+    /// `reason` replaces the selection's, so it is kept here. Absent when static failed
+    /// before selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
     /// Failing static checks (`check file:line message`) or failing test ids.
     #[serde(default)]
     pub failures: Vec<String>,
@@ -71,6 +76,7 @@ impl Verdict {
             reason: reason.into(),
             mode: None,
             selected: vec![],
+            selection: None,
             failures: vec![],
             ms: 0,
             static_ms: 0,
@@ -191,6 +197,7 @@ fn check(
                 verdict: Outcome::Pass,
                 reason: format!("no tests affected ({reason})"),
                 mode: Some("subset".into()),
+                selection: Some(reason),
                 static_ms,
                 affected_ms,
                 ..Verdict::skipped("")
@@ -227,6 +234,7 @@ fn check(
     let base_verdict = Verdict {
         mode: Some(mode.into()),
         selected,
+        selection: Some(reason.clone()),
         static_ms,
         affected_ms,
         tests_ms,
