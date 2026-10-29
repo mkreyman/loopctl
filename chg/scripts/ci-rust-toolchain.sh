@@ -41,7 +41,7 @@ exec 9>&-
 
 echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
 echo "RUSTUP_TOOLCHAIN=$ver" >>"$GITHUB_ENV"
-# A CARGO_HOME per job: Swatinem/rust-cache prunes CARGO_HOME's registry in its post step,
-# which would pull sources from under a concurrent job's build in the shared ~/.cargo.
-# rust-cache restores this one, so the registry is not downloaded afresh.
-echo "CARGO_HOME=${RUNNER_TEMP:?}/cargo-home" >>"$GITHUB_ENV"
+# A CARGO_HOME per job, never the shared ~/.cargo, where concurrent jobs would change the
+# registry under each other's builds. It lives in the workspace so the cache actions
+# (.github/actions/cargo-cache-*) name it by a relative path, the same on every slot.
+echo "CARGO_HOME=${GITHUB_WORKSPACE:?}/.ci-cargo-home" >>"$GITHUB_ENV"

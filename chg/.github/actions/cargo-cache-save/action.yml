@@ -1,0 +1,28 @@
+name: cargo cache save
+description: >
+  Prunes the workspace's own build out of target and saves the cache cargo-cache-restore
+  reads, under a key unique to this run. Use it only on master and only when the restore
+  matched nothing under its base key, in a step with timeout-minutes and continue-on-error,
+  and give the job that much more time: an upload is only an optimisation and must never
+  fail or cancel a job.
+inputs:
+  base:
+    description: The restore's base output.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        python3 "$GITHUB_ACTION_PATH/prune.py" target
+        du -sch target .ci-cargo-home/registry/index .ci-cargo-home/registry/cache .ci-cargo-home/git/db 2>/dev/null || true
+    # A key per run: a save cut off mid-upload leaves its reservation on a key no later
+    # save asks for, so it can never block the next master save.
+    - uses: actions/cache/save@v4
+      with:
+        path: |
+          .ci-cargo-home/registry/index
+          .ci-cargo-home/registry/cache
+          .ci-cargo-home/git/db
+          target
+        key: ${{ inputs.base }}-${{ github.run_id }}-${{ github.run_attempt }}
