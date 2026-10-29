@@ -36,6 +36,7 @@ defmodule ChgAdapter.IntegrationTest do
       ".gitignore",
       ".tool-versions",
       ".chg",
+      "apps",
       "config",
       "docs",
       "lib",
@@ -260,7 +261,7 @@ defmodule ChgAdapter.IntegrationTest do
       end
 
     assert Enum.sort(ids) == Enum.uniq(Enum.sort(ids))
-    assert length(ids) == 10
+    assert length(ids) == 14
   end
 
   test "static passes a clean change and reports format and compile failures", ctx do
@@ -320,6 +321,18 @@ defmodule ChgAdapter.IntegrationTest do
         do:
           refute("docs/stories/" in reads, "#{f} credited with another file's compile-time read")
 
+    # Reads under _build count as what they were compiled from: a beam as its module, a
+    # file under the built priv as the project's priv path.
+    built = "test/sample/build_reads_test.exs"
+    assert Sample.Scanned in rec.cover[built]
+    refute Enum.any?(rec.cover, fn {f, mods} -> f != built and Sample.Scanned in mods end)
+    assert "priv/greeting.txt" in rec.reads[built]
+    # A path dependency's build counts as its source directory, its priv as that path.
+    shared = "test/sample/shared_reads_test.exs"
+    assert "apps/shared/" in rec.reads[shared]
+    assert "apps/shared/priv/note.txt" in rec.reads[shared]
+    refute Enum.any?(rec.reads, fn {f, r} -> f != shared and "apps/shared/" in r end)
+
     refute Enum.any?(rec.global_reads, &match?({:spawn, _}, &1))
     refute Enum.any?(rec.global_reads, &(&1 == "./" or String.starts_with?(&1, "docs")))
 
@@ -333,6 +346,34 @@ defmodule ChgAdapter.IntegrationTest do
 
     assert {%{"mode" => "subset", "tests" => [], "reason" => "coverage of " <> _}, 0} =
              chg(ctx, ["chg.affected", "--base", "HEAD~1"], env)
+
+    # A test that only scanned a module's beam runs when that module changes, and one that
+    # read the built priv when the source priv is read at run time and changed.
+    edit!(ctx, "lib/sample/scanned.ex", &String.replace(&1, ":allowed", ":denied"))
+
+    assert {%{"mode" => "subset", "tests" => ["test/sample/build_reads_test.exs"]}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"], env)
+
+    edit!(ctx, "lib/sample/scanned.ex", &String.replace(&1, ":denied", ":allowed"))
+    # A path dependency's source, named by read_at_runtime, selects the test that read
+    # its build (and files_test, whose subprocess may read anything).
+    edit!(ctx, "apps/shared/lib/shared.ex", &String.replace(&1, ":shared", ":changed"))
+    read_shared = [{"CHG_READ", "apps/shared/lib/shared.ex"}]
+
+    assert {%{"mode" => "subset", "tests" => tests}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"], env ++ read_shared)
+
+    assert "test/sample/shared_reads_test.exs" in tests
+    refute "test/sample/build_reads_test.exs" in tests
+
+    edit!(ctx, "apps/shared/lib/shared.ex", &String.replace(&1, ":changed", ":shared"))
+    read_priv = [{"CHG_READ", "priv/greeting.txt"}]
+
+    assert {%{"mode" => "subset", "tests" => tests}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"], env ++ read_priv)
+
+    assert "test/sample/build_reads_test.exs" in tests
+    refute "test/sample/reports_test.exs" in tests
 
     edit!(ctx, "lib/sample/accounts.ex", &String.replace(&1, "user-", "member-"))
 
@@ -362,6 +403,25 @@ defmodule ChgAdapter.IntegrationTest do
     dirty = Path.join(history, "dirty.cover")
     chg(ctx, ["chg.shard", "--of", "1", "--index", "1"], [{"CHG_RECORD", dirty}])
     refute File.exists?(dirty)
+  end
+
+  test "a build outside the repo (MIX_BUILD_PATH) is read as what it was compiled from",
+       ctx do
+    build = Path.join(ctx.root, "build-#{System.unique_integer([:positive])}")
+    record = Path.join(ctx.root, "elsewhere-#{System.unique_integer([:positive])}.cover")
+    env = [{"MIX_BUILD_PATH", build}, {"CHG_RECORD", record}]
+
+    assert {%{"results" => [_ | _]}, 0} =
+             chg(ctx, ["chg.shard", "--of", "1", "--index", "1"], env)
+
+    assert File.exists?(Path.join(build, "lib/sample/ebin/Elixir.Sample.Scanned.beam"))
+    rec = record |> File.read!() |> :erlang.binary_to_term()
+    built = "test/sample/build_reads_test.exs"
+    shared = "test/sample/shared_reads_test.exs"
+    assert Sample.Scanned in rec.cover[built]
+    assert "priv/greeting.txt" in rec.reads[built]
+    assert "apps/shared/" in rec.reads[shared]
+    assert "apps/shared/priv/note.txt" in rec.reads[shared]
   end
 
   describe "through chg" do

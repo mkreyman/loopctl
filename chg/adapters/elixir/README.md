@@ -95,7 +95,14 @@ subprocess (`System.cmd/3`, `:os.cmd/1`) is recorded as `{:spawn, name}`, becaus
 reads are not seen. Reads go to the test file whose process made them: every process a test
 module's runner starts, transitively, is that module's from the moment it starts, and so is
 every process a compiling worker starts. A read by any other process (the Repo pool, a server
-the app started) goes to the windows open then, and outside every window into `global_reads`. The record also holds
+the app started) goes to the windows open then, and outside every window into `global_reads`.
+A read under the build (`Mix.Project.build_path/0`, so `build_path` and `MIX_BUILD_PATH`
+count) is recorded as what it was compiled from. A project module's beam (a guard test
+scanning compiled code) counts as executing that module. A file under the app's built `priv`
+(`:code.priv_dir/1`) is a read of `priv/<path>`. A path dependency's build in the repo is a
+read of its directory (its `priv` of the same path under it); a fetched dependency's is a read
+of `mix.lock`. Anything else there (a path dependency outside the repo, another `_build` env, consolidated protocols, the `.app` file, the
+manifests) leaves the test file out of the coverage, so selection always runs it. The record also holds
 `ChgAdapter.Digest` of every module, and each test file's time. Tracing costs about 11% of
 the suite's time: HomeCareBilling's whole suite on minis at 1191e0fe6 (2026-10-19) ran in 658 s
 recorded and 591 s not, back to back, with the load average between 22 and 41.

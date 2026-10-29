@@ -8,7 +8,7 @@ defmodule Sample.MixProject do
       elixir: "~> 1.19 and >= 1.19.5",
       elixirc_paths: elixirc_paths(Mix.env()),
       elixirc_options: [check_cwd: false],
-      deps: []
+      deps: [{:shared, path: "apps/shared"}]
     ]
   end
 
