@@ -85,7 +85,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # The repo's own pin, so local and CI run one Node (.tool-versions).
+          node-version-file: .tool-versions
 
       - name: Install dependencies
         run: npm ci
