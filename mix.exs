@@ -134,7 +134,8 @@ defmodule Loopctl.MixProject do
       # Phoenix
       {:phoenix, "~> 1.8.4"},
       {:phoenix_ecto, "~> 4.5"},
-      {:phoenix_html, "~> 4.2"},
+      # >= 4.4: CVE-2026-117645, attribute injection in attributes_escape/1 (4.3.0 and below).
+      {:phoenix_html, "~> 4.4"},
       {:phoenix_live_view, "~> 1.1.0"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
