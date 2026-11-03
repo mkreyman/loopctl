@@ -189,6 +189,9 @@ kill_timeout = 90
   port = 9568
   path = "/metrics"
 
+# 1024mb since 2026-11-02: at 512mb machine 2872420c0d2348 was OOM-killed
+# (exit 137, oom_killed=true) at 2026-11-02T00:50Z and sessions saw loopctl as
+# down. Lower it only with a peak-RSS measurement under the real load.
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1024mb"

@@ -54,9 +54,8 @@ defmodule Loopctl.MixProject do
           # CVE-2026-94194), so the pin below 1.11.0 in deps/0 costs no security.
           # The HTTP/1-only posture is still pinned by
           # test/loopctl/net/no_outbound_http2_test.exs.
-          # bandit moved to 1.13.1 (2026-10-17), which OSV reports clean of every
-          # advisory 1.12.5 carried (1.13.0 fixed CVE-2026-105660, the HTTP/1
-          # request-target authority issue), so no bandit ignore remains.
+          # bandit moved to 1.14.1 (2026-11-02), which clears the thirteen HTTP/2
+          # and WebSocket advisories filed against 1.13.1, so no bandit ignore remains.
           # endpoint_http2_test.exs fails on any bandit version change, so a move
           # cannot go unnoticed.
           # cloak 1.1.4 and cloak_ecto 1.3.0 — no patched release exists for either
