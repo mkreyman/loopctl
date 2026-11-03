@@ -252,7 +252,7 @@ endpoint_http = [
   # HTTP/2 is off: Bandit then closes a connection that opens with the HTTP/2 preface
   # instead of serving it. Nothing needs it — Fly's proxy speaks HTTP/1.1 to the app
   # (fly.toml `h2_backend = false`). Off since #981, when it also kept the then-unpatched
-  # CVE-2026-105659 unreachable; bandit 1.13.1 patches that CVE, and the option stays
+  # CVE-2026-105659 unreachable; bandit 1.14.1 (OSV-clean) patches it, and the option stays
   # because nothing serves h2. test/loopctl_web/endpoint_http2_test.exs fails if it goes.
   http_2_options: [enabled: false]
 ]

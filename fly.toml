@@ -133,25 +133,20 @@ kill_timeout = 90
   # budget multiplies the per-node pools by it, so it must stay the true maximum (2), not
   # the number usually running. Change it when the machine count changes.
   #
-  # CLUSTER_PEERS_MAY_SUSPEND follows [http_service] below: with auto_stop_machines
-  # suspending down to min_machines_running (1), the second machine is usually suspended,
-  # so fewer peers than EXPECTED_APP_NODES - 1 is normal and Loopctl.ClusterReadiness
-  # reports it as `peers_may_be_suspended`, not the `expected_peers_missing` alarm — but only
-  # while `loopctl.internal` (which lists started machines only) lists no other machine that
-  # is not connected; a running peer that failed to join still alarms. Delete it if every
-  # machine is ever kept running, and the alarm comes back for suspension too. The count itself is
-  # always on `loopctl.cluster.peers.connected`. test/loopctl/fly_toml_test.exs holds this
-  # line to the [http_service] settings.
+  # CLUSTER_PEERS_MAY_SUSPEND is deliberately unset: min_machines_running below equals
+  # EXPECTED_APP_NODES, so a missing peer is a fault and Loopctl.ClusterReadiness alarms
+  # `expected_peers_missing`. test/loopctl/fly_toml_test.exs holds that to [http_service].
   DNS_CLUSTER_QUERY = "loopctl.internal"
   EXPECTED_APP_NODES = "2"
-  CLUSTER_PEERS_MAY_SUSPEND = "true"
 
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = "suspend"
   auto_start_machines = true
-  min_machines_running = 1
+  # 2 since 2026-11-02: every Claude session on the fleet depends on loopctl, and with 1 an
+  # OOM kill of the running machine left nothing serving until the proxy woke the other.
+  min_machines_running = 2
 
   [http_service.concurrency]
     type = "connections"
@@ -189,6 +184,9 @@ kill_timeout = 90
   port = 9568
   path = "/metrics"
 
+# 1024mb since 2026-11-02: at 512mb machine 2872420c0d2348 was OOM-killed
+# (exit 137, oom_killed=true) at 2026-11-02T00:50Z and sessions saw loopctl as
+# down. Lower it only with a peak-RSS measurement under the real load.
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1024mb"
