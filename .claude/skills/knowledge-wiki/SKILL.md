@@ -512,7 +512,7 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
 - **p95:** `histogram_quantile(0.95, sum by (le) (rate(<bucket>[24h])))`. Fly Prometheus auth is the
   FlyV1-token-not-Bearer gotcha — wiki `6dd01e58`.
 - **Low-traffic caveat (READ THIS before trusting a p95).** Prod serves ~2 semantic searches/hr, so
-  ANY window's p95 is dominated by the occasional cold-cache / autostop-resume outlier on the 512MB
+  ANY window's p95 is dominated by the occasional cold-cache outlier on the 1 GB shared-CPU
   machines — one cold query swings it by seconds. Read p50 AND the bucket distribution, never the
   sparse p95 in isolation. The CI plan-shape gate is the real regression gate; the prod p95 is an
   observation, not a pass/fail number.

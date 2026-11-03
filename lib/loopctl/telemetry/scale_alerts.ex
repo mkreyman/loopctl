@@ -390,7 +390,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   IMPORTANT (post-review correction): this guard does NOT flip `/health`'s top-level
   `status` — `fly.toml` wires plain `GET /health` as the CONTINUOUS load-balancer
-  liveness check (10s interval, `min_machines_running: 1`), not a deploy-only smoke
+  liveness check (10s interval, `min_machines_running: 2`), not a deploy-only smoke
   probe, so coupling a benign config-only concern to it would let a missing webhook URL
   depool an otherwise-healthy fleet. Instead it is surfaced as `checks.scale_alerts` /
   `reasons.scale_alerts` (visible, non-blocking for routing) AND folded into the

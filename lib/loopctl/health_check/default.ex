@@ -20,7 +20,7 @@ defmodule Loopctl.HealthCheck.Default do
   ## Liveness (`status`) vs readiness (`ready`) — US-32.4 post-review correction
 
   `fly.toml` wires plain `GET /health` as the CONTINUOUS `http_service` load-balancer
-  check (10s interval, `min_machines_running: 1`, `strategy: rolling`) — it is not a
+  check (10s interval, `min_machines_running: 2`, `strategy: rolling`) — it is not a
   deploy-only smoke probe, it decides whether a running node stays in traffic rotation
   RIGHT NOW. A benign, purely observational misconfiguration (scale alerts enabled but
   no webhook URL) must never depool an otherwise-healthy node on that continuous check.

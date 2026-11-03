@@ -4,6 +4,14 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Changed
+
+- **Production keeps both machines running at 1024mb (2026-11-02).** `fly.toml` now sets
+  `memory = "1024mb"` and `min_machines_running = 2`, and drops `CLUSTER_PEERS_MAY_SUSPEND`,
+  so a missing peer alarms `expected_peers_missing` again. A machine was OOM-killed at 512mb
+  while it was the only one running. A self-hoster who copies `fly.toml` pays for two
+  always-on 1 GB machines.
+
 ### Removed
 
 - **Epic 45's change threads are deleted (#984).** BREAKING for anything still calling them:
