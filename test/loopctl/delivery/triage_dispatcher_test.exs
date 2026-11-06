@@ -97,6 +97,53 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       write_ledger_row(ctx, story.id, kind: "implement", released_at: nil)
       assert story.id in candidate_ids(50)
     end
+
+    test "a source that requires a ticket admits only issues filed from one", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      {source_id, record_id} = source_and_record(ctx, story.id)
+      set_ticket(record_id, nil)
+
+      # False, the default: every issue is triaged, as before the field existed.
+      assert story.id in candidate_ids(50)
+
+      # Required, and the issue carries no ticket reference: not a candidate, so it holds no
+      # slot and no session is paid for. This is how HCB keeps its own sessions' issues out.
+      set_requires_ticket(source_id, true)
+      refute story.id in candidate_ids(50)
+
+      # A Ticket line with no HomeCareBilling footer confirming it, the shape one typed line
+      # leaves, is a ref without an id: still not a candidate.
+      {1, _} =
+        AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+          set: [ticket_ref: "HCB-a1b2c3d4", ticket_id: nil]
+        )
+
+      refute story.id in candidate_ids(50)
+
+      # The facts are re-extracted on every delivery, so an issue edited into the format is
+      # judged as it now stands.
+      set_ticket(record_id, "a1b2c3d4-0000-4000-8000-000000000000")
+      assert story.id in candidate_ids(50)
+
+      # And turning the requirement off admits everything again.
+      set_ticket(record_id, nil)
+      set_requires_ticket(source_id, false)
+      assert story.id in candidate_ids(50)
+    end
+
+    test "another tenant's ticket requirement does not filter this tenant's stories", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      other_tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      other = fixture(:detected_story, %{tenant_id: other_tenant.id})
+      {other_source_id, other_record_id} = source_and_record(%{tenant: other_tenant}, other.id)
+
+      set_ticket(other_record_id, nil)
+      set_requires_ticket(other_source_id, true)
+
+      ids = candidate_ids(50)
+      assert story.id in ids
+      refute other.id in ids
+    end
   end
 
   describe "run_with/2" do
@@ -404,6 +451,33 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       )
 
     story
+  end
+
+  defp source_and_record(ctx, story_id) do
+    AdminRepo.one!(
+      from s in Loopctl.WorkBreakdown.Story,
+        join: r in Loopctl.Intake.Record,
+        on: r.id == s.intake_record_id,
+        where: s.id == ^story_id and s.tenant_id == ^ctx.tenant.id,
+        select: {r.source_id, r.id}
+    )
+  end
+
+  defp set_requires_ticket(source_id, value) do
+    {1, _} =
+      AdminRepo.update_all(from(s in Loopctl.Intake.Source, where: s.id == ^source_id),
+        set: [triage_requires_ticket: value]
+      )
+  end
+
+  defp set_ticket(record_id, ticket_id) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+        set: [
+          ticket_ref: ticket_id && "HCB-" <> String.slice(ticket_id, 0, 8),
+          ticket_id: ticket_id
+        ]
+      )
   end
 
   defp reload_story(ctx, story_id) do

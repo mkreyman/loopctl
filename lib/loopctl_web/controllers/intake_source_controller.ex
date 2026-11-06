@@ -104,6 +104,18 @@ defmodule LoopctlWeb.IntakeSourceController do
                   "Required when the source is `chg`; on a `pr` source an explicit null " <>
                   "clears it."
 
+  @triage_requires_ticket_doc "WHICH ISSUES ARE TRIAGED. False (the default): every issue " <>
+                                "the webhook delivers. True: only an issue HomeCareBilling " <>
+                                "filed from a support ticket, recognised by the single " <>
+                                "`#HCB-xxxxxxxx` Ticket line intake extracts as " <>
+                                "`ticket_ref`, confirmed by its footer; every other issue " <>
+                                "stays detected and costs nothing. Read at dispatch time. A " <>
+                                "format filter, not authentication: anyone who can open an " <>
+                                "issue can type the format. NOT nullable: null, a string " <>
+                                "(`true` and `0` as strings included) or any other " <>
+                                "non-boolean " <>
+                                "is a 422."
+
   @source_schema %Schema{
     type: :object,
     required: [
@@ -113,6 +125,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       :base_branch,
       :mode,
       :required_checks,
+      :triage_requires_ticket,
       :chg_root_dispatch_id,
       :target_epic_id,
       :revoked_at,
@@ -148,6 +161,7 @@ defmodule LoopctlWeb.IntakeSourceController do
         items: %Schema{type: :string},
         description: @required_checks_doc
       },
+      triage_requires_ticket: %Schema{type: :boolean, description: @triage_requires_ticket_doc},
       mode: %Schema{type: :string, enum: ["pr", "chg"], description: @mode_doc},
       chg_root_dispatch_id: %Schema{
         type: :string,
@@ -201,6 +215,10 @@ defmodule LoopctlWeb.IntakeSourceController do
              },
              maxItems: Source.max_required_checks(),
              description: "Optional. " <> @required_checks_doc
+           },
+           triage_requires_ticket: %Schema{
+             type: :boolean,
+             description: "Optional, false when omitted. " <> @triage_requires_ticket_doc
            },
            mode: %Schema{
              type: :string,
@@ -310,7 +328,8 @@ defmodule LoopctlWeb.IntakeSourceController do
     summary: "Repoint a GitHub intake source at an epic",
     description:
       "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null, and/or " <>
-        "`base_branch`, and/or `mode`. EVERY FIELD IS OPTIONAL AND ONE YOU DO NOT SEND IS " <>
+        "`base_branch`, and/or `mode`, and/or `triage_requires_ticket` (which issues are triaged at " <>
+        "all). EVERY FIELD IS OPTIONAL AND ONE YOU DO NOT SEND IS " <>
         "LEFT ALONE — clearing the epic takes an explicit null, and a body naming none of " <>
         "them is a 422 `nothing_to_update`. " <>
         "The " <>
@@ -347,6 +366,10 @@ defmodule LoopctlWeb.IntakeSourceController do
              },
              maxItems: Source.max_required_checks(),
              description: "Optional. " <> @required_checks_doc
+           },
+           triage_requires_ticket: %Schema{
+             type: :boolean,
+             description: "Optional; omitted leaves it as it is. " <> @triage_requires_ticket_doc
            },
            mode: %Schema{
              type: :string,
@@ -441,6 +464,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_if_present(params, "base_branch", :base_branch)
       |> put_if_present(params, "mode", :mode)
       |> put_if_present(params, "required_checks", :required_checks)
+      |> put_if_present(params, "triage_requires_ticket", :triage_requires_ticket)
       |> put_if_present(params, "change_events_secret", :change_events_secret)
       |> put_if_present(params, "chg_root_dispatch_id", :chg_root_dispatch_id)
 
@@ -505,6 +529,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_if_present(params, "base_branch", :base_branch)
       |> put_if_present(params, "mode", :mode)
       |> put_if_present(params, "required_checks", :required_checks)
+      |> put_if_present(params, "triage_requires_ticket", :triage_requires_ticket)
       |> put_if_present(params, "change_events_secret", :change_events_secret)
       |> put_if_present(params, "chg_root_dispatch_id", :chg_root_dispatch_id)
 
@@ -524,7 +549,8 @@ defmodule LoopctlWeb.IntakeSourceController do
             code: "nothing_to_update",
             message:
               "Name at least one of target_epic_id (null clears it), base_branch, mode, " <>
-                "required_checks, change_events_secret or chg_root_dispatch_id. A field you " <>
+                "required_checks, triage_requires_ticket, change_events_secret or " <>
+                "chg_root_dispatch_id. A field you " <>
                 "do not send is left exactly as it was."
           }
         })

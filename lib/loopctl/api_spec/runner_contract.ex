@@ -58,6 +58,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.21.0) REVIEW IS DISPATCHABLE (epic 45, US-45.3). `x-connection.dispatchable_kinds` adds `review`: loopctl places a review of a story's change thread as a runner dispatch of kind `review`, carrying the story (`RunnerStory`, as an implement dispatch does) and a `review` object (`RunnerReview`: `review_id`, `round`, and the checkpoint to read — `checkpoint_id`, `checkpoint_seq`, `commit_sha`, `tree_sha`). It CLAIMS NOTHING: `claim_epoch` is the implementer's claim, echoed back like any dispatch's, and the review never writes code. The session answers with two new messages: `review_finding` (`RunnerReviewFinding`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, `severity`, optional `location` and `introduced_by`) for each defect it found, and ONE `review_verdict` (`RunnerReviewVerdict`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`) that completes the review's round and ends it; the slot is freed by the session's `session_ended`, not by the verdict. Both are bound to the review loopctl recorded for THIS dispatch and THIS runner, and are idempotent on `<dispatch_id>:<client_seq>`. New refusal codes: `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`. `session_ended` now also ends a REVIEW session: recorded once, the slot freed, no stage effect and no retry-ceiling count, answered with `kind: "review"` and `replayed` only (`RunnerSessionEndedAck` requires only `replayed` from this version; an implement session's ack still carries every row field). Only a runner that DECLARES `review` on join is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run reviews: a 1.20.0 copy has no `review` kind, no `RunnerReview`, no `review_finding` and no `review_verdict` | | | | |
   | (1.22.0) ONE CODE, ONE MEANING, then WHICH REFUSALS END THE CLAIM (loopctl#920). Two codes were each answered both when the claim was over and when one message was wrong, so those halves get codes of their own: `claim_epoch_mismatch` (was `stale_claim_epoch`: the message's epoch is not its own dispatch's while the claim stands; `stale_claim_epoch` now means only that the claim moved) and `wrong_dispatch_kind` (was `unknown_dispatch`: this runner's dispatch of another kind; `unknown_dispatch` now means not this runner's, or gone). Both are permanent for that one message. A runner that JOINS declaring 1.22.0 or later gets the new codes; an older one keeps getting the old. Then `x-connection.claim_ending_errors`, keyed by work event with no `"*"` (`unknown_dispatch` and `stale_claim_epoch` on every work event except `stale_claim_epoch` on `triage_verdict`, whose resend is the reclaim repair; `not_claimant` on `checkpoint`; `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` on the judgements), and `x-connection.claim_ending_remedy`: send that dispatch no more of its work and stop its session; its `session_ended` on exit is sent as always, resent on `rate_limited`, and final on any permanent refusal. `claim_not_live` is not claim-ending: it is also answered once review is requested, while the session still reports its stages. RE-VENDOR, and declare 1.22.0 on join, to get the split codes and derive the set | | | | |
   | (1.23.0) THE CHANGE THREAD AND REVIEW SURFACE IS RETIRED (loopctl#984; Epic 45 was deleted and its successor, Epic 47, hears about a change from chg rather than from a runner). Gone: the `checkpoint`, `thread_entry`, `review_finding` and `review_verdict` messages with their schemas, acks, buckets, limits and refusal codes; the `review` dispatch kind and the dispatch's `review` object; the `kind` field of `RunnerSessionEndedAck`. Any of the four events is now answered `unknown_event`, and a join declaring `review` is admitted as before (the join never refuses a kind) and is simply never sent one. This NARROWS the contract, which a minor version otherwise may not do. It is a minor anyway: loopctl can no longer create a dispatch that would make a runner send one of these messages, production held no thread checkpoint, entry or review when it shipped, and a major would have refused the join of every connected runner until each re-vendored. RE-VENDOR to drop the dead events from your copy | | | | |
+  | (1.24.0) `x-connection.limits.lens_verdicts.max_bytes` PUBLISHES the cap on a message's three `lens_verdicts` together, under the byte rule. It has been enforced since 1.15.0 and was stated only in the field's prose, so a runner could not check it without re-typing a number. The field maxima do not imply it: three lenses at every maximum measure 8,402 bytes in ASCII and about twice that in characters outside the Basic Multilingual Plane, so a schema-valid set can still be refused `invalid_payload`. Nothing changes on the wire. RE-VENDOR to check it locally | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -400,7 +401,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.23.0"
+  @version "1.24.0"
   @major 1
 
   defmodule ByteRule do
@@ -3719,7 +3720,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           },
           "story" => RunnerStory.limits(),
           "triage" => RunnerTriage.limits(),
-          "triage_verdict" => RunnerTriageVerdict.limits()
+          "triage_verdict" => RunnerTriageVerdict.limits(),
+          # The cap on the three `lens_verdicts` together (1.24.0). Enforced since 1.15.0 and
+          # stated only in prose until now; the field maxima do not imply it once a string
+          # holds characters outside the Basic Multilingual Plane.
+          "lens_verdicts" => %{"max_bytes" => RunnerLensVerdict.max_bytes()}
         },
         # The transition table a `stage` message is checked against, published so a runner
         # can refuse an impossible transition locally instead of learning it from a refusal.

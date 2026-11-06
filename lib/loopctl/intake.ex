@@ -286,6 +286,7 @@ defmodule Loopctl.Intake do
       base_branch: "base_branch",
       mode: "mode",
       required_checks: "required_checks",
+      triage_requires_ticket: "triage_requires_ticket",
       change_events_secret: "change_events_secret",
       chg_root_dispatch_id: "chg_root_dispatch_id"
     ]
@@ -408,6 +409,9 @@ defmodule Loopctl.Intake do
                  # Which route the merge gate reads, recorded for the same reason
                  # as the branch — a later `intake_source_mode_set` says what it changed TO.
                  "mode" => Atom.to_string(source.mode),
+                 # Which issues are triaged at all, so a later `intake_source_triage_requires_ticket_set`
+                 # has a starting value to be read against.
+                 "triage_requires_ticket" => source.triage_requires_ticket,
                  # The custody input a `chg` source names (PRD §6). The secret itself is never
                  # on the chain; only whether one was set.
                  "chg_root_dispatch_id" => source.chg_root_dispatch_id,
@@ -462,7 +466,8 @@ defmodule Loopctl.Intake do
 
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
   `:base_branch` (NOT nullable), `:mode` (`"pr"` or `"chg"`, NOT nullable),
-  `:required_checks`, `:change_events_secret` and `:chg_root_dispatch_id` (both nullable on a
+  `:required_checks`, `:triage_requires_ticket` (NOT nullable; `true` triages only ticket-filed issues),
+  `:change_events_secret` and `:chg_root_dispatch_id` (both nullable on a
   `pr` source and required on a `chg` one). A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
@@ -493,6 +498,7 @@ defmodule Loopctl.Intake do
     :base_branch,
     :mode,
     :required_checks,
+    :triage_requires_ticket,
     :change_events_secret,
     :chg_root_dispatch_id
   ]
@@ -553,6 +559,8 @@ defmodule Loopctl.Intake do
         do: cast_required_checks(changeset, attrs),
         else: changeset
 
+    changeset = Source.put_triage_requires_ticket(changeset, attrs)
+
     with {:ok, changeset} <- valid(changeset) do
       write_update(tenant_id, changeset, fields, opts)
     end
@@ -603,6 +611,7 @@ defmodule Loopctl.Intake do
            :ok <- append_if(fields, :base_branch, tenant_id, source, opts),
            :ok <- append_if(fields, :mode, tenant_id, source, opts),
            :ok <- append_if(fields, :required_checks, tenant_id, source, opts),
+           :ok <- append_if(fields, :triage_requires_ticket, tenant_id, source, opts),
            :ok <- append_if(fields, :chg_root_dispatch_id, tenant_id, source, opts),
            :ok <- append_if(fields, :change_events_secret, tenant_id, source, opts) do
         source
@@ -618,28 +627,7 @@ defmodule Loopctl.Intake do
   end
 
   defp append_update(field, tenant_id, source, opts) do
-    {action, payload} =
-      case field do
-        :target_epic_id ->
-          {"intake_source_repointed", %{"target_epic_id" => source.target_epic_id}}
-
-        :base_branch ->
-          {"intake_source_base_branch_set", %{"base_branch" => source.base_branch}}
-
-        :mode ->
-          {"intake_source_mode_set", %{"mode" => Atom.to_string(source.mode)}}
-
-        :required_checks ->
-          {"intake_source_required_checks_set", %{"required_checks" => source.required_checks}}
-
-        :chg_root_dispatch_id ->
-          {"intake_source_chg_root_set", %{"chg_root_dispatch_id" => source.chg_root_dispatch_id}}
-
-        # Whether a secret is set, never the secret: the chain is readable by every auditor.
-        :change_events_secret ->
-          {"intake_source_change_events_secret_set",
-           %{"change_events_secret_set" => is_binary(source.change_events_secret)}}
-      end
+    {action, payload} = update_entry(field, source)
 
     case AuditChain.append(tenant_id, %{
            action: action,
@@ -652,6 +640,32 @@ defmodule Loopctl.Intake do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp update_entry(:target_epic_id, source),
+    do: {"intake_source_repointed", %{"target_epic_id" => source.target_epic_id}}
+
+  defp update_entry(:base_branch, source),
+    do: {"intake_source_base_branch_set", %{"base_branch" => source.base_branch}}
+
+  defp update_entry(:mode, source),
+    do: {"intake_source_mode_set", %{"mode" => Atom.to_string(source.mode)}}
+
+  defp update_entry(:required_checks, source),
+    do: {"intake_source_required_checks_set", %{"required_checks" => source.required_checks}}
+
+  defp update_entry(:triage_requires_ticket, source),
+    do:
+      {"intake_source_triage_requires_ticket_set",
+       %{"triage_requires_ticket" => source.triage_requires_ticket}}
+
+  defp update_entry(:chg_root_dispatch_id, source),
+    do: {"intake_source_chg_root_set", %{"chg_root_dispatch_id" => source.chg_root_dispatch_id}}
+
+  # Whether a secret is set, never the secret: the chain is readable by every auditor.
+  defp update_entry(:change_events_secret, source),
+    do:
+      {"intake_source_change_events_secret_set",
+       %{"change_events_secret_set" => is_binary(source.change_events_secret)}}
 
   # AC-47.2.2: the root a `chg` source names is a CUSTODY INPUT (PRD §6) — later stories accept a
   # review only from a child of it and refuse it as a verifier — so it is checked against the

@@ -67,6 +67,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.GitRef
   alias Loopctl.Intake
+  alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners
@@ -159,12 +160,18 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   """
   @spec candidates(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
   def candidates(limit) when is_integer(limit) and limit > 0 do
+    # `bool_or/1` over a group of exactly one row is that row's flag: the aggregate is only how
+    # a grouped query is allowed to name it.
     bound_projects =
       from src in Source,
         where: is_nil(src.revoked_at),
         group_by: [src.tenant_id, src.project_id],
         having: count(src.id) == 1,
-        select: %{tenant_id: src.tenant_id, project_id: src.project_id}
+        select: %{
+          tenant_id: src.tenant_id,
+          project_id: src.project_id,
+          requires_ticket: fragment("bool_or(?)", src.triage_requires_ticket)
+        }
 
     live_triage =
       from d in DispatchRecord,
@@ -177,11 +184,22 @@ defmodule Loopctl.Delivery.TriageDispatcher do
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
         join: b in subquery(bound_projects),
         on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
+        join: rec in Record,
+        on: rec.id == st.intake_record_id and rec.tenant_id == st.tenant_id,
         left_join: live in subquery(live_triage),
         on: live.tenant_id == s.tenant_id and live.story_id == s.story_id,
         where: s.stage == :detected,
-        where: not is_nil(st.intake_record_id),
         where: is_nil(live.story_id),
+        # A source with `triage_requires_ticket` triages only an issue filed from a support
+        # ticket: one whose record carries the `ticket_id` `Loopctl.Intake.TicketFacts` keeps
+        # only when a single Ticket line AND a single HomeCareBilling footer agree on it. A
+        # structured fact, read as it stands after the latest delivery, and not one of the
+        # untrusted fields this module may never name. It is still a CLAIM: whoever can open
+        # an issue can type both lines, so on HCB's private repository this keeps out issues
+        # filed in any other format (its own sessions'), not a collaborator set on forging one.
+        # Any other story is simply not a candidate: it stays at `detected`, holds no slot and
+        # costs nothing.
+        where: not b.requires_ticket or not is_nil(rec.ticket_id),
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,

@@ -6,6 +6,11 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **ecto 3.14.3 for CVE-2026-118391 (2026-11-06)**, with ecto_sql 3.14.0, decimal 3.2.0 and
+  cowboy 2.20.0. Two more HIGH advisories are acknowledged in `mix.exs` because no fixed
+  release exists on hex: cowboy CVE-2026-115701 and cowlib CVE-2026-113431. Both are memory
+  exhaustion by a client of a Cowboy listener, and loopctl's only one is the `:9568` metrics
+  reporter on Fly's private network. A self-hoster who publishes that port is exposed.
 - **Production keeps both machines running at 1024mb (2026-11-02).** `fly.toml` now sets
   `memory = "1024mb"` and `min_machines_running = 2`, and drops `CLUSTER_PEERS_MAY_SUSPEND`,
   so a missing peer alarms `expected_peers_missing` again. A machine was OOM-killed at 512mb
@@ -48,6 +53,18 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Intake sources can triage only support-ticket issues (2026-11-06).**
+  `intake_sources.triage_requires_ticket` (migration
+  `20261106230000_add_triage_requires_ticket_to_intake_sources`, boolean, NOT NULL, default
+  false, so every existing source triages every issue as before). True makes the triage
+  dispatcher pick only stories whose intake record carries a `ticket_id`, which intake keeps
+  when an issue's single `#HCB-xxxxxxxx` Ticket line and HomeCareBilling footer agree; the
+  rest stay `detected` and use no runner. A format filter, not authentication: anyone who can
+  open an issue can type the format. Set it with `POST`/`PATCH /api/v1/intake/sources` or the
+  `intake_source_enroll` / `intake_source_update` tools; anything but a JSON boolean is a 422.
+- **Runner contract 1.24.0** publishes `x-connection.limits.lens_verdicts.max_bytes`, the cap
+  on a triage verdict's three lens verdicts together. Minor: a runner should re-vendor to read
+  the cap rather than hard-code it.
 - **A reopened issue whose loop has ended comes back to triage (US-47.10, #986).** Migration
   `20261019180000_add_generation_to_intake_records` adds `intake_records.generation`
   (default 1, so every existing row becomes generation 1) and replaces the unique index

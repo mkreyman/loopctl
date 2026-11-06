@@ -71,6 +71,7 @@ defmodule Loopctl.Intake.Source do
              :base_branch,
              :mode,
              :required_checks,
+             :triage_requires_ticket,
              :chg_root_dispatch_id,
              :target_epic_id,
              :revoked_at,
@@ -113,6 +114,17 @@ defmodule Loopctl.Intake.Source do
     # some has its (tenant, repository) credential resolved before any GitHub read
     # (`credential_unavailable` if there is none).
     field :required_checks, {:array, :string}, default: []
+
+    # WHICH ISSUES ARE TRIAGED. False (the default): every issue the webhook delivers, as
+    # before the field existed. True: only an issue whose intake record carries a `ticket_id`,
+    # which `Loopctl.Intake.TicketFacts` keeps only when one `#HCB-xxxxxxxx` Ticket line and
+    # one HomeCareBilling footer agree, as on an issue HomeCareBilling filed from a support
+    # ticket; any other stays at `detected` and costs nothing. Read at dispatch time, so an
+    # issue edited into or out of the format is judged as it stands. A FORMAT FILTER, not
+    # authentication: anyone who can open an issue can type both lines (a description that
+    # repeats them voids them instead), so it separates HCB's ticket issues from issues filed
+    # any other way, and trusts the repository's own write access for the rest.
+    field :triage_requires_ticket, :boolean, default: false
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
 
     # `:chg` only (see the moduledoc). Never in the encoder list: write-only.
@@ -150,6 +162,7 @@ defmodule Loopctl.Intake.Source do
     # the field gets its value validated rather than a silent substitution.
     |> cast(attrs, [:mode], empty_values: [])
     |> cast(attrs, [:required_checks], empty_values: [])
+    |> put_triage_requires_ticket(attrs)
     |> cast(attrs, [:change_events_secret, :chg_root_dispatch_id], empty_values: [])
     |> validate_required([:repo_full_name])
     |> validate_mode()
@@ -334,6 +347,30 @@ defmodule Loopctl.Intake.Source do
     do: name != "" and String.trim(name) == name and byte_size(name) <= @max_check_name_bytes
 
   defp usable_name?(_not_a_string), do: false
+
+  @doc """
+  Puts `attrs.triage_requires_ticket` on the changeset when it is NAMED, and only when it is a
+  JSON boolean; absent leaves the row as it is. Every path that writes the flag goes through
+  this.
+
+  NOT an Ecto cast: the `:boolean` type also accepts `"true"`, `"false"`, `"1"` and `"0"`, so
+  `"0"` sent to a field documented as a boolean would silently turn the filter off. Null and
+  every other value are a 422, as for `base_branch` and `mode`: a caller that sent a value
+  gets an answer about it.
+  """
+  @spec put_triage_requires_ticket(Ecto.Changeset.t(), map()) :: Ecto.Changeset.t()
+  def put_triage_requires_ticket(%Ecto.Changeset{} = changeset, attrs) when is_map(attrs) do
+    case Map.fetch(attrs, :triage_requires_ticket) do
+      :error ->
+        changeset
+
+      {:ok, value} when is_boolean(value) ->
+        put_change(changeset, :triage_requires_ticket, value)
+
+      {:ok, _not_a_boolean} ->
+        add_error(changeset, :triage_requires_ticket, "must be true or false")
+    end
+  end
 
   @doc "The modes a source may take."
   @spec modes() :: [atom()]

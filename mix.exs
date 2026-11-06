@@ -49,6 +49,18 @@ defmodule Loopctl.MixProject do
           # (config/config.exs, Bandit.PhoenixAdapter). The metrics endpoint emits no
           # structured headers built from untrusted input. Recheck when cowlib > 2.21.0.
           "CVE-2026-43966",
+          # Two more against the same metrics-only Cowboy stack (2026-11-06), neither with
+          # a patched release on hex: OSV records each fix only as a git commit.
+          # CVE-2026-115701 (HIGH): cowboy HTTP/1.1 buffers pipelined data without bound,
+          # introduced 2.18.0, still flagged at 2.20.0, the newest on hex.
+          # CVE-2026-113431 (HIGH): cowlib's cow_http2_machine does not bound a decoded
+          # header list (HPACK amplification), introduced 2.7.0; 2.21.0 is the newest.
+          # Both are memory exhaustion by a client of a Cowboy listener, and the only one is
+          # the :9568 metrics reporter, reachable only by Fly's scraper on private 6PN
+          # (fly.toml [metrics]; it is not in http_service). The public API is Bandit.
+          # Recheck when cowboy > 2.20.0 or cowlib > 2.21.0.
+          "CVE-2026-115701",
+          "CVE-2026-113431",
           # No mint ignores remain: 1.10.2 (2026-09-29) backported the fixes for all
           # three advisories 1.11.0 carried (CVE-2026-91043 HIGH, CVE-2026-92103,
           # CVE-2026-94194), so the pin below 1.11.0 in deps/0 costs no security.
