@@ -1767,6 +1767,9 @@
         "per_string_char": 6,
         "text": "Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits."
       },
+      "lens_verdicts": {
+        "max_bytes": 9000
+      },
       "min_interval_ms": {
         "status": 1000,
         "trace": 50,
@@ -2030,5 +2033,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.23.0"
+  "x-contract-version": "1.24.0"
 }

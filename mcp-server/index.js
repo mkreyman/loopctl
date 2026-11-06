@@ -8988,6 +8988,15 @@ const TOOLS = [
             "read (`credential_unavailable` if there is none). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
         },
+        triage_requires_ticket: {
+          type: "boolean",
+          description:
+            "Optional, false when omitted. WHICH ISSUES ARE TRIAGED. False: every issue the " +
+            "webhook delivers. True: only an issue HomeCareBilling filed from a support " +
+            "ticket (its single `#HCB-xxxxxxxx` Ticket line, extracted as `ticket_ref`); every " +
+            "other issue stays `detected` and costs nothing. Null is refused (422). Changed " +
+            "later with intake_source_update.",
+        },
         secret_file: {
           type: "string",
           description:
@@ -9140,6 +9149,15 @@ const TOOLS = [
             "names some has its (tenant, repository) credential resolved before any GitHub " +
             "read (`credential_unavailable` if there is none). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused. Omit to leave the current list alone.",
+        },
+        triage_requires_ticket: {
+          type: "boolean",
+          description:
+            "WHICH ISSUES ARE TRIAGED. True: only an issue HomeCareBilling filed from a " +
+            "support ticket (its single `#HCB-xxxxxxxx` Ticket line, extracted as " +
+            "`ticket_ref`) is sent to triage; every other issue stays `detected` and costs " +
+            "nothing. False: every issue is triaged. Read at dispatch time, so it reaches the " +
+            "stories already waiting. Null is refused; omit the field to leave it alone.",
         },
       },
       required: ["source_id"],

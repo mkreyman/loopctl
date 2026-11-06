@@ -39,7 +39,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "a01a152b854be3f549bca095d5f783e9645928951e6e6f61d5a378013d25cca8"
+  @digest "24021b5557a8608982e42bb66ab927b1721ffa37d384a41cfa8d8a01a11a4113"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -73,8 +73,13 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.23.0"
-      assert schema["x-contract-version"] == "1.23.0"
+      assert RunnerContract.version() == "1.24.0"
+      assert schema["x-contract-version"] == "1.24.0"
+
+      # 1.24.0: the cap on a message's three lens verdicts is published, from its declaration.
+      assert connection["limits"]["lens_verdicts"] == %{
+               "max_bytes" => RunnerContract.RunnerLensVerdict.max_bytes()
+             }
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",

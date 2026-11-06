@@ -4,6 +4,21 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **Intake sources can triage only support-ticket issues (2026-11-06).**
+  `intake_sources.triage_requires_ticket` (migration
+  `20261106230000_add_triage_requires_ticket_to_intake_sources`, boolean, NOT NULL, default
+  false, so every existing source triages every issue as before). True makes the triage
+  dispatcher pick only stories whose intake record carries a `ticket_ref`, the
+  `#HCB-xxxxxxxx` reference extracted from an issue HomeCareBilling filed from a support
+  ticket; the rest stay `detected` and use no runner. Set it with
+  `POST`/`PATCH /api/v1/intake/sources` or the `intake_source_enroll` /
+  `intake_source_update` tools; null is a 422.
+- **Runner contract 1.24.0** publishes `x-connection.limits.lens_verdicts.max_bytes`, the cap
+  on a triage verdict's three lens verdicts together. Minor: a runner should re-vendor to read
+  the cap rather than hard-code it.
+
 ### Changed
 
 - **Production keeps both machines running at 1024mb (2026-11-02).** `fly.toml` now sets

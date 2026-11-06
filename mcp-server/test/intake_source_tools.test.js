@@ -173,6 +173,7 @@ describe("intake_source_enroll", () => {
       "required_checks",
       "revoked_at",
       "target_epic_id",
+      "triage_requires_ticket",
       "updated_at",
     ]);
   });
@@ -1068,6 +1069,32 @@ describe("intake_source_update", () => {
     );
     assert.equal(refused.error, true);
     assert.equal(calls.length, 1, "a refused update must not reach the API");
+  });
+
+  test("triage_requires_ticket is forwarded on update, false included, and a non-boolean is refused", async () => {
+    const { calls, apiCall } = fakeApi({
+      source: { ...created().source, triage_requires_ticket: true },
+    });
+
+    const result = await updateIntakeSource(
+      { source_id: SOURCE_ID, triage_requires_ticket: true },
+      deps({ apiCall }),
+    );
+    assert.deepEqual(calls[0].body, { triage_requires_ticket: true });
+    assert.equal(result.source.triage_requires_ticket, true);
+
+    // False is a value, not "not named": it turns the filter off.
+    await updateIntakeSource({ source_id: SOURCE_ID, triage_requires_ticket: false }, deps({ apiCall }));
+    assert.deepEqual(calls[1].body, { triage_requires_ticket: false });
+
+    for (const bad of [null, "true", 1]) {
+      const refused = await updateIntakeSource(
+        { source_id: SOURCE_ID, triage_requires_ticket: bad },
+        deps({ apiCall }),
+      );
+      assert.equal(refused.error, true, JSON.stringify(bad));
+    }
+    assert.equal(calls.length, 2, "a refused update must not reach the API");
   });
 
   test("a null mode is refused locally on update, naming the reason", async () => {

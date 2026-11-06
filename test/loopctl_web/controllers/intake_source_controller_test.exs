@@ -494,6 +494,80 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
                )
     end
 
+    test "triage_requires_ticket is set, recorded and turned off by PATCH, and a bad value " <>
+           "changes nothing",
+         %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert AdminRepo.get!(Source, source.id).triage_requires_ticket == false
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"triage_requires_ticket" => true})
+        |> json_response(200)
+
+      assert body["source"]["triage_requires_ticket"] == true
+      assert AdminRepo.get!(Source, source.id).triage_requires_ticket == true
+
+      assert [%{payload: %{"triage_requires_ticket" => true}}] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and
+                       e.action == "intake_source_triage_requires_ticket_set"
+               )
+
+      # Null has no meaning for a NOT NULL flag and a non-boolean is not one, so each is a 422
+      # and the stored value stands.
+      for bad <- [nil, "maybe", 7] do
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"triage_requires_ticket" => bad})
+        |> json_response(422)
+
+        assert AdminRepo.get!(Source, source.id).triage_requires_ticket == true
+      end
+
+      off =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"triage_requires_ticket" => false})
+        |> json_response(200)
+
+      assert off["source"]["triage_requires_ticket"] == false
+      assert AdminRepo.get!(Source, source.id).triage_requires_ticket == false
+    end
+
+    test "triage_requires_ticket can be set at enrolment, and null there is a 422", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.put(create_params(ctx, "mkreyman/ticketed"), "triage_requires_ticket", true)
+        )
+        |> json_response(201)
+
+      assert body["source"]["triage_requires_ticket"] == true
+      assert AdminRepo.get!(Source, body["source"]["id"]).triage_requires_ticket == true
+
+      build_conn()
+      |> auth(ctx.operator_key)
+      |> post(
+        ~p"/api/v1/intake/sources",
+        Map.put(create_params(ctx, "mkreyman/nulled"), "triage_requires_ticket", nil)
+      )
+      |> json_response(422)
+    end
+
     test "an unknown or null mode is refused, and nothing changes", %{conn: conn} do
       ctx = operator_ctx()
 
