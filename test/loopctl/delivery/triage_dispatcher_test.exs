@@ -101,7 +101,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     test "a source that requires a ticket admits only issues filed from one", ctx do
       story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       {source_id, record_id} = source_and_record(ctx, story.id)
-      set_ticket_ref(record_id, nil)
+      set_ticket(record_id, nil)
 
       # False, the default: every issue is triaged, as before the field existed.
       assert story.id in candidate_ids(50)
@@ -111,13 +111,22 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       set_requires_ticket(source_id, true)
       refute story.id in candidate_ids(50)
 
+      # A Ticket line with no HomeCareBilling footer confirming it, the shape one typed line
+      # leaves, is a ref without an id: still not a candidate.
+      {1, _} =
+        AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+          set: [ticket_ref: "HCB-a1b2c3d4", ticket_id: nil]
+        )
+
+      refute story.id in candidate_ids(50)
+
       # The facts are re-extracted on every delivery, so an issue edited into the format is
       # judged as it now stands.
-      set_ticket_ref(record_id, "HCB-a1b2c3d4")
+      set_ticket(record_id, "a1b2c3d4-0000-4000-8000-000000000000")
       assert story.id in candidate_ids(50)
 
       # And turning the requirement off admits everything again.
-      set_ticket_ref(record_id, nil)
+      set_ticket(record_id, nil)
       set_requires_ticket(source_id, false)
       assert story.id in candidate_ids(50)
     end
@@ -128,7 +137,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       other = fixture(:detected_story, %{tenant_id: other_tenant.id})
       {other_source_id, other_record_id} = source_and_record(%{tenant: other_tenant}, other.id)
 
-      set_ticket_ref(other_record_id, nil)
+      set_ticket(other_record_id, nil)
       set_requires_ticket(other_source_id, true)
 
       ids = candidate_ids(50)
@@ -461,10 +470,13 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       )
   end
 
-  defp set_ticket_ref(record_id, ref) do
+  defp set_ticket(record_id, ticket_id) do
     {1, _} =
       AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
-        set: [ticket_ref: ref]
+        set: [
+          ticket_ref: ticket_id && "HCB-" <> String.slice(ticket_id, 0, 8),
+          ticket_id: ticket_id
+        ]
       )
   end
 

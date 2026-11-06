@@ -108,9 +108,13 @@ defmodule LoopctlWeb.IntakeSourceController do
                                 "the webhook delivers. True: only an issue HomeCareBilling " <>
                                 "filed from a support ticket, recognised by the single " <>
                                 "`#HCB-xxxxxxxx` Ticket line intake extracts as " <>
-                                "`ticket_ref`; every other issue stays detected and costs " <>
-                                "nothing. Read at dispatch time. NOT nullable: null or a " <>
-                                "non-boolean is a 422."
+                                "`ticket_ref`, confirmed by its footer; every other issue " <>
+                                "stays detected and costs nothing. Read at dispatch time. A " <>
+                                "format filter, not authentication: anyone who can open an " <>
+                                "issue can type the format. NOT nullable: null, a string " <>
+                                "(`true` and `0` as strings included) or any other " <>
+                                "non-boolean " <>
+                                "is a 422."
 
   @source_schema %Schema{
     type: :object,

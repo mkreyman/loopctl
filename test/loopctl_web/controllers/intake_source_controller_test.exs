@@ -522,8 +522,9 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
                )
 
       # Null has no meaning for a NOT NULL flag and a non-boolean is not one, so each is a 422
-      # and the stored value stands.
-      for bad <- [nil, "maybe", 7] do
+      # and the stored value stands. The strings Ecto's `:boolean` would accept are the case
+      # that matters: `"0"` silently turning the filter off is what a cast would allow.
+      for bad <- [nil, "maybe", 7, "false", "0", "true", "1"] do
         build_conn()
         |> auth(ctx.operator_key)
         |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"triage_requires_ticket" => bad})

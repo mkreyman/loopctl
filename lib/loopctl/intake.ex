@@ -559,17 +559,7 @@ defmodule Loopctl.Intake do
         do: cast_required_checks(changeset, attrs),
         else: changeset
 
-    changeset =
-      if :triage_requires_ticket in fields,
-        do:
-          changeset
-          |> Ecto.Changeset.cast(
-            Map.take(attrs, [:triage_requires_ticket]),
-            [:triage_requires_ticket],
-            empty_values: []
-          )
-          |> Source.validate_triage_requires_ticket(),
-        else: changeset
+    changeset = Source.put_triage_requires_ticket(changeset, attrs)
 
     with {:ok, changeset} <- valid(changeset) do
       write_update(tenant_id, changeset, fields, opts)

@@ -116,12 +116,14 @@ defmodule Loopctl.Intake.Source do
     field :required_checks, {:array, :string}, default: []
 
     # WHICH ISSUES ARE TRIAGED. False (the default): every issue the webhook delivers, as
-    # before the field existed. True: only an issue whose intake record carries a
-    # `ticket_ref`, the `#HCB-xxxxxxxx` reference `Loopctl.Intake.TicketFacts` extracts from
-    # an issue HomeCareBilling filed from a support ticket; any other stays at `detected` and
-    # costs nothing. Read at dispatch time, so an issue edited into or out of the format is
-    # judged as it stands. The reference is a structured fact, never prose, and a reporter who
-    # types a second Ticket line voids it rather than forging one (`structured_field_spoof`).
+    # before the field existed. True: only an issue whose intake record carries a `ticket_id`,
+    # which `Loopctl.Intake.TicketFacts` keeps only when one `#HCB-xxxxxxxx` Ticket line and
+    # one HomeCareBilling footer agree, as on an issue HomeCareBilling filed from a support
+    # ticket; any other stays at `detected` and costs nothing. Read at dispatch time, so an
+    # issue edited into or out of the format is judged as it stands. A FORMAT FILTER, not
+    # authentication: anyone who can open an issue can type both lines (a description that
+    # repeats them voids them instead), so it separates HCB's ticket issues from issues filed
+    # any other way, and trusts the repository's own write access for the rest.
     field :triage_requires_ticket, :boolean, default: false
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
 
@@ -160,12 +162,11 @@ defmodule Loopctl.Intake.Source do
     # the field gets its value validated rather than a silent substitution.
     |> cast(attrs, [:mode], empty_values: [])
     |> cast(attrs, [:required_checks], empty_values: [])
-    |> cast(attrs, [:triage_requires_ticket], empty_values: [])
+    |> put_triage_requires_ticket(attrs)
     |> cast(attrs, [:change_events_secret, :chg_root_dispatch_id], empty_values: [])
     |> validate_required([:repo_full_name])
     |> validate_mode()
     |> validate_required_checks()
-    |> validate_triage_requires_ticket()
     |> validate_base_branch()
     |> validate_format(:repo_full_name, @repo_format, message: "must be owner/name")
     |> check_constraint(:repo_full_name, name: :intake_sources_repo_shape)
@@ -348,17 +349,27 @@ defmodule Loopctl.Intake.Source do
   defp usable_name?(_not_a_string), do: false
 
   @doc """
-  `triage_requires_ticket` must be `true` or `false` on every path that writes it. NOT NULL:
-  an explicit null is a 422 rather than a fall back to the default, the choice `base_branch`
-  and `mode` make, because a caller that sent a value gets an answer about it. A non-boolean
-  is refused by the cast itself.
+  Puts `attrs.triage_requires_ticket` on the changeset when it is NAMED, and only when it is a
+  JSON boolean; absent leaves the row as it is. Every path that writes the flag goes through
+  this.
+
+  NOT an Ecto cast: the `:boolean` type also accepts `"true"`, `"false"`, `"1"` and `"0"`, so
+  `"0"` sent to a field documented as a boolean would silently turn the filter off. Null and
+  every other value are a 422, as for `base_branch` and `mode`: a caller that sent a value
+  gets an answer about it.
   """
-  @spec validate_triage_requires_ticket(Ecto.Changeset.t()) :: Ecto.Changeset.t()
-  def validate_triage_requires_ticket(%Ecto.Changeset{} = changeset) do
-    if Map.has_key?(changeset.changes, :triage_requires_ticket) and
-         is_nil(changeset.changes.triage_requires_ticket),
-       do: add_error(changeset, :triage_requires_ticket, "must be true or false"),
-       else: changeset
+  @spec put_triage_requires_ticket(Ecto.Changeset.t(), map()) :: Ecto.Changeset.t()
+  def put_triage_requires_ticket(%Ecto.Changeset{} = changeset, attrs) when is_map(attrs) do
+    case Map.fetch(attrs, :triage_requires_ticket) do
+      :error ->
+        changeset
+
+      {:ok, value} when is_boolean(value) ->
+        put_change(changeset, :triage_requires_ticket, value)
+
+      {:ok, _not_a_boolean} ->
+        add_error(changeset, :triage_requires_ticket, "must be true or false")
+    end
   end
 
   @doc "The modes a source may take."

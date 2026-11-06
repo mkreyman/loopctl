@@ -8993,8 +8993,10 @@ const TOOLS = [
           description:
             "Optional, false when omitted. WHICH ISSUES ARE TRIAGED. False: every issue the " +
             "webhook delivers. True: only an issue HomeCareBilling filed from a support " +
-            "ticket (its single `#HCB-xxxxxxxx` Ticket line, extracted as `ticket_ref`); every " +
-            "other issue stays `detected` and costs nothing. Null is refused (422). Changed " +
+            "ticket (its single `#HCB-xxxxxxxx` Ticket line confirmed by the HomeCareBilling " +
+            "footer, recorded as `ticket_id`); every other issue stays `detected` and costs " +
+            "nothing. A format filter, not authentication. Anything but a boolean is refused " +
+            "(422). Changed " +
             "later with intake_source_update.",
         },
         secret_file: {
@@ -9154,8 +9156,9 @@ const TOOLS = [
           type: "boolean",
           description:
             "WHICH ISSUES ARE TRIAGED. True: only an issue HomeCareBilling filed from a " +
-            "support ticket (its single `#HCB-xxxxxxxx` Ticket line, extracted as " +
-            "`ticket_ref`) is sent to triage; every other issue stays `detected` and costs " +
+            "support ticket (its single `#HCB-xxxxxxxx` Ticket line confirmed by the " +
+            "HomeCareBilling footer, recorded as `ticket_id`) is sent to triage; a format " +
+            "filter, not authentication. Every other issue stays `detected` and costs " +
             "nothing. False: every issue is triaged. Read at dispatch time, so it reaches the " +
             "stories already waiting. Null is refused; omit the field to leave it alone.",
         },

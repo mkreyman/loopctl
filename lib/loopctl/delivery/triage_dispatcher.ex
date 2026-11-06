@@ -191,11 +191,15 @@ defmodule Loopctl.Delivery.TriageDispatcher do
         where: s.stage == :detected,
         where: is_nil(live.story_id),
         # A source with `triage_requires_ticket` triages only an issue filed from a support
-        # ticket: one whose record carries the `ticket_ref` `Loopctl.Intake.TicketFacts`
-        # extracted. A structured fact, read as it stands after the latest delivery, and not one
-        # of the untrusted fields this module may never name. Any other story is simply not a
-        # candidate: it stays at `detected`, holds no slot and costs nothing.
-        where: not b.requires_ticket or not is_nil(rec.ticket_ref),
+        # ticket: one whose record carries the `ticket_id` `Loopctl.Intake.TicketFacts` keeps
+        # only when a single Ticket line AND a single HomeCareBilling footer agree on it. A
+        # structured fact, read as it stands after the latest delivery, and not one of the
+        # untrusted fields this module may never name. It is still a CLAIM: whoever can open
+        # an issue can type both lines, so on HCB's private repository this keeps out issues
+        # filed in any other format (its own sessions'), not a collaborator set on forging one.
+        # Any other story is simply not a candidate: it stays at `detected`, holds no slot and
+        # costs nothing.
+        where: not b.requires_ticket or not is_nil(rec.ticket_id),
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,
