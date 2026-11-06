@@ -21,12 +21,14 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   ## Selection
 
-  Oldest first, and FAIR ACROSS TENANTS: the read ranks each tenant's queue separately and
-  takes every tenant's oldest story before any tenant's second. One bound is shared by the
-  whole fleet, so a plain global ordering let one tenant with a full queue consume every slot
-  of every pass, and no other tenant's work was ever looked at. Oldest-first WITHIN a tenant
-  is the part that cannot starve a story, and it is what
-  `Loopctl.Workers.TriageTriggerWorker.candidates/0` already uses.
+  FAIR ACROSS TENANTS, and across each tenant's PROJECTS: the read ranks each project's queue
+  oldest first, then takes every project's oldest before any project's second, and every
+  tenant's first before any tenant's second. One bound is shared by the whole fleet, so a
+  plain global ordering let one tenant with a full queue consume every slot of every pass, and
+  no other tenant's work was ever looked at. A plain oldest-first ranking within a tenant did
+  the same one level down: whether a runner takes a repository is decided per story, after
+  this read, so a project no runner accepts held the head of the queue for ever (2026-11-06).
+  Oldest-first WITHIN a project is the part that cannot starve a story.
 
   A candidate must also be `pending` or `contracted` (#884): `Placement.place/4` contracts a
   `pending` one before it mints, so a triage-accepted story, a release whose re-contract did
