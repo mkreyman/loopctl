@@ -196,10 +196,10 @@ defmodule LoopctlRunner.Control do
   because an `ok` that recorded the verdict and an `ok` that applied nothing are otherwise the
   same answer.
 
-  `triage` is NOT in `@kinds`, so none of this is reachable from the wire today: a triage dispatch
-  is refused `kind_not_supported` before the accept path is consulted. A pending triage start an
-  earlier build accepted is resumed like any other, and runs in a detached worktree of its own
-  (`LoopctlRunner.TriageRun`), never in the repository's live checkout.
+  The verdict travels with the three lenses' own judgements in `lens_verdicts` (1.15.0), which
+  Gate A reads (`LoopctlRunner.TriageVerdict.validate/1`). A pending triage start is resumed like
+  any other, and runs in a detached worktree of its own (`LoopctlRunner.TriageRun`), never in the
+  repository's live checkout.
 
   ## Reviews (contract 1.21.0)
 
@@ -390,14 +390,15 @@ defmodule LoopctlRunner.Control do
   # and its own start in `start_pending/2`. Declaring a kind whose dispatch this runner cannot
   # accept makes loopctl send it — the declaration decides — and every one is refused as `other`,
   # which suppresses nothing and records nothing, so the machine soaks that kind for as long as it
-  # declares it. `review` has both (contract 1.21.0); `triage` still has no lens verdicts
-  # (`LoopctlRunner.TriagePrompt`), so it stays undeclared. `contract_test` holds that canary.
+  # declares it. `triage` and `review` have both; `triage` became declarable once its session
+  # stated one lens verdict per lens beside the verdict (contract 1.15.0's `lens_verdicts`, which
+  # Gate A reads — without them every triage escalated). `contract_test` holds the set.
   #
   # EMPTY IS THE ONE VALUE THAT MUST NEVER SHIP. loopctl reads an empty array as no declaration
   # at all, falls back to its ledger, keeps sending `implement`, and caches the refusal
   # permanently for the life of this runner's row — the exact trap declaring exists to escape.
   # Draining is how this runner says it wants no work.
-  @kinds ["implement", "review"]
+  @kinds ["implement", "review", "triage"]
 
   if @kinds == [],
     do:

@@ -77,6 +77,44 @@ defmodule LoopctlRunner.TriageDispatchTest do
   end
 
   describe "the verdict message" do
+    # Gate A reads one `RunnerLensVerdict` per lens from the MESSAGE (1.15.0); a verdict without
+    # them escalates at triage, a confident `story` included. This is the path that stops it: the
+    # session states them in its one object, validation keeps them, and they leave beside the
+    # verdict rather than inside it.
+    test "a story with three lens verdicts and no gating codes carries them beside the verdict" do
+      story = %{
+        "outcome" => "story",
+        "confidence" => "high",
+        "story" => %{"title" => "T", "description" => "D", "acceptance_criteria" => ["A"]}
+      }
+
+      lenses =
+        for lens <- ~w(analyst architect engineer),
+            do: %{
+              "lens" => lens,
+              "outcome" => "story",
+              "confidence" => "high",
+              "escalation_reasons" => []
+            }
+
+      assert {:ok, statement} =
+               LoopctlRunner.TriageVerdict.validate(Map.put(story, "lens_verdicts", lenses))
+
+      assert {:ok, payload} = TriageDispatch.verdict_message(@binding, {:verdict, statement})
+
+      assert payload["verdict"] == story
+      refute Map.has_key?(payload["verdict"], "lens_verdicts")
+      assert payload["lens_verdicts"] == lenses
+      assert Contract.validate("RunnerTriageVerdictMessage", payload) == :ok
+      # Nothing gating is anywhere Gate A looks, so it has no reason to escalate this one.
+      gating = Map.fetch!(Contract.connection(), "triage_gating_reasons")
+
+      refute Enum.any?(
+               payload["lens_verdicts"],
+               &Enum.any?(&1["escalation_reasons"], fn r -> r in gating end)
+             )
+    end
+
     test "a verdict is stated alone, with no incomplete beside it" do
       assert {:ok, payload} = TriageDispatch.verdict_message(@binding, {:verdict, @verdict})
 

@@ -19,9 +19,15 @@ defmodule LoopctlRunner.TriageVerdict do
 
   A verdict that fails any of these is the session's mistake, not loopctl's, so it is reported
   as one: the run ends without a verdict and says which check refused it.
+
+  The same object carries `lens_verdicts`, the three lenses' own judgements that the message sends
+  beside the verdict and Gate A reads (contract 1.15.0). They are checked on their own and, unlike
+  the verdict, DROPPED rather than refused when they fail: `validate/1` says why.
   """
 
   alias LoopctlRunner.{ByteRule, Capability, Contract}
+
+  require Logger
 
   @definition "RunnerTriageVerdict"
   @verdict_file "verdict.json"
@@ -32,6 +38,43 @@ defmodule LoopctlRunner.TriageVerdict do
                Map.fetch!(Map.fetch!(Contract.connection(), "limits"), "triage_verdict"),
                "max_bytes"
              )
+
+  # `lens_verdicts` as the MESSAGE defines it, which is what loopctl validates: the field's own
+  # schema, items inline, read from `RunnerTriageVerdictMessage` and fetched so a rename fails the
+  # build. The lens names come from the same place.
+  @lens_key "lens_verdicts"
+  @lens_schema Contract.schema_def("RunnerTriageVerdictMessage")
+               |> Map.fetch!("properties")
+               |> Map.fetch!(@lens_key)
+  @lens_names @lens_schema
+              |> Map.fetch!("items")
+              |> Map.fetch!("properties")
+              |> Map.fetch!("lens")
+              |> Map.fetch!("enum")
+              |> Enum.sort()
+
+  # THE CAP ON ALL THREE TOGETHER, under the byte rule, which the field maxima do not imply: three
+  # lenses at every maxLength are 8402 bytes in ASCII and about twice that in astral characters.
+  # Read from the vendored file, never typed: from `limits.lens_verdicts.max_bytes` once a vendoring
+  # publishes it there (loopctl 1.24.0), and until then from the field's own description, where
+  # 1.15.0 states it ("At most N bytes for all three under the byte rule"). Neither present fails
+  # the build, because a missing cap is a set loopctl refuses whole, taking the verdict with it.
+  @lens_max_bytes (case get_in(Contract.connection(), ["limits", @lens_key, "max_bytes"]) do
+                     max when is_integer(max) ->
+                       max
+
+                     nil ->
+                       case Regex.run(
+                              ~r/At most (\d+) bytes for all three under the byte rule/,
+                              Map.fetch!(@lens_schema, "description")
+                            ) do
+                         [_, digits] ->
+                           String.to_integer(digits)
+
+                         nil ->
+                           raise "the vendored contract states no byte cap for lens_verdicts"
+                       end
+                   end)
 
   @type verdict :: %{String.t() => term()}
 
@@ -106,13 +149,107 @@ defmodule LoopctlRunner.TriageVerdict do
   defp invalid({:error, reason}) when is_binary(reason), do: {:error, {:invalid, reason}}
   defp invalid(result), do: result
 
-  @doc "Validates a verdict against the contract, its conditional shape and the byte rule."
+  @doc """
+  Validates what a session stated: the verdict against the contract, its conditional shape and the
+  byte rule, and the `lens_verdicts` stated beside it.
+
+  The session states ONE object: the `RunnerTriageVerdict` fields, plus `lens_verdicts` — the
+  three lenses' own judgements, which the message carries BESIDE the verdict (contract 1.15.0) and
+  never inside it. They are split here, so every check on the verdict sees the verdict alone, and
+  rejoined on the way out for `LoopctlRunner.TriageDispatch` to place in the message.
+
+  LENS VERDICTS THAT FAIL ARE DROPPED, NEVER THE VERDICT. A verdict without them still reaches
+  loopctl, which escalates it at triage because Gate A cannot be evaluated — a person sees it,
+  with its evidence. Refusing the whole statement instead would turn that into `verdict_invalid`,
+  a run that produced nothing, and the session cannot restate it: it is over by the time this
+  runs. A dropped set is logged as an error; a missing one is an error unless the verdict was an
+  `escalate` already, which it costs nothing.
+  """
   @spec validate(verdict()) :: {:ok, verdict()} | {:error, String.t()}
-  def validate(verdict) when is_map(verdict) do
+  def validate(statement) when is_map(statement) do
+    {lenses, verdict} = Map.pop(statement, @lens_key)
+
     with :ok <- against_contract(verdict),
          :ok <- story_matches_outcome(verdict),
          :ok <- within_byte_rule(verdict) do
-      {:ok, verdict}
+      {:ok, with_lenses(verdict, lenses)}
+    end
+  end
+
+  # Missing lens verdicts cost something only when the verdict was NOT already an escalate: Gate A
+  # then overturns the session's `story` or `reject`. An escalate loses nothing, and the empty
+  # report is told to leave them out, so that case is noted rather than raised as an error.
+  defp with_lenses(%{"outcome" => "escalate"} = verdict, nil) do
+    Logger.info("this run's escalate verdict carries no lens_verdicts; it escalates as stated")
+    verdict
+  end
+
+  defp with_lenses(verdict, nil) do
+    Logger.error(
+      "this run's #{verdict["outcome"]} verdict carries no lens_verdicts; loopctl escalates it " <>
+        "at triage because Gate A cannot be evaluated without one judgement per lens"
+    )
+
+    verdict
+  end
+
+  defp with_lenses(verdict, lenses) do
+    case validate_lens_verdicts(lenses) do
+      :ok ->
+        Map.put(verdict, @lens_key, lenses)
+
+      {:error, reason} ->
+        Logger.error(
+          "this run's lens_verdicts were dropped and the verdict sent without them, so loopctl " <>
+            "escalates it at triage: #{reason}"
+        )
+
+        verdict
+    end
+  end
+
+  @doc """
+  Whether `lens_verdicts` is what the message admits: the contract's own schema for the field, and
+  the rule its description states in prose and the schema cannot — every lens it names, each
+  exactly once.
+  """
+  @spec validate_lens_verdicts(term()) :: :ok | {:error, String.t()}
+  def validate_lens_verdicts(lenses) do
+    with :ok <- lenses_against_contract(lenses),
+         :ok <- each_lens_once(lenses) do
+      lenses_within_byte_rule(lenses)
+    end
+  end
+
+  defp each_lens_once(lenses) do
+    named = lenses |> Enum.map(& &1["lens"]) |> Enum.sort()
+
+    if named == @lens_names,
+      do: :ok,
+      else:
+        {:error,
+         "lens_verdicts names #{inspect(named)}; it must name each of " <>
+           "#{inspect(@lens_names)} exactly once"}
+  end
+
+  defp lenses_within_byte_rule(lenses) do
+    bytes = ByteRule.bytes(lenses)
+
+    if bytes <= @lens_max_bytes,
+      do: :ok,
+      else:
+        {:error,
+         "lens_verdicts is #{bytes} bytes under the contract's byte rule, over #{@lens_max_bytes}"}
+  end
+
+  @doc "The cap the vendored contract states for the three lens verdicts together."
+  @spec lens_max_bytes() :: pos_integer()
+  def lens_max_bytes, do: @lens_max_bytes
+
+  defp lenses_against_contract(lenses) do
+    case Contract.validate_against(@lens_schema, lenses, @lens_key) do
+      :ok -> :ok
+      {:error, errors} -> {:error, Enum.join(errors, "; ")}
     end
   end
 

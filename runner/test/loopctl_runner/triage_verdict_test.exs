@@ -20,6 +20,104 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
   defp state(reason), do: {:error, reason}
 
+  describe "the lens verdicts stated beside it" do
+    import ExUnit.CaptureLog
+
+    defp lenses(overrides \\ %{}) do
+      for lens <- ~w(analyst architect engineer),
+          do:
+            Map.merge(
+              %{"lens" => lens, "outcome" => "escalate", "confidence" => "low"},
+              overrides
+            )
+    end
+
+    test "three, one per lens, are kept and the verdict is checked without them" do
+      statement = Map.put(verdict(), "lens_verdicts", lenses())
+      assert TriageVerdict.validate(statement) == {:ok, statement}
+    end
+
+    test "a set that is not one per lens is dropped, the verdict kept, and the reason logged" do
+      [first | _] = lenses()
+
+      for {bad, why} <- [
+            {[first, first, first], "exactly once"},
+            {Enum.take(lenses(), 2), "exactly once"},
+            {lenses(%{"outcome" => "maybe"}), "lens_verdicts"},
+            {"three lenses", "lens_verdicts"}
+          ] do
+        log =
+          capture_log(fn ->
+            assert TriageVerdict.validate(Map.put(verdict(), "lens_verdicts", bad)) ==
+                     {:ok, verdict()}
+          end)
+
+        assert log =~ "dropped"
+        assert log =~ why
+      end
+    end
+
+    test "none at all still sends the verdict; an error only when Gate A will overturn it" do
+      story = verdict(%{"outcome" => "reject"})
+
+      for missing <- [story, Map.put(story, "lens_verdicts", nil)] do
+        log =
+          capture_log([level: :error], fn ->
+            assert TriageVerdict.validate(missing) == {:ok, story}
+          end)
+
+        assert log =~ "reject verdict carries no lens_verdicts"
+      end
+
+      # An escalate escalates anyway, and the empty-report prompt tells the session to leave them
+      # out: no error for the instructed case.
+      log =
+        capture_log([level: :error], fn ->
+          assert TriageVerdict.validate(verdict()) == {:ok, verdict()}
+        end)
+
+      refute log =~ "lens_verdicts"
+    end
+
+    test "a set over the byte cap the contract states is dropped, not sent to sink the verdict" do
+      # Read from the vendored file (1.15.0 states it in the field's description), never typed.
+      description =
+        Contract.schema_def("RunnerTriageVerdictMessage")["properties"]["lens_verdicts"][
+          "description"
+        ]
+
+      assert description =~ "At most #{TriageVerdict.lens_max_bytes()} bytes for all three"
+
+      # Every string inside its maxLength, so the schema passes; astral characters cost 12 bytes
+      # each under the byte rule, which puts the three over the cap.
+      crab = String.duplicate("🦀", 60)
+
+      over =
+        lenses(%{
+          "escalation_reasons" => [crab, crab, crab],
+          "contradicts" => [%{"kind" => "story", "ref" => crab, "why" => crab}]
+        })
+
+      assert LoopctlRunner.ByteRule.bytes(over) > TriageVerdict.lens_max_bytes()
+      assert {:error, reason} = TriageVerdict.validate_lens_verdicts(over)
+      assert reason =~ "over #{TriageVerdict.lens_max_bytes()}"
+
+      log =
+        capture_log(fn ->
+          assert TriageVerdict.validate(Map.put(verdict(), "lens_verdicts", over)) ==
+                   {:ok, verdict()}
+        end)
+
+      assert log =~ "dropped"
+    end
+
+    test "a verdict that fails is refused whatever the lens verdicts beside it" do
+      statement = verdict(%{"outcome" => "story"}) |> Map.put("lens_verdicts", lenses())
+      assert {:error, reason} = TriageVerdict.validate(statement)
+      assert reason =~ "carries no draft story"
+    end
+  end
+
   describe "an escalation with no words" do
     @codes LoopctlRunner.TriagePrompt.reason_codes()
     @gating hd(Map.fetch!(@codes, :gating))

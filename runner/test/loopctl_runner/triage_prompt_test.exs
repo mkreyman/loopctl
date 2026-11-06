@@ -477,7 +477,38 @@ defmodule LoopctlRunner.TriagePromptTest do
 
     with_lenses = build_with_lenses()
     assert with_lenses =~ "lenses you dispatch apply this same test"
-    assert with_lenses =~ "carry it through into `escalation_reasons`"
+    assert with_lenses =~ "carry it through exactly as it wrote it, into that lens's"
+  end
+
+  test "lens_verdicts is required with a report, named in the contract's words, and omitted without" do
+    # Gate A reads one RunnerLensVerdict per lens (1.15.0); a verdict without them escalates every
+    # triage. The session must be told to state them, under the CONTRACT's lens names.
+    with_lenses = build_with_lenses()
+    assert with_lenses =~ "`lens_verdicts` is REQUIRED"
+
+    for {agent, lens} <- [
+          {"triage-analyst", "analyst"},
+          {"triage-architect", "architect"},
+          {"triage-engineer", "engineer"}
+        ],
+        do: assert(with_lenses =~ "`#{lens}` for `#{agent}`")
+
+    # Each lens's own codes, and only codes: the gate reads them nowhere else.
+    assert with_lenses =~ "holds ONLY the bare codes THAT lens reported"
+    assert with_lenses =~ "\"lens_verdicts\": [...]"
+    # One story about what a lens states, everywhere: its own judgement, never the run's verdict.
+    assert with_lenses =~ "none of them states the run's verdict"
+    refute with_lenses =~ "none of them states a verdict"
+
+    # The session that judges the three readings itself still states one entry per reading.
+    without = build()
+    assert without =~ "`lens_verdicts` is REQUIRED"
+    assert without =~ "your three readings, named `analyst`, `architect`, `engineer`"
+
+    # No report: no lens read anything, so nothing is recorded as a lens's judgement.
+    empty = build_with_lenses(%{"untrusted" => ""})
+    assert empty =~ "`lens_verdicts` — leave it out"
+    refute empty =~ "`lens_verdicts` is REQUIRED"
   end
 
   test "the reasons cap is the contract's, and the prompt says codes go in first" do

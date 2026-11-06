@@ -1,13 +1,11 @@
 defmodule LoopctlRunner.ControlTriageTest do
   @moduledoc """
-  The triage half of the accept path: what a `triage` dispatch is answered with today, and what a
-  triage run's verdict does on the wire.
+  The triage half of the accept path: what a `triage` dispatch is answered with, and what a triage
+  run's verdict does on the wire.
 
-  `triage` is not in `Control.kinds/0`, so a triage dispatch from loopctl is refused
-  `kind_not_supported` before the accept path is consulted — the first test pins exactly that. The
-  rest drive the two routes that do not go through the kind check, both of them real sequences: a
-  pending start this runner had already accepted and recorded on disk, and the outcome message a
-  triage run sends back to whichever Control is alive.
+  The first test drives a dispatch from the wire to a verdict carrying its lens verdicts. The rest
+  drive the two other real sequences: a pending start this runner had already accepted and
+  recorded on disk, and the outcome message a triage run sends back to whichever Control is alive.
   """
 
   # One shared test server and its script: these run serially.
@@ -17,7 +15,6 @@ defmodule LoopctlRunner.ControlTriageTest do
     Contract,
     Control,
     ControlConfig,
-    Owner,
     PendingStarts,
     PendingVerdicts,
     Reaper,
@@ -213,30 +210,48 @@ defmodule LoopctlRunner.ControlTriageTest do
     Process.exit(task, :kill)
   end
 
-  describe "a triage dispatch today" do
-    test "is refused kind_not_supported however well formed it is, and starts nothing", ctx do
-      {pid, topic} = running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+  describe "a triage dispatch" do
+    # End to end, from the wire: the declared kind is accepted, the session runs, and what it
+    # stated reaches loopctl as a verdict WITH one lens verdict per lens beside it — the one shape
+    # Gate A can evaluate rather than escalate.
+    test "is accepted, runs, and its verdict reaches loopctl with its lens verdicts", ctx do
+      story = %{
+        "outcome" => "story",
+        "confidence" => "high",
+        "story" => %{"title" => "T", "description" => "D", "acceptance_criteria" => ["A"]}
+      }
+
+      lenses =
+        for lens <- ~w(analyst architect engineer),
+            do: %{"lens" => lens, "outcome" => "story", "confidence" => "high"}
+
+      TestLoopctl.put(:triage_verdict_replies, [:ok])
+
+      {pid, topic} =
+        running_control(ctx, [
+          {"FAKE_CLAUDE_MODE", "stream"},
+          {"FAKE_VERDICT", Jason.encode!(Map.put(story, "lens_verdicts", lenses))}
+        ])
+
+      assert "triage" in Control.kinds()
       dispatch = triage_dispatch()
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert reply["dispatch_id"] == dispatch["dispatch_id"]
+      assert reply["decision"] == "accepted"
 
-      assert reply == %{
+      assert next_verdict() == %{
                "dispatch_id" => dispatch["dispatch_id"],
                "claim_epoch" => 3,
-               "decision" => "refused",
-               "reason" => "kind_not_supported",
-               "detail" => "this runner runs only: implement, review"
+               "verdict" => story,
+               "lens_verdicts" => lenses
              }
 
-      # The declaration and the check are one list, and triage is in neither.
-      refute "triage" in Control.kinds()
+      :ok = wait_until(fn -> Control.info(pid).triage_verdicts_pending == 0 end, 5_000)
 
-      refute_receive {:test_loopctl, {:triage_verdict, _}}, 500
-      assert Control.info(pid).runs_in_flight == []
-      assert Control.info(pid).pending_starts == []
-      assert RunState.all(ctx.config.runs_dir) == []
-      assert PendingStarts.all(ctx.config.runs_dir) == []
+      assert [{_dir, %{"kind" => "triage", "status" => "verdict"}}] =
+               RunState.all(ctx.config.runs_dir)
     end
   end
 
@@ -317,7 +332,7 @@ defmodule LoopctlRunner.ControlTriageTest do
       past = DateTime.utc_now() |> DateTime.add(-60, :second)
 
       triage_run = fn config, triage, repo, opts ->
-        LoopctlRunner.TriageRun.execute(
+        TriageRun.execute(
           config,
           triage,
           repo,
@@ -325,8 +340,7 @@ defmodule LoopctlRunner.ControlTriageTest do
         )
       end
 
-      # Through a pending start: this runner declares no triage kind, so one reaches it only as an
-      # accept it already gave.
+      # Through a pending start: an accept this runner already gave.
       dispatch = triage_dispatch()
       :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
 
@@ -346,11 +360,12 @@ defmodule LoopctlRunner.ControlTriageTest do
       assert Process.alive?(pid)
       assert Control.info(pid).joined
 
-      # And forgotten: loopctl's re-send is decided afresh — here refused, since this runner
-      # declares no triage kind — never answered `accepted` with nothing running.
+      # And forgotten: loopctl's re-send is decided afresh and starts a run of its own, rather
+      # than being answered from the run that ended.
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
-      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "refused"}}}, 5_000
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      :ok = wait_until(fn -> length(RunState.all(ctx.config.runs_dir)) == 2 end, 10_000)
     end
 
     test "whose verdict its Control died before delivering is sent by the next one", ctx do

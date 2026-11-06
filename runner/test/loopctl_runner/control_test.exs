@@ -60,7 +60,7 @@ defmodule LoopctlRunner.ControlTest do
     assert join["contract_version"] == "1.22.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
-    assert join["kinds"] == ["implement", "review"]
+    assert join["kinds"] == ["implement", "review", "triage"]
     # Non-empty ON THE WIRE, which is where it decides anything: loopctl reads an empty array as
     # no declaration at all and falls back to its permanent ledger.
     refute join["kinds"] == []
@@ -345,7 +345,7 @@ defmodule LoopctlRunner.ControlTest do
       assert %{joined: true, draining: true, accepts_dispatches: false} = Control.info(pid)
     end
 
-    test "under a service manager the config decides, and nothing overrides it", ctx do
+    test "under a service manager the config decides, and nothing overrides it", _ctx do
       # The other half: without the marker the task's refusal must not leak into the release
       # path, where the unit's environment is the clean one and the config is the authority.
       System.delete_env(LoopctlRunner.Application.refuse_dispatches_var())
@@ -3643,7 +3643,11 @@ defmodule LoopctlRunner.ControlTest do
       assert_receive {:delivered, ^message}, 1_000
     end
 
-    test "a dispatch without a story is refused as other, a triage one as kind_not_supported",
+    # Every kind the vendored contract dispatches is declared now, so no schema-valid dispatch can
+    # draw `kind_not_supported`: a kind outside the contract's enum is refused `other` by validation
+    # first. That is the right answer — it is a malformed message, not a statement of capability —
+    # and `declared_kind/1` stays for the vendoring that adds a kind this runner does not run.
+    test "a dispatch without a story, or of a kind the contract does not name, is refused as other",
          ctx do
       {pid, topic} = accepting_control(ctx, "stream")
 
@@ -3654,26 +3658,18 @@ defmodule LoopctlRunner.ControlTest do
       assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
       assert detail == "the dispatch carries no story"
 
-      triage = story_dispatch(%{"kind" => "triage"})
-      TestLoopctl.Endpoint.broadcast(topic, "dispatch", triage)
+      undeclared = story_dispatch(%{"kind" => "deploy"})
+      refute "deploy" in LoopctlRunner.Control.kinds()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", undeclared)
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
 
-      assert %{"decision" => "refused", "reason" => "kind_not_supported", "detail" => detail} =
-               reply
+      assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
+      assert detail =~ "RunnerDispatch.kind"
 
-      # The refusal names the declaration, from the same list the join sends.
-      assert detail == "this runner runs only: implement, review"
-      assert detail =~ Enum.join(LoopctlRunner.Control.kinds(), ", ")
-
-      # The kind is judged before policy, so a draining runner still answers kind_not_supported
-      # rather than draining: the reason states a capability, not a moment.
-      Control.set_draining(pid, true)
-      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch(%{"kind" => "triage"}))
-
-      assert_receive {:test_loopctl, {:dispatch_reply, %{"reason" => "kind_not_supported"}}},
-                     5_000
-
-      Control.set_draining(pid, false)
+      # And nothing the contract dispatches is undeclared, which is why the refusal above is the
+      # only one an unknown kind can draw.
+      dispatchable = Contract.connection()["dispatchable_kinds"]
+      assert Enum.sort(dispatchable) == Enum.sort(LoopctlRunner.Control.kinds())
 
       malformed = story_dispatch() |> put_in(["story", "title"], String.duplicate("a", 201))
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", malformed)

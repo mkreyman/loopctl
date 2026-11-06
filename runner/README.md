@@ -13,12 +13,12 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.22.0. The triage dispatch arrived in 1.7.0 and is NOT
-dispatchable here yet: the prompt a triage session reads and the verdict it states are built
-(`LoopctlRunner.TriagePrompt`, `LoopctlRunner.TriageVerdict`), while the accept path that would
-run one is not, and neither are the per-lens `lens_verdicts` (contract 1.15.0) without which Gate A
-escalates every triage verdict. This runner declares only `implement`, so loopctl sends it nothing
-else.
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.22.0. It
+declares `implement`, `review` and `triage`. A triage session dispatches three read-only lenses,
+each ending its report with its own outcome and confidence, and states one verdict with the
+per-lens `lens_verdicts` (contract 1.15.0) beside it, which is what Gate A reads
+(`LoopctlRunner.TriagePrompt`, `LoopctlRunner.TriageVerdict`). Lens verdicts that fail the
+contract are dropped rather than the verdict, which loopctl then escalates.
 
 The daemon has a dispatch accept path, off by default. With `control.accepts_dispatches` false
 (the default) it reports `draining: true` and refuses every `dispatch` with `dispatches_disabled`.
@@ -156,7 +156,7 @@ What the log says in each failure:
 | a metric cannot be read | `health sample omitted: cannot read <metric>`, once, until `health sample readable again` |
 | a dispatch arrives | `dispatch <id> received`, then either `dispatch <id> refused (<reason>): <detail>` and `dispatch_reply sent: refused (<reason>)`, or `dispatch <id> accepted: run of story-<story_id> starts once loopctl records it` and `dispatch_reply sent: accepted`; then `loopctl recorded the dispatch_reply`, all with `dispatch_id`, `story_id` and `claim_epoch` |
 | a dispatch is refused `other` | `the dispatch carries no story`, `the dispatch story <field> ...` for a malformed story, or `the dispatch does not make a runnable story: ...` |
-| a dispatch names a kind this runner does not declare | refused `kind_not_supported`, detail `this runner runs only: implement` |
+| a dispatch names a kind this runner does not declare | refused `kind_not_supported`, detail `this runner runs only: implement, review, triage`. Every kind the vendored contract dispatches is declared, so today a kind outside it is refused `other` by validation first |
 | a dispatch arrives again | `dispatch <id> was already accepted and started here; answering accepted again, starting nothing`; a different `claim_epoch` is refused `other` |
 | an accepted run moves | `stage report sent: claimed -> worktree`, then `loopctl recorded the stage claimed -> worktree`, and the same for `worktree -> implementing`. Reports outstanding when the channel closes are resent after the rejoin |
 | an accepted run ends | `session_ended sent: <reason>`, then `loopctl recorded session_ended (<reason>)` — with `; it was a resend, and loopctl applied nothing a second time` on a replay. A session that escalated first reports `-> escalated` with edge `session_escalated` and reason `run ended escalated; session exit reason ...; the session escalated: <text>`; a run with no session reports only that `-> escalated`, naming its status |

@@ -42,9 +42,9 @@ defmodule LoopctlRunner.TriagePrompt do
   # carried in the message's `lens_verdicts` — NOT in the verdict's own `escalation_reasons`, which
   # loopctl records verbatim. Gate A reads `lens_verdicts` at triage and again at merge, and a
   # `triage_verdict` sent WITHOUT them escalates at triage because the gate cannot be evaluated.
-  # This runner builds no `lens_verdicts` yet, and that is safe only because `triage` is not in
-  # `Control`'s kinds, so no triage dispatch reaches it. Adding the kind without building one lens
-  # verdict per lens would escalate EVERY triage, a confident `proceed` included.
+  # So the session states one `lens_verdicts` entry per lens beside its verdict, carrying the codes
+  # THAT lens reported (`lens_verdicts_bullet/2`), and `TriageVerdict.validate/1` checks them. A
+  # verdict without them escalates every triage, a confident `story` included.
   @gating_codes Map.fetch!(Contract.connection(), "triage_gating_reasons")
 
   # NOT published as gating, and that is what it is: Gate A collects every other code as a soft
@@ -181,7 +181,7 @@ defmodule LoopctlRunner.TriagePrompt do
        heredoc so the shell expands nothing in it, and then STOP:
 
            #{verdict_script()} #{token} <<'VERDICT'
-           {"outcome": "...", "confidence": "...", ...}
+           {"outcome": "...", "confidence": "...", ..., "lens_verdicts": [...]}
            VERDICT
 
        That token is yours. It is what makes the verdict the SESSION's rather than something a
@@ -219,6 +219,7 @@ defmodule LoopctlRunner.TriagePrompt do
     - `duplicate_of` is the UUID of an existing story this report already describes — a uuid, not
       an issue number, a title or a slug — the commonest outcome after `reject`, and the reason it
       has its own field.
+    - #{lens_verdicts_bullet(lenses, report?(triage["untrusted"]))}
     - Sizes: #{bounds()}. The WHOLE verdict must also be under #{max_bytes()} bytes, counted the
       contract's way: 6 bytes per character, 12 for one outside the Basic Multilingual Plane. An
       emoji therefore costs double, and every field at its maximum is already close to the cap, so
@@ -305,7 +306,9 @@ defmodule LoopctlRunner.TriagePrompt do
     do:
       " The lenses you dispatch apply this same test in these same words and report the answer" <>
         " to you; a lens reporting one of these codes is reporting a FACT it established, so" <>
-        " carry it through into `escalation_reasons` exactly as it wrote it."
+        " carry it through exactly as it wrote it, into that lens's `lens_verdicts` entry and" <>
+        " into your own `escalation_reasons`. Each lens ends its report with its OUTCOME and" <>
+        " CONFIDENCE, and those go into its entry unchanged."
 
   defp readings(lenses, report?)
 
@@ -313,8 +316,9 @@ defmodule LoopctlRunner.TriagePrompt do
     """
     Judge it through three lenses and keep them apart, yourself: the business question (is this
        actionable as written), the architectural one (does it fit what exists), and the
-       engineering one (is it implementable as scoped, and what would it break). Where they
-       disagree, do not pick a side: that disagreement is itself a reason to escalate.\
+       engineering one (is it implementable as scoped, and what would it break). Give each
+       reading its own outcome, confidence and codes, which are its `lens_verdicts` entry. Where
+       they disagree, do not pick a side: that disagreement is itself a reason to escalate.\
     """
   end
 
@@ -336,7 +340,8 @@ defmodule LoopctlRunner.TriagePrompt do
        intact: a lens has no way to read it otherwise, it is not in the checkout, and a lens told
        the report in your own words is being handed the reporter's text with the fence stripped
        off — by you, as if it were yours. Never paraphrase it, summarise it or quote part of it
-       into a lens's task. A lens reads and reports; none of them states a verdict. Where they
+       into a lens's task. A lens reads and reports, ending with its own OUTCOME and CONFIDENCE;
+       none of them states the run's verdict. Where they
        disagree, do not pick a side: that disagreement is itself a reason to escalate.\
     """
   end
@@ -524,4 +529,53 @@ defmodule LoopctlRunner.TriagePrompt do
   end
 
   defp inline(values), do: Enum.map_join(values, ", ", &"`#{&1}`")
+
+  # `lens_verdicts` as the message defines it, the bounds read from there like every other.
+  @lens_item Contract.schema_def("RunnerTriageVerdictMessage")
+             |> Map.fetch!("properties")
+             |> Map.fetch!("lens_verdicts")
+             |> Map.fetch!("items")
+  @lens_item_props Map.fetch!(@lens_item, "properties")
+  @lens_required Map.fetch!(@lens_item, "required")
+  @lens_reasons Map.fetch!(@lens_item_props, "escalation_reasons")
+  @lens_contradicts Map.fetch!(@lens_item_props, "contradicts")
+
+  # The bullet a session reads for `lens_verdicts`. Without a report no lens read anything, and
+  # three judgements made by nobody are not worth recording: the verdict is an escalate either way,
+  # and loopctl escalates one sent without them.
+  defp lens_verdicts_bullet(_lenses, false),
+    do:
+      "`lens_verdicts` — leave it out. There is no report, so no lens read one, and a judgement " <>
+        "no lens made is not one to record."
+
+  defp lens_verdicts_bullet(lenses, true) do
+    """
+    `lens_verdicts` is REQUIRED, and it is what the loop's gate reads. It is a list of exactly \
+    #{length(LoopctlRunner.TriageTools.contract_lenses())} objects, one per lens and each lens \
+    once: #{lens_names(lenses)}. Each has #{inline(@lens_required)} required, and optional \
+    `escalation_reasons` and `contradicts`. It carries THAT LENS's judgement, never yours: the \
+    OUTCOME and CONFIDENCE it reported, exactly as it reported them, even where it disagrees with \
+    your verdict — a disagreement smoothed over here is the one signal the loop loses. \
+    `escalation_reasons` in a lens's entry holds ONLY the bare codes THAT lens reported, never a \
+    sentence: at most #{@lens_reasons["maxItems"]} entries of \
+    #{get_in(@lens_reasons, ["items", "maxLength"])} characters, and an empty list when it \
+    reported none. The gate matches them WHOLE, and only here: a code missing from the lens's \
+    entry is a code the gate never sees, whatever your own `escalation_reasons` say. \
+    `contradicts` holds at most #{@lens_contradicts["maxItems"]} of that lens's, shaped like \
+    yours. A verdict sent without these reaches a person as an escalation, whatever its outcome. \
+    They are not counted in the verdict's byte cap below.\
+    """
+  end
+
+  defp lens_names([]),
+    do:
+      "your three readings, named " <>
+        inline(LoopctlRunner.TriageTools.contract_lenses()) <>
+        ", one for each question above"
+
+  defp lens_names(lenses),
+    do:
+      Enum.map_join(lenses, ", ", fn agent ->
+        "`#{LoopctlRunner.TriageTools.contract_lens(agent)}` for `#{agent}`"
+      end)
 end

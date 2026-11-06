@@ -198,7 +198,17 @@ defmodule LoopctlRunner.TriageDispatch do
     end
   end
 
-  defp put_outcome(payload, {:verdict, verdict}), do: Map.put(payload, "verdict", verdict)
+  # The session states the lens verdicts in the same object as its verdict, and the message carries
+  # them BESIDE it (`TriageVerdict.validate/1`, which has already checked them or dropped them).
+  defp put_outcome(payload, {:verdict, statement}) do
+    case Map.pop(statement, "lens_verdicts") do
+      {nil, verdict} ->
+        Map.put(payload, "verdict", verdict)
+
+      {lenses, verdict} ->
+        payload |> Map.put("verdict", verdict) |> Map.put("lens_verdicts", lenses)
+    end
+  end
 
   # The cap is applied HERE, in the shared constructor, and not only by the producers that
   # remember to: a detail one codepoint over is refused `invalid_payload`, which is permanent, so

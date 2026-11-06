@@ -105,10 +105,9 @@ defmodule LoopctlRunner.ContractTest do
   end
 
   test "triage arrives with its own bounds, readable from the contract rather than prose" do
-    # 1.7.0 carries the triage dispatch and the verdict this runner will emit. Neither is live
-    # here: `triage` is outside Control.kinds(), so loopctl sends none. What this asserts is that
-    # the bounds an emitter must respect are machine-readable, so the emitter reads them from the
-    # contract the way DispatchRun reads the story's.
+    # 1.7.0 carries the triage dispatch and the verdict this runner emits. What this asserts is
+    # that the bounds an emitter must respect are machine-readable, so the emitter reads them from
+    # the contract the way DispatchRun reads the story's.
     limits = Contract.connection()["limits"]
     assert %{"fields" => triage_fields, "max_bytes" => triage_bytes} = limits["triage"]
     assert %{"untrusted" => %{"max_length" => untrusted}} = triage_fields
@@ -122,7 +121,6 @@ defmodule LoopctlRunner.ContractTest do
              Contract.schema_def("RunnerTriageVerdict")
 
     assert "story" in outcomes
-    refute "triage" in LoopctlRunner.Control.kinds()
   end
 
   test "the published limits match the schema at EVERY depth, elements under item_fields" do
@@ -325,9 +323,10 @@ defmodule LoopctlRunner.ContractTest do
   test "the declaration is exactly the kinds the accept path can actually run" do
     # Widening @kinds declares a capability loopctl then sends, and a declared kind with no accept
     # path of its own is refused as `other` — suppressing nothing, recording nothing, and soaking
-    # that kind for as long as it is declared. `implement` and `review` (1.21.0) each have one;
-    # `triage` still builds no lens verdicts, so it stays out.
-    assert LoopctlRunner.Control.kinds() == ["implement", "review"]
+    # that kind for as long as it is declared. `implement`, `review` (1.21.0) and `triage` each
+    # have one; `triage` is declared because its verdict now carries the `lens_verdicts` Gate A
+    # reads (1.15.0), without which every triage would escalate.
+    assert LoopctlRunner.Control.kinds() == ["implement", "review", "triage"]
     # Each is one loopctl sends at all: a declared kind it does not know is ignored, not refused.
     dispatchable = Contract.connection()["dispatchable_kinds"]
     assert Enum.all?(LoopctlRunner.Control.kinds(), &(&1 in dispatchable))

@@ -3,7 +3,7 @@ defmodule LoopctlRunner.TriageTools do
   What a triage session may use, and the three lenses it judges through (design §8).
 
   A TRIAGE SESSION IS NO LONGER PREVENTED FROM WRITING, and the whole truth belongs here rather
-  than in a sentence someone re-reads when triage becomes a declared kind. It runs the same
+  than in a sentence someone has to go looking for, since triage is a declared kind. It runs the same
   posture an implement session does (`LoopctlRunner.Session`'s moduledoc says why): no
   `--allowedTools`, no `--tools`, nothing denied. So its `Bash` — which it must have, because
   `priv/bin/loop-verdict` is how a verdict leaves and `priv/bin/loop-escalate` is what the system
@@ -44,7 +44,7 @@ defmodule LoopctlRunner.TriageTools do
   disagree" unrepresentable, which is the one signal triage exists to surface.
   """
 
-  alias LoopctlRunner.TriagePrompt
+  alias LoopctlRunner.{Contract, TriagePrompt}
 
   # THE SAME VOCABULARY THE SESSION PROMPT USES, from the same place: `TriagePrompt.reason_codes/0`,
   # which reads the gating half out of the vendored contract. Transcribing them here as well is the
@@ -94,6 +94,18 @@ defmodule LoopctlRunner.TriageTools do
                   "\n",
                   &"  - #{&1} — #{Map.fetch!(@lens_conditions, &1)}."
                 )
+
+  # THE LENS'S OWN JUDGEMENT, in the contract's words. Since 1.15.0 Gate A reads one
+  # `RunnerLensVerdict` per lens from the message's `lens_verdicts`, so each lens states an outcome
+  # and a confidence of its own, which the session copies into that lens's entry. Read from the
+  # vendored definition rather than typed, because the contract refuses any other word.
+  @lens_props Contract.schema_def("RunnerLensVerdict") |> Map.fetch!("properties")
+  @lens_outcomes @lens_props |> Map.fetch!("outcome") |> Map.fetch!("enum")
+  @lens_confidences @lens_props |> Map.fetch!("confidence") |> Map.fetch!("enum")
+  @published_lenses @lens_props |> Map.fetch!("lens") |> Map.fetch!("enum")
+
+  @judgement_lines "OUTCOME: #{Enum.join(@lens_outcomes, " | ")}\n" <>
+                     "CONFIDENCE: #{Enum.join(@lens_confidences, " | ")}"
 
   # DECLARED, not described. A lens whose definition carries no `tools` inherits broad
   # capability, and "a repository you may only read" in its prompt is then prose rather than an
@@ -176,6 +188,19 @@ defmodule LoopctlRunner.TriageTools do
 
   That single case was 19 of the 21 lens disagreements measured across 26 real intake tickets. It \
   is not a difference of judgement; each lens was right about what it looked at.
+
+  ## Your own judgement
+
+  End your report with these two lines, choosing exactly one of the words shown on each and \
+  writing it bare:
+
+  #{@judgement_lines}
+
+  `story` means actionable as written, `escalate` that a human must decide something first, and \
+  `reject` that it should not become a story at all. It is YOUR reading through this lens and is \
+  recorded as yours, beside the run's verdict; it need not agree with the session or with any \
+  other lens. The codes above stay on lines of their own as well, because the loop's gate reads \
+  each lens's codes from what that lens reported.
   """
 
   @lenses %{
@@ -195,9 +220,11 @@ defmodule LoopctlRunner.TriageTools do
         of one instead, say exactly that and judge nothing — a report described to you in another \
         session's words is the reporter's text with its fence stripped off.
 
-        Report what you found and what you could not settle. You do NOT state the verdict, and you \
-        do not soften a disagreement with another lens — the session that dispatched you states one \
-        verdict, and lenses that disagree are a reason to escalate rather than something to resolve.
+        Report what you found and what you could not settle, then end with your OWN judgement \
+        through this lens, in the form below. You do NOT state the run's verdict, and you do not \
+        soften a disagreement with another lens — the session that dispatched you states one \
+        verdict, records your judgement beside it as yours, and lenses that disagree are a reason \
+        to escalate rather than something to resolve.
         """ <> @judgement
     },
     "triage-architect" => %{
@@ -216,9 +243,11 @@ defmodule LoopctlRunner.TriageTools do
         of one instead, say exactly that and judge nothing — a report described to you in another \
         session's words is the reporter's text with its fence stripped off.
 
-        Report what you found and what you could not settle. You do NOT state the verdict, and you \
-        do not soften a disagreement with another lens — the session that dispatched you states one \
-        verdict, and lenses that disagree are a reason to escalate rather than something to resolve.
+        Report what you found and what you could not settle, then end with your OWN judgement \
+        through this lens, in the form below. You do NOT state the run's verdict, and you do not \
+        soften a disagreement with another lens — the session that dispatched you states one \
+        verdict, records your judgement beside it as yours, and lenses that disagree are a reason \
+        to escalate rather than something to resolve.
         """ <> @judgement
     },
     "triage-engineer" => %{
@@ -237,12 +266,40 @@ defmodule LoopctlRunner.TriageTools do
         of one instead, say exactly that and judge nothing — a report described to you in another \
         session's words is the reporter's text with its fence stripped off.
 
-        Report what you found and what you could not settle. You do NOT state the verdict, and you \
-        do not soften a disagreement with another lens — the session that dispatched you states one \
-        verdict, and lenses that disagree are a reason to escalate rather than something to resolve.
+        Report what you found and what you could not settle, then end with your OWN judgement \
+        through this lens, in the form below. You do NOT state the run's verdict, and you do not \
+        soften a disagreement with another lens — the session that dispatched you states one \
+        verdict, records your judgement beside it as yours, and lenses that disagree are a reason \
+        to escalate rather than something to resolve.
         """ <> @judgement
     }
   }
+
+  # The name the CONTRACT gives each lens (`RunnerLensVerdict.lens`), which is what a session
+  # writes in `lens_verdicts`. The agent names stay `triage-*` because that is what the operator's
+  # own copies are called; the build fails if the two sets stop pairing one to one.
+  @contract_lenses %{
+    "triage-analyst" => "analyst",
+    "triage-architect" => "architect",
+    "triage-engineer" => "engineer"
+  }
+
+  if Enum.sort(Map.keys(@contract_lenses)) != Enum.sort(Map.keys(@lenses)) or
+       Enum.sort(Map.values(@contract_lenses)) != Enum.sort(@published_lenses) do
+    raise "the lenses shipped here (#{inspect(Map.keys(@lenses))}) no longer pair one to one " <>
+            "with the contract's RunnerLensVerdict lenses (#{inspect(@published_lenses)})"
+  end
+
+  @doc """
+  The contract's name for a lens agent (`"triage-analyst"` → `"analyst"`), or the name itself when
+  it is not one of the agents shipped here.
+  """
+  @spec contract_lens(String.t()) :: String.t()
+  def contract_lens(agent), do: Map.get(@contract_lenses, agent, agent)
+
+  @doc "The lens names the contract publishes, which `lens_verdicts` must carry exactly once each."
+  @spec contract_lenses() :: [String.t()]
+  def contract_lenses, do: Enum.sort(@published_lenses)
 
   @doc "The lens definitions, as the JSON `--agents` takes."
   @spec agents_json() :: String.t()
