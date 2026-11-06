@@ -195,6 +195,24 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       # story: the second story arrives once every tenant's first has been taken.
       assert candidate_ids(3) == [first.id, other_story.id, second.id]
     end
+
+    test "every PROJECT's oldest before any project's second, within one tenant", ctx do
+      backlog_head = bind_repo(ctx, queued_story(ctx))
+      backlog_next = queued_story(ctx)
+      move_to_project(backlog_next.id, backlog_head.project_id)
+      newcomer = bind_repo(ctx, queued_story(ctx))
+
+      backdate(backlog_head.id, -600)
+      backdate(backlog_next.id, -590)
+      backdate(newcomer.id, -60)
+
+      # Whether a runner takes a story's repository is decided per story, after this read, so a
+      # project no runner accepts kept its rows at the head of an oldest-first ranking and the
+      # same batch came back every pass. Ranked per project, the newer project's only story is
+      # reached in the same pass as the backlog's head.
+      assert candidate_ids(2) == [backlog_head.id, newcomer.id]
+      assert candidate_ids(3) == [backlog_head.id, newcomer.id, backlog_next.id]
+    end
   end
 
   describe "available_runner/2" do
@@ -852,6 +870,15 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   defp candidate_ids(limit) do
     Enum.map(DispatchDriver.candidates(limit), & &1.story_id)
+  end
+
+  # A second story under an already-bound project: the project is what the ranking partitions
+  # on, and the fixture gives every story its own.
+  defp move_to_project(story_id, project_id) do
+    {1, _} =
+      AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story_id),
+        set: [project_id: project_id]
+      )
   end
 
   defp backdate(story_id, seconds) do

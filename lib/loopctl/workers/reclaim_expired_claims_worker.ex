@@ -180,7 +180,7 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
 
   @doc """
   The expired claims one run releases, at most `limit`: ranked WITHIN each tenant
-  (`row_number()` over the tenant, as `Loopctl.Delivery.TriageDispatcher.candidates/1` ranks),
+  (`row_number()` over the tenant, as `Loopctl.Delivery.TriageDispatcher.stranded/1` ranks),
   then by that rank — so every tenant's first comes before any tenant's second, and one
   tenant's failing leases cannot fill the batch. Within a tenant, leases never stamped
   `lease_reclaim_failed_at` come first, oldest lease first, then the stamped ones, so a
