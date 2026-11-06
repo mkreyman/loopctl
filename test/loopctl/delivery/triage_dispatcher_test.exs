@@ -131,6 +131,28 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       assert story.id in candidate_ids(50)
     end
 
+    test "every PROJECT's oldest before any project's second: a backlog cannot fill the batch",
+         ctx do
+      backlog = for _ <- 1..3, do: fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      [head | rest] = backlog
+      Enum.each(rest, &move_to_project(&1.id, head.project_id))
+
+      ticket = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      {source_id, record_id} = source_and_record(ctx, ticket.id)
+      set_requires_ticket(source_id, true)
+      set_ticket(record_id, "a1b2c3d4-0000-4000-8000-000000000000")
+
+      backlog |> Enum.with_index() |> Enum.each(fn {s, i} -> backdate(s.id, -600 + i) end)
+      backdate(ticket.id, -60)
+
+      # 2026-11-06, production: 79 stories of projects no runner accepts were older than HCB's
+      # support tickets and held all 20 slots of every pass, so the tickets were never offered
+      # to the one runner that would take them. Ranked per project, the ticket is in the batch
+      # beside the backlog's head however long the backlog is.
+      assert candidate_ids(2) == [head.id, ticket.id]
+      assert candidate_ids(4) == [head.id, ticket.id | Enum.map(rest, & &1.id)]
+    end
+
     test "another tenant's ticket requirement does not filter this tenant's stories", ctx do
       story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       other_tenant = fixture(:tenant, %{trust_tier: :human_anchored})
@@ -477,6 +499,26 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
           ticket_ref: ticket_id && "HCB-" <> String.slice(ticket_id, 0, 8),
           ticket_id: ticket_id
         ]
+      )
+  end
+
+  # A second story under an existing project: the ranking partitions on the project, and the
+  # fixture gives every story its own. Its intake record stays on its own source, which the
+  # candidate read never compares with the project.
+  defp move_to_project(story_id, project_id) do
+    {1, _} =
+      AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story_id),
+        set: [project_id: project_id]
+      )
+  end
+
+  defp backdate(story_id, seconds) do
+    at = NaiveDateTime.add(NaiveDateTime.utc_now(), seconds, :second)
+
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^story_id),
+        set: [updated_at: NaiveDateTime.truncate(at, :second)]
       )
   end
 

@@ -107,14 +107,16 @@ defmodule Loopctl.Delivery.DispatchDriver do
   `Loopctl.WorkBreakdown.Dependencies`) AND under a project bound to exactly ONE active intake source —
   see the moduledoc on why the stage row alone selected released stories for ever, and why an
   unaddressable project is the same trap wearing the driver's own `:blocked` label. Ranked per
-  tenant and ordered by that rank first, so a tenant with one queued story is reached in the
-  same pass as a tenant with two hundred.
+  project, then per tenant by that rank, and ordered by the tenant rank first: a tenant with one
+  queued story is reached in the same pass as a tenant with two hundred, and a project with one
+  in the same pass as a project with two hundred that no runner accepts.
 
   Fleet-wide and with no tenant in the predicate, exactly like the triage trigger's own
   candidate read — and carrying the same cost, which migration `20260921110000` documents for
   that one: a read on this shape with no supporting index sorts the whole table every pass.
-  `story_stages_queued_idx` is its counterpart, keyed `(tenant_id, updated_at, story_id)` to
-  match the window's PARTITION BY plus its ORDER BY.
+  `story_stages_queued_idx` is its counterpart, keyed `(tenant_id, updated_at, story_id)`: it
+  finds the `queued` rows in order. The per-project window then sorts only those rows, since the
+  project is on `stories`, which is the queue's size and not the table's.
 
   Public so the selection is falsifiable rather than buried in the pass.
   """
@@ -137,7 +139,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
     # mints, so selected it would be refused on every pass, its `updated_at` frozen at the head
     # of the oldest-first ranking. The claim's own definition (`Dependencies`), not a copy. A
     # story left out here is still visible as blocked (`Queries.list_blocked_stories/2`).
-    ranked =
+    ranked_in_project =
       from s in StoryStage,
         join: st in Story,
         as: :story,
@@ -153,10 +155,29 @@ defmodule Loopctl.Delivery.DispatchDriver do
           tenant_id: s.tenant_id,
           story_id: s.story_id,
           updated_at: s.updated_at,
+          project_rank:
+            over(row_number(),
+              partition_by: [st.tenant_id, st.project_id],
+              order_by: [asc: s.updated_at, asc: s.story_id]
+            )
+        }
+
+    # ROUND-ROBIN ACROSS A TENANT'S PROJECTS, then across tenants: every project's oldest story
+    # outranks any project's second. Whether a runner accepts a story's repository is decided
+    # per story, after this read, so a project no runner takes keeps its rows at the head of a
+    # plain oldest-first ranking and the same batch comes back every pass; a project behind it
+    # is never reached. `TriageDispatcher.candidates/1` hit exactly that on 2026-11-06 and
+    # ranks the same way.
+    ranked =
+      from p in subquery(ranked_in_project),
+        select: %{
+          tenant_id: p.tenant_id,
+          story_id: p.story_id,
+          updated_at: p.updated_at,
           rank:
             over(row_number(),
-              partition_by: s.tenant_id,
-              order_by: [asc: s.updated_at, asc: s.story_id]
+              partition_by: p.tenant_id,
+              order_by: [asc: p.project_rank, asc: p.updated_at, asc: p.story_id]
             )
         }
 

@@ -125,8 +125,8 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   @doc """
   Stories at `detected` that came from an intake record, are under a project bound to exactly
-  one intake source, and have no triage session already running — oldest first, fair across
-  tenants.
+  one intake source, and have no triage session already running — oldest first within a
+  project, round-robin across a tenant's projects, fair across tenants.
 
   The intake record is required rather than optional: the triage payload IS the reporter's
   words, so a story with no record has nothing to triage and would be dispatched with an empty
@@ -178,7 +178,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
         where: d.kind == ^@kind and is_nil(d.released_at),
         select: %{tenant_id: d.tenant_id, story_id: d.story_id}
 
-    ranked =
+    ranked_in_project =
       from s in StoryStage,
         join: st in Story,
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
@@ -204,10 +204,31 @@ defmodule Loopctl.Delivery.TriageDispatcher do
           tenant_id: s.tenant_id,
           story_id: s.story_id,
           updated_at: s.updated_at,
+          project_rank:
+            over(row_number(),
+              partition_by: [st.tenant_id, st.project_id],
+              order_by: [asc: s.updated_at, asc: s.story_id]
+            )
+        }
+
+    # Round-robin across a tenant's projects, then across tenants: every project's oldest
+    # story outranks any project's second. A plain oldest-first ranking let one project's
+    # backlog fill the whole batch whenever no runner accepts its repository (a runner's
+    # `repos` declaration is read per story, after this query), and the batch is the same
+    # every pass, so a project behind it was never reached: on 2026-11-06, 79 loopctl, chg
+    # and claude-config stories older than HCB's support tickets held all 20 slots against
+    # a fleet that accepts only HCB. Per-project ranking bounds what one project can hold to
+    # its share, so a project behind it gets a slot on the next pass.
+    ranked =
+      from p in subquery(ranked_in_project),
+        select: %{
+          tenant_id: p.tenant_id,
+          story_id: p.story_id,
+          updated_at: p.updated_at,
           rank:
             over(row_number(),
-              partition_by: s.tenant_id,
-              order_by: [asc: s.updated_at, asc: s.story_id]
+              partition_by: p.tenant_id,
+              order_by: [asc: p.project_rank, asc: p.updated_at, asc: p.story_id]
             )
         }
 
