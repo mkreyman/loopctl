@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.10.1 — 2026-11-07
+
+### Fixed
+
+- README: `tuning_drafts` lists the `nothing_to_learn` status, and `agent_outcomes` names
+  `verify` and `spec_tuner` among its spec ids with what counts as success for each. No tool
+  changed; `agent_outcomes` already accepted both ids.
+
 ## 3.10.0 — 2026-11-07 (the improvement loop)
 
 ### Added
