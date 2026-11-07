@@ -14,6 +14,7 @@ defmodule Loopctl.Agents.VerifyCustodyTest do
   alias Loopctl.Agents.AgentResult
   alias Loopctl.Agents.VerifierPlacement
   alias Loopctl.Agents.VerifyVerdict
+  alias Loopctl.Delivery.ImplementerStart
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Dispatches
@@ -231,8 +232,126 @@ defmodule Loopctl.Agents.VerifyCustodyTest do
     end
   end
 
+  describe "AC-48.18.3: on the pr route only the bound verifier reports, reviews and verifies" do
+    setup ctx do
+      b = mint(ctx, %{})
+      {:ok, _} = bind(ctx, b.id)
+      {:ok, _} = ImplementerStart.ensure_started(ctx.tenant.id, ctx.story.id)
+      c = mint(ctx, %{agent_id: fixture(:agent, %{tenant_id: ctx.tenant.id}).id})
+      %{b: b, c: c}
+    end
+
+    test "a separately rooted dispatch control did not bind cannot report", ctx do
+      assert {:error, :pr_route_verifier_only} = report(ctx, ctx.c)
+      assert story(ctx).agent_status == :implementing
+    end
+
+    test "after B's report neither a human-operator key nor another dispatch may review, " <>
+           "and no other dispatch may verify, on any verify path",
+         ctx do
+      assert {:ok, _} = report(ctx, ctx.b)
+
+      assert {:error, :pr_route_verifier_only} = review(ctx, nil, [])
+      assert {:error, :pr_route_verifier_only} = review(ctx, ctx.c.agent_id, ctx.c.lineage_path)
+      assert {:ok, _} = review(ctx, ctx.b.agent_id, ctx.b.lineage_path)
+
+      assert {:error, :pr_route_verifier_only} =
+               Progress.verify_story(ctx.tenant.id, ctx.story.id, %{"summary" => "x"},
+                 orchestrator_agent_id: ctx.c.agent_id,
+                 verifier_lineage: ctx.c.lineage_path
+               )
+
+      assert {:error, :pr_route_verifier_only} =
+               Progress.ensure_verify_allowed(story(ctx), ctx.c.agent_id, ctx.c.lineage_path)
+
+      # Reject is remediation and is not gated here.
+      refute Progress.ensure_verify_allowed(
+               story(ctx),
+               ctx.c.agent_id,
+               ctx.c.lineage_path,
+               :reject
+             ) == {:error, :pr_route_verifier_only}
+
+      assert story(ctx).verified_status == :unverified
+    end
+
+    test "a story on no live pr-mode source is not gated", ctx do
+      {1, _} =
+        from(s in Source, where: s.id == ^ctx.source.id)
+        |> AdminRepo.update_all(set: [revoked_at: DateTime.utc_now()])
+
+      assert {:ok, _} = report(ctx, ctx.c)
+    end
+  end
+
+  describe "a verdict never skips an act it did not do" do
+    test "a report found under another agent cancels the verdict instead of skipping", ctx do
+      args = answered!(ctx)
+      {:ok, _} = ImplementerStart.ensure_started(ctx.tenant.id, ctx.story.id)
+      other = fixture(:agent, %{tenant_id: ctx.tenant.id})
+
+      ctx.story
+      |> Ecto.Changeset.change(
+        agent_status: :reported_done,
+        reported_done_at: DateTime.utc_now(),
+        reported_by_agent_id: other.id
+      )
+      |> AdminRepo.update!()
+
+      assert {:cancel, :custody_act_by_other} = VerifyVerdict.apply(args)
+      assert story(ctx).verified_status == :unverified
+    end
+  end
+
+  describe "a rebind takes the recorded head with the verification" do
+    test "binding a new verifier clears verified_head_sha", ctx do
+      verified!(ctx)
+      assert {:ok, _} = bind(ctx, mint(ctx, %{}).id)
+
+      assert Stages.get(ctx.tenant.id, ctx.story.id).verified_head_sha == nil
+      assert story(ctx).verified_status == :unverified
+    end
+
+    test "a superseded verdict's late head write is refused and retires nothing", ctx do
+      verified!(ctx)
+      superseded = story(ctx).verifier_dispatch_id
+      read = Stages.get(ctx.tenant.id, ctx.story.id)
+      b2 = mint(ctx, %{})
+      assert {:ok, _} = bind(ctx, b2.id)
+
+      assert {:error, {:verified_head_not_recorded, :verifier_rebound}} =
+               VerifyVerdict.record_verified_head(ctx.tenant.id, ctx.story.id, read, superseded)
+
+      assert Stages.get(ctx.tenant.id, ctx.story.id).verified_head_sha == nil
+      assert story(ctx).verifier_dispatch_id == b2.id
+    end
+  end
+
+  defp report(ctx, d) do
+    Progress.report_story(ctx.tenant.id, ctx.story.id,
+      agent_id: d.agent_id,
+      reporter_lineage: d.lineage_path
+    )
+  end
+
+  defp review(ctx, agent_id, lineage) do
+    Progress.record_review(ctx.tenant.id, ctx.story.id, %{"review_type" => "test"},
+      reviewer_agent_id: agent_id,
+      reviewer_lineage: lineage
+    )
+  end
+
   # A pass applied for real: placement binds B, the verdict is recorded and applied.
   defp verified!(ctx) do
+    assert {:ok, :verified} = VerifyVerdict.apply(answered!(ctx))
+
+    assert AdminRepo.one(
+             from s in StoryStage, where: s.story_id == ^ctx.story.id, select: s.verified_head_sha
+           ) == ctx.head
+  end
+
+  # Placement binds B and the pass verdict is recorded on B's ledger row; returns the job args.
+  defp answered!(ctx) do
     test_pid = self()
 
     assert {:ok, :dispatched} =
@@ -270,15 +389,10 @@ defmodule Loopctl.Agents.VerifyCustodyTest do
                })
     end)
 
-    assert {:ok, :verified} =
-             VerifyVerdict.apply(%{
-               "tenant_id" => ctx.tenant.id,
-               "story_id" => ctx.story.id,
-               "dispatch_id" => payload["dispatch_id"]
-             })
-
-    assert AdminRepo.one(
-             from s in StoryStage, where: s.story_id == ^ctx.story.id, select: s.verified_head_sha
-           ) == ctx.head
+    %{
+      "tenant_id" => ctx.tenant.id,
+      "story_id" => ctx.story.id,
+      "dispatch_id" => payload["dispatch_id"]
+    }
   end
 end

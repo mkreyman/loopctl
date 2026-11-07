@@ -72,7 +72,8 @@ defmodule Loopctl.Delivery.MergeExecution do
 
   A runner with no live socket stops its claim being held, and starts a clock
   (`story_stages.runner_absence`). Any sweep that sees it live again clears the clock. Past
-  `runner_gone_after_seconds/0` — shorter than the hold, so the claim cannot lapse first — the
+  `runner_gone_after_seconds/0` — shorter, by two sweeps, than the `renew_within_seconds/0` a
+  live sweep always leaves on the lease, so the claim cannot lapse first — the
   story is escalated over `:runner_gone`, NOT re-queued: the pull request is open, green and
   verified, and re-queuing would start a fresh implement session on finished work. Past the
   dispatch's credential expiry the hold stops and the lease reclaim does what it always did.
@@ -138,11 +139,24 @@ defmodule Loopctl.Delivery.MergeExecution do
   @refusal_retry_seconds 60
   @max_refusals 10
 
-  # The runner-gone bound. SHORTER than the hold, so a story whose runner vanished is escalated
-  # while its claim is still held rather than reclaimed and re-queued by the lease sweep.
+  # The runner-gone bound. SHORTER than what is left of the hold at the last live sweep, so a
+  # story whose runner vanished is escalated while its claim is still held rather than
+  # reclaimed and re-queued by the lease sweep. A live sweep leaves at least
+  # `@renew_within_seconds` on the lease (it renews below that), the absence clock starts at
+  # most one sweep later, and the escalation fires at most one sweep after the bound: so the
+  # renewal threshold must exceed the bound by two sweep intervals, checked at compile time.
   @runner_gone_after_seconds 600
   @hold_seconds 1_800
-  @renew_within_seconds 600
+  @renew_within_seconds 1_200
+  @sweep_interval_seconds 60
+
+  if @renew_within_seconds <= @runner_gone_after_seconds + 2 * @sweep_interval_seconds or
+       @renew_within_seconds >= @hold_seconds do
+    raise CompileError,
+      description:
+        "MergeExecution: renew_within (#{@renew_within_seconds}) must exceed runner_gone " <>
+          "(#{@runner_gone_after_seconds}) by two sweeps and stay below the hold (#{@hold_seconds})"
+  end
 
   @halt_snooze_seconds 300
   @unevaluated_snooze_seconds 60
@@ -205,13 +219,31 @@ defmodule Loopctl.Delivery.MergeExecution do
     now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
     opts = Keyword.put(opts, :now, now)
 
-    opts
-    |> candidates()
-    |> Enum.map_reduce(%{}, fn row, open ->
-      {tenant_open, open} = tenant_open(open, row.tenant_id)
-      {sweep_row(row, tenant_open, opts), open}
-    end)
-    |> elem(0)
+    sweep_pages(opts, nil, %{}, [])
+  end
+
+  # Every candidate, every sweep, a page of `:limit` at a time in key order. A fixed batch
+  # ordered by `updated_at` starved row `limit + 1` for ever, because the common outcomes
+  # (`:held` inside the window, a repeated absence, a closed tenant) write no stage row and
+  # so never rotate to the back.
+  defp sweep_pages(opts, cursor, open, acc) do
+    limit = Keyword.get(opts, :limit, @default_limit)
+    rows = candidates(opts, cursor, limit)
+
+    {outcomes, open} =
+      Enum.map_reduce(rows, open, fn row, open ->
+        {tenant_open, open} = tenant_open(open, row.tenant_id)
+        {sweep_row(row, tenant_open, opts), open}
+      end)
+
+    acc = [outcomes | acc]
+
+    if length(rows) < limit do
+      acc |> Enum.reverse() |> List.flatten()
+    else
+      last = List.last(rows)
+      sweep_pages(opts, {last.tenant_id, last.story_id}, open, acc)
+    end
   end
 
   # The custody surface, judged once per tenant per sweep.
@@ -276,7 +308,10 @@ defmodule Loopctl.Delivery.MergeExecution do
       ) ->
         :ok
 
-      DateTime.diff(row.claim_lease_cap, now) > @renew_within_seconds ->
+      # The lease the reclaimer reads is `claimed_until`; the hold keeps it equal to the cap,
+      # but judging the earlier of the two means a lease that ever trailed the cap is renewed.
+      DateTime.diff(earlier(row.claimed_until || row.claim_lease_cap, row.claim_lease_cap), now) >
+          @renew_within_seconds ->
         :ok
 
       true ->
@@ -393,7 +428,7 @@ defmodule Loopctl.Delivery.MergeExecution do
   # intake source is in mode `pr` (`Loopctl.Intake.pr_route?/3`'s rule, here as SQL), at the
   # story's own epoch. On AdminRepo with explicit tenant predicates on every join; tenant ids
   # come back with each row and every write goes through the RLS repo.
-  defp candidates(opts) do
+  defp candidates(opts, cursor, limit) do
     pr_projects =
       from src in Source,
         where: is_nil(src.revoked_at),
@@ -410,8 +445,8 @@ defmodule Loopctl.Delivery.MergeExecution do
       on: d.id == st.implementer_dispatch_id and d.tenant_id == st.tenant_id,
       where: s.stage == :ci and not is_nil(s.runner_id),
       where: s.claim_epoch == st.claim_epoch,
-      order_by: [asc: s.updated_at, asc: s.story_id],
-      limit: ^Keyword.get(opts, :limit, @default_limit),
+      order_by: [asc: s.tenant_id, asc: s.story_id],
+      limit: ^limit,
       select: %{
         tenant_id: s.tenant_id,
         story_id: s.story_id,
@@ -428,7 +463,24 @@ defmodule Loopctl.Delivery.MergeExecution do
       }
     )
     |> scope_tenant(Keyword.get(opts, :tenant_id))
+    |> after_cursor(cursor)
     |> AdminRepo.all()
+  end
+
+  defp after_cursor(query, nil), do: query
+
+  defp after_cursor(query, {tenant_id, story_id}) do
+    where(
+      query,
+      [s],
+      fragment(
+        "(?, ?) > (?, ?)",
+        s.tenant_id,
+        s.story_id,
+        type(^tenant_id, :binary_id),
+        type(^story_id, :binary_id)
+      )
+    )
   end
 
   defp scope_tenant(query, nil), do: query

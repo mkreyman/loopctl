@@ -46,7 +46,9 @@ defmodule LoopctlWeb.ReviewRecordController do
         "absent, malformed or not a submitted revision of the story's current change), and " <>
         "records one verdict per reviewer dispatch (409 `chg_review_already_recorded`). " <>
         "These run after, never instead of, the existing custody gates. On any other story " <>
-        "`commit_sha` is ignored and not stored.",
+        "`commit_sha` is ignored and not stored. A story on the pull-request route " <>
+        "(US-48.18) is reviewed only by the verifier dispatch loopctl placed for it: any " <>
+        "other key, a human operator's included, is refused 409 `pr_route_verifier_only`.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Review completion params", "application/json",

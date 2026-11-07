@@ -526,6 +526,10 @@ defmodule Loopctl.Delivery.Stages do
 
   defp escalate_if_ungated(_tenant_id, row, _transition, _epoch, _opts), do: {row, nil}
 
+  # Against the RECORDED head: the report carries only `merge_sha`, so a head pushed after the
+  # allow and merged past the gate passes here. `PostDeployVerification` closes that half by
+  # reading the head GitHub actually merged, at `merged`, before control carries it forward,
+  # and escalates over this same `:ungated_merge` edge.
   defp ungated?(%StoryStage{head_sha: head, merge_gate_allowed_sha: allowed}),
     do: is_nil(head) or allowed != head
 

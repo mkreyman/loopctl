@@ -255,7 +255,9 @@ defmodule Loopctl.Delivery.PostDeployVerification do
           required(:merged_at) => fact(DateTime.t()),
           required(:deployments) =>
             fact(%{deployments: [judged_deployment()], incomplete: term() | nil})
-            | :not_attempted
+            | :not_attempted,
+          optional(:merged_head) => fact(String.t()) | :not_attempted,
+          optional(:allowed_sha) => String.t() | nil
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage | :change_protocol
@@ -403,7 +405,8 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   @judged_facts [
     {:repo, :repository_unresolved},
     {:merged_at, :merge_time_unknown},
-    {:deployments, :deployments_unavailable}
+    {:deployments, :deployments_unavailable},
+    {:merged_head, :merged_head_unavailable}
   ]
 
   defp transient_reasons(facts) do
@@ -425,7 +428,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   defp waits?(reason),
     do: MergePrecondition.transient?(reason) or Credential.configuration?(reason)
 
-  defp error_reason(facts, key) do
+  # `:merged_head` is optional in `t:facts/0` (only `merged` reads it), so its absence is
+  # "not attempted"; every other judged fact is required and its absence fails closed.
+  defp error_reason(facts, :merged_head = key),
+    do: error_reason(Map.put_new(facts, key, :not_attempted), key, :required)
+
+  defp error_reason(facts, key), do: error_reason(facts, key, :required)
+
+  defp error_reason(facts, key, :required) do
     case Map.get(facts, key) do
       {:ok, _value} -> nil
       :not_attempted -> nil
@@ -463,9 +473,24 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # question, in the order a reader would ask it: do we know what had to ship, and does any
   # deployment that could have carried it say it did.
   defp decide(result, facts) do
-    case Map.get(facts, :merge_sha) do
-      nil -> failed(result, [:merge_sha_not_recorded])
-      merge_sha -> decide_page(result, facts, merge_sha, value(facts, :deployments))
+    case {ungated_merge(facts), Map.get(facts, :merge_sha)} do
+      {{:ungated_merge, _allowed, _merged} = ungated, _merge_sha} -> failed(result, [ungated])
+      {nil, nil} -> failed(result, [:merge_sha_not_recorded])
+      {nil, merge_sha} -> decide_page(result, facts, merge_sha, value(facts, :deployments))
+    end
+  end
+
+  # Decided FIRST: whether anything shipped is beside the point when the merge itself was
+  # never allowed. Only a fact that was read (`merged`) is judged; at `deployed` it is
+  # `:not_attempted` and this is silent.
+  defp ungated_merge(facts) do
+    case value(facts, :merged_head) do
+      nil ->
+        nil
+
+      merged ->
+        allowed = Map.get(facts, :allowed_sha)
+        if allowed == merged, do: nil, else: {:ungated_merge, allowed, merged}
     end
   end
 
@@ -637,9 +662,26 @@ defmodule Loopctl.Delivery.PostDeployVerification do
       # inside the transition into `merged` and named in that transition's chain entry.
       merge_sha: stage.merge_sha,
       merged_at: merged_at,
-      deployments: deployments(tenant_id, repo, env, merged_at, stage.merge_sha)
+      deployments: deployments(tenant_id, repo, env, merged_at, stage.merge_sha),
+      # US-48.17 review: the head GitHub actually merged, against the head the gate allowed.
+      # The ci -> merged report carries only `merge_sha`, so the in-transaction ungated check
+      # can compare the allow only with the RECORDED head; a newer head pushed and merged
+      # past the gate passes it. Read once, at `merged`, before control carries it forward.
+      merged_head: merged_head(story, stage),
+      allowed_sha: stage.merge_gate_allowed_sha
     }
   end
+
+  defp merged_head(story, %StoryStage{stage: :merged} = stage) do
+    case MergePrecondition.read_pull_request(story, stage) do
+      {:ok, %{merged?: true, head_sha: head}} when is_binary(head) -> {:ok, head}
+      {:ok, %{merged?: true} = pr} -> {:error, {:merged_head_unknown, shape(pr)}}
+      {:ok, _open} -> {:error, :pull_request_not_merged}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp merged_head(_story, _stage), do: :not_attempted
 
   # WHEN the loop recorded the merge, read from the stage event the transition into `merged`
   # wrote. That table is append-only and nothing prunes it, so the event is present for
@@ -828,7 +870,12 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   end
 
   defp act(tenant_id, story_id, %Result{decision: :failed} = result, opts) do
-    target = failure_transition(result.stage)
+    target =
+      if result.stage == :merged and
+           Enum.any?(result.reasons, &match?({:ungated_merge, _, _}, &1)),
+         do: {:merged, :escalated, :ungated_merge},
+         else: failure_transition(result.stage)
+
     {_outcome, result} = transition(tenant_id, story_id, result, target, opts)
     result
   end

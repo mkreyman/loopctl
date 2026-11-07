@@ -26,7 +26,10 @@ defmodule Loopctl.Repo.Migrations.CreateSpecTuningDrafts do
   - `status` — `pending` (dispatched, unanswered), `proposed` (loopctl's own judgement of the
     runner's scores: strictly better and no existing case regressed), `rejected` (it did not,
     `rejection_reasons` say why), `landed` (an operator recorded the PR), `superseded` (a
-    later proposal for the same spec replaced it), `abandoned` (its dispatch ended unanswered).
+    later proposal for the same spec replaced it), `abandoned` (its dispatch ended unanswered),
+    `nothing_to_learn` (the window held no failure to learn from, so nothing was dispatched;
+    the row exists to close the window, or the pair would stay due and take its tenant's
+    first slot on every pass).
   - `input` — the traces loopctl sent, FENCED untrusted text and loopctl's own values, as sent:
     each new eval case's input is the trace it names, so the case input is loopctl's and never
     the runner's.
@@ -129,14 +132,18 @@ defmodule Loopctl.Repo.Migrations.CreateSpecTuningDrafts do
 
     create constraint(:spec_tuning_drafts, :spec_tuning_drafts_status,
              check:
-               "status IN ('pending', 'proposed', 'rejected', 'landed', 'superseded', 'abandoned')"
+               "status IN ('pending', 'proposed', 'rejected', 'landed', 'superseded', 'abandoned', " <>
+                 "'nothing_to_learn')"
            )
 
-    # An answered draft carries the runner's answer; a pending or abandoned one carries none.
+    # An answered draft carries the runner's answer; a pending or abandoned one carries none,
+    # and a nothing_to_learn one was never dispatched: no dispatch, no answer, answered_at set.
     # A landed draft names the pull request that landed it, and nothing else does.
     create constraint(:spec_tuning_drafts, :spec_tuning_drafts_shape,
              check:
                "(status IN ('pending', 'abandoned') AND diff IS NULL AND answered_at IS NULL) OR " <>
+                 "(status = 'nothing_to_learn' AND dispatch_id IS NULL AND diff IS NULL " <>
+                 "AND answered_at IS NOT NULL) OR " <>
                  "(status IN ('proposed', 'rejected', 'landed', 'superseded') " <>
                  "AND diff IS NOT NULL AND answered_at IS NOT NULL " <>
                  "AND new_cases IS NOT NULL AND current_score IS NOT NULL " <>

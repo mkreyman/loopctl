@@ -18,7 +18,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **`tuning_draft_mark_landed`** records that a person merged a proposed draft's template
   change (`POST /api/v1/tuning_drafts/:id/landed`, `pr_url` required). It changes no template
   and no spec version. 409 `not_proposed`, 422 for a malformed `pr_url`. Requires
-  `LOOPCTL_USER_KEY`.
+  `LOOPCTL_USER_KEY`. A draft may also be `nothing_to_learn`: the window held no failure, so
+  nothing was dispatched and the window closed.
+
+### Changed
+
+- **`report_story`**, **`review_complete`** and **`verify_story`** name their new refusal:
+  409 `pr_route_verifier_only` on a pull-request-route story for any key but the one minted for
+  the story's bound `verify@1` dispatch (loopctl US-48.18). `reject_story` is not gated by it.
+- **`agent_outcomes`** counts verify and spec_tuner successes, and `reply_draft_list` names its
+  422 for a project reference it cannot resolve.
 
 ## 3.9.1 — 2026-11-07 (verify@1)
 

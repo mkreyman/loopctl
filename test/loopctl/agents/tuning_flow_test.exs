@@ -122,6 +122,29 @@ defmodule Loopctl.Agents.TuningFlowTest do
     }
   end
 
+  describe "a window with no failure to learn from" do
+    test "closes with a nothing_to_learn row, so the pair stops taking its tenant's slot",
+         ctx do
+      AdminRepo.update_all(from(o in RunOutcome, where: o.id == ^ctx.overridden.id),
+        set: [signals: %{}]
+      )
+
+      assert {:ok, [{candidate, :nothing_to_learn}]} = run_pass()
+      assert candidate.tenant_id == ctx.tenant.id
+
+      assert [draft] =
+               AdminRepo.all(from(d in TuningDraft, where: d.tenant_id == ^ctx.tenant.id))
+
+      assert draft.status == :nothing_to_learn
+      assert draft.dispatch_id == nil and draft.diff == nil
+      assert draft.outcome_rows == 2
+      assert %DateTime{} = draft.answered_at
+
+      # The window is closed: the same rows never make the pair due again.
+      assert {:ok, []} = run_pass()
+    end
+  end
+
   describe "a tuning run, through the runner socket" do
     test "TC-48.13.1: the override becomes a trace expecting the human's route, and the result is stored as loopctl decides",
          ctx do

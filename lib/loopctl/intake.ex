@@ -771,7 +771,10 @@ defmodule Loopctl.Intake do
   unlineaged reject on such a story, and `Loopctl.Delivery.Stages` retires its verification on
   every edge that clears its head.
   """
-  @spec pr_route?(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  @spec pr_route?(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) :: boolean()
+  # A story with no id was never persisted, so it has no stage row and no route.
+  def pr_route?(_repo, _tenant_id, nil), do: false
+
   def pr_route?(repo, tenant_id, story_id) do
     staged? =
       repo.exists?(

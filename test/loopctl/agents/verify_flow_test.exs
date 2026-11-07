@@ -483,7 +483,12 @@ defmodule Loopctl.Agents.VerifyFlowTest do
         |> AdminRepo.update_all(set: [verified_head_sha: nil])
 
       assert {:error, {:verified_head_not_recorded, :verdict_stale}} =
-               VerifyVerdict.record_verified_head(ctx.tenant.id, ctx.story.id, read)
+               VerifyVerdict.record_verified_head(
+                 ctx.tenant.id,
+                 ctx.story.id,
+                 read,
+                 payload["dispatch_id"]
+               )
 
       assert stage(ctx).verified_head_sha == nil
       assert story(ctx).verified_status == :unverified

@@ -447,6 +447,34 @@ defmodule Loopctl.Agents.TuningTest do
 
       assert AdminRepo.get!(TuningDraft, landed.id).status == :landed
     end
+
+    test "a rejected proposal that is not a newer version is stored, naming no version" do
+      tenant = fixture(:tenant)
+
+      pending =
+        fixture(:tuning_draft, %{tenant_id: tenant.id, status: :pending, from_version: 2})
+
+      record = %Loopctl.Runners.DispatchRecord{
+        tenant_id: tenant.id,
+        dispatch_id: pending.dispatch_id,
+        kind: "spec_tune"
+      }
+
+      stale = %{id: "triage", from_version: 2, to_version: 2, diff: "--- a\n+++ b\n"}
+
+      {:ok, :ok} =
+        Repo.with_tenant(tenant.id, fn ->
+          Tuning.write_result(
+            record,
+            result([], [line("t01", true, true, true)], %{template: stale})
+          )
+        end)
+
+      stored = AdminRepo.get!(TuningDraft, pending.id)
+      assert stored.status == :rejected
+      assert "template_mismatch" in stored.rejection_reasons
+      assert stored.to_version == nil
+    end
   end
 
   # ── list/2 and the cursor ──────────────────────────────────────────────────────────────────

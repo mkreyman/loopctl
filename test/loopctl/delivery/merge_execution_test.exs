@@ -329,6 +329,17 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
       set_stage(ctx, stage: :reviewing)
       assert [] = sweep(ctx, DateTime.utc_now())
     end
+
+    test "every candidate is read each sweep, past the page size", ctx do
+      second = fixture(:merge_instruction_story, %{tenant: ctx.tenant, repo: "acme/other"})
+      now = DateTime.utc_now()
+
+      # Neither outcome writes a stage row, which is what starved a fixed, updated_at-ordered
+      # batch: the same first page every minute, the rest never.
+      assert [:held, :held] = sweep(ctx, now, enabled?: false, limit: 1)
+      assert [:held, :held] = sweep(ctx, now, enabled?: false, limit: 1)
+      assert second.tenant.id == ctx.tenant.id
+    end
   end
 
   describe "AC-48.17.3: the lease" do
@@ -383,6 +394,28 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
     test "an absent runner's claim is not held", ctx do
       assert [:runner_absent] = sweep(ctx, ctx.now, live?: fn _, _ -> false end)
       assert reanchored(ctx) == []
+    end
+  end
+
+  describe "AC-48.17.3: the claim outlives the runner-gone bound" do
+    test "a cap the last live sweep left unrenewed is still ahead when the escalation fires",
+         ctx do
+      t0 = DateTime.utc_now()
+      set_dispatch_expiry(ctx, DateTime.add(t0, 7_200))
+      # Just outside the renewal window: the live sweep at t0 writes nothing.
+      cap = DateTime.add(t0, MergeExecution.renew_within_seconds() + 1)
+      claim(ctx, cap)
+
+      assert [:held] = sweep(ctx, t0, enabled?: false)
+      assert reanchored(ctx) == []
+
+      gone = fn _tenant, _runner -> false end
+      first_absent = DateTime.add(t0, 60)
+      escalated_at = DateTime.add(first_absent, MergeExecution.runner_gone_after_seconds() + 60)
+
+      assert [:runner_absent] = sweep(ctx, first_absent, live?: gone)
+      assert [:runner_gone] = sweep(ctx, escalated_at, live?: gone)
+      assert DateTime.after?(cap, escalated_at)
     end
   end
 

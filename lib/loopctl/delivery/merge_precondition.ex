@@ -1051,6 +1051,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp pr_number(%{pr_number: number}) when is_integer(number) and number > 0, do: {:ok, number}
   defp pr_number(%{pr_number: number}), do: {:error, {:not_recorded, number}}
 
+  @doc """
+  The forge's pull request for `story` at the number its stage row recorded, read with the
+  tenant's credential for the story's own repository (never a caller's). For a reader AFTER
+  the merge (`Loopctl.Delivery.PostDeployVerification`): the merged pull request's `head_sha`
+  is the head that was actually merged, which is what an ungated merge is judged on.
+  """
+  @spec read_pull_request(Loopctl.WorkBreakdown.Story.t(), Loopctl.Delivery.StoryStage.t()) ::
+          {:ok, map()} | {:error, term()}
+  def read_pull_request(story, stage) do
+    forge =
+      with {:ok, name} <- story |> source_for_story() |> repo_of(),
+           do: Credential.repo(story.tenant_id, name)
+
+    pull_request(forge, pr_number(stage))
+  end
+
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
   # A missing credential is reported as itself whether or not a number was recorded, so both
   # broken inputs are named in one refusal.

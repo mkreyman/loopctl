@@ -31,6 +31,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   @repo "acme/widgets"
   @merge String.duplicate("a", 40)
   @deployed String.duplicate("b", 40)
+  @allowed_head String.duplicate("e", 40)
 
   setup :verify_on_exit!
 
@@ -745,6 +746,38 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert {"deployed", "verified", "forward", "test"} in transitions
     end
 
+    test "a merge of a head the gate never allowed escalates over ungated_merge, never deploys",
+         ctx do
+      # The session pushed past the allow and merged that head itself; the report carried
+      # only the merge sha, so the recorded head still equalled the allow.
+      stub_merged_head(@deployed)
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:ungated_merge, @allowed_head, @deployed} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+
+      assert [%StageEvent{edge: "ungated_merge"}] =
+               for(
+                 %StageEvent{event: "transitioned", to_stage: "escalated"} = e <-
+                   Stages.list_events(ctx.tenant_id, ctx.story_id),
+                 do: e
+               )
+    end
+
+    test "an unreadable pull request waits rather than judging the merge", ctx do
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, 77 ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :unresolved, unresolved_kind: :forge_fault}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+    end
+
     test "the deploy write names the deployment, and verification follows in ONE pass", ctx do
       # A merge BEHIND the deployed commit: containment, not equality, exactly as at deployed.
       stub_deployment()
@@ -1002,14 +1035,30 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
   # A pr-route story as the runner leaves it (US-48.16 AC-1): `ci -> merged` reported with
   # the merge sha, no release yet.
+  # The merge gate allowed @allowed_head and GitHub merged that head, so the ungated-merge
+  # read passes; `stub_merged_head/1` overrides it.
   defp at_merged(ctx) do
     {:ok, {1, _}} =
       Repo.with_tenant(ctx.tenant_id, fn ->
         from(s in StoryStage, where: s.story_id == ^ctx.story_id)
-        |> Repo.update_all(set: [stage: :merged, release_id: nil])
+        |> Repo.update_all(
+          set: [
+            stage: :merged,
+            release_id: nil,
+            pr_number: 77,
+            merge_gate_allowed_sha: @allowed_head
+          ]
+        )
       end)
 
+    stub_merged_head(@allowed_head)
     :ok
+  end
+
+  defp stub_merged_head(head) do
+    Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{}, 77 ->
+      {:ok, %{merged?: true, head_sha: head, merge_sha: @merge}}
+    end)
   end
 
   defp link_intake_record(ctx, issue_number) do

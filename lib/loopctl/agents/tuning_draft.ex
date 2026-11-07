@@ -15,7 +15,7 @@ defmodule Loopctl.Agents.TuningDraft do
 
   use Loopctl.Schema
 
-  @statuses [:pending, :proposed, :rejected, :landed, :superseded, :abandoned]
+  @statuses [:pending, :proposed, :rejected, :landed, :superseded, :abandoned, :nothing_to_learn]
 
   @type t :: %__MODULE__{}
 

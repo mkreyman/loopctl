@@ -19,7 +19,15 @@ export const MISSING_USER_KEY =
   "tuning draft tools: the traces carry customer ticket text and landing records a person's " +
   "merge, so both endpoints refuse agent and orchestrator keys.";
 
-export const STATUSES = ["pending", "proposed", "rejected", "landed", "superseded", "abandoned"];
+export const STATUSES = [
+  "pending",
+  "proposed",
+  "rejected",
+  "landed",
+  "superseded",
+  "abandoned",
+  "nothing_to_learn",
+];
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PR_URL = /^https:\/\/github\.com\/[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}\/pull\/[1-9][0-9]{0,9}$/;

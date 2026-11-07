@@ -588,6 +588,41 @@ defmodule Loopctl.Agents.OutcomesTest do
       assert %{runs: 3, successes: 1, human_overrides: 1} = line
     end
 
+    test "a verify run's success is the verdict it returned, which ends agent_result" do
+      t = fixture(:stage_tenant, %{}).id
+      verify = %{tenant_id: t, spec_id: "verify", archetype: "judge", end_reason: "agent_result"}
+
+      fixture(:agent_run_outcome, verify)
+      fixture(:agent_run_outcome, Map.put(verify, :end_reason, "wall_clock_exceeded"))
+
+      assert {:ok, %{versions: [line]}} = Outcomes.summary(t, "verify")
+      assert %{runs: 2, successes: 1} = line
+    end
+
+    test "a spec_tuner run's success is a proposal loopctl accepted" do
+      t = fixture(:stage_tenant, %{}).id
+
+      tuner = %{
+        tenant_id: t,
+        spec_id: "spec_tuner",
+        archetype: "draft",
+        end_reason: "agent_result"
+      }
+
+      fixture(
+        :agent_run_outcome,
+        Map.put(tuner, :signals, %{"tuning_status" => %{"value" => "proposed"}})
+      )
+
+      fixture(
+        :agent_run_outcome,
+        Map.put(tuner, :signals, %{"tuning_status" => %{"value" => "rejected"}})
+      )
+
+      assert {:ok, %{versions: [line]}} = Outcomes.summary(t, "spec_tuner")
+      assert %{runs: 2, successes: 1} = line
+    end
+
     test "a spec with no rows answers no versions, and a window outside bounds is refused" do
       t = fixture(:stage_tenant, %{}).id
 

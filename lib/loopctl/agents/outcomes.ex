@@ -336,7 +336,9 @@ defmodule Loopctl.Agents.Outcomes do
   Per version: `runs`, `ended` (rows whose session end was recorded), and
 
   - `successes` — a `:build` row whose work merged; a `:judge` row that recorded a verdict a
-    human did not override; a `:draft` row whose draft was stored `drafted`;
+    human did not override (`triage_verdict` for triage, `agent_result` for verify); a
+    `:draft` row whose draft was stored `drafted`, or whose tuning proposal loopctl accepted
+    (`tuning_status` `proposed`, spec_tuner);
   - `human_overrides` — rows carrying `human_override: true`;
   - `budget_exhausted` — rows whose session ended `wall_clock_exceeded` or
     `max_turns_exceeded`;
@@ -394,15 +396,17 @@ defmodule Loopctl.Agents.Outcomes do
               """
               CASE ?
                 WHEN 'build' THEN coalesce((?->'merged'->>'value')::boolean, false)
-                WHEN 'judge' THEN coalesce(? = 'triage_verdict', false)
+                WHEN 'judge' THEN coalesce(? IN ('triage_verdict', 'agent_result'), false)
                   AND NOT coalesce((?->'human_override'->>'value')::boolean, false)
                 WHEN 'draft' THEN coalesce(?->'draft_screen'->>'value' = 'drafted', false)
+                  OR coalesce(?->'tuning_status'->>'value' = 'proposed', false)
                 ELSE false
               END
               """,
               o.archetype,
               o.signals,
               o.end_reason,
+              o.signals,
               o.signals,
               o.signals
             )

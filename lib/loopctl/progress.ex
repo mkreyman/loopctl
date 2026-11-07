@@ -942,12 +942,28 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # The stage row's `verified_head_sha` goes in the SAME transaction, after the story lock and
+  # behind the stage-row lock: a superseded verifier's verdict job that recorded its head just
+  # before this rebind would otherwise leave `verified_head_sha == head_sha` on an unverified
+  # story, which takes it out of verify@1's candidates for good (US-48.18 review).
   defp retire_earlier_verification(tenant_id, %Story{} = story, opts) do
+    clear_verified_head(tenant_id, story.id)
+
     if verification_to_retire?(story) do
       apply_invalidation(AdminRepo, tenant_id, story, "verifier_rebound", opts)
     else
       {:ok, story, nil}
     end
+  end
+
+  defp clear_verified_head(tenant_id, story_id) do
+    AdminRepo.update_all(
+      from(s in Loopctl.Delivery.StoryStage,
+        where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
+        where: not is_nil(s.verified_head_sha)
+      ),
+      set: [verified_head_sha: nil, updated_at: DateTime.utc_now()]
+    )
   end
 
   @doc """
@@ -1334,6 +1350,8 @@ defmodule Loopctl.Progress do
     dispatch-minted work — its separation cannot be shown (fails closed)
   - `{:error, :missing_assigned_agent}` if the story has neither an assigned agent
     nor an implementer dispatch (custody-unattributed — fails closed)
+  - `{:error, :pr_route_verifier_only}` (US-48.18) on a pull-request-route story, unless the
+    caller is the verifier dispatch control bound to it
   - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
     dispatch cannot be resolved (e.g. a cross-tenant id) — a lineage-integrity
     failure that fails closed (LCP-1 §7.5)
@@ -2714,6 +2732,8 @@ defmodule Loopctl.Progress do
     dispatch-minted work (the nil-reviewer human-operator permit requires BOTH a nil
     `:reviewer_agent_id` and an empty `:reviewer_lineage`)
   - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
+  - `{:error, :pr_route_verifier_only}` (US-48.18) on a pull-request-route story, unless the
+    caller is the verifier dispatch control bound to it; the human-operator permit included
   - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
     dispatch cannot be resolved (lineage-integrity failure, fails closed — LCP-1 §7.5)
   - `{:error, :chg_reviewer_required}` (US-47.5) on a story bound to a chg change, when the
@@ -2912,6 +2932,8 @@ defmodule Loopctl.Progress do
   - `{:error, :caller_lineage_required}` if a key no dispatch minted tries to certify
     dispatch-minted work (fails closed; an ordinary refusal, not a byzantine signal)
   - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
+  - `{:error, :pr_route_verifier_only}` (US-48.18) on a pull-request-route story, unless the
+    caller is the verifier dispatch control bound to it (verify, verify-all and bulk verify)
   - `{:error, :unresolvable_dispatch_lineage}` if a dispatch the story references
     (implementer or verifier) cannot be resolved (lineage-integrity failure, fails
     closed — LCP-1 §7.4.1)
@@ -3113,7 +3135,8 @@ defmodule Loopctl.Progress do
              :self_verify_blocked
              | :missing_assigned_agent
              | :unresolvable_dispatch_lineage
-             | :caller_lineage_required}
+             | :caller_lineage_required
+             | :pr_route_verifier_only}
   def ensure_verify_allowed(story, orchestrator_agent_id, caller_lineage, gate \\ :verify) do
     case validate_not_self_verify(story, orchestrator_agent_id, caller_lineage, gate) do
       {:ok, _} -> :ok
@@ -4298,11 +4321,17 @@ defmodule Loopctl.Progress do
     # shape legal — so this predicate is the ONLY guard for a never-dispatched
     # agentless story, not mere defense in depth. Backfilled stories are
     # already verified and never reach here.)
-    if custody_orphaned?(story) do
-      log_custody_orphaned(story, orchestrator_agent_id, "verify")
-      {:error, :missing_assigned_agent}
-    else
-      verify_caller_separation(story, orchestrator_agent_id, caller_lineage, gate)
+    cond do
+      custody_orphaned?(story) ->
+        log_custody_orphaned(story, orchestrator_agent_id, "verify")
+        {:error, :missing_assigned_agent}
+
+      # US-48.18 AC-48.18.3, every verify path (single, verify-all, bulk). Reject is exempt.
+      gate == :verify and not pr_route_verifier?(story, caller_lineage) ->
+        {:error, :pr_route_verifier_only}
+
+      true ->
+        verify_caller_separation(story, orchestrator_agent_id, caller_lineage, gate)
     end
   end
 
@@ -4947,24 +4976,49 @@ defmodule Loopctl.Progress do
     # DB CHECK stories_reported_done_requires_agent does not close this (it is
     # satisfied when implementer_dispatch_id IS NULL), so this is the enforcement,
     # mirroring verify/review-complete.
-    if custody_unattributed?(story) do
-      log_custody_orphaned(story, agent_id, "report")
-      {:error, :missing_assigned_agent}
-    else
+    cond do
+      custody_unattributed?(story) ->
+        log_custody_orphaned(story, agent_id, "report")
+        {:error, :missing_assigned_agent}
+
+      not pr_route_verifier?(story, reporter_lineage) ->
+        {:error, :pr_route_verifier_only}
+
       # US-26.2.2 AC-2: lineage comparison (primary). The reporter's lineage is
       # derived SERVER-SIDE from the caller's dispatch (never client-supplied); a
       # sub-agent dispatched BY the implementer shares its lineage root and is
       # blocked even though its agent_id differs. A DECLARED-but-unresolvable
       # implementer dispatch is an integrity failure, not a self-report — it fails
       # closed under its own error code (see lineage_status/2).
-      case lineage_status(story, reporter_lineage) do
-        :unresolvable -> {:error, :unresolvable_dispatch_lineage}
-        :unlineaged -> {:error, :caller_lineage_required}
-        :conflict -> {:error, :self_report_blocked}
-        :ok -> validate_report_not_same_agent(story, agent_id)
-      end
+      true ->
+        case lineage_status(story, reporter_lineage) do
+          :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+          :unlineaged -> {:error, :caller_lineage_required}
+          :conflict -> {:error, :self_report_blocked}
+          :ok -> validate_report_not_same_agent(story, agent_id)
+        end
     end
   end
+
+  # US-48.18 AC-48.18.3: on the pull-request route, report, review-complete and verify belong
+  # to CONTROL's verifier dispatch alone — the one `bind_verifier_dispatch/4` recorded as the
+  # story's `verifier_dispatch_id`, identified by being the LEAF of the caller's server-resolved
+  # lineage. A runner session inherits the operator's MCP set, so without this an unlineaged
+  # `:user` key could record a review (the human-operator permit), or mint itself a fresh root
+  # dispatch and report, and `Loopctl.Agents.VerifyVerdict` would then skip the act it found
+  # already done — a custody record carrying acts by a principal other than the verifier.
+  # Reject is not gated: sending work back is remediation, and the pr route's own remediation
+  # edge (`:verify_rejected`) does not go through it.
+  defp pr_route_verifier?(story, caller_lineage) do
+    not Loopctl.Intake.pr_route?(AdminRepo, story.tenant_id, story.id) or
+      bound_verifier_leaf?(story.verifier_dispatch_id, caller_lineage)
+  end
+
+  defp bound_verifier_leaf?(verifier_dispatch_id, [_ | _] = lineage)
+       when is_binary(verifier_dispatch_id),
+       do: List.last(lineage) == verifier_dispatch_id
+
+  defp bound_verifier_leaf?(_verifier_dispatch_id, _lineage), do: false
 
   defp validate_report_not_same_agent(story, agent_id) do
     if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
@@ -5052,6 +5106,11 @@ defmodule Loopctl.Progress do
         log_custody_orphaned(story, reviewer_agent_id, "review")
         {:error, :missing_assigned_agent}
 
+      # US-48.18: ranked BEFORE the human-operator permit, which is exactly the unlineaged
+      # `:user` key a runner session holds (see `pr_route_verifier?/2`).
+      not pr_route_verifier?(story, reviewer_lineage) ->
+        {:error, :pr_route_verifier_only}
+
       # nil reviewer_agent_id AND no lineage: this is a human operator (user-role key
       # that no dispatch minted). Humans are structurally different from the assigned
       # implementing agent, so nil cannot equal any agent_id — pass through. The
@@ -5068,12 +5127,16 @@ defmodule Loopctl.Progress do
       # declared-but-unresolvable implementer dispatch fails closed under its own
       # integrity error code (see lineage_status/2).
       true ->
-        case lineage_status(story, reviewer_lineage) do
-          :unresolvable -> {:error, :unresolvable_dispatch_lineage}
-          :unlineaged -> {:error, :caller_lineage_required}
-          :conflict -> {:error, :self_review_blocked}
-          :ok -> validate_review_not_same_agent(story, reviewer_agent_id)
-        end
+        validate_review_lineage(story, reviewer_agent_id, reviewer_lineage)
+    end
+  end
+
+  defp validate_review_lineage(story, reviewer_agent_id, reviewer_lineage) do
+    case lineage_status(story, reviewer_lineage) do
+      :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+      :unlineaged -> {:error, :caller_lineage_required}
+      :conflict -> {:error, :self_review_blocked}
+      :ok -> validate_review_not_same_agent(story, reviewer_agent_id)
     end
   end
 

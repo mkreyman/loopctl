@@ -93,7 +93,10 @@ defmodule Loopctl.Agents.Tuning do
   # A pending row older than this whose dispatch holds no slot ended unanswered.
   @pending_grace_seconds 86_400
 
-  @answered_statuses [:proposed, :rejected, :landed, :superseded]
+  # `:nothing_to_learn` closes a window as surely as an answer does: without it, a pair whose
+  # window held no failure stayed due, ranked first in its tenant (most rows) and took that
+  # tenant's first slot on every pass, starving every other pair.
+  @answered_statuses [:proposed, :rejected, :landed, :superseded, :nothing_to_learn]
 
   # A function, not an attribute: an OTP 28 regex cannot be escaped into a module attribute.
   defp pr_url_format,
@@ -256,7 +259,7 @@ defmodule Loopctl.Agents.Tuning do
     with {:ok, target} <- target_spec(candidate.spec_id),
          {:ok, source} <- Intake.source_for_project(candidate.tenant_id, candidate.project_id),
          :ok <- usable_base_branch(source.base_branch),
-         {:ok, object} <- input(candidate, target, pass.now),
+         {:ok, object} <- learnable(candidate, target, pass.now),
          [%Runner{} = runner | _] <-
            Dispatcher.runners(pass.spec, candidate.tenant_id, source.repo_full_name) do
       send_tuning(pass, candidate, %{target: target, source: source, runner: runner}, object)
@@ -267,6 +270,50 @@ defmodule Loopctl.Agents.Tuning do
     end
   rescue
     error -> errored(candidate, Exception.format(:error, error, __STACKTRACE__))
+  end
+
+  defp learnable(candidate, target, now) do
+    case input(candidate, target, now) do
+      {:ok, object} ->
+        {:ok, object}
+
+      {:error, :nothing_to_learn} = nothing ->
+        :ok = record_nothing_to_learn(candidate, target, now)
+        nothing
+    end
+  end
+
+  # Closes the window with no dispatch. A concurrent pass's pending row for the pair does not
+  # conflict with it (the unique index is partial on `pending`); its own answer, when it
+  # comes, simply carries the later window.
+  defp record_nothing_to_learn(candidate, target, now) do
+    {template_id, template_version} = target.prompt
+
+    row = %{
+      id: Ecto.UUID.generate(),
+      tenant_id: candidate.tenant_id,
+      project_id: candidate.project_id,
+      dispatch_id: nil,
+      target_spec_id: target.id,
+      target_spec_version: target.version,
+      template_id: template_id,
+      from_version: template_version,
+      eval_set: eval_set(target),
+      status: :nothing_to_learn,
+      window_since: candidate.since,
+      window_until: now,
+      outcome_rows: candidate.outcome_rows,
+      input: %{"traces" => []},
+      rejection_reasons: [],
+      answered_at: now,
+      inserted_at: now,
+      updated_at: now
+    }
+
+    {:ok, {1, _rows}} =
+      Repo.with_tenant(candidate.tenant_id, fn -> Repo.insert_all(TuningDraft, [row]) end)
+
+    :ok
   end
 
   defp target_spec(spec_id) do
@@ -656,7 +703,10 @@ defmodule Loopctl.Agents.Tuning do
     |> Ecto.Changeset.change(
       status: status,
       rejection_reasons: Enum.map(reasons, &Atom.to_string/1),
-      to_version: result.proposed_template.to_version,
+      # Only an accepted proposal names a version: a rejected one may carry a version that is
+      # not newer (`:template_mismatch`), and the CHECK `to_version > from_version` would
+      # raise on it and lose the verdict.
+      to_version: if(status == :proposed, do: result.proposed_template.to_version),
       new_cases: %{"cases" => result.new_cases},
       diff: result.proposed_template.diff,
       current_score: scores.current,

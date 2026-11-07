@@ -91,9 +91,8 @@ defmodule Loopctl.Delivery.EscalationInbox do
   @default_limit 50
   @max_limit 100
 
-  # The digest's per-tenant read bound, and how many story ids one post names. The rest are
-  # counted, so the count is always the true one.
-  @digest_row_limit 500
+  # How many story ids one post names. Each project's count is taken in SQL
+  # (`project_counts/2`), so it is the true one however many there are.
   @digest_ids_listed 50
   @digest_min_age_seconds 3_600
   @digest_tenant_limit 1_000
@@ -519,29 +518,44 @@ defmodule Loopctl.Delivery.EscalationInbox do
   @spec post_digest(Ecto.UUID.t(), DateTime.t()) :: [digest_outcome()]
   def post_digest(tenant_id, %DateTime{} = now) when is_binary(tenant_id) do
     cutoff = DateTime.add(now, -@digest_min_age_seconds, :second)
+    filters = [reason_class: :budget_exhausted, escalated_before: cutoff]
 
-    {:ok, %{data: rows}} =
-      read(
-        tenant_id,
-        [reason_class: :budget_exhausted, escalated_before: cutoff],
-        @digest_row_limit
-      )
-
-    case Enum.group_by(rows, & &1.project_id) do
-      grouped when map_size(grouped) == 0 -> []
-      grouped -> post_grouped(tenant_id, grouped, now)
+    case project_counts(tenant_id, filters) do
+      [] -> []
+      counts -> post_counted(tenant_id, counts, filters, now)
     end
   end
 
+  # The TRUE count per project, in SQL, before any row is read: reading a bounded page
+  # tenant-wide and grouping it afterwards undercounted every project past the bound and gave
+  # a project whose rows were all older than the newest page no digest at all.
+  defp project_counts(tenant_id, filters) do
+    {:ok, counts} =
+      Repo.with_tenant(tenant_id, fn ->
+        from(r in subquery(escalated_rows(tenant_id)),
+          group_by: r.project_id,
+          select: {r.project_id, count(r.stage_id)}
+        )
+        |> filter(filters)
+        |> Repo.all()
+      end)
+
+    counts
+  end
+
   # The system agent is resolved only once something qualifies, so a quiet tenant gains no row.
-  defp post_grouped(tenant_id, grouped, now) do
+  defp post_counted(tenant_id, counts, filters, now) do
     case digest_agent(tenant_id) do
       {:ok, agent_id} ->
-        for {project_id, project_rows} <- grouped,
-            do: post_project(tenant_id, project_id, agent_id, project_rows, now)
+        for {project_id, count} <- counts do
+          {:ok, %{data: rows}} =
+            read(tenant_id, [{:project_id, project_id} | filters], @digest_ids_listed)
+
+          post_project(tenant_id, project_id, agent_id, {rows, count}, now)
+        end
 
       {:error, reason} ->
-        for {project_id, _rows} <- grouped, do: {:error, project_id, reason}
+        for {project_id, _count} <- counts, do: {:error, project_id, reason}
     end
   end
 
@@ -554,18 +568,23 @@ defmodule Loopctl.Delivery.EscalationInbox do
   @spec digest_agent_name() :: String.t()
   def digest_agent_name, do: @digest_agent_name
 
-  @doc "The digest body for `rows` of one project on `now`'s UTC day. Never names a reason."
-  @spec digest_body([entry()], DateTime.t()) :: String.t()
-  def digest_body(rows, %DateTime{} = now) do
-    count = length(rows)
-    {listed, unlisted} = Enum.split(rows, @digest_ids_listed)
+  @doc """
+  The digest body for one project on `now`'s UTC day: `count` qualifying stories, of which
+  `rows` (the newest, at most #{@digest_ids_listed}) are named. `count` defaults to the rows
+  given. Never names a reason.
+  """
+  @spec digest_body([entry()], DateTime.t(), non_neg_integer() | nil) :: String.t()
+  def digest_body(rows, %DateTime{} = now, count \\ nil) do
+    {listed, _unlisted} = Enum.split(rows, @digest_ids_listed)
+    count = max(count || length(rows), length(listed))
+    unlisted = count - length(listed)
 
     lines =
       Enum.map(listed, fn row ->
         "- #{row.story_id} work_left_behind=#{work_left_behind(row)}"
       end)
 
-    more = if unlisted == [], do: [], else: ["- and #{length(unlisted)} more"]
+    more = if unlisted == 0, do: [], else: ["- and #{unlisted} more"]
 
     Enum.join(
       [
@@ -587,9 +606,9 @@ defmodule Loopctl.Delivery.EscalationInbox do
   defp work_left_behind(%{run: %{work_left_behind: value}}), do: value
   defp work_left_behind(_row), do: :unknown
 
-  defp post_project(tenant_id, project_id, agent_id, rows, now) do
+  defp post_project(tenant_id, project_id, agent_id, {rows, count}, now) do
     attrs = %{
-      body: digest_body(rows, now),
+      body: digest_body(rows, now, count),
       key: digest_key(project_id, now),
       session_id: @digest_session
     }

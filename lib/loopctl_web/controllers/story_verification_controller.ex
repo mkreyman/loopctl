@@ -89,7 +89,10 @@ defmodule LoopctlWeb.StoryVerificationController do
         "follow the landing (409 `chg_landing_reverted`). A forge read that times out or " <>
         "fails, a missing `verified/master` ref or commit, or no credential for the " <>
         "repository is 503 `chg_trunk_unevaluated` with `Retry-After` — never a pass. A story " <>
-        "with no change binding takes exactly the gates it took before.",
+        "with no change binding takes exactly the gates it took before. A story on the " <>
+        "pull-request route (US-48.18) is verified only by the verifier dispatch loopctl " <>
+        "placed for it: any other key is refused 409 `pr_route_verifier_only`, here, on " <>
+        "verify-all and on bulk verify.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{

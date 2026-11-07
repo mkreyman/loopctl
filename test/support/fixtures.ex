@@ -3531,7 +3531,7 @@ defmodule Loopctl.Fixtures do
             target_spec_id: Map.get(attrs, :target_spec_id, "triage"),
             target_spec_version: 1,
             template_id: Map.get(attrs, :target_spec_id, "triage"),
-            from_version: 1,
+            from_version: Map.get(attrs, :from_version, 1),
             eval_set: Map.get(attrs, :target_spec_id, "triage") <> "@1",
             status: status,
             rejection_reasons: if(status == :rejected, do: ["not_better"], else: []),

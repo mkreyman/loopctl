@@ -228,7 +228,10 @@ defmodule LoopctlWeb.StoryStatusController do
         "bound to a lineage known when it is minted, and the reporter is by definition " <>
         "a principal distinct from the implementer who started the work. " <>
         "A key descending from an intake source's `chg_root_dispatch_id` is refused 409 " <>
-        "`chg_root_review_only` (US-47.5). " <>
+        "`chg_root_review_only` (US-47.5). A key no dispatch minted, on dispatch-minted " <>
+        "work, is refused 409 `caller_lineage_required`. A story on the pull-request route " <>
+        "(US-48.18) is reported only by the verifier dispatch loopctl placed for it: any " <>
+        "other key is refused 409 `pr_route_verifier_only`. " <>
         "Optionally includes an artifact report and/or a token usage record.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
@@ -608,7 +611,12 @@ defmodule LoopctlWeb.StoryStatusController do
              # #803: the reporter presented an epoch from a claim that has ended.
              :stale_claim_epoch,
              # US-47.5: chg-server's keys may only review.
-             :chg_root_review_only
+             :chg_root_review_only,
+             # A key no dispatch minted, on dispatch-minted work. Missing from this list
+             # until US-48.18's review, so that documented 409 was a CaseClauseError (500).
+             :caller_lineage_required,
+             # US-48.18: a pull-request-route story is reported by its verifier dispatch.
+             :pr_route_verifier_only
            ] ->
         {:error, reason}
 

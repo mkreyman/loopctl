@@ -45,7 +45,10 @@ defmodule Loopctl.Agents.VerifyVerdict do
   head nobody judged. Then B is revoked.
 
   `Progress.bind_verifier_dispatch/4` retired any earlier report and verification when B was
-  bound, so "already done" can only mean done by THIS verdict's earlier attempt.
+  bound, and on the pull-request route `Progress` refuses report, review-complete and verify
+  to every key but B's (`pr_route_verifier_only`), so "already done" can only mean done by THIS
+  verdict's earlier attempt. The skips check it anyway: a report or review found done under
+  another agent is `{:error, :custody_act_by_other}`, never a skip.
 
   ## `reject`
 
@@ -289,7 +292,7 @@ defmodule Loopctl.Agents.VerifyVerdict do
          :ok <- report(tenant_id, story.id, verifier),
          :ok <- review(tenant_id, story.id, verifier, args),
          :ok <- verify(tenant_id, story.id, verifier, stage),
-         :ok <- record_verified_head(tenant_id, story.id, stage) do
+         :ok <- record_verified_head(tenant_id, story.id, stage, verifier.id) do
       revoke(tenant_id, verifier)
       {:ok, :verified}
     else
@@ -324,8 +327,8 @@ defmodule Loopctl.Agents.VerifyVerdict do
 
   defp report(tenant_id, story_id, verifier) do
     case fetch_story(tenant_id, story_id) do
-      {:ok, %Story{agent_status: :reported_done}} ->
-        :ok
+      {:ok, %Story{agent_status: :reported_done, reported_by_agent_id: by}} ->
+        if by == verifier.agent_id, do: :ok, else: {:error, :custody_act_by_other}
 
       {:ok, %Story{} = story} ->
         tenant_id
@@ -345,34 +348,43 @@ defmodule Loopctl.Agents.VerifyVerdict do
   defp review(tenant_id, story_id, verifier, args) do
     {:ok, story} = fetch_story(tenant_id, story_id)
 
-    if reviewed?(tenant_id, story) do
-      :ok
-    else
-      tenant_id
-      |> Progress.record_review(
-        story_id,
-        %{
-          "review_type" => "verify@1",
-          "findings_count" => length(args["findings"] || []),
-          "summary" => "verify@1 pass at #{args["head_sha"]}"
-        },
-        reviewer_agent_id: verifier.agent_id,
-        reviewer_lineage: verifier.lineage_path,
-        actor_label: @actor_label
-      )
-      |> ok()
+    case reviewers(tenant_id, story) do
+      [] ->
+        record_review(tenant_id, story_id, verifier, args)
+
+      reviewers ->
+        if verifier.agent_id in reviewers, do: :ok, else: {:error, :custody_act_by_other}
     end
   end
 
-  defp reviewed?(tenant_id, %Story{reported_done_at: %DateTime{} = at, id: story_id}) do
-    AdminRepo.exists?(
+  defp record_review(tenant_id, story_id, verifier, args) do
+    tenant_id
+    |> Progress.record_review(
+      story_id,
+      %{
+        "review_type" => "verify@1",
+        "findings_count" => length(args["findings"] || []),
+        "summary" => "verify@1 pass at #{args["head_sha"]}"
+      },
+      reviewer_agent_id: verifier.agent_id,
+      reviewer_lineage: verifier.lineage_path,
+      actor_label: @actor_label
+    )
+    |> ok()
+  end
+
+  # The reviewers of THIS report: records whose `reviewed_report_at` is the story's current
+  # `reported_done_at`.
+  defp reviewers(tenant_id, %Story{reported_done_at: %DateTime{} = at, id: story_id}) do
+    AdminRepo.all(
       from r in ReviewRecord,
         where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
-        where: r.reviewed_report_at == ^at
+        where: r.reviewed_report_at == ^at,
+        select: r.reviewer_agent_id
     )
   end
 
-  defp reviewed?(_tenant_id, _story), do: false
+  defp reviewers(_tenant_id, _story), do: []
 
   defp verify(tenant_id, story_id, verifier, stage) do
     case fetch_story(tenant_id, story_id) do
@@ -398,23 +410,42 @@ defmodule Loopctl.Agents.VerifyVerdict do
   @doc """
   The last write of a `pass`: records `verified_head_sha` as `stage.head_sha` — the head the
   verdict judged, as `apply/1` read it — under the row lock, on the guard that the row's head
-  is STILL that one. A head that moved in between leaves a verification of nothing anyone
-  judged, so it is retired (`Progress.invalidate_verification/3`) rather than kept, and the
-  answer is `{:error, {:verified_head_not_recorded, reason}}`.
+  is STILL that one AND that the story is still `verified` under `verifier_dispatch_id`. A head
+  that moved in between leaves a verification of nothing anyone judged, so it is retired
+  (`Progress.invalidate_verification/3`) rather than kept, and the answer is
+  `{:error, {:verified_head_not_recorded, reason}}`. A story that a later verifier dispatch
+  was bound to in between (B expired mid-apply and B2 was placed, which retired this
+  verification) is `:verifier_rebound`: writing the head then would leave `verified_head_sha`
+  equal to the head on an UNVERIFIED story, which takes it out of verify@1's candidates for
+  good.
 
   Public so a test can hand it the row `apply/1` read, which is the only way to reach the race
   it guards without racing two processes.
   """
-  @spec record_verified_head(Ecto.UUID.t(), Ecto.UUID.t(), StoryStage.t()) ::
+  @spec record_verified_head(Ecto.UUID.t(), Ecto.UUID.t(), StoryStage.t(), Ecto.UUID.t()) ::
           :ok | {:error, {:verified_head_not_recorded, term()}}
-  def record_verified_head(tenant_id, story_id, %StoryStage{head_sha: head} = stage) do
+  def record_verified_head(
+        tenant_id,
+        story_id,
+        %StoryStage{head_sha: head} = stage,
+        verifier_dispatch_id
+      ) do
     case Stages.record_effect(tenant_id, story_id, :verified_head_sha, head,
            claim_epoch: stage.claim_epoch,
            actor_label: @actor_label,
-           guard: fn -> head_still(tenant_id, story_id, head) end
+           guard: fn ->
+             with :ok <- head_still(tenant_id, story_id, head) do
+               still_verified_by(tenant_id, story_id, verifier_dispatch_id)
+             end
+           end
          ) do
       {:ok, _row} ->
         :ok
+
+      # The rebind already retired this verification; retiring again could only reach the
+      # NEW verifier's, should it have finished in between.
+      {:error, :verifier_rebound} ->
+        {:error, {:verified_head_not_recorded, :verifier_rebound}}
 
       {:error, reason} ->
         retire(tenant_id, story_id, reason)
@@ -432,6 +463,25 @@ defmodule Loopctl.Agents.VerifyVerdict do
       )
 
     if current == head, do: :ok, else: {:error, :verdict_stale}
+  end
+
+  # Read under the stage-row lock `record_effect/5` holds, and deliberately WITHOUT a story
+  # lock (`Progress.bind_verifier_dispatch/4` locks story, then stage; locking story here would
+  # invert that order). Either the rebind committed first and this sees it, or the rebind's
+  # retirement runs after this commit and clears `verified_head_sha` itself, in its own
+  # transaction, behind the stage-row lock it then waits for.
+  defp still_verified_by(tenant_id, story_id, verifier_dispatch_id) do
+    current =
+      Repo.one(
+        from s in Story,
+          where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+          select: {s.verified_status, s.verifier_dispatch_id}
+      )
+
+    case current do
+      {:verified, ^verifier_dispatch_id} -> :ok
+      _ -> {:error, :verifier_rebound}
+    end
   end
 
   defp retire(tenant_id, story_id, cause) do

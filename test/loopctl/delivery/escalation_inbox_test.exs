@@ -349,6 +349,50 @@ defmodule Loopctl.Delivery.EscalationInboxTest do
       assert String.starts_with?(agent.name, Agent.reserved_name_prefix())
     end
 
+    test "every project gets its own digest carrying its own true count" do
+      %{story: a} = fixture(:escalated_story, %{escalated_at: DateTime.add(@now, -7_200)})
+
+      %{story: b1} =
+        fixture(:escalated_story, %{
+          tenant_id: a.tenant_id,
+          escalated_at: DateTime.add(@now, -9_000)
+        })
+
+      %{story: b2} =
+        fixture(:escalated_story, %{sibling_of: b1, escalated_at: DateTime.add(@now, -8_000)})
+
+      assert b1.project_id != a.project_id
+
+      results = EscalationInbox.post_digest(a.tenant_id, @now)
+      assert length(results) == 2
+      assert Enum.all?(results, &match?({:posted, _}, &1))
+
+      by_project = Map.new(posts(a.tenant_id), &{&1.project_id, &1.body})
+
+      assert by_project[a.project_id] =~ "1 story is parked"
+      assert by_project[a.project_id] =~ a.id
+      refute by_project[a.project_id] =~ b1.id
+
+      assert by_project[b1.project_id] =~ "2 stories are parked"
+      assert by_project[b1.project_id] =~ b1.id
+      assert by_project[b1.project_id] =~ b2.id
+      refute by_project[b1.project_id] =~ a.id
+    end
+
+    test "the body states the true count and how many it did not name" do
+      rows = [
+        %{story_id: Ecto.UUID.generate(), run: %{work_left_behind: true}},
+        %{story_id: Ecto.UUID.generate(), run: nil}
+      ]
+
+      body = EscalationInbox.digest_body(rows, @now, 60)
+
+      assert body =~ "60 stories are parked"
+      assert body =~ "- and 58 more"
+      assert EscalationInbox.digest_body(rows, @now) =~ "2 stories are parked"
+      refute EscalationInbox.digest_body(rows, @now) =~ "- and "
+    end
+
     test "the next day is a new digest" do
       %{story: story} = fixture(:escalated_story, %{escalated_at: DateTime.add(@now, -7_200)})
 
