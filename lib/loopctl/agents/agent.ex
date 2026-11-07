@@ -22,6 +22,12 @@ defmodule Loopctl.Agents.Agent do
   @agent_types [:orchestrator, :implementer]
   @statuses [:active, :idle, :deactivated]
 
+  # Names loopctl gives its OWN per-tenant agents (US-48.11's `system:escalation-digest`, which
+  # coordination posts are attributed to). Written only by server code that bypasses these
+  # changesets; refused here so no key can register or rename an agent into the namespace and
+  # so own the identity a system post is attributed to.
+  @reserved_name_prefix "system:"
+
   @derive {Jason.Encoder,
            only: [
              :id,
@@ -58,6 +64,7 @@ defmodule Loopctl.Agents.Agent do
     |> validate_required([:name, :agent_type])
     |> validate_inclusion(:agent_type, @agent_types)
     |> validate_length(:name, min: 1, max: 255)
+    |> validate_unreserved_name()
     |> validate_metadata()
     |> put_change(:last_seen_at, DateTime.utc_now())
     |> unique_constraint([:tenant_id, :name],
@@ -74,6 +81,7 @@ defmodule Loopctl.Agents.Agent do
     |> cast(attrs, [:name, :status, :metadata])
     |> validate_inclusion(:status, @statuses)
     |> validate_length(:name, min: 1, max: 255)
+    |> validate_unreserved_name()
     |> validate_metadata()
     |> unique_constraint([:tenant_id, :name],
       message: "has already been taken for this tenant"
@@ -91,6 +99,21 @@ defmodule Loopctl.Agents.Agent do
   """
   @spec statuses() :: [atom()]
   def statuses, do: @statuses
+
+  @doc """
+  The agent-name prefix reserved for loopctl's own system agents. `register_changeset/2` and
+  `update_changeset/2` refuse a name that starts with it.
+  """
+  @spec reserved_name_prefix() :: String.t()
+  def reserved_name_prefix, do: @reserved_name_prefix
+
+  defp validate_unreserved_name(changeset) do
+    validate_change(changeset, :name, fn :name, name ->
+      if is_binary(name) and String.starts_with?(String.downcase(name), @reserved_name_prefix),
+        do: [name: "must not start with #{inspect(@reserved_name_prefix)}, which is reserved"],
+        else: []
+    end)
+  end
 
   defp validate_metadata(changeset) do
     validate_change(changeset, :metadata, fn :metadata, value ->

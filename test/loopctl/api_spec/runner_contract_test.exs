@@ -41,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "c6fb47c200cd1795fde3ca89b78d90481ab574d0f6bbcf82ea72f692f8cf0023"
+  @digest "5d2a292f8de6cfde4ff5751888ce6dc2f5a0a949180c6e22e0634d794ed4508e"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -75,8 +75,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.26.0"
-      assert schema["x-contract-version"] == "1.26.0"
+      assert RunnerContract.version() == "1.27.0"
+      assert schema["x-contract-version"] == "1.27.0"
 
       # 1.26.0 (US-48.9): the reply drafter is a kind a runner may be sent.
       assert "reply_draft" in connection["dispatchable_kinds"]
@@ -1845,6 +1845,90 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # takes the edge. Published nowhere a runner could send it from.
       refute Enum.any?(connection["stage_transitions"], &(&1["edge"] == "budget_reported"))
       assert {:implementing, :escalated, :budget_reported} in StageMachine.transitions()
+    end
+  end
+
+  describe "cast_session_ended/1 turns and work left behind (contract 1.27.0, AC-48.11.2)" do
+    defp ended(attrs) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "claim_epoch" => 3,
+          "reason" => "wall_clock_exceeded"
+        },
+        attrs
+      )
+    end
+
+    test "both optional fields are carried when sent, in either boolean value" do
+      for left <- [true, false] do
+        payload = ended(%{"turns_used" => 41, "work_left_behind" => left})
+
+        assert {:ok, message} = RunnerContract.cast_session_ended(payload)
+
+        assert message == %{
+                 dispatch_id: payload["dispatch_id"],
+                 claim_epoch: 3,
+                 reason: "wall_clock_exceeded",
+                 turns_used: 41,
+                 work_left_behind: left
+               }
+      end
+
+      assert {:ok, %{turns_used: 0}} =
+               RunnerContract.cast_session_ended(ended(%{"turns_used" => 0}))
+    end
+
+    test "absent stays absent: a 1.26.0 runner's message casts exactly as before" do
+      assert {:ok, message} = RunnerContract.cast_session_ended(ended(%{}))
+      refute Map.has_key?(message, :turns_used)
+      refute Map.has_key?(message, :work_left_behind)
+
+      # Either one alone is fine: a runner that cannot tell what it left behind omits that.
+      assert {:ok, only_turns} = RunnerContract.cast_session_ended(ended(%{"turns_used" => 7}))
+      refute Map.has_key?(only_turns, :work_left_behind)
+    end
+
+    test "a value of the wrong type or range is invalid_payload" do
+      # "41" and "true" are not here: the contract's cast (OpenApiSpex) reads a digit string
+      # as an integer and "true"/"false" as booleans on every field, `claim_epoch` included,
+      # and these two follow the same rule. Anything else of the wrong type is refused.
+      for bad <- [
+            %{"turns_used" => "forty"},
+            %{"turns_used" => -1},
+            %{"turns_used" => %{"n" => 1}},
+            %{"turns_used" => 1.5},
+            %{"turns_used" => nil},
+            %{"turns_used" => RunnerSessionEnded.max_turns_used() + 1},
+            %{"work_left_behind" => "unknown"},
+            %{"work_left_behind" => "yes"},
+            %{"work_left_behind" => [true]},
+            %{"work_left_behind" => nil},
+            %{"work_left_behind" => 1}
+          ] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_session_ended(ended(bad)),
+               inspect(bad)
+      end
+
+      assert {:ok, %{turns_used: max}} =
+               RunnerContract.cast_session_ended(
+                 ended(%{"turns_used" => RunnerSessionEnded.max_turns_used()})
+               )
+
+      assert max == RunnerSessionEnded.max_turns_used()
+    end
+
+    test "the published shape names both as optional properties" do
+      ended = RunnerContract.json_schema()["$defs"]["RunnerSessionEnded"]
+
+      assert Enum.sort(ended["required"]) == ~w(claim_epoch dispatch_id reason)
+
+      assert %{"type" => "integer", "minimum" => 0, "maximum" => max} =
+               ended["properties"]["turns_used"]
+
+      assert max == RunnerSessionEnded.max_turns_used()
+      assert %{"type" => "boolean"} = ended["properties"]["work_left_behind"]
     end
   end
 

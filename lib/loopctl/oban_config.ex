@@ -747,6 +747,13 @@ defmodule Loopctl.ObanConfig do
            # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
            # crontab assertion in oban_plugins_config_test.exs.
            {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker},
+           # US-48.11: the daily escalation digest — one channel post per project holding
+           # budget-exhausted escalations older than an hour. DAILY and HARDCODED (no env
+           # var), like the entry above. 14:00 UTC is the start of the operator's US
+           # morning, when a parked implementation is worth reading about. Idempotent per
+           # project per UTC day. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"0 14 * * *", Loopctl.Workers.EscalationDigestWorker},
            # PARKED (see `@parked_crons`) — DECLARED here, filtered out of the live
            # crontab by `reject_parked/2` unless an operator names it in
            # `OBAN_UNPARK_CRONS`. Its action is `archive`, which is TERMINAL, and an

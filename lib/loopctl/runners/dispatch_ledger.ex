@@ -163,6 +163,22 @@ defmodule Loopctl.Runners.DispatchLedger do
   @spec prune_budget() :: pos_integer()
   def prune_budget, do: @prune_budget
 
+  # The `runner_dispatches.max_turns` integer column's ceiling. `RunnerDispatch.max_turns` has a
+  # minimum and no maximum, so a budget past this is a dispatch the contract admits and the
+  # column cannot hold: it is recorded as not known (NULL) rather than raising out of the
+  # insert and refusing the dispatch over a figure only the escalation inbox reads.
+  @max_storable_turns 2_147_483_647
+
+  @doc "The largest turn budget the ledger stores; a larger one is recorded as NULL."
+  @spec max_storable_turns() :: pos_integer()
+  def max_storable_turns, do: @max_storable_turns
+
+  defp storable_turns(turns)
+       when is_integer(turns) and turns >= 1 and turns <= @max_storable_turns,
+       do: turns
+
+  defp storable_turns(_turns), do: nil
+
   @doc """
   Records a validated dispatch as `sent`, or finds the row an earlier dispatch of the same
   `dispatch_id` wrote. See the moduledoc for the refusals.
@@ -202,6 +218,9 @@ defmodule Loopctl.Runners.DispatchLedger do
       base_branch: implement_only(dispatch, Map.get(dispatch, :base_branch)),
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
+      # The turn budget it is PLACED under (US-48.11), by the rule `wall_clock_seconds`
+      # follows: here on the first insert, then refreshed by the push that wins delivery.
+      max_turns: storable_turns(Map.get(dispatch, :max_turns)),
       # Born holding NO slot: the row is inserted first (that is how a retry is told from a
       # first send), and `take_slot/1` clears this in the same transaction. The CHECK that
       # every unreleased row is bounded therefore holds at every instant, not only at commit
@@ -316,7 +335,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   A winning push also refreshes `wall_clock_seconds` to the clock of the dispatch actually
   delivered, and raises `wall_clock_seconds_max` to it when it is the longest yet —
   `Loopctl.Runners.Capacity.heal/3` bounds an accepted session by that largest pushed clock,
-  falling back to `wall_clock_seconds` on a row that has none.
+  falling back to `wall_clock_seconds` on a row that has none. It refreshes `max_turns` the
+  same way, to the turn budget of the dispatch delivered (US-48.11); a dispatch map that names
+  no `max_turns` leaves the row's as it is.
   Recorded here rather than in `record_sent/3` because a re-send that is then DROPPED must
   not move the bound of a session an earlier push started.
   """
@@ -391,8 +412,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   # `wall_clock_seconds_max` only ever grows: it is the longest clock any push of this dispatch
   # carried, which is what an acceptance re-anchors the claim on (`reanchor_lease/3`).
   # `GREATEST` ignores the NULL of a row never pushed before.
+  #
+  # `max_turns` is the budget of the session this push starts; `COALESCE` keeps the placed one
+  # when the pushed map carries none.
   defp decide(repo, %DispatchRecord{} = record, "pushed", dispatch, now) do
     wall_clock_seconds = dispatch.wall_clock_seconds
+    max_turns = storable_turns(Map.get(dispatch, :max_turns))
 
     {1, _} =
       from(d in DispatchRecord,
@@ -404,6 +429,7 @@ defmodule Loopctl.Runners.DispatchLedger do
             wall_clock_seconds: ^wall_clock_seconds,
             wall_clock_seconds_max:
               fragment("GREATEST(?, ?)", d.wall_clock_seconds_max, ^wall_clock_seconds),
+            max_turns: fragment("COALESCE(?, ?)", type(^max_turns, :integer), d.max_turns),
             updated_at: ^now
           ]
         ]
@@ -744,12 +770,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   this call recorded it or found it already recorded (US-44.3, contract 1.16.0).
 
   `attrs` carries what the caller derived from the message: `:reason`, `:digest` (the canonical
-  digest of the whole message) and `:counts_toward_retry_ceiling` (`nil` for a reason that
+  digest of the report's identity, `dispatch_id`, `claim_epoch` and `reason`) and `:counts_toward_retry_ceiling` (`nil` for a reason that
   re-queues nothing) — and `:story_id`, the dispatch's story as `held_dispatch/3` returned it, so
   the story's lock can be taken first without reading the dispatch row twice. A row whose
   story is not that one is `:unknown_dispatch`. Returns
   `{:ok, {:recorded | :replayed, session}}`, where `session` is the map `accepted_session/3`
   returns.
+
+  The first recording also stores the message's optional `turns_used` and `work_left_behind`
+  (contract 1.27.0) as `session_turns_used` and `work_left_behind`, NULL when absent. They are
+  not in the digest, so a resend differing only in them is `:replayed` and writes nothing.
 
   ## THE DIGEST IS COMPARED BEFORE THE EPOCH FENCE, and that order is the feature
 
@@ -848,7 +878,12 @@ defmodule Loopctl.Runners.DispatchLedger do
           session_ended_reason: attrs.reason,
           session_ended_digest: attrs.digest,
           session_ended_at: ended_at,
-          counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling
+          counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling,
+          # The runner's own figures (contract 1.27.0), with the FIRST report only: a replay
+          # returned above, so a resend that recounts them never rewrites these. Absent from
+          # a 1.26.0 report, and then NULL — not known, never zero or false.
+          session_turns_used: Map.get(message, :turns_used),
+          work_left_behind: Map.get(message, :work_left_behind)
         )
         |> Repo.update!()
 

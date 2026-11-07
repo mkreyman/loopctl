@@ -109,6 +109,7 @@
     ["GET","/api/v1/epics/:id/progress","LoopctlWeb.EpicController",":progress"],
     ["GET","/api/v1/epics/:id/story_dependencies","LoopctlWeb.StoryDependencyController",":index"],
     ["POST","/api/v1/epics/:id/verify-all","LoopctlWeb.StoryVerificationController",":verify_all"],
+    ["GET","/api/v1/escalations","LoopctlWeb.EscalationController",":index"],
     ["GET","/api/v1/ingestion-anomalies","LoopctlWeb.IngestionAnomalyController",":index"],
     ["PATCH","/api/v1/ingestion-anomalies/:id","LoopctlWeb.IngestionAnomalyController",":update"],
     ["POST","/api/v1/intake/github/:source_id","LoopctlWeb.GithubIntakeController",":deliver"],

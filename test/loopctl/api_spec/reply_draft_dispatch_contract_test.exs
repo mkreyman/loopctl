@@ -37,7 +37,8 @@ defmodule Loopctl.ApiSpec.ReplyDraftDispatchContractTest do
     assert "reply_draft" in Kinds.all()
     assert "reply_draft" in Kinds.dispatchable()
     assert Enum.sort(Kinds.fenced_report_kinds()) == ["reply_draft", "triage"]
-    assert RunnerContract.version() == "1.26.0"
+    # Since 1.26.0: a later minor keeps the kind, so this pins the floor, not the version.
+    assert Version.compare(RunnerContract.version(), "1.26.0") != :lt
   end
 
   test "a reply_draft dispatch carrying the fenced report casts", ctx do

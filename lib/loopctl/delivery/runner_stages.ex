@@ -311,13 +311,19 @@ defmodule Loopctl.Delivery.RunnerStages do
     end
   end
 
-  # The digest is over the WHOLE cast message — dispatch, epoch and reason — in the canonical
+  # The digest is over the report's IDENTITY — dispatch, epoch and reason — in the canonical
   # form `TriageVerdictRecord.digest/1` already defines for the same job, so "the same bytes"
-  # means one thing on both idempotent runner messages.
+  # means one thing on both idempotent runner messages. NOT over the whole message since
+  # contract 1.27.0: `turns_used` and `work_left_behind` are figures recorded with the first
+  # copy, and a resend that recounts or drops them is the same report, answered `ok`, whose
+  # first figures stand. Those three keys are exactly what a 1.26.0 message cast to, so a row
+  # recorded before this change is still matched by its resend.
+  @session_end_identity [:dispatch_id, :claim_epoch, :reason]
+
   defp session_end_attrs(%{reason: reason} = message, story_id) do
     %{
       reason: reason,
-      digest: TriageVerdictRecord.digest(message),
+      digest: TriageVerdictRecord.digest(Map.take(message, @session_end_identity)),
       counts_toward_retry_ceiling: counts_toward_retry_ceiling(reason),
       story_id: story_id
     }

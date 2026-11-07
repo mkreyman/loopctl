@@ -560,7 +560,7 @@
       "type": "object"
     },
     "RunnerSessionEnded": {
-      "description": "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, not a request — control decides the story's next stage from `reason`: `completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` escalate an in-flight story over the control-only `budget_reported` edge and end its claim, `crashed` releases the claim at once over `runner_lost` — re-queued below the retry ceiling, escalated over the control-only `attempts_exhausted` edge at it (since 1.18.0) — and `usage_exhausted` releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: a byte-identical resend is answered `ok` with the row even after the release it caused moved the claim epoch on, and a different `reason` is `already_recorded`.",
+      "description": "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, not a request — control decides the story's next stage from `reason`: `completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` escalate an in-flight story over the control-only `budget_reported` edge and end its claim, `crashed` releases the claim at once over `runner_lost` — re-queued below the retry ceiling, escalated over the control-only `attempts_exhausted` edge at it (since 1.18.0) — and `usage_exhausted` releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: a byte-identical resend is answered `ok` with the row even after the release it caused moved the claim epoch on, and a different `reason` is `already_recorded`. Since 1.27.0 it may also carry `turns_used` and `work_left_behind`, both optional and both recorded with the first copy only: the report's identity is `dispatch_id`, `claim_epoch` and `reason`, so a resend differing only in them is the same report, answered `ok`, and the first copy's values stand.",
       "properties": {
         "claim_epoch": {
           "description": "The `claim_epoch` of the dispatch, echoed.",
@@ -582,6 +582,16 @@
             "crashed"
           ],
           "type": "string"
+        },
+        "turns_used": {
+          "description": "OPTIONAL (since 1.27.0). The number of agent turns the session took, as the runner counted them. Omit it when the runner does not count turns. Shown beside the turn budget the dispatch was placed under; it changes no stage.",
+          "maximum": 2147483647,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "work_left_behind": {
+          "description": "OPTIONAL (since 1.27.0). `true` when, at exit, the session's branch had commits that were not on the remote; `false` when it had none. OMIT it when the runner could not tell (no branch, an unreadable checkout, no remote to compare against): loopctl then shows it as unknown, and never infers it.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -2200,5 +2210,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.26.0"
+  "x-contract-version": "1.27.0"
 }

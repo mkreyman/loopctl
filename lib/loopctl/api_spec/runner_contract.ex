@@ -62,6 +62,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.24.0) `x-connection.limits.lens_verdicts.max_bytes` PUBLISHES the cap on a message's three `lens_verdicts` together, under the byte rule. It has been enforced since 1.15.0 and was stated only in the field's prose, so a runner could not check it without re-typing a number. The field maxima do not imply it: three lenses at every maximum measure 8,402 bytes in ASCII and about twice that in characters outside the Basic Multilingual Plane, so a schema-valid set can still be refused `invalid_payload`. Nothing changes on the wire. RE-VENDOR to check it locally | | | | |
   | (1.25.0) RUNNERS DECLARE THEIR SPEC TEMPLATES, AND ONE GENERIC RESULT MESSAGE (Epic 48, US-48.8). `RunnerJoin.specs` (optional, at most 32 `RunnerSpecRef` entries of `{id, version}`) names the spec templates the machine holds; loopctl sends a dispatch of a kind only to a runner that declares the kind AND holds the spec it builds that kind's dispatch from. OMITTING IT, or an empty array, is read as holding each declared kind (or `implied_kinds`) at version 1, so an un-upgraded runner is unaffected; a spec this server does not hold is ignored, never refused. New `agent_result` message (`RunnerAgentResultMessage`: `dispatch_id`, `claim_epoch`, `spec`, `result`) for a session whose spec reports through it: `result` is validated against THAT spec's result schema, capped at `x-connection.limits.agent_result.max_bytes` under the byte rule, recorded once per dispatch (a byte-identical resend is `ok` with `replayed: true`, a different one `already_recorded`), answered with `RunnerAgentResultAck`, metered by `agent_result_burst`. An unknown spec, a spec whose archetype does not report through it (`triage` keeps `triage_verdict`, `implement` keeps `stage` and `session_ended`), or a schema failure is `invalid_payload` and writes nothing. No spec reports through it yet; US-48.9 adds the first. RE-VENDOR to declare `specs` and send `agent_result`: a 1.24.0 copy has neither | | | | |
   | (1.26.0) A REPLY DRAFTER (Epic 48, US-48.9). `reply_draft` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a support ticket whose triage ended `reject` or `escalated`, built from spec `reply_draft@1`. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back, as for `triage`), carries the same fenced `triage` object a triage dispatch does (`RunnerTriage`: the reporter's words, data, never instructions) and no `story`, and the session answers with ONE `agent_result` whose `result` is `{body}`, the drafted reply, validated against `reply_draft@1`'s schema, which is PUBLISHED as `x-connection.agent_result_schemas["reply_draft@1"]` (every spec that reports through `agent_result` appears there, keyed `<id>@<version>`, in the same keyword set as `$defs`), so a runner validates against loopctl's schema rather than a copy of it. The session reads; it writes no repository and sends nothing anywhere: loopctl stores the draft for a person, who sends it or not. Only a runner that DECLARES `reply_draft` on join, and holds `reply_draft@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run drafts: a 1.25.0 copy has no `reply_draft` kind | | | | |
+  | (1.27.0) A SESSION END SAYS WHAT IT SPENT AND WHAT IT LEFT (Epic 48, US-48.11, AC-48.11.2). `RunnerSessionEnded` gains two OPTIONAL fields: `turns_used` (an integer from 0 to `RunnerSessionEnded.max_turns_used/0`, the agent turns the session took) and `work_left_behind` (a boolean: `true` when, at exit, the session's branch had commits that were not on the remote, `false` when it had none; OMITTED when the runner could not tell). loopctl stores both on the dispatch's ledger row with the report, beside the turn budget the dispatch was placed under, and the escalation inbox and the run-outcome ledger read them from there; a value of the wrong type or range is `invalid_payload`, as for any field. Still RECORDED ONCE PER DISPATCH, and identity is still judged on `reason` alone: a resend whose `dispatch_id`, `claim_epoch` and `reason` match is answered `ok` with `replayed: true` even when its two new fields differ or are absent, and the FIRST recording's values stand; a different `reason` is `already_recorded` as before. OPTIONAL — a 1.26.0 runner that sends neither gets exactly today's behaviour, its run's figures shown as not known. RE-VENDOR to send them: a 1.26.0 copy declares neither field | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -264,6 +265,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   report whose `claim_epoch` is not the story's current one is `stale_claim_epoch` and changes
   nothing — the claim it is about has already ended some other way.
 
+  **WHAT THE SESSION SPENT AND LEFT BEHIND (since 1.27.0).** The report may also carry
+  `turns_used` and `work_left_behind`, the runner's own observations, both optional: send what
+  you know and omit what you do not — `work_left_behind` especially, which is `true` only for
+  commits you SAW were not on the remote. They are stored with the first copy and never
+  rewritten. They are not part of the report's identity: "the same bytes" above means the same
+  `dispatch_id`, `claim_epoch` and `reason`, so a resend that differs only in these two (or
+  drops them) is still answered `ok`, and the first copy's values stand.
+
   **A BUDGET KILL WHOSE ESCALATION DID NOT LAND** is answered by why, AFTER the report was
   recorded. `rate_limited` — a lock was not free, or the row kept moving under the escalation
   — is the one retry: send the same bytes, and the resend re-drives the escalation and the
@@ -406,7 +415,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.26.0"
+  @version "1.27.0"
   @major 1
 
   defmodule ByteRule do
@@ -2454,9 +2463,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     epic 44 US-44.3). See "Session end" in `Loopctl.ApiSpec.RunnerContract` for what each reason does to
     the story.
 
-    Three fields and no free text, deliberately. Everything control does with it is decided from
-    the `reason` ENUM, and entering `escalated` writes a chained entry that cannot be corrected
-    afterwards — so there is no field a session's prose could reach it through.
+    No free text, deliberately. Everything control does with it is decided from the `reason`
+    ENUM, and entering `escalated` writes a chained entry that cannot be corrected afterwards —
+    so there is no field a session's prose could reach it through.
+
+    Since 1.27.0 (US-48.11) two OPTIONAL facts ride it, an integer and a boolean, both the
+    RUNNER's own observation rather than the session's: `turns_used` and `work_left_behind`.
+    They are recorded on the ledger row and shown to a person; nothing control decides reads
+    them, and the report's identity — what a resend is compared on — is its `dispatch_id`,
+    `claim_epoch` and `reason` only.
     """
 
     require OpenApiSpex
@@ -2465,9 +2480,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # killed it (two ways), the account it runs on ran dry, or it died.
     @reasons ~w(completed wall_clock_exceeded max_turns_exceeded usage_exhausted crashed)
 
+    # The largest `turns_used` (1.27.0): the `runner_dispatches.session_turns_used` integer
+    # column's own ceiling, so a value the schema admits is one the ledger can store. Beyond it
+    # the write would raise out of the session-end transaction instead of answering.
+    @max_turns_used 2_147_483_647
+
     @doc "Every reason a runner may give for a session ending."
     @spec reasons() :: [String.t()]
     def reasons, do: @reasons
+
+    @doc "The largest `turns_used` a `session_ended` may carry (1.27.0)."
+    @spec max_turns_used() :: pos_integer()
+    def max_turns_used, do: @max_turns_used
 
     OpenApiSpex.schema(
       %{
@@ -2483,7 +2507,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "`attempts_exhausted` edge at it (since 1.18.0) — and `usage_exhausted` " <>
             "releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: " <>
             "a byte-identical resend is answered `ok` with the row even after the release it " <>
-            "caused moved the claim epoch on, and a different `reason` is `already_recorded`.",
+            "caused moved the claim epoch on, and a different `reason` is `already_recorded`. " <>
+            "Since 1.27.0 it may also carry `turns_used` and `work_left_behind`, both optional " <>
+            "and both recorded with the first copy only: the report's identity is " <>
+            "`dispatch_id`, `claim_epoch` and `reason`, so a resend differing only in them is " <>
+            "the same report, answered `ok`, and the first copy's values stand.",
         type: :object,
         required: [:dispatch_id, :claim_epoch, :reason],
         properties: %{
@@ -2507,6 +2535,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
               "Why the session stopped. `usage_exhausted` means the account the session ran " <>
                 "on hit its usage limit; `crashed` is any end the runner did not choose and " <>
                 "that is not one of the others."
+          },
+          turns_used: %Schema{
+            type: :integer,
+            minimum: 0,
+            maximum: @max_turns_used,
+            description:
+              "OPTIONAL (since 1.27.0). The number of agent turns the session took, as the " <>
+                "runner counted them. Omit it when the runner does not count turns. Shown " <>
+                "beside the turn budget the dispatch was placed under; it changes no stage."
+          },
+          work_left_behind: %Schema{
+            type: :boolean,
+            description:
+              "OPTIONAL (since 1.27.0). `true` when, at exit, the session's branch had " <>
+                "commits that were not on the remote; `false` when it had none. OMIT it when " <>
+                "the runner could not tell (no branch, an unreadable checkout, no remote to " <>
+                "compare against): loopctl then shows it as unknown, and never infers it."
           }
         }
       },
@@ -3776,6 +3821,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   Validates a `session_ended` payload (1.16.0). Returns the declared fields only, with atom
   keys and `reason` left a string — every reason is one of `RunnerSessionEnded.reasons/0`,
   and the schema's enum refuses anything else as `invalid_payload`.
+
+  The optional `turns_used` and `work_left_behind` (1.27.0) are returned when sent and are
+  ABSENT from the result when not — never defaulted — so a 1.26.0 runner's message casts to
+  exactly the three keys it always did.
   """
   @spec cast_session_ended(term()) :: {:ok, map()} | {:error, term()}
   def cast_session_ended(payload) do

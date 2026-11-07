@@ -206,7 +206,9 @@ defmodule Loopctl.Agents.RegistryTest do
       # the event the spec answers with and the screens that run over it.
       "lib/loopctl/delivery_gates/measurement/eval_replay.ex",
       # US-48.12: a run's outcome row names the spec {id, version} its dispatch ran under.
-      "lib/loopctl/agents/outcomes.ex"
+      "lib/loopctl/agents/outcomes.ex",
+      # US-48.11: an inbox row names the spec {id, version} of the dispatch that parked it.
+      "lib/loopctl/delivery/escalation_inbox.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

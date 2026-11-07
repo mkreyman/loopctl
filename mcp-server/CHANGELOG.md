@@ -5,6 +5,25 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.9.0 — 2026-11-07 (the escalation inbox)
+
+### Added
+
+- **`escalation_list`** reads the escalation inbox (loopctl US-48.11, `GET /api/v1/escalations`):
+  every story of the tenant parked at `escalated`, newest first, with `reason_class` derived from
+  the stage-machine edge (budget_exhausted, session_failed, triage_escalated, gate_refused,
+  operator_released, other) and, for a budget kill, the run's elapsed time, budget and branch
+  from the dispatch ledger, its turns used against its turn budget, and `work_left_behind`
+  (`"true"`/`"false"` from the runner's session-end report, `"unknown"` for a runner older
+  than contract 1.27.0). Filters `reason_class`, `project_id`, `since`; keyset pagination
+  through `next_cursor`. It reads only: `resolve_escalation` with `to: "queued"` works a row
+  again. Any key of the tenant reads it; `LOOPCTL_AGENT_KEY` is passed as an override.
+
+### Changed
+
+- **`agent_outcomes`**' description no longer says no runner reports turns: `median_turns` is
+  filled from the runner's session-end report since loopctl runner contract 1.27.0.
+
 ## 3.8.0 — 2026-11-07 (agent outcomes)
 
 ### Added

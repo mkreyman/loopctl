@@ -2659,6 +2659,64 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # A story PARKED at `escalated` (US-48.11's inbox), entirely on the RLS `Loopctl.Repo`
+  # sandbox connection: its stage row, the `transitioned -> escalated` stage event over `:edge`
+  # (default `:budget_reported`) at `:escalated_at` (default now) — the inbox orders on it and
+  # the digest's one-hour age reads it — and, unless `ledger: false`, the implement dispatch
+  # ledger row that parked it: accepted ten minutes before the escalation and ended by the
+  # runner's `session_ended` (`:session_ended_reason`, default `wall_clock_exceeded`) one second
+  # before it. `:max_turns` (the budget placed), `:session_turns_used` and `:work_left_behind`
+  # (the runner's 1.27.0 report) default to NULL, a 1.26.0 runner's row. Pass `:tenant_id` to
+  # add to an existing tenant, and `:sibling_of` (a story) to put the new story in that story's
+  # project. Returns `%{story:, stage:, dispatch:}`.
+  def fixture(:escalated_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    edge = Map.get(attrs, :edge, :budget_reported)
+    escalated_at = Map.get_lazy(attrs, :escalated_at, &DateTime.utc_now/0)
+
+    story =
+      case Map.get(attrs, :sibling_of) do
+        nil -> fixture(:stage_story, Map.take(attrs, [:tenant_id]))
+        %Story{} = sibling -> sibling_story(sibling)
+      end
+
+    tenant_id = story.tenant_id
+
+    stage =
+      fixture(:story_stage, %{
+        tenant_id: tenant_id,
+        story_id: story.id,
+        stage: :escalated,
+        branch: Map.get(attrs, :stage_branch),
+        escalation_reason: Map.get(attrs, :reason, "session_ended:wall_clock_exceeded")
+      })
+
+    {:ok, dispatch} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        Loopctl.Repo.insert_all(Loopctl.Delivery.StageEvent, [
+          %{
+            id: Ecto.UUID.generate(),
+            tenant_id: tenant_id,
+            story_stage_id: stage.id,
+            story_id: story.id,
+            event: "transitioned",
+            from_stage: Atom.to_string(Map.get(attrs, :from, :implementing)),
+            to_stage: "escalated",
+            edge: edge && Atom.to_string(edge),
+            claim_epoch: stage.claim_epoch,
+            lock_version: stage.lock_version,
+            actor_label: "fixture",
+            data: %{},
+            inserted_at: escalated_at
+          }
+        ])
+
+        if Map.get(attrs, :ledger, true), do: escalated_ledger_row(story, escalated_at, attrs)
+      end)
+
+    %{story: story, stage: stage, dispatch: dispatch}
+  end
+
   # A RECORDED triage verdict (`triage_verdicts`), as `Loopctl.Delivery.TriageVerdict` writes
   # one after a runner's verdict message, for the readers that judge it (US-44.1). Defaults
   # to a unanimous `story` verdict with all three lens verdicts; pass `lens_verdicts: nil` for
@@ -2760,6 +2818,9 @@ defmodule Loopctl.Fixtures do
             status: Map.get(attrs, :status, "accepted"),
             trace_acked_seq: -1,
             wall_clock_seconds: 3_600,
+            # The turn budget it was placed under (contract 1.27.0's escalation inbox reads
+            # it). NULL unless given, as on a row written before the column.
+            max_turns: Map.get(attrs, :max_turns),
             delivery: "pushed",
             pushed_at: now,
             replied_at: now,
@@ -3900,6 +3961,82 @@ defmodule Loopctl.Fixtures do
       ),
       set: [triage_dispatch_id: verdict.dispatch_id]
     )
+  end
+
+  # A second story in `sibling`'s project and epic, on `Repo`, for `fixture(:escalated_story)`.
+  defp sibling_story(%Story{} = sibling) do
+    {:ok, story} =
+      Loopctl.Repo.with_tenant(sibling.tenant_id, fn ->
+        %Story{
+          tenant_id: sibling.tenant_id,
+          project_id: sibling.project_id,
+          epic_id: sibling.epic_id
+        }
+        |> Story.create_changeset(build(:story, %{}))
+        |> Loopctl.Repo.insert!()
+      end)
+
+    story
+  end
+
+  # The implement dispatch that parked a `fixture(:escalated_story)`, inside its `with_tenant`.
+  defp escalated_ledger_row(%Story{} = story, escalated_at, attrs) do
+    runner = Loopctl.Repo.insert!(stage_runner_row(story.tenant_id))
+    accepted_at = DateTime.add(escalated_at, -600, :second)
+    reason = Map.get(attrs, :session_ended_reason, "wall_clock_exceeded")
+
+    Loopctl.Repo.insert!(%DispatchRecord{
+      tenant_id: story.tenant_id,
+      runner_id: runner.id,
+      dispatch_id: Ecto.UUID.generate(),
+      story_id: story.id,
+      claim_epoch: 0,
+      kind: Map.get(attrs, :kind, "implement"),
+      branch: Map.get(attrs, :branch, "loop/escalated-#{System.unique_integer([:positive])}"),
+      status: "accepted",
+      trace_acked_seq: -1,
+      wall_clock_seconds: 3_600,
+      max_turns: Map.get(attrs, :max_turns),
+      delivery: "pushed",
+      pushed_at: accepted_at,
+      replied_at: accepted_at,
+      released_at: escalated_at,
+      slot_generation: 0,
+      session_ended_reason: reason,
+      session_turns_used: reason && Map.get(attrs, :session_turns_used),
+      work_left_behind: reason && Map.get(attrs, :work_left_behind),
+      session_ended_digest: reason && Ecto.UUID.generate(),
+      session_ended_at: reason && DateTime.add(escalated_at, -1, :second),
+      inserted_at: accepted_at,
+      updated_at: accepted_at
+    })
+  end
+
+  # The runner a ledger row needs, its key and agent included, as `fixture(:stage_runner)`
+  # inserts it — but INSIDE a `with_tenant` the caller already holds, which that fixture
+  # cannot be called from (`with_tenant/2` refuses to nest).
+  defp stage_runner_row(tenant_id) do
+    api_key =
+      %ApiKey{tenant_id: tenant_id}
+      |> ApiKey.create_changeset(%{name: "runner:escalated", role: :agent})
+      |> Ecto.Changeset.put_change(:key_hash, Auth.hash_key(Ecto.UUID.generate()))
+      |> Ecto.Changeset.put_change(:key_prefix, "lc_escal")
+      |> Loopctl.Repo.insert!()
+
+    name = "runner-#{System.unique_integer([:positive])}"
+
+    agent =
+      %Agent{tenant_id: tenant_id}
+      |> Agent.register_changeset(%{
+        name: Loopctl.Runners.agent_name(name),
+        agent_type: :implementer
+      })
+      |> Loopctl.Repo.insert!()
+
+    %Runner{tenant_id: tenant_id}
+    |> Runner.create_changeset(%{name: name})
+    |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
+    |> Ecto.Changeset.put_change(:agent_id, agent.id)
   end
 
   defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do

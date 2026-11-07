@@ -45,6 +45,13 @@ defmodule Loopctl.Runners.DispatchRecord do
   `counts_toward_retry_ceiling` says, for the two reasons that re-queue the story, whether
   that release is spent against the retry ceiling — `crashed` is, `usage_exhausted` is not.
 
+  Since contract 1.27.0 the same report may carry `session_turns_used` and
+  `work_left_behind`, written with it and never again. The digest is over the report's
+  IDENTITY (`dispatch_id`, `claim_epoch`, `reason`), not those figures, so a resend that
+  differs only in them is the same report and the first recording's figures stand.
+  `max_turns`, the budget the session ran under, is loopctl's own: bound at placement like
+  `wall_clock_seconds`.
+
   ## Trust boundary
 
   Every field is set programmatically in `Loopctl.Runners`; there is no caller changeset.
@@ -87,6 +94,10 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :trace_acked_seq, :integer, default: -1
     field :wall_clock_seconds, :integer
     field :wall_clock_seconds_max, :integer
+    # The turn budget the dispatch was placed under (US-48.11, AC-48.11.2): written where
+    # `wall_clock_seconds` is, on the first insert and again by the push that wins delivery.
+    # NULL on a row older than the column, and for a budget the column cannot hold.
+    field :max_turns, :integer
     field :released_at, :utc_datetime_usec
     field :reserved_at, :utc_datetime_usec
     field :slot_generation, :integer, default: 0
@@ -98,6 +109,11 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :session_ended_digest, :string
     field :session_ended_at, :utc_datetime_usec
     field :counts_toward_retry_ceiling, :boolean
+    # The runner's own figures from that report (contract 1.27.0), written with it, once:
+    # the turns the session took, and whether its branch had commits not on the remote at
+    # exit. NULL when the report carried none — a 1.26.0 runner, or one that could not tell.
+    field :session_turns_used, :integer
+    field :work_left_behind, :boolean
     # The result a `:draft` session reported through `agent_result` (contract 1.25.0, US-48.8),
     # validated against `agent_result_spec`'s schema. Written once, with the digest a resend is
     # compared against, by `Loopctl.Runners.DispatchLedger.record_agent_result/4`; all four

@@ -21,6 +21,7 @@ defmodule Loopctl.Delivery.SessionEndTest do
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
@@ -234,6 +235,76 @@ defmodule Loopctl.Delivery.SessionEndTest do
     end
   end
 
+  describe "turns used and work left behind (contract 1.27.0, AC-48.11.2)" do
+    test "are written to the ledger row with the first report, true or false" do
+      for left <- [true, false] do
+        ctx = session(:implementing)
+
+        assert {:ok, %{replayed?: false}} =
+                 end_session(ctx, "wall_clock_exceeded", %{
+                   turns_used: 58,
+                   work_left_behind: left
+                 })
+
+        recorded = ledger(ctx.record)
+        assert recorded.session_turns_used == 58
+        assert recorded.work_left_behind == left
+      end
+    end
+
+    test "a 1.26.0 report, which carries neither, leaves both NULL" do
+      ctx = session(:implementing)
+
+      assert {:ok, _} = end_session(ctx, "max_turns_exceeded")
+
+      recorded = ledger(ctx.record)
+      assert recorded.session_turns_used == nil
+      assert recorded.work_left_behind == nil
+    end
+
+    test "identity is the reason: a resend differing only in them is a replay, first values stand" do
+      ctx = session(:implementing)
+
+      assert {:ok, %{replayed?: false}} =
+               end_session(ctx, "wall_clock_exceeded", %{turns_used: 10, work_left_behind: true})
+
+      # The same report re-sent by a runner that has since lost (or recounted) the figures.
+      assert {:ok, %{replayed?: true}} = end_session(ctx, "wall_clock_exceeded")
+
+      assert {:ok, %{replayed?: true}} =
+               end_session(ctx, "wall_clock_exceeded", %{turns_used: 11, work_left_behind: false})
+
+      recorded = ledger(ctx.record)
+      assert {recorded.session_turns_used, recorded.work_left_behind} == {10, true}
+
+      # A different REASON is still a different report.
+      assert {:error, :already_recorded} =
+               end_session(ctx, "crashed", %{turns_used: 10, work_left_behind: true})
+    end
+
+    test "a report recorded before 1.27.0 is still matched by its resend" do
+      # The digest of a row recorded by the previous code was taken over the whole message,
+      # which was exactly `{dispatch_id, claim_epoch, reason}`; the identity digest is over the
+      # same three, so a resend of that report is still answered ok.
+      ctx = session(:implementing)
+      message = message(ctx.record, "completed")
+
+      as_tenant(ctx.record.tenant_id, fn ->
+        from(d in DispatchRecord, where: d.id == ^ctx.record.id)
+        |> Repo.update_all(
+          set: [
+            session_ended_reason: "completed",
+            session_ended_digest: TriageVerdictRecord.digest(message),
+            session_ended_at: DateTime.utc_now()
+          ]
+        )
+      end)
+
+      assert {:ok, %{replayed?: true}} = end_session(ctx, "completed", %{turns_used: 3})
+      assert ledger(ctx.record).session_turns_used == nil
+    end
+  end
+
   describe "refusals of a first report" do
     test "a claim_epoch that is not the story's current one is stale and changes nothing (AC-44.3.6)" do
       ctx = session(:implementing)
@@ -415,6 +486,46 @@ defmodule Loopctl.Delivery.SessionEndTest do
           )
         end)
       end
+    end
+
+    test "the 1.27.0 figures never stand without a report, and hold their ranges" do
+      ctx = session(:implementing)
+      now = DateTime.utc_now()
+
+      # A figure with no recorded session end behind it.
+      assert_raise Postgrex.Error, ~r/runner_dispatches_session_end_figures_reported/, fn ->
+        set_session_end(ctx.record, session_turns_used: 3)
+      end
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_session_end_figures_reported/, fn ->
+        set_session_end(ctx.record, work_left_behind: false)
+      end
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_session_turns_used_nonnegative/, fn ->
+        set_session_end(ctx.record,
+          session_ended_reason: "completed",
+          session_ended_digest: "d",
+          session_ended_at: now,
+          session_turns_used: -1
+        )
+      end
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_max_turns_positive/, fn ->
+        set_session_end(ctx.record, max_turns: 0)
+      end
+
+      # And the shape the session-end write produces is admitted.
+      set_session_end(ctx.record,
+        session_ended_reason: "completed",
+        session_ended_digest: "d",
+        session_ended_at: now,
+        session_turns_used: 0,
+        work_left_behind: false,
+        max_turns: 1
+      )
+
+      assert {ledger(ctx.record).session_turns_used, ledger(ctx.record).work_left_behind} ==
+               {0, false}
     end
   end
 

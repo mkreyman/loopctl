@@ -57,6 +57,21 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A session end reports its turns and the work it left behind (2026-11-07, US-48.11,
+  runner contract 1.27.0).** `session_ended` gains two optional fields: `turns_used` (an
+  integer, 0 up to the int4 ceiling) and `work_left_behind` (a boolean: `true` when the
+  session's branch had commits not on the remote at exit, `false` when it had none, omitted
+  when the runner could not tell). A wrong type or range is `invalid_payload`. The report is
+  still recorded once per dispatch and its identity is still `dispatch_id`, `claim_epoch` and
+  `reason`: a resend that differs only in the new fields is answered `ok` (`replayed: true`)
+  and the first copy's values stand. A 1.26.0 runner that sends neither behaves exactly as
+  before; re-vendor the contract to send them. Migration `20261107180000` adds three nullable
+  columns to `runner_dispatches`: `max_turns` (the turn budget the dispatch was placed under,
+  written where `wall_clock_seconds` is and refreshed by the push that wins delivery; a budget
+  past the int4 ceiling is stored NULL rather than refusing the dispatch), `session_turns_used`
+  and `work_left_behind` (written once, with the session end). CHECKs keep the counts
+  non-negative, the budget positive, and both session-end figures NULL on a row with no
+  recorded session end. No backfill: existing rows read as not reported.
 - **Run-outcome ledger per agent spec version (2026-11-07, US-48.12).** Migration
   `20261107170000` adds the RLS table `agent_run_outcomes`: one row per runner dispatch, keyed
   by the spec `{id, version}` it ran under, with the session's end and the signals later
@@ -64,8 +79,28 @@ All notable changes to loopctl are documented here.
   a triage verdict, a re-queue after a budget kill, the draft screen). New
   `GET /api/v1/agent_specs/:spec_id/outcomes?window_days=` (any key, agent role up, default
   30 days, at most 365; 400 outside that) returns per-version counts, rates and medians;
-  loopctl-mcp-server 3.8.0 exposes it as `agent_outcomes`. `turns` and cost stay null: no
-  runner message reports them yet.
+  loopctl-mcp-server 3.8.0 exposes it as `agent_outcomes`. `turns` comes from the runner's
+  session-end report (contract 1.27.0), so `median_turns` is null for runs on an older runner;
+  cost stays null, because no runner message reports it.
+- **The escalation inbox (2026-11-07, US-48.11).** `GET /api/v1/escalations` lists the
+  tenant's stories parked at `escalated`, newest first, keyset-paginated, any authenticated
+  key (`agent` role and above), read-only. Each row's `reason_class` (`budget_exhausted`,
+  `session_failed`, `triage_escalated`, `gate_refused`, `operator_released`, `other`) is
+  derived from the stage-machine edge, never from `escalation_reason`. That field is untrusted
+  session text, returned raw and fenced. A `budget_exhausted` row carries the run's elapsed
+  time, budget and branch from the dispatch ledger, and the turns it used against the turn
+  budget it was placed under. `work_left_behind` is `true` or `false` as the runner's 1.27.0
+  session-end report says, and `unknown` (with `turns_used` null) when an older runner's
+  report carries neither. Filters are `reason_class`,
+  `project_id` and `since`. New 400s: an unknown `reason_class`, a bad `since`, `limit` or
+  cursor. A malformed `project_id` is a 422. loopctl-mcp-server 3.9.0 adds
+  `escalation_list`. A new daily Oban cron, `EscalationDigestWorker` at 14:00 UTC with no env
+  var, posts one digest per project that has `budget_exhausted` rows older than an hour. It
+  goes to that project's coordination channel under the key
+  `escalation-digest:<project_id>:<YYYY-MM-DD>`, at most once per project per UTC day, and its
+  author is a per-tenant agent named `system:escalation-digest`. **New API constraint:** agent
+  names starting `system:` (any case) are now reserved, and register and update refuse them
+  with 422. Only a name being set is judged, so an existing agent with such a name keeps it.
 - **Reply drafts for tickets triage set aside (2026-11-07, US-48.9).** For a story whose
   intake record carries a support `ticket_id` and which triage rejected or escalated, a runner
   session drafts a reply (agent spec `reply_draft@1`, dispatch kind `reply_draft`, runner

@@ -91,11 +91,16 @@ defmodule Loopctl.Agents.OutcomesTest do
     %{story: story, runner: runner, row: row, record: record, agent: agent}
   end
 
-  defp end_session(ctx, reason) do
+  # `attrs` adds the optional fields of a contract 1.27.0 report (`turns_used`,
+  # `work_left_behind`); without them it is the report a 1.26.0 runner sends.
+  defp end_session(ctx, reason, attrs \\ %{}) do
     RunnerStages.end_session(
       ctx.story.tenant_id,
       ctx.runner.id,
-      %{dispatch_id: ctx.record.dispatch_id, claim_epoch: @epoch, reason: reason},
+      Map.merge(
+        %{dispatch_id: ctx.record.dispatch_id, claim_epoch: @epoch, reason: reason},
+        attrs
+      ),
       actor_id: ctx.runner.api_key_id
     )
   end
@@ -160,7 +165,7 @@ defmodule Loopctl.Agents.OutcomesTest do
       assert %DateTime{} = row.ended_at
       assert is_integer(row.elapsed_s) and row.elapsed_s >= 0
       assert row.end_reason == "completed"
-      # No runner message reports either.
+      # This session's end reported no turn count (a 1.26.0 report), and nothing reports cost.
       assert row.turns == nil
       assert row.cost_millicents == nil
 
@@ -409,6 +414,38 @@ defmodule Loopctl.Agents.OutcomesTest do
 
       assert outcome(ctx.record) == first
       assert outcome_count(ctx.story.tenant_id) == 1
+    end
+
+    test "turns come from the session end the runner reported, and a resend keeps the first" do
+      ctx = implement_session(:pr_open)
+
+      assert {:ok, %{replayed?: false}} =
+               end_session(ctx, "completed", %{turns_used: 37, work_left_behind: false})
+
+      assert outcome(ctx.record).turns == 37
+
+      # Identity is the reason: a resend that differs only in the count is the same report,
+      # and the first recording's count stands.
+      assert {:ok, %{replayed?: true}} = end_session(ctx, "completed", %{turns_used: 99})
+      assert outcome(ctx.record).turns == 37
+
+      assert {:ok, %{versions: [%{median_turns: 37.0}]}} =
+               Outcomes.summary(ctx.story.tenant_id, "implement")
+    end
+
+    test "turns reported on a session end are filled into a row a signal created first" do
+      ctx = implement_session(:ci)
+      t = ctx.story.tenant_id
+
+      assert {:ok, _} =
+               Stages.record_effect(t, ctx.story.id, :merge_gate_allowed_sha, @head,
+                 claim_epoch: @epoch,
+                 actor_label: "control:merge_precondition"
+               )
+
+      assert outcome(ctx.record).turns == nil
+      assert {:ok, _} = end_session(ctx, "completed", %{turns_used: 12})
+      assert outcome(ctx.record).turns == 12
     end
 
     test "a repeated gate event leaves the signal as first written" do

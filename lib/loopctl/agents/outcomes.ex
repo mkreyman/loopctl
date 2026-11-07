@@ -41,11 +41,19 @@ defmodule Loopctl.Agents.Outcomes do
   the event (`"stage:ci->merged:forward"`, `"effect:merge_gate_allowed_sha"`,
   `"review_record:<id>"`, `"triage_verdict"`, `"agent_result"`).
 
+  ## Turns, from the session end
+
+  `turns` is the runner's own count from its `session_ended` report (runner contract 1.27.0,
+  `turns_used`), which the ledger stores on the dispatch's row with the report
+  (`session_turns_used`); the session-end write copies it here in the same transaction. It is
+  NULL for a session whose end did not report one — a 1.26.0 runner, or a session that ended
+  through a result message (`triage_verdict`, `agent_result`), which carries no count.
+
   ## Not recorded, because no event carries it
 
-  `turns` and `cost_millicents` stay NULL: no runner message reports either. Review findings
-  are counts only — `review_records` holds no severity. A `:draft`'s release, edit or discard
-  has no event: loopctl never sends a reply draft and records nothing a person does with it.
+  `cost_millicents` stays NULL: no runner message reports it. Review findings are counts only —
+  `review_records` holds no severity. A `:draft`'s release, edit or discard has no event:
+  loopctl never sends a reply draft and records nothing a person does with it.
   """
 
   import Ecto.Query
@@ -106,8 +114,9 @@ defmodule Loopctl.Agents.Outcomes do
 
   @doc """
   Records the END of `record`'s session on its outcome row, inside the caller's transaction
-  on `repo`: creates the row if no signal has yet, and fills `ended_at`, `elapsed_s` and
-  `end_reason` ONCE — a row already ended is left exactly as it is.
+  on `repo`: creates the row if no signal has yet, and fills `ended_at`, `elapsed_s`,
+  `end_reason` and `turns` (the ledger row's `session_turns_used`, NULL when the session end
+  reported none) ONCE — a row already ended is left exactly as it is.
 
   `end_reason` is loopctl's own enum: the runner's `session_ended` reason, or the result
   message that ended the session. Options: `:now` (the clock, `DateTime.utc_now/0` by
@@ -120,18 +129,25 @@ defmodule Loopctl.Agents.Outcomes do
 
     with {:ok, identity} <- identity(repo, record) do
       elapsed = elapsed_s(identity.started_at, now)
+      turns = record.session_turns_used
 
       upsert =
         from(o in RunOutcome,
           where: is_nil(o.ended_at),
           update: [
-            set: [ended_at: ^now, elapsed_s: ^elapsed, end_reason: ^end_reason, updated_at: ^now]
+            set: [
+              ended_at: ^now,
+              elapsed_s: ^elapsed,
+              end_reason: ^end_reason,
+              turns: ^turns,
+              updated_at: ^now
+            ]
           ]
         )
 
       row =
         identity
-        |> Map.merge(%{ended_at: now, elapsed_s: elapsed, end_reason: end_reason})
+        |> Map.merge(%{ended_at: now, elapsed_s: elapsed, end_reason: end_reason, turns: turns})
         |> stamp(now)
 
       repo.insert_all(RunOutcome, [row],
@@ -326,7 +342,7 @@ defmodule Loopctl.Agents.Outcomes do
     `max_turns_exceeded`;
 
   each also as a rate over `runs`, and the median `elapsed_s` and `turns` over the rows that
-  carry one (`nil` when none does — no runner reports turns yet).
+  carry one (`nil` when none does — `turns` only from a runner on contract 1.27.0 or later).
 
   A bounded aggregate over one spec's rows in one tenant, on `(tenant_id, spec_id,
   inserted_at)`: an ordinary tenant read on `Loopctl.Repo`, not a `Loopctl.HeavyRead` one.

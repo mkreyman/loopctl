@@ -430,6 +430,9 @@ defmodule LoopctlWeb.Router do
     # session parked stayed parked for ever, including the one the first end-to-end run left.
     get "/stories/:id/stage", StoryEscalationController, :show
     post "/stories/:id/stage/resolve", StoryEscalationController, :resolve
+    # US-48.11: the escalation inbox — every parked story, findable by reason class. A read,
+    # open to every key of the tenant; resolving one stays the user-role route above.
+    get "/escalations", EscalationController, :index
     # US-47.7: the chg changes bound to a story and their applied events (Epic 47). A read,
     # open to every key of the tenant like the stage above.
     get "/stories/:id/changes", StoryChangeController, :show

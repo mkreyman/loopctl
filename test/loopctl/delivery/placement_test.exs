@@ -1547,6 +1547,32 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert claimed_until == cap
     end
 
+    # AC-48.11.2: the escalation inbox reads the turn budget off the ledger. It follows the
+    # rule `wall_clock_seconds` follows: bound at placement, refreshed by the push that wins.
+    test "the ledger records the turn budget placed, and a RESUME's push refreshes it", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = build(:placement_dispatch, %{"story_id" => story.id, "max_turns" => 40})
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+      assert first.max_turns == 40
+      assert DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id).max_turns == 40
+
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "max_turns", 25),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.max_turns == 25
+
+      {record, _lease} = accept(runner, placed)
+      assert record.max_turns == 25
+    end
+
     test "a RESUME runs the same wall clock rule and refuses an out-of-range clock", ctx do
       %{runner: runner, story: story} = ctx
       payload = build(:placement_dispatch, %{"story_id" => story.id})

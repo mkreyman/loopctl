@@ -70,7 +70,9 @@ defmodule LoopctlWeb.AgentOutcomeController do
       median_turns: %OpenApiSpex.Schema{
         type: :number,
         nullable: true,
-        description: "Median turns; null while no runner message reports turns."
+        description:
+          "Median turns over the runs that carry one, from the runner's session-end report " <>
+            "(runner contract 1.27.0); null when none does."
       }
     }
   }
