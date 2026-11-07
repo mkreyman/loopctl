@@ -675,6 +675,7 @@ changes). Refactors, test fixes, and internal hardening stay out — `git log
 | tenant scoping, RLS policies, migrations, new tables, the three repos, heavy/vector reads | `.claude/skills/tenancy-rls/SKILL.md` |
 | Knowledge Wiki, agent memory, context retriever, hybrid search, novelty gate, embeddings, KB curation permissions | `.claude/skills/knowledge-wiki/SKILL.md` |
 | Oban health in production — are the cron jobs firing, is a queue backed up, is a worker stuck | `.claude/skills/oban-health/SKILL.md` |
+| agent specs and the registry (`lib/loopctl/agents/`), runner templates, the eval replay, the outcome ledger, tuning drafts, reply drafts, the escalation inbox | `docs/agent-specs.md`; for what a spec or a verifier may do to custody state, also `.claude/skills/chain-of-custody/SKILL.md` |
 
 ## MCP Server
 

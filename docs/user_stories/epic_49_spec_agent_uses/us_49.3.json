@@ -1,0 +1,82 @@
+{
+  "id": "US-49.3",
+  "title": "advisory_bump@1: an advisory intake source and a build spec that bumps one advisory per run",
+  "epic": {
+    "id": "epic_49",
+    "name": "Spec agent uses"
+  },
+  "priority": "medium",
+  "phase": "spec_agent_uses",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "a dependency advisory reported on a repository's default branch to become one story that a spec agent bumps, verifies and merges",
+    "so_that": "the advisory bumps that recur across loopctl, loopctl-runner, home_care_billing and claude-config (about 14 PRs in the 30 days to 2026-11-07) stop costing a session each and stop rediscovering the same audit traps"
+  },
+  "rationale": "Epic 48's PRD names the dependency-advisory bumper as the next :build spec and says it waits for an advisory intake source and Gate B entries. KB f07c9d2b, 7209856a, 7fcc62a6, 3c205dc2 and 2c5ae474 record five traps a session meets on these bumps; the runner template carries them.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-49.3.1",
+      "description": "An advisory intake path records one intake record per (repository, advisory id), idempotent on that pair, from a scheduled audit the runner performs and reports; no reporter text exists on this path."
+    },
+    {
+      "id": "AC-49.3.2",
+      "description": "Registry entry advisory_bump@1 with archetype :build; the payload names the advisory, package, fixed version and the repository's current ignore entry if any."
+    },
+    {
+      "id": "AC-49.3.3",
+      "description": "The spec never adds or extends an ignore_advisories entry: when no fixed version is reachable within the pin, the run escalates with the reason enum fix_breaks_pin or no_fixed_version."
+    },
+    {
+      "id": "AC-49.3.4",
+      "description": "The verifier re-runs the repository's audit command at the head and passes only when the named advisory no longer reports and the CI ignore list equals the mix.exs list (KB 7fcc62a6)."
+    },
+    {
+      "id": "AC-49.3.5",
+      "description": "The outcome row records merged, reverted, CI result, merge gate decision, and advisory_cleared from the verifier's audit, never from the implementer's report."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-49.3.1",
+      "name": "one record per advisory",
+      "type": "integration",
+      "steps": [
+        "report the same advisory twice"
+      ],
+      "expected_results": [
+        "one intake record"
+      ]
+    },
+    {
+      "id": "TC-49.3.2",
+      "name": "an ignore is refused",
+      "type": "unit",
+      "steps": [
+        "screen a diff that adds an ignore_advisories entry"
+      ],
+      "expected_results": [
+        "refuse, escalate"
+      ]
+    },
+    {
+      "id": "TC-49.3.3",
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": [
+        "two tenants report the same advisory"
+      ],
+      "expected_results": [
+        "two records, each visible only to its tenant"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Enroll loopctl-runner first: small lockfile, fast CI.",
+    "A new env var for the audit schedule, if any, gets its deploy/FLY_SECRETS.md row in the same change."
+  ],
+  "dependencies": [
+    "US-49.1",
+    "US-48.12",
+    "US-48.18"
+  ]
+}
