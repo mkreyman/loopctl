@@ -653,6 +653,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     repo = MergePrecondition.repo_for_story(story)
     env = environment()
     merged_at = merged_at(tenant_id, stage)
+    deployments = deployments(tenant_id, repo, env, merged_at, stage.merge_sha)
 
     %{
       stage: stage.stage,
@@ -662,12 +663,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
       # inside the transition into `merged` and named in that transition's chain entry.
       merge_sha: stage.merge_sha,
       merged_at: merged_at,
-      deployments: deployments(tenant_id, repo, env, merged_at, stage.merge_sha),
+      deployments: deployments,
       # US-48.17 review: the head GitHub actually merged, against the head the gate allowed.
       # The ci -> merged report carries only `merge_sha`, so the in-transaction ungated check
       # can compare the allow only with the RECORDED head; a newer head pushed and merged
-      # past the gate passes it. Read once, at `merged`, before control carries it forward.
-      merged_head: merged_head(story, stage),
+      # past the gate passes it. Read only on the sweep a deployment CARRIES the merge — the
+      # one that could advance the story — so a story waiting at `merged` for its deploy costs
+      # no forge read per sweep, and a merged head cannot change between them.
+      merged_head: if(carried?(deployments), do: merged_head(story, stage), else: :not_attempted),
       allowed_sha: stage.merge_gate_allowed_sha
     }
   end
@@ -682,6 +685,9 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   end
 
   defp merged_head(_story, _stage), do: :not_attempted
+
+  defp carried?({:ok, %{deployments: deployments}}), do: Enum.any?(deployments, & &1.contains)
+  defp carried?(_unavailable), do: false
 
   # WHEN the loop recorded the merge, read from the stage event the transition into `merged`
   # wrote. That table is append-only and nothing prunes it, so the event is present for

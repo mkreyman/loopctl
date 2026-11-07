@@ -122,6 +122,47 @@ defmodule Loopctl.Agents.TuningFlowTest do
     }
   end
 
+  describe "a pair that sends nothing spends no slot" do
+    test "with limit 1, a pair with no runner does not keep its tenant's other pair waiting",
+         ctx do
+      other = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
+
+      fixture(:intake_source, %{
+        tenant_id: ctx.tenant.id,
+        project_id: other.project_id,
+        repo_full_name: "acme/second-#{System.unique_integer([:positive])}"
+      })
+
+      overridden = %{
+        "verdict" => %{"value" => %{"outcome" => "escalate", "destination" => "escalated"}},
+        "human_override" => %{"value" => true},
+        "human_route" => %{"value" => "queued"}
+      }
+
+      for signals <- [overridden, %{}] do
+        fixture(:agent_run_outcome, %{
+          tenant_id: ctx.tenant.id,
+          story: other,
+          spec_id: "triage",
+          archetype: "judge",
+          end_reason: "triage_verdict",
+          signals: signals
+        })
+      end
+
+      # No runner joined: both pairs answer :no_runner, and neither spends the one slot.
+      assert {:ok, outcomes} = run_pass(limit: 1)
+
+      assert Enum.map(outcomes, fn {_candidate, outcome} -> outcome end) == [
+               :no_runner,
+               :no_runner
+             ]
+
+      assert outcomes |> Enum.map(fn {c, _} -> c.project_id end) |> Enum.sort() ==
+               Enum.sort([ctx.story.project_id, other.project_id])
+    end
+  end
+
   describe "a window with no failure to learn from" do
     test "closes with a nothing_to_learn row, so the pair stops taking its tenant's slot",
          ctx do

@@ -319,8 +319,12 @@ defmodule Loopctl.Delivery.MergeExecution do
     end
   end
 
+  # Judged against the LEASE as well as the cap, the pair `hold_claim/2` reads: a
+  # `claimed_until` trailing the cap is renewed even when the cap does not move.
   defp extend(row, until) do
-    if DateTime.after?(until, row.claim_lease_cap) do
+    held = earlier(row.claimed_until || row.claim_lease_cap, row.claim_lease_cap)
+
+    if DateTime.after?(until, held) do
       case Progress.extend_ci_hold_lease(row.tenant_id, row.story_id, %{
              claim_epoch: row.claim_epoch,
              until: until,

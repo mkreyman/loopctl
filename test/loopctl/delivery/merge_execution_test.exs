@@ -417,6 +417,29 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
       assert [:runner_gone] = sweep(ctx, escalated_at, live?: gone)
       assert DateTime.after?(cap, escalated_at)
     end
+
+    test "a lease trailing an unmoved cap is pulled up to the cap", ctx do
+      t0 = DateTime.utc_now()
+      set_dispatch_expiry(ctx, DateTime.add(t0, 7_200))
+      cap = DateTime.add(t0, 5_400)
+
+      # The ended session's last heartbeat lease, well inside the renewal window.
+      from(s in Story, where: s.id == ^ctx.story_id)
+      |> AdminRepo.update_all(
+        set: [
+          agent_status: :implementing,
+          claimed_until: DateTime.add(t0, 300),
+          claim_lease_cap: cap
+        ]
+      )
+
+      sweep(ctx, t0, enabled?: false)
+
+      story = AdminRepo.get!(Story, ctx.story_id)
+      assert DateTime.compare(story.claimed_until, cap) == :eq
+      assert DateTime.compare(story.claim_lease_cap, cap) == :eq
+      assert [_entry] = reanchored(ctx)
+    end
   end
 
   describe "AC-48.17.3: a runner that is gone" do

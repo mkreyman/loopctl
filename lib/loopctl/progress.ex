@@ -947,23 +947,13 @@ defmodule Loopctl.Progress do
   # before this rebind would otherwise leave `verified_head_sha == head_sha` on an unverified
   # story, which takes it out of verify@1's candidates for good (US-48.18 review).
   defp retire_earlier_verification(tenant_id, %Story{} = story, opts) do
-    clear_verified_head(tenant_id, story.id)
+    {:ok, _cleared} = Stages.clear_verified_head(tenant_id, story.id, opts)
 
     if verification_to_retire?(story) do
       apply_invalidation(AdminRepo, tenant_id, story, "verifier_rebound", opts)
     else
       {:ok, story, nil}
     end
-  end
-
-  defp clear_verified_head(tenant_id, story_id) do
-    AdminRepo.update_all(
-      from(s in Loopctl.Delivery.StoryStage,
-        where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
-        where: not is_nil(s.verified_head_sha)
-      ),
-      set: [verified_head_sha: nil, updated_at: DateTime.utc_now()]
-    )
   end
 
   @doc """
@@ -1944,9 +1934,13 @@ defmodule Loopctl.Progress do
     end)
   end
 
+  # The ci hold judges the LEASE the reclaimer reads as well as the cap (`held: :lease`): a
+  # `claimed_until` trailing the cap (the ended session's last heartbeat lease) is pulled up
+  # even when the cap does not move. A RESUME keeps its heartbeat lease below the cap on
+  # purpose, so `reanchor_dispatch_lease/3` judges the cap alone.
   defp hold_claim_open(%Story{claim_epoch: epoch} = story, epoch, until, label) do
     if live_claim?(story, DateTime.utc_now()),
-      do: move_cap_forward(Repo, story, until, label),
+      do: move_cap_forward(Repo, story, until, label, :lease),
       else: {:error, :claim_not_live}
   end
 
@@ -1966,8 +1960,25 @@ defmodule Loopctl.Progress do
 
   def live_claim?(%Story{}, _now), do: false
 
-  defp move_cap_forward(repo, %Story{claim_lease_cap: %DateTime{} = current} = story, cap, label) do
-    if DateTime.after?(cap, current) do
+  defp move_cap_forward(repo, story, cap, label, held \\ :cap)
+
+  defp move_cap_forward(
+         repo,
+         %Story{claim_lease_cap: %DateTime{} = current} = story,
+         cap,
+         label,
+         held
+       ) do
+    judged =
+      case held do
+        :cap -> current
+        :lease -> earliest(story.claimed_until || current, current)
+      end
+
+    if DateTime.after?(cap, judged) do
+      # Never moves the cap backward: a lease pulled up to an unmoved cap lands ON it.
+      cap = if DateTime.after?(cap, current), do: cap, else: current
+
       with {:ok, updated} <-
              story
              |> Ecto.Changeset.change(claim_lease_cap: cap, claimed_until: cap)
@@ -2001,7 +2012,9 @@ defmodule Loopctl.Progress do
   end
 
   # An uncapped claim — one not taken for a runner dispatch — has no cap to move.
-  defp move_cap_forward(_repo, %Story{} = story, _cap, _label), do: {:ok, story}
+  defp move_cap_forward(_repo, %Story{} = story, _cap, _label, _held), do: {:ok, story}
+
+  defp earliest(a, b), do: if(DateTime.before?(a, b), do: a, else: b)
 
   @doc """
   The change every RELEASE writes: no lease, no lease cap, and the next epoch. And no

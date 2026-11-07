@@ -778,6 +778,20 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
     end
 
+    test "no deployment carries the merge yet: the pull request is never read", ctx do
+      # The merged head only matters once a deploy carries the merge; reading it on every
+      # sweep before then spent one forge call per waiting story per run.
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _number ->
+        flunk("the merged head is read only once a deployment carries the merge")
+      end)
+
+      stub_deployment(contains: false)
+
+      assert {:ok, %Result{decision: decision}} = enforce(ctx)
+      refute decision in [:verified, :failed]
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+    end
+
     test "the deploy write names the deployment, and verification follows in ONE pass", ctx do
       # A merge BEHIND the deployed commit: containment, not equality, exactly as at deployed.
       stub_deployment()

@@ -96,6 +96,13 @@ defmodule Loopctl.Agents.Tuning do
   # `:nothing_to_learn` closes a window as surely as an answer does: without it, a pair whose
   # window held no failure stayed due, ranked first in its tenant (most rows) and took that
   # tenant's first slot on every pass, starving every other pair.
+  # How many ranked candidates one pass may walk past to fill its `limit` (see
+  # `attempt_until/3`). A candidate is a (tenant, project, target spec), so the set is small.
+  @scan_limit 500
+
+  # The outcome that spends one of a pass's `limit` slots: a dispatch was sent.
+  @slot_outcomes [:dispatched]
+
   @answered_statuses [:proposed, :rejected, :landed, :superseded, :nothing_to_learn]
 
   # A function, not an attribute: an OTP 28 regex cannot be escaped into a module attribute.
@@ -161,14 +168,32 @@ defmodule Loopctl.Agents.Tuning do
       }
 
       outcomes =
-        for candidate <- candidates(limit, min_rows: Keyword.get(opts, :min_rows)),
-            do: {candidate, attempt(pass, candidate)}
+        @scan_limit
+        |> max(limit)
+        |> candidates(min_rows: Keyword.get(opts, :min_rows))
+        |> attempt_until(pass, limit)
 
       {:ok, outcomes}
     else
       :disabled -> {:ok, []}
       {:error, _reason} = error -> error
     end
+  end
+
+  # Walks the ranked candidates and stops after `limit` attempts that SENT something. An
+  # attempt that sends nothing (no runner, a blocked source, an error, nothing to learn)
+  # spends no slot: a pair stuck that way used to take its tenant's first slot on every pass,
+  # so a small limit never reached that tenant's other pairs.
+  defp attempt_until(candidates, pass, limit) do
+    candidates
+    |> Enum.reduce_while({[], 0}, fn candidate, {done, sent} ->
+      outcome = attempt(pass, candidate)
+      sent = if outcome in @slot_outcomes, do: sent + 1, else: sent
+      done = [{candidate, outcome} | done]
+      if sent >= limit, do: {:halt, {done, sent}}, else: {:cont, {done, sent}}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
   end
 
   defp fetch_budgets(spec, opts) do

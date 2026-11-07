@@ -306,10 +306,34 @@ defmodule Loopctl.Agents.VerifyCustodyTest do
   describe "a rebind takes the recorded head with the verification" do
     test "binding a new verifier clears verified_head_sha", ctx do
       verified!(ctx)
+      before = Stages.get(ctx.tenant.id, ctx.story.id)
+      head = before.verified_head_sha
+      assert is_binary(head)
       assert {:ok, _} = bind(ctx, mint(ctx, %{}).id)
 
-      assert Stages.get(ctx.tenant.id, ctx.story.id).verified_head_sha == nil
+      row = Stages.get(ctx.tenant.id, ctx.story.id)
+      assert row.verified_head_sha == nil
+      assert row.lock_version > before.lock_version
       assert story(ctx).verified_status == :unverified
+
+      # The clear is in the stage history, naming the head it retired.
+      assert [%{data: %{"previous" => ^head, "value" => "cleared"}}] =
+               for(
+                 %{event: "effect_recorded", data: %{"reason" => "verifier_rebound"}} = e <-
+                   Stages.list_events(ctx.tenant.id, ctx.story.id),
+                 do: e
+               )
+    end
+
+    test "a rebind with no recorded head writes no stage event", ctx do
+      assert {:ok, _} = bind(ctx, mint(ctx, %{}).id)
+
+      assert [] ==
+               for(
+                 %{event: "effect_recorded", data: %{"reason" => "verifier_rebound"}} = e <-
+                   Stages.list_events(ctx.tenant.id, ctx.story.id),
+                 do: e
+               )
     end
 
     test "a superseded verdict's late head write is refused and retires nothing", ctx do

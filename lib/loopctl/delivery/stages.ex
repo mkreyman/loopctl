@@ -1781,6 +1781,53 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
+  @doc """
+  Clears a stage row's `verified_head_sha` because the verifier that judged it was rebound
+  (US-48.18): the merge gate must never allow a head the CURRENT verifier did not judge.
+
+  Runs inside the rebinding `AdminRepo` transaction, under the row lock, bumps
+  `lock_version` and records an `effect_recorded` event (`"value" => "cleared"`) carrying
+  the head it retired, so the clear is visible in the stage history. A row with no recorded
+  head, or no row, is left alone.
+  """
+  @spec clear_verified_head(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, :cleared | :unchanged}
+  def clear_verified_head(tenant_id, story_id, opts \\ []) do
+    unless AdminRepo.in_transaction?(),
+      do: raise(ArgumentError, "clear_verified_head/3 runs inside the rebinding transaction")
+
+    from(s in StoryStage,
+      where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
+      lock: "FOR UPDATE"
+    )
+    |> AdminRepo.one()
+    |> case do
+      %StoryStage{verified_head_sha: head} = row when is_binary(head) ->
+        {1, [updated]} =
+          from(s in StoryStage,
+            where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+            select: s,
+            update: [
+              set: [verified_head_sha: nil, updated_at: ^DateTime.utc_now()],
+              inc: [lock_version: 1]
+            ]
+          )
+          |> AdminRepo.update_all([])
+
+        insert_event(AdminRepo, updated, "effect_recorded", nil, nil, opts[:actor_label], %{
+          "effect" => "verified_head_sha",
+          "value" => "cleared",
+          "previous" => head,
+          "reason" => "verifier_rebound"
+        })
+
+        {:ok, :cleared}
+
+      _ ->
+        {:ok, :unchanged}
+    end
+  end
+
   # Every row a claim or a release may touch: `done` and `failed` are finished with.
   defp live_row(tenant_id, story_id) do
     from(s in StoryStage,
