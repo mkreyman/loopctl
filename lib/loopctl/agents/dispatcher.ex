@@ -1,11 +1,17 @@
 defmodule Loopctl.Agents.Dispatcher do
   @moduledoc """
-  One dispatch pass of a `:judge` spec (Epic 48, US-48.4).
+  One dispatch pass of a `:judge` spec (Epic 48, US-48.4) or a `:build` spec (US-48.7).
 
-  `run/2` is what `Loopctl.Delivery.TriageDispatcher.run_with/2` used to be, with every part
-  that belonged to the triage KIND read from the spec instead (`triage@1`,
-  `Loopctl.Agents.Specs.TriageV1`), so the next `:judge` agent is a new spec rather than a copy
-  of the pass. A pass, in order:
+  `run/2` is what `Loopctl.Delivery.TriageDispatcher.run_with/2` and
+  `Loopctl.Delivery.DispatchDriver.run_with/2` used to be, with every part that belonged to the
+  KIND read from the spec instead (`triage@1`, `Loopctl.Agents.Specs.TriageV1`; `implement@1`,
+  `Loopctl.Agents.Specs.ImplementV1`), so the next agent of either archetype is a new spec
+  rather than a copy of the pass. The archetype decides which pass runs; see "The `:build`
+  pass" below for the second.
+
+  ## The `:judge` pass
+
+  In order:
 
   1. **The spec's sweeps** (`spec.sweeps`): control passes that finish a story a previous pass
      left half-taken. Each outcome is tagged with its sweep's tag — `{:stranded, outcome}` for
@@ -22,8 +28,37 @@ defmodule Loopctl.Agents.Dispatcher do
 
   It CLAIMS NOTHING. The dispatch echoes the story's current `claim_epoch`, which is what the
   ledger fences against and what the verdict's transitions are checked on when it comes back.
-  That is the archetype's semantics, not a spec field, and `run/2` refuses any other archetype
-  rather than running a `:build` spec down a path that does not claim.
+  That is the archetype's semantics, not a spec field: a `:judge` spec never reaches the claim,
+  and a `:build` spec never reaches the claimless push.
+
+  ## The `:build` pass
+
+  It PLACES: for each candidate it CALLS `Loopctl.Delivery.Placement.place/4`, which contracts
+  a pending story, mints the session dispatch, claims the story (binding
+  `implementer_dispatch_id` and `assigned_agent_id`), builds the story object and pushes. None
+  of that is rewritten here, and none of it is a spec field: claiming and the mint are
+  archetype semantics, and `place/4` refuses a kind whose spec is not a `:build`
+  (`:not_placeable_kind`). What the pass reads from the spec, per candidate:
+
+  1. **The candidates**: `Candidates.query/2` over `spec.candidates`, as for a `:judge`.
+  2. **The runners**: `runners/3` — the tenant's admission pre-check
+     (`Loopctl.Runners.Capacity.admit/2`) when `spec.runner` names
+     `:tenant_admission_headroom`, then `Selection.runners/3` for `spec.kind`.
+  3. **The operator key**: the tenant's oldest live unlineaged `:user` key, cached per tenant
+     for the pass (`operator_key/2`). It is resolved from the database, never an input.
+  4. **The dispatch** (`spec.payload` `:story_payload`, `spec.refs`): the fields the caller of
+     `place/4` owns. `branch` (`:story_branch_for_runner_prefixes`) is omitted, because only
+     `place/4` holds the target runner's declaration it is derived from; `base_branch`
+     (`:source_base_branch`) is the intake source's, judged by `DispatchPayload.fill/3` inside
+     `place/4` before anything is minted. No story object: `place/4` builds it and refuses one
+     a caller supplies.
+  5. **The runner advance** (`spec.advance_on`): the machine refusals on which the next
+     selected runner is tried. See `Loopctl.Agents.Spec` for what each one does to the answer.
+
+  Its outcomes are `Loopctl.Delivery.DispatchDriver.outcome/0`'s — `:placed`, `:no_runner`,
+  `:unplaceable`, `:blocked`, `:errored` — and its log label and actor are the driver's
+  (`"DispatchDriver"`, `"worker:dispatch_driver"`), because an operator's alerts and the
+  claim's audit rows read them.
 
   ## Behind `:dispatch_driver_enabled`
 
@@ -42,7 +77,13 @@ defmodule Loopctl.Agents.Dispatcher do
     actor (`"worker:triage_dispatcher"`) and the too-large escalation reason
     (`"triage_dispatch:triage_too_large"`), derived from `spec.id` and the payload builder's
     refusal by `label/1`, `actor_label/1` and `too_large_reason/2`, so the log lines and the
-    audit rows are byte-identical to the pass before it moved.
+    audit rows are byte-identical to the pass before it moved. A `:build` pass's label and
+    actor are the ARCHETYPE's (`"DispatchDriver"`, `"worker:dispatch_driver"`), not derived
+    from its id: they are what the implement pass wrote before it moved, and a second `:build`
+    spec is the same driver placing another kind.
+  - The classification of `Placement.place/4`'s refusals for a `:build` pass: the four states
+    only a person clears (`:blocked`) are the placement protocol's answers, the same for every
+    `:build` kind.
   - The runner facts (`spec.runner`): `Selection.runners/3` enforces a fixed set for every
     kind, which `triage@1` names; the pass does not re-derive selection from the list.
   """
@@ -52,6 +93,7 @@ defmodule Loopctl.Agents.Dispatcher do
   alias Loopctl.Agents.Candidates
   alias Loopctl.Agents.Spec
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriagePayload
@@ -60,6 +102,7 @@ defmodule Loopctl.Agents.Dispatcher do
   alias Loopctl.Intake
   alias Loopctl.Repo
   alias Loopctl.Runners
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Selection
@@ -67,7 +110,8 @@ defmodule Loopctl.Agents.Dispatcher do
 
   require Logger
 
-  @type outcome ::
+  @typedoc "A `:judge` pass's outcomes."
+  @type judge_outcome ::
           :dispatched
           | :no_runner
           | :deferred
@@ -75,6 +119,11 @@ defmodule Loopctl.Agents.Dispatcher do
           | :escalated
           | :errored
           | {:stranded, :escalated | :blocked | :errored}
+
+  @typedoc "A `:build` pass's outcomes: `Loopctl.Delivery.DispatchDriver.outcome/0`."
+  @type build_outcome :: :placed | :no_runner | :unplaceable | :blocked | :errored
+
+  @type outcome :: judge_outcome() | build_outcome()
 
   @type budgets :: %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}
 
@@ -85,6 +134,8 @@ defmodule Loopctl.Agents.Dispatcher do
           | {:budgets, budgets()}
           | {:enabled?, boolean()}
           | {:dispatch, (Ecto.UUID.t(), Ecto.UUID.t(), map() -> :ok | {:error, term()})}
+          | {:place,
+             (Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword() -> {:ok, map()} | {:error, term()})}
           | {:sweep_limit, pos_integer()}
 
   # REFUSALS THAT CLEAR BY THEMSELVES, and the difference from `:blocked` is what an operator
@@ -129,12 +180,24 @@ defmodule Loopctl.Agents.Dispatcher do
   # refusal that means "a person must read this ticket" (the `:payload_too_large` screen).
   @payload_builders %{triage_payload: %{key: "triage", too_large: :triage_too_large}}
 
-  # The ref sources this pass can resolve. `:story_branch_for_runner_prefixes` is a `:build`
-  # source (`DispatchPayload.fill/3`), derived per story from the target runner.
+  # The ref sources a `:judge` pass can resolve. `:story_branch_for_runner_prefixes` is a
+  # `:build` source (`DispatchPayload.fill/3`), derived per story from the target runner.
   @ref_sources [:source_base_branch]
+
+  # The ref sources and payload builders a `:build` pass can hand `Placement.place/4`.
+  @build_ref_sources [:source_base_branch, :story_branch_for_runner_prefixes]
+  @build_payloads [:story_payload]
 
   # The sweeps this pass can run, and the tag each one's outcomes carry.
   @sweep_tags %{stranded_triaged_unbound: :stranded}
+
+  # `Placement.place/4`'s refusals that clear only when a person acts — no operator key, a
+  # halted or agent-rooted tenant, a project with no single intake source, a runner whose own
+  # declaration leaves no room for a branch — and which a `:build` pass therefore reports
+  # `:blocked` at ERROR rather than `:unplaceable` at info. `{:branch_not_allowed, _, _}` and
+  # `{:invalid_branch_name, :branch, _}` are absent on purpose: both refuse a CALLER-supplied
+  # `branch`, and the pass sends none.
+  @build_blocked [:no_operator_key, :tenant_halted, :custody_tier_required]
 
   @doc """
   One pass of `spec`, or `{:ok, []}` while `:dispatch_driver_enabled` is off.
@@ -145,11 +208,14 @@ defmodule Loopctl.Agents.Dispatcher do
   - `:budgets` — the session budgets, already decided. Absent, `budgets/1` reads the spec's
     pair and a missing or over-ceiling value is returned as the error, before anything runs.
   - `:enabled?` — the switch; defaults to `DispatchDriver.enabled?/0`.
-  - `:dispatch` — the push; defaults to `&Loopctl.Runners.dispatch/3`.
+  - `:dispatch` — a `:judge` pass's push; defaults to `&Loopctl.Runners.dispatch/3`.
+  - `:place` — a `:build` pass's placement; defaults to `&Loopctl.Delivery.Placement.place/4`.
+    It is handed the operator key and the actor label the pass resolved, never anything a
+    caller of `run/2` supplied: the seam is the call, not the identity.
   - `:sweep_limit` — the most rows each sweep finishes per pass (default #{@sweep_limit}).
 
-  Raises `ArgumentError` for a spec this pass cannot run: one that is not a `:judge`, or that
-  names a payload builder, a ref source or a sweep this module has no clause for. A spec is
+  Raises `ArgumentError` for a spec this pass cannot run: a `:draft`, or a spec that names a
+  payload builder, a ref source or a sweep its archetype's pass has no clause for. A spec is
   code, so that is a programming error, never a runtime state.
   """
   @spec run(Spec.t(), [option()]) ::
@@ -196,6 +262,28 @@ defmodule Loopctl.Agents.Dispatcher do
     |> Candidates.query(limit: limit)
     |> Loopctl.AdminRepo.all()
     |> Enum.map(&Map.take(&1, [:tenant_id, :story_id]))
+  end
+
+  @doc """
+  Every runner of `tenant_id` that would accept a dispatch of `spec` for `repo` right now, in
+  the order to try them (fewest slots in flight first).
+
+  The tenant's admission headroom first, when `spec.runner` names `:tenant_admission_headroom`:
+  `Loopctl.Runners.Capacity.admit/2` is one aggregate read, and a tenant at its admission cap
+  has no runner for any story. Then `Loopctl.Runners.Selection.runners/3` for `spec.kind`:
+  connected, not draining, the repository and the kind declared, a free slot and a
+  subscription that is not exhausted.
+  """
+  @spec runners(Spec.t(), Ecto.UUID.t(), String.t()) :: [Runner.t()]
+  def runners(%Spec{} = spec, tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
+    if admitted?(spec, tenant_id),
+      do: Selection.runners(tenant_id, spec.kind, repo),
+      else: []
+  end
+
+  defp admitted?(%Spec{runner: facts}, tenant_id) do
+    :tenant_admission_headroom not in facts or
+      Capacity.admit(Loopctl.AdminRepo, tenant_id) == :ok
   end
 
   @doc """
@@ -265,6 +353,19 @@ defmodule Loopctl.Agents.Dispatcher do
     end
   end
 
+  defp pass(%Spec{archetype: :build} = spec, limit, budgets, opts) do
+    place = Keyword.get(opts, :place, &Placement.place/4)
+
+    {outcomes, _cache} =
+      spec
+      |> candidates(limit)
+      |> Enum.map_reduce(%{}, fn candidate, cache ->
+        attempt_build(spec, candidate, budgets, place, cache)
+      end)
+
+    outcomes
+  end
+
   defp pass(spec, limit, budgets, opts) do
     dispatch = Keyword.get(opts, :dispatch, &Runners.dispatch/3)
     sweep_limit = Keyword.get(opts, :sweep_limit, @sweep_limit)
@@ -327,8 +428,7 @@ defmodule Loopctl.Agents.Dispatcher do
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
          {:ok, refs} <- resolve_refs(spec, source),
          {:ok, object} <- build_payload(spec, input),
-         [%Runner{} = runner | _] <-
-           Selection.runners(tenant_id, spec.kind, source.repo_full_name) do
+         [%Runner{} = runner | _] <- runners(spec, tenant_id, source.repo_full_name) do
       dispatch.(tenant_id, runner.id, payload(spec, story, source, refs, object, budgets))
     else
       {:error, reason} -> {:error, reason}
@@ -473,13 +573,169 @@ defmodule Loopctl.Agents.Dispatcher do
     if story, do: {:ok, story}, else: {:error, :story_not_found}
   end
 
+  # ── the :build pass ─────────────────────────────────────────────────────────────────────────
+
+  # ONE STORY MAY NOT KILL THE PASS, the lesson `TriageTriggerWorker` records: the read is
+  # oldest-first, so a story that raises sits at the head of every later batch too. EXITS as
+  # well as raises — a pool checkout timeout exits.
+  #
+  # The tenant-level facts are cached ACROSS candidates and the runner facts are not: a
+  # tenant's operator key does not change while a pass runs, while its runners' free slots
+  # change with every story this very pass places. So is whether the tenant's `:no_runner`
+  # note has been logged (`Selection.note_no_runner/3`).
+  defp attempt_build(spec, candidate, budgets, place, cache) do
+    {result, cache} = place_candidate(spec, candidate, budgets, place, cache)
+    outcome = classify_build(spec, candidate, result)
+
+    {outcome, note_if_no_runner(spec, outcome, candidate, cache)}
+  rescue
+    error -> {errored(spec, candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
+  catch
+    kind, value ->
+      {errored(spec, candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
+  end
+
+  # THE ORDER IS LOAD-BEARING for the outcome a story gets: a project no runner takes is
+  # `:no_runner` before the operator key is read, so a tenant with no usable key still reports
+  # `:no_runner` for a story no machine would take.
+  defp place_candidate(spec, %{tenant_id: tenant_id, story_id: story_id}, budgets, place, cache) do
+    with {:ok, story} <- fetch_story(tenant_id, story_id),
+         {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
+         [_ | _] = runners <- runners(spec, tenant_id, source.repo_full_name),
+         {{:ok, key}, cache} <- operator_key(tenant_id, cache) do
+      {place_on_first_usable(spec, tenant_id, runners, {story, source, budgets}, key, place),
+       cache}
+    else
+      {{:error, _reason} = error, %{} = cache} -> {error, cache}
+      {:error, reason} -> {{:error, reason}, cache}
+      [] -> {{:error, :no_runner}, cache}
+    end
+  end
+
+  # ONE MISCONFIGURED MACHINE MAY NOT STOP A REPOSITORY (846.2 review round 2, finding 3), so a
+  # refusal `spec.advance_on` names tries the next runner rather than ending the story's turn.
+  # See `Loopctl.Agents.Spec` for why only machine refusals decided before the mint qualify,
+  # and for the difference between the two: `:runner_exhausted` is passed over WITHOUT becoming
+  # the answer, `{:no_conforming_branch, _}` is advanced past AND kept as it, so a pass on which
+  # every machine is misconfigured still reports the state that needs a person.
+  #
+  # A FRESH dispatch per runner: each attempt is its own `dispatch_id`, as the driver's was.
+  defp place_on_first_usable(spec, tenant_id, runners, {story, source, budgets}, key, place) do
+    Enum.reduce_while(runners, {:error, :no_runner}, fn runner, last ->
+      result =
+        place.(tenant_id, runner.id, build_dispatch(spec, story, source, budgets),
+          api_key: key,
+          actor_label: actor_label(spec)
+        )
+
+      advance(spec.advance_on, result, last)
+    end)
+  end
+
+  defp advance(advance_on, {:error, :runner_exhausted}, last) do
+    if :runner_exhausted in advance_on,
+      do: {:cont, last},
+      else: {:halt, {:error, :runner_exhausted}}
+  end
+
+  defp advance(advance_on, {:error, {:no_conforming_branch, _}} = result, _last) do
+    if :no_conforming_branch in advance_on, do: {:cont, result}, else: {:halt, result}
+  end
+
+  defp advance(_advance_on, result, _last), do: {:halt, result}
+
+  # THE FIELDS THE CALLER OF `place/4` OWNS, and nothing else. `spec.payload` `:story_payload`
+  # adds nothing here: `place/4` builds the story object from loopctl's own rows after the
+  # claim and refuses one a caller supplies. Of `spec.refs`, `:story_branch_for_runner_prefixes`
+  # is OMITTED — the branch depends on what the TARGET runner declared, read off the live
+  # socket the push will reach, which only `place/4` holds, so `DispatchPayload.fill/3` fills
+  # it there and the two cannot disagree — and `:source_base_branch` is the intake source's,
+  # judged by `fill/3` before anything is minted.
+  #
+  # The budgets are passed rather than re-read: a pass reads them once, so every story it
+  # places spends against the same policy even if an operator changes it mid-pass.
+  defp build_dispatch(%Spec{payload: :story_payload} = spec, story, source, budgets) do
+    refs =
+      for {field, :source_base_branch} <- spec.refs,
+          into: %{},
+          do: {to_string(field), source.base_branch}
+
+    Map.merge(refs, %{
+      "dispatch_id" => Ecto.UUID.generate(),
+      "story_id" => story.id,
+      "kind" => spec.kind,
+      "repo" => source.repo_full_name,
+      "wall_clock_seconds" => budgets.wall_clock_seconds,
+      "max_turns" => budgets.max_turns
+    })
+  end
+
+  defp classify_build(spec, candidate, result) do
+    case result do
+      {:ok, _placed} -> :placed
+      {:error, :no_runner} -> :no_runner
+      {:error, reason} when reason in @build_blocked -> blocked(spec, candidate, reason)
+      {:error, {:no_intake_source, _} = reason} -> blocked(spec, candidate, reason)
+      {:error, {:ambiguous_intake_source, _, _} = reason} -> blocked(spec, candidate, reason)
+      {:error, {:no_conforming_branch, _} = reason} -> blocked(spec, candidate, reason)
+      {:error, reason} -> deferred(spec, candidate, reason)
+    end
+  end
+
+  defp note_if_no_runner(spec, :no_runner, candidate, cache),
+    do: Selection.note_no_runner(cache, label(spec), candidate)
+
+  defp note_if_no_runner(_spec, _outcome, _candidate, cache), do: cache
+
+  # THE TENANT'S OPERATOR KEY — an unlineaged `:user` key, which is what `place/4`'s ceiling
+  # admits for a caller that no dispatch minted. A pass has no request and therefore no
+  # authenticated principal of its own, so it acts as the tenant's operator; anything else
+  # would mean minting a credential for a worker, which is a root the custody chain does not
+  # have. A tenant with no such key cannot be driven, and that is reported rather than worked
+  # around. Resolved HERE, from the database: custody identity is never an input of the pass.
+  #
+  # NEITHER REVOKED NOR EXPIRED. `Loopctl.Auth` refuses an expired key on every request, and
+  # expiry is what key ROTATION uses — `expire_api_key/2` — so a rotated-out key is expired
+  # and not revoked. `Placement.resolve_caller/2` validates neither, so an expired key here
+  # would mint dispatches and drive custody transitions that the HTTP pipeline would have
+  # 401'd. Oldest first among what is left, which is the tenant's original operator key.
+  #
+  # CACHED PER PASS, keyed by tenant: it cannot change while a pass runs, and the read is on
+  # the three-connection AdminRepo pool that every authenticated request in the fleet shares.
+  defp operator_key(tenant_id, cache) do
+    case Map.fetch(cache, {:operator_key, tenant_id}) do
+      {:ok, cached} ->
+        {cached, cache}
+
+      :error ->
+        now = DateTime.utc_now()
+
+        key =
+          Loopctl.AdminRepo.one(
+            from k in Loopctl.Auth.ApiKey,
+              where: k.tenant_id == ^tenant_id and k.role == :user,
+              where: is_nil(k.revoked_at),
+              where: is_nil(k.expires_at) or k.expires_at > ^now,
+              order_by: [asc: k.inserted_at],
+              limit: 1
+          )
+
+        result = if key, do: {:ok, key}, else: {:error, :no_operator_key}
+        {result, Map.put(cache, {:operator_key, tenant_id}, result)}
+    end
+  end
+
   # ── the kind-named strings ──────────────────────────────────────────────────────────────────
 
   # `"triage"` -> `"TriageDispatcher"`: the prefix every line of the pass carried before it
-  # moved, so an operator's log search and alert still match.
+  # moved, so an operator's log search and alert still match. A `:build` pass is the dispatch
+  # driver's, whatever its kind: `"DispatchDriver"`.
+  defp label(%Spec{archetype: :build}), do: "DispatchDriver"
   defp label(%Spec{id: id}), do: Macro.camelize(id <> "_dispatcher")
 
-  # `"worker:triage_dispatcher"`: the stage audit's actor.
+  # `"worker:triage_dispatcher"`: the stage audit's actor. A `:build` pass's is the label
+  # `place/4` records on the claim, the transition and any release.
+  defp actor_label(%Spec{archetype: :build}), do: "worker:dispatch_driver"
   defp actor_label(%Spec{id: id}), do: "worker:" <> id <> "_dispatcher"
 
   # `"triage_dispatch:triage_too_large"`: the escalation reason an operator reads on the row.
@@ -508,12 +764,34 @@ defmodule Loopctl.Agents.Dispatcher do
         )
   end
 
+  # A `:build` pass hands `Placement.place/4` a dispatch it can complete: no sweep (a placement
+  # that fails is undone by `place/4` itself, so nothing is left half-taken for a sweep to
+  # finish), the story payload `place/4` builds, and only refs `place/4`'s `fill/3` resolves.
+  defp runnable!(%Spec{archetype: :build} = spec) do
+    unsupported =
+      [
+        {:payload, [spec.payload] -- @build_payloads},
+        {:refs, Enum.uniq(Keyword.values(spec.refs)) -- @build_ref_sources},
+        {:sweeps, Map.keys(spec.sweeps)}
+      ]
+      |> Enum.reject(fn {_field, values} -> values == [] end)
+
+    if unsupported == [],
+      do: :ok,
+      else:
+        raise(
+          ArgumentError,
+          "#{spec.id}@#{spec.version}: Loopctl.Agents.Dispatcher cannot run the :build " <>
+            "pass over " <> inspect(unsupported)
+        )
+  end
+
   defp runnable!(%Spec{} = spec),
     do:
       raise(
         ArgumentError,
         "#{spec.id}@#{spec.version} is a #{inspect(spec.archetype)} spec; " <>
-          "Loopctl.Agents.Dispatcher runs only a :judge pass"
+          "Loopctl.Agents.Dispatcher runs only a :judge or a :build pass"
       )
 
   # ── log lines ───────────────────────────────────────────────────────────────────────────────
@@ -522,9 +800,12 @@ defmodule Loopctl.Agents.Dispatcher do
   # source whose base branch is not a ref — logged at ERROR for the reason `DispatchDriver`
   # gives: a queue that never drains while every pass reports `:ok` at `info` is
   # indistinguishable from an empty one.
+  #
+  # The `:build` line keeps the driver's own wording, which says the one thing an operator
+  # watching a queue that never drains needs to read: it will not clear by itself.
   defp blocked(spec, candidate, reason) do
     Logger.error(
-      "#{label(spec)}: BLOCKED until somebody changes something: " <>
+      "#{label(spec)}: BLOCKED until somebody changes something#{blocked_suffix(spec)}: " <>
         "story_id=#{candidate.story_id} reason=#{inspect(reason)}",
       tenant_id: candidate.tenant_id
     )
@@ -532,6 +813,12 @@ defmodule Loopctl.Agents.Dispatcher do
     :blocked
   end
 
+  defp blocked_suffix(%Spec{archetype: :build}), do: " — this will not clear by itself"
+  defp blocked_suffix(%Spec{}), do: ""
+
+  # A refusal that clears on its own: `:deferred` for a `:judge` pass, `:unplaceable` for a
+  # `:build` one — the driver's name for the same thing, which its worker and its operators
+  # read.
   defp deferred(spec, candidate, reason) do
     Logger.info(
       "#{label(spec)}: leaving for the next pass: story_id=#{candidate.story_id} " <>
@@ -539,8 +826,11 @@ defmodule Loopctl.Agents.Dispatcher do
       tenant_id: candidate.tenant_id
     )
 
-    :deferred
+    transient_outcome(spec)
   end
+
+  defp transient_outcome(%Spec{archetype: :build}), do: :unplaceable
+  defp transient_outcome(%Spec{}), do: :deferred
 
   defp errored(spec, candidate, detail) do
     Logger.error(

@@ -226,10 +226,20 @@ defmodule Loopctl.Agents.DispatcherTest do
   end
 
   describe "run/2 over a spec it cannot run" do
-    test "a :build spec is refused before anything is read" do
-      assert_raise ArgumentError, ~r/implement@1 is a :build spec/, fn ->
-        Dispatcher.run(ImplementV1.spec(), limit: 20, budgets: @budgets, enabled?: true)
+    # US-48.7 gave the `:build` archetype its own pass (`Loopctl.Agents.BuildDispatcherTest`);
+    # an archetype with no pass is still refused before anything is read.
+    test "a :draft spec is refused before anything is read" do
+      spec = %{TriageV1.spec() | archetype: :draft}
+
+      assert_raise ArgumentError, ~r/triage@1 is a :draft spec/, fn ->
+        Dispatcher.run(spec, limit: 20, budgets: @budgets, enabled?: true)
       end
+    end
+
+    test "a :build spec runs the :build pass, not the claimless push" do
+      # Off, so nothing is read: the point is that it is not refused as an archetype.
+      assert Dispatcher.run(ImplementV1.spec(), limit: 20, budgets: @budgets, enabled?: false) ==
+               {:ok, []}
     end
 
     # A spec is code, so these are programming errors: a :judge spec naming a builder, a ref

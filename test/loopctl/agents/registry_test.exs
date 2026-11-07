@@ -180,7 +180,9 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.6: `Spec.holds_claim?/1`, the budget keys and the default kind.
       "lib/loopctl/delivery/dispatch_payload.ex",
       "lib/loopctl/delivery/placement.ex",
-      "lib/loopctl/runners/dispatch_ledger.ex"
+      "lib/loopctl/runners/dispatch_ledger.ex",
+      # US-48.7: the cron caller that runs the `:build` pass with `implement@1`.
+      "lib/loopctl/workers/dispatch_driver_worker.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

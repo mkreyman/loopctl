@@ -8603,7 +8603,13 @@ const TOOLS = [
       "left assigned/implementing: nothing was pushed or written and the claim is not revived. " +
       "Place the story again with a NEW dispatch_id once it is placeable. 409 " +
       "`dependencies_not_met` means a story it depends on, or one in an epic its epic depends on, " +
-      "is not verified: nothing was minted, claimed or pushed; place it once they are.",
+      "is not verified: nothing was minted, claimed or pushed; place it once they are.\n\n" +
+      "422 `not_placeable_kind` means the `kind` is not one whose agent spec CLAIMS a story " +
+      "(the `:build` archetype; `implement` is the only one today). Placement claims the story " +
+      "and mints the custody lineage, so a kind that must not hold a claim — `triage`, or a " +
+      "kind no spec describes — is refused BEFORE anything is minted or claimed. " +
+      "Loopctl dispatches triage itself, without a claim; omit `kind`, which defaults to " +
+      "implement.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8619,8 +8625,8 @@ const TOOLS = [
             "custody lineage — while a triage session only reads, and loopctl dispatches " +
             "triage itself from `detected` without claiming anything. Asking for `triage` " +
             "here would claim a story for a session that is only deciding whether it is work, " +
-            "put it at `claimed`, and send a triage dispatch carrying no reporter words at " +
-            "all, because nothing on this path builds the triage object.",
+            "so the server refuses it 422 `not_placeable_kind` before any claim is written " +
+            "— the same answer as any kind whose agent spec is not a `:build`.",
         },
         dispatch_id: {
           type: "string",

@@ -231,6 +231,33 @@ defmodule Loopctl.Agents.SpecTest do
       end
     end
 
+    # US-48.7. `advance_on` is a closed set of placement refusals, and only a spec that places
+    # (`:build`) may name any.
+    test "advance_on outside the closed set fails to compile" do
+      message =
+        ImplementV1 |> fields() |> put(:advance_on, [:runner_exhausted, :busy]) |> refused()
+
+      assert message =~ "advance_on [:busy] not in [:runner_exhausted, :no_conforming_branch]"
+    end
+
+    test "advance_on naming a refusal twice fails to compile" do
+      message =
+        ImplementV1
+        |> fields()
+        |> put(:advance_on, [:runner_exhausted, :runner_exhausted])
+        |> refused()
+
+      assert message =~ "advance_on names a value twice"
+    end
+
+    test "a :judge spec naming any advance_on fails to compile" do
+      message = TriageV1 |> fields() |> put(:advance_on, [:runner_exhausted]) |> refused()
+
+      assert message =~
+               "agent spec triage@1 (archetype :judge) names advance_on [:runner_exhausted]; " <>
+                 "only a :build spec places"
+    end
+
     test "an unknown field fails to compile" do
       message = TriageV1 |> fields() |> put(:owner_key, "lc_live_x") |> refused()
       assert message =~ "unknown field(s) [:owner_key]"

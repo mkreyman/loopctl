@@ -60,6 +60,10 @@ defmodule Loopctl.Agents.Spec do
   - `payload` — the payload builder the dispatch carries.
   - `refs` — for each `RunnerDispatch.ref_fields/0` key, where its value comes from.
   - `runner` — the eligibility facts a runner must satisfy before the dispatch is written.
+  - `advance_on` — the placement refusals on which a `:build` pass tries the story's NEXT
+    selected runner instead of stopping (US-48.7). Only a refusal about the MACHINE that is
+    decided before anything is minted may be named, and only a `:build` spec may name any: a
+    `:judge` pass sends to the first runner `Selection.runners/3` returns and nothing else.
   - `budgets` — the `{wall_clock_key, max_turns_key}` config pair.
   - `result` — the runner messages the session answers with.
   - `screens` — `%{screen => route}`: the route each control screen takes when it refuses.
@@ -90,6 +94,7 @@ defmodule Loopctl.Agents.Spec do
     :payload,
     :refs,
     :runner,
+    :advance_on,
     :budgets,
     :result,
     :screens,
@@ -116,6 +121,7 @@ defmodule Loopctl.Agents.Spec do
           payload: atom(),
           refs: keyword(atom()),
           runner: [atom()],
+          advance_on: [atom()],
           budgets: {atom(), atom()},
           result: [String.t()],
           screens: %{optional(atom()) => route()},
@@ -158,6 +164,20 @@ defmodule Loopctl.Agents.Spec do
     :subscription_not_exhausted,
     :tenant_admission_headroom
   ]
+
+  # The placement refusals a `:build` pass may advance past to the story's next runner
+  # (`Loopctl.Agents.Dispatcher`). Both are about the MACHINE and both are decided by
+  # `Placement.place/4` before anything is minted, so a refused attempt has written nothing:
+  #
+  # - `:runner_exhausted` — the machine ran dry after selection; passed over WITHOUT becoming
+  #   the answer, so a story every selected machine was dry for is `:no_runner`.
+  # - `:no_conforming_branch` — the machine's `branch_prefixes` can produce no valid branch;
+  #   advanced past AND kept as the answer, so a pass on which every machine is misconfigured
+  #   still reports the state that needs a person.
+  #
+  # Every other refusal concerns the story (the next machine would answer identically) or has
+  # already spent something, so advancing on it would loop or compensate once per runner.
+  @advance_refusals [:runner_exhausted, :no_conforming_branch]
 
   # The config pairs `DispatchDriver.normalise_budget/2` has a ceiling for.
   @budget_pairs [
@@ -307,7 +327,8 @@ defmodule Loopctl.Agents.Spec do
          :ok <- check_closed_sets(spec),
          :ok <- check_routes(spec),
          :ok <- check_archetype_transitions(spec),
-         :ok <- check_archetype_effects(spec) do
+         :ok <- check_archetype_effects(spec),
+         :ok <- check_archetype_advance(spec) do
       {:ok, spec}
     end
   end
@@ -365,6 +386,7 @@ defmodule Loopctl.Agents.Spec do
       one_of(label, :payload, spec.payload, @payloads),
       refs(label, spec.refs),
       subset_of(label, :runner, spec.runner, @runner_facts, non_empty: true),
+      subset_of(label, :advance_on, spec.advance_on, @advance_refusals, non_empty: false),
       one_of(label, :budgets, spec.budgets, @budget_pairs),
       subset_of(label, :result, spec.result, @results, non_empty: true),
       keys_of(label, :screens, spec.screens, @screens),
@@ -511,6 +533,18 @@ defmodule Loopctl.Agents.Spec do
            inspect(allowed_effects(spec.archetype))}
     end
   end
+
+  # Advancing to another runner is a PLACEMENT's answer, so only a spec that places may name a
+  # refusal to advance on.
+  defp check_archetype_advance(%__MODULE__{archetype: :build}), do: :ok
+  defp check_archetype_advance(%__MODULE__{advance_on: []}), do: :ok
+
+  defp check_archetype_advance(spec),
+    do:
+      {:error,
+       "#{label(spec)} (archetype #{inspect(spec.archetype)}) names advance_on " <>
+         "#{inspect(spec.advance_on)}; only a :build spec places, so only a :build spec " <>
+         "may advance to another runner"}
 
   defp label(%__MODULE__{id: id, version: version}), do: "agent spec #{id}@#{version}"
 end

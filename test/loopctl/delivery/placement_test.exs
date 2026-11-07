@@ -160,6 +160,77 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert reload(runner.tenant_id, story.id).agent_status == :contracted
     end
 
+    # US-48.7, TC-48.7.2. Placement CLAIMS and mints the custody lineage, which is the `:build`
+    # archetype; a kind whose spec is anything else is refused before any of it. Both budgets
+    # are supplied, so `DispatchPayload.fill/3` — which reads a kind's budget keys only to fill
+    # a missing one — would have let the dispatch through to the claim, and the source is bound,
+    # so nothing else on the path refuses first.
+    test "a kind whose spec is not a :build is refused 422 not_placeable_kind, and NO claim " <>
+           "is written",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      bind_repo(runner.tenant_id, story, "mkreyman/home_care_billing")
+
+      for kind <- ["triage", "no_such_kind", 42] do
+        payload = %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "story_id" => story.id,
+          "kind" => kind,
+          "wall_clock_seconds" => 3_600,
+          "max_turns" => 50
+        }
+
+        assert {:error, :not_placeable_kind} = place(ctx, payload), inspect(kind)
+        refute_push "dispatch", _pushed
+
+        # NO CLAIM ROW: the story is exactly as the setup left it, nothing was minted for it,
+        # and the ledger holds nothing for the dispatch.
+        assert Stages.get(runner.tenant_id, story.id).stage == :queued
+        unclaimed = reload(runner.tenant_id, story.id)
+        assert unclaimed.agent_status == :contracted
+        assert unclaimed.assigned_agent_id == nil
+        assert unclaimed.implementer_dispatch_id == nil
+        assert unclaimed.claim_epoch == story.claim_epoch
+
+        assert AdminRepo.aggregate(
+                 from(d in Dispatch, where: d.tenant_id == ^runner.tenant_id),
+                 :count
+               ) == 0
+
+        assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
+      end
+
+      # Non-vacuous: the SAME request naming `implement` is placed.
+      assert {:ok, %{implementer_dispatch_id: session_id}} =
+               place(ctx, %{
+                 "dispatch_id" => Ecto.UUID.generate(),
+                 "story_id" => story.id,
+                 "kind" => "implement",
+                 "wall_clock_seconds" => 3_600,
+                 "max_turns" => 50
+               })
+
+      assert_push "dispatch", _pushed, @reply_timeout
+      assert reload(runner.tenant_id, story.id).implementer_dispatch_id == session_id
+    end
+
+    test "a dispatch naming NO kind is implement's, so the kind guard does not refuse it", ctx do
+      %{runner: runner, story: story} = ctx
+      bind_repo(runner.tenant_id, story, "mkreyman/home_care_billing")
+
+      # Refused by the contract's cast after the claim (the wire requires `kind`), and undone:
+      # the guard does not refuse it, because an absent kind is `Registry.default_kind/0`.
+      assert {:error, reason} =
+               place(ctx, %{
+                 "dispatch_id" => Ecto.UUID.generate(),
+                 "story_id" => story.id,
+                 "wall_clock_seconds" => 3_600,
+                 "max_turns" => 50
+               })
+
+      refute reason == :not_placeable_kind
+    end
+
     test "a CALLER-supplied story object is refused, and nothing is claimed", ctx do
       %{runner: runner, story: story} = ctx
 

@@ -50,6 +50,7 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
       :free_slot,
       :subscription_not_exhausted
     ],
+    advance_on: [],
     budgets: {:triage_wall_clock_seconds, :triage_max_turns},
     result: ["triage_verdict"],
     screens: %{

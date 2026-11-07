@@ -226,6 +226,7 @@ defmodule Loopctl.Delivery.Placement do
           | :runner_not_provisioned
           | :runner_declines_work
           | :runner_exhausted
+          | :not_placeable_kind
           | :invalid_transition
           | :wrong_stage
           | :busy
@@ -291,6 +292,11 @@ defmodule Loopctl.Delivery.Placement do
 
   ## Refusals
 
+  - `:not_placeable_kind` — the dispatch's `kind` is not one whose agent spec CLAIMS a story
+    (`Loopctl.Agents.Spec.holds_claim?/1`, the `:build` archetype): `triage`, a kind no spec
+    describes, or a value that is not a kind. Refused on a NEW placement BEFORE ANY CLAIM IS
+    WRITTEN — before the runner is read, the story contracted or anything minted. An absent
+    `kind` is `implement` (`Loopctl.Agents.Registry.default_kind/0`).
   - `:tenant_halted` — the tenant's custody operations are halted (L6). Checked BEFORE the
     mint, because `CheckCustodyHalt` is a pipeline plug and this path has no `conn`, and
     because `Runners.dispatch/3`'s own halt check runs after both commits.
@@ -373,10 +379,34 @@ defmodule Loopctl.Delivery.Placement do
          :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
       # A resume re-pushes an IMPLEMENT session and moves its claim's cap.
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
-        nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
+        nil -> place_new(tenant_id, runner_id, dispatch, story_id, caller, opts)
         record -> resume_implement(tenant_id, runner_id, dispatch, record, opts)
       end
     end
+  end
+
+  # ONLY A KIND WHOSE SPEC CLAIMS MAY BE PLACED (US-48.7), and that is decided BEFORE ANY CLAIM
+  # IS WRITTEN — before the runner is read, the story is contracted, anything is minted or the
+  # claim is taken. Placement claims the story and mints the custody lineage, which is the
+  # `:build` archetype's semantics; a `:judge` session only reads, and claiming for it marks
+  # the story as being worked by the machine that is only deciding whether it is work.
+  #
+  # Before this guard nothing on this path asked. A `triage` dispatch — or one of a kind no spec
+  # describes — that carried both budgets passed `DispatchPayload.fill/3` (which reads a
+  # kind's budget keys only to fill a missing budget), contracted and claimed the story, minted
+  # a session dispatch and appended two immutable chain entries, and only then met the cast or
+  # the runner, with a compensating release behind it.
+  #
+  # `Spec.holds_claim?/1` is the one reading of the question. A dispatch naming no `kind` is
+  # `Registry.default_kind/0`'s (`implement`), as `fill/3` reads it for its budgets; any kind
+  # no spec describes, or a value that is not a kind at all, holds no claim and is refused.
+  #
+  # On the NEW-placement path only. A resume claims nothing, and `resume_implement/5` already
+  # refuses a ledger row of a kind that holds no claim (`:dispatch_id_conflict`).
+  defp place_new(tenant_id, runner_id, dispatch, story_id, caller, opts) do
+    if Spec.holds_claim?(Map.get(dispatch, "kind")),
+      do: claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts),
+      else: {:error, :not_placeable_kind}
   end
 
   # THE STORY OBJECT IS LOOPCTL'S TO BUILD, so a caller may not supply one. `attach_story/6`
@@ -726,10 +756,10 @@ defmodule Loopctl.Delivery.Placement do
   defp pin_recorded_base_branch(dispatch, _record), do: {:ok, dispatch}
 
   # `ImplementerInput.story_object/2` is the pure half of `StoryPayload.build/3` — the same
-  # allowlist and the same caps, with no database write of any kind. Non-implement kinds carry
-  # no story object at all, exactly as on the claim path.
+  # allowlist and the same caps, with no database write of any kind. A kind whose spec claims
+  # nothing carries no story object at all, exactly as on the claim path (`carries_story?/1`).
   defp rebuild_story(dispatch, story) do
-    if Map.get(dispatch, "kind") == "implement" do
+    if carries_story?(dispatch) do
       case ImplementerInput.story_object(story) do
         {:ok, object} ->
           {:ok, Map.put(dispatch, "story", object)}
@@ -1044,7 +1074,7 @@ defmodule Loopctl.Delivery.Placement do
   # new epoch. The claim goes back, the session dispatch is revoked, and the story stays where
   # `StoryPayload.build/3` put it — with a human.
   defp attach_story(tenant_id, dispatch, story, session, epoch, opts) do
-    if Map.get(dispatch, "kind") == "implement" do
+    if carries_story?(dispatch) do
       case StoryPayload.build(tenant_id, story.id,
              claim_epoch: epoch,
              actor_lineage: session.lineage_path,
@@ -1056,6 +1086,20 @@ defmodule Loopctl.Delivery.Placement do
     else
       {:ok, dispatch}
     end
+  end
+
+  # WHETHER THE DISPATCH CARRIES A STORY OBJECT: its `kind` NAMED, and that kind's spec holding
+  # a claim (`Spec.holds_claim?/1`, the `:build` archetype). This replaced a literal
+  # `kind == "implement"`, and it answers identically for every value: `implement` carries
+  # one, `triage` and any kind no spec describes do not — and neither does a dispatch naming
+  # NO kind. That last case is why the `is_binary/1` is here and the nil default
+  # `holds_claim?/1` applies to a LEDGER row is not: the contract requires `kind` on the wire,
+  # so a payload without one is refused by `Runners.dispatch/3`'s cast, and building (and
+  # possibly ESCALATING) a story for a frame that is never sent would be a write with no
+  # purpose.
+  defp carries_story?(dispatch) do
+    kind = Map.get(dispatch, "kind")
+    is_binary(kind) and Spec.holds_claim?(kind)
   end
 
   # The claim carries the session dispatch on it: `:dispatch_id` becomes the story's

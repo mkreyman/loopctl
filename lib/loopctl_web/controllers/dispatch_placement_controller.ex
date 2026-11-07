@@ -138,9 +138,11 @@ defmodule LoopctlWeb.DispatchPlacementController do
            kind: %Schema{
              type: :string,
              description:
-               "Only the kinds in `x-connection.dispatchable_kinds` are accepted. A kind no " <>
-                 "agent spec describes is given no budget: with either budget omitted it is " <>
-                 "422 `invalid_payload` before anything is minted or claimed."
+               "Only a kind whose agent spec CLAIMS a story (the `:build` archetype — " <>
+                 "`implement` today) may be placed: placement claims the story and mints its " <>
+                 "custody lineage. Any other kind — `triage`, which loopctl dispatches itself " <>
+                 "without a claim, or a kind no agent spec describes — is 422 " <>
+                 "`not_placeable_kind` before anything is minted or claimed."
            },
            repo: %Schema{type: :string},
            branch: %Schema{
@@ -235,7 +237,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
            "a retry named a different `branch` from the one this dispatch was already sent " <>
            "on; or `base_branch_conflict` — a retry named a different `base_branch` from the " <>
            "one recorded at the first push, which the merge gate judges against. Nothing " <>
-           "was claimed on any of them. Or " <>
+           "was claimed on any of them. Or `not_placeable_kind` — the `kind` is not one " <>
+           "whose agent spec claims a story (the `:build` archetype), such as `triage` or a " <>
+           "kind no spec describes; refused before anything is minted or claimed. Or " <>
            "`story_not_accepted` — the story object is built by loopctl from " <>
            "its own records and may not be supplied by a caller; or " <>
            "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
@@ -564,6 +568,19 @@ defmodule LoopctlWeb.DispatchPlacementController do
   defp refuse(conn, :runner_ambiguous) do
     error(conn, 409, "runner_ambiguous", %{
       message: "More than one live connection for this runner; loopctl will not guess."
+    })
+  end
+
+  # US-48.7. `place/4` refuses a kind whose agent spec does not claim a story, before any claim
+  # is written. 422 rather than 409: the remedy is in the request (the kind), not in the state
+  # of the story or the machine, and the fallback has no clause for the atom.
+  defp refuse(conn, :not_placeable_kind) do
+    error(conn, 422, "not_placeable_kind", %{
+      message:
+        "Placement claims the story and mints its custody lineage, so only a kind whose " <>
+          "agent spec claims a story (the :build archetype; `implement` today) may be " <>
+          "placed. Nothing was minted or claimed. loopctl dispatches triage itself, without " <>
+          "a claim; send `kind: implement`."
     })
   end
 

@@ -9,8 +9,10 @@ defmodule Loopctl.Agents.Registry do
   Read for each spec's `candidates`: `TriageDispatcher.candidates/1` and
   `DispatchDriver.candidates/1` are `Loopctl.Agents.Candidates.query/2` over their spec
   (US-48.3). The triage dispatch pass runs from `triage@1` through `Loopctl.Agents.Dispatcher`
-  (US-48.4). Read for each kind's archetype and budgets (US-48.6): `Spec.holds_claim?/1` is
-  the one claim-holding predicate the dispatch ledger and `Placement` ask, and
+  (US-48.4), and so does the implement pass from `implement@1` (US-48.7). Read for each kind's
+  archetype and budgets (US-48.6): `Spec.holds_claim?/1` is the one claim-holding predicate
+  the dispatch ledger and `Placement` ask — including `Placement.place/4`'s refusal of a kind
+  that is not a `:build` — and
   `DispatchPayload.budget_keys/1` reads the spec's `budgets`. Later stories move the rest of
   each dispatch kind onto its spec, each with an
   equivalence test; until then `Loopctl.Agents.RegistryTest` binds the registry to the lists it

@@ -634,6 +634,18 @@ describe("the wiring in index.js", () => {
       assert.match(declaration("place_dispatch"), /runner_exhausted/);
       assert.match(declaration("place_dispatch"), /usage_exhausted_until/);
     });
+
+    // US-48.7. `Placement.place/4` refuses a kind whose agent spec is not a `:build` before any
+    // claim is written; the tool description is what a session reads instead of the
+    // controller, so both declarations name the refusal and say nothing was claimed.
+    test("place_dispatch names 422 not_placeable_kind in its description and its row", () => {
+      const start = INDEX_SRC.indexOf('name: "place_dispatch"');
+      const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+      assert.match(declaration, /422 `not_placeable_kind`/);
+      assert.match(declaration, /BEFORE anything is minted or claimed/);
+      assert.match(row("place_dispatch"), /422 `not_placeable_kind`/);
+    });
   });
 
   test("the paths the tools build are the routes loopctl serves", () => {
