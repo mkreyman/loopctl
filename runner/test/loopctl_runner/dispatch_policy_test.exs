@@ -211,6 +211,21 @@ defmodule LoopctlRunner.DispatchPolicyTest do
     assert reason(decide(ctx, %{@dispatch | "base_branch" => "-x"})) == "branch_not_allowed"
   end
 
+  test "review and triage are held to plain ref names only, never to the prefixes", ctx do
+    # Neither writes its `branch`: a review fetches the implementer's, and loopctl sends a
+    # triage with the BASE as its branch, run on a detached tree. On 2026-11-06 minis
+    # (prefixes ["loop/"]) refused every triage dispatch `master is outside ["loop/"]`.
+    for kind <- ["review", "triage"] do
+      assert {:accept, _} = decide(ctx, %{@dispatch | "kind" => kind, "branch" => "master"})
+
+      assert reason(decide(ctx, %{@dispatch | "kind" => kind, "branch" => "loop/../master"})) ==
+               "branch_not_allowed"
+    end
+
+    # The branches this machine DOES write stay inside its prefixes.
+    assert reason(decide(ctx, %{@dispatch | "branch" => "master"})) == "branch_not_allowed"
+  end
+
   test "wall clock and turns over this runner's own limits are refused", ctx do
     assert reason(decide(ctx, %{@dispatch | "wall_clock_seconds" => 3601})) ==
              "wall_clock_exceeds_limit"

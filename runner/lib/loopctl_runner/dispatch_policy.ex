@@ -30,7 +30,9 @@ defmodule LoopctlRunner.DispatchPolicy do
        IMPLEMENTER's, derived from whatever prefixes that machine declared, and a review never
        cuts, writes or pushes it — it only fetches it, which a plain ref name is what makes safe.
        Refusing one for a prefix this machine enforces on the branches it WRITES would turn away
-       every review of a story implemented elsewhere;
+       every review of a story implemented elsewhere. A `triage` dispatch is held to the second
+       half too: it names the base branch as its `branch` and runs on a detached tree that is
+       never branched or pushed, so a prefix check refused every one (minis, 2026-11-06);
     7. `wall_clock_exceeds_limit`, `max_turns_exceeds_limit` — over `max_wall_clock_s` or
        `max_turns`;
     8. `token_budget_exceeds_limit` — when `control.max_token_budget` is set, a dispatch with no
@@ -166,13 +168,19 @@ defmodule LoopctlRunner.DispatchPolicy do
   defp repo(_dispatch, _control, _config),
     do: {:refuse, "repo_not_allowed", "the dispatch names no repo"}
 
+  # The kinds that never write their `branch`, so this machine's prefixes, which bound the
+  # branches it CUTS and PUSHES, have nothing to bound. A review fetches the implementer's
+  # branch; a triage run judges the base from a detached worktree and loopctl names the base
+  # itself as `branch` (`LoopctlRunner.TriageRun`). Both keep the plain-ref check above.
+  @prefix_exempt_kinds ["review", "triage"]
+
   defp refs(%{"base_branch" => base, "branch" => branch} = dispatch, config)
        when is_binary(base) and is_binary(branch) do
     cond do
       not plain_ref?(base) or not plain_ref?(branch) ->
         {:refuse, "branch_not_allowed", "a ref is not a plain ref name"}
 
-      dispatch["kind"] == "review" ->
+      dispatch["kind"] in @prefix_exempt_kinds ->
         :ok
 
       not Enum.any?(config.branch_prefixes, &String.starts_with?(branch, &1)) ->
