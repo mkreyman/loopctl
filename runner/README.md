@@ -224,8 +224,9 @@ deleting a config directory rather than a refactor. Build it that way.
 
 ## Enrolled machines
 
-minis (Linux), mac-mini (macOS), blockit (macOS). Not beelink (dedicated CI host) and not
-xps13 (4 threads, 8 GB soldered).
+minis, ryzen and x1 (Linux), mac-mini and blockit (macOS). ryzen also runs the `fleet-ci` pool and
+the local model, so its runner declares one session (Mark, 2026-11-06: ryzen and x1 belong in the
+implementer pool). Not beelink (the fleet's main CI host) and not xps13 (retired).
 
 ## Packaging
 
