@@ -12,7 +12,7 @@
     "i_want_to": "have a pr-route session stop at a green pull request and have it merged only after loopctl's merge precondition records an allow for its head",
     "so_that": "Gate A, Gate B over the real diff, custody and the 12-file / 1000-line bound judge every unattended merge, as they already do on the thread route"
   },
-  "rationale": "HCB PR #3938 (2026-11-07) merged on the session's own word: the runner's pr-mode prompt says 'merge on green' (loopctl-runner dispatch_prompt.ex finish/4), and merge_precondition is exact_role [:orchestrator, :user], so a session cannot call it. Triage ran both gates over the request, but nothing judged the diff that shipped. StageMachine's note above @runner_transitions says who performs the merge 'is undecided in the design'; this story decides it for the pr route: control decides, the runner executes.",
+  "rationale": "HCB PR #3938 (2026-11-07) merged on the session's own word: the runner's pr-mode prompt says 'merge on green' (loopctl-runner dispatch_prompt.ex finish/4), and nothing obliges the session to call merge_precondition first (it is exact_role [:orchestrator, :user], and a session inherits the operator's legacy orchestrator key, so it could, but nothing makes it). Triage ran both gates over the request, but nothing judged the diff that shipped. StageMachine's note above @runner_transitions says who performs the merge 'is undecided in the design'; this story decides it for the pr route: control decides, the runner executes.",
   "acceptance_criteria": [
     {
       "id": "AC-48.17.1",
@@ -53,5 +53,5 @@
     "Contract: a new control -> runner message; runner contract minor bump.",
     "Load .claude/skills/chain-of-custody/SKILL.md before touching the stage machine or the merge gate."
   ],
-  "dependencies": ["US-48.16"]
+  "dependencies": ["US-48.16", "US-48.18"]
 }
