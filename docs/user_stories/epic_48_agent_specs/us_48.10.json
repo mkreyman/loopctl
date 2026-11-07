@@ -1,0 +1,92 @@
+{
+  "id": "US-48.10",
+  "title": "Eval harness: a case set per spec, run offline through the runner",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "a small eval set per spec that runs without production",
+    "so_that": "a prompt or spec change is measured before it ships, not discovered on a live ticket"
+  },
+  "rationale": "The guide's advice the loop skipped: evals before scale. Today quality is learned one live ticket at a time.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.10.1",
+      "description": "An eval case is a JSON file eval/<spec>/<case>.json in loopctl-runner: {spec, version, input (the dispatch object exactly as sent), fixture repo + pinned commit, expectations}; expectations are deterministic first (schema-valid, outcome allowed, required escalation codes, lens agreement, forbidden content), a rubric only where text quality is the point."
+    },
+    {
+      "id": "AC-48.10.2",
+      "description": "mix loopctl_runner.eval <spec> runs each case through the runner's own launcher in a scratch detached worktree of a local fixture clone, with no control socket, and reads the result off disk; it prints a per-case pass/fail table and exits non-zero on any failure."
+    },
+    {
+      "id": "AC-48.10.3",
+      "description": "loopctl replays recorded eval results through its pure screens (GateA.evaluate, the triage screens, InjectionDetector) in its test suite beside DeliveryGates.Measurement."
+    },
+    {
+      "id": "AC-48.10.4",
+      "description": "Seed sets: triage@1 and reply_draft@1 at least five synthetic cases each; implement@1 at least three cases on a fixture repo. No real ticket text (PRD default 1)."
+    },
+    {
+      "id": "AC-48.10.5",
+      "description": "The eval never reaches a production repository, the production socket or a customer."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.10.1",
+      "verifies": [
+        "AC-48.10.2",
+        "AC-48.10.5"
+      ],
+      "name": "runs offline",
+      "type": "integration",
+      "steps": [
+        "run the eval with the network to loopctl blocked"
+      ],
+      "expected_results": [
+        "completes",
+        "table printed"
+      ]
+    },
+    {
+      "id": "TC-48.10.2",
+      "verifies": [
+        "AC-48.10.2"
+      ],
+      "name": "failing case fails the run",
+      "type": "integration",
+      "steps": [
+        "a case whose expectation cannot hold"
+      ],
+      "expected_results": [
+        "non-zero exit naming the case"
+      ]
+    },
+    {
+      "id": "TC-48.10.3",
+      "verifies": [
+        "AC-48.10.3"
+      ],
+      "name": "replay in loopctl",
+      "type": "unit",
+      "steps": [
+        "replay a recorded triage result"
+      ],
+      "expected_results": [
+        "same screen codes as the live path"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Repos: loopctl-runner (cases, task) and loopctl (replay).",
+    "The implement agent inherits ~/.claude on its machine in pr mode, so implement eval results are machine-dependent until the template pins what it inherits; record the machine with each result."
+  ],
+  "dependencies": [
+    "US-48.8",
+    "US-48.9"
+  ]
+}

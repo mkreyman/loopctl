@@ -4,16 +4,19 @@ defmodule Loopctl.Delivery.PostDeployVerification.Result do
 
   - `decision` — one of three:
     - `:verified` — the story's merge is running in the target deployment. The story takes
-      `{deployed, verified, :forward}`
+      `{deployed, verified, :forward}`, preceded at `merged` by `{merged, deployed, :forward}`
     - `:failed` — it is not, or the deploy did not succeed, or something could not be
       established that a human has to look at. The story takes
-      `{deployed, escalated, :verification_failed}`
+      `{deployed | merged, escalated, :verification_failed}`
     - `:unresolved` — no verdict yet: the forge was transiently unavailable, or the deploy
       has not been created, settled, or carried this merge. NOTHING transitions and the next
       sweep asks again. Never an escalation on its own, because `escalated` is human-only and
       one network blip (or one queued build) must not park a story on Mark. It escalates only
       once the consecutive count for its KIND passes
       `PostDeployVerification.max_consecutive_unresolved/1`
+  - `stage` — the stage the story was read at, `:merged` or `:deployed` (US-48.16). It
+    decides nothing about the verdict; it decides which edge the verdict is written over.
+    After a `merged -> deployed` write it reads `:deployed`
   - `unresolved_kind` — `:forge_fault` or `:deploy_pending`, on an `:unresolved` result and
     `nil` otherwise. The two have different bounds and are counted separately, because one
     number for both made every repository whose deploy takes longer than ten minutes
@@ -54,6 +57,7 @@ defmodule Loopctl.Delivery.PostDeployVerification.Result do
   @enforce_keys [:decision, :reasons, :resolution]
   defstruct [
     :decision,
+    :stage,
     :reasons,
     :resolution,
     :unresolved_kind,
@@ -70,6 +74,7 @@ defmodule Loopctl.Delivery.PostDeployVerification.Result do
 
   @type t :: %__MODULE__{
           decision: decision(),
+          stage: :merged | :deployed | nil,
           reasons: [term()],
           resolution: Resolution.t(),
           unresolved_kind: :forge_fault | :deploy_pending | nil,

@@ -38,7 +38,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   4. **Custody** (design §9) — `verified_status: :verified`, set through a verifier
      dispatch whose lineage is separate from the implementer's. That comparison is
      `Loopctl.Progress.merge_custody_status/1`, which is the L4 gate `verify` already runs;
-     there is no second lineage comparison here.
+     there is no second lineage comparison here. And the verification must have been made AT
+     the recorded head (US-48.18): the stage row's `verified_head_sha` equal to its
+     `head_sha`, else `:verified_for_other_head`.
   5. **The head has not moved** — the pull request's head must be the `head_sha` the stage
      row recorded, which is the head CI ran on and the story was verified at. A push after
      either is ordinary work rather than an escalation, so it goes back to `implementing`
@@ -871,6 +873,24 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   def hard_bound_reasons(diffstat), do: [{:invalid_diffstat, shape(diffstat)}]
 
+  # THE CUSTODY FACT IS BOUND TO THE HEAD (US-48.18, AC-48.18.4). `merge_custody_status/1`
+  # reads `verified_status`, which names no commit, so a story verified at X that went back to
+  # work and returned to `ci` at Y passed it. The stage row records the head the verification
+  # was made at (`verified_head_sha`, control-written), and a verification for any other head
+  # — or for no recorded head at all — is refused `:verified_for_other_head`. Decided after
+  # the recorded custody passes, so a story with no verification still reads `:not_verified`.
+  defp custody_at_head(story, stage) do
+    case Progress.merge_custody_status(story) do
+      :ok ->
+        if is_binary(stage.head_sha) and stage.verified_head_sha == stage.head_sha,
+          do: :ok,
+          else: {:error, :verified_for_other_head}
+
+      refused ->
+        refused
+    end
+  end
+
   defp custody_reasons(:ok), do: []
   defp custody_reasons({:error, reason}), do: [{:custody, reason}]
   defp custody_reasons(other), do: [{:custody, {:unreadable, shape(other)}}]
@@ -974,7 +994,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # its moduledoc says it is and a test can name a different list without touching
       # VM-global state.
       self_deploy_excluded: self_deploy_excluded_repos(),
-      custody: Progress.merge_custody_status(story),
+      custody: custody_at_head(story, stage),
       # The head CI ran on and the story was verified at, and the head a previous allow was
       # granted for. Both are read from the stage row, never from the caller.
       recorded_head_sha: stage.head_sha,
@@ -1030,6 +1050,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp pr_number(%{pr_number: number}) when is_integer(number) and number > 0, do: {:ok, number}
   defp pr_number(%{pr_number: number}), do: {:error, {:not_recorded, number}}
+
+  @doc """
+  The forge's pull request for `story` at the number its stage row recorded, read with the
+  tenant's credential for the story's own repository (never a caller's). For a reader AFTER
+  the merge (`Loopctl.Delivery.PostDeployVerification`): the merged pull request's `head_sha`
+  is the head that was actually merged, which is what an ungated merge is judged on.
+  """
+  @spec read_pull_request(Loopctl.WorkBreakdown.Story.t(), Loopctl.Delivery.StoryStage.t()) ::
+          {:ok, map()} | {:error, term()}
+  def read_pull_request(story, stage) do
+    forge =
+      with {:ok, name} <- story |> source_for_story() |> repo_of(),
+           do: Credential.repo(story.tenant_id, name)
+
+    pull_request(forge, pr_number(stage))
+  end
 
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
   # A missing credential is reported as itself whether or not a number was recorded, so both

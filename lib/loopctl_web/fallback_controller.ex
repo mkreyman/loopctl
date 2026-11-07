@@ -47,6 +47,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :missing_assigned_agent}` -> 409 (reported_done story has no assigned agent/dispatch lineage; custody chain broken)
   - `{:error, :unresolvable_dispatch_lineage}` -> 409 (a dispatch the story references — implementer, or verifier on verify — could not be resolved; custody gate failed closed on an integrity error, tenant NOT halted)
   - `{:error, :caller_lineage_required}` -> 409 (a key no dispatch minted tried to report/review/verify dispatch-minted work; a configuration refusal, tenant NOT halted)
+  - `{:error, :pr_route_verifier_only}` -> 409 (US-48.18: report/review/verify of a pull-request-route story by a key other than its control-bound verifier dispatch; tenant NOT halted)
   - `{:error, :chg_reviewer_required}` -> 409 (US-47.5: review-complete on a story bound to a chg change by a key that is not a strict descendant of its chg root)
   - `{:error, :commit_sha_not_bound}` -> 422 (US-47.5: that review named no submitted revision of the story's current binding)
   - `{:error, :chg_review_already_recorded}` -> 409 (US-47.5: the chg reviewer dispatch already recorded its one verdict)
@@ -594,6 +595,24 @@ defmodule LoopctlWeb.FallbackController do
             "lineages — and your key was not minted by a dispatch, so it has none. Call " <>
             "again with an ephemeral key from POST /api/v1/dispatches.",
         remediation: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+      }
+    })
+  end
+
+  def call(conn, {:error, :pr_route_verifier_only}) do
+    # US-48.18 AC-48.18.3: a pull-request-route story is reported, reviewed and verified by
+    # control's verifier dispatch alone. A refusal of every other principal, the operator's
+    # key included — not a byzantine self-claim, so no custody violation is recorded.
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "pr_route_verifier_only",
+        message:
+          "This story is on the pull-request route: loopctl reports, reviews and verifies it " <>
+            "through the verifier dispatch it placed (verify@1). No other key may.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
       }
     })
   end

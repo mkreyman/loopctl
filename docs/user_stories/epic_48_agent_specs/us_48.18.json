@@ -1,0 +1,78 @@
+{
+  "id": "US-48.18",
+  "title": "verify@1: control verifies a pr-route story at ci through an independently rooted verifier dispatch",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "have a story that reaches ci on the pr route judged by a second runner session, and have control report, review and verify it under a verifier dispatch rooted apart from the implementer's",
+    "so_that": "the merge precondition's custody check can pass at the head CI ran on without a human, and US-48.17's merge gate can ever answer allow"
+  },
+  "rationale": "On the pr route the only custody act is the claim Placement makes (placement.ex:814, :1170-1186). start, report, request-review, review-complete and verify are never called, so Progress.merge_custody_status/1 (progress.ex:4011) can never be :ok and US-48.17 alone escalates every story at ci; HCB story ddb4fcc1 shows agent_status pending, reported_done_at null. Every implementer dispatch is already its own root (parent List.last([]) under the unlineaged operator :user key, placement.ex:1174), so a verifier minted the same way is root-separated by construction and the lineage ceiling holds. Verify also compares assigned_agent_id (progress.ex:4116), so the verifier must run on a different runner. A verify is not bound to a head today (merge_custody_status reads verified_status only) and validate_verifiable refuses a re-verify (progress.ex:4176), so a story verified at head X that returns to ci at Y would merge unverified. Sessions inherit the operator's MCP set (Mark's runner rule, 2026-09-16), which holds unlineaged legacy orchestrator and reviewer keys; reject is exempt from the empty-lineage refusal (progress.ex:4068), so once pr-route stories reach reported_done a session could reject a sibling story. Design brief: architect pass 2026-11-07, every claim checked against the cited lines.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.18.1",
+      "description": "Registry holds verify@1 (archetype :judge, kind verify). Its candidates are stories at ci on a pr-mode source with a recorded head_sha whose verified_head_sha differs from it; the kind is in RunnerContract.Kinds, the runner_dispatches_kind CHECK and the runner contract (minor bump), and registry_test's bindings stay green."
+    },
+    {
+      "id": "AC-48.18.2",
+      "description": "Placing verify@1 mints dispatch B with the operator key as a new root, role :orchestrator, agent = a runner R2 whose agent id differs from the implementer runner's, and binds it through a new Progress.bind_verifier_dispatch/4 that locks the story, requires implementer_dispatch_id, fails closed on an empty lineage, a shared root or the same agent id, and writes verifier_dispatch_id with a chained verifier_selected audit entry in one transaction (sharing the write-and-audit half with assign_rotating_verifier/3). No eligible R2 escalates the story at ci naming no_independent_verifier_runner. B's key never reaches the session and is revoked once the verdict is applied."
+    },
+    {
+      "id": "AC-48.18.3",
+      "description": "The verify session reviews the PR diff at the recorded head against the story's acceptance criteria and answers an agent_result verdict (pass, or reject with findings). Control applies it in a job unique per (story, dispatch): pass runs Progress report, record_review and verify in that order with lineage and agent id read from B's row (each step skips when already done), then records stage effect verified_head_sha; reject sends the story ci -> implementing over a new control-only edge :verify_rejected carrying the findings. A runner's claimed -> implementing calls Progress.start_story/3 with the start cap the claim minted. No key the session holds is accepted by report, review or verify for this story."
+    },
+    {
+      "id": "AC-48.18.4",
+      "description": "The verify is bound to its head: a verdict whose head is not the stage row's current head_sha, or a story no longer at ci, is dropped and the drop recorded; verified_head_sha is head-keyed and cleared with head_sha; every head-clearing edge on a verified pr-route story calls a new Progress.invalidate_verification/3 in the same transaction (unverified, agent_status implementing, chained audit entry); MergePrecondition's custody fact requires verified_head_sha == the recorded head and otherwise refuses :verified_for_other_head."
+    },
+    {
+      "id": "AC-48.18.5",
+      "description": "Two custody holes this route opens are closed: Agents.Dispatcher's operator key query admits only keys no dispatch minted, and an unlineaged reject on a story whose stage row is on a pr-mode source is refused caller_lineage_required."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.18.1",
+      "verifies": ["AC-48.18.2", "AC-48.18.3"],
+      "name": "a pass verdict leaves merge_custody_status :ok at the current head",
+      "type": "integration",
+      "steps": ["a story at ci on a pr-mode source, claimed under dispatch A on runner R", "verify@1 is placed under root dispatch B on runner R2", "R2 answers pass for the recorded head"],
+      "expected_results": ["verifier_dispatch_id is B", "verified_status is :verified and verified_head_sha is the head", "Progress.merge_custody_status/1 returns :ok", "B is revoked"]
+    },
+    {
+      "id": "TC-48.18.2",
+      "verifies": ["AC-48.18.4"],
+      "name": "a verdict for a moved head is dropped, and a moved head after verify invalidates it",
+      "type": "integration",
+      "steps": ["a pass verdict names head X while the stage row's head_sha is Y", "separately, a verified story goes ci -> implementing over :base_moved"],
+      "expected_results": ["the first leaves verified_status unchanged and records the drop", "the second sets verified_status unverified and clears verified_head_sha"]
+    },
+    {
+      "id": "TC-48.18.3",
+      "verifies": ["AC-48.18.2"],
+      "name": "one runner cannot verify its own work",
+      "type": "integration",
+      "steps": ["the only runner able to take verify@1 is the implementer's runner"],
+      "expected_results": ["nothing is placed", "the story escalates naming no_independent_verifier_runner"]
+    },
+    {
+      "id": "TC-48.18.4",
+      "verifies": ["AC-48.18.5"],
+      "name": "an unlineaged key cannot reject a pr-route story",
+      "type": "integration",
+      "steps": ["a pr-route story at reported_done", "reject with a key no dispatch minted"],
+      "expected_results": ["409 caller_lineage_required", "the story is unchanged"]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/chain-of-custody/SKILL.md first. This story writes verifier_dispatch_id and reaches report, review-complete and verify; no role gate changes, control calls Progress with server-resolved lineage as Placement already does for claim. Fixers run on Opus; the epic PR needs /security-review.",
+    "Every pr-mode repository needs at least two runners with distinct agent ids; HCB has minis, ryzen and x1.",
+    "Candidate predicates must not overlap with US-48.17's merge job: verify@1 takes verified_head_sha != head_sha, the merge job takes verified_head_sha == head_sha."
+  ],
+  "dependencies": ["US-48.16"]
+}

@@ -23,7 +23,9 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:ci_red` — ci -> implementing
   - `:review_findings` — reviewing -> implementing
   - `:base_moved` — merge conflict or base moved: pr_open | ci -> implementing
-  - `:verification_failed` — post-deploy verification failing: deployed -> escalated
+  - `:verification_failed` — post-deploy verification failing: deployed | merged ->
+    escalated. From `merged` for a pr-route story, which control carries to `deployed`
+    itself (US-48.16) and so may judge before it gets there
   - `:triage_escalate` — triaged -> escalated, the triage trio's `escalate` verdict
     (design §4), including the disagreement that escalates by construction
   - `:triage_reject` — triaged -> failed, the triage trio's `reject` verdict (design §4):
@@ -123,6 +125,36 @@ defmodule Loopctl.Delivery.StageMachine do
     landed revision (a policy auto-approval, or a review loopctl never accepted). chg lands on
     its own authority, so the merge stands and nothing is cleared; the story is held for a
     human and is never verified without one
+
+  The VERIFY edges (US-48.18), both taken by CONTROL from `ci`, neither runner-reportable:
+
+  - `:verify_rejected` — ci -> implementing, when the independently rooted verifier session
+    of `verify@1` answers `reject` for the story's CURRENT head
+    (`Loopctl.Agents.VerifyVerdict`). The findings are the reason. Its own edge rather than
+    `:review_findings` or `:ci_red`, because both of those are a runner's own report and `ci`
+    is a runner source stage: reusing one would let an implementing session write the
+    verifier's verdict about itself
+  - `:no_independent_verifier_runner` — ci -> escalated, when the only runners able to take a
+    `verify` dispatch are the implementer's own agent (`Loopctl.Agents.VerifierPlacement`).
+    Nothing can verify the story without a person adding a machine
+
+  The MERGE edges (US-48.17), all three taken by CONTROL, none runner-reportable. On the pull
+  request route control decides the merge and the runner executes it
+  (`Loopctl.Delivery.MergeExecution`):
+
+  - `:runner_gone` — ci -> escalated, when the runner holding the claim has had no live socket
+    for longer than `MergeExecution.runner_gone_after_seconds/0` while the story waited at
+    `ci`. Escalated rather than re-queued: the pull request is open and green, and only the
+    machine that built it can be told to merge it. Not `:runner_lost` — that is a RELEASE edge
+    into `queued`, taken by the claim release alone
+  - `:merge_unanswered` — ci -> escalated, when the runner was instructed to merge the
+    recorded head `MergeExecution.max_sends/0` times and never reported the merge
+  - `:ungated_merge` — merged -> escalated, taken in the SAME transaction as a reported
+    `ci -> merged` on a pull-request-route story whose recorded allow
+    (`merge_gate_allowed_sha`) is not its head: a session merged without the gate. The merge
+    stands — it happened on GitHub — so nothing is cleared, and the reason names the sha. It
+    is never taken on the change protocol: chg lands through
+    `Loopctl.Delivery.Stages.advance_in_tenant_transaction/4`, which does not run the check
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
 
@@ -256,10 +288,27 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:pr_open, :implementing, :base_moved},
                    {:ci, :implementing, :base_moved},
                    {:deployed, :escalated, :verification_failed},
+                   # US-48.16: control also reads a pr-route story at `merged` (its runner
+                   # reports up to the merge and stops), writing `merged -> deployed` once a
+                   # deployment carries the merge. A verdict reached BEFORE that — no deploy
+                   # inside the bounds, or one that failed — escalates from `merged`, over the
+                   # same control-only edge. `merged` is a runner SOURCE stage, so only the edge
+                   # allowlist (`@runner_reportable_edges`) keeps this off the wire.
+                   {:merged, :escalated, :verification_failed},
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
-                   {:merged, :implementing, :merge_refused}
+                   {:merged, :implementing, :merge_refused},
+                   # US-48.18: the verifier's reject, and no machine apart from the
+                   # implementer's to verify on. Both CONTROL-ONLY (see the moduledoc).
+                   {:ci, :implementing, :verify_rejected},
+                   {:ci, :escalated, :no_independent_verifier_runner},
+                   # US-48.17: the merge control decides and the runner executes. All three
+                   # CONTROL-ONLY (see the moduledoc); `escalated` leaves over
+                   # `:human_resolution`, so none of them makes a stage absorbing.
+                   {:ci, :escalated, :runner_gone},
+                   {:ci, :escalated, :merge_unanswered},
+                   {:merged, :escalated, :ungated_merge}
                  ] ++
                  @budget_exceeded ++
                  @released ++
@@ -325,16 +374,24 @@ defmodule Loopctl.Delivery.StageMachine do
   #
   # So: a runner may report what its own session did and control can independently check,
   # plus its own escalation, which stops the loop rather than advancing it. A story therefore
-  # WAITS at `deployed` for control to decide verified-or-escalated, and no writer for that
-  # exists yet — an unimplemented control path, chosen deliberately over a session certifying
-  # itself.
+  # WAITS for control to decide verified-or-escalated — at `deployed`, or at `merged` when its
+  # session stopped at the merge (a pr-route session, US-48.16) — and the writer of that
+  # decision is `Loopctl.Delivery.PostDeployVerification`, which also writes
+  # `merged -> deployed` itself once a deployment carries the merge.
   #
   # One residual asymmetry, named rather than hidden: `ci -> merged` is reportable while
   # `ci -> escalated` over `:merge_gate` is not, so the merge gate's positive outcome is a
   # runner's to report and its refusal is not. That is the checkability rule above and not an
-  # oversight — a merge NAMES a sha GitHub can confirm, the gate's refusal names nothing —
-  # but WHO PERFORMS THE MERGE is undecided in the design (§9 puts auto-merge last, and build
-  # order step 1 merges nothing). Revisit this line when that is settled.
+  # oversight — a merge NAMES a sha GitHub can confirm, the gate's refusal names nothing.
+  #
+  # WHO PERFORMS THE MERGE is settled for the pull-request route (US-48.17): control decides,
+  # the runner executes. `Loopctl.Delivery.MergeExecution` runs the merge gate over the
+  # recorded head and, on an allow, instructs the runner holding the claim to merge exactly
+  # that head; the runner then reports `ci -> merged` here with the sha GitHub returned. The
+  # report stays reportable because the runner is still the one that saw the merge happen, and
+  # it is no longer the runner's word on whether it MAY: a pull-request-route merge reported
+  # for a head the gate did not allow is escalated over `:ungated_merge` in the same
+  # transaction (`Loopctl.Delivery.Stages.advance/4`).
   #
   # The SOURCE filter is also what keeps `claimed` out as a destination: `queued` is the only
   # stage anything enters `claimed` from, and `queued` is not a source. A separate
@@ -409,7 +466,14 @@ defmodule Loopctl.Delivery.StageMachine do
     # `record_effect/5`'s idempotence is exactly the semantics an allow needs: the same
     # head twice is the same allow, and a DIFFERENT head is `:effect_conflict` rather than
     # a silent re-grant.
-    merge_gate_allowed_sha: [:ci]
+    merge_gate_allowed_sha: [:ci],
+    # THE HEAD A VERIFICATION WAS MADE AT (US-48.18). Written by CONTROL at `ci`
+    # (`Loopctl.Agents.VerifyVerdict`) once report, review and verify have committed for a
+    # `pass` naming this head, and only when the row's `head_sha` is still that head. A
+    # verification is about a commit; `stories.verified_status` alone names none, so a story
+    # verified at X that came back to `ci` at Y read as verified at Y. Head-keyed below, and
+    # read by `Loopctl.Delivery.MergePrecondition`'s custody fact.
+    verified_head_sha: [:ci]
   }
 
   # Identities that stop describing the story when an edge is taken, cleared by that edge.
@@ -425,7 +489,19 @@ defmodule Loopctl.Delivery.StageMachine do
   # commit, and the count would escalate a fresh head on its predecessor's blips.
   # `head_keyed/0` is what the drift guard reads, so a new head-bound field cannot be added
   # to one clause and forgotten in the others.
-  @head_keyed [:head_sha, :merge_gate_allowed_sha, :merge_gate_unevaluated]
+  #
+  # `merge_instruction` and `runner_absence` (US-48.17) are head-keyed as well. An instruction
+  # is to merge ONE head, so one left behind would read as "already instructed" for a head
+  # nobody instructed; an absence is the clock on the runner the story waited on at `ci`, and a
+  # story that went back to work has stopped waiting.
+  @head_keyed [
+    :head_sha,
+    :merge_gate_allowed_sha,
+    :merge_gate_unevaluated,
+    :verified_head_sha,
+    :merge_instruction,
+    :runner_absence
+  ]
 
   # Everything BOUND TO THE MERGE, cleared wherever `merge_sha` is. The same rule as
   # `@head_keyed` one identity along: post-deploy verification's unresolved count is kept
@@ -458,11 +534,18 @@ defmodule Loopctl.Delivery.StageMachine do
   #   is the RECORD OF A VERDICT, and the same rule that keeps `:merge_gate` off the wire
   #   keeps its allow off too: a session may not report the outcome of a check it does not
   #   perform, and here it would not merely report it but GRANT it.
+  # - `verified_head_sha` — written by `Loopctl.Agents.VerifyVerdict` (US-48.18). The record of
+  #   the VERIFIER'S verdict about the head; a session reporting it would certify its own work.
   #
   # Anything the gate writes in future goes here as well. The test in
   # `runner_contract_test.exs` binds this list to the wire schema in both directions, so a new
   # effect that belongs on neither side goes red rather than reaching a runner.
-  @control_written_effects [:runner_id, :merge_gate_allowed_sha, :triage_dispatch_id]
+  @control_written_effects [
+    :runner_id,
+    :merge_gate_allowed_sha,
+    :triage_dispatch_id,
+    :verified_head_sha
+  ]
 
   @reportable_effects @effect_stages
                       |> Map.keys()
@@ -510,6 +593,11 @@ defmodule Loopctl.Delivery.StageMachine do
           | :reverted
           | :reverted_after_verify
           | :change_outside_lifecycle
+          | :verify_rejected
+          | :no_independent_verifier_runner
+          | :runner_gone
+          | :merge_unanswered
+          | :ungated_merge
 
   @type effect ::
           :runner_id
@@ -521,6 +609,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :release_id
           | :merge_gate_allowed_sha
           | :triage_dispatch_id
+          | :verified_head_sha
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to

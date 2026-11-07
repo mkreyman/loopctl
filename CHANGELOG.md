@@ -6,6 +6,80 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The improvement loop: `spec_tuner@1` proposes prompt-template changes, and loopctl never
+  applies them (US-48.13, 2026-11-07).** A weekly pass (`SpecTunerDispatchWorker`, Mondays
+  06:00 UTC, behind `DISPATCH_DRIVER_ENABLED` and `DRAFT_DISPATCH_ENABLED`) takes each
+  (project, target spec) whose run-outcome ledger has 20 rows since its last answered tuning
+  run, and sends one `spec_tune` dispatch carrying that spec's failed runs as fenced traces. The
+  answer is stored in `spec_tuning_drafts` under the status loopctl decides from the per-case
+  results: `proposed` only when strictly better with no existing case regressing. A person turns
+  a proposed draft into a pull request and marks it landed (`POST /api/v1/tuning_drafts/:id/landed`,
+  user role); `GET /api/v1/tuning_drafts` lists them (user role). MCP tools `tuning_drafts` and
+  `tuning_draft_mark_landed` (loopctl-mcp-server 3.10.0).
+  - **Runner contract 1.30.0** (minor): `spec_tune` is a dispatchable kind and the first that
+    names NO story. `story_id` is no longer schema-required on `dispatch` (every other kind
+    still carries it, enforced in code), and a `spec_tune` dispatch carries `claim_epoch` 0 and
+    a `spec_tune` object. Its result is an `agent_result` under `spec_tuner@1`. Re-vendor
+    `priv/runner_contract/v1.json`. A runner that does not declare `spec_tune` is never sent
+    one.
+  - **Migration `20261107210000_create_spec_tuning_drafts`** widens the `runner_dispatches`
+    kind CHECK, makes `runner_dispatches.story_id` and `agent_run_outcomes.story_id` nullable
+    for `spec_tune` rows only (a shape CHECK holds both directions), and creates
+    `spec_tuning_drafts` (RLS enabled). No backfill and no manual step. Its rollback deletes any
+    `spec_tune` ledger and outcome rows before restoring NOT NULL.
+- **Control decides the pull-request merge, and the runner executes it (US-48.17,
+  2026-11-07).** A new pass (`MergeSweepWorker`, every minute) runs the merge gate, as control,
+  over each pull-request story at `ci` that is verified at its head. On `allow` it sends the
+  runner holding the claim a `merge` instruction, and the runner merges exactly that head and
+  reports `ci -> merged`. Only sending the instruction is behind `DISPATCH_DRIVER_ENABLED`.
+  - **Runner contract 1.29.0** (minor): a new control -> runner event, `merge`
+    (`RunnerMergeInstruction`: `dispatch_id`, `claim_epoch`, `story_id`, `repo`, `pr_number`,
+    `head_sha`, `merge_method` = `squash`). Re-vendor `priv/runner_contract/v1.json` and
+    declare 1.29.0 on join. A runner that joins on an older version is never sent a merge, and
+    its pull-request stories escalate `merge_unanswered`.
+  - **A pull-request merge with no gate allow for its head escalates `ungated_merge`.** The
+    merge is recorded and then escalated in the same transaction, and the reason names the
+    merge commit and the head. A runner that still merges on its own (before contract 1.29.0)
+    therefore escalates every pull-request merge it reports. chg stories are not affected.
+  - **A pull-request story's claim no longer lapses at `ci`.** loopctl holds it open while the
+    runner is connected, never past the implement dispatch's credential expiry. A story whose
+    runner has been gone for ten minutes escalates `runner_gone` instead of going back to the
+    queue. `renew_story_claim` is unchanged.
+  - **Migration `20261107200000_add_merge_instruction_and_runner_absence`** adds
+    `story_stages.merge_instruction` and `story_stages.runner_absence`, and two stage-event
+    names. No backfill and no manual step. Its rollback refuses while any row carries either
+    new event.
+- **Control verifies pull-request stories at `ci` under an independent verifier (US-48.18,
+  2026-11-07).** A new `verify@1` pass (`VerifyDispatchWorker`, every minute, behind
+  `DISPATCH_DRIVER_ENABLED`) mints a verifier dispatch as a new root under the tenant's
+  operator key for a runner whose agent is not the implementer's, and sends that runner a
+  `verify` dispatch. On `pass` control reports, reviews and verifies the story and records the
+  head it judged. On `reject` the story goes back to `implementing` with the findings. A
+  verdict for a head the story no longer has is dropped. When the implementer's own agent is
+  the only one the tenant has, the story escalates `no_independent_verifier_runner`.
+  - **Runner contract 1.28.0** (minor): `verify` is a dispatchable kind, and its dispatch
+    carries `verify: {pr_number, head_sha}`. Re-vendor `priv/runner_contract/v1.json`. A
+    runner gets `verify` dispatches only if it declares the kind when it joins, and until one
+    does, every pull-request story waits at `ci`.
+  - **The merge gate is bound to the head.** A story verified at another head, or at no
+    recorded head, is refused `verified_for_other_head`. A story verified before this release
+    has no recorded head, so it is verified again before it can merge. Any move that clears a
+    pull-request story's head (`base_moved`, `ci_red`, a reject) also clears its verification.
+  - **`POST /api/v1/stories/:id/reject` and bulk reject refuse a key no dispatch minted on a
+    pull-request story** with 409 `caller_lineage_required`. Such keys can still reject any
+    other story.
+  - **The tenant operator key a pass acts as can no longer be a dispatch-minted `:user` key.**
+    A tenant whose only `:user` key was minted by a dispatch is reported `no_operator_key`.
+  - **Migration `20261107190000_add_verified_head_sha_and_verify_kind`** adds
+    `story_stages.verified_head_sha` and `verify` to the dispatch-kind CHECK. No backfill and
+    no manual step.
+- **Pull-request stories now close their GitHub issue after the deploy (US-48.16,
+  2026-11-07).** Post-deploy verification also reads stories at `merged`: once a successful
+  deployment carries the merge commit it writes `deployed` (the deployment id as
+  `release_id`), verifies, and the issue is closed `shipped`. A merged story with no such
+  deployment escalates `verification_failed` at the existing bounds. A pr-mode repository
+  needs its `(tenant, repository)` pair in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, or a tenant
+  token, for these reads; without one its merged stories wait and then escalate.
 - **`POST /api/v1/stories/:id/stage/resolve` accepts `to: detected` (2026-11-07).** A human can
   now send a story that triage escalated back to be triaged again; its old triage dispatch is
   unbound. A story an implementer was assigned or worked is refused 409 `not_retriageable`,
@@ -57,6 +131,63 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A session end reports its turns and the work it left behind (2026-11-07, US-48.11,
+  runner contract 1.27.0).** `session_ended` gains two optional fields: `turns_used` (an
+  integer, 0 up to the int4 ceiling) and `work_left_behind` (a boolean: `true` when the
+  session's branch had commits not on the remote at exit, `false` when it had none, omitted
+  when the runner could not tell). A wrong type or range is `invalid_payload`. The report is
+  still recorded once per dispatch and its identity is still `dispatch_id`, `claim_epoch` and
+  `reason`: a resend that differs only in the new fields is answered `ok` (`replayed: true`)
+  and the first copy's values stand. A 1.26.0 runner that sends neither behaves exactly as
+  before; re-vendor the contract to send them. Migration `20261107180000` adds three nullable
+  columns to `runner_dispatches`: `max_turns` (the turn budget the dispatch was placed under,
+  written where `wall_clock_seconds` is and refreshed by the push that wins delivery; a budget
+  past the int4 ceiling is stored NULL rather than refusing the dispatch), `session_turns_used`
+  and `work_left_behind` (written once, with the session end). CHECKs keep the counts
+  non-negative, the budget positive, and both session-end figures NULL on a row with no
+  recorded session end. No backfill: existing rows read as not reported.
+- **Run-outcome ledger per agent spec version (2026-11-07, US-48.12).** Migration
+  `20261107170000` adds the RLS table `agent_run_outcomes`: one row per runner dispatch, keyed
+  by the spec `{id, version}` it ran under, with the session's end and the signals later
+  events prove (merge-gate decision, CI result, merge, review counts, a human's override of
+  a triage verdict, a re-queue after a budget kill, the draft screen). New
+  `GET /api/v1/agent_specs/:spec_id/outcomes?window_days=` (any key, agent role up, default
+  30 days, at most 365; 400 outside that) returns per-version counts, rates and medians;
+  loopctl-mcp-server 3.8.0 exposes it as `agent_outcomes`. `turns` comes from the runner's
+  session-end report (contract 1.27.0), so `median_turns` is null for runs on an older runner;
+  cost stays null, because no runner message reports it.
+- **The escalation inbox (2026-11-07, US-48.11).** `GET /api/v1/escalations` lists the
+  tenant's stories parked at `escalated`, newest first, keyset-paginated, any authenticated
+  key (`agent` role and above), read-only. Each row's `reason_class` (`budget_exhausted`,
+  `session_failed`, `triage_escalated`, `gate_refused`, `operator_released`, `other`) is
+  derived from the stage-machine edge, never from `escalation_reason`. That field is untrusted
+  session text, returned raw and fenced. A `budget_exhausted` row carries the run's elapsed
+  time, budget and branch from the dispatch ledger, and the turns it used against the turn
+  budget it was placed under. `work_left_behind` is `true` or `false` as the runner's 1.27.0
+  session-end report says, and `unknown` (with `turns_used` null) when an older runner's
+  report carries neither. Filters are `reason_class`,
+  `project_id` and `since`. New 400s: an unknown `reason_class`, a bad `since`, `limit` or
+  cursor. A malformed `project_id` is a 422. loopctl-mcp-server 3.9.0 adds
+  `escalation_list`. A new daily Oban cron, `EscalationDigestWorker` at 14:00 UTC with no env
+  var, posts one digest per project that has `budget_exhausted` rows older than an hour. It
+  goes to that project's coordination channel under the key
+  `escalation-digest:<project_id>:<YYYY-MM-DD>`, at most once per project per UTC day, and its
+  author is a per-tenant agent named `system:escalation-digest`. **New API constraint:** agent
+  names starting `system:` (any case) are now reserved, and register and update refuse them
+  with 422. Only a name being set is judged, so an existing agent with such a name keeps it.
+- **Reply drafts for tickets triage set aside (2026-11-07, US-48.9).** For a story whose
+  intake record carries a support `ticket_id` and which triage rejected or escalated, a runner
+  session drafts a reply (agent spec `reply_draft@1`, dispatch kind `reply_draft`, runner
+  contract **1.26.0**: the kind is dispatchable and carries the fenced report in the `triage`
+  object). loopctl stores the draft and NEVER sends it. A body the injection screen flags is
+  stored `refused` with the screen's codes and without the body. Read them with
+  `GET /api/v1/projects/:project_id/reply_drafts` (`user` role: the bodies are drafted from
+  customer ticket text; cursor-paginated), MCP `reply_draft_list` in loopctl-mcp-server 3.7.0.
+  New env var **`DRAFT_DISPATCH_ENABLED`**, default off, which also needs
+  `DISPATCH_DRIVER_ENABLED`; sessions spend the `TRIAGE_*` budgets. Migration
+  `20261107140000_create_reply_drafts` adds the `reply_drafts` table (RLS) and `reply_draft`
+  to the `runner_dispatches_kind` CHECK; its `down` deletes the `reply_draft` ledger rows
+  before restoring the CHECK. A recorded `agent_result` now also releases its dispatch's slot.
 - **Intake sources can triage only support-ticket issues (2026-11-06).**
   `intake_sources.triage_requires_ticket` (migration
   `20261106230000_add_triage_requires_ticket_to_intake_sources`, boolean, NOT NULL, default
@@ -66,6 +197,17 @@ All notable changes to loopctl are documented here.
   rest stay `detected` and use no runner. A format filter, not authentication: anyone who can
   open an issue can type the format. Set it with `POST`/`PATCH /api/v1/intake/sources` or the
   `intake_source_enroll` / `intake_source_update` tools; anything but a JSON boolean is a 422.
+- **Runner contract 1.25.0: runners declare the agent specs they hold, and `:draft` results
+  come back through one `agent_result` message (US-48.8).** `RunnerJoin.specs` is an optional
+  list of `{id, version}` (at most 32). A kind is dispatched only to a runner holding the spec
+  loopctl runs it under; a runner sending no `specs` is read as holding version 1 of each
+  declared kind's spec, so every runner already deployed is eligible exactly as before.
+  `GET /api/v1/runners/pool` returns the declaration as `specs` (null when none), and
+  loopctl-mcp-server 3.6.1's `runner_pool` describes it. Migration
+  `20261107120000_add_runner_dispatches_agent_result` adds four nullable columns to
+  `runner_dispatches` (no backfill, no manual step) where a validated result is recorded once
+  per dispatch. No production spec reports through `agent_result` yet, so every one is refused
+  `invalid_payload` today. Minor: re-vendor to declare `specs`.
 - **Runner contract 1.24.0** publishes `x-connection.limits.lens_verdicts.max_bytes`, the cap
   on a triage verdict's three lens verdicts together. Minor: a runner should re-vendor to read
   the cap rather than hard-code it.

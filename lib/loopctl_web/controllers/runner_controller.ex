@@ -269,6 +269,7 @@ defmodule LoopctlWeb.RunnerController do
                    :machine_id,
                    :kinds,
                    :branch_prefixes,
+                   :specs,
                    :suppressed_kinds,
                    :unsupported_kinds,
                    :usage_exhausted_until
@@ -367,6 +368,27 @@ defmodule LoopctlWeb.RunnerController do
                          "ENFORCES a prefix and declares none shows `[]` here, which is " <>
                          "that misconfiguration made visible. Per-CONNECTION, so it can " <>
                          "change when the runner reconnects."
+                   },
+                   specs: %Schema{
+                     type: :array,
+                     nullable: true,
+                     items: %Schema{
+                       type: :object,
+                       required: [:id, :version],
+                       properties: %{
+                         id: %Schema{type: :string},
+                         version: %Schema{type: :integer, minimum: 1}
+                       }
+                     },
+                     description:
+                       "The agent specs this runner DECLARED it holds on join (contract " <>
+                         "1.25.0), as `{id, version}`, or null from a runner that declared " <>
+                         "none — which loopctl reads as holding version 1 of the spec of " <>
+                         "each kind in `kinds`. A kind is sent only to a runner holding the " <>
+                         "spec loopctl runs that kind under, so a connected machine whose " <>
+                         "`kinds` includes a kind it is never sent is explained here: it " <>
+                         "lists the spec at another version, or not at all. Per-CONNECTION, " <>
+                         "so it can change when the runner reconnects."
                    },
                    suppressed_kinds: %Schema{
                      type: :array,
@@ -488,6 +510,11 @@ defmodule LoopctlWeb.RunnerController do
     end
   end
 
+  # Rendered through `Runners.declared_specs/1`, the function eligibility reads, so an entry
+  # the cast would not have produced is not shown as held.
+  defp declared_specs(%{specs: [_ | _]} = meta), do: Runners.declared_specs(meta)
+  defp declared_specs(_meta), do: nil
+
   defp pool_entry({machine, %{metas: metas}}, capacity, barred, exhausted) do
     meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
     held = Map.get(capacity, Map.get(meta, :runner_id), %{})
@@ -522,6 +549,9 @@ defmodule LoopctlWeb.RunnerController do
       # exactly what `[]` means here. The same function the derivation decides on, so the
       # pool cannot show one thing while a placement does another.
       branch_prefixes: Runners.declared_branch_prefixes(meta),
+      # What the runner SAID, or null for silence — the `kinds` rule above, for the same
+      # reason: the version-1 reading of silence is loopctl's, not the machine's words.
+      specs: declared_specs(meta),
       suppressed_kinds: Runners.suppressed_kinds(meta),
       unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), []),
       # The SAME effective value placement decides on (`Loopctl.Runners.Usage`), so a machine

@@ -1,0 +1,77 @@
+{
+  "id": "US-48.12",
+  "title": "A run-outcome ledger per spec version",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "every dispatch to end in one outcome row keyed by its spec {id, version}, with what later happened to its work",
+    "so_that": "each agent's track record is a query, and the improvement loop (US-48.13) learns from what humans and gates did with the output rather than from the agent's own report"
+  },
+  "rationale": "Mark, 2026-11-07: \"we need some kind of a feedback loop built-in, so these agents would self-improve as they work.\" A loop can only improve on a signal it records. The KB's account of the production-to-eval cycle (4efb55d0, a349c48f) starts from traces turned into evals; today a run's fate is scattered over the ledger, stage history and GitHub.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.12.1",
+      "description": "Table agent_run_outcomes (tenant_id, RLS): one row per dispatch, unique on dispatch_id, carrying spec_id, spec_version, prompt template {id, version}, story_id, project_id, started_at, ended_at, elapsed_s, turns, end_reason, and cost where the runner reported it."
+    },
+    {
+      "id": "AC-48.12.2",
+      "description": "Downstream signals are appended to the row as they happen, each from the system event that proves it, never from session text: for :judge, whether a human overrode the verdict (resolve_escalation to a different route, or re-triage); for :build, merge gate decision, review finding count by severity, CI result, merged or not, and whether it was re-queued after a budget kill; for :draft, released / edited / discarded."
+    },
+    {
+      "id": "AC-48.12.3",
+      "description": "Writes are idempotent: a redelivered session-end or a repeated gate event leaves the row unchanged (keyed on dispatch_id plus signal name)."
+    },
+    {
+      "id": "AC-48.12.4",
+      "description": "Agents.Outcomes.summary(tenant_id, spec_id, opts) returns per-version counts and rates (success, human override, budget exhausted, median elapsed and turns) over a window; MCP tool agent_outcomes calls it, in the same change."
+    },
+    {
+      "id": "AC-48.12.5",
+      "description": "Tenant isolation: one tenant's outcomes never appear in another's summary."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.12.1",
+      "verifies": ["AC-48.12.1", "AC-48.12.2"],
+      "name": "an implement run's row fills in through merge",
+      "type": "integration",
+      "steps": ["dispatch, end the session, record the gate allow, the review findings and the merge"],
+      "expected_results": ["one row with every signal, each from its event"]
+    },
+    {
+      "id": "TC-48.12.2",
+      "verifies": ["AC-48.12.2"],
+      "name": "a human override of a triage verdict is recorded",
+      "type": "integration",
+      "steps": ["triage routes to escalate", "a human resolves to queued"],
+      "expected_results": ["human_override true on the triage row"]
+    },
+    {
+      "id": "TC-48.12.3",
+      "verifies": ["AC-48.12.3"],
+      "name": "redelivery does not double count",
+      "type": "integration",
+      "steps": ["deliver the same session-end twice"],
+      "expected_results": ["one row, unchanged"]
+    },
+    {
+      "id": "TC-48.12.4",
+      "verifies": ["AC-48.12.5"],
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": ["record outcomes in two tenants", "summarise as tenant A"],
+      "expected_results": ["only tenant A's rows counted"]
+    }
+  ],
+  "technical_notes": [
+    "The row is written by control-side effects already on each path (session_ended, merge_precondition, resolve_escalation); no new runner message.",
+    "Load .claude/skills/tenancy-rls/SKILL.md."
+  ],
+  "dependencies": ["US-48.8"]
+}

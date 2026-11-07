@@ -5,6 +5,79 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.10.0 — 2026-11-07 (the improvement loop)
+
+### Added
+
+- **`tuning_drafts`** lists the improvement loop's tuning drafts (loopctl US-48.13,
+  `GET /api/v1/tuning_drafts`): what a `spec_tuner@1` session proposed for a target spec from
+  its failed runs — a prompt-template diff, new eval cases and both templates' scores — under
+  the status loopctl decided itself (`proposed` only when strictly better with no existing case
+  regressing, `rejected` with its reasons otherwise). Filters `project_id`, `spec_id`, `status`;
+  keyset pagination through `next_cursor`. Requires `LOOPCTL_USER_KEY`.
+- **`tuning_draft_mark_landed`** records that a person merged a proposed draft's template
+  change (`POST /api/v1/tuning_drafts/:id/landed`, `pr_url` required). It changes no template
+  and no spec version. 409 `not_proposed`, 422 for a malformed `pr_url`. Requires
+  `LOOPCTL_USER_KEY`. A draft may also be `nothing_to_learn`: the window held no failure, so
+  nothing was dispatched and the window closed.
+
+### Changed
+
+- **`report_story`**, **`review_complete`** and **`verify_story`** name their new refusal:
+  409 `pr_route_verifier_only` on a pull-request-route story for any key but the one minted for
+  the story's bound `verify@1` dispatch (loopctl US-48.18). `reject_story` is not gated by it.
+- **`agent_outcomes`** counts verify and spec_tuner successes, and `reply_draft_list` names its
+  422 for a project reference it cannot resolve.
+
+## 3.9.1 — 2026-11-07 (verify@1)
+
+### Changed
+
+- **`reject_story`**'s description names its new refusal: 409 `caller_lineage_required` for a
+  key no dispatch minted on a pull-request-route story (loopctl US-48.18), which control now
+  verifies and rejects through its own verifier dispatch.
+
+## 3.9.0 — 2026-11-07 (the escalation inbox)
+
+### Added
+
+- **`escalation_list`** reads the escalation inbox (loopctl US-48.11, `GET /api/v1/escalations`):
+  every story of the tenant parked at `escalated`, newest first, with `reason_class` derived from
+  the stage-machine edge (budget_exhausted, session_failed, triage_escalated, gate_refused,
+  operator_released, other) and, for a budget kill, the run's elapsed time, budget and branch
+  from the dispatch ledger, its turns used against its turn budget, and `work_left_behind`
+  (`"true"`/`"false"` from the runner's session-end report, `"unknown"` for a runner older
+  than contract 1.27.0). Filters `reason_class`, `project_id`, `since`; keyset pagination
+  through `next_cursor`. It reads only: `resolve_escalation` with `to: "queued"` works a row
+  again. Any key of the tenant reads it; `LOOPCTL_AGENT_KEY` is passed as an override.
+
+### Changed
+
+- **`agent_outcomes`**' description no longer says no runner reports turns: `median_turns` is
+  filled from the runner's session-end report since loopctl runner contract 1.27.0.
+
+## 3.8.0 — 2026-11-07 (agent outcomes)
+
+### Added
+
+- **`agent_outcomes`** reads an agent spec's track record from the run-outcome ledger (loopctl
+  US-48.12, `GET /api/v1/agent_specs/:spec_id/outcomes`): per spec version, newest first, the
+  runs recorded in the last `window_days` (default 30, at most 365) and how many succeeded,
+  were overridden by a human or exhausted their budget, each also as a rate, with the median
+  elapsed seconds and turns. Any tenant key reads it (`role: :agent`); `LOOPCTL_AGENT_KEY` is
+  the tool's own key, after `LOOPCTL_API_KEY`.
+
+## 3.7.0 — 2026-11-07 (reply drafts)
+
+### Added
+
+- **`reply_draft_list`** reads a project's reply drafts (loopctl US-48.9,
+  `GET /api/v1/projects/:project_id/reply_drafts`): what a runner session drafted for a support
+  ticket triage rejected or escalated, `drafted` with its body or `refused` with the screen
+  code and no body. loopctl never sends a draft; a person reads it and sends it or not. Keyset
+  pagination through `next_cursor`. Requires `LOOPCTL_USER_KEY`: the endpoint is user-role
+  because the bodies are drafted from customer ticket text.
+
 ## 3.6.0 — 2026-11-07 (re-triage an escalated story)
 
 ### Added

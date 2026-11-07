@@ -89,7 +89,10 @@ defmodule LoopctlWeb.StoryVerificationController do
         "follow the landing (409 `chg_landing_reverted`). A forge read that times out or " <>
         "fails, a missing `verified/master` ref or commit, or no credential for the " <>
         "repository is 503 `chg_trunk_unevaluated` with `Retry-After` — never a pass. A story " <>
-        "with no change binding takes exactly the gates it took before.",
+        "with no change binding takes exactly the gates it took before. A story on the " <>
+        "pull-request route (US-48.18) is verified only by the verifier dispatch loopctl " <>
+        "placed for it: any other key is refused 409 `pr_route_verifier_only`, here, on " <>
+        "verify-all and on bulk verify.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
@@ -122,14 +125,19 @@ defmodule LoopctlWeb.StoryVerificationController do
         "`attempts_exhausted` at it, leaving it `pending` for a human. The story returned is " <>
         "the story as the reset left it. A key descending from an intake source's " <>
         "`chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5): reject is " <>
-        "exempt from `caller_lineage_required` only.",
+        "exempt from `caller_lineage_required` only — EXCEPT on a story whose delivery stage " <>
+        "row is on a pull-request intake source (US-48.18), where a key no dispatch minted is " <>
+        "refused 409 `caller_lineage_required`: control verifies such a story under its own " <>
+        "verifier dispatch, and a session inheriting an unlineaged legacy key could otherwise " <>
+        "reject a sibling story's work.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Rejection params", "application/json", Schemas.RejectRequest},
     responses: %{
       200 => {"Story rejected", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition, a custody refusal, or `chg_root_cannot_verify` (" <>
+        {"Invalid transition, a custody refusal (including `caller_lineage_required` for an " <>
+           "unlineaged key on a pull-request-route story), or `chg_root_cannot_verify` (" <>
            Messages.chg_root_cannot_verify() <> ")", "application/json", Schemas.ErrorResponse},
       422 => {"Reason required", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
@@ -488,7 +496,9 @@ defmodule LoopctlWeb.StoryVerificationController do
                    :missing_assigned_agent,
                    :not_found,
                    :audit_chain_append_failed,
-                   :chg_root_cannot_verify
+                   :chg_root_cannot_verify,
+                   # US-48.18 (AC-48.18.5): an unlineaged reject of a pull-request-route story.
+                   :caller_lineage_required
                  ] or is_struct(reason, Ecto.Changeset)
 
   @doc """

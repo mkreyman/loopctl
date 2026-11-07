@@ -134,6 +134,7 @@ defmodule Loopctl.Delivery.Stages do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Outcomes
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth.Role
@@ -144,6 +145,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.Untrusted
   alias Loopctl.GitSha
+  alias Loopctl.Intake
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
@@ -182,6 +184,10 @@ defmodule Loopctl.Delivery.Stages do
                               "delivery loop was working. A human decides what it does next " <>
                               "— resolve it from escalated."
 
+  # Who the ungated-merge escalation is attributed to (US-48.17): the merge gate, whose
+  # authorisation the reported merge lacks — never the runner that reported it.
+  @ungated_merge_label "control:merge_gate"
+
   @max_pr_number 9_223_372_036_854_775_807
 
   # The `story_stages_text_bounds` CHECK on `escalation_reason`, read from the ONE place it is
@@ -199,7 +205,7 @@ defmodule Loopctl.Delivery.Stages do
   a story with no row) and the chain entry its escalation appended (`nil` when none), which the
   caller announces after commit (`announce_release/1`).
   """
-  @type released :: {StoryStage.t() | nil, Entry.t() | nil}
+  @type released :: {StoryStage.t() | nil, Entry.t() | [Entry.t()] | nil}
 
   @type advance_error ::
           :invalid_transition
@@ -418,6 +424,11 @@ defmodule Loopctl.Delivery.Stages do
     (`Loopctl.Runners.Capacity.release/4`). A dispatch row that has gone missing is LOGGED
     and the transition still commits — the heal sweep bounds an unreleased slot within a
     minute, while a rollback would strand the story at a stage nothing can move it off.
+  - `:row_guard` — a one-arity function given the stage row as it stands UNDER the row lock,
+    before the compare-and-set, returning `:ok` or `{:error, reason}`; an error rolls the
+    transition back as `{:error, reason}`. For a control writer whose transition is only
+    right while a value it read still holds — `verify@1`'s reject is a verdict on one head
+    (US-48.18).
   - `:actor_label`, `:actor_role`, `:actor_lineage` — attribution; role and lineage are
     SERVER-resolved by the caller from the authenticating key, never taken from a request
   """
@@ -438,9 +449,103 @@ defmodule Loopctl.Delivery.Stages do
       # the caller is bounded on the text it sent, the column holds the escaped form, and the
       # two numbers are deliberately different.
       in_tenant(tenant_id, fn ->
-        transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
+        {row, entry, invalidated} =
+          transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
+
+        {row, ungated} = escalate_if_ungated(tenant_id, row, {from, to, edge}, epoch, opts)
+
+        {row, Enum.reject([invalidated, entry, ungated], &is_nil/1)}
       end)
     end
+  end
+
+  # AN UNGATED MERGE IS ESCALATED WHEN IT IS REPORTED (US-48.17, AC-48.17.4), in the same
+  # transaction as the `ci -> merged` that reports it. On the pull-request route the merge is
+  # control's to decide: `Loopctl.Delivery.MergeExecution` instructs the runner to merge a head
+  # only after `Loopctl.Delivery.MergePrecondition` recorded an allow for it. A `merged` for a
+  # head with no such allow is a session that merged anyway (HCB PR #3938), and it is never
+  # silently accepted.
+  #
+  # The merge is RECORDED first and then escalated, over `{:merged, :escalated, :ungated_merge}`,
+  # because it happened: GitHub holds the merge commit, and the chain must say so and name the
+  # sha. Clearing it or refusing the report would leave the row at `ci` describing a pull
+  # request that is no longer open. `:review_missing` is the same shape for chg (US-47.5).
+  #
+  # SCOPED TO THE PULL-REQUEST ROUTE (`Intake.pr_route?/3`), read in this transaction. A chg
+  # landing never reaches here — it advances through `advance_in_tenant_transaction/4`, which
+  # does not call this — and a story whose project is bound to no live source, or to a `chg`
+  # one beside a `pr` one, is not on the pull-request route either.
+  #
+  # The ONLY other `ci -> merged` writer on this path is `MergeExecution` adopting an
+  # `:already_merged` verdict, which `MergePrecondition` returns only when the recorded allow
+  # names the merged head — so it never trips this.
+  defp escalate_if_ungated(
+         tenant_id,
+         %StoryStage{stage: :merged} = row,
+         {:ci, :merged, _},
+         epoch,
+         opts
+       ) do
+    if ungated?(row) and Intake.pr_route?(Repo, tenant_id, row.story_id) do
+      reason = ungated_reason(row)
+
+      Logger.warning(
+        "ungated merge escalated: tenant_id=#{tenant_id} story_id=#{row.story_id} " <>
+          "merge_sha=#{inspect(row.merge_sha)} head_sha=#{inspect(row.head_sha)} " <>
+          "allowed_sha=#{inspect(row.merge_gate_allowed_sha)}"
+      )
+
+      escalation_opts =
+        [
+          reason: reason,
+          actor_label: @ungated_merge_label,
+          actor_role: :agent,
+          actor_lineage: [],
+          event_data: %{
+            "merge_sha" => row.merge_sha,
+            "head_sha" => row.head_sha,
+            "allowed_sha" => row.merge_gate_allowed_sha
+          }
+        ] ++ Keyword.take(opts, [:session_dispatch])
+
+      {escalated, entry, _invalidated} =
+        transition(
+          tenant_id,
+          row.story_id,
+          {:merged, :escalated, :ungated_merge},
+          epoch,
+          [],
+          escalation_opts
+        )
+
+      {escalated, entry}
+    else
+      {row, nil}
+    end
+  end
+
+  defp escalate_if_ungated(_tenant_id, row, _transition, _epoch, _opts), do: {row, nil}
+
+  # Against the RECORDED head: the report carries only `merge_sha`, so a head pushed after the
+  # allow and merged past the gate passes here. `PostDeployVerification` closes that half by
+  # reading the head GitHub actually merged, at `merged`, before control carries it forward,
+  # and escalates over this same `:ungated_merge` edge.
+  defp ungated?(%StoryStage{head_sha: head, merge_gate_allowed_sha: allowed}),
+    do: is_nil(head) or allowed != head
+
+  # Control's own words, naming the sha: the chain entry is written from this, and nothing a
+  # runner supplied belongs in it.
+  defp ungated_reason(%StoryStage{} = row) do
+    why =
+      case row.merge_gate_allowed_sha do
+        nil -> "no merge-gate allow was recorded"
+        other -> "the merge gate allowed #{other}, a different head"
+      end
+
+    StageMachine.bounded_reason(
+      "ungated_merge: merged #{row.merge_sha} at head #{row.head_sha || "unrecorded"}, and " <>
+        "#{why}. The merge stands on GitHub; a human decides what the story is now."
+    )
   end
 
   @doc """
@@ -487,7 +592,11 @@ defmodule Loopctl.Delivery.Stages do
     opts = Keyword.delete(opts, :session_dispatch)
 
     with {:ok, effects} <- precheck_effects({from, to, edge}, opts, :change_event) do
-      {row, entry} =
+      # The third element is a retired verification's entry, which only a PR-route story
+      # produces (`maybe_invalidate_verification/4`); this seam serves chg stories, so it is
+      # `nil` here in practice. Were one ever produced it is still committed with the caller's
+      # transaction; only its broadcast is skipped, which the STH sweep cron covers.
+      {row, entry, _invalidated} =
         transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
 
       {:ok, row, entry}
@@ -682,7 +791,10 @@ defmodule Loopctl.Delivery.Stages do
 
   defp transition(tenant_id, story_id, {from, to, edge} = transition, epoch, effects, opts) do
     reason = Keyword.get(opts, :reason)
-    story = share_lock_story(tenant_id, story_id)
+    clears_head? = :head_sha in StageMachine.clears(from, to, edge)
+
+    story =
+      share_lock_story(tenant_id, story_id, if(clears_head?, do: :no_key_update, else: :share))
 
     # The fence against a zombie: a caller whose claim has ended presents an old epoch.
     if story.claim_epoch != epoch, do: Repo.rollback(:stale_claim_epoch)
@@ -705,6 +817,7 @@ defmodule Loopctl.Delivery.Stages do
     # would say nothing was retracted.
     previous = lock_row(tenant_id, story_id)
     bound_to_caller!(previous, from, Keyword.get(opts, :session_dispatch))
+    row_guard!(previous, Keyword.get(opts, :row_guard))
 
     row = compare_and_set(tenant_id, story, transition, reason)
     insert_event(Repo, row, "transitioned", from, edge, opts[:actor_label], note(reason, opts))
@@ -716,7 +829,25 @@ defmodule Loopctl.Delivery.Stages do
     row = put_effects(row, effects, opts)
     release_session_slot(row, to, opts)
     record_issue_closure(row, story, transition)
-    {row, maybe_chain(row, previous, transition, reason, opts)}
+    # What this transition proves about a run's work (US-48.12) — a merge, a CI verdict, a
+    # gate refusal, a human's resolution — on the run's outcome row, in THIS transaction.
+    # BEFORE the chain append, like the two writes above; it takes no lock that order names.
+    :ok = Outcomes.observe_transition(Repo, previous, row, transition)
+    invalidated = maybe_invalidate_verification(row, clears_head?, transition, opts)
+    {row, maybe_chain(row, previous, transition, reason, opts), invalidated}
+  end
+
+  # A caller's own condition on the LOCKED pre-image (`:row_guard`, US-48.18): a verdict that
+  # sends a story back to work is only a verdict on the head it judged, and the head can move
+  # between the caller's read and this lock. Judged here, under the row lock, so nothing can
+  # move it before the compare-and-set below.
+  defp row_guard!(_previous, nil), do: :ok
+
+  defp row_guard!(previous, guard) when is_function(guard, 1) do
+    case guard.(previous) do
+      :ok -> :ok
+      {:error, reason} -> Repo.rollback(reason)
+    end
   end
 
   # THE OUTBOX for what the reporter is told (#805 item 1), written in THIS transaction.
@@ -869,16 +1000,22 @@ defmodule Loopctl.Delivery.Stages do
   # ALONE, so alternating kinds still accumulate, and a verdict clears both together.
   #
   # The merge gate has one kind and therefore no total; its stored shape is unchanged.
+  #
+  # `stages` are where a count may be written. Post-deploy verification reads a pr-route
+  # story at `merged` as well as `deployed` (US-48.16), and the count is ONE clock across
+  # both: it is merge-keyed and `merged -> deployed` over `:forward` clears nothing, so a
+  # story that waited at `merged` and then reached `deployed` keeps its count rather than
+  # starting a fresh bound on top of the time it already spent.
   @counters %{
     merge_gate: %{
       column: :merge_gate_unevaluated,
-      stage: :ci,
+      stages: [:ci],
       event: "merge_gate_unevaluated",
       totalled_by: nil
     },
     post_deploy: %{
       column: :post_deploy_unresolved,
-      stage: :deployed,
+      stages: [:merged, :deployed],
       event: "post_deploy_unresolved",
       totalled_by: ["merge_sha"]
     }
@@ -940,8 +1077,9 @@ defmodule Loopctl.Delivery.Stages do
   faster one's bound and escalated every story on the normal path. A run of forge faults
   followed by a run of waiting is two different conditions, so the second starts at 1.
 
-  Fenced by the claim epoch like every other write here, and refused off `deployed` — no
-  other stage runs this gate.
+  Fenced by the claim epoch like every other write here, and refused off `merged` and
+  `deployed` — no other stage runs this gate. `merged` is read for a pr-route story, which
+  the verifier carries to `deployed` itself (US-48.16); the count runs on across that edge.
 
   ## Options
 
@@ -979,7 +1117,7 @@ defmodule Loopctl.Delivery.Stages do
 
   defp count_unresolved(counter, row, story, identity, opts) do
     if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
-    if row.stage != counter.stage, do: Repo.rollback(:wrong_stage)
+    if row.stage not in counter.stages, do: Repo.rollback(:wrong_stage)
 
     counts = next_counts(Map.fetch!(row, counter.column), identity, counter.totalled_by)
     value = identity |> Map.put("count", counts.count) |> put_total(counter, counts)
@@ -1034,6 +1172,133 @@ defmodule Loopctl.Delivery.Stages do
           {:ok, :cleared | :nothing_to_clear} | {:error, :not_found | :stale_claim_epoch | :busy}
   def clear_post_deploy_unresolved(tenant_id, story_id, opts),
     do: clear_counter(:post_deploy, tenant_id, story_id, opts)
+
+  @doc """
+  Records that control sent (or tried to send) the runner holding a story's claim a merge
+  instruction for `instruction["head_sha"]` (US-48.17), as `story_stages.merge_instruction`,
+  with a `merge_instructed` stage event carrying the same map.
+
+  Written by `Loopctl.Delivery.MergeExecution` AFTER the push, so a node dying between the two
+  sends one more instruction rather than none; the runner merges with `--match-head-commit`
+  and adopts a pull request already merged at that head, so a second instruction is harmless.
+
+  Fenced by the claim epoch, refused off `ci` (`:wrong_stage`), and refused
+  `:head_moved` when the row's `head_sha` is no longer the instruction's: an instruction is for
+  one head, and a record for another would read as "already instructed" for a head nobody
+  instructed. Head-keyed (`StageMachine.head_keyed/0`), so every edge that clears the head
+  clears it.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec record_merge_instruction(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, StoryStage.t()}
+          | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :head_moved | :busy}
+  def record_merge_instruction(tenant_id, story_id, %{"head_sha" => head} = instruction, opts) do
+    write_ci_record(tenant_id, story_id, :merge_instruction, "merge_instructed", opts, fn row ->
+      if is_binary(head) and row.head_sha == head,
+        do: {:ok, instruction},
+        else: {:error, :head_moved}
+    end)
+  end
+
+  @doc """
+  Notes that the runner holding a story's claim had no live socket while the story waited at
+  `ci` (US-48.17), and returns WHEN that absence began: `{:ok, since}`.
+
+  The first observation writes `story_stages.runner_absence` as `%{"runner_id", "since"}` with a
+  `runner_absence` stage event; a later one for the SAME runner writes nothing and returns the
+  recorded `since`, so the clock runs from the first sweep that saw the runner gone. One for a
+  DIFFERENT runner than the record names starts a fresh clock: the absence is of the machine
+  the row says holds the claim.
+
+  Fenced by the claim epoch, refused off `ci`. Head-keyed, so a story that goes back to work
+  stops its clock.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec note_runner_absence(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), DateTime.t(), keyword()) ::
+          {:ok, DateTime.t()}
+          | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
+  def note_runner_absence(tenant_id, story_id, runner_id, %DateTime{} = now, opts) do
+    result =
+      write_ci_record(tenant_id, story_id, :runner_absence, "runner_absence", opts, fn row ->
+        case row.runner_absence do
+          %{"runner_id" => ^runner_id, "since" => since} when is_binary(since) ->
+            {:ok, :unchanged}
+
+          _none_or_another_runner ->
+            {:ok, %{"runner_id" => runner_id, "since" => DateTime.to_iso8601(now)}}
+        end
+      end)
+
+    with {:ok, row} <- result do
+      {:ok, since, _offset} = DateTime.from_iso8601(row.runner_absence["since"])
+      {:ok, since}
+    end
+  end
+
+  @doc """
+  Clears a story's `runner_absence` once its runner is seen live again (US-48.17). A no-op that
+  writes nothing when there is none, so a sweep over a healthy story leaves no event.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec clear_runner_absence(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, StoryStage.t()}
+          | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
+  def clear_runner_absence(tenant_id, story_id, opts) do
+    write_ci_record(tenant_id, story_id, :runner_absence, "runner_absence", opts, fn row ->
+      if is_nil(row.runner_absence), do: {:ok, :unchanged}, else: {:ok, nil}
+    end)
+  end
+
+  # ONE writer for the two `ci`-stage records MergeExecution keeps (US-48.17): the story's epoch
+  # under a share lock, the row under its own, the row's epoch and stage, then `decide` on the
+  # locked row — `{:ok, :unchanged}` writes nothing, `{:ok, value}` writes the column and one
+  # event, `{:error, reason}` rolls back.
+  defp write_ci_record(tenant_id, story_id, column, event, opts, decide) do
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+
+    in_tenant(tenant_id, fn ->
+      story = share_lock_story(tenant_id, story_id)
+      if story.claim_epoch != epoch, do: Repo.rollback(:stale_claim_epoch)
+
+      row = lock_row(tenant_id, story_id) || Repo.rollback(:not_found)
+      if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
+      if row.stage != :ci, do: Repo.rollback(:wrong_stage)
+
+      case decide.(row) do
+        {:ok, :unchanged} -> {row, nil}
+        {:ok, value} -> {put_ci_record(row, column, event, value, opts), nil}
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  defp put_ci_record(row, column, event, value, opts) do
+    previous = Map.fetch!(row, column)
+
+    {1, [updated]} =
+      from(s in StoryStage,
+        where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+        select: s,
+        update: [
+          set: ^[{column, value}, {:updated_at, DateTime.utc_now()}],
+          inc: [lock_version: 1]
+        ]
+      )
+      |> Repo.update_all([])
+
+    data = if is_nil(value), do: %{"cleared" => previous}, else: value
+    insert_event(Repo, updated, event, nil, nil, opts[:actor_label], data)
+    updated
+  end
 
   defp clear_counter(name, tenant_id, story_id, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
@@ -1107,8 +1372,8 @@ defmodule Loopctl.Delivery.Stages do
 
   `effect` is one of `StageMachine.effects/0`: `:runner_id` (a runner UUID),
   `:worktree_path` (1..4096 characters), `:branch` and `:release_id` (1..255),
-  `:pr_number` (positive integer), and `:head_sha`, `:merge_sha` and
-  `:merge_gate_allowed_sha` (40 or 64 lowercase hex).
+  `:pr_number` (positive integer), and `:head_sha`, `:merge_sha`, `:merge_gate_allowed_sha`
+  and `:verified_head_sha` (40 or 64 lowercase hex).
 
   - `{:ok, row}` — recorded, or ALREADY recorded with this same value (a replay)
   - `:invalid_effect` — unknown effect or malformed value
@@ -1219,6 +1484,9 @@ defmodule Loopctl.Delivery.Stages do
       |> Map.merge(%{"effect" => Atom.to_string(effect), "value" => event_value(value)})
 
     insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
+    # The merge gate's ALLOW is this effect (`merge_gate_allowed_sha`); its outcome signal
+    # (US-48.12) is written here, in the write's own transaction. Every other effect: nothing.
+    :ok = Outcomes.observe_effect(Repo, row, effect)
     row
   end
 
@@ -1381,6 +1649,7 @@ defmodule Loopctl.Delivery.Stages do
         row
         |> requeue(new_epoch, edge, counted?, opts)
         |> settle(cause, counted?, opts)
+        |> retire_released_verification(row, edge, opts)
 
       true ->
         row
@@ -1476,6 +1745,9 @@ defmodule Loopctl.Delivery.Stages do
   def announce_release({_row, nil}), do: :ok
   def announce_release({_row, %Entry{} = entry}), do: AuditChain.announce_entry(entry)
 
+  def announce_release({_row, entries}) when is_list(entries),
+    do: Enum.each(entries, &AuditChain.announce_entry/1)
+
   @doc """
   Makes a story's stage row follow a CLAIM, inside the claiming transaction
   (`Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk claim).
@@ -1509,6 +1781,53 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
+  @doc """
+  Clears a stage row's `verified_head_sha` because the verifier that judged it was rebound
+  (US-48.18): the merge gate must never allow a head the CURRENT verifier did not judge.
+
+  Runs inside the rebinding `AdminRepo` transaction, under the row lock, bumps
+  `lock_version` and records an `effect_recorded` event (`"value" => "cleared"`) carrying
+  the head it retired, so the clear is visible in the stage history. A row with no recorded
+  head, or no row, is left alone.
+  """
+  @spec clear_verified_head(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, :cleared | :unchanged}
+  def clear_verified_head(tenant_id, story_id, opts \\ []) do
+    unless AdminRepo.in_transaction?(),
+      do: raise(ArgumentError, "clear_verified_head/3 runs inside the rebinding transaction")
+
+    from(s in StoryStage,
+      where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
+      lock: "FOR UPDATE"
+    )
+    |> AdminRepo.one()
+    |> case do
+      %StoryStage{verified_head_sha: head} = row when is_binary(head) ->
+        {1, [updated]} =
+          from(s in StoryStage,
+            where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+            select: s,
+            update: [
+              set: [verified_head_sha: nil, updated_at: ^DateTime.utc_now()],
+              inc: [lock_version: 1]
+            ]
+          )
+          |> AdminRepo.update_all([])
+
+        insert_event(AdminRepo, updated, "effect_recorded", nil, nil, opts[:actor_label], %{
+          "effect" => "verified_head_sha",
+          "value" => "cleared",
+          "previous" => head,
+          "reason" => "verifier_rebound"
+        })
+
+        {:ok, :cleared}
+
+      _ ->
+        {:ok, :unchanged}
+    end
+  end
+
   # Every row a claim or a release may touch: `done` and `failed` are finished with.
   defp live_row(tenant_id, story_id) do
     from(s in StoryStage,
@@ -1533,6 +1852,29 @@ defmodule Loopctl.Delivery.Stages do
 
     {:ok, updated}
   end
+
+  # A REQUEUE CLEARS THE HEAD (`StageMachine.clears/3`), so on a pr-route story it retires the
+  # verification made at that head too (US-48.18, AC-48.18.4), in the releasing transaction —
+  # the same rule `transition/6` applies to every other head-clearing edge. The entry rides
+  # with the release's own, announced by `announce_release/1` after the caller commits.
+  defp retire_released_verification({:ok, {row, entry}}, previous, edge, opts) do
+    if :head_sha in StageMachine.clears(previous.stage, :queued, edge) and
+         Intake.pr_route?(AdminRepo, previous.tenant_id, previous.story_id) do
+      case Progress.invalidate_verification(previous.tenant_id, previous.story_id,
+             repo: AdminRepo,
+             cause: edge,
+             actor_label: opts[:actor_label]
+           ) do
+        {:ok, :invalidated, retired} -> {:ok, {row, Enum.reject([retired, entry], &is_nil/1)}}
+        {:ok, :unchanged, nil} -> {:ok, {row, entry}}
+        {:error, _reason} -> {:error, :audit_chain_append_failed}
+      end
+    else
+      {:ok, {row, entry}}
+    end
+  end
+
+  defp retire_released_verification(error, _previous, _edge, _opts), do: error
 
   # A row already at the new epoch (an idempotent force-unclaim) is left exactly as it is —
   # and returned, because what the release decides next depends on the stage it is at.
@@ -1973,7 +2315,8 @@ defmodule Loopctl.Delivery.Stages do
        do: {:ok, value}
 
   defp validate_effect(sha, value)
-       when sha in [:head_sha, :merge_sha, :merge_gate_allowed_sha] and is_binary(value) do
+       when sha in [:head_sha, :merge_sha, :merge_gate_allowed_sha, :verified_head_sha] and
+              is_binary(value) do
     if GitSha.valid?(value), do: {:ok, value}, else: {:error, :invalid_effect}
   end
 
@@ -2026,6 +2369,10 @@ defmodule Loopctl.Delivery.Stages do
 
     case result do
       {:ok, {row, nil}} ->
+        {:ok, row}
+
+      {:ok, {row, entries}} when is_list(entries) ->
+        Enum.each(entries, &AuditChain.announce_entry/1)
         {:ok, row}
 
       {:ok, {row, entry}} ->
@@ -2105,10 +2452,15 @@ defmodule Loopctl.Delivery.Stages do
 
   # FOR SHARE: a release or a claim (FOR UPDATE on the story) cannot commit between this
   # read of `claim_epoch` and the write it fences. Taken BEFORE the stage row (see moduledoc).
-  defp share_lock_story(tenant_id, story_id) do
+  #
+  # `:no_key_update` for a transition that clears the head (US-48.18): it may go on to retire
+  # the story's verification (`Loopctl.Progress.invalidate_verification/3`), which UPDATES the
+  # story, and upgrading a share lock that a second transition on the same story also holds is
+  # a deadlock — each waits for the other's share lock. Taking the stronger lock first makes the
+  # second transition wait at the story, before it reaches the stage row.
+  defp share_lock_story(tenant_id, story_id, mode \\ :share) do
     from(s in Story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-      lock: "FOR SHARE",
       select: %{
         id: s.id,
         claim_epoch: s.claim_epoch,
@@ -2119,10 +2471,37 @@ defmodule Loopctl.Delivery.Stages do
         intake_record_id: s.intake_record_id
       }
     )
+    |> story_lock(mode)
     |> Repo.one()
     |> case do
       nil -> Repo.rollback(:not_found)
       story -> story
+    end
+  end
+
+  defp story_lock(query, :share), do: lock(query, "FOR SHARE")
+  defp story_lock(query, :no_key_update), do: lock(query, "FOR NO KEY UPDATE")
+
+  # A HEAD-CLEARING EDGE RETIRES THE VERIFICATION MADE AT THAT HEAD (US-48.18, AC-48.18.4), in
+  # this transaction, on a pr-route story only: `verified_head_sha` goes with the head
+  # (`StageMachine.head_keyed/0`), and `stories.verified_status` must go with it, or the next
+  # `ci` at a new head reads a verification nobody made there — and `validate_verifiable/1`
+  # refuses the re-verify that would make one. A chg story is never touched: chg verifies its
+  # own way (US-47.5), and its seam (`advance_in_tenant_transaction/4`) never reaches a
+  # pr-mode source. Returns the unannounced chain entry, or `nil`.
+  defp maybe_invalidate_verification(_row, false, _transition, _opts), do: nil
+
+  defp maybe_invalidate_verification(row, true, {_from, _to, edge}, opts) do
+    if Intake.pr_route?(Repo, row.tenant_id, row.story_id) do
+      case Progress.invalidate_verification(row.tenant_id, row.story_id,
+             repo: Repo,
+             cause: edge,
+             actor_label: opts[:actor_label]
+           ) do
+        {:ok, :invalidated, entry} -> entry
+        {:ok, :unchanged, nil} -> nil
+        {:error, reason} -> Repo.rollback(reason)
+      end
     end
   end
 

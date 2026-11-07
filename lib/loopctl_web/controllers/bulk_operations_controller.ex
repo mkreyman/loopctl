@@ -88,7 +88,9 @@ defmodule LoopctlWeb.BulkOperationsController do
     description:
       "Orchestrator rejects multiple stories with reasons. A key descending from an intake " <>
         "source's `chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5) " <>
-        "for the whole batch, and nothing is rejected.",
+        "for the whole batch, and nothing is rejected. A story whose delivery stage row is on " <>
+        "a pull-request intake source is a per-story `caller_lineage_required` error for a " <>
+        "key no dispatch minted (US-48.18).",
     request_body: {"Reject params", "application/json", Schemas.BulkRejectRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},

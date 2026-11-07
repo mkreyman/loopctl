@@ -135,6 +135,9 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.Agents.Outcomes
+  alias Loopctl.Agents.Registry
+  alias Loopctl.Agents.Spec
   alias Loopctl.Delivery.Stages
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
@@ -143,9 +146,6 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
   alias Loopctl.WorkBreakdown.Story
-
-  # The `kind`s that are an implement session; NULL is one too (see `implement_kind?/1`).
-  @implement_kinds ["implement"]
 
   # Retention (see "Retention" in the moduledoc). The batch is one DELETE statement's worth of
   # rows and the budget is one tenant's worth per run: both bound how long a single statement
@@ -162,6 +162,27 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc "The rows one retention run may delete for one tenant."
   @spec prune_budget() :: pos_integer()
   def prune_budget, do: @prune_budget
+
+  # The `runner_dispatches.max_turns` integer column's ceiling. `RunnerDispatch.max_turns` has a
+  # minimum and no maximum, so a budget past this is a dispatch the contract admits and the
+  # column cannot hold: it is recorded as not known (NULL) rather than raising out of the
+  # insert and refusing the dispatch over a figure only the escalation inbox reads.
+  @max_storable_turns 2_147_483_647
+
+  # The epoch a STORY-LESS dispatch (`spec_tune`, US-48.13) is sent and fenced with: it serves
+  # no claim, so it carries the constant the contract requires of it (`claim_epoch: 0`) and
+  # every fence compares against that constant instead of a story's.
+  @storyless_epoch 0
+
+  @doc "The largest turn budget the ledger stores; a larger one is recorded as NULL."
+  @spec max_storable_turns() :: pos_integer()
+  def max_storable_turns, do: @max_storable_turns
+
+  defp storable_turns(turns)
+       when is_integer(turns) and turns >= 1 and turns <= @max_storable_turns,
+       do: turns
+
+  defp storable_turns(_turns), do: nil
 
   @doc """
   Records a validated dispatch as `sent`, or finds the row an earlier dispatch of the same
@@ -186,7 +207,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       tenant_id: tenant_id,
       runner_id: runner_id,
       dispatch_id: dispatch.dispatch_id,
-      story_id: dispatch.story_id,
+      story_id: Map.get(dispatch, :story_id),
       claim_epoch: dispatch.claim_epoch,
       kind: dispatch.kind,
       # RECORDED ON THE FIRST INSERT AND NEVER REWRITTEN (#846.2 review round 2, finding 4).
@@ -202,6 +223,9 @@ defmodule Loopctl.Runners.DispatchLedger do
       base_branch: implement_only(dispatch, Map.get(dispatch, :base_branch)),
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
+      # The turn budget it is PLACED under (US-48.11), by the rule `wall_clock_seconds`
+      # follows: here on the first insert, then refreshed by the push that wins delivery.
+      max_turns: storable_turns(Map.get(dispatch, :max_turns)),
       # Born holding NO slot: the row is inserted first (that is how a retry is told from a
       # first send), and `take_slot/1` clears this in the same transaction. The CHECK that
       # every unreleased row is bounded therefore holds at every instant, not only at commit
@@ -225,7 +249,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       # Nothing is sent for a claim that has already moved on: the dispatch must carry the
       # story's CURRENT epoch, read under a share lock so a release cannot commit between
       # this read and the row it gates.
-      if current_claim_epoch(tenant_id, dispatch.story_id) != dispatch.claim_epoch,
+      if current_claim_epoch(tenant_id, Map.get(dispatch, :story_id)) != dispatch.claim_epoch,
         do: Repo.rollback(:stale_claim_epoch)
 
       # Inserted BEFORE the slot is taken, holding none. A concurrent first send of the same
@@ -294,7 +318,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   defp same_dispatch?(record, runner_id, dispatch) do
-    record.runner_id == runner_id and record.story_id == dispatch.story_id and
+    record.runner_id == runner_id and record.story_id == Map.get(dispatch, :story_id) and
       record.claim_epoch == dispatch.claim_epoch and record.kind == dispatch.kind
   end
 
@@ -316,7 +340,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   A winning push also refreshes `wall_clock_seconds` to the clock of the dispatch actually
   delivered, and raises `wall_clock_seconds_max` to it when it is the longest yet —
   `Loopctl.Runners.Capacity.heal/3` bounds an accepted session by that largest pushed clock,
-  falling back to `wall_clock_seconds` on a row that has none.
+  falling back to `wall_clock_seconds` on a row that has none. It refreshes `max_turns` the
+  same way, to the turn budget of the dispatch delivered (US-48.11); a dispatch map that names
+  no `max_turns` leaves the row's as it is.
   Recorded here rather than in `record_sent/3` because a re-send that is then DROPPED must
   not move the bound of a session an earlier push started.
   """
@@ -391,8 +417,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   # `wall_clock_seconds_max` only ever grows: it is the longest clock any push of this dispatch
   # carried, which is what an acceptance re-anchors the claim on (`reanchor_lease/3`).
   # `GREATEST` ignores the NULL of a row never pushed before.
+  #
+  # `max_turns` is the budget of the session this push starts; `COALESCE` keeps the placed one
+  # when the pushed map carries none.
   defp decide(repo, %DispatchRecord{} = record, "pushed", dispatch, now) do
     wall_clock_seconds = dispatch.wall_clock_seconds
+    max_turns = storable_turns(Map.get(dispatch, :max_turns))
 
     {1, _} =
       from(d in DispatchRecord,
@@ -404,6 +434,7 @@ defmodule Loopctl.Runners.DispatchLedger do
             wall_clock_seconds: ^wall_clock_seconds,
             wall_clock_seconds_max:
               fragment("GREATEST(?, ?)", d.wall_clock_seconds_max, ^wall_clock_seconds),
+            max_turns: fragment("COALESCE(?, ?)", type(^max_turns, :integer), d.max_turns),
             updated_at: ^now
           ]
         ]
@@ -607,12 +638,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   The session a runner is running under `dispatch_id`: `{:ok, %{kind:, story_id:,
   claim_epoch:, slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
 
-  KIND-SCOPED, IMPLEMENT BY DEFAULT: a row of another kind is refused
+  KIND-SCOPED, CLAIM-HOLDING BY DEFAULT: a row of another kind is refused
   (`:wrong_dispatch_kind`, contract 1.22.0), so a consumer cannot forget the kind. A triage
   dispatch holds no claim, so it may not reach an implement path through a fence on epoch or
   story. A caller that wants
   another kind asks for it: `kind: "triage"` (`Loopctl.Delivery.TriageVerdict`), or `kind:
-  :any`. Implement means `implement_kind?/1`.
+  :any`. The default, `:holds_claim`, means `Loopctl.Agents.Spec.holds_claim?/1`.
 
   For the `stage` path (#803, contract 1.4.0), which needs the story the dispatch is for and
   the slot generation to release when the session ends. It is a READ and takes no lock: the
@@ -655,7 +686,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         |> Repo.one()
       end)
 
-    wanted = Keyword.get(opts, :kind, :implement)
+    wanted = Keyword.get(opts, :kind, :holds_claim)
 
     case result do
       nil -> {:error, :unknown_dispatch}
@@ -698,7 +729,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   For the lease reclaim, which must not re-queue a claim a budget kill ended
   (`Loopctl.Progress.reclaim_expired_claim/3`). Only an implement session's end counts
-  (`where_implement_kind/1`): another kind's budget kill or exhausted subscription says
+  (`where_holds_claim/1`): another kind's budget kill or exhausted subscription says
   nothing about the implementer's. A read with no
   lock: every field it returns is
   final once the report is recorded, and the reclaim re-checks the claim under the story lock.
@@ -724,7 +755,7 @@ defmodule Loopctl.Runners.DispatchLedger do
           order_by: [asc: r.session_ended_at],
           limit: 1
         )
-        |> where_implement_kind()
+        |> where_holds_claim()
         |> Repo.one()
       end)
 
@@ -744,12 +775,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   this call recorded it or found it already recorded (US-44.3, contract 1.16.0).
 
   `attrs` carries what the caller derived from the message: `:reason`, `:digest` (the canonical
-  digest of the whole message) and `:counts_toward_retry_ceiling` (`nil` for a reason that
+  digest of the report's identity, `dispatch_id`, `claim_epoch` and `reason`) and `:counts_toward_retry_ceiling` (`nil` for a reason that
   re-queues nothing) — and `:story_id`, the dispatch's story as `held_dispatch/3` returned it, so
   the story's lock can be taken first without reading the dispatch row twice. A row whose
   story is not that one is `:unknown_dispatch`. Returns
   `{:ok, {:recorded | :replayed, session}}`, where `session` is the map `accepted_session/3`
   returns.
+
+  The first recording also stores the message's optional `turns_used` and `work_left_behind`
+  (contract 1.27.0) as `session_turns_used` and `work_left_behind`, NULL when absent. They are
+  not in the digest, so a resend differing only in them is `:replayed` and writes nothing.
 
   ## THE DIGEST IS COMPARED BEFORE THE EPOCH FENCE, and that order is the feature
 
@@ -840,38 +875,178 @@ defmodule Loopctl.Runners.DispatchLedger do
          :ok <- epoch_matches(record, message.claim_epoch, current),
          :ok <- story_fence(record, current),
          :ok <- accepted(record) do
-      record
-      |> Ecto.Changeset.change(
-        session_ended_reason: attrs.reason,
-        session_ended_digest: attrs.digest,
-        session_ended_at: DateTime.utc_now(),
-        counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling
-      )
-      |> Repo.update!()
-      |> then(&{:recorded, session_of(&1)})
+      ended_at = DateTime.utc_now()
+
+      recorded =
+        record
+        |> Ecto.Changeset.change(
+          session_ended_reason: attrs.reason,
+          session_ended_digest: attrs.digest,
+          session_ended_at: ended_at,
+          counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling,
+          # The runner's own figures (contract 1.27.0), with the FIRST report only: a replay
+          # returned above, so a resend that recounts them never rewrites these. Absent from
+          # a 1.26.0 report, and then NULL — not known, never zero or false.
+          session_turns_used: Map.get(message, :turns_used),
+          work_left_behind: Map.get(message, :work_left_behind)
+        )
+        |> Repo.update!()
+
+      # The run's outcome row (US-48.12), in THIS transaction: a session end is never recorded
+      # without its outcome or the reverse. Only on the first recording — a replay returns above.
+      :ok = Outcomes.record_end_in(Repo, recorded, attrs.reason, now: ended_at)
+
+      {:recorded, session_of(recorded)}
     end
   end
 
+  @doc """
+  Records the result a `:draft` session reported through `agent_result` (contract 1.25.0,
+  US-48.8) on its dispatch's ledger row, as `runner_id` in `tenant_id`, EXACTLY ONCE.
+
+  `message` is the cast envelope (`dispatch_id`, `claim_epoch`); `attrs` is what
+  `Loopctl.Agents.AgentResult` derived from loopctl's own registry and the validated result:
+  `kind` (the spec's dispatch kind), `spec` (`"<id>@<version>"`), `result` and `digest`.
+
+  Under the dispatch row's lock, in order:
+
+  - a row carrying a result already: the SAME digest is `:replayed` whatever has happened to
+    the row's status since, and a DIFFERENT one is `:already_recorded` — the session cannot
+    restate its result, so the two sides disagree and no resend settles it;
+  - the row is this runner's in this tenant (`:unknown_dispatch` otherwise, whoever else's it
+    is), of the spec's kind (`:wrong_dispatch_kind`), at the message's own epoch
+    (`:claim_epoch_mismatch`), and ACCEPTED (`:dispatch_not_accepted` — no session ran).
+
+  Nothing is fenced on the story's claim epoch: a `:draft` dispatch claims nothing and this
+  write moves no story, so the message's agreement with its own dispatch is the whole check.
+  A value Postgres refuses is `:rejected_by_database` and a lock that could not be had is
+  `:capacity_busy`, as for a reply.
+
+  ## The spec's effect, and the slot, in the SAME transaction (US-48.9)
+
+  `effect` is the spec's effect — `Loopctl.Agents.AgentResult` builds it from the spec's
+  `effects`, e.g. `reply_draft@1`'s `reply_drafts` row — called with the row as recorded,
+  under the row lock, before commit. It runs only on `:recorded`, never on a replay, so it
+  writes once per dispatch; anything it raises rolls the ledger write back with it, so a
+  result is never recorded without its effect or the reverse.
+
+  The dispatch's slot is released in the same transaction: the result IS the session's end
+  (a `:draft` session answers once and stops, as a triage session does with its verdict, and
+  `session_ended` is an implement session's message), so without this the slot stayed held
+  until the heal sweep passed the session's whole wall clock. Idempotent by generation
+  (`Capacity.release/4`).
+  """
+  @spec record_agent_result(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          map(),
+          map(),
+          (DispatchRecord.t() -> :ok)
+        ) ::
+          {:ok, {:recorded | :replayed, DispatchRecord.t()}}
+          | {:error,
+             :unknown_dispatch
+             | :wrong_dispatch_kind
+             | :claim_epoch_mismatch
+             | :dispatch_not_accepted
+             | :already_recorded
+             | :rejected_by_database
+             | :capacity_busy}
+  def record_agent_result(tenant_id, runner_id, message, attrs, effect \\ fn _record -> :ok end)
+      when is_function(effect, 1) do
+    context = %{operation: :record_agent_result, dispatch_id: message.dispatch_id, run_id: nil}
+
+    runner_write(tenant_id, runner_id, context, [], fn ->
+      with {:ok, record} <- held(tenant_id, runner_id, message.dispatch_id, lock: true) do
+        agent_result(record, message, attrs, effect)
+      end
+    end)
+    |> flatten()
+  end
+
+  # Each clause returns its result BARE, as `session_end/4`'s do.
+  defp agent_result(%DispatchRecord{agent_result_digest: digest} = record, _message, attrs, _fx)
+       when is_binary(digest) do
+    if digest == attrs.digest,
+      do: {:replayed, record},
+      else: {:error, :already_recorded}
+  end
+
+  defp agent_result(%DispatchRecord{} = record, message, attrs, effect) do
+    with :ok <- kind_is(record, attrs.kind),
+         :ok <- own_epoch(record, message.claim_epoch),
+         :ok <- accepted(record),
+         :ok <- storyless_live(record) do
+      result_at = DateTime.utc_now()
+
+      recorded =
+        record
+        |> Ecto.Changeset.change(
+          agent_result: attrs.result,
+          agent_result_spec: attrs.spec,
+          agent_result_digest: attrs.digest,
+          agent_result_at: result_at
+        )
+        |> Repo.update!()
+
+      # The run's outcome row (US-48.12) BEFORE the effect, so the effect's own signal
+      # (`Outcomes.observe_reply_draft/3`) lands on it — all in this one transaction.
+      :ok = Outcomes.record_end_in(Repo, recorded, "agent_result", now: result_at)
+      :ok = effect.(recorded)
+      _ = Capacity.release(Repo, recorded, recorded.slot_generation)
+
+      {:recorded, recorded}
+    end
+  end
+
+  defp kind_is(%DispatchRecord{kind: kind}, wanted) do
+    if kind_answers?(kind, wanted), do: :ok, else: {:error, :wrong_dispatch_kind}
+  end
+
+  # THE FENCE A STORY-LESS DISPATCH HAS IN PLACE OF THE CLAIM EPOCH (US-48.13). A `spec_tune`
+  # row serves no claim, so nothing moves under it when its session dies: what ends it is its
+  # reservation being released (by the capacity heal: runner revoked, never answered, over its
+  # wall clock) or its runner being revoked. Either one is the dispatch GONE, and a first
+  # result for it is `unknown_dispatch`. A result already recorded is answered before this, by
+  # its digest, so a byte-identical resend still replays and a different one is refused.
+  defp storyless_live(%DispatchRecord{story_id: nil} = record) do
+    revoked? =
+      Repo.exists?(
+        from r in Loopctl.Runners.Runner,
+          where: r.tenant_id == ^record.tenant_id and r.id == ^record.runner_id,
+          where: not is_nil(r.revoked_at)
+      )
+
+    if is_nil(record.released_at) and not revoked?,
+      do: :ok,
+      else: {:error, :unknown_dispatch}
+  end
+
+  defp storyless_live(%DispatchRecord{}), do: :ok
+
+  defp own_epoch(%DispatchRecord{claim_epoch: epoch}, epoch), do: :ok
+  defp own_epoch(%DispatchRecord{}, _epoch), do: {:error, :claim_epoch_mismatch}
+
   defp implement_dispatch(%DispatchRecord{kind: kind}) do
-    if implement_kind?(kind), do: :ok, else: {:error, :wrong_dispatch_kind}
+    if Spec.holds_claim?(kind), do: :ok, else: {:error, :wrong_dispatch_kind}
   end
 
   defp implement_only(dispatch, value),
-    do: if(implement_kind?(dispatch.kind), do: value, else: nil)
+    do: if(Spec.holds_claim?(dispatch.kind), do: value, else: nil)
 
   @doc """
-  Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
-  written before `kind` existed, when `implement` was the only kind sent. The ONE reading of
-  that rule, for every path that must refuse a triage session a claim to report on. `where_implement_kind/1` is the same
-  rule as a query filter.
+  `Loopctl.Agents.Spec.holds_claim?/1` as a filter on a query whose first binding is a ledger
+  row: a kind in `Loopctl.Agents.Registry.claim_holding_kinds/0`, or a NULL kind when the
+  predicate reads `nil` as claim-holding (a row written before `kind` existed).
   """
-  @spec implement_kind?(String.t() | nil) :: boolean()
-  def implement_kind?(kind), do: is_nil(kind) or kind in @implement_kinds
+  @spec where_holds_claim(Ecto.Queryable.t()) :: Ecto.Query.t()
+  def where_holds_claim(query) do
+    kinds = Registry.claim_holding_kinds()
 
-  @doc "`implement_kind?/1` as a filter on a query whose first binding is a ledger row."
-  @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
-  def where_implement_kind(query),
-    do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
+    if Spec.holds_claim?(nil),
+      do: where(query, [r], is_nil(r.kind) or r.kind in ^kinds),
+      else: where(query, [r], r.kind in ^kinds)
+  end
 
   @doc """
   The refusal for a message whose `claim_epoch` is not its own dispatch's, decided by the
@@ -907,7 +1082,8 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   @doc """
   Whether a row of `kind` answers for `wanted`, the kind a session accessor asks for:
-  `:implement` (the default everywhere, `implement_kind?/1`), a named kind, or `:any`.
+  `:holds_claim` (the default everywhere, `Loopctl.Agents.Spec.holds_claim?/1`), a named
+  kind, or `:any`.
 
   For the accessors that read the row WHATEVER its kind and then decide, so that a row of the
   wrong kind is `:wrong_dispatch_kind` (contract 1.22.0, loopctl#920) rather than
@@ -915,9 +1091,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   in that message, while `:unknown_dispatch` says the dispatch is not this runner's or is gone.
   Neither answer reads another runner's or tenant's row, so the split leaks nothing.
   """
-  @spec kind_answers?(String.t() | nil, :implement | :any | String.t()) :: boolean()
+  @spec kind_answers?(String.t() | nil, :holds_claim | :any | String.t()) :: boolean()
   def kind_answers?(_kind, :any), do: true
-  def kind_answers?(kind, :implement), do: implement_kind?(kind)
+  def kind_answers?(kind, :holds_claim), do: Spec.holds_claim?(kind)
   def kind_answers?(kind, wanted) when is_binary(wanted), do: kind == wanted
 
   # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
@@ -943,7 +1119,36 @@ defmodule Loopctl.Runners.DispatchLedger do
       limit: 1,
       select: %{branch: r.branch, base_branch: r.base_branch}
     )
-    |> where_implement_kind()
+    |> where_holds_claim()
+  end
+
+  @doc """
+  The dispatch that ran the claim of `claim_epoch`: the newest implement row of that claim its
+  runner ACCEPTED (the same rows `claim_route_query/3` reads), as `%{dispatch_id, runner_id}`,
+  or `nil`. For `Loopctl.Delivery.MergeExecution` (US-48.17), whose merge instruction names
+  the dispatch the runner reports the merge under — `RunnerStages` accepts a `stage` message
+  only for this runner's ACCEPTED dispatch at the story's epoch, and an accepted row stays
+  `accepted` after its session ends. A read with no lock: both values are written with the row
+  and never change, and the stage report it leads to is fenced on the story's epoch.
+  """
+  @spec claim_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
+          %{dispatch_id: Ecto.UUID.t(), runner_id: Ecto.UUID.t()} | nil
+  def claim_dispatch(tenant_id, story_id, claim_epoch) do
+    {:ok, found} =
+      in_tenant(tenant_id, fn ->
+        from(r in DispatchRecord,
+          where: r.status in ^@route_statuses,
+          where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+          where: r.claim_epoch == ^claim_epoch,
+          order_by: [desc: r.inserted_at],
+          limit: 1,
+          select: %{dispatch_id: r.dispatch_id, runner_id: r.runner_id}
+        )
+        |> where_holds_claim()
+        |> Repo.one()
+      end)
+
+    found
   end
 
   defp session_of(%DispatchRecord{} = record) do
@@ -1033,7 +1238,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
         where: r.dispatch_id == ^dispatch_id and not is_nil(s.claim_lease_cap)
       )
-      |> where_implement_kind()
+      |> where_holds_claim()
       |> Repo.exists?()
 
     if capped?, do: :no_key_update, else: :share
@@ -1059,7 +1264,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   # is not a refusal.
   #
   # ONLY AN IMPLEMENT ACCEPTANCE gets here with a `%Story{}`: `reply_story_lock/3` takes the
-  # write lock only for an implement dispatch (`where_implement_kind/1`), so no other kind's
+  # write lock only for an implement dispatch (`where_holds_claim/1`), so no other kind's
   # acceptance moves the implementer's lease. That lock choice is the one place the kind is decided for this path.
   defp reanchor_lease(
          %DispatchRecord{replied_at: %DateTime{} = replied_at} = record,
@@ -1407,11 +1612,16 @@ defmodule Loopctl.Runners.DispatchLedger do
       story = locked_story(tenant_id, story_id, story_lock)
 
       with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, lock: true),
-           :ok <- story_fence(record, story && story.claim_epoch) do
+           :ok <- story_fence(record, fence_epoch(story_id, story)) do
         {:ok, record, story}
       end
     end
   end
+
+  # A story-less dispatch (`spec_tune`, US-48.13) is fenced on the constant epoch it was sent
+  # with: there is no claim to move past it, so nothing can make it stale but its own row.
+  defp fence_epoch(nil, _story), do: @storyless_epoch
+  defp fence_epoch(_story_id, story), do: story && story.claim_epoch
 
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
   # exactly like a row that does not exist. It reads the row WHATEVER its kind: every caller is
@@ -1451,12 +1661,19 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  defp current_claim_epoch(tenant_id, story_id, lock \\ :share) do
+  defp current_claim_epoch(tenant_id, story_id, lock \\ :share)
+
+  defp current_claim_epoch(_tenant_id, nil, _lock), do: @storyless_epoch
+
+  defp current_claim_epoch(tenant_id, story_id, lock) do
     case locked_story(tenant_id, story_id, lock) do
       %{claim_epoch: epoch} -> epoch
       nil -> nil
     end
   end
+
+  # No story to lock: `Ecto` refuses a `== ^nil` comparison, and there is nothing to fence.
+  defp locked_story(_tenant_id, nil, _lock), do: nil
 
   defp locked_story(tenant_id, story_id, :share) do
     from(s in Story,

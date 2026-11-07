@@ -140,6 +140,11 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # commit — a comparison the session cannot see.
     refute {:deployed, :escalated, :verification_failed} in reportable
     refute StageMachine.runner_reportable?(:deployed, :escalated, :verification_failed)
+    # US-48.16: control also reads a pr-route story at `merged`, and escalates it from there
+    # over the same verdict. `merged` IS a runner source stage, so only the edge allowlist
+    # keeps this one off the wire — which is exactly what this pins.
+    refute {:merged, :escalated, :verification_failed} in reportable
+    refute StageMachine.runner_reportable?(:merged, :escalated, :verification_failed)
 
     # And `failed` is terminal with NO way out, `:human_resolution` included, so a runner
     # able to report `:budget_exceeded` could park a story for good.
@@ -152,6 +157,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     for triple <- [
           {:ci, :escalated, :merge_gate},
           {:deployed, :escalated, :verification_failed},
+          {:merged, :escalated, :verification_failed},
           {:implementing, :failed, :budget_exceeded}
         ] do
       assert triple in StageMachine.transitions(), inspect(triple)
@@ -386,6 +392,38 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # A merge is a chained fact, so retracting it writes a counter-entry.
     assert StageMachine.chained?(:merged, :implementing, :merge_refused)
     assert StageMachine.reason_required?(:implementing, :merge_refused)
+  end
+
+  describe "verify@1's edges and effect (US-48.18)" do
+    test "both edges are in the table and neither is on the runner allowlist" do
+      for {_from, _to, edge} = transition <- [
+            {:ci, :implementing, :verify_rejected},
+            {:ci, :escalated, :no_independent_verifier_runner}
+          ] do
+        assert transition in StageMachine.transitions(), inspect(transition)
+        refute transition in StageMachine.runner_transitions(), inspect(transition)
+        refute edge in StageMachine.runner_reportable_edges()
+        refute edge in StageMachine.runner_edges()
+        refute StageMachine.human_only?(edge)
+      end
+    end
+
+    test "verified_head_sha is control-written, written at ci only, and head-keyed" do
+      assert :verified_head_sha in StageMachine.control_written_effects()
+      refute :verified_head_sha in StageMachine.reportable_effects()
+      assert StageMachine.effect_stages(:verified_head_sha) == [:ci]
+      assert :verified_head_sha in StageMachine.head_keyed()
+    end
+
+    test "every edge that clears the head clears the verified head with it" do
+      for {from, to, edge} <- StageMachine.transitions(),
+          cleared = StageMachine.clears(from, to, edge),
+          :head_sha in cleared do
+        assert :verified_head_sha in cleared, inspect({from, to, edge})
+      end
+
+      assert :verified_head_sha in StageMachine.clears(:ci, :implementing, :verify_rejected)
+    end
   end
 
   describe "the change-protocol edges (US-47.4)" do

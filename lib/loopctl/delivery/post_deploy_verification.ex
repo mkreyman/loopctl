@@ -3,11 +3,34 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   The control-side check that a merged story is actually RUNNING (issue #803 §3 and §9,
   issue #805 item 2).
 
-  A story reaches `deployed` and stops. `Loopctl.Delivery.StageMachine`'s runner allowlist
-  holds `:verification_failed` back deliberately — "a session may not report the outcome of
-  a check it does not perform" — and its source filter stops at `merged`, so nothing a
-  runner sends can write `{deployed, verified}` either. Until this module existed, ESCALATION
-  WAS THE ONLY WAY OUT OF `deployed`. This is the writer of both edges.
+  A story's session stops at `deployed`, or at `merged`. `Loopctl.Delivery.StageMachine`'s
+  runner allowlist holds `:verification_failed` back deliberately — "a session may not report
+  the outcome of a check it does not perform" — and its source filter stops at `merged`, so
+  nothing a runner sends can write `{deployed, verified}` either. Until this module existed,
+  ESCALATION WAS THE ONLY WAY OUT OF `deployed`. This is the writer of both edges.
+
+  ## A pr-route story is read at `merged` too (US-48.16)
+
+  A pr-mode session reports up to `ci -> merged` (carrying the merge sha GitHub returned) and
+  ends; nothing a runner does after that observes the deploy. So the sweep reads stories at
+  `merged` as well, asks exactly the same question of the same deployments, and when a
+  carrying deployment SUCCEEDED writes `{merged, deployed, :forward}` itself — `release_id` is
+  that deployment's id, the only identity the edge into `deployed` may record — and then
+  `{deployed, verified, :forward}` in the same pass, so the issue closure the shipped verdict
+  records (`Loopctl.Intake.IssueClosures`) follows as it does for any verified story. A
+  verdict that is not a ship is reached at `merged` exactly as at `deployed`, with the same
+  bounds, and escalates from `merged` over the same `:verification_failed` edge
+  (`failure_transition/1`). `deployed` is never written for a deployment that did not ship.
+
+  The bounds are ONE clock from the merge. The waiting count is merge-keyed and the forward
+  edge into `deployed` clears nothing (`StageMachine.clears/3`), and the `since` every read
+  asks for is the recorded merge time, so a story that waited at `merged` does not start a
+  fresh bound when it reaches `deployed`.
+
+  A CHANGE-BOUND story at `merged` (`Loopctl.Changes.Binding`, the chg route) is not read:
+  chg reports its own `deployed` event (`Loopctl.Changes.EventEffects`), and a deploy written
+  here would race it. Such a story is `{:error, :change_protocol}` and is not a sweep
+  candidate. Once it is at `deployed` it is verified like any other.
 
   ## What it compares, and why not the workflow run
 
@@ -73,7 +96,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   | what the forge says | decision | what happens to the story |
   |---|---|---|
-  | ANY deployment carrying the merge ever succeeded | `:verified` | `{deployed, verified, :forward}` |
+  | ANY deployment carrying the merge ever succeeded | `:verified` | `{deployed, verified, :forward}`; from `merged`, `{merged, deployed, :forward}` with that deployment as `release_id` first |
   | deployments carry it, none ever succeeded, all settled | `:failed` | escalated, naming the state and both shas |
   | deployments carry it, none succeeded, one is still running | `:unresolved` | nothing. The next sweep asks again |
   | NO deployment since the merge | `:unresolved` | nothing. The deploy job has not made its record |
@@ -111,16 +134,21 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   Nowhere in particular, like the merge precondition: a function on whatever node serves
   the call, owning no process and caching nothing. `Loopctl.Workers.PostDeployVerificationWorker`
   is the caller, an Oban cron sweep, because by `deployed` THE SESSION HAS ENDED — the stage
-  is in `StageMachine.session_ends_at/0` and its runner slot has already gone back — so
+  is in `StageMachine.session_ends_at/0` and its runner slot has already gone back; a
+  pr-route session at `merged` has sent `session_ended` too — so
   there is no caller left to poll an endpoint. A restart loses nothing: every fact comes
   from Postgres or the forge, and the next sweep re-reads both.
 
   ## Retries and partitions
 
   `evaluate/2` writes nothing and may be repeated freely. `enforce/3` adds the transition,
-  which is the stage machine's compare-and-set from `deployed`, so a second run of the same
-  sweep finds the row already at `verified` or `escalated` and is refused `:stale_stage` —
-  it cannot verify twice or escalate twice. The count is a fenced write like any other.
+  which is the stage machine's compare-and-set from `deployed` (or `merged`), so a second run
+  of the same sweep finds the row already moved and is refused `:stale_stage` — it cannot
+  deploy, verify or escalate twice. A runner that reports `merged -> deployed` itself between
+  the read and the write wins the same way, and this sweep's next pass verifies the row it
+  left. A pass that wrote `deployed` and then lost the verify write leaves the story at
+  `deployed`, which the next pass judges from there. The count is a fenced write like any
+  other.
 
   A forge partition is `:unresolved` by construction: nothing can be established, so nothing
   is decided. A partition between two loopctl nodes is not a partition of the state — both
@@ -142,18 +170,27 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   before this module may tell a reporter a fix shipped.
   """
 
+  import Ecto.Query, only: [from: 2]
+
   require Logger
 
+  alias Loopctl.Changes.Binding
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PostDeployVerification.Result
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Repo
   alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
   @default_environment "production"
+
+  # The stages a story is read at. `merged` for a pr-route story whose session stopped at
+  # the merge (US-48.16); `deployed` for every other.
+  @read_stages [:merged, :deployed]
 
   # TWO bounds, because two conditions reach `:unresolved` and they are not the same length
   # of problem. One number for both is how the normal path escalated: five sweeps is about
@@ -203,25 +240,47 @@ defmodule Loopctl.Delivery.PostDeployVerification do
           contains: boolean()
         }
 
+  @typedoc "The stages a verdict is reached at."
+  @type read_stage :: :merged | :deployed
+
+  @typedoc """
+  `:stage` is the stage the story was read at, and decides nothing in `judge/1`: it is carried
+  onto the result so the writer takes the edge out of THAT stage. Absent, it is `:deployed`.
+  """
   @type facts :: %{
+          optional(:stage) => read_stage(),
           required(:repo) => fact(String.t()),
           required(:environment) => String.t(),
           required(:merge_sha) => String.t() | nil,
           required(:merged_at) => fact(DateTime.t()),
           required(:deployments) =>
             fact(%{deployments: [judged_deployment()], incomplete: term() | nil})
-            | :not_attempted
+            | :not_attempted,
+          optional(:merged_head) => fact(String.t()) | :not_attempted,
+          optional(:allowed_sha) => String.t() | nil
         }
 
-  @type error :: :not_found | :no_stage | :wrong_stage
+  @type error :: :not_found | :no_stage | :wrong_stage | :change_protocol
 
   @doc "The transition a passing verification takes."
   @spec success_transition() :: StageMachine.transition()
   def success_transition, do: {:deployed, :verified, :forward}
 
-  @doc "The transition a failing verification takes."
+  @doc """
+  The transition a passing verification of a story at `merged` takes FIRST, carrying the
+  carrying deployment's id as `release_id` (US-48.16). `success_transition/0` follows it.
+  """
+  @spec deploy_transition() :: StageMachine.transition()
+  def deploy_transition, do: {:merged, :deployed, :forward}
+
+  @doc "The transition a failing verification takes, from `deployed`."
   @spec failure_transition() :: StageMachine.transition()
-  def failure_transition, do: {:deployed, :escalated, :verification_failed}
+  def failure_transition, do: failure_transition(:deployed)
+
+  @doc "The transition a failing verification takes from the stage the story was read at."
+  @spec failure_transition(read_stage()) :: StageMachine.transition()
+  def failure_transition(from) when from in [:merged, :deployed],
+    do: {from, :escalated, :verification_failed}
 
   @doc """
   The consecutive-unresolved bound for one KIND of waiting. Past it the sweep escalates
@@ -261,6 +320,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   def judge(facts) do
     base = %Result{
       decision: :unresolved,
+      stage: Map.get(facts, :stage, :deployed),
       reasons: [],
       resolution: Resolution.for_verdict(:escalated),
       repo: value(facts, :repo),
@@ -283,30 +343,34 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   end
 
   @doc """
-  Gathers the facts for a story at `deployed` and judges them. Writes nothing, and opens no
-  transaction across a forge call.
+  Gathers the facts for a story at `deployed` or `merged` and judges them. Writes nothing,
+  and opens no transaction across a forge call.
 
   ## Errors
 
   `{:error, :not_found}` for a story that is not in the tenant, `{:error, :no_stage}` when
-  it has no stage row, and `{:error, :wrong_stage}` when the row is not at `deployed` — the
-  only stage this check is about. These are the caller asking at the wrong moment, not
-  verdicts about the deploy.
+  it has no stage row, `{:error, :wrong_stage}` when the row is at neither `merged` nor
+  `deployed` — the only stages this check is about — and `{:error, :change_protocol}` for a
+  change-bound story at `merged`, whose deploy chg reports itself. These are the caller
+  asking at the wrong moment, not verdicts about the deploy.
   """
   @spec evaluate(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, Result.t()} | {:error, error()}
   def evaluate(tenant_id, story_id) do
     with {:ok, story} <- fetch_story(tenant_id, story_id),
-         {:ok, stage} <- fetch_stage(tenant_id, story_id) do
+         {:ok, stage} <- fetch_stage(tenant_id, story_id),
+         :ok <- pr_route(tenant_id, stage) do
       {:ok, tenant_id |> gather(story, stage) |> judge()}
     end
   end
 
   @doc """
-  `evaluate/2`, plus the one transition its decision implies.
+  `evaluate/2`, plus the transition its decision implies.
 
-  - `:verified` — `{deployed, verified, :forward}`, then the unresolved count is cleared
-  - `:failed` — `{deployed, escalated, :verification_failed}`, with a reason naming every
-    failure and both shas
+  - `:verified` — `{deployed, verified, :forward}`, then the unresolved count is cleared. At
+    `merged`, `{merged, deployed, :forward}` with `release_id` set to the carrying
+    deployment's id comes first; if it is refused nothing else is written
+  - `:failed` — `{deployed | merged, escalated, :verification_failed}` from the stage the
+    story was read at, with a reason naming every failure and both shas
   - `:unresolved` — the count is incremented and nothing transitions, until the count passes
     `max_consecutive_unresolved/0`, at which point the verdict becomes `:failed` and
     escalates through the ordinary path
@@ -341,7 +405,8 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   @judged_facts [
     {:repo, :repository_unresolved},
     {:merged_at, :merge_time_unknown},
-    {:deployments, :deployments_unavailable}
+    {:deployments, :deployments_unavailable},
+    {:merged_head, :merged_head_unavailable}
   ]
 
   defp transient_reasons(facts) do
@@ -363,7 +428,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   defp waits?(reason),
     do: MergePrecondition.transient?(reason) or Credential.configuration?(reason)
 
-  defp error_reason(facts, key) do
+  # `:merged_head` is optional in `t:facts/0` (only `merged` reads it), so its absence is
+  # "not attempted"; every other judged fact is required and its absence fails closed.
+  defp error_reason(facts, :merged_head = key),
+    do: error_reason(Map.put_new(facts, key, :not_attempted), key, :required)
+
+  defp error_reason(facts, key), do: error_reason(facts, key, :required)
+
+  defp error_reason(facts, key, :required) do
     case Map.get(facts, key) do
       {:ok, _value} -> nil
       :not_attempted -> nil
@@ -401,9 +473,24 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # question, in the order a reader would ask it: do we know what had to ship, and does any
   # deployment that could have carried it say it did.
   defp decide(result, facts) do
-    case Map.get(facts, :merge_sha) do
-      nil -> failed(result, [:merge_sha_not_recorded])
-      merge_sha -> decide_page(result, facts, merge_sha, value(facts, :deployments))
+    case {ungated_merge(facts), Map.get(facts, :merge_sha)} do
+      {{:ungated_merge, _allowed, _merged} = ungated, _merge_sha} -> failed(result, [ungated])
+      {nil, nil} -> failed(result, [:merge_sha_not_recorded])
+      {nil, merge_sha} -> decide_page(result, facts, merge_sha, value(facts, :deployments))
+    end
+  end
+
+  # Decided FIRST: whether anything shipped is beside the point when the merge itself was
+  # never allowed. Only a fact that was read (`merged`) is judged; at `deployed` it is
+  # `:not_attempted` and this is silent.
+  defp ungated_merge(facts) do
+    case value(facts, :merged_head) do
+      nil ->
+        nil
+
+      merged ->
+        allowed = Map.get(facts, :allowed_sha)
+        if allowed == merged, do: nil, else: {:ungated_merge, allowed, merged}
     end
   end
 
@@ -566,17 +653,41 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     repo = MergePrecondition.repo_for_story(story)
     env = environment()
     merged_at = merged_at(tenant_id, stage)
+    deployments = deployments(tenant_id, repo, env, merged_at, stage.merge_sha)
 
     %{
+      stage: stage.stage,
       repo: repo,
       environment: env,
       # From the STAGE ROW, never a caller: this is the merge the loop performed, written
       # inside the transition into `merged` and named in that transition's chain entry.
       merge_sha: stage.merge_sha,
       merged_at: merged_at,
-      deployments: deployments(tenant_id, repo, env, merged_at, stage.merge_sha)
+      deployments: deployments,
+      # US-48.17 review: the head GitHub actually merged, against the head the gate allowed.
+      # The ci -> merged report carries only `merge_sha`, so the in-transaction ungated check
+      # can compare the allow only with the RECORDED head; a newer head pushed and merged
+      # past the gate passes it. Read only on the sweep a deployment CARRIES the merge — the
+      # one that could advance the story — so a story waiting at `merged` for its deploy costs
+      # no forge read per sweep, and a merged head cannot change between them.
+      merged_head: if(carried?(deployments), do: merged_head(story, stage), else: :not_attempted),
+      allowed_sha: stage.merge_gate_allowed_sha
     }
   end
+
+  defp merged_head(story, %StoryStage{stage: :merged} = stage) do
+    case MergePrecondition.read_pull_request(story, stage) do
+      {:ok, %{merged?: true, head_sha: head}} when is_binary(head) -> {:ok, head}
+      {:ok, %{merged?: true} = pr} -> {:error, {:merged_head_unknown, shape(pr)}}
+      {:ok, _open} -> {:error, :pull_request_not_merged}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp merged_head(_story, _stage), do: :not_attempted
+
+  defp carried?({:ok, %{deployments: deployments}}), do: Enum.any?(deployments, & &1.contains)
+  defp carried?(_unavailable), do: false
 
   # WHEN the loop recorded the merge, read from the stage event the transition into `merged`
   # wrote. That table is append-only and nothing prunes it, so the event is present for
@@ -706,9 +817,31 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   defp fetch_stage(tenant_id, story_id) do
     case Stages.get(tenant_id, story_id) do
       nil -> {:error, :no_stage}
-      %{stage: :deployed} = stage -> {:ok, stage}
+      %{stage: stage} = row when stage in @read_stages -> {:ok, row}
       %{stage: _other} -> {:error, :wrong_stage}
     end
+  end
+
+  # A change-bound story at `merged` is on the chg route, whose own `deployed` event moves it
+  # on (`Loopctl.Changes.EventEffects`); a deploy written here would race that event. The
+  # BINDING is the truth, never the project's intake mode — the same test
+  # `Loopctl.Changes.ReviewCustody` and `Stages` make. At `deployed` the route no longer
+  # matters: nothing else writes `deployed -> verified`.
+  defp pr_route(tenant_id, %StoryStage{stage: :merged, story_id: story_id}) do
+    if change_bound?(tenant_id, story_id), do: {:error, :change_protocol}, else: :ok
+  end
+
+  defp pr_route(_tenant_id, %StoryStage{}), do: :ok
+
+  defp change_bound?(tenant_id, story_id) do
+    {:ok, bound?} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.exists?(
+          from b in Binding, where: b.tenant_id == ^tenant_id and b.story_id == ^story_id
+        )
+      end)
+
+    bound?
   end
 
   defp source, do: PullRequestSource
@@ -719,6 +852,22 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # did not move — a lost race with a human, a stale epoch — so the story is still at
   # `deployed` and its unresolved count is still the live record of why; clearing it would
   # reset the backstop on the strength of a write that failed.
+  # A pr-route story at `merged` whose merge a deployment carried and SHIPPED (US-48.16):
+  # control writes the deploy the session never saw, naming that deployment as the release,
+  # and then judges `deployed` exactly as for a runner-reported deploy — in this same pass,
+  # on the same verdict, because nothing about the forge's answer changed between the two
+  # writes. A refused deploy write (a runner reported it first, a stale epoch) writes
+  # nothing more; the count stays as the live record, and the next pass reads the row as it
+  # is.
+  defp act(tenant_id, story_id, %Result{decision: :verified, stage: :merged} = result, opts) do
+    effects = [release_id: release_id(result)]
+
+    case transition(tenant_id, story_id, result, deploy_transition(), opts, effects) do
+      {:ok, deployed} -> act(tenant_id, story_id, %{deployed | stage: :deployed}, opts)
+      {:error, unchanged} -> unchanged
+    end
+  end
+
   defp act(tenant_id, story_id, %Result{decision: :verified} = result, opts) do
     case transition(tenant_id, story_id, result, success_transition(), opts) do
       {:ok, verified} -> clear_unresolved(tenant_id, story_id, verified, opts)
@@ -727,7 +876,13 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   end
 
   defp act(tenant_id, story_id, %Result{decision: :failed} = result, opts) do
-    {_outcome, result} = transition(tenant_id, story_id, result, failure_transition(), opts)
+    target =
+      if result.stage == :merged and
+           Enum.any?(result.reasons, &match?({:ungated_merge, _, _}, &1)),
+         do: {:merged, :escalated, :ungated_merge},
+         else: failure_transition(result.stage)
+
+    {_outcome, result} = transition(tenant_id, story_id, result, target, opts)
     result
   end
 
@@ -794,11 +949,29 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     end
   end
 
-  defp transition(tenant_id, story_id, %Result{} = result, {_from, to, edge} = target, opts) do
+  # The release is the deployment that carried the merge — its forge id, as the text
+  # `release_id` is stored as (`Loopctl.Changes.EventEffects` writes chg's integer release
+  # the same way). A `:verified` result always names one: `verified/2` sets it.
+  defp release_id(%Result{deployment_id: id}) when is_integer(id), do: Integer.to_string(id)
+  defp release_id(%Result{deployment_id: id}) when is_binary(id), do: id
+
+  # `effects` is this module's own, never the caller's: the only identity a sweep writes is
+  # the release on `merged -> deployed`, and it comes from the forge's answer.
+  defp transition(tenant_id, story_id, result, target, opts, effects \\ [])
+
+  defp transition(
+         tenant_id,
+         story_id,
+         %Result{} = result,
+         {_from, to, edge} = target,
+         opts,
+         effects
+       ) do
     advance_opts =
       opts
       |> Keyword.take([:claim_epoch, :actor_label, :actor_role, :actor_lineage])
       |> Keyword.put(:reason, reason_text(result))
+      |> Keyword.put(:effects, effects)
 
     case Stages.advance(tenant_id, story_id, target, advance_opts) do
       {:ok, _row} ->

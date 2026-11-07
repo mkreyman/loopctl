@@ -692,7 +692,28 @@ defmodule Loopctl.Delivery.StagesTest do
       assert row.merge_gate_unevaluated == %{"head_sha" => @sha_a, "count" => 1}
     end
 
-    test "is refused off the deployed stage — no other stage runs this gate" do
+    test "is written at merged too, and runs on across merged -> deployed (US-48.16)" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:ci, :merged},
+          claim_epoch: story.claim_epoch,
+          actor_lineage: [],
+          effects: [merge_sha: @sha_a]
+        )
+
+      assert {:ok, %{count: 1}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, %{count: 2}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:merged, :deployed}, opts)
+
+      # ONE clock from the merge: the forward edge into `deployed` clears nothing.
+      assert {:ok, %{count: 3, total: 3}} =
+               note_post_deploy(story, @sha_a, :deploy_pending, opts)
+    end
+
+    test "is refused off the merged and deployed stages — no other stage runs this gate" do
       {story, _row} = at_stage(:ci)
 
       assert {:error, :wrong_stage} =
@@ -716,7 +737,8 @@ defmodule Loopctl.Delivery.StagesTest do
       pr_number: 821,
       merge_sha: String.duplicate("d", 64),
       release_id: "v421",
-      merge_gate_allowed_sha: String.duplicate("1", 40)
+      merge_gate_allowed_sha: String.duplicate("1", 40),
+      verified_head_sha: String.duplicate("3", 40)
     }
 
     @others %{
@@ -727,7 +749,8 @@ defmodule Loopctl.Delivery.StagesTest do
       pr_number: 822,
       merge_sha: String.duplicate("f", 40),
       release_id: "v422",
-      merge_gate_allowed_sha: String.duplicate("2", 40)
+      merge_gate_allowed_sha: String.duplicate("2", 40),
+      verified_head_sha: String.duplicate("4", 40)
     }
 
     test "a replay of every outward stage finds and reuses its recorded identity" do
@@ -2035,7 +2058,13 @@ defmodule Loopctl.Delivery.StagesTest do
                "post_deploy_unresolved" => nil,
                # The release and chg's trunk verification are merge-keyed too (US-47.4).
                "release_id" => nil,
-               "trunk_verified_sha" => nil
+               "trunk_verified_sha" => nil,
+               # Head-keyed (US-48.18): a verification is of one head, retracted with it.
+               "verified_head_sha" => nil,
+               # Head-keyed (US-48.17): a merge instruction names one head, and the runner's
+               # absence clock is the wait for that head's merge.
+               "merge_instruction" => nil,
+               "runner_absence" => nil
              }
 
       # And the next attempt can record its own head again.

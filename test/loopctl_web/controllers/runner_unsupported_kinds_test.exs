@@ -134,6 +134,38 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
     assert entry["kinds"] == nil
   end
 
+  # US-48.8: a declared kind is sent only to a runner holding its spec, so a machine whose
+  # `kinds` names a kind it is never sent has to be explained on the pool.
+  test "the pool renders the specs a runner DECLARED", %{conn: conn} do
+    ctx = operator_ctx()
+
+    track(ctx.runner, %{
+      kinds: ["triage", "implement"],
+      specs: [%{id: "triage", version: 1}, %{id: "implement", version: 2}]
+    })
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+
+    assert entry["specs"] == [
+             %{"id" => "triage", "version" => 1},
+             %{"id" => "implement", "version" => 2}
+           ]
+  end
+
+  test "a runner that declared no specs renders null, never the version-1 reading",
+       %{conn: conn} do
+    ctx = operator_ctx()
+    track(ctx.runner, %{kinds: ["implement"]})
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+    assert Map.has_key?(entry, "specs")
+    assert entry["specs"] == nil
+  end
+
   # #834 round 2, finding 4. A suppression is loopctl withholding work, not the machine
   # revising its declaration — so the two are rendered as separate fields. Folding them made
   # the pool report a statement the runner never made, which is the exact thing the null

@@ -763,6 +763,41 @@ defmodule Loopctl.Intake do
   end
 
   @doc """
+  Whether `story_id` is a PR-ROUTE delivery story (US-48.18): it has a delivery stage row, and
+  every live intake source of its project is in mode `pr` (at least one). Read on `repo` with
+  explicit `tenant_id` predicates, so it holds on `Loopctl.AdminRepo` as well as under RLS.
+
+  The custody consequence of the answer is the caller's: `Loopctl.Progress` refuses an
+  unlineaged reject on such a story, and `Loopctl.Delivery.Stages` retires its verification on
+  every edge that clears its head.
+  """
+  @spec pr_route?(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) :: boolean()
+  # A story with no id was never persisted, so it has no stage row and no route.
+  def pr_route?(_repo, _tenant_id, nil), do: false
+
+  def pr_route?(repo, tenant_id, story_id) do
+    staged? =
+      repo.exists?(
+        from st in StoryStage, where: st.tenant_id == ^tenant_id and st.story_id == ^story_id
+      )
+
+    staged? and pr_modes?(repo, tenant_id, story_id)
+  end
+
+  defp pr_modes?(repo, tenant_id, story_id) do
+    modes =
+      repo.all(
+        from s in live_sources_query(tenant_id),
+          join: story in Story,
+          on: story.project_id == s.project_id and story.tenant_id == s.tenant_id,
+          where: story.id == ^story_id,
+          select: s.mode
+      )
+
+    modes != [] and Enum.all?(modes, &(&1 == :pr))
+  end
+
+  @doc """
   Whether a merge allow may be recorded for `story_id`: `{:error, :change_protocol_enrolled}`
   when a live intake source of the story's project is in mode `chg`, `:ok` otherwise.
 

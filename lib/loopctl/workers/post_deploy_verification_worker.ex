@@ -1,7 +1,8 @@
 defmodule Loopctl.Workers.PostDeployVerificationWorker do
   @moduledoc """
-  #803 §9 — decides `verified` or `escalated` for every story waiting at `deployed`. Runs
-  every two minutes via Oban Cron.
+  #803 §9 — decides `verified` or `escalated` for every story waiting at `deployed`, and
+  for every pr-route story waiting at `merged`, which it first carries to `deployed` once a
+  deployment ships its merge (US-48.16). Runs every two minutes via Oban Cron.
 
   ## Why a sweep and not an endpoint
 
@@ -24,9 +25,12 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
 
   ## The candidate read, and what bounds a run
 
-  Stories at `deployed`, fleet-wide, on `AdminRepo` (BYPASSRLS, so its explicit predicates
-  are the only scoping) — the same shape as `HealRunnerCapacityWorker`. Every candidate
-  genuinely has work, so a decided story drops out of the next run's candidates by itself.
+  Stories at `deployed`, and stories at `merged` with no change binding (a chg story's
+  deploy is chg's to report), fleet-wide, on `AdminRepo` (BYPASSRLS, so its explicit
+  predicates are the only scoping) — the same shape as `HealRunnerCapacityWorker`. Each is
+  then evaluated under ITS OWN tenant id, so no evaluation reads another tenant's rows.
+  Every candidate genuinely has work, so a decided story drops out of the next run's
+  candidates by itself.
   Oldest `updated_at` first, and each sweep touches the row it wrote, so a backlog past
   `@batch` drains round-robin rather than starving its tail.
 
@@ -65,6 +69,7 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Changes.Binding
   alias Loopctl.Delivery.PostDeployVerification
   alias Loopctl.Delivery.PostDeployVerification.Result
   alias Loopctl.Delivery.StoryStage
@@ -202,9 +207,31 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
     )
   end
 
-  defp candidates do
+  # A CHANGE-BOUND story at `merged` is excluded HERE, not only refused by the verifier:
+  # nothing in this sweep touches its row, so left in the candidate set it would stay the
+  # oldest `updated_at` for ever and hold a batch slot on every run. The predicate is
+  # explicit on `tenant_id` because AdminRepo bypasses RLS.
+  #
+  # Public ONLY so the exclusion is falsifiable: the verifier refuses a change-bound story
+  # anyway, so a test of the sweep's outcome cannot tell a filtered candidate from a refused
+  # one — and only the filter keeps the batch from starving.
+  @doc false
+  @spec candidates() :: [
+          %{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t(), claim_epoch: integer()}
+        ]
+  def candidates do
     from(s in StoryStage,
-      where: s.stage == :deployed,
+      as: :stage,
+      where:
+        s.stage == :deployed or
+          (s.stage == :merged and
+             not exists(
+               from b in Binding,
+                 where:
+                   b.tenant_id == parent_as(:stage).tenant_id and
+                     b.story_id == parent_as(:stage).story_id,
+                 select: 1
+             )),
       order_by: [asc: s.updated_at, asc: s.id],
       limit: @batch,
       select: %{tenant_id: s.tenant_id, story_id: s.story_id, claim_epoch: s.claim_epoch}

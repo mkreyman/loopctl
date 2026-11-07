@@ -1,0 +1,99 @@
+{
+  "id": "US-48.1",
+  "title": "Retire the dead review kind in loopctl-runner and re-vendor contract 1.24.0",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "the runner to declare only the kinds loopctl can dispatch",
+    "so_that": "the spec registry starts from the two real kinds and the runner's contract matches loopctl's"
+  },
+  "rationale": "loopctl retired review as a dispatch kind in contract 1.23.0 (runner_contract.ex:579-580, migration 20261018120000), but loopctl-runner still declares @kinds [implement, review, triage] (control.ex:401), keeps review_dispatch/review_run/review_prompt/review_judgements and priv/bin/loop-review-*/loop-finding, and vendors contract 1.22.0. Dead code that a spec registry would otherwise have to model.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.1.1",
+      "description": "LoopctlRunner.Control declares kinds [\"implement\", \"triage\"] on join; the review kind's modules, prompts and priv/bin helpers are deleted, and so is thread-mode checkpoint reporting that served only contract 1.20/1.21."
+    },
+    {
+      "id": "AC-48.1.2",
+      "description": "priv/runner_contract/v1.json and contract.ex vendor loopctl's contract 1.24.0; the runner's contract test passes against it."
+    },
+    {
+      "id": "AC-48.1.3",
+      "description": "No dispatch outcome changes: an implement or triage dispatch is accepted and run exactly as before, and a review dispatch is refused kind_not_supported as any unknown kind is."
+    },
+    {
+      "id": "AC-48.1.4",
+      "description": "README.md describes two kinds and drops every review-kind section."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.1.1",
+      "verifies": [
+        "AC-48.1.1"
+      ],
+      "name": "join declares two kinds",
+      "type": "unit",
+      "steps": [
+        "start Control against a fake socket",
+        "read the join payload"
+      ],
+      "expected_results": [
+        "kinds == [\"implement\", \"triage\"]"
+      ]
+    },
+    {
+      "id": "TC-48.1.2",
+      "verifies": [
+        "AC-48.1.2"
+      ],
+      "name": "vendored contract is 1.24.0",
+      "type": "unit",
+      "steps": [
+        "read the vendored contract version"
+      ],
+      "expected_results": [
+        "1.24.0"
+      ]
+    },
+    {
+      "id": "TC-48.1.3",
+      "verifies": [
+        "AC-48.1.3"
+      ],
+      "name": "review dispatch refused",
+      "type": "unit",
+      "steps": [
+        "send a dispatch with kind review"
+      ],
+      "expected_results": [
+        "dispatch_reply refused kind_not_supported",
+        "no session starts"
+      ]
+    },
+    {
+      "id": "TC-48.1.4",
+      "verifies": [
+        "AC-48.1.3"
+      ],
+      "name": "implement and triage unchanged",
+      "type": "integration",
+      "steps": [
+        "run the existing implement and triage dispatch tests"
+      ],
+      "expected_results": [
+        "all pass unmodified"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Repo: loopctl-runner. Independent of the loopctl stories; can run beside US-48.2.",
+    "Check loopctl's runner_pool after deploy: every runner's kinds list loses review and suppressed_kinds does not grow."
+  ],
+  "dependencies": []
+}

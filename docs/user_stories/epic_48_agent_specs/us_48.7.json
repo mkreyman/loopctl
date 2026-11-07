@@ -1,0 +1,87 @@
+{
+  "id": "US-48.7",
+  "title": "The implement dispatch runs from its spec",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "DispatchDriver and Placement to run implement@1 through the :build archetype",
+    "so_that": "the claim and mint path is one archetype a new :build spec reuses"
+  },
+  "rationale": "DispatchDriver (dispatch_driver.ex:127-548) and Placement (placement.ex:364-1125) hard-code the operator key, admission pre-check, runner advance and the claim. Placement.place/4 also has no kind guard: a non-implement kind would claim and then fail cast_dispatch.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.7.1",
+      "description": "Agents.Dispatcher.run/2 handles :build: candidates, payload (:typed_story), refs (:derived_story_unique), operator key, Capacity.admit pre-check, advance_on [:runner_exhausted, :no_conforming_branch]; the claim and mint code is called by the archetype, unchanged."
+    },
+    {
+      "id": "AC-48.7.2",
+      "description": "DispatchDriverWorker's outcomes and the pushed payloads are identical to today's on recorded fixtures."
+    },
+    {
+      "id": "AC-48.7.3",
+      "description": "Placement.place/4 refuses a spec whose archetype is not :build with 422 not_placeable_kind before any claim; the place_dispatch MCP tool description names the refusal."
+    },
+    {
+      "id": "AC-48.7.4",
+      "description": "The custody fields written at claim (implementer_dispatch_id, assigned_agent_id) are unchanged, shown by the existing L4 gate tests passing unmodified."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.7.1",
+      "verifies": [
+        "AC-48.7.2"
+      ],
+      "name": "same outcomes",
+      "type": "integration",
+      "steps": [
+        "run old and new driver passes over a fixture corpus"
+      ],
+      "expected_results": [
+        "identical outcomes and payloads"
+      ]
+    },
+    {
+      "id": "TC-48.7.2",
+      "verifies": [
+        "AC-48.7.3"
+      ],
+      "name": "kind guard",
+      "type": "integration",
+      "steps": [
+        "call place with a triage spec"
+      ],
+      "expected_results": [
+        "422 not_placeable_kind",
+        "no claim written"
+      ]
+    },
+    {
+      "id": "TC-48.7.3",
+      "verifies": [
+        "AC-48.7.4"
+      ],
+      "name": "custody unchanged",
+      "type": "integration",
+      "steps": [
+        "run the custody gate suites"
+      ],
+      "expected_results": [
+        "pass unmodified"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/chain-of-custody/SKILL.md.",
+    "The MCP tool change ships in the same story (CLAUDE.md: an operator endpoint is not done until a tool calls it)."
+  ],
+  "dependencies": [
+    "US-48.3",
+    "US-48.6"
+  ]
+}

@@ -430,6 +430,9 @@ defmodule LoopctlWeb.Router do
     # session parked stayed parked for ever, including the one the first end-to-end run left.
     get "/stories/:id/stage", StoryEscalationController, :show
     post "/stories/:id/stage/resolve", StoryEscalationController, :resolve
+    # US-48.11: the escalation inbox — every parked story, findable by reason class. A read,
+    # open to every key of the tenant; resolving one stays the user-role route above.
+    get "/escalations", EscalationController, :index
     # US-47.7: the chg changes bound to a story and their applied events (Epic 47). A read,
     # open to every key of the tenant like the stage above.
     get "/stories/:id/changes", StoryChangeController, :show
@@ -489,6 +492,20 @@ defmodule LoopctlWeb.Router do
     get "/projects/:project_id/ui-tests/:id", UiTestController, :show
     post "/projects/:project_id/ui-tests/:id/findings", UiTestController, :add_finding
     post "/projects/:project_id/ui-tests/:id/complete", UiTestController, :complete
+
+    # US-48.9: the reply drafts reply_draft@1 stored for a project's tickets. A read, user-role
+    # (ticket-derived text); loopctl never sends one.
+    get "/projects/:project_id/reply_drafts", ReplyDraftController, :index
+
+    # US-48.12: an agent spec's track record, per version, from the run-outcome ledger. A
+    # read of counts and enums, agent-role.
+    get "/agent_specs/:spec_id/outcomes", AgentOutcomeController, :summary
+
+    # US-48.13: the improvement loop's drafts, and the operator's record that one landed in a
+    # pull request. User-role both: traces carry ticket text, and `landed` certifies a person
+    # merged a prompt change. loopctl applies nothing.
+    get "/tuning_drafts", TuningDraftController, :index
+    post "/tuning_drafts/:id/landed", TuningDraftController, :landed
 
     # Epic management
     get "/projects/:project_id/epics", EpicController, :index

@@ -14,6 +14,8 @@ defmodule Loopctl.Fixtures do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.Agents.Spec, as: AgentSpec
+  alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.ReviewRecord
@@ -129,6 +131,37 @@ defmodule Loopctl.Fixtures do
   end
 
   # A conforming runner join payload; `attrs` (string keys, "machine" among them) override.
+  # US-48.8: a TEST-ONLY `:draft` spec that reports through the generic `agent_result`
+  # message and names NO effect, so the generic agent_result path is exercised apart from
+  # `reply_draft@1`'s (US-48.9) `:reply_draft` effect. Injected through `Loopctl.Agents.AgentResult.apply/4`'s
+  # `:specs` option — never added to `Loopctl.Agents.Registry`. Built from `triage@1`'s fields
+  # (its kind, candidates and control-only routes are all a `:draft` may name), validated by
+  # the same `Spec.new!/2` a spec module compiles through.
+  def build(:agent_result_spec, attrs) do
+    schema = %OpenApiSpex.Schema{
+      type: :object,
+      required: [:reply],
+      additionalProperties: false,
+      properties: %{
+        reply: %OpenApiSpex.Schema{type: :string, maxLength: 200},
+        tone: %OpenApiSpex.Schema{type: :string, enum: ["plain", "warm"]}
+      }
+    }
+
+    TriageV1.spec()
+    |> Map.from_struct()
+    |> Map.merge(%{
+      id: "echo_draft",
+      archetype: :draft,
+      effects: [],
+      result: ["agent_result"],
+      result_schema: schema
+    })
+    |> Map.merge(Enum.into(attrs, %{}))
+    |> Enum.to_list()
+    |> AgentSpec.new!(__ENV__)
+  end
+
   def build(:runner_join_payload, attrs) do
     Map.merge(
       %{
@@ -2534,7 +2567,7 @@ defmodule Loopctl.Fixtures do
 
   # A story the merge precondition can judge (#803, US-45.4): reported done and verified by
   # separate dispatches, its repository bound to an intake source requiring the `test` check,
-  # its stage row at `ci` on PR 4242 at `:head_sha`, and a triage verdict. Pass `:tenant_id`,
+  # its stage row at `ci` on PR 4242 at `:head_sha` and verified at it, and a triage verdict. Pass `:tenant_id`,
   # `:repo` and `:head_sha`. Returns `%{tenant_id:, project_id:, story_id:}`, the context the
   # merge tests run on.
   def fixture(:merge_ready_story, attrs) do
@@ -2578,12 +2611,138 @@ defmodule Loopctl.Fixtures do
       stage: :ci,
       claim_epoch: 0,
       pr_number: 4242,
-      head_sha: Map.fetch!(attrs, :head_sha)
+      head_sha: Map.fetch!(attrs, :head_sha),
+      # US-48.18: the verification was made AT this head. `:verified_head_sha` overrides it
+      # (`nil` for a story verified before the column existed, another sha for a stale one).
+      verified_head_sha: Map.get(attrs, :verified_head_sha, Map.fetch!(attrs, :head_sha)),
+      # US-48.17: the runner holding the claim, when the test needs one (default none).
+      runner_id: Map.get(attrs, :runner_id)
     })
 
     fixture(:triage_verdict, %{tenant_id: tenant_id, story_id: story.id})
 
     %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
+  end
+
+  # A `:merge_ready_story` the merge job can instruct (US-48.17): on a HUMAN-ANCHORED tenant
+  # (`:tenant` supplies one, `:trust_tier` overrides the tier), its stage row naming a runner
+  # (`fixture(:stage_runner)`), and an ACCEPTED implement ledger row for that runner at the
+  # claim's epoch 0 — the dispatch the instruction names. `:repo` defaults to "acme/widgets",
+  # `:head_sha` to 40 `a`s. Returns the `:merge_ready_story` map plus `tenant`, `runner`,
+  # `dispatch_id`, `repo` and `head`.
+  def fixture(:merge_instruction_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    head = Map.get(attrs, :head_sha, String.duplicate("a", 40))
+    repo = Map.get(attrs, :repo, "acme/widgets")
+
+    tenant =
+      Map.get_lazy(attrs, :tenant, fn ->
+        fixture(:tenant, %{trust_tier: Map.get(attrs, :trust_tier, :human_anchored)})
+      end)
+
+    runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+
+    ctx =
+      fixture(:merge_ready_story, %{
+        tenant_id: tenant.id,
+        repo: repo,
+        head_sha: head,
+        runner_id: runner.id
+      })
+
+    ledger =
+      fixture(:accepted_dispatch, %{
+        tenant_id: tenant.id,
+        runner: runner,
+        story_id: ctx.story_id,
+        claim_epoch: 0
+      })
+
+    Map.merge(ctx, %{
+      tenant: tenant,
+      runner: runner,
+      dispatch_id: ledger.dispatch_id,
+      repo: repo,
+      head: head
+    })
+  end
+
+  # A pull-request-route story waiting for `verify@1` (US-48.18): a human-anchored tenant with
+  # an unlineaged operator `:user` key, a `pr`-mode intake source for `:repo` (default
+  # "acme/widgets"), two runners on DIFFERENT agents (`implementer_runner`, `verifier_runner`),
+  # and a story CLAIMED by the implementer runner's agent under root dispatch A — the shape
+  # `Placement` leaves: `agent_status` `:assigned` (its start never spent), `assigned_agent_id`
+  # and `implementer_dispatch_id` set — with its stage row at `ci` on PR 77 at `:head_sha`
+  # (default 40 `a`s), on branch "loop/us-1", `verified_head_sha` unset. `:trust_tier`
+  # overrides the tenant's tier, `:tenant` supplies one. Returns a map of every row.
+  def fixture(:verify_ready_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    head = Map.get(attrs, :head_sha, String.duplicate("a", 40))
+    repo = Map.get(attrs, :repo, "acme/widgets")
+
+    tenant =
+      Map.get_lazy(attrs, :tenant, fn ->
+        fixture(:tenant, %{trust_tier: Map.get(attrs, :trust_tier, :human_anchored)})
+      end)
+
+    {_raw, operator_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+    project = fixture(:project, %{tenant_id: tenant.id})
+    epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+    {_secret, source} =
+      fixture(:intake_source, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        repo_full_name: repo
+      })
+
+    implementer_runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+    verifier_runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+
+    story =
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, project_id: project.id})
+
+    {:ok, %{dispatch: implementer}} =
+      Dispatches.create_dispatch(tenant.id, %{
+        role: :agent,
+        agent_id: implementer_runner.agent_id,
+        story_id: story.id
+      })
+
+    story =
+      story
+      |> Ecto.Changeset.change(%{
+        agent_status: :assigned,
+        assigned_agent_id: implementer_runner.agent_id,
+        implementer_dispatch_id: implementer.id,
+        claim_epoch: 1
+      })
+      |> AdminRepo.update!()
+
+    stage =
+      fixture(:story_stage, %{
+        tenant_id: tenant.id,
+        story_id: story.id,
+        stage: :ci,
+        claim_epoch: 1,
+        runner_id: implementer_runner.id,
+        branch: "loop/us-1",
+        pr_number: 77,
+        head_sha: head
+      })
+
+    %{
+      tenant: tenant,
+      operator_key: operator_key,
+      project: project,
+      source: source,
+      implementer_runner: implementer_runner,
+      verifier_runner: verifier_runner,
+      implementer: implementer,
+      story: story,
+      stage: stage,
+      head: head
+    }
   end
 
   # A delivery stage row inserted DIRECTLY at any stage (#803), bypassing
@@ -2624,6 +2783,64 @@ defmodule Loopctl.Fixtures do
     else
       insert.()
     end
+  end
+
+  # A story PARKED at `escalated` (US-48.11's inbox), entirely on the RLS `Loopctl.Repo`
+  # sandbox connection: its stage row, the `transitioned -> escalated` stage event over `:edge`
+  # (default `:budget_reported`) at `:escalated_at` (default now) — the inbox orders on it and
+  # the digest's one-hour age reads it — and, unless `ledger: false`, the implement dispatch
+  # ledger row that parked it: accepted ten minutes before the escalation and ended by the
+  # runner's `session_ended` (`:session_ended_reason`, default `wall_clock_exceeded`) one second
+  # before it. `:max_turns` (the budget placed), `:session_turns_used` and `:work_left_behind`
+  # (the runner's 1.27.0 report) default to NULL, a 1.26.0 runner's row. Pass `:tenant_id` to
+  # add to an existing tenant, and `:sibling_of` (a story) to put the new story in that story's
+  # project. Returns `%{story:, stage:, dispatch:}`.
+  def fixture(:escalated_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    edge = Map.get(attrs, :edge, :budget_reported)
+    escalated_at = Map.get_lazy(attrs, :escalated_at, &DateTime.utc_now/0)
+
+    story =
+      case Map.get(attrs, :sibling_of) do
+        nil -> fixture(:stage_story, Map.take(attrs, [:tenant_id]))
+        %Story{} = sibling -> sibling_story(sibling)
+      end
+
+    tenant_id = story.tenant_id
+
+    stage =
+      fixture(:story_stage, %{
+        tenant_id: tenant_id,
+        story_id: story.id,
+        stage: :escalated,
+        branch: Map.get(attrs, :stage_branch),
+        escalation_reason: Map.get(attrs, :reason, "session_ended:wall_clock_exceeded")
+      })
+
+    {:ok, dispatch} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        Loopctl.Repo.insert_all(Loopctl.Delivery.StageEvent, [
+          %{
+            id: Ecto.UUID.generate(),
+            tenant_id: tenant_id,
+            story_stage_id: stage.id,
+            story_id: story.id,
+            event: "transitioned",
+            from_stage: Atom.to_string(Map.get(attrs, :from, :implementing)),
+            to_stage: "escalated",
+            edge: edge && Atom.to_string(edge),
+            claim_epoch: stage.claim_epoch,
+            lock_version: stage.lock_version,
+            actor_label: "fixture",
+            data: %{},
+            inserted_at: escalated_at
+          }
+        ])
+
+        if Map.get(attrs, :ledger, true), do: escalated_ledger_row(story, escalated_at, attrs)
+      end)
+
+    %{story: story, stage: stage, dispatch: dispatch}
   end
 
   # A RECORDED triage verdict (`triage_verdicts`), as `Loopctl.Delivery.TriageVerdict` writes
@@ -2727,6 +2944,9 @@ defmodule Loopctl.Fixtures do
             status: Map.get(attrs, :status, "accepted"),
             trace_acked_seq: -1,
             wall_clock_seconds: 3_600,
+            # The turn budget it was placed under (contract 1.27.0's escalation inbox reads
+            # it). NULL unless given, as on a row written before the column.
+            max_turns: Map.get(attrs, :max_turns),
             delivery: "pushed",
             pushed_at: now,
             replied_at: now,
@@ -3156,6 +3376,178 @@ defmodule Loopctl.Fixtures do
 
     {:ok, _row} = Stages.open(tenant_id, story.id, actor_label: "test")
     story
+  end
+
+  # US-48.9: a `:detected_story` TRIAGE SET ASIDE — taken `detected -> triaged -> <to>` over
+  # the real stage machine, `:to` being `:failed` (`:triage_reject`, the default) or
+  # `:escalated` (`:triage_escalate`), the route a triage worker takes, under the same actor
+  # shape. `:ticket_id` (a fresh one by default; `nil` for none) is written on its intake
+  # record. Every `:detected_story` attribute passes through.
+  def fixture(:set_aside_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    story = fixture(:detected_story, attrs)
+
+    case Map.get(attrs, :ticket_id, Ecto.UUID.generate()) do
+      nil ->
+        :ok
+
+      ticket_id ->
+        record_id =
+          AdminRepo.one!(from s in Story, where: s.id == ^story.id, select: s.intake_record_id)
+
+        {1, _} =
+          AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+            set: [ticket_id: ticket_id]
+          )
+    end
+
+    edge =
+      case Map.get(attrs, :to, :failed) do
+        :failed -> {:triaged, :failed, :triage_reject}
+        :escalated -> {:triaged, :escalated, :triage_escalate}
+      end
+
+    for transition <- [{:detected, :triaged, :forward}, edge] do
+      row = Stages.get(tenant_id, story.id)
+
+      {:ok, _row} =
+        Stages.advance(tenant_id, story.id, transition,
+          claim_epoch: row.claim_epoch,
+          actor_label: "worker:triage_dispatcher",
+          actor_role: :agent,
+          actor_lineage: [],
+          reason: if(elem(transition, 2) == :forward, do: nil, else: "triage_verdict:test")
+        )
+    end
+
+    story
+  end
+
+  # US-48.12: an `agent_run_outcomes` row written DIRECTLY, for a read test (the summary, the
+  # endpoint); the write paths are `Loopctl.Agents.Outcomes`' own, exercised through the events
+  # that drive them. `:story` defaults to a fresh `fixture(:stage_story)` of `:tenant_id`;
+  # `:spec_id`, `:spec_version`, `:archetype`, `:end_reason`, `:elapsed_s`, `:turns`,
+  # `:signals` and `:inserted_at` shape the row. Written on `Loopctl.Repo`.
+  def fixture(:agent_run_outcome, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    story =
+      Map.get_lazy(attrs, :story, fn -> fixture(:stage_story, %{tenant_id: tenant_id}) end)
+
+    now = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    spec_id = Map.get(attrs, :spec_id, "implement")
+
+    row = %Loopctl.Agents.RunOutcome{
+      tenant_id: tenant_id,
+      dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+      story_id: story.id,
+      project_id: story.project_id,
+      kind: Map.get(attrs, :kind, spec_id),
+      spec_id: spec_id,
+      spec_version: Map.get(attrs, :spec_version, 1),
+      archetype: Map.get(attrs, :archetype, "build"),
+      prompt_template_id: spec_id,
+      prompt_template_version: Map.get(attrs, :spec_version, 1),
+      started_at: DateTime.add(now, -Map.get(attrs, :elapsed_s, 60), :second),
+      ended_at: Map.get(attrs, :ended_at, now),
+      elapsed_s: Map.get(attrs, :elapsed_s, 60),
+      turns: Map.get(attrs, :turns),
+      end_reason: Map.get(attrs, :end_reason, "completed"),
+      signals: Map.get(attrs, :signals, %{}),
+      inserted_at: now,
+      updated_at: now
+    }
+
+    {:ok, inserted} = Loopctl.Repo.with_tenant(tenant_id, fn -> Loopctl.Repo.insert!(row) end)
+    inserted
+  end
+
+  # US-48.9: a `reply_drafts` row for a fresh `:set_aside_story` of `:tenant_id` (or for
+  # `:story`), `drafted` with `:body` by default. `:inserted_at` orders a page; `:project_id`
+  # files several stories' drafts under one project, for a page of more than one. Written on
+  # `AdminRepo` as a row, for a read test; the write path is `Loopctl.ReplyDrafts`'s own.
+  def fixture(:reply_draft, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    story =
+      Map.get_lazy(attrs, :story, fn -> fixture(:set_aside_story, %{tenant_id: tenant_id}) end)
+
+    status = Map.get(attrs, :status, :drafted)
+
+    AdminRepo.insert!(%Loopctl.ReplyDrafts.ReplyDraft{
+      tenant_id: tenant_id,
+      project_id: Map.get(attrs, :project_id, story.project_id),
+      story_id: story.id,
+      dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+      ticket_id: Map.get(attrs, :ticket_id, Ecto.UUID.generate()),
+      status: status,
+      body: if(status == :drafted, do: Map.get(attrs, :body, "Thanks for writing in.")),
+      screen_code:
+        if(status == :refused, do: Map.get(attrs, :screen_code, "injection_detector_draft")),
+      screen_signals: Map.get(attrs, :screen_signals, []),
+      inserted_at: Map.get(attrs, :inserted_at, DateTime.utc_now())
+    })
+  end
+
+  # US-48.13: a `spec_tuning_drafts` row of `:tenant_id` under `:project_id` (a fresh project
+  # by default), `proposed` with a complete answer by default. `:status` `:pending` or
+  # `:abandoned` writes no answer, `:landed` names a PR. Written on `AdminRepo` as a row, for a
+  # read or a landed-marking test; the write path is `Loopctl.Agents.Tuning`'s own.
+  def fixture(:tuning_draft, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    project_id =
+      Map.get_lazy(attrs, :project_id, fn -> fixture(:project, %{tenant_id: tenant_id}).id end)
+
+    status = Map.get(attrs, :status, :proposed)
+    now = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    answered? = status in [:proposed, :rejected, :landed, :superseded]
+
+    answer =
+      if answered?,
+        do: %{
+          to_version: 2,
+          new_cases: %{"cases" => []},
+          diff: "--- a\n+++ b\n",
+          current_score: %{"passed" => 1, "total" => 2},
+          proposed_score: %{"passed" => 2, "total" => 2},
+          per_case: %{"cases" => []},
+          answered_at: now
+        },
+        else: %{}
+
+    AdminRepo.insert!(
+      struct(
+        Loopctl.Agents.TuningDraft,
+        Map.merge(
+          %{
+            tenant_id: tenant_id,
+            project_id: project_id,
+            dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+            target_spec_id: Map.get(attrs, :target_spec_id, "triage"),
+            target_spec_version: 1,
+            template_id: Map.get(attrs, :target_spec_id, "triage"),
+            from_version: Map.get(attrs, :from_version, 1),
+            eval_set: Map.get(attrs, :target_spec_id, "triage") <> "@1",
+            status: status,
+            rejection_reasons: if(status == :rejected, do: ["not_better"], else: []),
+            window_since: Map.get(attrs, :window_since),
+            window_until: Map.get(attrs, :window_until, now),
+            outcome_rows: 20,
+            input: Map.get(attrs, :input, %{"traces" => []}),
+            pr_url: if(status == :landed, do: "https://github.com/acme/widgets/pull/7"),
+            landed_at: if(status == :landed, do: now),
+            inserted_at: now,
+            updated_at: now
+          },
+          answer
+        )
+      )
+    )
   end
 
   # The project, epic, story and intake source a `Loopctl.Workers.VerificationRunnerWorker`
@@ -3753,6 +4145,82 @@ defmodule Loopctl.Fixtures do
       ),
       set: [triage_dispatch_id: verdict.dispatch_id]
     )
+  end
+
+  # A second story in `sibling`'s project and epic, on `Repo`, for `fixture(:escalated_story)`.
+  defp sibling_story(%Story{} = sibling) do
+    {:ok, story} =
+      Loopctl.Repo.with_tenant(sibling.tenant_id, fn ->
+        %Story{
+          tenant_id: sibling.tenant_id,
+          project_id: sibling.project_id,
+          epic_id: sibling.epic_id
+        }
+        |> Story.create_changeset(build(:story, %{}))
+        |> Loopctl.Repo.insert!()
+      end)
+
+    story
+  end
+
+  # The implement dispatch that parked a `fixture(:escalated_story)`, inside its `with_tenant`.
+  defp escalated_ledger_row(%Story{} = story, escalated_at, attrs) do
+    runner = Loopctl.Repo.insert!(stage_runner_row(story.tenant_id))
+    accepted_at = DateTime.add(escalated_at, -600, :second)
+    reason = Map.get(attrs, :session_ended_reason, "wall_clock_exceeded")
+
+    Loopctl.Repo.insert!(%DispatchRecord{
+      tenant_id: story.tenant_id,
+      runner_id: runner.id,
+      dispatch_id: Ecto.UUID.generate(),
+      story_id: story.id,
+      claim_epoch: 0,
+      kind: Map.get(attrs, :kind, "implement"),
+      branch: Map.get(attrs, :branch, "loop/escalated-#{System.unique_integer([:positive])}"),
+      status: "accepted",
+      trace_acked_seq: -1,
+      wall_clock_seconds: 3_600,
+      max_turns: Map.get(attrs, :max_turns),
+      delivery: "pushed",
+      pushed_at: accepted_at,
+      replied_at: accepted_at,
+      released_at: escalated_at,
+      slot_generation: 0,
+      session_ended_reason: reason,
+      session_turns_used: reason && Map.get(attrs, :session_turns_used),
+      work_left_behind: reason && Map.get(attrs, :work_left_behind),
+      session_ended_digest: reason && Ecto.UUID.generate(),
+      session_ended_at: reason && DateTime.add(escalated_at, -1, :second),
+      inserted_at: accepted_at,
+      updated_at: accepted_at
+    })
+  end
+
+  # The runner a ledger row needs, its key and agent included, as `fixture(:stage_runner)`
+  # inserts it — but INSIDE a `with_tenant` the caller already holds, which that fixture
+  # cannot be called from (`with_tenant/2` refuses to nest).
+  defp stage_runner_row(tenant_id) do
+    api_key =
+      %ApiKey{tenant_id: tenant_id}
+      |> ApiKey.create_changeset(%{name: "runner:escalated", role: :agent})
+      |> Ecto.Changeset.put_change(:key_hash, Auth.hash_key(Ecto.UUID.generate()))
+      |> Ecto.Changeset.put_change(:key_prefix, "lc_escal")
+      |> Loopctl.Repo.insert!()
+
+    name = "runner-#{System.unique_integer([:positive])}"
+
+    agent =
+      %Agent{tenant_id: tenant_id}
+      |> Agent.register_changeset(%{
+        name: Loopctl.Runners.agent_name(name),
+        agent_type: :implementer
+      })
+      |> Loopctl.Repo.insert!()
+
+    %Runner{tenant_id: tenant_id}
+    |> Runner.create_changeset(%{name: name})
+    |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
+    |> Ecto.Changeset.put_change(:agent_id, agent.id)
   end
 
   defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do

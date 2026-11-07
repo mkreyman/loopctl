@@ -15,7 +15,8 @@ for module <- [
       LoopctlWeb.RunnerSocket,
       LoopctlWeb.RunnerShutdownNotice,
       Loopctl.Runners,
-      Loopctl.Runners.Selection
+      Loopctl.Runners.Selection,
+      Loopctl.Agents.Dispatcher
     ] do
   Logger.put_module_level(module, :info)
 end

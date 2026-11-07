@@ -1,0 +1,45 @@
+{
+  "id": "US-48.15",
+  "title": "Review current processes and rank new uses for spec agents",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "medium",
+  "phase": "agent_specs",
+  "after_release": "epic/48-agent-specs",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "a ranked list of the workflows across my repos where a spec agent would remove real work, each with its archetype, trigger, measured cost of doing it by hand today, and risk",
+    "so_that": "the next agents built are the ones that pay for themselves, chosen from evidence rather than novelty"
+  },
+  "rationale": "Mark, 2026-11-07: \"we should review our current processes and brainstorm practical new uses of these agents to help with our workflows and processes in a meaningful way.\"",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.15.1",
+      "description": "docs/research/agent-spec-uses.md inventories the recurring processes visible in session logs, loopctl channels, the KB and the repos' hooks and crons (support tickets, triage, review, CI repair, dependency advisories, KB curation, release notes, deploy verification, fleet upkeep), each with how often it happens and the hands-on time it costs, measured where a source exists and marked estimated where not."
+    },
+    {
+      "id": "AC-48.15.2",
+      "description": "Each candidate use names its archetype (:judge, :build, :draft, or 'needs :assess'), its trigger, its input, what a human still decides, and its custody risk; candidates that would need an agent to certify its own work are listed as rejected with the reason."
+    },
+    {
+      "id": "AC-48.15.3",
+      "description": "The top five become stories in a new epic folder with acceptance criteria, each naming the outcome signal US-48.12 would record for it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.15.1",
+      "verifies": ["AC-48.15.3"],
+      "name": "the new stories validate",
+      "type": "unit",
+      "steps": ["run test/loopctl/user_story_schema_test.exs"],
+      "expected_results": ["passes"]
+    }
+  ],
+  "technical_notes": [
+    "Search the KB first (knowledge_search on the process names); prior decisions about each workflow outrank a fresh idea."
+  ],
+  "dependencies": ["US-48.12"]
+}

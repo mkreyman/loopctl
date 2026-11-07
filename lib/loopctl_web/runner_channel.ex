@@ -112,6 +112,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
   require Logger
 
+  alias Loopctl.Agents.AgentResult
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.Delivery.RunnerStages
@@ -139,6 +140,9 @@ defmodule LoopctlWeb.RunnerChannel do
   @session_ended_capacity RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
   @session_ended_refill_ms RunnerContract.session_ended_burst()
                            |> Map.fetch!("refill_interval_ms")
+  @agent_result_capacity RunnerContract.agent_result_burst() |> Map.fetch!("capacity")
+  @agent_result_refill_ms RunnerContract.agent_result_burst()
+                          |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -178,6 +182,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:stage_bucket, :full)
        |> assign(:verdict_bucket, :full)
        |> assign(:session_ended_bucket, :full)
+       |> assign(:agent_result_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -266,6 +271,26 @@ defmodule LoopctlWeb.RunnerChannel do
 
   def handle_info({:runner_dispatch, dispatch, _slot_generation}, socket),
     do: dispatch_to_socket(dispatch, socket)
+
+  # A MERGE INSTRUCTION (contract 1.29.0, US-48.17), behind the same two checks as a dispatch,
+  # nearest the push: only the sole live socket pushes it, and never on a halted tenant — a
+  # merge is the outward effect custody exists to gate. There is no ledger decision and no slot
+  # to release: an instruction claims nothing, and one that is not pushed is pushed again by
+  # `Loopctl.Delivery.MergeExecution`'s resend.
+  def handle_info({:runner_merge_instruction, instruction}, socket) do
+    cond do
+      not sole_live_socket?(socket) ->
+        log_merge_not_pushed(socket, instruction, "not the only live socket for this runner")
+
+      Runners.custody_halted?(socket.assigns.tenant_id) ->
+        log_merge_not_pushed(socket, instruction, "tenant custody halted")
+
+      true ->
+        push(socket, "merge", instruction)
+    end
+
+    {:noreply, socket}
+  end
 
   def handle_info(:recheck, socket) do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
@@ -421,6 +446,30 @@ defmodule LoopctlWeb.RunnerChannel do
       fn message ->
         with {:ok, held} <- RunnerStages.held_dispatch(tenant_id, runner.id, message.dispatch_id),
              do: end_session(tenant_id, runner, message, held)
+      end
+    )
+  end
+
+  # What a `:draft` session produced (contract 1.25.0, US-48.8): the ONE generic result
+  # message, validated against the named spec's own `result_schema`. `triage_verdict` and
+  # `session_ended` stay, because their results move custody edges a schema cannot judge;
+  # `AgentResult.apply/4` refuses any spec that does not report through this message.
+  #
+  # The tenant and the runner are this socket's assigns, never the payload's. IDEMPOTENT for
+  # the reason `triage_verdict` is: the session that wrote the result has stopped, so a
+  # runner's only move after a transient refusal is to resend the same bytes.
+  defp handle_message("agent_result", payload, socket) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    bucketed(
+      socket,
+      "agent_result",
+      RunnerContract.cast_agent_result_message(payload),
+      {:agent_result_bucket, @agent_result_capacity, @agent_result_refill_ms},
+      fn message ->
+        with {:ok, %{record: record, replayed?: replayed?}} <-
+               AgentResult.apply(tenant_id, runner.id, message),
+             do: {:ok, %{recorded_at: record.agent_result_at, replayed: replayed?}}
       end
     )
   end
@@ -910,7 +959,7 @@ defmodule LoopctlWeb.RunnerChannel do
   defp drop_dispatch(socket, dispatch, why) do
     Logger.warning(
       "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} dropped: #{why} " <>
-        "tenant_id=#{socket.assigns.tenant_id} story_id=#{dispatch.story_id} " <>
+        "tenant_id=#{socket.assigns.tenant_id} story_id=#{Map.get(dispatch, :story_id)} " <>
         "claim_epoch=#{dispatch.claim_epoch}"
     )
 
@@ -942,17 +991,25 @@ defmodule LoopctlWeb.RunnerChannel do
   defp log_undelivered(socket, dispatch, what) do
     Logger.warning(
       "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} not delivered: " <>
-        "#{what} tenant_id=#{socket.assigns.tenant_id} story_id=#{dispatch.story_id} " <>
+        "#{what} tenant_id=#{socket.assigns.tenant_id} story_id=#{Map.get(dispatch, :story_id)} " <>
         "claim_epoch=#{dispatch.claim_epoch}"
     )
 
     :ok
   end
 
+  defp log_merge_not_pushed(socket, instruction, why) do
+    Logger.warning(
+      "runner #{socket.assigns.runner.id} merge instruction not pushed: #{why} " <>
+        "tenant_id=#{socket.assigns.tenant_id} story_id=#{instruction.story_id} " <>
+        "head_sha=#{instruction.head_sha} claim_epoch=#{instruction.claim_epoch}"
+    )
+  end
+
   defp dispatch_to_socket(dispatch, socket) do
     correlation = [
       dispatch_id: dispatch.dispatch_id,
-      story_id: dispatch.story_id,
+      story_id: Map.get(dispatch, :story_id),
       claim_epoch: dispatch.claim_epoch
     ]
 

@@ -316,6 +316,15 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "human-anchored tenant. MCP tool: resolve_escalation"
       },
       %{
+        method: "GET",
+        path: "/api/v1/escalations",
+        description:
+          "The escalation inbox: every escalated story, newest first, with a server-derived " <>
+            "reason_class (filters: reason_class, project_id, since; cursor-paginated). " <>
+            "Read-only; work a row again with resolve_escalation to: queued. Role: agent or " <>
+            "above. MCP tool: escalation_list"
+      },
+      %{
         method: "POST",
         path: "/api/v1/stories/:id/start",
         description: "Start implementation (alias: /start-work)"

@@ -1,0 +1,66 @@
+{
+  "id": "US-48.5",
+  "title": "Triage result routing reads its spec",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "TriageVerdict to route outcomes, run screens and apply effects from triage@1",
+    "so_that": "a :judge spec's result is handled by one routing path"
+  },
+  "rationale": "TriageVerdict hard-codes @routes (triage_verdict.ex:148-166), its screens (Gate A, Gate B triage phase, the injection screen, criteria present, :971-1018, :653-876) and its effects (bind triage_dispatch_id, write the drafted story).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.5.1",
+      "description": "TriageVerdict reads outcomes, screens and effects from the spec; screens and effects are code modules named by the spec from a closed set."
+    },
+    {
+      "id": "AC-48.5.2",
+      "description": "Over the existing triage_verdict test corpus, the transitions applied, the screen codes and the drafted-story rows are identical before and after; the old and new paths run side by side in the test until the old one is deleted."
+    },
+    {
+      "id": "AC-48.5.3",
+      "description": "Re-triage (escalated -> detected) still supersedes the story's triage dispatches (rerun: :supersede_on_retriage) and Gate A resets."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.5.1",
+      "verifies": [
+        "AC-48.5.2"
+      ],
+      "name": "routing equivalence",
+      "type": "integration",
+      "steps": [
+        "replay every triage_verdict test fixture through both paths"
+      ],
+      "expected_results": [
+        "identical transitions, codes and rows"
+      ]
+    },
+    {
+      "id": "TC-48.5.2",
+      "verifies": [
+        "AC-48.5.3"
+      ],
+      "name": "re-triage",
+      "type": "integration",
+      "steps": [
+        "escalate, re-triage, resend the old verdict"
+      ],
+      "expected_results": [
+        "dispatch_not_accepted"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/chain-of-custody/SKILL.md: triage_dispatch_id binding is custody."
+  ],
+  "dependencies": [
+    "US-48.4"
+  ]
+}

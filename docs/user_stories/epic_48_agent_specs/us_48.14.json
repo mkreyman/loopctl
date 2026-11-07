@@ -1,0 +1,50 @@
+{
+  "id": "US-48.14",
+  "title": "Document agent specs, and a user-scoped skill that builds one",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "medium",
+  "phase": "agent_specs",
+  "after_release": "epic/48-agent-specs",
+  "story": {
+    "as_a": "session on any machine",
+    "i_want_to": "a skill that walks me from 'we need an agent that does X' to a merged spec, runner template, eval set and outcome tracking",
+    "so_that": "a new agent is a new spec, built the same way every time, without rediscovering the archetypes and custody limits"
+  },
+  "rationale": "Mark, 2026-11-07: \"We should thoroughly document this new functionality, once we built it, with a user scoped skill to build these agents (you have my permission to do that work in the claude-config repo).\" It describes the built system, so it lands after the epic merges.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.14.1",
+      "description": "docs/agent-specs.md in loopctl documents the shipped system: archetypes and what each may do to custody state, every spec field with its closed set, the registry and its tests, the runner template contract, the eval harness, the outcome ledger, the improvement loop, and the escalation inbox."
+    },
+    {
+      "id": "AC-48.14.2",
+      "description": "claude-config gains a user-scoped skill (skills/agent-spec-builder/SKILL.md) whose steps are: pick the archetype from the job, write the spec, write the runner template, write the eval cases first, register and test, land the runner and loopctl PRs, watch the outcomes. It names the refusals a spec hits (an edge outside its archetype, a predicate outside the set) and why."
+    },
+    {
+      "id": "AC-48.14.3",
+      "description": "The skill ships with an eval (bin/plugin-eval.sh --changed) whose cases include a request that must be refused (an agent that both implements and verifies) and one that must be redirected to an existing spec."
+    },
+    {
+      "id": "AC-48.14.4",
+      "description": "CLAUDE.md's domain skill routing table in loopctl gains a row for agent specs."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.14.1",
+      "verifies": ["AC-48.14.3"],
+      "name": "skill eval passes",
+      "type": "integration",
+      "steps": ["bin/plugin-eval.sh --changed in claude-config"],
+      "expected_results": ["all cases pass, including the custody refusal"]
+    }
+  ],
+  "technical_notes": [
+    "Write from the merged code, not from this PRD: names may have moved during the build.",
+    "claude-config merges through its own PR, then the claude-config-sync skill."
+  ],
+  "dependencies": ["US-48.13"]
+}

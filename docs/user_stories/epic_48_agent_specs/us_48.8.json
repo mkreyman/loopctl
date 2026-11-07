@@ -1,0 +1,100 @@
+{
+  "id": "US-48.8",
+  "title": "Contract 1.25.0: runners declare specs, a generic result event, a runner template registry",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "runners to declare which spec templates they hold and report a non-triage spec's result through one event",
+    "so_that": "a new spec ships as a spec, a template and an eval set, without a new socket event"
+  },
+  "rationale": "Today each kind has its own result event (triage_verdict) and the runner's work/3 has one clause per kind (control.ex:1812-1883).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.8.1",
+      "description": "RunnerJoin gains optional specs: [{id, version}]; loopctl derives eligibility from it in kind_supported/4 and stores nothing per runner. A runner that sends no specs is read as declaring each of its kinds at version 1, so today's runners are unaffected."
+    },
+    {
+      "id": "AC-48.8.2",
+      "description": "A generic agent_result event carries a spec id, version and a result object validated against that spec's JSON schema; triage keeps triage_verdict. Byte limits and the enum-only audit rule apply."
+    },
+    {
+      "id": "AC-48.8.3",
+      "description": "loopctl-runner holds a template registry keyed {id, version}; work/3 dispatches through it; implement@1 and triage@1 are its first two entries, built from today's prompts unchanged; the branch-prefix exemption comes from the archetype."
+    },
+    {
+      "id": "AC-48.8.4",
+      "description": "The contract version is 1.25.0 in both repos, and the contract test in each binds the vendored copy."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.8.1",
+      "verifies": [
+        "AC-48.8.1"
+      ],
+      "name": "old runner unaffected",
+      "type": "integration",
+      "steps": [
+        "join with no specs field"
+      ],
+      "expected_results": [
+        "eligible for its declared kinds exactly as before"
+      ]
+    },
+    {
+      "id": "TC-48.8.2",
+      "verifies": [
+        "AC-48.8.1"
+      ],
+      "name": "spec eligibility",
+      "type": "integration",
+      "steps": [
+        "join declaring reply_draft@1 only"
+      ],
+      "expected_results": [
+        "selected for reply_draft, not for implement"
+      ]
+    },
+    {
+      "id": "TC-48.8.3",
+      "verifies": [
+        "AC-48.8.2"
+      ],
+      "name": "result validated",
+      "type": "integration",
+      "steps": [
+        "send agent_result failing the spec schema"
+      ],
+      "expected_results": [
+        "refused, nothing written"
+      ]
+    },
+    {
+      "id": "TC-48.8.4",
+      "verifies": [
+        "AC-48.8.3"
+      ],
+      "name": "templates unchanged",
+      "type": "unit",
+      "steps": [
+        "render implement@1 and triage@1 from the registry"
+      ],
+      "expected_results": [
+        "byte-identical to today's prompts"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Repos: loopctl and loopctl-runner. loopctl ships first; the runner upgrade follows.",
+    "Each new kind still needs a dispatch_records kind CHECK migration and a Kinds.all entry: the registry test in US-48.2 fails until they agree."
+  ],
+  "dependencies": [
+    "US-48.5",
+    "US-48.7"
+  ]
+}

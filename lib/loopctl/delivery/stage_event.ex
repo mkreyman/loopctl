@@ -18,6 +18,12 @@ defmodule Loopctl.Delivery.StageEvent do
     that reached no verdict because the forge was unavailable or the deploy had not
     settled. `data` carries the merge sha, the KIND of waiting (`forge_fault` or
     `deploy_pending`, which have different bounds) and the consecutive count.
+  - `merge_instructed` — control pushed (or tried to push) a merge instruction for the
+    story's head to the runner holding its claim (US-48.17); `data` carries the instruction
+    record as `story_stages.merge_instruction` now holds it, outcome included.
+  - `runner_absence` — the story's runner was found with no live socket while the story
+    waited at `ci`, or was found live again after that (US-48.17); `data` carries the
+    absence record, or `"cleared"` with the one that ended.
 
   **This list is the `story_stage_events_event` CHECK's allow-list.** Adding an event name
   means a migration that rewrites the constraint AND a line here; the two drifting is how a
