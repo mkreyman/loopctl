@@ -45,7 +45,7 @@ defmodule Loopctl.Agents.Spec do
   `StageMachine.reportable_effects/0`, a `:judge` spec only the control-written triage binding,
   the drafted story and the verifier's verdict with the head it binds (`:verify_verdict`,
   `:verified_head_sha`, US-48.18), and a `:draft` spec only its stored artifact
-  (`:reply_draft`, US-48.9).
+  (`:reply_draft`, US-48.9; `:tuning_draft`, US-48.13).
 
   ## A `:draft` may name NO transition at all, and so may a verifier
 
@@ -177,7 +177,10 @@ defmodule Loopctl.Agents.Spec do
   # `:story_payload` — `StoryPayload` / `ImplementerInput.story_object/2` (a `RunnerStory`).
   # `:verify_payload` — `Loopctl.Agents.VerifierPlacement`: the story object plus the pull
   # request and the head to judge (`RunnerVerify`), read off the stage row (US-48.18).
-  @payloads [:fenced_intake_report, :story_payload, :verify_payload]
+  # `:spec_tune_traces` — `Loopctl.Agents.Tuning.input/3`: a target spec's failed runs as
+  # fenced untrusted trace text, the target's template and eval-set identity, riding the
+  # dispatch's `spec_tune` object (`RunnerSpecTune`, US-48.13). A tuning dispatch has no story.
+  @payloads [:fenced_intake_report, :story_payload, :verify_payload, :spec_tune_traces]
 
   # Where each ref field's value comes from.
   @ref_sources [
@@ -267,12 +270,14 @@ defmodule Loopctl.Agents.Spec do
   # ledger's own transaction (US-48.9).
   # `:verify_verdict` is the verifier's verdict, applied by `Loopctl.Agents.VerifyVerdict` in a
   # job enqueued once the ledger write commits (US-48.18).
-  @effects StageMachine.effects() ++ [:story_draft, :reply_draft, :verify_verdict]
+  # `:tuning_draft` is the `spec_tuning_drafts` row `Loopctl.Agents.Tuning.write_result/2`
+  # answers in the ledger's own transaction, its status decided by loopctl (US-48.13).
+  @effects StageMachine.effects() ++ [:story_draft, :reply_draft, :verify_verdict, :tuning_draft]
 
   @archetype_effects %{
     judge: [:triage_dispatch_id, :story_draft, :verify_verdict, :verified_head_sha],
     build: StageMachine.reportable_effects(),
-    draft: [:reply_draft]
+    draft: [:reply_draft, :tuning_draft]
   }
 
   @reruns [
@@ -288,7 +293,10 @@ defmodule Loopctl.Agents.Spec do
     # `:no_unreleased_dispatch_of_kind` in the candidate read.
     :one_unreleased_dispatch_per_story,
     # The story's claim: one implementer at a time.
-    :one_claim_per_story
+    :one_claim_per_story,
+    # A tuning run has no story: one `pending` draft per (tenant, project, target spec), held
+    # by the partial unique index `spec_tuning_drafts_pending_uidx` (US-48.13).
+    :one_pending_tuning_per_project_spec
   ]
 
   # A function, not an attribute: an OTP 28 regex cannot be escaped into a module attribute.

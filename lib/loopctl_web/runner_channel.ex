@@ -959,7 +959,7 @@ defmodule LoopctlWeb.RunnerChannel do
   defp drop_dispatch(socket, dispatch, why) do
     Logger.warning(
       "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} dropped: #{why} " <>
-        "tenant_id=#{socket.assigns.tenant_id} story_id=#{dispatch.story_id} " <>
+        "tenant_id=#{socket.assigns.tenant_id} story_id=#{Map.get(dispatch, :story_id)} " <>
         "claim_epoch=#{dispatch.claim_epoch}"
     )
 
@@ -991,7 +991,7 @@ defmodule LoopctlWeb.RunnerChannel do
   defp log_undelivered(socket, dispatch, what) do
     Logger.warning(
       "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} not delivered: " <>
-        "#{what} tenant_id=#{socket.assigns.tenant_id} story_id=#{dispatch.story_id} " <>
+        "#{what} tenant_id=#{socket.assigns.tenant_id} story_id=#{Map.get(dispatch, :story_id)} " <>
         "claim_epoch=#{dispatch.claim_epoch}"
     )
 
@@ -1009,7 +1009,7 @@ defmodule LoopctlWeb.RunnerChannel do
   defp dispatch_to_socket(dispatch, socket) do
     correlation = [
       dispatch_id: dispatch.dispatch_id,
-      story_id: dispatch.story_id,
+      story_id: Map.get(dispatch, :story_id),
       claim_epoch: dispatch.claim_epoch
     ]
 

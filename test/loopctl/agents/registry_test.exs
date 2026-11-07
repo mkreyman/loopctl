@@ -17,6 +17,7 @@ defmodule Loopctl.Agents.RegistryTest do
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs.ImplementV1
   alias Loopctl.Agents.Specs.ReplyDraftV1
+  alias Loopctl.Agents.Specs.SpecTunerV1
   alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.Agents.Specs.VerifyV1
   alias Loopctl.ApiSpec.RunnerContract
@@ -43,7 +44,12 @@ defmodule Loopctl.Agents.RegistryTest do
       assert implement == ImplementV1.spec()
       assert reply_draft == ReplyDraftV1.spec()
       assert verify == VerifyV1.spec()
-      assert Registry.all() == [triage, implement, reply_draft, verify]
+
+      assert {:ok, %Spec{archetype: :draft, kind: "spec_tune"} = spec_tuner} =
+               Registry.fetch("spec_tuner", 1)
+
+      assert spec_tuner == SpecTunerV1.spec()
+      assert Registry.all() == [triage, implement, reply_draft, verify, spec_tuner]
     end
 
     test "for_kind/1 finds each kind's spec and refuses an unknown one" do
@@ -51,6 +57,7 @@ defmodule Loopctl.Agents.RegistryTest do
       assert {:ok, %Spec{id: "implement"}} = Registry.for_kind("implement")
       assert {:ok, %Spec{id: "reply_draft"}} = Registry.for_kind("reply_draft")
       assert {:ok, %Spec{id: "verify"}} = Registry.for_kind("verify")
+      assert {:ok, %Spec{id: "spec_tuner"}} = Registry.for_kind("spec_tune")
       assert Registry.for_kind("review") == {:error, :unknown_kind}
     end
 
@@ -234,7 +241,11 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.11: an inbox row names the spec {id, version} of the dispatch that parked it.
       "lib/loopctl/delivery/escalation_inbox.ex",
       # US-48.18: the cron caller that runs the verifier pass with `verify@1`.
-      "lib/loopctl/workers/verify_dispatch_worker.ex"
+      "lib/loopctl/workers/verify_dispatch_worker.ex",
+      # US-48.13: the tuning pass names its targets from the registry, and its cron caller
+      # runs it with `spec_tuner@1`.
+      "lib/loopctl/agents/tuning.ex",
+      "lib/loopctl/workers/spec_tuner_dispatch_worker.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do
@@ -246,7 +257,7 @@ defmodule Loopctl.Agents.RegistryTest do
           Path.wildcard("lib/loopctl/agents/specs/*.ex")
 
       # Non-vacuous: the pattern matches the registry's own files, and the scan sees lib/web.
-      assert length(own) == 6
+      assert length(own) == 7
       assert Enum.all?(own, &(&1 |> File.read!() |> String.match?(reference)))
       assert Enum.any?(sources, &String.starts_with?(&1, "lib/loopctl_web/"))
 

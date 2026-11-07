@@ -45,6 +45,14 @@ defmodule Loopctl.Agents.Candidates do
   `failed`. Only a story triage itself left there is one triage set aside.
   `Loopctl.Agents.Spec` calls it while a spec module compiles, so a bad list is a build failure.
 
+  ## The one subject that is not a story
+
+  `%{subject: :spec_outcomes, order: order}` (US-48.13) names a spec whose candidates are
+  (project, target spec) pairs from the run-outcome ledger, not stories: `spec_tuner@1`'s. It
+  carries no predicates because this module's story read does not apply to it; its read is
+  `Loopctl.Agents.Tuning.candidates/2`, and `query/2` raises rather than read stories for it.
+  `story_subject?/1` is how a caller tells the two forms apart.
+
   ## Why each exclusion is IN the read rather than discovered per story
 
   Every one closes the same trap. A story the pass selects but cannot act on keeps its
@@ -105,7 +113,9 @@ defmodule Loopctl.Agents.Candidates do
 
   @type order :: :round_robin_project_tenant
 
-  @type candidates :: %{predicates: [predicate()], order: order()}
+  @type candidates ::
+          %{predicates: [predicate()], order: order()}
+          | %{subject: :spec_outcomes, order: order()}
 
   @typedoc "One selected row: what both passes read."
   @type row :: %{
@@ -159,8 +169,28 @@ defmodule Loopctl.Agents.Candidates do
     end
   end
 
+  # A spec whose dispatch has NO story (US-48.13): `spec_tuner@1` picks a (project, target
+  # spec) pair from the run outcomes, and `Loopctl.Agents.Tuning.candidates/1` is that read.
+  def validate(%{subject: :spec_outcomes, order: order} = candidates)
+      when map_size(candidates) == 2 do
+    if order in @orders,
+      do: :ok,
+      else: {:error, "candidates.order #{inspect(order)} is not one of #{inspect(@orders)}"}
+  end
+
   def validate(value),
-    do: {:error, "candidates must be %{predicates: [...], order: ...}, got #{inspect(value)}"}
+    do:
+      {:error,
+       "candidates must be %{predicates: [...], order: ...} or " <>
+         "%{subject: :spec_outcomes, order: ...}, got #{inspect(value)}"}
+
+  @doc """
+  Whether `candidates` reads STORIES: `false` only for `%{subject: :spec_outcomes}`, whose
+  dispatch carries no story and whose read is `Loopctl.Agents.Tuning.candidates/1`.
+  """
+  @spec story_subject?(candidates()) :: boolean()
+  def story_subject?(%{subject: :spec_outcomes}), do: false
+  def story_subject?(_candidates), do: true
 
   @doc """
   The candidate read for `spec`: at most `opts[:limit]` rows of `t:row/0`, in ranking order.
@@ -194,6 +224,12 @@ defmodule Loopctl.Agents.Candidates do
     case validate(candidates) do
       :ok -> :ok
       {:error, message} -> raise ArgumentError, "Candidates.query/2: " <> message
+    end
+
+    unless story_subject?(candidates) do
+      raise ArgumentError,
+            "Candidates.query/2 reads stories; a :spec_outcomes spec is read by " <>
+              "Loopctl.Agents.Tuning.candidates/1"
     end
 
     %{predicates: predicates, order: :round_robin_project_tenant} = candidates

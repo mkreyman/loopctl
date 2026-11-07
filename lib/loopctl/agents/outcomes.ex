@@ -17,7 +17,7 @@ defmodule Loopctl.Agents.Outcomes do
   | `Loopctl.Runners.DispatchLedger` (`session_ended`) | the ledger row's session-end write | the row, `end_reason` = the runner's reason |
   | `Loopctl.Delivery.TriageVerdict` | the `triage_verdicts` insert | the row, `end_reason` `triage_verdict`/`triage_incomplete`, signal `verdict` |
   | `Loopctl.Runners.DispatchLedger` (`agent_result`) | the ledger row's result write and its effect | the row, `end_reason` `agent_result`, signal `draft_screen` |
-  | `Loopctl.Delivery.Stages` (every transition and effect) | the stage row's compare-and-set | `merge_gate`, `ci_result`, `merged`, `merge_refused`, `human_override`, `requeued_after_budget_kill` |
+  | `Loopctl.Delivery.Stages` (every transition and effect) | the stage row's compare-and-set | `merge_gate`, `ci_result`, `merged`, `merge_refused`, `human_override`, `human_route`, `requeued_after_budget_kill` |
   | `Loopctl.Progress.record_review/4` | the review record's Multi | `review_findings` |
 
   ## Idempotent by `(dispatch_id, signal)`
@@ -490,8 +490,13 @@ defmodule Loopctl.Agents.Outcomes do
     case signals do
       %{"verdict" => %{"value" => %{"destination" => destination}}} ->
         overridden? = to == :detected or Atom.to_string(to) != destination
+        now = now(opts)
 
-        append(repo, row.tenant_id, dispatch_id, "human_override", overridden?, source, now(opts))
+        append(repo, row.tenant_id, dispatch_id, "human_override", overridden?, source, now)
+
+        # WHERE the human sent it, loopctl's own stage name: the decision the improvement loop
+        # turns into an eval case's expectation (US-48.13). Written once, like every signal.
+        append(repo, row.tenant_id, dispatch_id, "human_route", Atom.to_string(to), source, now)
 
       _no_verdict ->
         :ok
@@ -589,6 +594,9 @@ defmodule Loopctl.Agents.Outcomes do
 
   defp spec_of(%DispatchRecord{kind: kind}),
     do: Registry.for_kind(kind || Registry.default_kind())
+
+  # A story-less dispatch (`spec_tune`, US-48.13) names no project through a story.
+  defp project_id(_repo, _tenant_id, nil), do: nil
 
   defp project_id(repo, tenant_id, story_id) do
     repo.one(

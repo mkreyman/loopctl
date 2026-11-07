@@ -35,7 +35,13 @@ defmodule Loopctl.Agents.Registry do
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs
 
-  @modules [Specs.TriageV1, Specs.ImplementV1, Specs.ReplyDraftV1, Specs.VerifyV1]
+  @modules [
+    Specs.TriageV1,
+    Specs.ImplementV1,
+    Specs.ReplyDraftV1,
+    Specs.VerifyV1,
+    Specs.SpecTunerV1
+  ]
 
   @specs Enum.map(@modules, & &1.spec())
 

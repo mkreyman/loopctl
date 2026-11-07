@@ -469,6 +469,34 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-48.13: SpecTunerDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.SpecTunerDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.SpecTunerDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs weekly", %{entry: entry} do
+      assert entry,
+             "expected a SpecTunerDispatchWorker crontab entry — without one the improvement " <>
+               "loop never runs. Safe to schedule unconditionally: it is off unless both " <>
+               "DISPATCH_DRIVER_ENABLED and DRAFT_DISPATCH_ENABLED are set."
+
+      assert elem(entry, 0) == "0 6 * * 1"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "US-48.17: MergeSweepWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

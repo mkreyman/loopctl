@@ -294,6 +294,8 @@
     ["POST","/api/v1/token-usage","LoopctlWeb.TokenUsageController",":create"],
     ["DELETE","/api/v1/token-usage/:id","LoopctlWeb.TokenUsageController",":delete"],
     ["POST","/api/v1/token-usage/:id/correction","LoopctlWeb.TokenUsageController",":correct"],
+    ["GET","/api/v1/tuning_drafts","LoopctlWeb.TuningDraftController",":index"],
+    ["POST","/api/v1/tuning_drafts/:id/landed","LoopctlWeb.TuningDraftController",":landed"],
     ["GET","/api/v1/webhooks","LoopctlWeb.WebhookController",":index"],
     ["POST","/api/v1/webhooks","LoopctlWeb.WebhookController",":create"],
     ["DELETE","/api/v1/webhooks/:id","LoopctlWeb.WebhookController",":delete"],

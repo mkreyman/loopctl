@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.10.0 — 2026-11-07 (the improvement loop)
+
+### Added
+
+- **`tuning_drafts`** lists the improvement loop's tuning drafts (loopctl US-48.13,
+  `GET /api/v1/tuning_drafts`): what a `spec_tuner@1` session proposed for a target spec from
+  its failed runs — a prompt-template diff, new eval cases and both templates' scores — under
+  the status loopctl decided itself (`proposed` only when strictly better with no existing case
+  regressing, `rejected` with its reasons otherwise). Filters `project_id`, `spec_id`, `status`;
+  keyset pagination through `next_cursor`. Requires `LOOPCTL_USER_KEY`.
+- **`tuning_draft_mark_landed`** records that a person merged a proposed draft's template
+  change (`POST /api/v1/tuning_drafts/:id/landed`, `pr_url` required). It changes no template
+  and no spec version. 409 `not_proposed`, 422 for a malformed `pr_url`. Requires
+  `LOOPCTL_USER_KEY`.
+
 ## 3.9.1 — 2026-11-07 (verify@1)
 
 ### Changed

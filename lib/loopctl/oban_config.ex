@@ -702,6 +702,12 @@ defmodule Loopctl.ObanConfig do
            # scheduling it unconditionally starts nothing. Keep in sync with the crontab
            # assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.VerifyDispatchWorker},
+           # US-48.13: spec_tuner@1, the improvement loop. Weekly, Monday 06:00 UTC: one
+           # `spec_tune` dispatch per (project, target spec) whose run outcomes gathered the
+           # tuner's threshold since its last run. A `:draft`: OFF with the driver AND behind
+           # `:draft_dispatch_enabled`, so scheduling it unconditionally starts nothing. Keep
+           # in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"0 6 * * 1", Loopctl.Workers.SpecTunerDispatchWorker},
            # US-48.17: the pr route's merge. Holds a verified story's claim open while its
            # runner is live, escalates it over :runner_gone when the runner vanishes, and
            # enqueues the per-head merge instruction job. Only the instruction is behind

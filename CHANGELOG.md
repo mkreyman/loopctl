@@ -6,6 +6,27 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The improvement loop: `spec_tuner@1` proposes prompt-template changes, and loopctl never
+  applies them (US-48.13, 2026-11-07).** A weekly pass (`SpecTunerDispatchWorker`, Mondays
+  06:00 UTC, behind `DISPATCH_DRIVER_ENABLED` and `DRAFT_DISPATCH_ENABLED`) takes each
+  (project, target spec) whose run-outcome ledger has 20 rows since its last answered tuning
+  run, and sends one `spec_tune` dispatch carrying that spec's failed runs as fenced traces. The
+  answer is stored in `spec_tuning_drafts` under the status loopctl decides from the per-case
+  results: `proposed` only when strictly better with no existing case regressing. A person turns
+  a proposed draft into a pull request and marks it landed (`POST /api/v1/tuning_drafts/:id/landed`,
+  user role); `GET /api/v1/tuning_drafts` lists them (user role). MCP tools `tuning_drafts` and
+  `tuning_draft_mark_landed` (loopctl-mcp-server 3.10.0).
+  - **Runner contract 1.30.0** (minor): `spec_tune` is a dispatchable kind and the first that
+    names NO story. `story_id` is no longer schema-required on `dispatch` (every other kind
+    still carries it, enforced in code), and a `spec_tune` dispatch carries `claim_epoch` 0 and
+    a `spec_tune` object. Its result is an `agent_result` under `spec_tuner@1`. Re-vendor
+    `priv/runner_contract/v1.json`. A runner that does not declare `spec_tune` is never sent
+    one.
+  - **Migration `20261107210000_create_spec_tuning_drafts`** widens the `runner_dispatches`
+    kind CHECK, makes `runner_dispatches.story_id` and `agent_run_outcomes.story_id` nullable
+    for `spec_tune` rows only (a shape CHECK holds both directions), and creates
+    `spec_tuning_drafts` (RLS enabled). No backfill and no manual step. Its rollback deletes any
+    `spec_tune` ledger and outcome rows before restoring NOT NULL.
 - **Control decides the pull-request merge, and the runner executes it (US-48.17,
   2026-11-07).** A new pass (`MergeSweepWorker`, every minute) runs the merge gate, as control,
   over each pull-request story at `ci` that is verified at its head. On `allow` it sends the

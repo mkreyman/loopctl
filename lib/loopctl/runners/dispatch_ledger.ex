@@ -169,6 +169,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   # insert and refusing the dispatch over a figure only the escalation inbox reads.
   @max_storable_turns 2_147_483_647
 
+  # The epoch a STORY-LESS dispatch (`spec_tune`, US-48.13) is sent and fenced with: it serves
+  # no claim, so it carries the constant the contract requires of it (`claim_epoch: 0`) and
+  # every fence compares against that constant instead of a story's.
+  @storyless_epoch 0
+
   @doc "The largest turn budget the ledger stores; a larger one is recorded as NULL."
   @spec max_storable_turns() :: pos_integer()
   def max_storable_turns, do: @max_storable_turns
@@ -202,7 +207,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       tenant_id: tenant_id,
       runner_id: runner_id,
       dispatch_id: dispatch.dispatch_id,
-      story_id: dispatch.story_id,
+      story_id: Map.get(dispatch, :story_id),
       claim_epoch: dispatch.claim_epoch,
       kind: dispatch.kind,
       # RECORDED ON THE FIRST INSERT AND NEVER REWRITTEN (#846.2 review round 2, finding 4).
@@ -244,7 +249,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       # Nothing is sent for a claim that has already moved on: the dispatch must carry the
       # story's CURRENT epoch, read under a share lock so a release cannot commit between
       # this read and the row it gates.
-      if current_claim_epoch(tenant_id, dispatch.story_id) != dispatch.claim_epoch,
+      if current_claim_epoch(tenant_id, Map.get(dispatch, :story_id)) != dispatch.claim_epoch,
         do: Repo.rollback(:stale_claim_epoch)
 
       # Inserted BEFORE the slot is taken, holding none. A concurrent first send of the same
@@ -313,7 +318,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   defp same_dispatch?(record, runner_id, dispatch) do
-    record.runner_id == runner_id and record.story_id == dispatch.story_id and
+    record.runner_id == runner_id and record.story_id == Map.get(dispatch, :story_id) and
       record.claim_epoch == dispatch.claim_epoch and record.kind == dispatch.kind
   end
 
@@ -970,7 +975,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp agent_result(%DispatchRecord{} = record, message, attrs, effect) do
     with :ok <- kind_is(record, attrs.kind),
          :ok <- own_epoch(record, message.claim_epoch),
-         :ok <- accepted(record) do
+         :ok <- accepted(record),
+         :ok <- storyless_live(record) do
       result_at = DateTime.utc_now()
 
       recorded =
@@ -996,6 +1002,27 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp kind_is(%DispatchRecord{kind: kind}, wanted) do
     if kind_answers?(kind, wanted), do: :ok, else: {:error, :wrong_dispatch_kind}
   end
+
+  # THE FENCE A STORY-LESS DISPATCH HAS IN PLACE OF THE CLAIM EPOCH (US-48.13). A `spec_tune`
+  # row serves no claim, so nothing moves under it when its session dies: what ends it is its
+  # reservation being released (by the capacity heal: runner revoked, never answered, over its
+  # wall clock) or its runner being revoked. Either one is the dispatch GONE, and a first
+  # result for it is `unknown_dispatch`. A result already recorded is answered before this, by
+  # its digest, so a byte-identical resend still replays and a different one is refused.
+  defp storyless_live(%DispatchRecord{story_id: nil} = record) do
+    revoked? =
+      Repo.exists?(
+        from r in Loopctl.Runners.Runner,
+          where: r.tenant_id == ^record.tenant_id and r.id == ^record.runner_id,
+          where: not is_nil(r.revoked_at)
+      )
+
+    if is_nil(record.released_at) and not revoked?,
+      do: :ok,
+      else: {:error, :unknown_dispatch}
+  end
+
+  defp storyless_live(%DispatchRecord{}), do: :ok
 
   defp own_epoch(%DispatchRecord{claim_epoch: epoch}, epoch), do: :ok
   defp own_epoch(%DispatchRecord{}, _epoch), do: {:error, :claim_epoch_mismatch}
@@ -1585,11 +1612,16 @@ defmodule Loopctl.Runners.DispatchLedger do
       story = locked_story(tenant_id, story_id, story_lock)
 
       with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, lock: true),
-           :ok <- story_fence(record, story && story.claim_epoch) do
+           :ok <- story_fence(record, fence_epoch(story_id, story)) do
         {:ok, record, story}
       end
     end
   end
+
+  # A story-less dispatch (`spec_tune`, US-48.13) is fenced on the constant epoch it was sent
+  # with: there is no claim to move past it, so nothing can make it stale but its own row.
+  defp fence_epoch(nil, _story), do: @storyless_epoch
+  defp fence_epoch(_story_id, story), do: story && story.claim_epoch
 
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
   # exactly like a row that does not exist. It reads the row WHATEVER its kind: every caller is
@@ -1629,12 +1661,19 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  defp current_claim_epoch(tenant_id, story_id, lock \\ :share) do
+  defp current_claim_epoch(tenant_id, story_id, lock \\ :share)
+
+  defp current_claim_epoch(_tenant_id, nil, _lock), do: @storyless_epoch
+
+  defp current_claim_epoch(tenant_id, story_id, lock) do
     case locked_story(tenant_id, story_id, lock) do
       %{claim_epoch: epoch} -> epoch
       nil -> nil
     end
   end
+
+  # No story to lock: `Ecto` refuses a `== ^nil` comparison, and there is nothing to fence.
+  defp locked_story(_tenant_id, nil, _lock), do: nil
 
   defp locked_story(tenant_id, story_id, :share) do
     from(s in Story,

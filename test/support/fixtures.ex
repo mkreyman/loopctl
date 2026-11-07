@@ -3492,6 +3492,64 @@ defmodule Loopctl.Fixtures do
     })
   end
 
+  # US-48.13: a `spec_tuning_drafts` row of `:tenant_id` under `:project_id` (a fresh project
+  # by default), `proposed` with a complete answer by default. `:status` `:pending` or
+  # `:abandoned` writes no answer, `:landed` names a PR. Written on `AdminRepo` as a row, for a
+  # read or a landed-marking test; the write path is `Loopctl.Agents.Tuning`'s own.
+  def fixture(:tuning_draft, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    project_id =
+      Map.get_lazy(attrs, :project_id, fn -> fixture(:project, %{tenant_id: tenant_id}).id end)
+
+    status = Map.get(attrs, :status, :proposed)
+    now = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    answered? = status in [:proposed, :rejected, :landed, :superseded]
+
+    answer =
+      if answered?,
+        do: %{
+          to_version: 2,
+          new_cases: %{"cases" => []},
+          diff: "--- a\n+++ b\n",
+          current_score: %{"passed" => 1, "total" => 2},
+          proposed_score: %{"passed" => 2, "total" => 2},
+          per_case: %{"cases" => []},
+          answered_at: now
+        },
+        else: %{}
+
+    AdminRepo.insert!(
+      struct(
+        Loopctl.Agents.TuningDraft,
+        Map.merge(
+          %{
+            tenant_id: tenant_id,
+            project_id: project_id,
+            dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+            target_spec_id: Map.get(attrs, :target_spec_id, "triage"),
+            target_spec_version: 1,
+            template_id: Map.get(attrs, :target_spec_id, "triage"),
+            from_version: 1,
+            eval_set: Map.get(attrs, :target_spec_id, "triage") <> "@1",
+            status: status,
+            rejection_reasons: if(status == :rejected, do: ["not_better"], else: []),
+            window_since: Map.get(attrs, :window_since),
+            window_until: Map.get(attrs, :window_until, now),
+            outcome_rows: 20,
+            input: Map.get(attrs, :input, %{"traces" => []}),
+            pr_url: if(status == :landed, do: "https://github.com/acme/widgets/pull/7"),
+            landed_at: if(status == :landed, do: now),
+            inserted_at: now,
+            updated_at: now
+          },
+          answer
+        )
+      )
+    )
+  end
+
   # The project, epic, story and intake source a `Loopctl.Workers.VerificationRunnerWorker`
   # run needs, under `:tenant_id`; returns `%{tenant_id:, project_id:, story_id:}`. The
   # source's repository is `:repo_full_name` (`"acme/widgets"` by default) and

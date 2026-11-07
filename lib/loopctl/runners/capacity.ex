@@ -738,8 +738,13 @@ defmodule Loopctl.Runners.Capacity do
       # reservation is an undelivered one.
       # The runner stops a session at its wall clock. Timed from acceptance, else from
       # the push this reservation made, else from the reservation itself.
+      # A STORY-LESS dispatch (`spec_tune`, US-48.13) serves no claim, so the claim fence
+      # cannot judge it: without the `is_nil` guard its reservation read as dead the instant
+      # it was taken. The other clauses — runner revoked, never pushed, never answered, over
+      # its wall clock — end it exactly as they end every other kind.
       where:
-        d.status in ["refused", "superseded"] or not exists(claim_current) or
+        d.status in ["refused", "superseded"] or
+          (not is_nil(d.story_id) and not exists(claim_current)) or
           not exists(runner_active) or undelivered_too_long(d, ^now) or
           unanswered_too_long(d, ^now) or wall_clock_over(d, ^now),
       select: d.id

@@ -32,7 +32,7 @@ defmodule Loopctl.Agents.KindPredicatesTest do
   @old_default_kind "implement"
 
   # Registry kinds the oracle predates: added by a later story, so not in its budget table.
-  @kinds_added_since ["reply_draft", "verify"]
+  @kinds_added_since ["reply_draft", "verify", "spec_tune"]
 
   defp old_implement_kind?(kind), do: is_nil(kind) or kind in @old_implement_kinds
 
@@ -114,6 +114,15 @@ defmodule Loopctl.Agents.KindPredicatesTest do
                {:ok, {:triage_wall_clock_seconds, :triage_max_turns}}
 
       refute Spec.holds_claim?("reply_draft")
+    end
+
+    test "US-48.13: spec_tune spends the triage budget and holds no claim" do
+      assert "spec_tune" in registry_kinds()
+
+      assert DispatchPayload.budget_keys("spec_tune") ==
+               {:ok, {:triage_wall_clock_seconds, :triage_max_turns}}
+
+      refute Spec.holds_claim?("spec_tune")
     end
 
     test "the default kind (fill/3, a nil ledger row) == the old literal" do

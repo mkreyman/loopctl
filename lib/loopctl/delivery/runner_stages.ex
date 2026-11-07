@@ -307,9 +307,14 @@ defmodule Loopctl.Delivery.RunnerStages do
           Ecto.UUID.t(),
           Ecto.UUID.t(),
           map(),
-          %{story_id: Ecto.UUID.t(), kind: String.t() | nil},
+          %{story_id: Ecto.UUID.t() | nil, kind: String.t() | nil},
           keyword()
         ) :: {:ok, %{row: StoryStage.t(), replayed?: boolean()}} | {:error, end_error()}
+  # A STORY-LESS dispatch (`spec_tune`, US-48.13) has no story session to end: it is answered
+  # exactly as a `reply_draft` session end is, before any stage read that a nil id would break.
+  def end_held_session(_tenant_id, _runner_id, %{} = _message, %{story_id: nil}, _opts),
+    do: {:error, :wrong_dispatch_kind}
+
   def end_held_session(tenant_id, runner_id, %{} = message, %{story_id: story_id}, opts) do
     actor_id = Keyword.fetch!(opts, :actor_id)
 

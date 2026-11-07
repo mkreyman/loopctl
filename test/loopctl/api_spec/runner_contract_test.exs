@@ -41,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "5b4eda63d0d109e5e4ea364f718b147a7072a084ba50db6db2b50bc52e4aab5e"
+  @digest "14ad1bca71fde78845cee6a71446fcf7aa7e63896251ff2ccfb9a23277905fe9"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -75,8 +75,28 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.29.0"
-      assert schema["x-contract-version"] == "1.29.0"
+      assert RunnerContract.version() == "1.30.0"
+      assert schema["x-contract-version"] == "1.30.0"
+
+      # 1.30.0 (US-48.13): `spec_tune` is a kind a runner may be sent and the one kind that
+      # names no story, so `story_id` left the schema's `required` (settled in code); its
+      # object and its result schema are published, and its traces are capped.
+      assert "spec_tune" in connection["dispatchable_kinds"]
+      refute "spec_tune" in RunnerContract.Kinds.implied_by_silence()
+      refute "story_id" in schema["$defs"]["RunnerDispatch"]["required"]
+      assert schema["$defs"]["RunnerDispatch"]["properties"]["spec_tune"]
+
+      assert %{"max_bytes" => 48_000, "fields" => %{"traces" => %{"max_items" => 8}}} =
+               connection["limits"]["spec_tune"]
+
+      assert connection["limits"]["spec_tune"]["fields"]["traces"]["item_fields"]["untrusted"] ==
+               %{"max_length" => 1500}
+
+      assert %{
+               "type" => "object",
+               "required" => ["new_cases", "proposed_template", "scores"],
+               "additionalProperties" => false
+             } = connection["agent_result_schemas"]["spec_tuner@1"]
 
       # 1.28.0 (US-48.18): the verifier is a kind a runner may be sent, it is never implied by
       # silence, and its verdict schema is published with the other agent_result specs.
@@ -1195,6 +1215,136 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
       assert Enum.any?(errors, &(&1 =~ "must be the intake record"))
+    end
+  end
+
+  describe "cast_dispatch/1 spec_tune (contract 1.30.0, US-48.13)" do
+    defp spec_tune_dispatch(overrides) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "kind" => "spec_tune",
+          "repo" => "mkreyman/home_care_billing",
+          "base_branch" => "master",
+          "branch" => "master",
+          "claim_epoch" => 0,
+          "wall_clock_seconds" => 1200,
+          "max_turns" => 40,
+          "spec_tune" => spec_tune_object()
+        },
+        overrides
+      )
+    end
+
+    defp spec_tune_object(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "target" => %{"id" => "triage", "version" => 1},
+          "template" => %{"id" => "triage", "version" => 1},
+          "eval_set" => "triage@1",
+          "window" => %{"since" => nil, "until" => "2026-11-07T06:00:00Z"},
+          "outcome_rows" => 20,
+          "traces" => [spec_tune_trace()]
+        },
+        overrides
+      )
+    end
+
+    defp spec_tune_trace(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "trace_id" => Ecto.UUID.generate(),
+          "failures" => ["human_override"],
+          "agent_decision" => %{"outcome" => "escalate"},
+          "human_decision" => %{"route" => "queued", "outcomes" => ["story"]},
+          "untrusted" => "fenced block"
+        },
+        overrides
+      )
+    end
+
+    test "a story-less spec_tune dispatch with epoch 0 casts" do
+      assert {:ok, cast} = RunnerContract.cast_dispatch(spec_tune_dispatch(%{}))
+      refute Map.has_key?(cast, :story_id)
+      assert [%{failures: ["human_override"]}] = cast.spec_tune.traces
+    end
+
+    test "a spec_tune dispatch naming a story is refused" do
+      dispatch = spec_tune_dispatch(%{"story_id" => Ecto.UUID.generate()})
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "names no story"))
+    end
+
+    test "a spec_tune dispatch with a non-zero epoch is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_dispatch(spec_tune_dispatch(%{"claim_epoch" => 3}))
+
+      assert Enum.any?(errors, &(&1 =~ "claim_epoch must be 0"))
+    end
+
+    test "a spec_tune dispatch without its object is refused" do
+      dispatch = Map.delete(spec_tune_dispatch(%{}), "spec_tune")
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "must carry the spec_tune object"))
+    end
+
+    test "a spec_tune object on a story-anchored kind is refused" do
+      dispatch =
+        spec_tune_dispatch(%{"kind" => "reply_draft", "story_id" => Ecto.UUID.generate()})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "spec_tune is only allowed when kind is spec_tune"))
+    end
+
+    test "every story-anchored kind still needs a story_id" do
+      story_kinds = Kinds.all() -- Kinds.storyless_kinds()
+      assert Kinds.storyless_kinds() == ["spec_tune"]
+      assert "implement" in story_kinds and "triage" in story_kinds
+
+      for kind <- story_kinds do
+        dispatch =
+          spec_tune_dispatch(%{"kind" => kind})
+          |> Map.delete("spec_tune")
+
+        assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+        assert Enum.any?(errors, &(&1 =~ "must carry story_id")), kind
+      end
+    end
+
+    test "no traces, or a trace with no failure, is refused in code" do
+      empty = spec_tune_dispatch(%{"spec_tune" => spec_tune_object(%{"traces" => []})})
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(empty)
+      assert Enum.any?(errors, &(&1 =~ "at least one trace"))
+
+      blank =
+        spec_tune_dispatch(%{
+          "spec_tune" => spec_tune_object(%{"traces" => [spec_tune_trace(%{"failures" => []})]})
+        })
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(blank)
+      assert Enum.any?(errors, &(&1 =~ "at least one failure"))
+    end
+
+    test "an unknown failure code, an oversized untrusted block or too many traces is refused" do
+      for object <- [
+            spec_tune_object(%{"traces" => [spec_tune_trace(%{"failures" => ["felt_bad"]})]}),
+            spec_tune_object(%{
+              "traces" => [spec_tune_trace(%{"untrusted" => String.duplicate("x", 1_501)})]
+            }),
+            spec_tune_object(%{"traces" => for(_ <- 1..9, do: spec_tune_trace())})
+          ] do
+        assert {:error, {:invalid, _}} =
+                 RunnerContract.cast_dispatch(spec_tune_dispatch(%{"spec_tune" => object}))
+      end
+    end
+
+    test "the object cap binds under the byte rule" do
+      # Eight traces at the per-field cap, each `untrusted` charged six bytes per character.
+      traces = for _ <- 1..8, do: spec_tune_trace(%{"untrusted" => String.duplicate("<", 1_500)})
+      dispatch = spec_tune_dispatch(%{"spec_tune" => spec_tune_object(%{"traces" => traces})})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "bytes under the byte rule"))
     end
   end
 

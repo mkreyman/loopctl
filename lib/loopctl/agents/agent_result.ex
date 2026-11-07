@@ -74,6 +74,7 @@ defmodule Loopctl.Agents.AgentResult do
   alias Loopctl.Agents.Outcomes
   alias Loopctl.Agents.Registry
   alias Loopctl.Agents.Spec
+  alias Loopctl.Agents.Tuning
   alias Loopctl.Agents.VerifyVerdict
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
@@ -172,7 +173,15 @@ defmodule Loopctl.Agents.AgentResult do
   #
   # `:verify_verdict` (US-48.18) has no in-transaction effect: `apply/4` enqueues its job after
   # the commit (see the moduledoc).
-  defp effects(_spec, nil, validated), do: {validated, fn _record -> :ok end}
+  #
+  # `:tuning_draft` (US-48.13) answers the run's pending `spec_tuning_drafts` row in the ledger's
+  # transaction, its status decided by `Tuning.decide/2` from the per-case results, never taken
+  # from the runner.
+  defp effects(%Spec{effects: effects}, nil, validated) do
+    if :tuning_draft in effects,
+      do: {validated, fn record -> Tuning.write_result(record, validated) end},
+      else: {validated, fn _record -> :ok end}
+  end
 
   #
   # The stored row's status is then the run's `draft_screen` outcome signal (US-48.12), read

@@ -28,6 +28,12 @@ import {
   storyStage,
 } from "../lib/delivery-loop.js";
 import { replyDraftList, replyDraftsPath } from "../lib/reply-drafts.js";
+import {
+  TUNING_DRAFTS_PATH,
+  landedPath,
+  tuningDraftMarkLanded,
+  tuningDrafts,
+} from "../lib/tuning-drafts.js";
 import { stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -572,6 +578,98 @@ describe("reply_draft_list (US-48.9)", () => {
   });
 });
 
+describe("tuning_drafts and tuning_draft_mark_landed (US-48.13)", () => {
+  const DRAFT_ID = "6c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e";
+  const PR = "https://github.com/mkreyman/loopctl/pull/1042";
+
+  test("GETs the drafts with the user key, filters encoded as query parameters", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await tuningDrafts({}, { userKey: "user-key", apiCall });
+    await tuningDrafts(
+      { project_id: DRAFT_ID, spec_id: "triage", status: "proposed", cursor: "a+b", limit: 10 },
+      { userKey: "user-key", apiCall },
+    );
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].method, "GET");
+    assert.equal(calls[0].path, TUNING_DRAFTS_PATH);
+    assert.equal(calls[0].body, null);
+    assert.equal(
+      calls[1].path,
+      `${TUNING_DRAFTS_PATH}?project_id=${DRAFT_ID}&spec_id=triage&status=proposed&cursor=a%2Bb&limit=10`,
+    );
+  });
+
+  test("POSTs the PR to the draft's landed path, and nothing else", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: PR }, { userKey: "user-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.equal(calls[0].path, landedPath(DRAFT_ID));
+    assert.equal(calls[0].path, `/api/v1/tuning_drafts/${DRAFT_ID}/landed`);
+    assert.deepEqual(calls[0].body, { pr_url: PR });
+  });
+
+  test("refuses locally, sending nothing, with no user key or a malformed argument", async () => {
+    const { calls, apiCall } = fakeApi();
+    const deps = { userKey: "user-key", apiCall };
+
+    const refusals = [
+      await tuningDrafts({}, { apiCall }),
+      await tuningDrafts({ project_id: "nope" }, deps),
+      await tuningDrafts({ spec_id: "Bad Spec" }, deps),
+      await tuningDrafts({ status: "applied" }, deps),
+      await tuningDrafts({ cursor: 7 }, deps),
+      await tuningDrafts({ limit: 0 }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: PR }, { apiCall }),
+      await tuningDraftMarkLanded({ pr_url: PR }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: "https://evil.example/a/b/pull/1" }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: `${PR}\nX` }, deps),
+    ];
+
+    for (const result of refusals) {
+      assert.equal(result.error, true);
+      assert.equal(result.status, 0, "a local refusal must not claim a server answered");
+    }
+
+    assert.match(refusals[0].body, /LOOPCTL_USER_KEY/);
+    assert.equal(calls.length, 0);
+  });
+
+  test("the descriptions say loopctl never applies a draft, what is refused and which key", () => {
+    for (const name of ["tuning_drafts", "tuning_draft_mark_landed"]) {
+      const start = INDEX_SRC.indexOf(`name: "${name}"`);
+      assert.ok(start > -1, `${name} is not declared`);
+      const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+      assert.match(declaration, /NEVER|changes no template/);
+      assert.match(declaration, /LOOPCTL_USER_KEY/);
+      assert.match(declaration, /403/);
+    }
+
+    const landed = INDEX_SRC.indexOf('name: "tuning_draft_mark_landed"');
+    const declaration = INDEX_SRC.slice(landed, INDEX_SRC.indexOf("inputSchema:", landed));
+    assert.match(declaration, /409 not_proposed/);
+    assert.match(declaration, /422/);
+  });
+
+  test("both handlers take the exact user key, as the runner tools do", () => {
+    for (const [fn, call] of [
+      ["tuningDraftsRead", /tuningDrafts\(args, runnerDeps\(\)\)/],
+      ["tuningDraftLand", /tuningDraftMarkLanded\(args, runnerDeps\(\)\)/],
+    ]) {
+      const start = INDEX_SRC.indexOf(`async function ${fn}(`);
+      assert.ok(start > -1, `the ${fn} handler was not found`);
+      const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
+      assert.match(stripComments(INDEX_SRC.slice(start, end)), call);
+    }
+  });
+});
+
 describe("the wiring in index.js", () => {
   test("every delivery-loop tool is declared, dispatched TO ITS OWN HANDLER, and documented", () => {
     // The defect these tools exist for is a verb that exists and nothing calls. A tool
@@ -595,6 +693,8 @@ describe("the wiring in index.js", () => {
       force_unclaim_story: "forceUnclaimStory",
       merge_precondition: "mergePreconditionTool",
       reply_draft_list: "replyDraftListRead",
+      tuning_drafts: "tuningDraftsRead",
+      tuning_draft_mark_landed: "tuningDraftLand",
     };
 
     for (const [name, handler] of Object.entries(wiring)) {

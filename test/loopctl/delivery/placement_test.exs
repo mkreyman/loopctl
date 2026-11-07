@@ -1681,6 +1681,7 @@ defmodule Loopctl.Delivery.PlacementTest do
                :kind,
                :max_turns,
                :repo,
+               :spec_tune,
                :story,
                :story_id,
                :token_budget,
@@ -1688,6 +1689,26 @@ defmodule Loopctl.Delivery.PlacementTest do
                :verify,
                :wall_clock_seconds
              ]
+
+      # `spec_tune` (contract 1.30.0) is the fourth nested object, and the deepest: its traces
+      # carry loopctl's own failure codes and decisions, plus `untrusted`, story text through
+      # `Untrusted.render/2`. Nothing in it is a credential; a tuning dispatch mints no key.
+      spec_tune = RunnerContract.RunnerSpecTune.schema().properties
+      trace = spec_tune.traces.items.properties
+
+      assert spec_tune |> Map.keys() |> Enum.sort() ==
+               [:eval_set, :outcome_rows, :target, :template, :traces, :window]
+
+      assert trace |> Map.keys() |> Enum.sort() ==
+               [:agent_decision, :failures, :human_decision, :trace_id, :untrusted]
+
+      assert trace.human_decision.properties |> Map.keys() |> Enum.sort() == [:outcomes, :route]
+      assert trace.agent_decision.properties |> Map.keys() == [:outcome]
+
+      for ref <- [spec_tune.target, spec_tune.template],
+          do: assert(ref.properties |> Map.keys() |> Enum.sort() == [:id, :version])
+
+      assert spec_tune.window.properties |> Map.keys() |> Enum.sort() == [:since, :until]
 
       # `verify` (contract 1.28.0) is the third nested object: the pull request number and the
       # head sha to judge, both loopctl's own values off the stage row. Neither is a credential
