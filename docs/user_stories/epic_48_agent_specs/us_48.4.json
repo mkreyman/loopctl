@@ -1,0 +1,82 @@
+{
+  "id": "US-48.4",
+  "title": "The triage dispatch pass runs from its spec",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "the triage pass to be the :judge archetype driven by triage@1",
+    "so_that": "the next :judge agent reuses the pass instead of copying TriageDispatcher"
+  },
+  "rationale": "TriageDispatcher.run_with/2 hard-codes the payload, refs, transient and blocked classification, and the stranded sweep (triage_dispatcher.ex:323-447).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.4.1",
+      "description": "Loopctl.Agents.Dispatcher.run(spec, opts) runs a :judge pass: candidates, payload builder (:fenced_intake_report), refs (:base_as_branch), the too-large escalation, transient/blocked classification and the spec's sweeps ([:stranded_triaged])."
+    },
+    {
+      "id": "AC-48.4.2",
+      "description": "TriageDispatchWorker calls it with triage@1; the outcome summary it logs and the Runners.dispatch payload maps are byte-identical to today's on recorded fixtures."
+    },
+    {
+      "id": "AC-48.4.3",
+      "description": "The :dispatch_driver_enabled switch still stops the pass."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.4.1",
+      "verifies": [
+        "AC-48.4.2"
+      ],
+      "name": "same payloads",
+      "type": "integration",
+      "steps": [
+        "record today's dispatch payloads on a fixture corpus",
+        "run the spec-driven pass"
+      ],
+      "expected_results": [
+        "identical maps, dispatch_id aside"
+      ]
+    },
+    {
+      "id": "TC-48.4.2",
+      "verifies": [
+        "AC-48.4.2"
+      ],
+      "name": "same outcomes",
+      "type": "integration",
+      "steps": [
+        "run both passes over the corpus with no runner, one runner, and an exhausted runner"
+      ],
+      "expected_results": [
+        "identical outcome summaries"
+      ]
+    },
+    {
+      "id": "TC-48.4.3",
+      "verifies": [
+        "AC-48.4.3"
+      ],
+      "name": "switch off",
+      "type": "unit",
+      "steps": [
+        "disable :dispatch_driver_enabled",
+        "run the pass"
+      ],
+      "expected_results": [
+        "nothing dispatched"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Keep TriageDispatchWorker and its cron (oban_config.ex:691)."
+  ],
+  "dependencies": [
+    "US-48.3"
+  ]
+}

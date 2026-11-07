@@ -1,0 +1,108 @@
+{
+  "id": "US-48.9",
+  "title": "First new spec: reply_draft@1 drafts a reply to a support ticket triage set aside",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "medium",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "agency support operator",
+    "i_want_to": "a drafted reply for a ticket triage rejected or escalated",
+    "so_that": "I answer the customer faster without the loop sending anything in my name"
+  },
+  "rationale": "The proof that a new agent is a spec: the smallest custody surface (claims nothing, writes no repository, adds no stage edge) and it reuses triage's candidates and payload. Mark's defaults 2 and 3 in the PRD.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.9.1",
+      "description": "reply_draft@1 is a :draft spec: candidates are stories with an intake record carrying a ticket_id whose triage ended reject or escalated and which have no draft; payload :fenced_intake_report; screen :injection_detector_draft."
+    },
+    {
+      "id": "AC-48.9.2",
+      "description": "One new effect writes a reply_drafts row (tenant_id, RLS enabled, story_id, ticket_id, body, inserted_at); nothing in loopctl sends it."
+    },
+    {
+      "id": "AC-48.9.3",
+      "description": "A reply_draft_list MCP tool (and endpoint) reads drafts for a project; its description says drafts are never sent by loopctl and which key it needs."
+    },
+    {
+      "id": "AC-48.9.4",
+      "description": "The runner template reply_draft@1 is read-only (Read, Glob, Grep) and returns the draft through agent_result."
+    },
+    {
+      "id": "AC-48.9.5",
+      "description": "A draft that fails the injection screen is stored as refused with the screen code, never as a draft."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.9.1",
+      "verifies": [
+        "AC-48.9.1",
+        "AC-48.9.2"
+      ],
+      "name": "drafts a set-aside ticket",
+      "type": "integration",
+      "steps": [
+        "a ticket story whose triage was rejected",
+        "run the pass with a fake runner returning a draft"
+      ],
+      "expected_results": [
+        "one reply_drafts row",
+        "no stage change"
+      ]
+    },
+    {
+      "id": "TC-48.9.2",
+      "verifies": [
+        "AC-48.9.2"
+      ],
+      "name": "never sends",
+      "type": "integration",
+      "steps": [
+        "inspect outbound calls during the pass"
+      ],
+      "expected_results": [
+        "none"
+      ]
+    },
+    {
+      "id": "TC-48.9.3",
+      "verifies": [
+        "AC-48.9.5"
+      ],
+      "name": "injection screened",
+      "type": "integration",
+      "steps": [
+        "return a draft carrying an instruction-shaped payload"
+      ],
+      "expected_results": [
+        "row refused with the screen code"
+      ]
+    },
+    {
+      "id": "TC-48.9.4",
+      "verifies": [
+        "AC-48.9.2",
+        "AC-48.9.3"
+      ],
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": [
+        "two tenants' drafts",
+        "list as tenant A"
+      ],
+      "expected_results": [
+        "only tenant A's"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/tenancy-rls/SKILL.md for the new table (ENABLE ROW LEVEL SECURITY, not FORCE).",
+    "Document any new env var in deploy/FLY_SECRETS.md."
+  ],
+  "dependencies": [
+    "US-48.8"
+  ]
+}

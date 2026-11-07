@@ -1,0 +1,88 @@
+{
+  "id": "US-48.3",
+  "title": "One candidate builder from closed predicates",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "triage's and implement's candidate queries built from one predicate set",
+    "so_that": "a new spec picks its stories by listing predicates, not by writing a query"
+  },
+  "rationale": "TriageDispatcher.candidates (triage_dispatcher.ex:162-246) and DispatchDriver.candidates (dispatch_driver.ex:127-199) share ranking and most filters but are written twice.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.3.1",
+      "description": "Loopctl.Agents.Candidates.query(spec, opts) builds the query from the spec's predicate list, drawn from a closed set: {:stage, s}, :intake_record_required, :intake_record_optional, :single_active_source, :issue_not_closed, :requires_ticket_if_source_says, :no_live_dispatch_of_self, {:agent_status_in, list}, :dependencies_met; ranking :round_robin_project_tenant is shared."
+    },
+    {
+      "id": "AC-48.3.2",
+      "description": "On one fixture corpus covering every predicate (closed issue, ticket filter on and off, two active sources, a live dispatch, unmet story and epic dependencies, pending vs contracted, an authored story with no intake record), the new query returns the same ordered list as the old candidates/1 for both kinds."
+    },
+    {
+      "id": "AC-48.3.3",
+      "description": "TriageDispatcher.candidates/1 and DispatchDriver.candidates/1 delegate to the builder; their callers are unchanged."
+    },
+    {
+      "id": "AC-48.3.4",
+      "description": "Tenant isolation: tenant A's candidates never include tenant B's stories."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.3.1",
+      "verifies": [
+        "AC-48.3.2"
+      ],
+      "name": "triage equivalence",
+      "type": "integration",
+      "steps": [
+        "seed the corpus",
+        "run old and new triage queries"
+      ],
+      "expected_results": [
+        "identical ordered story ids"
+      ]
+    },
+    {
+      "id": "TC-48.3.2",
+      "verifies": [
+        "AC-48.3.2"
+      ],
+      "name": "implement equivalence",
+      "type": "integration",
+      "steps": [
+        "seed the corpus",
+        "run old and new implement queries"
+      ],
+      "expected_results": [
+        "identical ordered story ids"
+      ]
+    },
+    {
+      "id": "TC-48.3.3",
+      "verifies": [
+        "AC-48.3.4"
+      ],
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": [
+        "seed two tenants",
+        "query as tenant A"
+      ],
+      "expected_results": [
+        "no tenant B rows"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Keep the per-project ranking from #1019 and the closed-issue filter from #1022 as predicates, with their tests.",
+    "Load .claude/skills/tenancy-rls/SKILL.md."
+  ],
+  "dependencies": [
+    "US-48.2"
+  ]
+}
