@@ -874,16 +874,22 @@ defmodule Loopctl.Delivery.Stages do
   # ALONE, so alternating kinds still accumulate, and a verdict clears both together.
   #
   # The merge gate has one kind and therefore no total; its stored shape is unchanged.
+  #
+  # `stages` are where a count may be written. Post-deploy verification reads a pr-route
+  # story at `merged` as well as `deployed` (US-48.16), and the count is ONE clock across
+  # both: it is merge-keyed and `merged -> deployed` over `:forward` clears nothing, so a
+  # story that waited at `merged` and then reached `deployed` keeps its count rather than
+  # starting a fresh bound on top of the time it already spent.
   @counters %{
     merge_gate: %{
       column: :merge_gate_unevaluated,
-      stage: :ci,
+      stages: [:ci],
       event: "merge_gate_unevaluated",
       totalled_by: nil
     },
     post_deploy: %{
       column: :post_deploy_unresolved,
-      stage: :deployed,
+      stages: [:merged, :deployed],
       event: "post_deploy_unresolved",
       totalled_by: ["merge_sha"]
     }
@@ -945,8 +951,9 @@ defmodule Loopctl.Delivery.Stages do
   faster one's bound and escalated every story on the normal path. A run of forge faults
   followed by a run of waiting is two different conditions, so the second starts at 1.
 
-  Fenced by the claim epoch like every other write here, and refused off `deployed` — no
-  other stage runs this gate.
+  Fenced by the claim epoch like every other write here, and refused off `merged` and
+  `deployed` — no other stage runs this gate. `merged` is read for a pr-route story, which
+  the verifier carries to `deployed` itself (US-48.16); the count runs on across that edge.
 
   ## Options
 
@@ -984,7 +991,7 @@ defmodule Loopctl.Delivery.Stages do
 
   defp count_unresolved(counter, row, story, identity, opts) do
     if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
-    if row.stage != counter.stage, do: Repo.rollback(:wrong_stage)
+    if row.stage not in counter.stages, do: Repo.rollback(:wrong_stage)
 
     counts = next_counts(Map.fetch!(row, counter.column), identity, counter.totalled_by)
     value = identity |> Map.put("count", counts.count) |> put_total(counter, counts)

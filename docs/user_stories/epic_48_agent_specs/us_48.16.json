@@ -1,0 +1,74 @@
+{
+  "id": "US-48.16",
+  "title": "A pr-route build run reports its PR, CI and merge, and control carries it to verified",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "see a pr-route story move through reviewing, pr_open, ci and merged as its session works, then deployed and verified once the merge ships",
+    "so_that": "the issue and the reporter's ticket close with the right resolution on their own, the story is never re-dispatched after it merged, and implement@1's outcome row (US-48.12) can count a merge"
+  },
+  "rationale": "HCB #3922 (story ddb4fcc1), 2026-11-07: the pr-mode session opened PR #3938 at 11:12 and auto-merged it at 11:22, while loopctl still read the story as implementing. The runner reports only worktree and implementing (session.ex moduledoc: 'reports the two stages it can actually observe'); the GitHub webhook subscribes to issues only; nothing writes merged -> deployed (PostDeployVerification reads deployed only); and the shipped resolution fires only on deployed -> verified. So the issue and its ticket never close, US-48.12's implement@1 success (merged) is never recorded, and a completed session leaves the claim to lapse and the story to be re-queued.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.16.1",
+      "description": "When a pr-mode implement session ends, for any reason, the runner reads the session branch's pull request against the dispatch base from the forge and reports, in order and only as far as it observed, implementing -> reviewing -> pr_open (pr_number, head_sha) -> ci (head_sha) -> merged (merge_sha) over :forward, before it sends session_ended. A stage loopctl already holds is not re-sent; a refusal of one stage stops the sequence and is logged, never retried in a loop."
+    },
+    {
+      "id": "AC-48.16.2",
+      "description": "Every value reported comes from the forge's answer about the dispatch's own branch and base (PR number, head sha, merge commit sha), never from session text or a file the session wrote."
+    },
+    {
+      "id": "AC-48.16.3",
+      "description": "Control writes merged -> deployed: the post-deploy sweep reads stories at merged whose merge_sha a deployment of the target environment names, and writes deployed with that deployment's id as release_id, then judges deployed -> verified as today. A merged story with no such deployment waits inside the existing bounds and escalates at them as a deployed one does."
+    },
+    {
+      "id": "AC-48.16.4",
+      "description": "deployed -> verified on a story that came from an intake record closes the GitHub issue through IssueCloser with the shipped resolution, so the reporter's ticket is told through the existing label-first path."
+    },
+    {
+      "id": "AC-48.16.5",
+      "description": "A thread-mode session reports nothing new: its stages stay with loopctl's merge executor."
+    },
+    {
+      "id": "AC-48.16.6",
+      "description": "Tenant isolation: the sweep never reads or advances another tenant's story."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.16.1",
+      "verifies": ["AC-48.16.1", "AC-48.16.2"],
+      "name": "a merged pull request is reported up to merged before session_ended",
+      "type": "unit",
+      "steps": ["end a pr-mode session whose branch has a merged pull request (fake forge)"],
+      "expected_results": ["stage messages implementing->reviewing->pr_open->ci->merged carrying the forge's pr_number, head_sha and merge_sha", "session_ended sent after them"]
+    },
+    {
+      "id": "TC-48.16.2",
+      "verifies": ["AC-48.16.1"],
+      "name": "an open pull request with green CI stops at ci; none stops at implementing",
+      "type": "unit",
+      "steps": ["end a session whose PR is open", "end one with no PR"],
+      "expected_results": ["reported through ci only", "nothing beyond implementing"]
+    },
+    {
+      "id": "TC-48.16.3",
+      "verifies": ["AC-48.16.3", "AC-48.16.4", "AC-48.16.6"],
+      "name": "a merged story whose merge_sha is deployed reaches verified and its issue closes",
+      "type": "integration",
+      "steps": ["a story at merged with merge_sha S and an intake record", "the forge mock lists a successful deployment of S", "run the sweep"],
+      "expected_results": ["merged -> deployed -> verified", "one issue closure recorded with verdict shipped", "a second tenant's merged story is untouched"]
+    }
+  ],
+  "technical_notes": [
+    "The runner reaches the forge with the gh CLI the session already uses; no new credential.",
+    "loopctl's forge reads for a pr-mode repository need its (tenant, repository) pair in VERIFICATION_OPERATOR_TOKEN_TENANTS or a tenant token (deploy/FLY_SECRETS.md).",
+    "Load .claude/skills/chain-of-custody/SKILL.md: the reported edges are all runner-reportable (StageMachine.runner_transitions/0); merged -> deployed is written by control."
+  ],
+  "dependencies": ["US-48.12"]
+}

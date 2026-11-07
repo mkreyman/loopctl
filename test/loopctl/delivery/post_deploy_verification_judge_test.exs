@@ -17,6 +17,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
   alias Loopctl.Delivery.PostDeployVerification
   alias Loopctl.Delivery.PostDeployVerification.Result
   alias Loopctl.Delivery.Resolution
+  alias Loopctl.Delivery.StageMachine
 
   @repo "acme/widgets"
   @merge String.duplicate("a", 40)
@@ -343,6 +344,30 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
     assert PostDeployVerification.failure_transition() ==
              {:deployed, :escalated, :verification_failed}
 
+    # US-48.16: a pr-route story is read at `merged` too. Its deploy is control's to write,
+    # and a failure there escalates from `merged` over the SAME edge.
+    assert PostDeployVerification.deploy_transition() == {:merged, :deployed, :forward}
+
+    assert PostDeployVerification.failure_transition(:merged) ==
+             {:merged, :escalated, :verification_failed}
+
+    assert PostDeployVerification.failure_transition(:deployed) ==
+             PostDeployVerification.failure_transition()
+
+    for {_from, _to, _edge} = t <- [
+          PostDeployVerification.deploy_transition(),
+          PostDeployVerification.failure_transition(:merged)
+        ] do
+      assert t in StageMachine.transitions(), inspect(t)
+    end
+
+    # The failure is control's verdict, never a runner's to report — from either stage.
+    refute StageMachine.runner_reportable?(
+             :merged,
+             :escalated,
+             :verification_failed
+           )
+
     for kind <- [:forge_fault, :deploy_pending] do
       assert PostDeployVerification.max_consecutive_unresolved(kind) > 0
     end
@@ -357,8 +382,42 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
 
   # -- helpers -----------------------------------------------------------------------------
 
+  describe "the stage the verdict is reached at (US-48.16)" do
+    test "is carried on the result, so the writer knows which edge to take" do
+      assert %Result{stage: :merged} = judge(stage: :merged, deployments: [])
+      assert %Result{stage: :deployed} = judge(stage: :deployed, deployments: [])
+    end
+
+    test "defaults to deployed for facts that do not name one" do
+      result =
+        PostDeployVerification.judge(%{
+          repo: {:ok, @repo},
+          environment: "production",
+          merge_sha: @merge,
+          merged_at: {:ok, @merged_at},
+          deployments: {:ok, %{deployments: [], incomplete: nil}}
+        })
+
+      assert result.stage == :deployed
+    end
+
+    test "the judgement is the SAME at merged as at deployed" do
+      for deployments <- [
+            [],
+            [deployment(contains: true)],
+            [deployment(contains: true, state: :failure)],
+            [deployment(contains: false)]
+          ] do
+        at_merged = judge(stage: :merged, deployments: deployments)
+        at_deployed = judge(stage: :deployed, deployments: deployments)
+        assert %{at_merged | stage: :deployed} == at_deployed
+      end
+    end
+  end
+
   defp judge(opts) do
     PostDeployVerification.judge(%{
+      stage: Keyword.get(opts, :stage, :deployed),
       repo: Keyword.get(opts, :repo, {:ok, @repo}),
       environment: "production",
       merge_sha: Keyword.get(opts, :merge_sha, @merge),

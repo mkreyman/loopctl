@@ -1,0 +1,57 @@
+{
+  "id": "US-48.17",
+  "title": "A pr-route merge waits for the merge gate's allow",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "have a pr-route session stop at a green pull request and have it merged only after loopctl's merge precondition records an allow for its head",
+    "so_that": "Gate A, Gate B over the real diff, custody and the 12-file / 1000-line bound judge every unattended merge, as they already do on the thread route"
+  },
+  "rationale": "HCB PR #3938 (2026-11-07) merged on the session's own word: the runner's pr-mode prompt says 'merge on green' (loopctl-runner dispatch_prompt.ex finish/4), and merge_precondition is exact_role [:orchestrator, :user], so a session cannot call it. Triage ran both gates over the request, but nothing judged the diff that shipped. StageMachine's note above @runner_transitions says who performs the merge 'is undecided in the design'; this story decides it for the pr route: control decides, the runner executes.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.17.1",
+      "description": "The pr-mode prompt tells the session to open the pull request, review, fix and wait for green CI, and NOT to merge; a claude-config hook refuses gh pr merge (including --auto) in a loop-mode session (hooks/lib/loop-mode.sh predicate)."
+    },
+    {
+      "id": "AC-48.17.2",
+      "description": "For a story at ci on a pr-mode source, a unique-per-story control job runs MergePrecondition over the recorded head; on allow it sends the runner holding the claim a merge instruction naming pr_number and head_sha (new contract message), the runner merges with gh pr merge --squash --match-head-commit and reports ci -> merged with the merge_sha; on refuse the story is escalated as today."
+    },
+    {
+      "id": "AC-48.17.3",
+      "description": "The claim does not lapse while the story waits at ci for the gate: the runner renews it, bounded by the dispatch cap, and a story whose runner is gone is escalated rather than re-queued."
+    },
+    {
+      "id": "AC-48.17.4",
+      "description": "A merge with no allow recorded for its head (a session that merged anyway) is escalated as an ungated merge when it is reported, never silently accepted."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.17.1",
+      "verifies": ["AC-48.17.2"],
+      "name": "allow leads to one runner merge and merged",
+      "type": "integration",
+      "steps": ["a story at ci with a green head", "MergePrecondition allows", "the runner acks the merge with a merge_sha"],
+      "expected_results": ["one merge instruction sent", "ci -> merged with that merge_sha"]
+    },
+    {
+      "id": "TC-48.17.2",
+      "verifies": ["AC-48.17.4"],
+      "name": "an ungated merge is escalated",
+      "type": "integration",
+      "steps": ["report ci -> merged for a head with no merge_gate_allowed_sha"],
+      "expected_results": ["escalated, reason names the ungated merge"]
+    }
+  ],
+  "technical_notes": [
+    "Contract: a new control -> runner message; runner contract minor bump.",
+    "Load .claude/skills/chain-of-custody/SKILL.md before touching the stage machine or the merge gate."
+  ],
+  "dependencies": ["US-48.16"]
+}

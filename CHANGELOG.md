@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Pull-request stories now close their GitHub issue after the deploy (US-48.16,
+  2026-11-07).** Post-deploy verification also reads stories at `merged`: once a successful
+  deployment carries the merge commit it writes `deployed` (the deployment id as
+  `release_id`), verifies, and the issue is closed `shipped`. A merged story with no such
+  deployment escalates `verification_failed` at the existing bounds. A pr-mode repository
+  needs its `(tenant, repository)` pair in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, or a tenant
+  token, for these reads; without one its merged stories wait and then escalate.
 - **`POST /api/v1/stories/:id/stage/resolve` accepts `to: detected` (2026-11-07).** A human can
   now send a story that triage escalated back to be triaged again; its old triage dispatch is
   unbound. A story an implementer was assigned or worked is refused 409 `not_retriageable`,

@@ -136,7 +136,9 @@ The exact glob lists live in the operator's knowledge base (article `4a86157b`),
 
 ## 7. After the merge
 
+- **`merged` to `deployed`, for a pull-request story:** a pull-request session reports up to `merged` and ends. `PostDeployVerification` then reads the story at `merged`: when a successful deployment of the target environment carries the merge commit, it writes `deployed` itself, with that deployment's id as `release_id`, and goes straight on to verify. A story with no such deployment waits at `merged` inside the same bounds a `deployed` story waits in, and escalates from `merged` over `verification_failed` when they run out. A chg story (one with a change binding) is not read at `merged`: chg reports its own `deployed`.
 - **`deployed` to `verified`, or to `escalated`:** `PostDeployVerification` compares the merge commit with the repository's deployment records.
+- **Forge access:** these reads need a token for the repository: its `(tenant, repository)` pair in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, or a tenant token ([deploy/FLY_SECRETS.md](../deploy/FLY_SECRETS.md)). Without one the story waits as a forge fault and escalates at that bound.
 - **`verified` to `done`:** `Loopctl.Delivery.Completion` moves the story on once its GitHub issue is closed, or once it has no issue to close.
 - **Closing the issue:** `IntakeIssueCloseWorker` closes the reporter's issue with a resolution label. An escalated story closes nothing.
 

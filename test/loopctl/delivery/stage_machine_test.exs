@@ -140,6 +140,11 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # commit — a comparison the session cannot see.
     refute {:deployed, :escalated, :verification_failed} in reportable
     refute StageMachine.runner_reportable?(:deployed, :escalated, :verification_failed)
+    # US-48.16: control also reads a pr-route story at `merged`, and escalates it from there
+    # over the same verdict. `merged` IS a runner source stage, so only the edge allowlist
+    # keeps this one off the wire — which is exactly what this pins.
+    refute {:merged, :escalated, :verification_failed} in reportable
+    refute StageMachine.runner_reportable?(:merged, :escalated, :verification_failed)
 
     # And `failed` is terminal with NO way out, `:human_resolution` included, so a runner
     # able to report `:budget_exceeded` could park a story for good.
@@ -152,6 +157,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     for triple <- [
           {:ci, :escalated, :merge_gate},
           {:deployed, :escalated, :verification_failed},
+          {:merged, :escalated, :verification_failed},
           {:implementing, :failed, :budget_exceeded}
         ] do
       assert triple in StageMachine.transitions(), inspect(triple)

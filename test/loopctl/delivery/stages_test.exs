@@ -692,7 +692,28 @@ defmodule Loopctl.Delivery.StagesTest do
       assert row.merge_gate_unevaluated == %{"head_sha" => @sha_a, "count" => 1}
     end
 
-    test "is refused off the deployed stage — no other stage runs this gate" do
+    test "is written at merged too, and runs on across merged -> deployed (US-48.16)" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:ci, :merged},
+          claim_epoch: story.claim_epoch,
+          actor_lineage: [],
+          effects: [merge_sha: @sha_a]
+        )
+
+      assert {:ok, %{count: 1}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, %{count: 2}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:merged, :deployed}, opts)
+
+      # ONE clock from the merge: the forward edge into `deployed` clears nothing.
+      assert {:ok, %{count: 3, total: 3}} =
+               note_post_deploy(story, @sha_a, :deploy_pending, opts)
+    end
+
+    test "is refused off the merged and deployed stages — no other stage runs this gate" do
       {story, _row} = at_stage(:ci)
 
       assert {:error, :wrong_stage} =

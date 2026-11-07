@@ -23,7 +23,9 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:ci_red` — ci -> implementing
   - `:review_findings` — reviewing -> implementing
   - `:base_moved` — merge conflict or base moved: pr_open | ci -> implementing
-  - `:verification_failed` — post-deploy verification failing: deployed -> escalated
+  - `:verification_failed` — post-deploy verification failing: deployed | merged ->
+    escalated. From `merged` for a pr-route story, which control carries to `deployed`
+    itself (US-48.16) and so may judge before it gets there
   - `:triage_escalate` — triaged -> escalated, the triage trio's `escalate` verdict
     (design §4), including the disagreement that escalates by construction
   - `:triage_reject` — triaged -> failed, the triage trio's `reject` verdict (design §4):
@@ -256,6 +258,13 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:pr_open, :implementing, :base_moved},
                    {:ci, :implementing, :base_moved},
                    {:deployed, :escalated, :verification_failed},
+                   # US-48.16: control also reads a pr-route story at `merged` (its runner
+                   # reports up to the merge and stops), writing `merged -> deployed` once a
+                   # deployment carries the merge. A verdict reached BEFORE that — no deploy
+                   # inside the bounds, or one that failed — escalates from `merged`, over the
+                   # same control-only edge. `merged` is a runner SOURCE stage, so only the edge
+                   # allowlist (`@runner_reportable_edges`) keeps this off the wire.
+                   {:merged, :escalated, :verification_failed},
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
@@ -325,9 +334,10 @@ defmodule Loopctl.Delivery.StageMachine do
   #
   # So: a runner may report what its own session did and control can independently check,
   # plus its own escalation, which stops the loop rather than advancing it. A story therefore
-  # WAITS at `deployed` for control to decide verified-or-escalated, and no writer for that
-  # exists yet — an unimplemented control path, chosen deliberately over a session certifying
-  # itself.
+  # WAITS for control to decide verified-or-escalated — at `deployed`, or at `merged` when its
+  # session stopped at the merge (a pr-route session, US-48.16) — and the writer of that
+  # decision is `Loopctl.Delivery.PostDeployVerification`, which also writes
+  # `merged -> deployed` itself once a deployment carries the merge.
   #
   # One residual asymmetry, named rather than hidden: `ci -> merged` is reportable while
   # `ci -> escalated` over `:merge_gate` is not, so the merge gate's positive outcome is a
