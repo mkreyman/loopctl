@@ -195,9 +195,11 @@ defmodule Loopctl.Agents.Spec do
     # predicted touches.
     :gate_a,
     :gate_b,
-    # `TriageVerdict.unflagged/1`: the drafted story scanned for `draft_signals/0`.
+    # `TriageVerdict`'s `:draft_injection` screen: the drafted story scanned for
+    # `draft_signals/0`.
     :draft_injection,
-    # `TriageVerdict.dispatchable/2`: the draft judged as a dispatch will judge it.
+    # `TriageVerdict`'s `:draft_dispatchable` screen: the draft judged as a dispatch will judge
+    # it.
     :draft_dispatchable,
     # `StoryPayload.build/3` parking a story the contract cannot describe.
     :story_not_dispatchable
@@ -291,6 +293,22 @@ defmodule Loopctl.Agents.Spec do
   @doc "The archetypes."
   @spec archetypes() :: [archetype()]
   def archetypes, do: @archetypes
+
+  @doc """
+  Every screen name a spec may give a route: the closed set its `screens` keys are checked
+  against when it compiles. `triage@1`'s are run by the code that names them:
+  `Loopctl.Agents.Dispatcher` (`:payload_too_large`) and `Loopctl.Delivery.TriageVerdict`
+  (`TriageVerdict.screens/0`, US-48.5).
+  """
+  @spec screen_names() :: [atom()]
+  def screen_names, do: @screens
+
+  @doc """
+  Every effect name a spec may list: the closed set its `effects` are checked against when it
+  compiles, before the archetype narrows it (`allowed_effects/1`).
+  """
+  @spec effect_names() :: [atom()]
+  def effect_names, do: @effects
 
   @doc """
   Whether a dispatch HOLDS A CLAIM on its story: its spec's archetype is `:build` (US-48.6).

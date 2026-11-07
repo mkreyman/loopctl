@@ -9,7 +9,8 @@ defmodule Loopctl.Agents.Registry do
   Read for each spec's `candidates`: `TriageDispatcher.candidates/1` and
   `DispatchDriver.candidates/1` are `Loopctl.Agents.Candidates.query/2` over their spec
   (US-48.3). The triage dispatch pass runs from `triage@1` through `Loopctl.Agents.Dispatcher`
-  (US-48.4), and so does the implement pass from `implement@1` (US-48.7). Read for each kind's
+  (US-48.4), and so does the implement pass from `implement@1` (US-48.7). The triage result is
+  routed from `triage@1` by `Loopctl.Delivery.TriageVerdict` (US-48.5). Read for each kind's
   archetype and budgets (US-48.6): `Spec.holds_claim?/1` is the one claim-holding predicate
   the dispatch ledger and `Placement` ask — including `Placement.place/4`'s refusal of a kind
   that is not a `:build` — and

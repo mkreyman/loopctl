@@ -4,9 +4,9 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
 
   The DISPATCH half is read: `Loopctl.Agents.Dispatcher.run/2` runs the pass from `candidates`
   (US-48.3), `payload`, `refs`, `budgets`, `kind`, `sweeps` and the `:payload_too_large` screen
-  (US-48.4). The RESULT half still lives in `Loopctl.Delivery.TriageVerdict` (the outcome
-  routes, the gate and draft screens, the draft); `Loopctl.Agents.RegistryTest` holds the two
-  equal until a later story moves it onto this description.
+  (US-48.4). The RESULT half is read too: `Loopctl.Delivery.TriageVerdict.apply/4` routes each
+  outcome by `outcomes`, takes each verdict screen's route from `screens` and applies `effects`
+  by name (US-48.5).
 
   - **Claims nothing.** The dispatch echoes the story's current `claim_epoch`.
   - **Every outcome passes through `triaged` first**, and the transition out of it is
