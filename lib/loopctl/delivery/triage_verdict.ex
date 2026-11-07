@@ -198,6 +198,24 @@ defmodule Loopctl.Delivery.TriageVerdict do
   def outcomes, do: @routes |> Map.keys() |> Enum.sort()
 
   @doc """
+  The route table itself: each outcome and the transitions it takes OUT of `triaged`, without
+  the shared triage step `transitions_for/1` prepends.
+
+  Public so `Loopctl.Agents.RegistryTest` can hold `triage@1`'s outcomes equal to it.
+  """
+  @spec routes() :: %{String.t() => [transition()]}
+  def routes, do: @routes
+
+  @doc """
+  The transitions an `incomplete` triage message implies, in order: the triage step, then the
+  same escalation an `escalate` verdict takes. Every incomplete reason routes this way.
+
+  Public for the same reason as `routes/0`; `apply/3` routes an incomplete message through it.
+  """
+  @spec incomplete_transitions() :: [transition(), ...]
+  def incomplete_transitions, do: [@triaged, @escalate]
+
+  @doc """
   True when the verdict's outcome ends the story rather than passing it on.
 
   `escalate` and `reject` both terminate this loop's automatic handling; `story` is the only
@@ -309,7 +327,8 @@ defmodule Loopctl.Delivery.TriageVerdict do
     # EVERY incomplete reason escalates. A triage run that produced nothing usable needs a
     # human, which is what `escalate` means; the enum exists so an operator can tell a crash
     # from a refused verdict, not so they route differently.
-    {:ok, @escalate}
+    [@triaged, leave] = incomplete_transitions()
+    {:ok, leave}
   end
 
   # Every route is the triage step and then ONE transition out of `triaged`, and the pass is

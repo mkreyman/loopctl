@@ -440,8 +440,15 @@ defmodule Loopctl.Delivery.DispatchPayload do
     end
   end
 
-  defp budget_keys("triage"), do: {:triage_wall_clock_seconds, :triage_max_turns}
-  defp budget_keys(_implement), do: {:dispatch_wall_clock_seconds, :dispatch_max_turns}
+  @doc """
+  The `{wall_clock_key, max_turns_key}` config pair a dispatch of `kind` spends against.
+
+  Public so `Loopctl.Agents.RegistryTest` can hold each agent spec's `budgets` equal to the
+  pair this module actually reads; `fill_budgets/2` is its only caller in `lib/`.
+  """
+  @spec budget_keys(String.t()) :: {atom(), atom()}
+  def budget_keys("triage"), do: {:triage_wall_clock_seconds, :triage_max_turns}
+  def budget_keys(_implement), do: {:dispatch_wall_clock_seconds, :dispatch_max_turns}
 
   defp budget(key), do: DispatchDriver.normalise_budget(Application.get_env(:loopctl, key), key)
 
