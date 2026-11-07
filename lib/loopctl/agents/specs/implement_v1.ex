@@ -2,10 +2,11 @@ defmodule Loopctl.Agents.Specs.ImplementV1 do
   @moduledoc """
   `implement@1`, a `:build`: today's implement dispatch, transcribed (US-48.2).
 
-  Nothing in `lib/` reads this yet. The behaviour lives in `Loopctl.Delivery.DispatchDriver`
-  (candidates, eligibility, budgets) and `Loopctl.Delivery.Placement` (the claim, the session
-  dispatch, the payload); `Loopctl.Agents.RegistryTest` holds the two equal until later stories
-  move the behaviour onto this description.
+  `candidates` is READ: `DispatchDriver.candidates/1` is `Loopctl.Agents.Candidates.query/2`
+  over it (US-48.3). The rest of the behaviour still lives in `Loopctl.Delivery.DispatchDriver`
+  (eligibility, budgets) and `Loopctl.Delivery.Placement` (the claim, the session dispatch, the
+  payload); `Loopctl.Agents.RegistryTest` holds the two equal until later stories move it onto
+  this description.
 
   - **Claims the story and mints a session dispatch**, binding `implementer_dispatch_id`. That
     is archetype semantics and stays code (`Placement.place/4`): the claim's
@@ -28,13 +29,14 @@ defmodule Loopctl.Agents.Specs.ImplementV1 do
     kind: "implement",
     candidates: %{
       predicates: [
-        :stage_queued,
-        :agent_status_pending_or_contracted,
+        {:stage, :queued},
+        {:agent_status_in, [:pending, :contracted]},
         :dependencies_met,
-        :one_active_intake_source,
+        :single_active_source,
+        :intake_record_optional,
         :issue_not_closed
       ],
-      order: :oldest_per_project_round_robin_projects_then_tenants
+      order: :round_robin_project_tenant
     },
     sweeps: %{},
     payload: :story_payload,

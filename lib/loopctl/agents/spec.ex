@@ -54,7 +54,8 @@ defmodule Loopctl.Agents.Spec do
   - `id`, `version` — the spec's name; `{id, version}` is unique in the registry.
   - `archetype` — `:judge | :build | :draft`.
   - `kind` — the dispatch kind, one of `RunnerContract.Kinds.all/0`.
-  - `candidates` — `%{predicates: [predicate], order: order}`, named from closed sets.
+  - `candidates` — `%{predicates: [predicate], order: order}`, from the closed set
+    `Loopctl.Agents.Candidates` builds the candidate read from.
   - `sweeps` — `%{sweep => route}`: control passes that finish a half-taken story.
   - `payload` — the payload builder the dispatch carries.
   - `refs` — for each `RunnerDispatch.ref_fields/0` key, where its value comes from.
@@ -74,6 +75,7 @@ defmodule Loopctl.Agents.Spec do
   result (one transition per message).
   """
 
+  alias Loopctl.Agents.Candidates
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.StageMachine
 
@@ -108,7 +110,7 @@ defmodule Loopctl.Agents.Spec do
           version: pos_integer(),
           archetype: archetype(),
           kind: String.t(),
-          candidates: %{predicates: [atom()], order: atom()},
+          candidates: Candidates.candidates(),
           sweeps: %{optional(atom()) => route()},
           payload: atom(),
           refs: keyword(atom()),
@@ -125,32 +127,8 @@ defmodule Loopctl.Agents.Spec do
 
   @archetypes [:judge, :build, :draft]
 
-  # The candidate predicates today's two `candidates/1` queries are built from
-  # (`TriageDispatcher.candidates/1`, `DispatchDriver.candidates/1`). US-48.3 builds one query
-  # from these names; until then they are descriptions only.
-  @candidate_predicates [
-    # `story_stages.stage = detected` / `= queued`.
-    :stage_detected,
-    :stage_queued,
-    # The story was filed from an intake record (an inner join).
-    :from_intake_record,
-    # Under a project bound to exactly ONE unrevoked intake source.
-    :one_active_intake_source,
-    # No unreleased ledger row of the spec's kind for the story.
-    :no_unreleased_dispatch_of_kind,
-    # A source with `triage_requires_ticket` admits only a record carrying a `ticket_id`.
-    :ticket_when_source_requires,
-    # The issue's latest delivered state is not `closed` (NULL passes).
-    :issue_not_closed,
-    # `agent_status` is `pending` or `contracted`.
-    :agent_status_pending_or_contracted,
-    # No unmet story or epic dependency (`Loopctl.WorkBreakdown.Dependencies`).
-    :dependencies_met
-  ]
-
-  # Oldest first within a project, every project's oldest before any project's second, every
-  # tenant's first before any tenant's second.
-  @candidate_orders [:oldest_per_project_round_robin_projects_then_tenants]
+  # The candidate predicates and their ranking are `Loopctl.Agents.Candidates`' closed set
+  # (US-48.3): that module builds the read from them, and its `validate/1` is the check here.
 
   # `TriageDispatcher.stranded/1`: a story at `triaged` with no verdict, no binding and no live
   # dispatch, left there by the too-large route's second transaction failing.
@@ -403,19 +381,12 @@ defmodule Loopctl.Agents.Spec do
   defp keys_of(label, field, value, _allowed),
     do: {:error, "#{label}: #{field} must be a map, got #{inspect(value)}"}
 
-  defp candidates(label, %{predicates: predicates, order: order} = candidates)
-       when map_size(candidates) == 2 do
-    with :ok <-
-           subset_of(label, :"candidates.predicates", predicates, @candidate_predicates,
-             non_empty: true
-           ),
-         do: one_of(label, :"candidates.order", order, @candidate_orders)
+  defp candidates(label, candidates) do
+    case Candidates.validate(candidates) do
+      :ok -> :ok
+      {:error, message} -> {:error, "#{label}: #{message}"}
+    end
   end
-
-  defp candidates(label, value),
-    do:
-      {:error,
-       "#{label}: candidates must be %{predicates: [...], order: ...}, got #{inspect(value)}"}
 
   # Exactly the contract's ref fields, each with a known source.
   defp refs(label, refs) do

@@ -2,10 +2,11 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
   @moduledoc """
   `triage@1`, a `:judge`: today's triage dispatch, transcribed (US-48.2).
 
-  Nothing in `lib/` reads this yet. The behaviour lives in `Loopctl.Delivery.TriageDispatcher`
-  (candidates, the stranded sweep, the payload, the budgets) and `Loopctl.Delivery.TriageVerdict`
-  (routes, screens, the draft); `Loopctl.Agents.RegistryTest` holds the two equal until later
-  stories move the behaviour onto this description.
+  `candidates` is READ: `TriageDispatcher.candidates/1` is `Loopctl.Agents.Candidates.query/2`
+  over it (US-48.3). The rest of the behaviour still lives in `Loopctl.Delivery.TriageDispatcher`
+  (the stranded sweep, the payload, the budgets) and `Loopctl.Delivery.TriageVerdict` (routes,
+  screens, the draft); `Loopctl.Agents.RegistryTest` holds the two equal until later stories
+  move it onto this description.
 
   - **Claims nothing.** The dispatch echoes the story's current `claim_epoch`.
   - **Every outcome passes through `triaged` first**, and the transition out of it is
@@ -24,14 +25,14 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
     kind: "triage",
     candidates: %{
       predicates: [
-        :stage_detected,
-        :from_intake_record,
-        :one_active_intake_source,
-        :no_unreleased_dispatch_of_kind,
-        :ticket_when_source_requires,
+        {:stage, :detected},
+        :intake_record_required,
+        :single_active_source,
+        :no_live_dispatch_of_self,
+        :requires_ticket_if_source_says,
         :issue_not_closed
       ],
-      order: :oldest_per_project_round_robin_projects_then_tenants
+      order: :round_robin_project_tenant
     },
     sweeps: %{
       stranded_triaged_unbound: [

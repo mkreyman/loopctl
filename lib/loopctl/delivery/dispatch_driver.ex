@@ -77,17 +77,15 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   import Ecto.Query
 
+  alias Loopctl.Agents.Candidates
+  alias Loopctl.Agents.Specs.ImplementV1
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.Placement
-  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
-  alias Loopctl.Intake.Record
-  alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Selection
-  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
@@ -121,81 +119,23 @@ defmodule Loopctl.Delivery.DispatchDriver do
   finds the `queued` rows in order. The per-project window then sorts only those rows, since the
   project is on `stories`, which is the queue's size and not the table's.
 
+  ## Built from the spec (US-48.3)
+
+  The read is `Loopctl.Agents.Candidates.query/2` over `implement@1`'s predicate list
+  (`Loopctl.Agents.Specs.ImplementV1`): `{:stage, :queued}`,
+  `{:agent_status_in, [:pending, :contracted]}` (`pending` too because `Placement` contracts a
+  pending story before it mints, #884), `:dependencies_met`, `:single_active_source`,
+  `:intake_record_optional` (an authored story has no record and stays a candidate) and
+  `:issue_not_closed` (#1022), ranked `:round_robin_project_tenant` (#1019). Each predicate's
+  reasoning lives on its clause in `Loopctl.Agents.Candidates`.
+
   Public so the selection is falsifiable rather than buried in the pass.
   """
   @spec candidates(pos_integer()) :: [candidate()]
   def candidates(limit) when is_integer(limit) and limit > 0 do
-    # ONE ACTIVE INTAKE SOURCE, in the predicate rather than discovered per story. A project
-    # with none has no repository and a project with two names no single one, so every story
-    # under it is `:blocked` — and a blocked story's `updated_at` never moves, which put it at
-    # the head of an oldest-first queue for ever. Twenty of them filled every pass's batch
-    # while the job reported a clean run: the same trap the `contracted` predicate closed for
-    # released stories, left open for the class this driver's own reporting introduced.
-    bound_projects =
-      from src in Source,
-        where: is_nil(src.revoked_at),
-        group_by: [src.tenant_id, src.project_id],
-        having: count(src.id) == 1,
-        select: %{tenant_id: src.tenant_id, project_id: src.project_id}
-
-    # A story whose dependencies are unmet is NOT a candidate: `Placement` refuses it before it
-    # mints, so selected it would be refused on every pass, its `updated_at` frozen at the head
-    # of the oldest-first ranking. The claim's own definition (`Dependencies`), not a copy. A
-    # story left out here is still visible as blocked (`Queries.list_blocked_stories/2`).
-    ranked_in_project =
-      from s in StoryStage,
-        join: st in Story,
-        as: :story,
-        on: st.id == s.story_id and st.tenant_id == s.tenant_id,
-        join: b in subquery(bound_projects),
-        on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
-        # A story filed from an issue that has since CLOSED is not implemented: the issue was
-        # finished or withdrawn after triage queued it. A story with no intake record (an
-        # authored one) is unaffected.
-        left_join: rec in Record,
-        on: rec.id == st.intake_record_id and rec.tenant_id == st.tenant_id,
-        where: is_nil(rec.issue_state) or rec.issue_state != "closed",
-        where: s.stage == :queued,
-        # `pending` too: `Placement` contracts a pending story before it mints (#884).
-        where: st.agent_status in [:pending, :contracted],
-        where: not exists(Dependencies.unmet_story_dependencies()),
-        where: not exists(Dependencies.unmet_epic_dependencies()),
-        select: %{
-          tenant_id: s.tenant_id,
-          story_id: s.story_id,
-          updated_at: s.updated_at,
-          project_rank:
-            over(row_number(),
-              partition_by: [st.tenant_id, st.project_id],
-              order_by: [asc: s.updated_at, asc: s.story_id]
-            )
-        }
-
-    # ROUND-ROBIN ACROSS A TENANT'S PROJECTS, then across tenants: every project's oldest story
-    # outranks any project's second. Whether a runner accepts a story's repository is decided
-    # per story, after this read, so a project no runner takes keeps its rows at the head of a
-    # plain oldest-first ranking and the same batch comes back every pass; a project behind it
-    # is never reached. `TriageDispatcher.candidates/1` hit exactly that on 2026-11-06 and
-    # ranks the same way.
-    ranked =
-      from p in subquery(ranked_in_project),
-        select: %{
-          tenant_id: p.tenant_id,
-          story_id: p.story_id,
-          updated_at: p.updated_at,
-          rank:
-            over(row_number(),
-              partition_by: p.tenant_id,
-              order_by: [asc: p.project_rank, asc: p.updated_at, asc: p.story_id]
-            )
-        }
-
-    Loopctl.AdminRepo.all(
-      from r in subquery(ranked),
-        order_by: [asc: r.rank, asc: r.updated_at, asc: r.story_id],
-        limit: ^limit,
-        select: %{tenant_id: r.tenant_id, story_id: r.story_id, updated_at: r.updated_at}
-    )
+    ImplementV1.spec()
+    |> Candidates.query(limit: limit)
+    |> Loopctl.AdminRepo.all()
   end
 
   @doc """

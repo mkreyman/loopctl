@@ -61,14 +61,14 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   import Ecto.Query
 
+  alias Loopctl.Agents.Candidates
+  alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriagePayload
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.GitRef
   alias Loopctl.Intake
-  alias Loopctl.Intake.Record
-  alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchRecord
@@ -156,93 +156,22 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     reservation whose session outran its wall clock, so a dead triage session stops excluding
     its story and the next pass sends a fresh dispatch.
 
+  ## Built from the spec (US-48.3)
+
+  The read is `Loopctl.Agents.Candidates.query/2` over `triage@1`'s predicate list
+  (`Loopctl.Agents.Specs.TriageV1`): `{:stage, :detected}`, `:intake_record_required`,
+  `:single_active_source`, `:no_live_dispatch_of_self`, `:requires_ticket_if_source_says`
+  (#1018) and `:issue_not_closed` (#1022), ranked `:round_robin_project_tenant` (#1019). Each
+  predicate's reasoning lives on its clause in `Loopctl.Agents.Candidates`.
+
   Public so the selection is falsifiable rather than buried in the pass.
   """
   @spec candidates(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
   def candidates(limit) when is_integer(limit) and limit > 0 do
-    # `bool_or/1` over a group of exactly one row is that row's flag: the aggregate is only how
-    # a grouped query is allowed to name it.
-    bound_projects =
-      from src in Source,
-        where: is_nil(src.revoked_at),
-        group_by: [src.tenant_id, src.project_id],
-        having: count(src.id) == 1,
-        select: %{
-          tenant_id: src.tenant_id,
-          project_id: src.project_id,
-          requires_ticket: fragment("bool_or(?)", src.triage_requires_ticket)
-        }
-
-    live_triage =
-      from d in DispatchRecord,
-        where: d.kind == ^@kind and is_nil(d.released_at),
-        select: %{tenant_id: d.tenant_id, story_id: d.story_id}
-
-    ranked_in_project =
-      from s in StoryStage,
-        join: st in Story,
-        on: st.id == s.story_id and st.tenant_id == s.tenant_id,
-        join: b in subquery(bound_projects),
-        on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
-        join: rec in Record,
-        on: rec.id == st.intake_record_id and rec.tenant_id == st.tenant_id,
-        left_join: live in subquery(live_triage),
-        on: live.tenant_id == s.tenant_id and live.story_id == s.story_id,
-        where: s.stage == :detected,
-        where: is_nil(live.story_id),
-        # A source with `triage_requires_ticket` triages only an issue filed from a support
-        # ticket: one whose record carries the `ticket_id` `Loopctl.Intake.TicketFacts` keeps
-        # only when a single Ticket line AND a single HomeCareBilling footer agree on it. A
-        # structured fact, read as it stands after the latest delivery, and not one of the
-        # untrusted fields this module may never name. It is still a CLAIM: whoever can open
-        # an issue can type both lines, so on HCB's private repository this keeps out issues
-        # filed in any other format (its own sessions'), not a collaborator set on forging one.
-        # Any other story is simply not a candidate: it stays at `detected`, holds no slot and
-        # costs nothing.
-        where: not b.requires_ticket or not is_nil(rec.ticket_id),
-        # A CLOSED issue is not triaged: somebody already finished or withdrew it. On
-        # 2026-11-07 every one of HCB's five support-ticket candidates had been fixed and
-        # closed days before the loop reached it. The state is the latest delivery's, so a
-        # reopened issue is a candidate again.
-        where: is_nil(rec.issue_state) or rec.issue_state != "closed",
-        select: %{
-          tenant_id: s.tenant_id,
-          story_id: s.story_id,
-          updated_at: s.updated_at,
-          project_rank:
-            over(row_number(),
-              partition_by: [st.tenant_id, st.project_id],
-              order_by: [asc: s.updated_at, asc: s.story_id]
-            )
-        }
-
-    # Round-robin across a tenant's projects, then across tenants: every project's oldest
-    # story outranks any project's second. A plain oldest-first ranking let one project's
-    # backlog fill the whole batch whenever no runner accepts its repository (a runner's
-    # `repos` declaration is read per story, after this query), and the batch is the same
-    # every pass, so a project behind it was never reached: on 2026-11-06, 79 loopctl, chg
-    # and claude-config stories older than HCB's support tickets held all 20 slots against
-    # a fleet that accepts only HCB. Per-project ranking bounds what one project can hold to
-    # its share, so a project behind it gets a slot on the next pass.
-    ranked =
-      from p in subquery(ranked_in_project),
-        select: %{
-          tenant_id: p.tenant_id,
-          story_id: p.story_id,
-          updated_at: p.updated_at,
-          rank:
-            over(row_number(),
-              partition_by: p.tenant_id,
-              order_by: [asc: p.project_rank, asc: p.updated_at, asc: p.story_id]
-            )
-        }
-
-    Loopctl.AdminRepo.all(
-      from r in subquery(ranked),
-        order_by: [asc: r.rank, asc: r.updated_at, asc: r.story_id],
-        limit: ^limit,
-        select: %{tenant_id: r.tenant_id, story_id: r.story_id}
-    )
+    TriageV1.spec()
+    |> Candidates.query(limit: limit)
+    |> Loopctl.AdminRepo.all()
+    |> Enum.map(&Map.take(&1, [:tenant_id, :story_id]))
   end
 
   @doc "The budgets a triage session runs under, or `{:error, {:unset, key}}`."

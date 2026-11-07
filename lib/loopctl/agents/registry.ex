@@ -6,10 +6,13 @@ defmodule Loopctl.Agents.Registry do
   its outcomes and effects decide which custody edges a runner message can drive (see
   `Loopctl.Agents.Spec`). Per-tenant data is limited to knobs that cannot move authority.
 
-  Read by NOTHING in `lib/` yet. Later stories move each dispatch kind onto its spec, each with
-  an equivalence test; until then `Loopctl.Agents.RegistryTest` binds the registry to the lists
-  it must agree with — `RunnerContract.Kinds.all/0`, the `runner_dispatches_kind` CHECK,
-  `TriageVerdict`'s routes, `DispatchPayload.budget_keys/1` and `StageMachine.transitions/0`.
+  Read, so far, only for each spec's `candidates`: `TriageDispatcher.candidates/1` and
+  `DispatchDriver.candidates/1` are `Loopctl.Agents.Candidates.query/2` over their spec
+  (US-48.3). Later stories move the rest of each dispatch kind onto its spec, each with an
+  equivalence test; until then `Loopctl.Agents.RegistryTest` binds the registry to the lists it
+  must agree with — `RunnerContract.Kinds.all/0`, the `runner_dispatches_kind` CHECK,
+  `TriageVerdict`'s routes, `DispatchPayload.budget_keys/1` and `StageMachine.transitions/0` —
+  and names the modules allowed to read it.
 
   `{id, version}` is unique, and so is `kind`: one spec per dispatch kind today. Both are
   checked when this module compiles.

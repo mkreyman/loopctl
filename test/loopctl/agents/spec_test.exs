@@ -183,16 +183,20 @@ defmodule Loopctl.Agents.SpecTest do
       {:archetype, :assess, "archetype :assess"},
       {:kind, "review", ~s(kind "review")},
       {:candidates,
-       %{
-         predicates: [:stage_detected, :by_vibes],
-         order: :oldest_per_project_round_robin_projects_then_tenants
-       }, "[:by_vibes]"},
-      {:candidates,
-       %{predicates: [], order: :oldest_per_project_round_robin_projects_then_tenants},
+       %{predicates: [{:stage, :detected}, :by_vibes], order: :round_robin_project_tenant},
+       "[:by_vibes]"},
+      {:candidates, %{predicates: [], order: :round_robin_project_tenant},
        "candidates.predicates must name at least one"},
-      {:candidates, %{predicates: [:stage_detected], order: :newest_first},
+      {:candidates, %{predicates: [{:stage, :detected}], order: :newest_first},
        "candidates.order :newest_first"},
-      {:candidates, [:stage_detected], "candidates must be"},
+      {:candidates, [{:stage, :detected}], "candidates must be"},
+      {:candidates, %{predicates: [{:stage, :nowhere}], order: :round_robin_project_tenant},
+       "{:stage, :nowhere}"},
+      {:candidates,
+       %{
+         predicates: [{:stage, :detected}, :issue_not_closed],
+         order: :round_robin_project_tenant
+       }, ":issue_not_closed needs"},
       {:sweeps, %{forever: [{:detected, :triaged, :forward}]}, "[:forever]"},
       {:sweeps, [], "sweeps must be a map"},
       {:payload, :raw_reporter_text, "payload :raw_reporter_text"},

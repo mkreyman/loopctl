@@ -166,8 +166,17 @@ defmodule Loopctl.Agents.RegistryTest do
     end
   end
 
-  describe "read by nothing, stored nowhere (AC-48.2.2, AC-48.2.5)" do
-    test "no module outside lib/loopctl/agents/ names the registry or a spec" do
+  describe "read only where a story moved it, stored nowhere (AC-48.2.2, AC-48.2.5, US-48.3)" do
+    # The modules a story has moved onto the registry, each with its equivalence test. A new
+    # reader belongs to the story that moves it, and is added here by that story.
+    @readers [
+      # US-48.3: the candidate builder and the two `candidates/1` that delegate to it.
+      "lib/loopctl/agents/candidates.ex",
+      "lib/loopctl/delivery/dispatch_driver.ex",
+      "lib/loopctl/delivery/triage_dispatcher.ex"
+    ]
+
+    test "only the modules a story moved onto the registry name it or a spec" do
       reference = ~r/Agents\.(Registry|Specs?)\b|Agents\.\{/
       sources = Path.wildcard("lib/**/*.ex")
 
@@ -185,7 +194,8 @@ defmodule Loopctl.Agents.RegistryTest do
             path |> File.read!() |> String.match?(reference),
             do: path
 
-      assert readers == []
+      # Both directions: no unlisted reader, and no listed one that has stopped reading.
+      assert Enum.sort(readers) == Enum.sort(@readers)
     end
 
     test "no migration creates storage for specs" do
