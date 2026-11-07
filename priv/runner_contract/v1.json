@@ -1596,6 +1596,24 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "loopctl runner contract",
   "x-connection": {
+    "agent_result_schemas": {
+      "reply_draft@1": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "The drafted reply to the customer, as plain text. A person reads it and sends it; loopctl never does.",
+            "maxLength": 3000,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "type": "object"
+      }
+    },
     "claim_ending_errors": {
       "agent_result": [
         "unknown_dispatch"

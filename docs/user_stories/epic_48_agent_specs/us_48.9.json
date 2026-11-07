@@ -28,7 +28,7 @@
     },
     {
       "id": "AC-48.9.4",
-      "description": "The runner template reply_draft@1 is read-only (Read, Glob, Grep) and returns the draft through agent_result."
+      "description": "The runner template reply_draft@1 runs on a detached scratch tree nothing pushes, carries no tool list (the runner's unattended-session posture, Mark 2026-09-16), and returns the draft only through agent_result, read from the fenced block ending its final message."
     },
     {
       "id": "AC-48.9.5",

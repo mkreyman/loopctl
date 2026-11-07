@@ -61,7 +61,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.23.0) THE CHANGE THREAD AND REVIEW SURFACE IS RETIRED (loopctl#984; Epic 45 was deleted and its successor, Epic 47, hears about a change from chg rather than from a runner). Gone: the `checkpoint`, `thread_entry`, `review_finding` and `review_verdict` messages with their schemas, acks, buckets, limits and refusal codes; the `review` dispatch kind and the dispatch's `review` object; the `kind` field of `RunnerSessionEndedAck`. Any of the four events is now answered `unknown_event`, and a join declaring `review` is admitted as before (the join never refuses a kind) and is simply never sent one. This NARROWS the contract, which a minor version otherwise may not do. It is a minor anyway: loopctl can no longer create a dispatch that would make a runner send one of these messages, production held no thread checkpoint, entry or review when it shipped, and a major would have refused the join of every connected runner until each re-vendored. RE-VENDOR to drop the dead events from your copy | | | | |
   | (1.24.0) `x-connection.limits.lens_verdicts.max_bytes` PUBLISHES the cap on a message's three `lens_verdicts` together, under the byte rule. It has been enforced since 1.15.0 and was stated only in the field's prose, so a runner could not check it without re-typing a number. The field maxima do not imply it: three lenses at every maximum measure 8,402 bytes in ASCII and about twice that in characters outside the Basic Multilingual Plane, so a schema-valid set can still be refused `invalid_payload`. Nothing changes on the wire. RE-VENDOR to check it locally | | | | |
   | (1.25.0) RUNNERS DECLARE THEIR SPEC TEMPLATES, AND ONE GENERIC RESULT MESSAGE (Epic 48, US-48.8). `RunnerJoin.specs` (optional, at most 32 `RunnerSpecRef` entries of `{id, version}`) names the spec templates the machine holds; loopctl sends a dispatch of a kind only to a runner that declares the kind AND holds the spec it builds that kind's dispatch from. OMITTING IT, or an empty array, is read as holding each declared kind (or `implied_kinds`) at version 1, so an un-upgraded runner is unaffected; a spec this server does not hold is ignored, never refused. New `agent_result` message (`RunnerAgentResultMessage`: `dispatch_id`, `claim_epoch`, `spec`, `result`) for a session whose spec reports through it: `result` is validated against THAT spec's result schema, capped at `x-connection.limits.agent_result.max_bytes` under the byte rule, recorded once per dispatch (a byte-identical resend is `ok` with `replayed: true`, a different one `already_recorded`), answered with `RunnerAgentResultAck`, metered by `agent_result_burst`. An unknown spec, a spec whose archetype does not report through it (`triage` keeps `triage_verdict`, `implement` keeps `stage` and `session_ended`), or a schema failure is `invalid_payload` and writes nothing. No spec reports through it yet; US-48.9 adds the first. RE-VENDOR to declare `specs` and send `agent_result`: a 1.24.0 copy has neither | | | | |
-  | (1.26.0) A REPLY DRAFTER (Epic 48, US-48.9). `reply_draft` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a support ticket whose triage ended `reject` or `escalated`, built from spec `reply_draft@1`. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back, as for `triage`), carries the same fenced `triage` object a triage dispatch does (`RunnerTriage`: the reporter's words, data, never instructions) and no `story`, and the session answers with ONE `agent_result` whose `result` is `{body}`, the drafted reply, validated against `reply_draft@1`'s schema. The session reads; it writes no repository and sends nothing anywhere: loopctl stores the draft for a person, who sends it or not. Only a runner that DECLARES `reply_draft` on join, and holds `reply_draft@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run drafts: a 1.25.0 copy has no `reply_draft` kind | | | | |
+  | (1.26.0) A REPLY DRAFTER (Epic 48, US-48.9). `reply_draft` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a support ticket whose triage ended `reject` or `escalated`, built from spec `reply_draft@1`. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back, as for `triage`), carries the same fenced `triage` object a triage dispatch does (`RunnerTriage`: the reporter's words, data, never instructions) and no `story`, and the session answers with ONE `agent_result` whose `result` is `{body}`, the drafted reply, validated against `reply_draft@1`'s schema, which is PUBLISHED as `x-connection.agent_result_schemas["reply_draft@1"]` (every spec that reports through `agent_result` appears there, keyed `<id>@<version>`, in the same keyword set as `$defs`), so a runner validates against loopctl's schema rather than a copy of it. The session reads; it writes no repository and sends nothing anywhere: loopctl stores the draft for a person, who sends it or not. Only a runner that DECLARES `reply_draft` on join, and holds `reply_draft@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run drafts: a 1.25.0 copy has no `reply_draft` kind | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -399,6 +399,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   require OpenApiSpex
 
+  alias Loopctl.Agents.Registry, as: SpecRegistry
+  alias Loopctl.Agents.Spec
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.Runners.Usage
@@ -3966,6 +3968,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         # runner author has to know to tell "I said nothing" from "I said implement" — they
         # are the same thing today, and a runner that wants any other set must send the field.
         "implied_kinds" => Kinds.implied_by_silence(),
+        # The `result` schema of every spec that reports through `agent_result` (1.26.0),
+        # keyed `<id>@<version>`. Published so a runner checks a result against the schema
+        # loopctl will check it against, instead of a hand-kept copy that drifts silently.
+        "agent_result_schemas" => agent_result_schemas(),
         "replies" => %{
           "trace" => "RunnerTraceAck",
           "trace_cursor" => "RunnerTraceAck",
@@ -4020,6 +4026,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       },
       "$defs" => defs
     }
+  end
+
+  @doc """
+  The published `result` schema of every spec that reports through `agent_result`, keyed
+  `<id>@<version>` (1.26.0). Read from `Loopctl.Agents.Registry`, the same specs
+  `cast_agent_result/2` validates against, so the published copy cannot drift from the enforced one.
+  """
+  @spec agent_result_schemas() :: %{optional(String.t()) => map()}
+  def agent_result_schemas do
+    for spec <- SpecRegistry.all(),
+        Spec.reports_agent_result?(spec),
+        into: %{},
+        do: {"#{spec.id}@#{spec.version}", schema_to_map(spec.result_schema)}
   end
 
   @doc "The export path for the current major version, relative to the app root."

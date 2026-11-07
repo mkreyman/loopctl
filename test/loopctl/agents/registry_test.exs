@@ -199,7 +199,9 @@ defmodule Loopctl.Agents.RegistryTest do
       "lib/loopctl/agents/agent_result.ex",
       "lib/loopctl/runners.ex",
       # US-48.9: the cron caller that runs the `:draft` pass with `reply_draft@1`.
-      "lib/loopctl/workers/reply_draft_dispatch_worker.ex"
+      "lib/loopctl/workers/reply_draft_dispatch_worker.ex",
+      # US-48.9: the runner contract publishes each agent_result spec's result schema.
+      "lib/loopctl/api_spec/runner_contract.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

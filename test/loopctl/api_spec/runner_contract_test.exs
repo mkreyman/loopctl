@@ -4,6 +4,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   import Bitwise
   import Loopctl.Fixtures
 
+  alias Loopctl.Agents.Registry, as: SpecRegistry
+  alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
   alias Loopctl.ApiSpec.RunnerContract.Kinds
@@ -39,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "3b72ba4becea6a813b51dac87d9645d72baa83a4e467f76a72f444b8b827caea"
+  @digest "c6fb47c200cd1795fde3ca89b78d90481ab574d0f6bbcf82ea72f692f8cf0023"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -78,6 +80,25 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       # 1.26.0 (US-48.9): the reply drafter is a kind a runner may be sent.
       assert "reply_draft" in connection["dispatchable_kinds"]
+
+      # 1.26.0: every agent_result spec's result schema is published, keyed <id>@<version>, so a
+      # runner validates against loopctl's schema and not a copy of it.
+      reporting =
+        for spec <- SpecRegistry.all(),
+            Spec.reports_agent_result?(spec),
+            do: "#{spec.id}@#{spec.version}"
+
+      assert reporting != []
+      assert Enum.sort(Map.keys(connection["agent_result_schemas"])) == Enum.sort(reporting)
+
+      assert %{
+               "type" => "object",
+               "required" => ["body"],
+               "additionalProperties" => false,
+               "properties" => %{
+                 "body" => %{"type" => "string", "minLength" => 1, "maxLength" => 3000}
+               }
+             } = connection["agent_result_schemas"]["reply_draft@1"]
 
       # 1.25.0 (US-48.8): the generic result message, its cap and burst, and the spec id bound.
       assert connection["events"]["agent_result"] == "RunnerAgentResultMessage"
