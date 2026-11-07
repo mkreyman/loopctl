@@ -191,8 +191,9 @@ defmodule LoopctlWeb.StoryEscalationController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"The story is not escalated (`not_escalated`, naming the stage it IS at), `to` is " <>
-           "`detected` for a story an implementer already worked (`not_retriageable`, naming " <>
-           "the stage-row identities it holds in `held`), or the stage machine has no such " <>
+           "`detected` for a story an implementer was assigned or worked (`not_retriageable`, " <>
+           "naming in `held` the stage-row identities and the story's `assigned_agent_id` / " <>
+           "`implementer_dispatch_id` it holds), or the stage machine has no such " <>
            "transition (`invalid_transition`)", "application/json", Schemas.ErrorResponse},
       # 846.8 review round 2. Resolving to `queued` RELEASES THE CLAIM first
       # (`prepare_story/6`), so every refusal `Progress.force_unclaim_story/3` and
@@ -267,7 +268,7 @@ defmodule LoopctlWeb.StoryEscalationController do
             status: 409,
             code: "not_retriageable",
             message:
-              "An implementer already worked this story (its stage row holds " <>
+              "An implementer was assigned or worked this story (its story or stage row holds " <>
                 Enum.join(held, ", ") <>
                 "), so it cannot go back to triage. Resolve it to queued, done or failed.",
             held: held

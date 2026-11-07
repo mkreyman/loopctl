@@ -88,6 +88,7 @@ defmodule Loopctl.Delivery.Escalations do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.WorkBreakdown.Story
 
   import Ecto.Query
@@ -488,6 +489,15 @@ defmodule Loopctl.Delivery.Escalations do
     with {:ok, story} <-
            release_claim(tenant_id, story_id, Keyword.get(opts, :actor_label), actor_lineage),
          do: {:ok, story.claim_epoch, story}
+  end
+
+  # A RE-TRIAGE retires the story's triage dispatches before the row leaves `escalated`. At
+  # `detected` any accepted triage dispatch of the story may bind it, and nothing moves the
+  # claim epoch of an unclaimed story, so without this a resend of the discarded verdict would
+  # bind the story to its old dispatch again. There is no claim to release.
+  defp prepare_story(tenant_id, story_id, :detected, row, _opts, _actor_lineage) do
+    {:ok, _superseded} = DispatchLedger.supersede_triage_dispatches(tenant_id, story_id)
+    {:ok, row.claim_epoch, nil}
   end
 
   defp prepare_story(_tenant_id, _story_id, _to, row, _opts, _actor_lineage),

@@ -532,6 +532,7 @@ defmodule Loopctl.Delivery.StageMachine do
   # Identities that describe the story for its whole life rather than one attempt at it, and
   # so survive even a human re-queue. A re-queue does not re-triage — the story does not go
   # back to `detected` — so the verdict Gate A judges is still the one this dispatch gave.
+  # The one edge that clears them is the human re-triage, `escalated -> detected` (`clears/3`).
   @story_lifetime_effects [:triage_dispatch_id]
   @required_effects %{merged: [:merge_sha]}
 
@@ -823,7 +824,10 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec transition_only?(atom()) :: boolean()
   def transition_only?(effect), do: effect in @transition_only
 
-  @doc "The identities no transition clears, a human re-queue included."
+  @doc """
+  The identities that survive every transition, a human re-queue included, except the human
+  re-triage (`escalated -> detected`), which clears them.
+  """
   @spec story_lifetime_effects() :: [effect()]
   def story_lifetime_effects, do: @story_lifetime_effects
 

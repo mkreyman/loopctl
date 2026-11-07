@@ -1486,6 +1486,33 @@ defmodule Loopctl.Runners.DispatchLedger do
     |> Repo.one()
   end
 
+  @doc """
+  Supersedes every live TRIAGE dispatch of `story_id`, for the human re-triage
+  (`escalated -> detected`). Returns the count.
+
+  The re-triage unbinds the story from its triage dispatch, and at `detected`
+  `Loopctl.Delivery.TriageVerdict` accepts a verdict from any accepted triage dispatch of the
+  story. The claim epoch cannot fence the old one: nothing bumps it on an unclaimed story, so
+  a byte-identical resend of the discarded verdict would replay, bind the story to the old
+  dispatch again and route it on the verdict a human just threw away. A superseded row is
+  refused by `accepted_session/4` (`:dispatch_not_accepted`), and its slot goes back if it
+  still held one.
+  """
+  @spec supersede_triage_dispatches(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, non_neg_integer()}
+  def supersede_triage_dispatches(tenant_id, story_id) do
+    in_tenant(tenant_id, fn ->
+      rows =
+        from(r in DispatchRecord,
+          where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+          where: r.kind == "triage" and r.status in ["sent", "accepted"]
+        )
+        |> Repo.all()
+
+      Enum.each(rows, &supersede/1)
+      length(rows)
+    end)
+  end
+
   # Only a live row: a refused one is already terminal, and its reason must stay. The claim
   # the dispatch served is over, so its slot goes back in the same transaction.
   defp supersede(%DispatchRecord{} = record) do

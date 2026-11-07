@@ -23,6 +23,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.WorkBreakdown.Queries
   alias Loopctl.WorkBreakdown.Story
 
@@ -189,6 +190,45 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       after_resolve = AdminRepo.get!(Story, ctx.triaged.id)
       assert after_resolve.claim_epoch == before.claim_epoch
       assert after_resolve.agent_status == before.agent_status
+    end
+
+    test "the old triage dispatch is superseded, so a resend of its verdict cannot bind", ctx do
+      # The verdict a human threw away arrives again, byte for byte. At `detected` any ACCEPTED
+      # triage dispatch of the story may bind it, and nothing moves an unclaimed story's epoch,
+      # so the ledger row is the only thing that can say the dispatch is over.
+      now = DateTime.utc_now()
+      old_dispatch = ctx.triage_dispatch_id
+
+      AdminRepo.insert_all(Loopctl.Runners.DispatchRecord, [
+        %{
+          tenant_id: ctx.tenant.id,
+          runner_id: ctx.runner.id,
+          dispatch_id: old_dispatch,
+          story_id: ctx.triaged.id,
+          claim_epoch: 0,
+          kind: "triage",
+          status: "accepted",
+          released_at: now,
+          wall_clock_seconds: 900,
+          reserved_at: now,
+          slot_generation: 1,
+          trace_acked_seq: -1,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+      assert {:ok, _} =
+               DispatchLedger.accepted_session(ctx.tenant.id, ctx.runner.id, old_dispatch,
+                 kind: "triage"
+               )
+
+      assert {:ok, %{stage: :detected}} = resolve(%{ctx | story: ctx.triaged}, :detected)
+
+      assert {:error, :dispatch_not_accepted} =
+               DispatchLedger.accepted_session(ctx.tenant.id, ctx.runner.id, old_dispatch,
+                 kind: "triage"
+               )
     end
 
     test "a story an implementer was ASSIGNED cannot go back to triage", ctx do

@@ -230,16 +230,16 @@ export async function storyStage({ story_id } = {}, { apiCall } = {}) {
 }
 
 /**
- * `POST /api/v1/stories/:id/stage/resolve`: move an escalated story off `escalated`, as a
- * human. `to` is `queued`, `done` or `failed`.
- */
-/**
  * Where `resolve_escalation` may send a story: the server's `{:escalated, to,
  * :human_resolution}` edges. `detected` is re-triage, refused 409 `not_retriageable` for a
- * story an implementer already worked.
+ * story an implementer was assigned or worked.
  */
 export const RESOLUTION_TARGETS = ["detected", "queued", "done", "failed"];
 
+/**
+ * `POST /api/v1/stories/:id/stage/resolve`: move an escalated story off `escalated`, as a
+ * human. `to` is one of `RESOLUTION_TARGETS`.
+ */
 export async function resolveEscalation({ story_id, to, reason } = {}, { userKey, apiCall } = {}) {
   if (!userKey) {
     return refuse(

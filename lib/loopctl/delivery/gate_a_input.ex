@@ -25,7 +25,8 @@ defmodule Loopctl.Delivery.GateAInput do
 
   The story's stage row carries `triage_dispatch_id`, written ON the `detected -> triaged`
   transition by the dispatch whose verdict took it (`Loopctl.Delivery.TriageVerdict`), in that
-  transition's own transaction, and cleared by nothing. A dispatch that did not triage the
+  transition's own transaction. Only a human re-triage (`escalated -> detected`) clears it, and
+  that also drops any Gate A answer a human gave before it. A dispatch that did not triage the
   story is refused before it can take any further transition. Gate A reads the bound
   dispatch's row. "The newest row for the story"
   would be wrong because records and transitions are separate writes, so a later row need not
@@ -136,6 +137,12 @@ defmodule Loopctl.Delivery.GateAInput do
   end
 
   defp step(%{to: "escalated"} = event, acc), do: %{acc | escalation: event}
+
+  # A RE-TRIAGE (`escalated -> detected`) discards the triage a human answered, so it answers
+  # nothing and forgets what came before: the next triage's lens verdicts are what Gate A
+  # judges, unless a human resolves a Gate A escalation of THAT triage.
+  defp step(%{edge: "human_resolution", to: "detected"}, _acc),
+    do: %{escalation: nil, resolved?: false}
 
   defp step(%{edge: "human_resolution"}, %{escalation: escalation} = acc),
     do: %{acc | escalation: nil, resolved?: acc.resolved? or gate_a_escalation?(escalation)}
