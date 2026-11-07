@@ -49,6 +49,7 @@ import { exactKeyMissingMessage, orchestratorKeyArgs } from "./lib/custody-key.j
 import { createHandoff } from "./lib/handoff.js";
 import { readPayloadFile } from "./lib/payload-path.js";
 import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runners.js";
+import { replyDraftList } from "./lib/reply-drafts.js";
 import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./lib/claim-lease.js";
 import { escalateStory as escalateStoryRequest, escalationNotice } from "./lib/escalation.js";
 import {
@@ -3405,6 +3406,12 @@ async function runnerRevoke(args) {
 
 async function runnerPoolRead(args) {
   return toContent(await runnerPool(args, runnerDeps()));
+}
+
+// US-48.9: reply drafts are read with the EXACT user key, for the runner tools' reason — the
+// endpoint is user-role (ticket-derived text) and a global key must not stand in for it.
+async function replyDraftListRead(args) {
+  return toContent(await replyDraftList(args, runnerDeps()));
 }
 
 // #803/#850: the delivery loop's operator verbs. `place_dispatch` and `resolve_escalation`
@@ -8549,6 +8556,44 @@ const TOOLS = [
   },
 
   {
+    name: "reply_draft_list",
+    description:
+      "List a project's REPLY DRAFTS, newest first (GET /api/v1/projects/:project_id/" +
+      "reply_drafts, loopctl US-48.9). A reply draft is what a runner session (agent spec " +
+      "reply_draft@1) wrote for a support ticket that triage rejected or escalated. loopctl " +
+      "NEVER SENDS a draft anywhere — no forge comment, no email, no webhook: a person reads it " +
+      "here and sends it themselves, or does not. Each draft has status `drafted` (with its body " +
+      "and ticket_id) or `refused` (body null): screen_code says why — " +
+      "injection_detector_draft (the body read as instructions; screen_signals carries the " +
+      "detector's codes, and the refused body is stored nowhere), payload_too_large (the ticket " +
+      "was too large to hand a session, so nothing was dispatched) or ticket_missing (the " +
+      "story's intake record no longer names a ticket). Paginate by passing a page's " +
+      "next_cursor back verbatim; it is null on the last page. REFUSES: 403 for any key that is " +
+      "not user-role — the drafts are written from customer ticket text, so agent and " +
+      "orchestrator keys cannot read them; 404 for a project the tenant does not hold; 400 for a " +
+      "cursor this endpoint did not issue to this tenant, or a bad limit. Requires " +
+      "LOOPCTL_USER_KEY (user role).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "The project — its id, slug or repo name.",
+        },
+        cursor: {
+          type: "string",
+          description: "A previous page's next_cursor, verbatim. Omit for the first page.",
+        },
+        limit: {
+          type: "integer",
+          description: "Page size, default 50, at most 100.",
+        },
+      },
+      required: ["project_id"],
+    },
+  },
+
+  {
     name: "place_dispatch",
     description:
       "PLACE a queued story on a runner: claim it under a freshly minted custody dispatch and " +
@@ -10274,6 +10319,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "runner_pool":
       return await runnerPoolRead(args);
+    case "reply_draft_list":
+      return await replyDraftListRead(args);
 
     case "place_dispatch":
       return await placeDispatch(args);

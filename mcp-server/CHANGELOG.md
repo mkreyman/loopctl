@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.7.0 — 2026-11-07 (reply drafts)
+
+### Added
+
+- **`reply_draft_list`** reads a project's reply drafts (loopctl US-48.9,
+  `GET /api/v1/projects/:project_id/reply_drafts`): what a runner session drafted for a support
+  ticket triage rejected or escalated, `drafted` with its body or `refused` with the screen
+  code and no body. loopctl never sends a draft; a person reads it and sends it or not. Keyset
+  pagination through `next_cursor`. Requires `LOOPCTL_USER_KEY`: the endpoint is user-role
+  because the bodies are drafted from customer ticket text.
+
 ## 3.6.0 — 2026-11-07 (re-triage an escalated story)
 
 ### Added

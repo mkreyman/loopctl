@@ -468,7 +468,8 @@ defmodule Loopctl.Agents.BuildDispatcherTest do
       implement = ImplementV1.spec()
 
       for {spec, named} <- [
-            {%{implement | payload: :triage_payload}, ~r/payload: \[:triage_payload\]/},
+            {%{implement | payload: :fenced_intake_report},
+             ~r/payload: \[:fenced_intake_report\]/},
             {%{implement | sweeps: %{stranded_triaged_unbound: []}},
              ~r/sweeps: \[:stranded_triaged_unbound\]/}
           ] do
@@ -478,12 +479,16 @@ defmodule Loopctl.Agents.BuildDispatcherTest do
       end
     end
 
-    test "a :draft spec is refused before anything is read" do
+    test "a :draft spec built on the :build parts is refused by the :draft pass, naming them" do
+      # A :draft has its own pass now (US-48.9); what it cannot run is a story payload and the
+      # :build ref sources, which this one carries, and it is refused before anything is read.
       spec = %{ImplementV1.spec() | archetype: :draft}
 
-      assert_raise ArgumentError, ~r/implement@1 is a :draft spec/, fn ->
-        Dispatcher.run(spec, limit: 20, budgets: @budgets, enabled?: true)
-      end
+      assert_raise ArgumentError,
+                   ~r/implement@1: .* cannot run the :draft pass over .*payload: \[:story_payload\]/,
+                   fn ->
+                     Dispatcher.run(spec, limit: 20, budgets: @budgets, enabled?: true)
+                   end
     end
   end
 

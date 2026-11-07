@@ -413,6 +413,34 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-48.9: ReplyDraftDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ReplyDraftDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.ReplyDraftDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs every minute, at triage's cadence", %{entry: entry} do
+      assert entry,
+             "expected a ReplyDraftDispatchWorker crontab entry — without one no ticket triage " <>
+               "set aside is ever drafted. Safe to schedule unconditionally: it is off unless " <>
+               "both DISPATCH_DRIVER_ENABLED and DRAFT_DISPATCH_ENABLED are set."
+
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "StoryCompletionWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

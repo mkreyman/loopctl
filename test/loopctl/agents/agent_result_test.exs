@@ -5,9 +5,9 @@ defmodule Loopctl.Agents.AgentResultTest do
   is unknown, or when the spec's archetype does not report through `agent_result`, and
   recorded ONCE on the dispatch ledger otherwise.
 
-  No production spec reports through `agent_result` yet (US-48.9 adds `reply_draft@1`), so the
-  accepting path runs against the test-only `build(:agent_result_spec)` injected through the
-  `:specs` option. The refusals that matter in production — an unknown spec, and `triage@1` —
+  The generic accepting path runs against the test-only `build(:agent_result_spec)`, a `:draft`
+  with no effect, injected through the `:specs` option; `reply_draft@1`'s effect is
+  `Loopctl.ReplyDraftsTest`'s. The refusals that matter in production — an unknown spec, and `triage@1` —
   are asserted against the REAL registry, with no option.
   """
 
@@ -96,7 +96,7 @@ defmodule Loopctl.Agents.AgentResultTest do
     end
 
     test "a spec the registry does not hold, read from the REAL registry", ctx do
-      message = message(ctx.record, %{"reply" => "Hi"}, %{id: "reply_draft", version: 1})
+      message = message(ctx.record, %{"reply" => "Hi"}, %{id: "summary_draft", version: 1})
 
       assert {:error, {:invalid, ["spec is not one loopctl holds"]}} =
                AgentResult.apply(ctx.runner.tenant_id, ctx.runner.id, message)

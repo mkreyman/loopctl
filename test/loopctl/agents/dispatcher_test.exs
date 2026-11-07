@@ -226,14 +226,15 @@ defmodule Loopctl.Agents.DispatcherTest do
   end
 
   describe "run/2 over a spec it cannot run" do
-    # US-48.7 gave the `:build` archetype its own pass (`Loopctl.Agents.BuildDispatcherTest`);
-    # an archetype with no pass is still refused before anything is read.
-    test "a :draft spec is refused before anything is read" do
+    # US-48.7 gave the `:build` archetype its own pass (`Loopctl.Agents.BuildDispatcherTest`)
+    # and US-48.9 the `:draft` one (`Loopctl.Agents.ReplyDraftDispatchTest`); a `:draft` naming
+    # a part that pass has no clause for is refused before anything is read.
+    test "a :draft spec with sweeps is refused before anything is read" do
       spec = %{TriageV1.spec() | archetype: :draft}
 
-      assert_raise ArgumentError, ~r/triage@1 is a :draft spec/, fn ->
-        Dispatcher.run(spec, limit: 20, budgets: @budgets, enabled?: true)
-      end
+      assert_raise ArgumentError,
+                   ~r/triage@1: .* cannot run the :draft pass over .*sweeps: \[:stranded_triaged_unbound\]/,
+                   fn -> Dispatcher.run(spec, limit: 20, budgets: @budgets, enabled?: true) end
     end
 
     test "a :build spec runs the :build pass, not the claimless push" do

@@ -113,7 +113,8 @@
         "kind": {
           "enum": [
             "triage",
-            "implement"
+            "implement",
+            "reply_draft"
           ],
           "type": "string"
         },
@@ -195,7 +196,7 @@
           ]
         },
         "triage": {
-          "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so the per-field maxima do not guarantee a payload that fits. An oversize record is escalated to a human, never truncated.",
+          "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch and, since 1.26.0, a `reply_draft` one (it drafts a reply from the same report, and like triage claims nothing and writes no code); an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so the per-field maxima do not guarantee a payload that fits. An oversize record is escalated to a human, never truncated.",
           "properties": {
             "escalation_reasons": {
               "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
@@ -1092,7 +1093,7 @@
       "type": "object"
     },
     "RunnerTriage": {
-      "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so the per-field maxima do not guarantee a payload that fits. An oversize record is escalated to a human, never truncated.",
+      "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch and, since 1.26.0, a `reply_draft` one (it drafts a reply from the same report, and like triage claims nothing and writes no code); an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so the per-field maxima do not guarantee a payload that fits. An oversize record is escalated to a human, never truncated.",
       "properties": {
         "escalation_reasons": {
           "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
@@ -1619,7 +1620,8 @@
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
       "triage",
-      "implement"
+      "implement",
+      "reply_draft"
     ],
     "error_fields": {
       "agent_result": {
@@ -2180,5 +2182,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.25.0"
+  "x-contract-version": "1.26.0"
 }

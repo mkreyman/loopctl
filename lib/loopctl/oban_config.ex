@@ -689,6 +689,13 @@ defmodule Loopctl.ObanConfig do
            # rather than a state an operator can be half in. Bounded per run. Keep in sync with
            # the crontab assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.TriageDispatchWorker},
+           # Epic 48 US-48.9: asks a runner to DRAFT a reply for each support ticket triage
+           # set aside (`reply_draft@1`, a `:draft`: it claims nothing and moves no stage).
+           # The triage dispatcher's cadence and reasons. OFF with the driver AND behind its
+           # own `:draft_dispatch_enabled` (default false), so scheduling it unconditionally
+           # starts nothing. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.ReplyDraftDispatchWorker},
            # #803 §3: the loop's LAST transition, `verified -> done`. Nothing in `lib/` wrote
            # that edge, so a story that passed every gate stopped one stage from the end for
            # ever — `verified` had no writable edge out at all, not even for an operator. NOT

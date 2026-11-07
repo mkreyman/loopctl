@@ -1012,10 +1012,25 @@ defmodule Loopctl.Delivery.TriageVerdict do
   def draft_signals, do: @draft_signals
 
   defp unflagged(attrs) do
-    case attrs |> scannable() |> InjectionDetector.scan() |> Enum.filter(&acted_on?/1) do
+    case attrs |> scannable() |> draft_flags() do
       [] -> :ok
       signals -> {:error, {:draft_flagged, signals}}
     end
+  end
+
+  @doc """
+  The DRAFT screen over session-authored `fields` (`{field, text}` pairs, as
+  `InjectionDetector.scan/1` takes them): the detector's `"<signal>:<field>"` codes whose
+  signal is one of `draft_signals/0`, sorted. `[]` is clean.
+
+  The one implementation of "is this session-written text instruction-shaped", shared by the
+  drafted story here and by `reply_draft@1`'s `:injection_detector_draft` screen
+  (`Loopctl.ReplyDrafts.screen/1`), so the calibration `draft_false_positive_test.exs` pins
+  binds both.
+  """
+  @spec draft_flags([{String.t(), String.t() | nil}]) :: [String.t()]
+  def draft_flags(fields) when is_list(fields) do
+    fields |> InjectionDetector.scan() |> Enum.filter(&acted_on?/1)
   end
 
   # A signal is `"<name>:<field>"`, and the field half is ours — it cannot contain a colon.

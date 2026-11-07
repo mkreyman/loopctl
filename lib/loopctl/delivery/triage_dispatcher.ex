@@ -12,7 +12,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   ## The pass runs from `triage@1` (US-48.4)
 
   Every function here is `Loopctl.Agents.Dispatcher` over `Loopctl.Agents.Specs.TriageV1`:
-  the candidates, the payload (`:triage_payload`), the refs (`:source_base_branch` for both
+  the candidates, the payload (`:fenced_intake_report`), the refs (`:source_base_branch` for both
   `branch` and `base_branch`), the too-large escalation (the `:payload_too_large` screen), the
   transient/blocked classification and the `:stranded_triaged_unbound` sweep. The cron caller,
   `Loopctl.Workers.TriageDispatchWorker`, calls the dispatcher with the spec directly; this

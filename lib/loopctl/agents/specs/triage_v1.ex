@@ -40,7 +40,7 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
         {:triaged, :escalated, :triage_escalate}
       ]
     },
-    payload: :triage_payload,
+    payload: :fenced_intake_report,
     refs: [branch: :source_base_branch, base_branch: :source_base_branch],
     runner: [
       :connected,

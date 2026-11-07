@@ -43,7 +43,14 @@ defmodule Loopctl.Agents.Spec do
 
   Effects follow the same rule one column along: a `:build` spec may name only
   `StageMachine.reportable_effects/0`, a `:judge` spec only the control-written triage binding
-  and the drafted story, and a `:draft` spec none (US-48.9 adds its stored artifact).
+  and the drafted story, and a `:draft` spec only its stored artifact (`:reply_draft`, US-48.9).
+
+  ## A `:draft` may name NO transition at all
+
+  A `:draft`'s output is a stored artifact a person releases, never a stage edge, so its routes
+  may be the empty list: `[]` states "this outcome or screen moves nothing", and only a `:draft`
+  may say it. A `:judge` or `:build` route is always a non-empty list of transitions, because
+  its outcome is what moves the story.
 
   What stays code whatever a spec says: claiming and the session-dispatch mint, operator-key
   resolution, the `implementer_dispatch_id` / `triage_dispatch_id` bindings, what
@@ -158,9 +165,10 @@ defmodule Loopctl.Agents.Spec do
   # dispatch, left there by the too-large route's second transaction failing.
   @sweeps [:stranded_triaged_unbound]
 
-  # `TriagePayload.build/1` (the reporter's words, fenced) and `StoryPayload` /
-  # `ImplementerInput.story_object/2` (a `RunnerStory`).
-  @payloads [:triage_payload, :story_payload]
+  # `:fenced_intake_report` — `TriagePayload.build/1`, the reporter's words fenced, riding the
+  # dispatch's `triage` object (`RunnerTriage`); read by `triage@1` and `reply_draft@1`.
+  # `:story_payload` — `StoryPayload` / `ImplementerInput.story_object/2` (a `RunnerStory`).
+  @payloads [:fenced_intake_report, :story_payload]
 
   # Where each ref field's value comes from.
   @ref_sources [
@@ -224,17 +232,23 @@ defmodule Loopctl.Agents.Spec do
     # it.
     :draft_dispatchable,
     # `StoryPayload.build/3` parking a story the contract cannot describe.
-    :story_not_dispatchable
+    :story_not_dispatchable,
+    # `Loopctl.ReplyDrafts.screen/1`: a drafted reply scanned with the drafted-story screen's
+    # own detector and signal set (`TriageVerdict.draft_flags/1`); a refusal is stored as a
+    # refused row, never as a draft (US-48.9).
+    :injection_detector_draft
   ]
 
   # Row writes a result can drive: the stage machine's side-effect identities plus the drafted
   # story row `TriageVerdict` writes.
-  @effects StageMachine.effects() ++ [:story_draft]
+  # `:reply_draft` is the `reply_drafts` row `Loopctl.ReplyDrafts.write_result/2` writes in the
+  # ledger's own transaction (US-48.9).
+  @effects StageMachine.effects() ++ [:story_draft, :reply_draft]
 
   @archetype_effects %{
     judge: [:triage_dispatch_id, :story_draft],
     build: StageMachine.reportable_effects(),
-    draft: []
+    draft: [:reply_draft]
   }
 
   @reruns [
@@ -544,8 +558,9 @@ defmodule Loopctl.Agents.Spec do
   defp outcomes(label, value),
     do: {:error, "#{label}: outcomes must be a non-empty map of routes, got #{inspect(value)}"}
 
-  # Every route is a non-empty list of transitions the stage machine HAS. A transition outside
-  # the table is refused here, before the archetype check, so the message says which it is.
+  # Every route is a non-empty list of transitions the stage machine HAS — or, for a `:draft`
+  # only, `[]`: "moves nothing" (see the moduledoc). A transition outside the table is refused
+  # here, before the archetype check, so the message says which it is.
   defp check_routes(spec) do
     label = label(spec)
 
@@ -554,8 +569,13 @@ defmodule Loopctl.Agents.Spec do
           {name, route} <- map,
           do: {"#{field}.#{name}", route}
 
-    Enum.find_value(routes, :ok, fn {where, route} -> route_error(label, where, route) end)
+    Enum.find_value(routes, :ok, fn {where, route} ->
+      route_error(spec.archetype, label, where, route)
+    end)
   end
+
+  defp route_error(:draft, _label, _where, []), do: nil
+  defp route_error(_archetype, label, where, route), do: route_error(label, where, route)
 
   defp route_error(label, where, route) when is_list(route) and route != [] do
     case Enum.reject(route, &(&1 in StageMachine.transitions())) do

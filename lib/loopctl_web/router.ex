@@ -490,6 +490,10 @@ defmodule LoopctlWeb.Router do
     post "/projects/:project_id/ui-tests/:id/findings", UiTestController, :add_finding
     post "/projects/:project_id/ui-tests/:id/complete", UiTestController, :complete
 
+    # US-48.9: the reply drafts reply_draft@1 stored for a project's tickets. A read, user-role
+    # (ticket-derived text); loopctl never sends one.
+    get "/projects/:project_id/reply_drafts", ReplyDraftController, :index
+
     # Epic management
     get "/projects/:project_id/epics", EpicController, :index
     post "/projects/:project_id/epics", EpicController, :create

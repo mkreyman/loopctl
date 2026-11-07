@@ -872,8 +872,28 @@ defmodule Loopctl.Runners.DispatchLedger do
   write moves no story, so the message's agreement with its own dispatch is the whole check.
   A value Postgres refuses is `:rejected_by_database` and a lock that could not be had is
   `:capacity_busy`, as for a reply.
+
+  ## The spec's effect, and the slot, in the SAME transaction (US-48.9)
+
+  `effect` is the spec's effect — `Loopctl.Agents.AgentResult` builds it from the spec's
+  `effects`, e.g. `reply_draft@1`'s `reply_drafts` row — called with the row as recorded,
+  under the row lock, before commit. It runs only on `:recorded`, never on a replay, so it
+  writes once per dispatch; anything it raises rolls the ledger write back with it, so a
+  result is never recorded without its effect or the reverse.
+
+  The dispatch's slot is released in the same transaction: the result IS the session's end
+  (a `:draft` session answers once and stops, as a triage session does with its verdict, and
+  `session_ended` is an implement session's message), so without this the slot stayed held
+  until the heal sweep passed the session's whole wall clock. Idempotent by generation
+  (`Capacity.release/4`).
   """
-  @spec record_agent_result(Ecto.UUID.t(), Ecto.UUID.t(), map(), map()) ::
+  @spec record_agent_result(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          map(),
+          map(),
+          (DispatchRecord.t() -> :ok)
+        ) ::
           {:ok, {:recorded | :replayed, DispatchRecord.t()}}
           | {:error,
              :unknown_dispatch
@@ -883,38 +903,44 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :already_recorded
              | :rejected_by_database
              | :capacity_busy}
-  def record_agent_result(tenant_id, runner_id, message, attrs) do
+  def record_agent_result(tenant_id, runner_id, message, attrs, effect \\ fn _record -> :ok end)
+      when is_function(effect, 1) do
     context = %{operation: :record_agent_result, dispatch_id: message.dispatch_id, run_id: nil}
 
     runner_write(tenant_id, runner_id, context, [], fn ->
       with {:ok, record} <- held(tenant_id, runner_id, message.dispatch_id, lock: true) do
-        agent_result(record, message, attrs)
+        agent_result(record, message, attrs, effect)
       end
     end)
     |> flatten()
   end
 
   # Each clause returns its result BARE, as `session_end/4`'s do.
-  defp agent_result(%DispatchRecord{agent_result_digest: digest} = record, _message, attrs)
+  defp agent_result(%DispatchRecord{agent_result_digest: digest} = record, _message, attrs, _fx)
        when is_binary(digest) do
     if digest == attrs.digest,
       do: {:replayed, record},
       else: {:error, :already_recorded}
   end
 
-  defp agent_result(%DispatchRecord{} = record, message, attrs) do
+  defp agent_result(%DispatchRecord{} = record, message, attrs, effect) do
     with :ok <- kind_is(record, attrs.kind),
          :ok <- own_epoch(record, message.claim_epoch),
          :ok <- accepted(record) do
-      record
-      |> Ecto.Changeset.change(
-        agent_result: attrs.result,
-        agent_result_spec: attrs.spec,
-        agent_result_digest: attrs.digest,
-        agent_result_at: DateTime.utc_now()
-      )
-      |> Repo.update!()
-      |> then(&{:recorded, &1})
+      recorded =
+        record
+        |> Ecto.Changeset.change(
+          agent_result: attrs.result,
+          agent_result_spec: attrs.spec,
+          agent_result_digest: attrs.digest,
+          agent_result_at: DateTime.utc_now()
+        )
+        |> Repo.update!()
+
+      :ok = effect.(recorded)
+      _ = Capacity.release(Repo, recorded, recorded.slot_generation)
+
+      {:recorded, recorded}
     end
   end
 

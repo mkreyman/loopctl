@@ -177,8 +177,8 @@ defmodule Loopctl.Agents.CandidatesTest do
     @refusals [
       {[{:stage, :detected}, :by_vibes], "[:by_vibes]"},
       {[], "must name at least one"},
-      {[:intake_record_required], "exactly one {:stage, stage}"},
-      {[{:stage, :detected}, {:stage, :queued}], "exactly one {:stage, stage}"},
+      {[:intake_record_required], "exactly one stage predicate"},
+      {[{:stage, :detected}, {:stage, :queued}], "exactly one stage predicate"},
       {[{:stage, :nowhere}], "{:stage, :nowhere}"},
       {[{:stage, :queued}, {:agent_status_in, []}], "{:agent_status_in, []}"},
       {[{:stage, :queued}, {:agent_status_in, [:dreaming]}], "{:agent_status_in, [:dreaming]}"},

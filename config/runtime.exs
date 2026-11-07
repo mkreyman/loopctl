@@ -198,6 +198,13 @@ config :loopctl,
        :dispatch_driver_enabled,
        System.get_env("DISPATCH_DRIVER_ENABLED") in ~w(true 1)
 
+# Epic 48 US-48.9: the reply drafter (`reply_draft@1`, Loopctl.Workers.ReplyDraftDispatchWorker).
+# OPT-IN on top of the driver, same exact spelling: a draft pass runs only while BOTH are on,
+# because drafting is new work on a runner no ticket needed before.
+config :loopctl,
+       :draft_dispatch_enabled,
+       System.get_env("DRAFT_DISPATCH_ENABLED") in ~w(true 1)
+
 # Its per-session budgets. NO DEFAULT on purpose: enabled with either unset, the driver
 # places nothing and the cron job FAILS naming the key, rather than dispatching on a figure
 # nobody chose. Set both, as ordinary config (not secrets), before enabling.

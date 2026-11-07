@@ -193,6 +193,7 @@
     ["GET","/api/v1/projects/:project_id/knowledge/lint","LoopctlWeb.KnowledgeLintController",":lint"],
     ["GET","/api/v1/projects/:project_id/knowledge/okf/export","LoopctlWeb.OKFController",":export"],
     ["GET","/api/v1/projects/:project_id/knowledge/stats","LoopctlWeb.KnowledgeStatsController",":stats"],
+    ["GET","/api/v1/projects/:project_id/reply_drafts","LoopctlWeb.ReplyDraftController",":index"],
     ["POST","/api/v1/projects/:project_id/stories","LoopctlWeb.StoryController",":create_in_project"],
     ["GET","/api/v1/projects/:project_id/ui-tests","LoopctlWeb.UiTestController",":index"],
     ["POST","/api/v1/projects/:project_id/ui-tests","LoopctlWeb.UiTestController",":create"],

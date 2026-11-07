@@ -16,6 +16,7 @@ defmodule Loopctl.Agents.RegistryTest do
   alias Loopctl.Agents.Registry
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs.ImplementV1
+  alias Loopctl.Agents.Specs.ReplyDraftV1
   alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
@@ -24,27 +25,33 @@ defmodule Loopctl.Agents.RegistryTest do
   alias Loopctl.Delivery.TriageVerdict
 
   describe "lookup" do
-    test "holds triage@1 as a :judge and implement@1 as a :build" do
+    test "holds triage@1 as a :judge, implement@1 as a :build and reply_draft@1 as a :draft" do
       assert {:ok, %Spec{archetype: :judge, kind: "triage"} = triage} =
                Registry.fetch("triage", 1)
 
       assert {:ok, %Spec{archetype: :build, kind: "implement"} = implement} =
                Registry.fetch("implement", 1)
 
+      assert {:ok, %Spec{archetype: :draft, kind: "reply_draft"} = reply_draft} =
+               Registry.fetch("reply_draft", 1)
+
       assert triage == TriageV1.spec()
       assert implement == ImplementV1.spec()
-      assert Registry.all() == [triage, implement]
+      assert reply_draft == ReplyDraftV1.spec()
+      assert Registry.all() == [triage, implement, reply_draft]
     end
 
     test "for_kind/1 finds each kind's spec and refuses an unknown one" do
       assert {:ok, %Spec{id: "triage"}} = Registry.for_kind("triage")
       assert {:ok, %Spec{id: "implement"}} = Registry.for_kind("implement")
+      assert {:ok, %Spec{id: "reply_draft"}} = Registry.for_kind("reply_draft")
       assert Registry.for_kind("review") == {:error, :unknown_kind}
     end
 
     test "fetch/2 refuses an unknown id or version" do
       assert Registry.fetch("triage", 2) == {:error, :unknown_spec}
-      assert Registry.fetch("reply_draft", 1) == {:error, :unknown_spec}
+      assert Registry.fetch("reply_draft", 2) == {:error, :unknown_spec}
+      assert Registry.fetch("summary_draft", 1) == {:error, :unknown_spec}
     end
   end
 
@@ -190,7 +197,9 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.8: the generic `agent_result` message, and the runner eligibility check that
       # asks whether a runner holds the spec a kind runs under.
       "lib/loopctl/agents/agent_result.ex",
-      "lib/loopctl/runners.ex"
+      "lib/loopctl/runners.ex",
+      # US-48.9: the cron caller that runs the `:draft` pass with `reply_draft@1`.
+      "lib/loopctl/workers/reply_draft_dispatch_worker.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do
@@ -202,7 +211,7 @@ defmodule Loopctl.Agents.RegistryTest do
           Path.wildcard("lib/loopctl/agents/specs/*.ex")
 
       # Non-vacuous: the pattern matches the registry's own files, and the scan sees lib/web.
-      assert length(own) == 4
+      assert length(own) == 5
       assert Enum.all?(own, &(&1 |> File.read!() |> String.match?(reference)))
       assert Enum.any?(sources, &String.starts_with?(&1, "lib/loopctl_web/"))
 

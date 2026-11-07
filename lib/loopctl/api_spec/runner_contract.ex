@@ -61,6 +61,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.23.0) THE CHANGE THREAD AND REVIEW SURFACE IS RETIRED (loopctl#984; Epic 45 was deleted and its successor, Epic 47, hears about a change from chg rather than from a runner). Gone: the `checkpoint`, `thread_entry`, `review_finding` and `review_verdict` messages with their schemas, acks, buckets, limits and refusal codes; the `review` dispatch kind and the dispatch's `review` object; the `kind` field of `RunnerSessionEndedAck`. Any of the four events is now answered `unknown_event`, and a join declaring `review` is admitted as before (the join never refuses a kind) and is simply never sent one. This NARROWS the contract, which a minor version otherwise may not do. It is a minor anyway: loopctl can no longer create a dispatch that would make a runner send one of these messages, production held no thread checkpoint, entry or review when it shipped, and a major would have refused the join of every connected runner until each re-vendored. RE-VENDOR to drop the dead events from your copy | | | | |
   | (1.24.0) `x-connection.limits.lens_verdicts.max_bytes` PUBLISHES the cap on a message's three `lens_verdicts` together, under the byte rule. It has been enforced since 1.15.0 and was stated only in the field's prose, so a runner could not check it without re-typing a number. The field maxima do not imply it: three lenses at every maximum measure 8,402 bytes in ASCII and about twice that in characters outside the Basic Multilingual Plane, so a schema-valid set can still be refused `invalid_payload`. Nothing changes on the wire. RE-VENDOR to check it locally | | | | |
   | (1.25.0) RUNNERS DECLARE THEIR SPEC TEMPLATES, AND ONE GENERIC RESULT MESSAGE (Epic 48, US-48.8). `RunnerJoin.specs` (optional, at most 32 `RunnerSpecRef` entries of `{id, version}`) names the spec templates the machine holds; loopctl sends a dispatch of a kind only to a runner that declares the kind AND holds the spec it builds that kind's dispatch from. OMITTING IT, or an empty array, is read as holding each declared kind (or `implied_kinds`) at version 1, so an un-upgraded runner is unaffected; a spec this server does not hold is ignored, never refused. New `agent_result` message (`RunnerAgentResultMessage`: `dispatch_id`, `claim_epoch`, `spec`, `result`) for a session whose spec reports through it: `result` is validated against THAT spec's result schema, capped at `x-connection.limits.agent_result.max_bytes` under the byte rule, recorded once per dispatch (a byte-identical resend is `ok` with `replayed: true`, a different one `already_recorded`), answered with `RunnerAgentResultAck`, metered by `agent_result_burst`. An unknown spec, a spec whose archetype does not report through it (`triage` keeps `triage_verdict`, `implement` keeps `stage` and `session_ended`), or a schema failure is `invalid_payload` and writes nothing. No spec reports through it yet; US-48.9 adds the first. RE-VENDOR to declare `specs` and send `agent_result`: a 1.24.0 copy has neither | | | | |
+  | (1.26.0) A REPLY DRAFTER (Epic 48, US-48.9). `reply_draft` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a support ticket whose triage ended `reject` or `escalated`, built from spec `reply_draft@1`. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back, as for `triage`), carries the same fenced `triage` object a triage dispatch does (`RunnerTriage`: the reporter's words, data, never instructions) and no `story`, and the session answers with ONE `agent_result` whose `result` is `{body}`, the drafted reply, validated against `reply_draft@1`'s schema. The session reads; it writes no repository and sends nothing anywhere: loopctl stores the draft for a person, who sends it or not. Only a runner that DECLARES `reply_draft` on join, and holds `reply_draft@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run drafts: a 1.25.0 copy has no `reply_draft` kind | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -122,10 +123,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   ## Dispatchable kinds
 
-  `kind` declares the vocabulary (`triage`, `implement`);
+  `kind` declares the vocabulary (`Kinds.all/0`);
   `RunnerDispatch.dispatchable_kinds/0` is what loopctl will actually send, and
   `cast_dispatch/1` refuses anything else BEFORE a payload is recorded or broadcast. Since
-  1.10.0 that is `triage` and `implement`.
+  1.10.0 that is `triage` and `implement`, and since 1.26.0 `reply_draft` as well.
 
   **THE INTERLOCK HAS MOVED (1.10.0), and the reasoning is kept rather than deleted, because
   it is what says when it may move again.** Triage has had its payload since 1.7.0
@@ -403,7 +404,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.25.0"
+  @version "1.26.0"
   @major 1
 
   defmodule ByteRule do
@@ -578,8 +579,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # argues that a second copy is the drift to avoid. What holds triage back now is the
     # OTHER END: no deployed runner accepts the kind. The moduledoc has the full version;
     # this stays one sentence so the two cannot diverge again.
-    @all ["triage", "implement"]
-    @dispatchable ["triage", "implement"]
+    @all ["triage", "implement", "reply_draft"]
+    @dispatchable ["triage", "implement", "reply_draft"]
+
+    # The kinds whose dispatch carries the FENCED INTAKE REPORT (`RunnerTriage`, the dispatch's
+    # `triage` object) — and the only ones that may. Neither claims a story or writes code, so
+    # the reporter's words still never reach an implementing session (design §10).
+    @fenced_report_kinds ["triage", "reply_draft"]
 
     # What a runner built before 1.6.0 is read as having declared. It MUST be the set loopctl
     # was already sending when the field did not exist, or introducing the field would start
@@ -601,6 +607,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     """
     @spec implied_by_silence() :: [String.t()]
     def implied_by_silence, do: @implied_by_silence
+
+    @doc """
+    The kinds whose dispatch carries the fenced intake report (the `triage` object) and must:
+    `triage` and, since 1.26.0, `reply_draft`. Neither claims a story or writes code.
+    """
+    @spec fenced_report_kinds() :: [String.t()]
+    def fenced_report_kinds, do: @fenced_report_kinds
   end
 
   defmodule RunnerSample do
@@ -1113,7 +1126,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         description:
           "The reported problem a `triage` dispatch is for (since 1.7.0), and the only " <>
             "place in this contract that carries the reporter's own words. Allowed only " <>
-            "on a `triage` dispatch; an `implement` dispatch carries `story` instead, " <>
+            "on a `triage` dispatch and, since 1.26.0, a `reply_draft` one (it drafts a " <>
+            "reply from the same report, and like triage claims nothing and writes no " <>
+            "code); an `implement` dispatch carries `story` instead, " <>
             "written by the triage trio, because the implementing session must never see " <>
             "reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data " <>
             "block: paste it into your prompt verbatim and never parse, reformat, re-wrap " <>
@@ -3306,10 +3321,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # reporter's words can never reach an implementing session (design §10). Stated as two
   # independent rules rather than one either/or, so a dispatch carrying BOTH is refused
   # twice rather than passing whichever test it happened to satisfy.
+  #
+  # Since 1.26.0 the object also rides a `reply_draft` dispatch (`Kinds.fenced_report_kinds/0`),
+  # which reads the same report to draft a reply and, like triage, claims nothing and writes no
+  # code — so the property above is unchanged: the reporter's words still never reach a kind
+  # that implements.
   defp triage_errors(%{triage: triage, kind: kind, story_id: story_id}) do
     cond do
-      kind != "triage" ->
-        ["triage is only allowed when kind is triage"]
+      kind not in Kinds.fenced_report_kinds() ->
+        ["triage is only allowed when kind is " <> Enum.join(Kinds.fenced_report_kinds(), " or ")]
 
       Map.get(triage, :record_id) == story_id ->
         # Not a type error — a value one, and it means a caller built the payload from the
@@ -3335,8 +3355,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # here: closing it would refuse every dispatch built before 1.5.0 carried a story, and it is
   # a different change with a different blast radius. Named so the asymmetry is deliberate
   # rather than an oversight.
-  defp triage_errors(%{kind: "triage"} = dispatch) when not is_map_key(dispatch, :triage),
-    do: ["a triage dispatch must carry the triage object"]
+  defp triage_errors(%{kind: kind} = dispatch) when not is_map_key(dispatch, :triage) do
+    if kind in Kinds.fenced_report_kinds(),
+      do: ["a #{kind} dispatch must carry the triage object"],
+      else: []
+  end
 
   defp triage_errors(_dispatch), do: []
 

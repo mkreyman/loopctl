@@ -57,6 +57,19 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Reply drafts for tickets triage set aside (2026-11-07, US-48.9).** For a story whose
+  intake record carries a support `ticket_id` and which triage rejected or escalated, a runner
+  session drafts a reply (agent spec `reply_draft@1`, dispatch kind `reply_draft`, runner
+  contract **1.26.0**: the kind is dispatchable and carries the fenced report in the `triage`
+  object). loopctl stores the draft and NEVER sends it. A body the injection screen flags is
+  stored `refused` with the screen's codes and without the body. Read them with
+  `GET /api/v1/projects/:project_id/reply_drafts` (`user` role: the bodies are drafted from
+  customer ticket text; cursor-paginated), MCP `reply_draft_list` in loopctl-mcp-server 3.7.0.
+  New env var **`DRAFT_DISPATCH_ENABLED`**, default off, which also needs
+  `DISPATCH_DRIVER_ENABLED`; sessions spend the `TRIAGE_*` budgets. Migration
+  `20261107140000_create_reply_drafts` adds the `reply_drafts` table (RLS) and `reply_draft`
+  to the `runner_dispatches_kind` CHECK; its `down` deletes the `reply_draft` ledger rows
+  before restoring the CHECK. A recorded `agent_result` now also releases its dispatch's slot.
 - **Intake sources can triage only support-ticket issues (2026-11-06).**
   `intake_sources.triage_requires_ticket` (migration
   `20261106230000_add_triage_requires_ticket_to_intake_sources`, boolean, NOT NULL, default

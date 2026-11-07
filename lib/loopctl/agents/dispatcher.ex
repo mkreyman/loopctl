@@ -1,6 +1,7 @@
 defmodule Loopctl.Agents.Dispatcher do
   @moduledoc """
-  One dispatch pass of a `:judge` spec (Epic 48, US-48.4) or a `:build` spec (US-48.7).
+  One dispatch pass of a `:judge` spec (Epic 48, US-48.4), a `:build` spec (US-48.7) or a
+  `:draft` spec (US-48.9).
 
   `run/2` is what `Loopctl.Delivery.TriageDispatcher.run_with/2` and
   `Loopctl.Delivery.DispatchDriver.run_with/2` used to be, with every part that belonged to the
@@ -60,6 +61,21 @@ defmodule Loopctl.Agents.Dispatcher do
   (`"DispatchDriver"`, `"worker:dispatch_driver"`), because an operator's alerts and the
   claim's audit rows read them.
 
+  ## The `:draft` pass (US-48.9)
+
+  The `:judge` pass's shape, because a `:draft` is the same kind of session — it reads a
+  story, claims nothing, and its dispatch echoes the story's current `claim_epoch` — with the
+  two differences its archetype makes:
+
+  - **No sweep and no stage move.** A `:draft` names no transition, so nothing is ever left
+    half-taken for a sweep to finish, and nothing here calls `Stages`.
+  - **A ticket too large to send is REFUSED, not escalated**: `spec.screens[:payload_too_large]`
+    is `[]` (moves nothing), and the pass stores a refused `reply_drafts` row with that screen
+    (`Loopctl.ReplyDrafts.refuse/4`), outcome `:refused`, so the story stops being a candidate.
+
+  What the session returns is not this module's: it arrives as `agent_result` and
+  `Loopctl.Agents.AgentResult` runs the spec's effect.
+
   ## Behind `:dispatch_driver_enabled`
 
   The SAME switch as `Loopctl.Delivery.DispatchDriver`, read once per pass
@@ -68,6 +84,11 @@ defmodule Loopctl.Agents.Dispatcher do
   and the too-large escalation are behind it too. `:enabled?` is an INPUT defaulting to that
   read, so a test reaches the work without touching application env; the cron caller never
   passes it.
+
+  A `:draft` pass is behind that switch AND its own, `:draft_dispatch_enabled`
+  (`DRAFT_DISPATCH_ENABLED`, default OFF, `drafts_enabled?/0`): a drafter is new work on an
+  operator's machines that no ticket needed before, so turning the loop on must not turn it on
+  too. Off, a `:draft` pass reads nothing.
 
   ## What is code here and not a spec field
 
@@ -100,6 +121,7 @@ defmodule Loopctl.Agents.Dispatcher do
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.GitRef
   alias Loopctl.Intake
+  alias Loopctl.ReplyDrafts
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -123,7 +145,10 @@ defmodule Loopctl.Agents.Dispatcher do
   @typedoc "A `:build` pass's outcomes: `Loopctl.Delivery.DispatchDriver.outcome/0`."
   @type build_outcome :: :placed | :no_runner | :unplaceable | :blocked | :errored
 
-  @type outcome :: judge_outcome() | build_outcome()
+  @typedoc "A `:draft` pass's outcomes: `:refused` is a ticket too large to send."
+  @type draft_outcome :: :dispatched | :no_runner | :deferred | :blocked | :refused | :errored
+
+  @type outcome :: judge_outcome() | build_outcome() | draft_outcome()
 
   @type budgets :: %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}
 
@@ -178,7 +203,7 @@ defmodule Loopctl.Agents.Dispatcher do
 
   # The payload builders this pass can run, the key the built object rides under, and the
   # refusal that means "a person must read this ticket" (the `:payload_too_large` screen).
-  @payload_builders %{triage_payload: %{key: "triage", too_large: :triage_too_large}}
+  @payload_builders %{fenced_intake_report: %{key: "triage", too_large: :triage_too_large}}
 
   # The ref sources a `:judge` pass can resolve. `:story_branch_for_runner_prefixes` is a
   # `:build` source (`DispatchPayload.fill/3`), derived per story from the target runner.
@@ -207,16 +232,17 @@ defmodule Loopctl.Agents.Dispatcher do
   - `:limit` (required) — the most candidates the pass attempts.
   - `:budgets` — the session budgets, already decided. Absent, `budgets/1` reads the spec's
     pair and a missing or over-ceiling value is returned as the error, before anything runs.
-  - `:enabled?` — the switch; defaults to `DispatchDriver.enabled?/0`.
+  - `:enabled?` — the switch; defaults to `DispatchDriver.enabled?/0`, and for a `:draft` to
+    that AND `drafts_enabled?/0`.
   - `:dispatch` — a `:judge` pass's push; defaults to `&Loopctl.Runners.dispatch/3`.
   - `:place` — a `:build` pass's placement; defaults to `&Loopctl.Delivery.Placement.place/4`.
     It is handed the operator key and the actor label the pass resolved, never anything a
     caller of `run/2` supplied: the seam is the call, not the identity.
   - `:sweep_limit` — the most rows each sweep finishes per pass (default #{@sweep_limit}).
 
-  Raises `ArgumentError` for a spec this pass cannot run: a `:draft`, or a spec that names a
-  payload builder, a ref source or a sweep its archetype's pass has no clause for. A spec is
-  code, so that is a programming error, never a runtime state.
+  Raises `ArgumentError` for a spec this pass cannot run: one that names a payload builder, a
+  ref source or a sweep its archetype's pass has no clause for. A spec is code, so that is a
+  programming error, never a runtime state.
   """
   @spec run(Spec.t(), [option()]) ::
           {:ok, [outcome()]} | {:error, {:unset, atom()} | {:over_contract_maximum, atom()}}
@@ -224,13 +250,23 @@ defmodule Loopctl.Agents.Dispatcher do
     :ok = runnable!(spec)
     limit = Keyword.fetch!(opts, :limit)
 
-    if Keyword.get_lazy(opts, :enabled?, &DispatchDriver.enabled?/0) == true do
+    if Keyword.get_lazy(opts, :enabled?, fn -> enabled?(spec) end) == true do
       with {:ok, budgets} <- fetch_budgets(spec, opts),
            do: {:ok, pass(spec, limit, budgets, opts)}
     else
       {:ok, []}
     end
   end
+
+  @doc """
+  Whether `:draft` passes may run: `:draft_dispatch_enabled` (`DRAFT_DISPATCH_ENABLED`), OFF
+  unless set to exactly `true`. Read with `DispatchDriver.enabled?/0`, never instead of it.
+  """
+  @spec drafts_enabled?() :: boolean()
+  def drafts_enabled?, do: Application.get_env(:loopctl, :draft_dispatch_enabled, false) == true
+
+  defp enabled?(%Spec{archetype: :draft}), do: DispatchDriver.enabled?() and drafts_enabled?()
+  defp enabled?(%Spec{}), do: DispatchDriver.enabled?()
 
   @doc """
   The budgets a session of `spec` runs under, from its `{wall_clock_key, max_turns_key}` pair,
@@ -404,7 +440,7 @@ defmodule Loopctl.Agents.Dispatcher do
         {:no_runner, Selection.note_no_runner(cache, label(spec), candidate)}
 
       {:error, ^too_large} ->
-        {escalate(spec, candidate, spec.screens.payload_too_large), cache}
+        {too_large(spec, candidate), cache}
 
       {:error, reason} when reason in @transient ->
         {deferred(spec, candidate, reason), cache}
@@ -418,6 +454,17 @@ defmodule Loopctl.Agents.Dispatcher do
     kind, value ->
       {errored(spec, candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
   end
+
+  # A `:judge` takes the screen's route to a person. A `:draft` names no route (`[]`): it
+  # stores the refusal instead, so the story stops being a candidate, and moves nothing.
+  defp too_large(%Spec{archetype: :draft} = spec, %{tenant_id: tenant_id, story_id: story_id}) do
+    case ReplyDrafts.refuse(tenant_id, story_id, :payload_too_large) do
+      :ok -> :refused
+      {:error, reason} -> blocked(spec, %{tenant_id: tenant_id, story_id: story_id}, reason)
+    end
+  end
+
+  defp too_large(spec, candidate), do: escalate(spec, candidate, spec.screens.payload_too_large)
 
   # The order is the order the triage pass read in, and it is load-bearing for the outcome a
   # story gets: the refs are judged before the payload is built, so a legacy source is
@@ -436,14 +483,15 @@ defmodule Loopctl.Agents.Dispatcher do
     end
   end
 
-  # `:triage_payload` reads the intake record: the reporter's words ARE the payload, which is
-  # why the candidate read requires one (`:intake_record_required`).
-  defp payload_input(%Spec{payload: :triage_payload}, tenant_id, story),
+  # `:fenced_intake_report` reads the intake record: the reporter's words ARE the payload,
+  # which is why the candidate read requires one (`:intake_record_required`).
+  defp payload_input(%Spec{payload: :fenced_intake_report}, tenant_id, story),
     do: Intake.get_record(tenant_id, story.intake_record_id)
 
   # `TriagePayload.build/1`: the reporter's words, fenced, refused whole when the rendered
   # object will not fit the contract.
-  defp build_payload(%Spec{payload: :triage_payload}, record), do: TriagePayload.build(record)
+  defp build_payload(%Spec{payload: :fenced_intake_report}, record),
+    do: TriagePayload.build(record)
 
   defp payload_builder(%Spec{payload: payload}), do: Map.fetch!(@payload_builders, payload)
 
@@ -786,13 +834,27 @@ defmodule Loopctl.Agents.Dispatcher do
         )
   end
 
-  defp runnable!(%Spec{} = spec),
-    do:
-      raise(
-        ArgumentError,
-        "#{spec.id}@#{spec.version} is a #{inspect(spec.archetype)} spec; " <>
-          "Loopctl.Agents.Dispatcher runs only a :judge or a :build pass"
-      )
+  # A `:draft` pass is the `:judge` pass with no sweep: the same payload builders and ref
+  # sources, and a `:payload_too_large` screen for the builder's refusal (whose route is `[]`).
+  defp runnable!(%Spec{archetype: :draft} = spec) do
+    unsupported =
+      [
+        {:payload, [spec.payload] -- Map.keys(@payload_builders)},
+        {:refs, Enum.uniq(Keyword.values(spec.refs)) -- @ref_sources},
+        {:sweeps, Map.keys(spec.sweeps)},
+        {:screens, if(Map.has_key?(spec.screens, :payload_too_large), do: [], else: [:missing])}
+      ]
+      |> Enum.reject(fn {_field, values} -> values == [] end)
+
+    if unsupported == [],
+      do: :ok,
+      else:
+        raise(
+          ArgumentError,
+          "#{spec.id}@#{spec.version}: Loopctl.Agents.Dispatcher cannot run the :draft " <>
+            "pass over " <> inspect(unsupported) <> " (a :payload_too_large screen is required)"
+        )
+  end
 
   # ── log lines ───────────────────────────────────────────────────────────────────────────────
 

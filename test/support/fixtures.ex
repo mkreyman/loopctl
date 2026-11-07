@@ -132,8 +132,8 @@ defmodule Loopctl.Fixtures do
 
   # A conforming runner join payload; `attrs` (string keys, "machine" among them) override.
   # US-48.8: a TEST-ONLY `:draft` spec that reports through the generic `agent_result`
-  # message. No production spec does yet (US-48.9 adds `reply_draft@1`), so the agent_result
-  # path is exercised with this one, injected through `Loopctl.Agents.AgentResult.apply/4`'s
+  # message and names NO effect, so the generic agent_result path is exercised apart from
+  # `reply_draft@1`'s (US-48.9) `:reply_draft` effect. Injected through `Loopctl.Agents.AgentResult.apply/4`'s
   # `:specs` option — never added to `Loopctl.Agents.Registry`. Built from `triage@1`'s fields
   # (its kind, candidates and control-only routes are all a `:draft` may name), validated by
   # the same `Spec.new!/2` a spec module compiles through.
@@ -3189,6 +3189,80 @@ defmodule Loopctl.Fixtures do
 
     {:ok, _row} = Stages.open(tenant_id, story.id, actor_label: "test")
     story
+  end
+
+  # US-48.9: a `:detected_story` TRIAGE SET ASIDE — taken `detected -> triaged -> <to>` over
+  # the real stage machine, `:to` being `:failed` (`:triage_reject`, the default) or
+  # `:escalated` (`:triage_escalate`), the route a triage worker takes, under the same actor
+  # shape. `:ticket_id` (a fresh one by default; `nil` for none) is written on its intake
+  # record. Every `:detected_story` attribute passes through.
+  def fixture(:set_aside_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    story = fixture(:detected_story, attrs)
+
+    case Map.get(attrs, :ticket_id, Ecto.UUID.generate()) do
+      nil ->
+        :ok
+
+      ticket_id ->
+        record_id =
+          AdminRepo.one!(from s in Story, where: s.id == ^story.id, select: s.intake_record_id)
+
+        {1, _} =
+          AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+            set: [ticket_id: ticket_id]
+          )
+    end
+
+    edge =
+      case Map.get(attrs, :to, :failed) do
+        :failed -> {:triaged, :failed, :triage_reject}
+        :escalated -> {:triaged, :escalated, :triage_escalate}
+      end
+
+    for transition <- [{:detected, :triaged, :forward}, edge] do
+      row = Stages.get(tenant_id, story.id)
+
+      {:ok, _row} =
+        Stages.advance(tenant_id, story.id, transition,
+          claim_epoch: row.claim_epoch,
+          actor_label: "worker:triage_dispatcher",
+          actor_role: :agent,
+          actor_lineage: [],
+          reason: if(elem(transition, 2) == :forward, do: nil, else: "triage_verdict:test")
+        )
+    end
+
+    story
+  end
+
+  # US-48.9: a `reply_drafts` row for a fresh `:set_aside_story` of `:tenant_id` (or for
+  # `:story`), `drafted` with `:body` by default. `:inserted_at` orders a page; `:project_id`
+  # files several stories' drafts under one project, for a page of more than one. Written on
+  # `AdminRepo` as a row, for a read test; the write path is `Loopctl.ReplyDrafts`'s own.
+  def fixture(:reply_draft, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    story =
+      Map.get_lazy(attrs, :story, fn -> fixture(:set_aside_story, %{tenant_id: tenant_id}) end)
+
+    status = Map.get(attrs, :status, :drafted)
+
+    AdminRepo.insert!(%Loopctl.ReplyDrafts.ReplyDraft{
+      tenant_id: tenant_id,
+      project_id: Map.get(attrs, :project_id, story.project_id),
+      story_id: story.id,
+      dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+      ticket_id: Map.get(attrs, :ticket_id, Ecto.UUID.generate()),
+      status: status,
+      body: if(status == :drafted, do: Map.get(attrs, :body, "Thanks for writing in.")),
+      screen_code:
+        if(status == :refused, do: Map.get(attrs, :screen_code, "injection_detector_draft")),
+      screen_signals: Map.get(attrs, :screen_signals, []),
+      inserted_at: Map.get(attrs, :inserted_at, DateTime.utc_now())
+    })
   end
 
   # The project, epic, story and intake source a `Loopctl.Workers.VerificationRunnerWorker`

@@ -157,7 +157,8 @@ Every variable is documented, with its default and what breaks when it is wrong,
 
 - **Driver switch:** `DISPATCH_DRIVER_ENABLED`. Turn it on last. Do not set it `false` as a Fly secret, which overrides and persists; change the `fly.toml` `[env]` line instead.
 - **Dispatch budgets:** `DISPATCH_WALL_CLOCK_SECONDS`, `DISPATCH_MAX_TURNS`, `DISPATCH_MAX_ATTEMPTS` (no default; unset means the first counted release escalates).
-- **Triage budgets:** `TRIAGE_WALL_CLOCK_SECONDS`, `TRIAGE_MAX_TURNS`.
+- **Triage budgets:** `TRIAGE_WALL_CLOCK_SECONDS`, `TRIAGE_MAX_TURNS`. Reply drafting spends these too.
+- **Reply drafts:** `DRAFT_DISPATCH_ENABLED`, off unless `true` or `1`, and only while the driver switch is on too. It asks a runner declaring the `reply_draft` kind to draft a reply for each support ticket triage rejected or escalated. loopctl stores each draft and never sends it; read them with `reply_draft_list` (a user key).
 - **Leases:** `STORY_CLAIM_LEASE_SECONDS`, `DISPATCH_LEASE_GRACE_SECONDS`.
 - **Tenant cap:** `RUNNER_MAX_IN_FLIGHT_SESSIONS`.
 - **Gates:** `DELIVERY_GATES_CONFIG` with `DELIVERY_GATES_CONFIG_SHA256`. Unset means every change escalates.

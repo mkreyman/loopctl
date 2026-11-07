@@ -685,9 +685,9 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
   describe "agent_result (US-48.8, contract 1.25.0)" do
     # The mechanism — the spec lookup, the schema, the ledger write, the audit row — is covered
     # without a socket in `Loopctl.Agents.AgentResultTest`, which injects a `:draft` spec. What
-    # is here is the WIRING with the PRODUCTION registry, which holds no spec that reports
-    # through this message: every result is refused before anything is written, and the
-    # refusal reaches the wire as the contract's published code.
+    # is here is the WIRING with the PRODUCTION registry on an IMPLEMENT dispatch: every result
+    # is refused before anything is written, and the refusal reaches the wire as the contract's
+    # published code. reply_draft@1's accepting path is `LoopctlWeb.RunnerChannelReplyDraftTest`.
     defp agent_result(dispatch_id, spec, result),
       do: stage_message(dispatch_id, %{"spec" => spec, "result" => result})
 
@@ -704,7 +704,8 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
     test "a spec loopctl does not hold is refused invalid_payload and records nothing", ctx do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
 
-      ref = push(channel, "agent_result", agent_result(dispatch_id, spec("reply_draft", 1), %{}))
+      ref =
+        push(channel, "agent_result", agent_result(dispatch_id, spec("summary_draft", 1), %{}))
 
       assert_reply ref,
                    :error,
@@ -712,6 +713,27 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
                    reply_timeout()
 
       nothing_recorded!(runner.tenant_id, dispatch_id)
+    end
+
+    test "reply_draft@1 on an implement dispatch is refused wrong_dispatch_kind", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      ref =
+        push(
+          channel,
+          "agent_result",
+          agent_result(dispatch_id, spec("reply_draft", 1), %{"body" => "Thanks for writing."})
+        )
+
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, reply_timeout()
+      nothing_recorded!(runner.tenant_id, dispatch_id)
+
+      {:ok, count} =
+        Loopctl.Repo.with_tenant(runner.tenant_id, fn ->
+          Loopctl.Repo.aggregate(Loopctl.ReplyDrafts.ReplyDraft, :count)
+        end)
+
+      assert count == 0
     end
 
     test "triage@1 and implement@1 keep their own messages, so agent_result refuses them",
@@ -738,11 +760,11 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       cap = RunnerContract.RunnerAgentResultMessage.max_result_bytes()
 
       for payload <- [
-            Map.delete(agent_result(dispatch_id, spec("reply_draft", 1), %{}), "result"),
-            agent_result(dispatch_id, spec("reply_draft", 1), "text"),
+            Map.delete(agent_result(dispatch_id, spec("summary_draft", 1), %{}), "result"),
+            agent_result(dispatch_id, spec("summary_draft", 1), "text"),
             agent_result(dispatch_id, spec("Reply", 1), %{}),
-            agent_result(dispatch_id, spec("reply_draft", 1), %{"r" => "a\u0000"}),
-            agent_result(dispatch_id, spec("reply_draft", 1), %{
+            agent_result(dispatch_id, spec("summary_draft", 1), %{"r" => "a\u0000"}),
+            agent_result(dispatch_id, spec("summary_draft", 1), %{
               "r" => String.duplicate("a", cap)
             })
           ] do
@@ -757,7 +779,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
     test "is metered by its own published bucket", ctx do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
       %{"capacity" => capacity} = RunnerContract.agent_result_burst()
-      payload = agent_result(dispatch_id, spec("reply_draft", 1), %{})
+      payload = agent_result(dispatch_id, spec("summary_draft", 1), %{})
 
       for _ <- 1..capacity do
         ref = push(channel, "agent_result", payload)

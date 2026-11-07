@@ -15,6 +15,7 @@ defmodule Loopctl.Agents.SpecTest do
 
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs.ImplementV1
+  alias Loopctl.Agents.Specs.ReplyDraftV1
   alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.Delivery.StageMachine
 
@@ -47,6 +48,38 @@ defmodule Loopctl.Agents.SpecTest do
 
     test "implement@1's own fields compile to the same struct" do
       assert compile(fields(ImplementV1)).spec() == ImplementV1.spec()
+    end
+
+    test "reply_draft@1's own fields compile to the same struct" do
+      assert compile(fields(ReplyDraftV1)).spec() == ReplyDraftV1.spec()
+    end
+  end
+
+  describe "a :draft names no transition (US-48.9)" do
+    test "reply_draft@1 names no stage edge anywhere" do
+      assert Spec.named_transitions(ReplyDraftV1.spec()) == []
+      assert ReplyDraftV1.spec().outcomes == %{"draft" => []}
+    end
+
+    test "an empty route is a :draft's alone: a :judge or a :build naming one fails" do
+      for module <- [TriageV1, ImplementV1] do
+        message = module |> fields() |> put(:outcomes, %{"x" => []}) |> refused()
+        assert message =~ "must be a non-empty list of transitions"
+      end
+    end
+
+    test "the :reply_draft effect is a :draft's alone" do
+      message =
+        TriageV1 |> fields() |> put(:effects, [:triage_dispatch_id, :reply_draft]) |> refused()
+
+      assert message =~ ":reply_draft"
+    end
+
+    test "the :injection_detector_draft screen and :fenced_intake_report payload are known" do
+      spec = ReplyDraftV1.spec()
+      assert Map.has_key?(spec.screens, :injection_detector_draft)
+      assert spec.payload == :fenced_intake_report
+      assert TriageV1.spec().payload == :fenced_intake_report
     end
   end
 

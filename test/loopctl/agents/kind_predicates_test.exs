@@ -31,6 +31,9 @@ defmodule Loopctl.Agents.KindPredicatesTest do
   @old_implement_kinds ["implement"]
   @old_default_kind "implement"
 
+  # Registry kinds the oracle predates: added by a later story, so not in its budget table.
+  @kinds_added_since ["reply_draft"]
+
   defp old_implement_kind?(kind), do: is_nil(kind) or kind in @old_implement_kinds
 
   defp old_kind_answers?(_kind, :any), do: true
@@ -50,7 +53,7 @@ defmodule Loopctl.Agents.KindPredicatesTest do
         "k" <> (:crypto.strong_rand_bytes(6) |> Base.encode32(case: :lower, padding: false))
       end
 
-    ["review", "reply_draft", "IMPLEMENT", "Triage", "implement ", " triage", ""] ++ random
+    ["review", "summary_draft", "IMPLEMENT", "Triage", "implement ", " triage", ""] ++ random
   end
 
   defp registry_kinds do
@@ -95,10 +98,22 @@ defmodule Loopctl.Agents.KindPredicatesTest do
       end
     end
 
-    test "budget_keys/1 == the old pair for every registry kind and nil" do
-      for kind <- registry_kinds() ++ [nil] do
+    # The oracle knows the kinds that existed when it was copied. A kind added since has no
+    # old pair to agree with — the old code would have charged it the implement budget, the
+    # AC-48.6.3 divergence — so each one states its own below.
+    test "budget_keys/1 == the old pair for every kind the oracle knew, and nil" do
+      for kind <- (registry_kinds() -- @kinds_added_since) ++ [nil] do
         assert DispatchPayload.budget_keys(kind) == {:ok, old_budget_keys(kind)}, inspect(kind)
       end
+    end
+
+    test "US-48.9: reply_draft spends the triage budget, a pass that reads one report" do
+      assert "reply_draft" in registry_kinds()
+
+      assert DispatchPayload.budget_keys("reply_draft") ==
+               {:ok, {:triage_wall_clock_seconds, :triage_max_turns}}
+
+      refute Spec.holds_claim?("reply_draft")
     end
 
     test "the default kind (fill/3, a nil ledger row) == the old literal" do

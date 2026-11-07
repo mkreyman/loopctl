@@ -19,10 +19,20 @@ defmodule Loopctl.Agents.Candidates do
   | `:no_live_dispatch_of_self` | no unreleased ledger row of the SPEC'S OWN kind names it |
   | `{:agent_status_in, statuses}` | its `agent_status` is one of `statuses` |
   | `:dependencies_met` | no unmet story or epic dependency (`Loopctl.WorkBreakdown.Dependencies`) |
+  | `:triage_set_aside` | TRIAGE set it aside: its stage is `failed` or `escalated` and its latest transition is the one triage takes there, `triaged -> failed` on `:triage_reject` or `triaged -> escalated` on `:triage_escalate` (US-48.9) |
+  | `:ticket_required` | its record carries a `ticket_id` (a support ticket), whatever its source says |
+  | `:no_reply_draft` | no `reply_drafts` row names it, drafted or refused (US-48.9) |
 
-  `validate/1` holds the combinations together: one stage, at most one intake-record predicate
-  and one status list, `:issue_not_closed` and `:requires_ticket_if_source_says` only with a
-  record joined, and the ticket predicate only with the single source it reads the flag from.
+  `validate/1` holds the combinations together: exactly one STAGE predicate (`{:stage, stage}`,
+  or `:triage_set_aside`, which decides the stage itself), at most one intake-record predicate
+  and one status list, `:issue_not_closed`, `:requires_ticket_if_source_says` and
+  `:ticket_required` only with a record joined, and the source-flag ticket predicate only with
+  the single source it reads the flag from.
+
+  `:triage_set_aside` reads the story's LATEST transition, not merely its stage, because both
+  stages have other ways in: an implement session escalates over `:session_escalated`, a budget
+  kill fails a story over `:budget_exceeded`, and a person can resolve an escalation to
+  `failed`. Only a story triage itself left there is one triage set aside.
   `Loopctl.Agents.Spec` calls it while a spec module compiles, so a bad list is a build failure.
 
   ## Why each exclusion is IN the read rather than discovered per story
@@ -54,10 +64,12 @@ defmodule Loopctl.Agents.Candidates do
 
   import Ecto.Query
 
+  alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
+  alias Loopctl.ReplyDrafts.ReplyDraft
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
@@ -72,6 +84,9 @@ defmodule Loopctl.Agents.Candidates do
           | :no_live_dispatch_of_self
           | {:agent_status_in, [atom()]}
           | :dependencies_met
+          | :triage_set_aside
+          | :ticket_required
+          | :no_reply_draft
 
   @type order :: :round_robin_project_tenant
 
@@ -92,7 +107,10 @@ defmodule Loopctl.Agents.Candidates do
                        :issue_not_closed,
                        :requires_ticket_if_source_says,
                        :no_live_dispatch_of_self,
-                       :dependencies_met
+                       :dependencies_met,
+                       :triage_set_aside,
+                       :ticket_required,
+                       :no_reply_draft
                      ]
 
   @orders [:round_robin_project_tenant]
@@ -219,14 +237,15 @@ defmodule Loopctl.Agents.Candidates do
   end
 
   defp check_cardinality(predicates) do
-    stages = for {:stage, _} = p <- predicates, do: p
+    stages = Enum.filter(predicates, &stage_predicate?/1)
     statuses = for {:agent_status_in, _} = p <- predicates, do: p
     records = Enum.filter(predicates, &(&1 in @record_predicates))
 
     cond do
       length(stages) != 1 ->
         {:error,
-         "candidates.predicates must name exactly one {:stage, stage}, got #{inspect(stages)}"}
+         "candidates.predicates must name exactly one stage predicate ({:stage, stage} or " <>
+           ":triage_set_aside), got #{inspect(stages)}"}
 
       length(statuses) > 1 ->
         {:error, "candidates.predicates may name at most one {:agent_status_in, statuses}"}
@@ -239,6 +258,10 @@ defmodule Loopctl.Agents.Candidates do
     end
   end
 
+  defp stage_predicate?({:stage, _stage}), do: true
+  defp stage_predicate?(:triage_set_aside), do: true
+  defp stage_predicate?(_predicate), do: false
+
   # A filter that reads a binding only another predicate's join introduces: without one of
   # `any_of` the query would name a binding that does not exist.
   @needs [
@@ -246,7 +269,8 @@ defmodule Loopctl.Agents.Candidates do
     {:requires_ticket_if_source_says, @record_predicates,
      "one of #{inspect(@record_predicates)}"},
     {:requires_ticket_if_source_says, [:single_active_source],
-     ":single_active_source, the source it reads triage_requires_ticket from"}
+     ":single_active_source, the source it reads triage_requires_ticket from"},
+    {:ticket_required, @record_predicates, "one of #{inspect(@record_predicates)}"}
   ]
 
   defp check_needs(predicates) do
@@ -343,6 +367,52 @@ defmodule Loopctl.Agents.Candidates do
     where(query, not exists(subquery(live)))
   end
 
+  # TRIAGE'S OWN WAY INTO `failed` / `escalated`, read off the story's latest transition (see
+  # the moduledoc). The pairs are the stage machine's own transitions out of `triaged` over the
+  # two triage edges (`set_aside_transitions/0`), so this reads the machine, not a copy of it.
+  defp apply_predicate(:triage_set_aside, query, _kind) do
+    latest =
+      from e in StageEvent,
+        where:
+          e.tenant_id == parent_as(:stage).tenant_id and
+            e.story_id == parent_as(:stage).story_id,
+        where: e.event == "transitioned",
+        order_by: [desc: e.inserted_at, desc: e.lock_version],
+        limit: 1,
+        select: %{from_stage: e.from_stage, to_stage: e.to_stage, edge: e.edge}
+
+    conditions =
+      Enum.reduce(set_aside_transitions(), dynamic(false), fn {to, edge}, acc ->
+        to_text = Atom.to_string(to)
+        edge_text = Atom.to_string(edge)
+
+        dynamic(
+          [stage: s, set_aside: e],
+          ^acc or (s.stage == ^to and e.to_stage == ^to_text and e.edge == ^edge_text)
+        )
+      end)
+
+    query
+    |> join(:inner_lateral, [stage: s], e in subquery(latest), as: :set_aside, on: true)
+    |> where([set_aside: e], e.from_stage == "triaged")
+    |> where(^conditions)
+  end
+
+  defp apply_predicate(:ticket_required, query, _kind),
+    do: where(query, [record: rec], not is_nil(rec.ticket_id))
+
+  # A REFUSED row counts too: that story was looked at and set aside for a person, and drafting
+  # it again would only be refused again.
+  defp apply_predicate(:no_reply_draft, query, _kind) do
+    drafted =
+      from d in ReplyDraft,
+        where:
+          d.tenant_id == parent_as(:stage).tenant_id and d.story_id == parent_as(:stage).story_id,
+        select: 1
+
+    where(query, not exists(subquery(drafted)))
+  end
+
   defp apply_predicate({:agent_status_in, statuses}, query, _kind),
     do: where(query, [story: st], st.agent_status in ^statuses)
 
@@ -352,6 +422,19 @@ defmodule Loopctl.Agents.Candidates do
     query
     |> where(not exists(Dependencies.unmet_story_dependencies()))
     |> where(not exists(Dependencies.unmet_epic_dependencies()))
+  end
+
+  @set_aside_edges [:triage_reject, :triage_escalate]
+
+  @doc """
+  The `{to_stage, edge}` pairs `:triage_set_aside` accepts: the stage machine's transitions out
+  of `triaged` over `:triage_reject` and `:triage_escalate`.
+  """
+  @spec set_aside_transitions() :: [{atom(), atom()}]
+  def set_aside_transitions do
+    for {:triaged, to, edge} <- StageMachine.transitions(),
+        edge in @set_aside_edges,
+        do: {to, edge}
   end
 
   defp round_robin_project_tenant(filtered, limit) do

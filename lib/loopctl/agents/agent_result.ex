@@ -29,8 +29,16 @@ defmodule Loopctl.Agents.AgentResult do
 
   On the dispatch's ledger row — `agent_result`, `agent_result_spec`, `agent_result_digest`,
   `agent_result_at` — the storage `session_ended` already uses for "one report per dispatch".
-  US-48.12 adds the outcome ledger a result feeds. A `:draft` result moves no story and writes
-  no effect: that is what the archetype MEANS, and why one generic message is safe for it.
+  US-48.12 adds the outcome ledger a result feeds. A `:draft` result moves no story: that is
+  what the archetype MEANS, and why one generic message is safe for it.
+
+  ## The spec's effect, in the same transaction (US-48.9)
+
+  A `:draft` may name one kind of effect, the stored artifact a person releases. `reply_draft@1`
+  names `:reply_draft`: its body is screened (`:injection_detector_draft`) and a `reply_drafts`
+  row is written — `drafted`, or `refused` with the screen's codes and no body — inside the
+  ledger's own transaction, so the two commit together, once per dispatch. A refused body is
+  not kept on the ledger row either. Nothing is sent anywhere (`Loopctl.ReplyDrafts`).
 
   ## The audit row is enums and counts, never the session's words
 
@@ -55,6 +63,7 @@ defmodule Loopctl.Agents.AgentResult do
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
   alias Loopctl.Audit
   alias Loopctl.Delivery.TriageVerdictRecord
+  alias Loopctl.ReplyDrafts
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
 
@@ -85,9 +94,10 @@ defmodule Loopctl.Agents.AgentResult do
     with {:ok, spec} <- held_spec(specs, spec_ref),
          :ok <- reports_here(spec),
          {:ok, validated} <- RunnerContract.cast_agent_result(result, spec.result_schema),
-         attrs = record_attrs(spec, validated),
+         {stored, effect} = effects(spec, validated),
+         attrs = record_attrs(spec, validated, stored),
          {:ok, {outcome, record}} <-
-           DispatchLedger.record_agent_result(tenant_id, runner_id, message, attrs) do
+           DispatchLedger.record_agent_result(tenant_id, runner_id, message, attrs, effect) do
       if outcome == :recorded, do: audit(tenant_id, record, spec, validated)
       {:ok, %{record: record, replayed?: outcome == :replayed}}
     end
@@ -108,16 +118,36 @@ defmodule Loopctl.Agents.AgentResult do
       else: {:error, {:invalid, ["spec does not report through agent_result"]}}
   end
 
+  # THE SPEC'S EFFECTS, by name (US-48.9), and what the ledger row keeps of the result. Each
+  # effect is code here, never a spec field's behaviour: a spec names `:reply_draft` and this
+  # is what that name does. The effect runs inside the ledger's transaction, once, on a result
+  # that was recorded rather than replayed (`DispatchLedger.record_agent_result/5`).
+  #
+  # `:reply_draft` screens the body first (`ReplyDrafts.screen/1`, `:injection_detector_draft`).
+  # A refused body is stored NOWHERE: the draft row is `refused` with the screen's codes, and the
+  # ledger row keeps the screen's name in place of the result (`ReplyDrafts.withheld_result/1`).
+  # The digest is still over the result as sent, so a byte-identical resend still replays.
+  defp effects(%Spec{effects: effects}, validated) do
+    if :reply_draft in effects do
+      screened = ReplyDrafts.screen(validated.body)
+
+      {ReplyDrafts.withheld_result(screened) || validated,
+       fn record -> ReplyDrafts.write_result(record, screened) end}
+    else
+      {validated, fn _record -> :ok end}
+    end
+  end
+
   # Everything written is loopctl's: the kind and the label from the registry entry, the
-  # result as the spec's schema shaped it. The digest covers the spec too, so the same object
-  # under another spec is a different result.
-  defp record_attrs(spec, validated) do
+  # result as the spec's schema shaped it (or what its effect withheld of it). The digest
+  # covers the spec too, so the same object under another spec is a different result.
+  defp record_attrs(spec, validated, stored) do
     label = "#{spec.id}@#{spec.version}"
 
     %{
       kind: spec.kind,
       spec: label,
-      result: validated,
+      result: stored,
       digest: TriageVerdictRecord.digest(%{spec: label, result: validated})
     }
   end

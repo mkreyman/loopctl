@@ -27,6 +27,7 @@ import {
   stagePath,
   storyStage,
 } from "../lib/delivery-loop.js";
+import { replyDraftList, replyDraftsPath } from "../lib/reply-drafts.js";
 import { stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -492,6 +493,85 @@ describe("id validation — shared by every verb here", () => {
   });
 });
 
+describe("reply_draft_list (US-48.9)", () => {
+  const PROJECT_ID = "5b0b6a5e-6d43-4f3e-9d1f-2f6c1c1e0a11";
+
+  test("GETs the project's drafts with the user key, and nothing else", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await replyDraftList({ project_id: PROJECT_ID }, { userKey: "user-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "GET");
+    assert.equal(calls[0].path, `/api/v1/projects/${PROJECT_ID}/reply_drafts`);
+    assert.equal(calls[0].body, null);
+  });
+
+  test("carries cursor and limit as query parameters, encoded", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await replyDraftList(
+      { project_id: PROJECT_ID, cursor: "a+b/c=", limit: 10 },
+      { userKey: "user-key", apiCall },
+    );
+
+    assert.equal(calls[0].path, `${replyDraftsPath(PROJECT_ID)}?cursor=a%2Bb%2Fc%3D&limit=10`);
+  });
+
+  test("path-encodes a project slug rather than refusing it", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await replyDraftList({ project_id: "home care/billing" }, { userKey: "user-key", apiCall });
+
+    assert.equal(calls[0].path, "/api/v1/projects/home%20care%2Fbilling/reply_drafts");
+  });
+
+  test("refuses locally, sending nothing, with no user key or no project", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    const noKey = await replyDraftList({ project_id: PROJECT_ID }, { apiCall });
+    assert.equal(noKey.error, true);
+    assert.match(noKey.body, /LOOPCTL_USER_KEY/);
+
+    const noProject = await replyDraftList({}, { userKey: "user-key", apiCall });
+    assert.equal(noProject.error, true);
+    assert.match(noProject.body, /project_id/);
+
+    const badLimit = await replyDraftList(
+      { project_id: PROJECT_ID, limit: 0 },
+      { userKey: "user-key", apiCall },
+    );
+    assert.equal(badLimit.error, true);
+
+    const badCursor = await replyDraftList(
+      { project_id: PROJECT_ID, cursor: 7 },
+      { userKey: "user-key", apiCall },
+    );
+    assert.equal(badCursor.error, true);
+
+    assert.equal(calls.length, 0);
+  });
+
+  test("its description says loopctl never sends a draft and names the key", () => {
+    const start = INDEX_SRC.indexOf('name: "reply_draft_list"');
+    assert.ok(start > -1, "reply_draft_list is not declared");
+    const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+    assert.match(declaration, /NEVER SENDS/);
+    assert.match(declaration, /LOOPCTL_USER_KEY/);
+    assert.match(declaration, /403/);
+  });
+
+  test("its handler takes the exact user key, as the runner tools do", () => {
+    const start = INDEX_SRC.indexOf("async function replyDraftListRead(");
+    assert.ok(start > -1, "the reply_draft_list handler was not found");
+    const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
+    const handler = stripComments(INDEX_SRC.slice(start, end));
+
+    assert.match(handler, /replyDraftList\(args, runnerDeps\(\)\)/);
+  });
+});
+
 describe("the wiring in index.js", () => {
   test("every delivery-loop tool is declared, dispatched TO ITS OWN HANDLER, and documented", () => {
     // The defect these tools exist for is a verb that exists and nothing calls. A tool
@@ -514,6 +594,7 @@ describe("the wiring in index.js", () => {
       resolve_escalation: "resolveEscalation",
       force_unclaim_story: "forceUnclaimStory",
       merge_precondition: "mergePreconditionTool",
+      reply_draft_list: "replyDraftListRead",
     };
 
     for (const [name, handler] of Object.entries(wiring)) {
