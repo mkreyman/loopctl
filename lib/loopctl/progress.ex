@@ -754,8 +754,20 @@ defmodule Loopctl.Progress do
       "agent_id=#{inspect(ctx.agent_id)}"
   end
 
-  # US-26.2.2 AC-4: loopctl selects the verifier, not the orchestrator
+  # US-26.2.2 AC-4: loopctl selects the verifier, not the orchestrator.
+  #
+  # NEVER on a pr-route story (US-48.18): there control's verify@1 dispatch is the one
+  # verifier, bound by `bind_verifier_dispatch/4`, and `pr_route_verifier?/2` admits only
+  # it. A rotating pick here would overwrite that binding from an `:agent` call the
+  # implementer makes itself, dropping control's verdict and handing report/review/verify
+  # to a dispatch control never chose (security review of #1024).
   defp assign_rotating_verifier(tenant_id, story_id, story) do
+    if Loopctl.Intake.pr_route?(AdminRepo, tenant_id, story_id),
+      do: :ok,
+      else: select_rotating_verifier(tenant_id, story_id, story)
+  end
+
+  defp select_rotating_verifier(tenant_id, story_id, story) do
     impl_lineage =
       if story.implementer_dispatch_id,
         do: get_dispatch_lineage(tenant_id, story.implementer_dispatch_id),

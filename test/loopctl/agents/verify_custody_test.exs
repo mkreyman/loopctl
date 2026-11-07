@@ -325,6 +325,38 @@ defmodule Loopctl.Agents.VerifyCustodyTest do
                )
     end
 
+    test "the implementer's request-review cannot rebind a pr-route story's verifier", ctx do
+      b = mint(ctx, %{})
+      assert {:ok, _} = bind(ctx, b.id)
+      # Another live, independently rooted dispatch: what a rotating pick would choose.
+      _x = mint(ctx, %{agent_id: fixture(:agent, %{tenant_id: ctx.tenant.id}).id})
+
+      AdminRepo.update!(Ecto.Changeset.change(story(ctx), agent_status: :implementing))
+
+      # A selection seed, so a rotating pick WOULD write (it fails closed without one).
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, :crypto.strong_rand_bytes(32)} end)
+      Loopctl.TenantKeys.init_cache()
+
+      assert {:ok, _} =
+               Progress.request_review(ctx.tenant.id, ctx.story.id,
+                 agent_id: ctx.implementer_runner.agent_id
+               )
+
+      assert story(ctx).verifier_dispatch_id == b.id
+
+      # Only the bind selected a verifier: a rotating pick that happened to land on B again
+      # would still have written its own entry.
+      assert 1 ==
+               AdminRepo.aggregate(
+                 from(e in Loopctl.AuditChain.Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and e.entity_id == ^ctx.story.id and
+                       e.action == "verifier_selected"
+                 ),
+                 :count
+               )
+    end
+
     test "a rebind with no recorded head writes no stage event", ctx do
       assert {:ok, _} = bind(ctx, mint(ctx, %{}).id)
 
