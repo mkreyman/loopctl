@@ -1,0 +1,73 @@
+{
+  "id": "US-48.11",
+  "title": "An escalation inbox: every parked story, findable by reason",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "list every escalated story with its reason class, the run that parked it and what that run left behind",
+    "so_that": "an implementation that ran out of budget is found and worked again instead of sitting parked where only its story id can reach it"
+  },
+  "rationale": "Mark, 2026-11-07: \"make sure that implementations that timed out can be found and surfaced to be worked on again.\" HCB #3922's first implement run committed its fix and was killed at 3600 s mid-push (session_ended:wall_clock_exceeded). It was found only because this session held the story id: no endpoint or MCP tool lists escalated stories (mcp-server/README.md has story_stage and resolve_escalation, both by id).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.11.1",
+      "description": "GET /api/v1/escalations lists the tenant's stories at stage escalated, newest first and cursor-paginated. Each row carries story_id, project, spec {id, version} of the dispatch that parked it, escalated_at, the raw escalation_reason (untrusted, fenced), and a server-derived reason_class from a closed set: budget_exhausted (wall_clock_exceeded, max_turns), session_failed, triage_escalated, gate_refused, operator_released, other."
+    },
+    {
+      "id": "AC-48.11.2",
+      "description": "A budget_exhausted row also carries elapsed seconds and turns used against the budget the dispatch was placed under, the loop branch, and whether the runner reported commits not on the remote (work_left_behind: true|false|unknown). These come from the dispatch ledger and the runner's session-end report, never from session text."
+    },
+    {
+      "id": "AC-48.11.3",
+      "description": "Filters: reason_class, project_id, since. The endpoint is user-role (it surfaces work for a human to resolve) and reads only; resolving stays resolve_escalation."
+    },
+    {
+      "id": "AC-48.11.4",
+      "description": "MCP tool escalation_list ships in the same change (declaration, dispatch case, README row, wiring test). Its description says it reads only and points at resolve_escalation to:queued as the way to work a row again."
+    },
+    {
+      "id": "AC-48.11.5",
+      "description": "A daily Oban job posts one digest to each project's coordination channel when that project has budget_exhausted rows older than an hour: count, story ids, work_left_behind. It posts nothing when there are none and is idempotent per project per day (the post key carries the date)."
+    },
+    {
+      "id": "AC-48.11.6",
+      "description": "Tenant isolation: tenant A's inbox and digest never include tenant B's stories."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.11.1",
+      "verifies": ["AC-48.11.1", "AC-48.11.2"],
+      "name": "a wall-clock kill is listed as budget_exhausted with its run figures",
+      "type": "integration",
+      "steps": ["escalate a story over session_ended:wall_clock_exceeded with a ledger row recording elapsed and turns", "GET /api/v1/escalations"],
+      "expected_results": ["one row, reason_class budget_exhausted, elapsed and turns from the ledger, work_left_behind from the session-end report"]
+    },
+    {
+      "id": "TC-48.11.2",
+      "verifies": ["AC-48.11.5"],
+      "name": "digest is posted once and only when there is something to post",
+      "type": "integration",
+      "steps": ["run the digest job twice on one day with one budget_exhausted row", "run it for a project with none"],
+      "expected_results": ["one channel post for the first project", "no post for the second"]
+    },
+    {
+      "id": "TC-48.11.3",
+      "verifies": ["AC-48.11.6"],
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": ["escalate one story in each of two tenants", "list as tenant A"],
+      "expected_results": ["only tenant A's story"]
+    }
+  ],
+  "technical_notes": [
+    "reason_class is derived in one function over the closed reason vocabulary; an unrecognised reason is other, never dropped.",
+    "Load .claude/skills/tenancy-rls/SKILL.md and .claude/skills/chain-of-custody/SKILL.md."
+  ],
+  "dependencies": ["US-48.7"]
+}
