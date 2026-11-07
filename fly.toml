@@ -136,10 +136,13 @@ kill_timeout = 90
 
   # spec_tuner@1's own pair (US-48.13). The runner bounds the WHOLE tuning run by this wall
   # clock, and its critic replays every eval case of the target spec under the current and the
-  # proposed template, each with that case's own full wall clock — so the triage pair cannot
-  # hold it. 14400 s fits a 4-case triage@1 set (4 x 2 x 1200 s = 9600 s) plus the reading
-  # session; a target spec with more cases needs more. Unused while DRAFT_DISPATCH_ENABLED is off.
-  SPEC_TUNE_WALL_CLOCK_SECONDS = "14400"
+  # proposed template, each with that case's own wall_clock_seconds — so the triage pair cannot
+  # hold it. Sized from loopctl-runner's eval/ sets on 2026-11-07, existing cases plus the 5 new
+  # ones a result may add (SpecTunerV1.max_new_cases/0), all run twice: implement@1 is the
+  # largest at 2 x (600+1800+1800) + 2 x 5 x 1800 = 26400 s; triage@1 is 2 x 6 x 900 + 2 x 5 x
+  # 900 = 19800 s. 28800 s leaves 2400 s for the reading session. Re-derive it when a case set
+  # grows or a case's wall clock rises. Unused while DRAFT_DISPATCH_ENABLED is off.
+  SPEC_TUNE_WALL_CLOCK_SECONDS = "28800"
   SPEC_TUNE_MAX_TURNS = "80"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
   # started machine's 6PN address and connects to the node of the same release there; the

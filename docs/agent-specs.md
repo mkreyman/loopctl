@@ -202,7 +202,7 @@ Every field is required. An unknown, missing or duplicated field is a `CompileEr
 | `refs` | keyword | exactly the keys of `RunnerContract.RunnerDispatch.ref_fields/0` (`branch`, `base_branch`), each with a source from `:source_base_branch`, `:story_branch_for_runner_prefixes`, `:stage_branch` |
 | `runner` | non-empty list | `:connected`, `:not_draining`, `:repo_declared`, `:kind_declared`, `:free_slot`, `:subscription_not_exhausted`, `:tenant_admission_headroom` |
 | `advance_on` | list, may be empty | `:runner_exhausted`, `:no_conforming_branch`; non-empty only on a `:build` |
-| `budgets` | `{wall_clock_key, max_turns_key}` | `{:triage_wall_clock_seconds, :triage_max_turns}`, `{:dispatch_wall_clock_seconds, :dispatch_max_turns}` |
+| `budgets` | `{wall_clock_key, max_turns_key}` | `{:triage_wall_clock_seconds, :triage_max_turns}`, `{:dispatch_wall_clock_seconds, :dispatch_max_turns}`, `{:spec_tune_wall_clock_seconds, :spec_tune_max_turns}` |
 | `result` | non-empty list | `"triage_verdict"`, `"stage"`, `"session_ended"`, `"agent_result"` |
 | `result_schema` | `OpenApiSpex.Schema` of type `:object`, or `nil` | set if and only if `result` names `"agent_result"` |
 | `screens` | `%{screen => route}` | `:payload_too_large`, `:gate_a`, `:gate_b`, `:draft_injection`, `:draft_dispatchable`, `:story_not_dispatchable`, `:injection_detector_draft`, `:verdict_stale`, `:no_independent_verifier_runner` |
