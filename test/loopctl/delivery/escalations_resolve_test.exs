@@ -23,6 +23,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.WorkBreakdown.Queries
   alias Loopctl.WorkBreakdown.Story
 
@@ -148,6 +149,144 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
         assert reload(ctx).assigned_agent_id == nil
       end
+    end
+  end
+
+  describe "resolve/3 to :detected (re-triage)" do
+    # The shape that needed it: a story escalated BY TRIAGE — `detected -> triaged -> escalated`,
+    # bound to the dispatch that triaged it, never claimed. On 2026-11-07 five HCB support-ticket
+    # stories reached it at once, `triage_verdict:verdict_invalid`, when a runner defect threw
+    # their verdicts away; `queued` would have sent them to implement with no triage at all.
+    setup ctx do
+      story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
+      triage_dispatch_id = Ecto.UUID.generate()
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: ctx.tenant.id,
+        story_id: story.id,
+        stage: :escalated,
+        claim_epoch: 0,
+        triage_dispatch_id: triage_dispatch_id,
+        escalation_reason: "triage_verdict:verdict_invalid"
+      })
+
+      %{triaged: story, triage_dispatch_id: triage_dispatch_id}
+    end
+
+    test "a story escalated by triage goes back to detected, unbound from its old dispatch",
+         ctx do
+      before = AdminRepo.get!(Story, ctx.triaged.id)
+
+      assert {:ok, row} = resolve(%{ctx | story: ctx.triaged}, :detected)
+      assert row.stage == :detected
+
+      # Unbound, so the next `detected -> triaged` binds the dispatch that triages it AGAIN and
+      # Gate A reads that one's lens verdicts, not the discarded run's.
+      assert row.triage_dispatch_id == nil
+      assert Stages.get(ctx.tenant.id, ctx.triaged.id).triage_dispatch_id == nil
+
+      # No claim existed, so none is released: the story is exactly the stub triage reads.
+      after_resolve = AdminRepo.get!(Story, ctx.triaged.id)
+      assert after_resolve.claim_epoch == before.claim_epoch
+      assert after_resolve.agent_status == before.agent_status
+    end
+
+    test "the old triage dispatch is superseded, so a resend of its verdict cannot bind", ctx do
+      # The verdict a human threw away arrives again, byte for byte. At `detected` any ACCEPTED
+      # triage dispatch of the story may bind it, and nothing moves an unclaimed story's epoch,
+      # so the ledger row is the only thing that can say the dispatch is over.
+      now = DateTime.utc_now()
+      old_dispatch = ctx.triage_dispatch_id
+
+      AdminRepo.insert_all(Loopctl.Runners.DispatchRecord, [
+        %{
+          tenant_id: ctx.tenant.id,
+          runner_id: ctx.runner.id,
+          dispatch_id: old_dispatch,
+          story_id: ctx.triaged.id,
+          claim_epoch: 0,
+          kind: "triage",
+          status: "accepted",
+          released_at: now,
+          wall_clock_seconds: 900,
+          reserved_at: now,
+          slot_generation: 1,
+          trace_acked_seq: -1,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+      assert {:ok, _} =
+               DispatchLedger.accepted_session(ctx.tenant.id, ctx.runner.id, old_dispatch,
+                 kind: "triage"
+               )
+
+      assert {:ok, %{stage: :detected}} = resolve(%{ctx | story: ctx.triaged}, :detected)
+
+      assert {:error, :dispatch_not_accepted} =
+               DispatchLedger.accepted_session(ctx.tenant.id, ctx.runner.id, old_dispatch,
+                 kind: "triage"
+               )
+    end
+
+    test "a story an implementer was ASSIGNED cannot go back to triage", ctx do
+      # The module setup's story: assigned to the runner's agent, claimed at @epoch, its row
+      # carrying no identities. The story's own claim is what refuses it.
+      assert {:error, {:not_retriageable, held}} = resolve(ctx, :detected)
+      assert :assigned_agent_id in held
+      assert Stages.get(ctx.tenant.id, ctx.story.id).stage == :escalated
+    end
+
+    for identity <- Escalations.implementation_identities() do
+      test "a row holding #{identity} cannot go back to triage", ctx do
+        # Values the row's own constraints admit: a real runner, a 40-hex sha.
+        value =
+          case unquote(identity) do
+            :pr_number -> 7
+            :runner_id -> ctx.runner.id
+            sha when sha in [:head_sha, :merge_sha] -> String.duplicate("a", 40)
+            _ -> "x"
+          end
+
+        {1, _} =
+          AdminRepo.update_all(
+            from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^ctx.triaged.id),
+            set: [{unquote(identity), value}]
+          )
+
+        assert {:error, {:not_retriageable, [unquote(identity)]}} =
+                 resolve(%{ctx | story: ctx.triaged}, :detected)
+
+        assert Stages.get(ctx.tenant.id, ctx.triaged.id).stage == :escalated
+      end
+    end
+
+    test "re-triage is human-only, like every other resolution", ctx do
+      assert {:error, :human_required} =
+               resolve(%{ctx | story: ctx.triaged}, :detected, actor_role: :agent)
+
+      assert {:error, :human_required} =
+               resolve(%{ctx | story: ctx.triaged}, :detected,
+                 actor_lineage: [Ecto.UUID.generate()]
+               )
+
+      assert Stages.get(ctx.tenant.id, ctx.triaged.id).stage == :escalated
+    end
+
+    test "another tenant's story is not found, not re-triaged", ctx do
+      other = fixture(:tenant, %{trust_tier: :human_anchored})
+
+      assert {:error, :unknown_story_stage} =
+               Escalations.resolve(other.id, ctx.triaged.id,
+                 to: :detected,
+                 actor_label: "test:operator",
+                 actor_role: :user,
+                 actor_lineage: []
+               )
+
+      assert Stages.get(ctx.tenant.id, ctx.triaged.id).stage == :escalated
     end
   end
 

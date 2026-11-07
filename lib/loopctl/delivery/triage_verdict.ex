@@ -98,18 +98,24 @@ defmodule Loopctl.Delivery.TriageVerdict do
   never re-screens. Past `triaged` the route has landed and there is nothing to do. Then the
   draft, then the one transition out of `triaged`.
 
-  ## An incomplete triage is not re-triaged, deliberately (US-44.2 round 3, finding 4)
+  ## An incomplete triage is re-triaged by a human, never re-queued
 
-  An `incomplete` run escalates. A human who re-queues it sends it on to an implementation the
-  merge gate will refuse: Gate A reads the bound dispatch's lens verdicts, an incomplete run
-  recorded none, and `Loopctl.Delivery.GateAInput` does not count the human resolution of an
-  incomplete run as a Gate A answer — so the merge gate refuses `:missing` and escalates
-  again. That refusal is the documented safe state, and it is kept rather than adding an
-  `escalated -> detected` re-triage edge, because `triage_dispatch_id` is a STORY-LIFETIME
-  identity (`StageMachine`) that no transition clears. A re-triage edge would have to clear it,
-  which gives a story two deciders over its life and reopens the question the binding exists
-  to close: whose lens verdicts Gate A reads. So the escalation is a person's to resolve, and
-  re-queueing it is the one resolution the merge gate will refuse — visibly, not silently.
+  An `incomplete` run escalates. A human who re-queues it (`to: queued`) sends it on to an
+  implementation the merge gate will refuse: Gate A reads the bound dispatch's lens verdicts,
+  an incomplete run recorded none, and `Loopctl.Delivery.GateAInput` does not count the human
+  resolution of an incomplete run as a Gate A answer — so the merge gate refuses `:missing`
+  and escalates again.
+
+  The resolution that works is the human-only re-triage, `escalated -> detected` (`to:
+  detected`). It is still ONE decider at a time, which is what the binding exists to hold:
+  - the edge clears `triage_dispatch_id`, so the next `detected -> triaged` binds the new
+    dispatch, and Gate A reads that one;
+  - `Loopctl.Delivery.Escalations.resolve/3` supersedes the old triage dispatches first
+    (`DispatchLedger.supersede_triage_dispatches/2`), so a resend of the discarded verdict is
+    refused `:dispatch_not_accepted` and cannot bind the story again (the claim epoch cannot
+    fence it, because nothing moves it on an unclaimed story);
+  - `GateAInput` forgets any Gate A answer a human gave before the re-triage;
+  - a story an implementer touched is refused `not_retriageable`.
   """
 
   import Ecto.Query

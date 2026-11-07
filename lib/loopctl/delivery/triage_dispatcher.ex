@@ -200,6 +200,11 @@ defmodule Loopctl.Delivery.TriageDispatcher do
         # Any other story is simply not a candidate: it stays at `detected`, holds no slot and
         # costs nothing.
         where: not b.requires_ticket or not is_nil(rec.ticket_id),
+        # A CLOSED issue is not triaged: somebody already finished or withdrew it. On
+        # 2026-11-07 every one of HCB's five support-ticket candidates had been fixed and
+        # closed days before the loop reached it. The state is the latest delivery's, so a
+        # reopened issue is a candidate again.
+        where: is_nil(rec.issue_state) or rec.issue_state != "closed",
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,

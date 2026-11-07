@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.6.0 — 2026-11-07 (re-triage an escalated story)
+
+### Added
+
+- **`resolve_escalation` takes `to: detected`**, which sends an escalated story back to be
+  TRIAGED again over the human-only edge `escalated -> detected`. It is for a story triage
+  escalated, such as `triage_verdict:verdict_invalid`, and it unbinds the story's old triage
+  dispatch so Gate A reads the new one's lens verdicts. loopctl refuses it 409
+  `not_retriageable`, listing what the story holds in `held`, for a story an implementer was
+  assigned or worked. Before this, `queued` was the only way back to work, and on a triage
+  escalation it skipped triage.
+
 ## 3.4.0 — 2026-10-19 (chg trunk evidence)
 
 ### Changed

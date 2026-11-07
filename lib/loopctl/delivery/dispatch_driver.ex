@@ -81,6 +81,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
+  alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
@@ -148,6 +149,12 @@ defmodule Loopctl.Delivery.DispatchDriver do
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
         join: b in subquery(bound_projects),
         on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
+        # A story filed from an issue that has since CLOSED is not implemented: the issue was
+        # finished or withdrawn after triage queued it. A story with no intake record (an
+        # authored one) is unaffected.
+        left_join: rec in Record,
+        on: rec.id == st.intake_record_id and rec.tenant_id == st.tenant_id,
+        where: is_nil(rec.issue_state) or rec.issue_state != "closed",
         where: s.stage == :queued,
         # `pending` too: `Placement` contracts a pending story before it mints (#884).
         where: st.agent_status in [:pending, :contracted],

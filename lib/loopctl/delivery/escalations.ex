@@ -88,6 +88,7 @@ defmodule Loopctl.Delivery.Escalations do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.WorkBreakdown.Story
 
   import Ecto.Query
@@ -107,6 +108,7 @@ defmodule Loopctl.Delivery.Escalations do
           # leaving the machine to answer `stale_stage` — the word it uses for a story that
           # moved under a runner.
           | {:not_escalated, StageMachine.stage()}
+          | {:not_retriageable, [atom()]}
           | {:unresolvable_target, term()}
           | Stages.advance_error()
           # PROPAGATED VERBATIM by `resolve/3`'s `with`, which has no `else` (846.8 review
@@ -374,9 +376,16 @@ defmodule Loopctl.Delivery.Escalations do
   one the loop's first end-to-end run left behind — and the affordance this module is named
   for was one-way.
 
-  `to` is `:queued`, `:done` or `:failed`, which is what `StageMachine` allows out of
-  `escalated`: send it back to be worked, accept it as finished, or close it as not going to
-  happen.
+  `to` is `:detected`, `:queued`, `:done` or `:failed`, which is what `StageMachine` allows out
+  of `escalated`: send it back to be triaged again, send it back to be worked, accept it as
+  finished, or close it as not going to happen.
+
+  `:detected` is refused `{:not_retriageable, held}` for a story any implementer touched —
+  one whose row holds any of `implementation_identities/0`, or whose story carries an
+  `assigned_agent_id` or `implementer_dispatch_id` — naming what it holds.
+  It releases no claim, because such a story was never claimed, and it clears every identity,
+  `triage_dispatch_id` included, so the next triage binds its own dispatch
+  (`StageMachine.clears/3`).
 
   ## Who may call it
 
@@ -451,6 +460,7 @@ defmodule Loopctl.Delivery.Escalations do
     with :ok <- resolvable(to),
          {:ok, row} <- live_row(tenant_id, story_id),
          :ok <- at_escalated(row),
+         :ok <- retriageable(to, row),
          :ok <- Stages.precheck(transition, advance_opts),
          {:ok, epoch, released} <-
            prepare_story(tenant_id, story_id, to, row, opts, actor_lineage),
@@ -479,6 +489,15 @@ defmodule Loopctl.Delivery.Escalations do
     with {:ok, story} <-
            release_claim(tenant_id, story_id, Keyword.get(opts, :actor_label), actor_lineage),
          do: {:ok, story.claim_epoch, story}
+  end
+
+  # A RE-TRIAGE retires the story's triage dispatches before the row leaves `escalated`. At
+  # `detected` any accepted triage dispatch of the story may bind it, and nothing moves the
+  # claim epoch of an unclaimed story, so without this a resend of the discarded verdict would
+  # bind the story to its old dispatch again. There is no claim to release.
+  defp prepare_story(tenant_id, story_id, :detected, row, _opts, _actor_lineage) do
+    {:ok, _superseded} = DispatchLedger.supersede_triage_dispatches(tenant_id, story_id)
+    {:ok, row.claim_epoch, nil}
   end
 
   defp prepare_story(_tenant_id, _story_id, _to, row, _opts, _actor_lineage),
@@ -538,6 +557,63 @@ defmodule Loopctl.Delivery.Escalations do
     if {:escalated, to, :human_resolution} in StageMachine.transitions(),
       do: :ok,
       else: {:error, {:unresolvable_target, to}}
+  end
+
+  # RE-TRIAGE IS FOR A STORY NO IMPLEMENTER EVER TOUCHED. `detected` is the start of the line,
+  # and sending a story there throws away everything recorded after it: the claim, the
+  # worktree, the branch, a pull request, a merge. A story escalated by triage has none of
+  # those, because each is written by a transition after `queued` (`claimed` writes
+  # `runner_id`, `worktree` the path and branch, and so on), and a story that has any of them
+  # is past triage: re-triaging it would leave a live branch or PR describing work the stage
+  # row no longer admits. Read from the row's own identities rather than from the escalation's
+  # reason, which a session can write.
+  @implementation_identities [
+    :runner_id,
+    :worktree_path,
+    :branch,
+    :head_sha,
+    :pr_number,
+    :merge_sha,
+    :release_id
+  ]
+
+  @doc "The stage-row identities whose presence means an implementer touched the story."
+  @spec implementation_identities() :: [atom()]
+  def implementation_identities, do: @implementation_identities
+
+  # The STORY is read too, because the row is not the only record of an implementer: a claim
+  # assigns `assigned_agent_id` and a dispatch-minted session writes `implementer_dispatch_id`,
+  # and either one on the story means somebody was handed the work.
+  defp retriageable(:detected, %StoryStage{} = row) do
+    held =
+      Enum.filter(@implementation_identities, &(Map.fetch!(row, &1) != nil)) ++
+        story_identities(row.tenant_id, row.story_id)
+
+    case held do
+      [] -> :ok
+      held -> {:error, {:not_retriageable, held}}
+    end
+  end
+
+  defp retriageable(_to, _row), do: :ok
+
+  defp story_identities(tenant_id, story_id) do
+    {:ok, story} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from s in Story,
+            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+            select: %{
+              assigned_agent_id: s.assigned_agent_id,
+              implementer_dispatch_id: s.implementer_dispatch_id
+            }
+        )
+      end)
+
+    case story do
+      nil -> []
+      story -> for {field, value} <- story, value != nil, do: field
+    end
   end
 
   # A story that is not escalated has nothing to resolve, and saying so is better than the

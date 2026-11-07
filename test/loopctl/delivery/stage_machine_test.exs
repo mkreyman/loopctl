@@ -285,7 +285,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     end
 
     # And escalating restores the human path, which is the point.
-    for to <- [:queued, :done, :failed] do
+    for to <- [:detected, :queued, :done, :failed] do
       assert StageMachine.allowed?(:escalated, to, :human_resolution)
     end
 
@@ -352,6 +352,18 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # A re-queue does not re-triage, so the dispatch whose verdict Gate A judges stays bound.
     assert :triage_dispatch_id in lifetime
     assert MapSet.disjoint?(MapSet.new(lifetime), cleared)
+  end
+
+  test "a human re-triage clears everything, the triage dispatch included" do
+    assert StageMachine.allowed?(:escalated, :detected, :human_resolution)
+    cleared = MapSet.new(StageMachine.clears(:escalated, :detected, :human_resolution))
+
+    # Unlike a re-queue: the story gives up its triage, so the next `detected -> triaged` must
+    # bind the dispatch that triages it again, and Gate A must read that one's lens verdicts.
+    assert MapSet.subset?(MapSet.new(StageMachine.effects()), cleared)
+    assert :triage_dispatch_id in cleared
+    assert MapSet.subset?(MapSet.new(StageMachine.head_keyed()), cleared)
+    assert MapSet.subset?(MapSet.new(StageMachine.merge_keyed()), cleared)
   end
 
   test "every stage is reachable from detected" do

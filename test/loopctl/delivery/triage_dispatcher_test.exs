@@ -131,6 +131,22 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       assert story.id in candidate_ids(50)
     end
 
+    test "a CLOSED issue is not triaged, and reopening it makes it a candidate again", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      {_source_id, record_id} = source_and_record(ctx, story.id)
+
+      set_issue_state(record_id, "open")
+      assert story.id in candidate_ids(50)
+
+      # 2026-11-07: all five of HCB's ticket candidates had been fixed and closed days before
+      # the loop reached them, and triage was dispatched on every one.
+      set_issue_state(record_id, "closed")
+      refute story.id in candidate_ids(50)
+
+      set_issue_state(record_id, "open")
+      assert story.id in candidate_ids(50)
+    end
+
     test "every PROJECT's oldest before any project's second: a backlog cannot fill the batch",
          ctx do
       backlog = for _ <- 1..3, do: fixture(:detected_story, %{tenant_id: ctx.tenant.id})
@@ -489,6 +505,13 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     {1, _} =
       AdminRepo.update_all(from(s in Loopctl.Intake.Source, where: s.id == ^source_id),
         set: [triage_requires_ticket: value]
+      )
+  end
+
+  defp set_issue_state(record_id, state) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+        set: [issue_state: state]
       )
   end
 

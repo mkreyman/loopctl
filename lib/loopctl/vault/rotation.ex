@@ -128,9 +128,26 @@ defmodule Loopctl.Vault.Rotation do
   Every Cloak-encrypted column in the schema, derived by reflection over `:loopctl`.
 
   Sorted by table so a run's output is stable between invocations.
+
+  Computed ONCE per VM and kept in `:persistent_term`. The set is a property of the compiled
+  application, so it cannot change while the VM runs, and the reflection is not free: it
+  asks the code server to load every module of `:loopctl`. In a lazily-loading test VM on a
+  busy host, that walk per call took a single `census/1` past ExUnit's 60s timeout (#1021).
   """
   @spec targets() :: [target()]
   def targets do
+    case :persistent_term.get({__MODULE__, :targets}, :unset) do
+      :unset ->
+        targets = reflect_targets()
+        :persistent_term.put({__MODULE__, :targets}, targets)
+        targets
+
+      targets ->
+        targets
+    end
+  end
+
+  defp reflect_targets do
     (Application.spec(:loopctl, :modules) || [])
     |> Enum.filter(&ecto_schema?/1)
     |> Enum.flat_map(&target_for/1)

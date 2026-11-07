@@ -229,6 +229,13 @@ describe("resolve_escalation", () => {
     assert.deepEqual(calls[1].body, { to: "failed", reason: "the reporter withdrew it" });
   });
 
+  test("sends a story back to triage with to: detected", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await resolveEscalation({ story_id: STORY_ID, to: "detected" }, deps({ apiCall }));
+    assert.deepEqual(calls[0].body, { to: "detected" });
+  });
+
   test("refuses a target the stage machine does not have", async () => {
     const { calls, apiCall } = fakeApi();
 

@@ -168,7 +168,14 @@ defmodule Loopctl.Delivery.StageMachine do
                 edge <- [:runner_lost, :claim_released],
                 do: {from, :queued, edge}
 
-  @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
+  # `detected` is RE-TRIAGE: the story goes back to the start of the line, to be triaged again
+  # by a fresh dispatch. Without it, a story whose triage produced no usable verdict could only
+  # be `queued` — handed to an implement session with no triage verdict and no Gate A input —
+  # or closed. On 2026-11-07 five HCB support-ticket stories were escalated that way at once,
+  # `triage_verdict:verdict_invalid`, by a runner defect that discarded their verdicts.
+  # `Escalations.resolve/3` admits it only for a story no implementer ever touched.
+  @human_resolution for to <- [:detected, :queued, :done, :failed],
+                        do: {:escalated, to, :human_resolution}
 
   # What a release decides AFTER it has requeued the row (US-44.4): the retry ceiling reached,
   # or an operator's release. From `queued` only, because the release has just put the row
@@ -525,6 +532,7 @@ defmodule Loopctl.Delivery.StageMachine do
   # Identities that describe the story for its whole life rather than one attempt at it, and
   # so survive even a human re-queue. A re-queue does not re-triage — the story does not go
   # back to `detected` — so the verdict Gate A judges is still the one this dispatch gave.
+  # The one edge that clears them is the human re-triage, `escalated -> detected` (`clears/3`).
   @story_lifetime_effects [:triage_dispatch_id]
   @required_effects %{merged: [:merge_sha]}
 
@@ -816,7 +824,10 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec transition_only?(atom()) :: boolean()
   def transition_only?(effect), do: effect in @transition_only
 
-  @doc "The identities no transition clears, a human re-queue included."
+  @doc """
+  The identities that survive every transition, a human re-queue included, except the human
+  re-triage (`escalated -> detected`), which clears them.
+  """
   @spec story_lifetime_effects() :: [effect()]
   def story_lifetime_effects, do: @story_lifetime_effects
 
@@ -847,6 +858,13 @@ defmodule Loopctl.Delivery.StageMachine do
       Enum.uniq(
         (Map.keys(@effect_stages) -- @story_lifetime_effects) ++ @head_keyed ++ @merge_keyed
       )
+
+  # Re-triage clears EVERYTHING, the story-lifetime `triage_dispatch_id` included: the next
+  # `detected -> triaged` binds the dispatch that triages it again, and Gate A must read that
+  # dispatch's lens verdicts, never the ones that came before. A human re-queue keeps it
+  # because the story keeps its triage; a re-triage is precisely the story giving it up.
+  def clears(:escalated, :detected, :human_resolution),
+    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed ++ @merge_keyed)
 
   # A refused merge never happened, so the identity recorded for it goes with the head —
   # and so does everything keyed to that merge.
