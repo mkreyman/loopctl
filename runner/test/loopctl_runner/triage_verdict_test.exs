@@ -18,6 +18,11 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
   defp script, do: Path.expand("../../priv/bin/loop-verdict", __DIR__)
 
+  # Every session the runner starts carries LOOP_VERDICT_CHECK (`Session.verdict_check/1`), so a
+  # suite run INSIDE one would inherit the real release checker. The tests of the unchecked path
+  # unset it; the checked path passes its own stand-in.
+  @unchecked {"LOOP_VERDICT_CHECK", nil}
+
   defp state(reason), do: {:error, reason}
 
   describe "the lens verdicts stated beside it" do
@@ -159,8 +164,8 @@ defmodule LoopctlRunner.TriageVerdictTest do
       # loopctl records the verdict's `escalation_reasons` verbatim (what gates is each lens's list
       # in `lens_verdicts`), so a thin escalate still reaches a human with its evidence and
       # missing_information. Refused here it would be `verdict_invalid` instead — the run reporting
-      # that it produced nothing — and the session cannot be asked again: `loop-verdict` links the
-      # file into place before anything validates it, and a run records one verdict.
+      # that it produced nothing — whenever `loop-verdict`'s own check could not run first. And
+      # where it does run, it refuses exactly what validate/1 refuses, so this stays out of both.
       thin = verdict(%{"escalation_reasons" => [@gating]})
 
       assert TriageVerdict.bare_escalation?(thin)
@@ -275,6 +280,140 @@ defmodule LoopctlRunner.TriageVerdictTest do
     end
   end
 
+  describe "the check loop-verdict runs before recording" do
+    setup do
+      {:ok, dir: tmp_dir!("verdict-check")}
+    end
+
+    # The shape that discarded five of five HCB triages on 2026-11-07: an evidence entry past its
+    # cap. check_file/1 must refuse what read/1 refuses, or loop-verdict lets through a verdict
+    # the runner then throws away after the session can no longer fix it.
+    test "it refuses exactly what read/1 refuses, with the field named", %{dir: dir} do
+      long = verdict(%{"evidence" => [String.duplicate("e", 151)]})
+      path = Path.join(dir, "candidate.json")
+      File.write!(path, Jason.encode!(long))
+
+      assert {:error, {:invalid, reason}} = TriageVerdict.check_file(path)
+      assert reason =~ "evidence[0]: longer than 150"
+
+      run_dir = tmp_dir!("verdict-check-run")
+      File.write!(TriageVerdict.file(run_dir), Jason.encode!(long))
+      assert TriageVerdict.read(run_dir) == TriageVerdict.check_file(path)
+
+      assert {65, ^reason} = path |> TriageVerdict.check_file() |> TriageVerdict.cli_result()
+      assert TriageVerdict.invalid_status() == 65
+    end
+
+    test "a valid verdict passes, and an unreadable file is not called invalid", %{dir: dir} do
+      path = Path.join(dir, "candidate.json")
+      File.write!(path, Jason.encode!(verdict()))
+      assert {0, _} = path |> TriageVerdict.check_file() |> TriageVerdict.cli_result()
+
+      missing = Path.join(dir, "absent.json")
+      assert {1, reason} = missing |> TriageVerdict.check_file() |> TriageVerdict.cli_result()
+      assert reason =~ "could not be read"
+    end
+  end
+
+  describe "loop-verdict with the runner's check" do
+    setup do
+      {:ok, run_dir: tmp_dir!("loop-verdict-check"), bin: tmp_dir!("checker")}
+    end
+
+    # A stand-in for the release's bin script: it answers `eval` with the given status and
+    # message, and copies the bytes it was asked to judge, so the test sees what it was handed.
+    defp checker(bin, status, message) do
+      path = Path.join(bin, "loopctl_runner")
+
+      File.write!(path, """
+      #!/bin/sh
+      [ "$1" = "eval" ] || exit 9
+      cp "$LOOP_VERDICT_FILE" "#{bin}/seen"
+      echo "#{message}"
+      exit #{status}
+      """)
+
+      File.chmod!(path, 0o755)
+      path
+    end
+
+    defp run_checked(run_dir, checker, body) do
+      {:ok, token} = TriageVerdict.mint_token(run_dir)
+      stdin = Path.join(tmp_dir!("stdin"), "stdin")
+      File.write!(stdin, body)
+
+      System.cmd("sh", ["-c", "#{script()} #{token} < #{stdin}"],
+        env: [{"LOOP_RUN_DIR", run_dir}, {"LOOP_VERDICT_CHECK", checker}],
+        stderr_to_stdout: true
+      )
+    end
+
+    test "a verdict the check refuses records NOTHING, names the problem, and can be restated", %{
+      run_dir: run_dir,
+      bin: bin
+    } do
+      bad = checker(bin, 65, "RunnerTriageVerdict.evidence[0]: longer than 150")
+      body = Jason.encode!(verdict())
+
+      assert {out, 4} = run_checked(run_dir, bad, body)
+      assert out =~ "NOTHING WAS RECORDED"
+      assert out =~ "evidence[0]: longer than 150"
+      assert File.read!(Path.join(bin, "seen")) == body
+      refute File.exists?(TriageVerdict.file(run_dir))
+      assert run_dir |> File.ls!() |> Enum.sort() == ["verdict.token"]
+
+      # The refusal left the run open: the corrected verdict is the one that counts.
+      good = checker(tmp_dir!("checker-ok"), 0, "the verdict is valid")
+      assert {out, 0} = run_checked(run_dir, good, body)
+      assert out =~ "Verdict recorded and valid against the contract"
+      assert File.read!(TriageVerdict.file(run_dir)) == body
+    end
+
+    test "a check that stalls is cut off and the verdict recorded unchecked", %{
+      run_dir: run_dir,
+      bin: bin
+    } do
+      stalled = Path.join(bin, "loopctl_runner")
+      File.write!(stalled, "#!/bin/sh\nexec sleep 30\n")
+      File.chmod!(stalled, 0o755)
+      body = Jason.encode!(verdict())
+      {:ok, token} = TriageVerdict.mint_token(run_dir)
+      stdin = Path.join(tmp_dir!("stdin"), "stdin")
+      File.write!(stdin, body)
+
+      {elapsed_us, {out, status}} =
+        :timer.tc(fn ->
+          System.cmd("sh", ["-c", "#{script()} #{token} < #{stdin}"],
+            env: [
+              {"LOOP_RUN_DIR", run_dir},
+              {"LOOP_VERDICT_CHECK", stalled},
+              {"LOOP_VERDICT_CHECK_TIMEOUT_S", "1"}
+            ],
+            stderr_to_stdout: true
+          )
+        end)
+
+      assert status == 0
+      assert elapsed_us < 10_000_000
+      assert out =~ "could not be checked before recording"
+      assert File.read!(TriageVerdict.file(run_dir)) == body
+      assert run_dir |> File.ls!() |> Enum.sort() == ["verdict.json", "verdict.token"]
+    end
+
+    test "a check that cannot run records the verdict unchecked rather than losing it", %{
+      run_dir: run_dir,
+      bin: bin
+    } do
+      broken = checker(bin, 1, "boot failed")
+      body = Jason.encode!(verdict())
+
+      assert {out, 0} = run_checked(run_dir, broken, body)
+      assert out =~ "could not be checked before recording (exit 1)"
+      assert out =~ "Verdict recorded, and not yet validated"
+      assert File.read!(TriageVerdict.file(run_dir)) == body
+    end
+  end
+
   describe "the command a session states its verdict with" do
     setup do
       {:ok, run_dir: tmp_dir!("loop-verdict")}
@@ -297,7 +436,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
         end
 
       System.cmd("sh", ["-c", "#{script()} #{Enum.join(args, " ")} < #{write_stdin(input)}"],
-        env: [{"LOOP_RUN_DIR", run_dir}],
+        env: [{"LOOP_RUN_DIR", run_dir}, @unchecked],
         stderr_to_stdout: true
       )
     end
@@ -368,7 +507,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       task =
         Task.async(fn ->
           System.cmd("sh", ["-c", "(#{feeder}) | #{script()} #{token}"],
-            env: [{"LOOP_RUN_DIR", run_dir}],
+            env: [{"LOOP_RUN_DIR", run_dir}, @unchecked],
             stderr_to_stdout: true
           )
         end)
@@ -425,7 +564,11 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
       {out, code} =
         System.cmd("sh", ["-c", "#{script()} #{token} < #{stdin}"],
-          env: [{"LOOP_RUN_DIR", run_dir}, {"PATH", bin <> ":" <> System.get_env("PATH")}],
+          env: [
+            {"LOOP_RUN_DIR", run_dir},
+            {"PATH", bin <> ":" <> System.get_env("PATH")},
+            @unchecked
+          ],
           stderr_to_stdout: true
         )
 
@@ -470,7 +613,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
       {out, 2} =
         System.cmd("sh", ["-c", "#{escalate} wrong-token < #{stdin}"],
-          env: [{"LOOP_RUN_DIR", run_dir}],
+          env: [{"LOOP_RUN_DIR", run_dir}, @unchecked],
           stderr_to_stdout: true
         )
 
@@ -479,7 +622,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
       {_, 0} =
         System.cmd("sh", ["-c", "#{escalate} #{token} < #{stdin}"],
-          env: [{"LOOP_RUN_DIR", run_dir}],
+          env: [{"LOOP_RUN_DIR", run_dir}, @unchecked],
           stderr_to_stdout: true
         )
 
@@ -493,7 +636,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
       {_, 0} =
         System.cmd("sh", ["-c", "#{escalate} < #{stdin}"],
-          env: [{"LOOP_RUN_DIR", run_dir}],
+          env: [{"LOOP_RUN_DIR", run_dir}, @unchecked],
           stderr_to_stdout: true
         )
 
@@ -526,7 +669,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
     test "the script refuses to run outside a loop session" do
       assert {out, code} =
                System.cmd(script(), ["token"],
-                 env: [{"LOOP_RUN_DIR", ""}],
+                 env: [{"LOOP_RUN_DIR", ""}, @unchecked],
                  stderr_to_stdout: true
                )
 

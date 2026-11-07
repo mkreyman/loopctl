@@ -15,10 +15,10 @@
 # keep unparsed. Here the session fills a form, and the runner validates it against the
 # contract before anything is sent.
 #
-# This script stores bytes and checks nothing about their meaning: the shape, the bounds and
-# the byte rule are `LoopctlRunner.TriageVerdict`'s to enforce, where the contract lives. It
-# caps what it will store so a runaway session cannot fill the disk, and refuses a second
-# verdict, since a run states one.
+# This script restates no part of the contract: the shape, the bounds and the byte rule are
+# `LoopctlRunner.TriageVerdict`'s to enforce, and it asks that module (through the release, see
+# the check below) before it records anything. It caps what it will store so a runaway session
+# cannot fill the disk, and refuses a second verdict, since a run states one.
 
 set -u
 
@@ -58,7 +58,7 @@ fi
 
 umask 077
 tmp=$(mktemp "$LOOP_RUN_DIR/.verdict.XXXXXX") || exit 1
-trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "$tmp" "$tmp.check"' EXIT
 
 # STRAIGHT TO THE FILE, never through a shell variable. Command substitution strips every
 # trailing newline and drops NUL bytes, so `$(head -c N)` measured a cut that landed on a newline
@@ -91,6 +91,59 @@ if [ "$first" != "{" ] || [ "$last" != "}" ]; then
     exit 2
 fi
 
+# JUDGED BEFORE IT IS RECORDED, by the runner's own validator, because a recorded verdict cannot
+# be restated and the session is the only one who can fix it. Until 2026-11-07 this script
+# recorded first and the runner judged after the session ended: one `evidence` string past its
+# 150-character cap then discarded a whole triage as `verdict_invalid`, five HCB tickets of five.
+# `LOOP_VERDICT_CHECK` is the release's bin script (`LoopctlRunner.Session.verdict_check/1`), and
+# `eval` runs `TriageVerdict.check_file/1` on these exact bytes in a fresh VM, so there is one
+# contract and this script restates none of it. Exit 65 means the verdict breaks the contract:
+# nothing is recorded and the session corrects it. Any other failure means the CHECK did not run,
+# and the verdict is recorded unchecked as before, because losing it to a broken checker is worse.
+checked=0
+checker="${LOOP_VERDICT_CHECK:-}"
+
+if [ -n "$checker" ]; then
+    # BOUNDED, so a checker VM that stalls costs at most this long and then falls through to the
+    # unchecked recording below instead of hanging the session's only output command. A portable
+    # watchdog rather than timeout(1), which macOS does not ship. The check takes ~0.5 s.
+    limit_s="${LOOP_VERDICT_CHECK_TIMEOUT_S:-30}"
+    LOOP_VERDICT_FILE="$tmp" "$checker" eval 'LoopctlRunner.TriageVerdict.check_cli()' > "$tmp.check" 2>&1 &
+    pid=$!
+    ticks=0
+
+    while kill -0 "$pid" 2> /dev/null; do
+        if [ "$ticks" -ge "$((limit_s * 10))" ]; then
+            kill -KILL "$pid" 2> /dev/null
+            break
+        fi
+
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+
+    wait "$pid" 2> /dev/null
+    status=$?
+    problems=$(cat "$tmp.check" 2> /dev/null)
+    rm -f "$tmp.check"
+
+    case "$status" in
+        0)
+            checked=1
+            ;;
+        65)
+            echo "NOTHING WAS RECORDED: the verdict breaks the contract and the runner would discard it:
+$problems
+Correct exactly those fields (a field 'longer than N' must be cut to N characters or fewer) and
+state the whole verdict again with the same command." >&2
+            exit 4
+            ;;
+        *)
+            echo "note: the verdict could not be checked before recording (exit $status); it is recorded as stated" >&2
+            ;;
+    esac
+fi
+
 # `ln` refuses an existing target, so the claim is atomic. The check at the top reads better in
 # the usual case; it is not the guarantee, because the whole of stdin is read between it and here
 # and the Bash tool can run two of these at once — with `mv`, both would pass the check and the
@@ -112,6 +165,11 @@ fi
 
 rm -f "$tmp.err"
 
-echo "Verdict recorded, and not yet validated: the runner checks it against the contract, and a
+if [ "$checked" -eq 1 ]; then
+    echo "Verdict recorded and valid against the contract. A run states one verdict, so this cannot
+be restated. Stop working now: make no further changes and end your turn."
+else
+    echo "Verdict recorded, and not yet validated: the runner checks it against the contract, and a
 run states one verdict, so this cannot be restated. Stop working now: make no further changes and
 end your turn."
+fi

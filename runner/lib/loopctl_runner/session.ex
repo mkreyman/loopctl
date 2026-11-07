@@ -501,7 +501,7 @@ defmodule LoopctlRunner.Session do
     # release_env/1 unsets are refused in session_env by Config, so nothing there is lost.
     # A `false` value in `extra` unsets that name, as it does for an Erlang Port: it is how the
     # grant's variable is kept from a session that has no grant.
-    Enum.map(base ++ release_path(env) ++ extra, fn
+    Enum.map(base ++ release_path(env) ++ verdict_check(env) ++ extra, fn
       {k, false} -> {to_charlist(k), false}
       {k, v} -> {to_charlist(k), to_charlist(v)}
     end) ++
@@ -565,6 +565,25 @@ defmodule LoopctlRunner.Session do
   end
 
   def release_path(_env), do: []
+
+  @doc """
+  `LOOP_VERDICT_CHECK`, the release's own `bin` script, as a `{name, value}` pair, or nothing when
+  the runner is not a release. `loop-verdict` runs it as `eval` to judge a verdict with
+  `LoopctlRunner.TriageVerdict.check_file/1` before recording it, so a session hears that its
+  verdict breaks the contract while it can still correct it. The `RELEASE_*` names stay unset
+  (`release_env/1`): this passes the one path the check needs and not the node's cookie, and the
+  eval VM it starts is not distributed.
+
+  Advisory, never a gate: a session can unset it for its own call, and the daemon still judges
+  the recorded file with `TriageVerdict.read/1`. Unset, `loop-verdict` records unchecked.
+  """
+  @spec verdict_check(%{String.t() => String.t()}) :: [{String.t(), String.t()}]
+  def verdict_check(%{"RELEASE_ROOT" => root}) when root != "" do
+    bin = Path.join([Path.expand(root), "bin", "loopctl_runner"])
+    if File.regular?(bin), do: [{"LOOP_VERDICT_CHECK", bin}], else: []
+  end
+
+  def verdict_check(_env), do: []
 
   @impl true
   # Raw chunks, split here. The Port's own {:line, N} mode delivers a trailing

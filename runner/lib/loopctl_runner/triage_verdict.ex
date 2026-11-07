@@ -18,7 +18,10 @@ defmodule LoopctlRunner.TriageVerdict do
       because the rule charges double for them — and an emoji in a drafted title is ordinary.
 
   A verdict that fails any of these is the session's mistake, not loopctl's, so it is reported
-  as one: the run ends without a verdict and says which check refused it.
+  as one. `loop-verdict` runs these same checks (`check_file/1`) before it records anything, so
+  the session hears which one refused it and states the verdict again; only a verdict recorded
+  unchecked (the check could not run) can still end the run without one, reported as
+  `verdict_invalid` with the check named.
 
   The same object carries `lens_verdicts`, the three lenses' own judgements that the message sends
   beside the verdict and Gate A reads (contract 1.15.0). They are checked on their own and, unlike
@@ -138,6 +141,67 @@ defmodule LoopctlRunner.TriageVerdict do
     end
   end
 
+  @doc """
+  Judges the verdict at `path` exactly as `read/1` will judge the run's verdict file, so
+  `loop-verdict` can refuse one the runner would throw away WHILE the session can still correct
+  it.
+
+  Before this, `loop-verdict` linked whatever object it was given and told the session to stop,
+  and the first judgement came after the session had ended. One `evidence` string past its
+  150-character cap then discarded a whole triage as `verdict_invalid`: on 2026-11-07 that was
+  five of five HCB tickets on minis.
+  """
+  @spec check_file(String.t()) ::
+          {:ok, verdict()} | {:error, {:invalid | :unreadable, String.t()}}
+  def check_file(path) do
+    case File.read(path) do
+      {:ok, body} ->
+        decode(body)
+
+      {:error, reason} ->
+        {:error,
+         {:unreadable, "the verdict file could not be read: #{:file.format_error(reason)}"}}
+    end
+  end
+
+  # The exit status `loop-verdict` reads as "this verdict breaks the contract, record nothing".
+  # Any other non-zero status means the check itself did not run, and the script records the
+  # verdict unchecked, as it did before, rather than losing a verdict to a broken checker.
+  @invalid_status 65
+
+  @doc "The exit status `check_cli/0` gives a verdict that breaks the contract."
+  @spec invalid_status() :: pos_integer()
+  def invalid_status, do: @invalid_status
+
+  @doc """
+  What `check_cli/0` prints and exits with for a `check_file/1` result: `{0, text}` for a valid
+  verdict, `{invalid_status(), reason}` for one the runner would refuse, `{1, reason}` when the
+  file could not be judged at all.
+  """
+  @spec cli_result({:ok, verdict()} | {:error, {:invalid | :unreadable, String.t()}}) ::
+          {non_neg_integer(), String.t()}
+  def cli_result({:ok, _verdict}), do: {0, "the verdict is valid"}
+  def cli_result({:error, {:invalid, reason}}), do: {@invalid_status, reason}
+  def cli_result({:error, {:unreadable, reason}}), do: {1, reason}
+
+  @doc """
+  The entry point `loop-verdict` reaches through the release's `eval`: judges the file named by
+  `LOOP_VERDICT_FILE`, prints the judgement and halts with `cli_result/1`'s status. It runs in a
+  fresh VM that starts no application; the contract is compiled into `LoopctlRunner.Contract`,
+  so nothing here needs the daemon.
+  """
+  @spec check_cli() :: no_return()
+  def check_cli do
+    {status, text} =
+      case System.get_env("LOOP_VERDICT_FILE") do
+        path when is_binary(path) and path != "" -> path |> check_file() |> cli_result()
+        _ -> {1, "LOOP_VERDICT_FILE names no file to check"}
+      end
+
+    IO.puts(text)
+    System.halt(status)
+  end
+
   defp decode(body) do
     case Jason.decode(body) do
       {:ok, verdict} when is_map(verdict) -> invalid(validate(verdict))
@@ -161,8 +225,8 @@ defmodule LoopctlRunner.TriageVerdict do
   LENS VERDICTS THAT FAIL ARE DROPPED, NEVER THE VERDICT. A verdict without them still reaches
   loopctl, which escalates it at triage because Gate A cannot be evaluated — a person sees it,
   with its evidence. Refusing the whole statement instead would turn that into `verdict_invalid`,
-  a run that produced nothing, and the session cannot restate it: it is over by the time this
-  runs. A dropped set is logged as an error; a missing one is an error unless the verdict was an
+  a run that produced nothing whenever the session cannot restate it: out of turns, or with
+  `loop-verdict` unable to run its check first and recording the verdict unchecked. A dropped set is logged as an error; a missing one is an error unless the verdict was an
   `escalate` already, which it costs nothing.
   """
   @spec validate(verdict()) :: {:ok, verdict()} | {:error, String.t()}
@@ -307,9 +371,9 @@ defmodule LoopctlRunner.TriageVerdict do
   (what gates, since 1.15.0, is each lens's own list in `lens_verdicts`), and an `escalate` goes to
   a person either way. Refusing it here would turn a verdict that escalates CORRECTLY — with its
   evidence, its `missing_information`, and a human on the other end — into `verdict_invalid`, which
-  is the run reporting that it produced nothing at all. Nor can the session make it good: nothing
-  validates a verdict until `loop-verdict` has already linked it into place, a run records one, and
-  by the time this is read the session is over. So the prompt REQUIRES a sentence, this says when
+  is the run reporting that it produced nothing at all. Nor does `loop-verdict` refuse it: that
+  command refuses exactly what `validate/1` refuses (`check_file/1`), and this is deliberately not
+  one of those checks, so the session is not asked to restate it. So the prompt REQUIRES a sentence, this says when
   one did not arrive, and the thin verdict still goes: less than was asked for, and far more than
   the alternative.
 

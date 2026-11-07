@@ -52,6 +52,21 @@ defmodule LoopctlRunner.SessionReleaseEnvTest do
     end
   end
 
+  test "a release passes its bin script as LOOP_VERDICT_CHECK, and nothing without one" do
+    root = LoopctlRunner.TestSupport.tmp_dir!("release-root")
+    bin = Path.join([root, "bin", "loopctl_runner"])
+
+    # No bin script under the root: nothing to point loop-verdict at.
+    assert Session.verdict_check(%{"RELEASE_ROOT" => root}) == []
+
+    File.mkdir_p!(Path.dirname(bin))
+    File.write!(bin, "#!/bin/sh\n")
+
+    assert Session.verdict_check(%{"RELEASE_ROOT" => root}) == [{"LOOP_VERDICT_CHECK", bin}]
+    assert Session.verdict_check(%{"RELEASE_ROOT" => ""}) == []
+    assert Session.verdict_check(%{"PATH" => "/usr/bin"}) == []
+  end
+
   test "outside a release PATH is left alone" do
     assert Session.release_path(%{"PATH" => "/usr/bin"}) == []
     assert Session.release_path(%{"RELEASE_ROOT" => "", "PATH" => "/usr/bin"}) == []
