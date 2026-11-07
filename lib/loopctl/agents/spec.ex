@@ -76,6 +76,7 @@ defmodule Loopctl.Agents.Spec do
   """
 
   alias Loopctl.Agents.Candidates
+  alias Loopctl.Agents.Registry
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.StageMachine
 
@@ -270,6 +271,32 @@ defmodule Loopctl.Agents.Spec do
   @doc "The archetypes."
   @spec archetypes() :: [archetype()]
   def archetypes, do: @archetypes
+
+  @doc """
+  Whether a dispatch HOLDS A CLAIM on its story: its spec's archetype is `:build` (US-48.6).
+
+  THE ONE READING of "is this an implement session", for every path that must refuse a session
+  of another kind a claim to report on, a fence on epoch or story, or a resume. Takes a spec,
+  or a dispatch kind as a ledger row or a payload carries it:
+
+  - a kind a spec describes answers for that spec's archetype;
+  - `nil` is `Loopctl.Agents.Registry.default_kind/0`: a ledger row written before `kind`
+    existed, when the implement dispatch was the only one sent;
+  - any other value holds NO claim. Failing closed is the point: a kind no spec describes was
+    never meant to claim a story, and reading it as one is what would let it.
+  """
+  @spec holds_claim?(t() | String.t() | nil) :: boolean()
+  def holds_claim?(%__MODULE__{archetype: archetype}), do: archetype == :build
+  def holds_claim?(nil), do: holds_claim?(Registry.default_kind())
+
+  def holds_claim?(kind) when is_binary(kind) do
+    case Registry.for_kind(kind) do
+      {:ok, spec} -> holds_claim?(spec)
+      {:error, :unknown_kind} -> false
+    end
+  end
+
+  def holds_claim?(_not_a_kind), do: false
 
   # ── validation ──────────────────────────────────────────────────────────────────────────────
 

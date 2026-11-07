@@ -134,7 +134,7 @@ defmodule Loopctl.Agents.RegistryTest do
   describe "shared bindings (AC-48.2.4)" do
     test "budget keys == DispatchPayload.budget_keys/1 for every spec" do
       for spec <- Registry.all() do
-        assert spec.budgets == DispatchPayload.budget_keys(spec.kind), spec.id
+        assert DispatchPayload.budget_keys(spec.kind) == {:ok, spec.budgets}, spec.id
       end
     end
 
@@ -173,7 +173,11 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.3: the candidate builder and the two `candidates/1` that delegate to it.
       "lib/loopctl/agents/candidates.ex",
       "lib/loopctl/delivery/dispatch_driver.ex",
-      "lib/loopctl/delivery/triage_dispatcher.ex"
+      "lib/loopctl/delivery/triage_dispatcher.ex",
+      # US-48.6: `Spec.holds_claim?/1`, the budget keys and the default kind.
+      "lib/loopctl/delivery/dispatch_payload.ex",
+      "lib/loopctl/delivery/placement.ex",
+      "lib/loopctl/runners/dispatch_ledger.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

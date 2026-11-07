@@ -137,7 +137,10 @@ defmodule LoopctlWeb.DispatchPlacementController do
            story_id: %Schema{type: :string, format: :uuid},
            kind: %Schema{
              type: :string,
-             description: "Only the kinds in `x-connection.dispatchable_kinds` are accepted."
+             description:
+               "Only the kinds in `x-connection.dispatchable_kinds` are accepted. A kind no " <>
+                 "agent spec describes is given no budget: with either budget omitted it is " <>
+                 "422 `invalid_payload` before anything is minted or claimed."
            },
            repo: %Schema{type: :string},
            branch: %Schema{

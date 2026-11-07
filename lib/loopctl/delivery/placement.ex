@@ -167,6 +167,7 @@ defmodule Loopctl.Delivery.Placement do
 
   require Logger
 
+  alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
@@ -559,7 +560,7 @@ defmodule Loopctl.Delivery.Placement do
   # The one thing a resume DOES write is the claim's lease cap, moved forward so the frame's
   # `deadline_at` leaves the resumed session its whole wall clock (`resume_deadline/4`).
   defp resume_implement(tenant_id, runner_id, dispatch, record, opts) do
-    if DispatchLedger.implement_kind?(record.kind),
+    if Spec.holds_claim?(record.kind),
       do: resume(tenant_id, runner_id, dispatch, record, opts),
       else: {:error, :dispatch_id_conflict}
   end

@@ -6,12 +6,14 @@ defmodule Loopctl.Agents.Registry do
   its outcomes and effects decide which custody edges a runner message can drive (see
   `Loopctl.Agents.Spec`). Per-tenant data is limited to knobs that cannot move authority.
 
-  Read, so far, only for each spec's `candidates`: `TriageDispatcher.candidates/1` and
+  Read for each spec's `candidates`: `TriageDispatcher.candidates/1` and
   `DispatchDriver.candidates/1` are `Loopctl.Agents.Candidates.query/2` over their spec
-  (US-48.3). Later stories move the rest of each dispatch kind onto its spec, each with an
+  (US-48.3). Read for each kind's archetype and budgets (US-48.6): `Spec.holds_claim?/1` is
+  the one claim-holding predicate the dispatch ledger and `Placement` ask, and
+  `DispatchPayload.budget_keys/1` reads the spec's `budgets`. Later stories move the rest of each dispatch kind onto its spec, each with an
   equivalence test; until then `Loopctl.Agents.RegistryTest` binds the registry to the lists it
   must agree with — `RunnerContract.Kinds.all/0`, the `runner_dispatches_kind` CHECK,
-  `TriageVerdict`'s routes, `DispatchPayload.budget_keys/1` and `StageMachine.transitions/0` —
+  `TriageVerdict`'s routes and `StageMachine.transitions/0` —
   and names the modules allowed to read it.
 
   `{id, version}` is unique, and so is `kind`: one spec per dispatch kind today. Both are
@@ -60,4 +62,24 @@ defmodule Loopctl.Agents.Registry do
   @doc "Every dispatch kind a spec describes, sorted."
   @spec kinds() :: [String.t()]
   def kinds, do: @specs |> Enum.map(& &1.kind) |> Enum.sort()
+
+  # implement@1's kind: the one dispatch there was before a dispatch carried `kind` at all.
+  @default_kind Specs.ImplementV1.spec().kind
+
+  @doc """
+  The kind of a dispatch that names none: `implement@1`'s, because before `kind` existed the
+  implement dispatch was the only one sent. `DispatchPayload.fill/3` defaults an absent `kind`
+  to it, and `Spec.holds_claim?/1` reads a `nil` ledger kind as it.
+  """
+  @spec default_kind() :: String.t()
+  def default_kind, do: @default_kind
+
+  @claim_holding_kinds for spec <- @specs, Spec.holds_claim?(spec), do: spec.kind
+
+  @doc """
+  Every kind whose spec holds a claim (`Spec.holds_claim?/1`), in registry order: the same
+  rule as a list, for a query filter on ledger rows (`DispatchLedger.where_holds_claim/1`).
+  """
+  @spec claim_holding_kinds() :: [String.t()]
+  def claim_holding_kinds, do: @claim_holding_kinds
 end
