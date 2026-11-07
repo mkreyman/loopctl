@@ -89,6 +89,15 @@ defmodule Loopctl.Vault.RotationTest do
       assert Enum.any?(Rotation.targets(), &(&1.table == @table))
     end
 
+    test "the reflection runs once per VM and later calls read the cached set (#1021)" do
+      targets = Rotation.targets()
+
+      # The walk over every module is what timed out under load; a second call must not
+      # repeat it, and must answer exactly what the first one reflected.
+      assert :persistent_term.get({Rotation, :targets}) == targets
+      assert Rotation.targets() == targets
+    end
+
     test "each target carries its table, a single-column primary key and its columns" do
       target = Enum.find(Rotation.targets(), &(&1.table == @table))
 

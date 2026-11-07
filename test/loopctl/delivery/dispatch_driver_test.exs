@@ -98,6 +98,36 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       assert story.id in candidate_ids(50)
     end
 
+    test "a story whose issue has CLOSED is not implemented; reopened, it is again", ctx do
+      repo = "mkreyman/repo-#{System.unique_integer([:positive])}"
+      story = bind_repo(ctx, queued_story(ctx), repo)
+
+      # An authored story carries no intake record and is not touched by the filter.
+      assert story.id in candidate_ids(50)
+
+      record =
+        fixture(:intake_record, %{
+          tenant_id: ctx.tenant.id,
+          project_id: story.project_id,
+          repo_full_name: repo
+        })
+
+      {1, _} =
+        AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+          set: [intake_record_id: record.id]
+        )
+
+      set_issue_state(record.id, "open")
+      assert story.id in candidate_ids(50)
+
+      # Closed after triage queued it: somebody fixed or withdrew it, so no session is paid for.
+      set_issue_state(record.id, "closed")
+      refute story.id in candidate_ids(50)
+
+      set_issue_state(record.id, "open")
+      assert story.id in candidate_ids(50)
+    end
+
     # #887 review round 1. Placement refuses a story with unmet dependencies before it mints,
     # so selected it would be refused on every pass, frozen at the head of the queue.
     test "a story with an unmet STORY dependency is not a candidate", ctx do
@@ -767,6 +797,13 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   # A story contracted and standing at `queued` — what a placement takes.
   defp queued_story(ctx), do: ctx |> triaged_story() |> queue()
+
+  defp set_issue_state(record_id, state) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+        set: [issue_state: state]
+      )
+  end
 
   defp triaged_story(ctx) do
     story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})

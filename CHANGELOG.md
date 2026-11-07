@@ -6,6 +6,10 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`POST /api/v1/stories/:id/stage/resolve` accepts `to: detected` (2026-11-07).** A human can
+  now send a story that triage escalated back to be triaged again; its old triage dispatch is
+  unbound. A story an implementer was assigned or worked is refused 409 `not_retriageable`,
+  with what it holds in `held`. loopctl-mcp-server 3.6.0 exposes it on `resolve_escalation`.
 - **ecto 3.14.3 for CVE-2026-118391 (2026-11-06)**, with ecto_sql 3.14.0, decimal 3.2.0 and
   cowboy 2.20.0. Two more HIGH advisories are acknowledged in `mix.exs` because no fixed
   release exists on hex: cowboy CVE-2026-115701 and cowlib CVE-2026-113431. Both are memory
