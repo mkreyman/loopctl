@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-49.6.6",
-      "description": "A spec_tune dispatch whose target spec's version differs from the template it names (e.g. target triage@3, template triage@1) loads its eval set and returns a result. Today the runner's SpecTune.prepare/2 loads the set keyed by the target's id@version while Eval.Case requires each case's spec@version to name a template the runner holds, so that set can never load and the tuning run ends without a result (found in the round-2 review of mkreyman/loopctl-runner#91). Key eval sets by template, or let a case name the target spec independently of its template; either way one rule, held by a runner test."
+      "description": "A spec_tune dispatch whose target spec's version differs from the template it names (e.g. target triage@3, template triage@1) loads its eval set and returns a result. Today loopctl keys the dispatch's eval_set on the target spec (Tuning.eval_set/1, lib/loopctl/agents/tuning.ex:515), the runner refuses any set other than the target's (SpecTune.eval_set/2, loopctl-runner lib/loopctl_runner/spec_tune.ex:153-157), and Eval.Case requires each case's spec@version to name a template the runner holds, so that set can never load and the tuning run ends without a result (found in the round-2 review of mkreyman/loopctl-runner#91). The rule: an eval set is keyed by the TEMPLATE its cases exercise. loopctl sends eval_set = the template's id@version, the runner's eval_set/2 requires it to equal spec_tune.template, and Eval.Case is unchanged."
     }
   ],
   "test_cases": [
@@ -94,13 +94,15 @@
         "runner holds template triage@1 and an eval set for it; a spec_tune dispatch targets triage@3 naming template triage@1"
       ],
       "expected_results": [
-        "the eval set loads and the run returns an agent_result with per-case scores"
+        "loopctl's dispatch names eval_set triage@1, the runner accepts it, the set loads and the run returns an agent_result with per-case scores",
+        "a dispatch naming eval_set triage@3 with template triage@1 is refused by the runner"
       ]
     }
   ],
   "technical_notes": [
     "Spans loopctl (registry live version, payload, contract) and loopctl-runner (Templates.for_dispatch/1 keyed on spec, declared templates).",
-    "The runner's join already declares {id, version} pairs (Templates.specs/1, contract 1.25.0), so loopctl's capability matching can key on them."
+    "The runner's join already declares {id, version} pairs (Templates.specs/1, contract 1.25.0), so loopctl's capability matching can key on them.",
+    "AC-49.6.6 changes both sides: loopctl's Tuning.eval_set/1 keys on the template, and the runner's SpecTune.eval_set/2 compares against spec_tune.template. They ship together, or a dispatch from one side is refused by the other."
   ],
   "dependencies": [
     "US-48.8",
