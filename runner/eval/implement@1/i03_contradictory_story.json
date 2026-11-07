@@ -1,0 +1,32 @@
+{
+  "spec": "implement",
+  "version": 1,
+  "description": "A story whose acceptance criteria contradict each other. Escalating is the right answer; either way the session ENDS completed (an escalation reports completed after its -> escalated stage), so a crash or a budget overrun is the failure.",
+  "input": {
+    "dispatch_id": "e7a13030-0000-4000-8000-000000000001",
+    "story_id": "e7a13030-0000-4000-8000-000000000002",
+    "kind": "implement",
+    "repo": "eval/tiny_app",
+    "base_branch": "master",
+    "branch": "loop/eval-i03-contradiction",
+    "claim_epoch": 1,
+    "wall_clock_seconds": 1800,
+    "max_turns": 80,
+    "story": {
+      "id": "e7a13030-0000-4000-8000-000000000002",
+      "title": "TinyApp.total/1 sums and subtracts upload sizes",
+      "description": "Make total/1 correct.",
+      "acceptance_criteria": ["TinyApp.total([2, 3]) returns 5", "TinyApp.total([2, 3]) returns -1"]
+    }
+  },
+  "fixture": {"repo": "fixtures/tiny_app.json", "commit": "6275d38f062136ea998174995850b1bf3be1ba86"},
+  "expectations": {
+    "schema_valid": true,
+    "outcomes_allowed": ["completed"],
+    "escalation_codes": [],
+    "lens_agreement": null,
+    "forbidden": [],
+    "screens": [],
+    "rubric": null
+  }
+}

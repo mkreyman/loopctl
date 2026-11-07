@@ -23,13 +23,16 @@ defmodule LoopctlRunner.DispatchRun do
   cap cannot have its tail trimmed into a clean-looking one.
   """
 
+  require Logger
+
   alias LoopctlRunner.{
     Config,
     Contract,
     DispatchPolicy,
-    DispatchPrompt,
-    Session,
+    PrStages,
+    Run,
     Story,
+    Templates,
     Uuid,
     Worktree
   }
@@ -221,35 +224,113 @@ defmodule LoopctlRunner.DispatchRun do
 
   The delivery mode is `.loopctl/mode` as THAT commit holds it (`Worktree.commit_file/4`) — the
   tree the session starts in, and written by no session — normalised and checked by
-  `DispatchPolicy.delivery_mode/1`; a `thread` mode then needs its push helper
-  (`DispatchPolicy.push_helper/2`) and a checkpoint reporter
-  (`DispatchPolicy.checkpoint_reporting/2`). Any refusal fails the dispatch closed.
+  `DispatchPolicy.delivery_mode/1`. A refusal fails the dispatch closed.
 
-  `finish` may carry `:push_script` (`Session.push_script/0` when absent) and
-  `:checkpoint_reporter` (`LoopctlRunner.CheckpointStream` when absent), which a test replaces.
+  The prompt is `template`'s (`LoopctlRunner.Templates.render/2`); implement@1 when none is given.
   """
-  @spec prompt(map(), map(), map(), keyword()) ::
+  @spec prompt(map(), map(), map(), Templates.t() | nil) ::
           (String.t() -> {:ok, String.t()} | {:refuse, String.t(), String.t()})
-  def prompt(dispatch, fields, story_object, finish \\ []) do
-    push_script = Keyword.get_lazy(finish, :push_script, &Session.push_script/0)
-    reporter = Keyword.get(finish, :checkpoint_reporter, LoopctlRunner.CheckpointStream)
-
-    where = %{
-      repo: dispatch["repo"],
-      branch: fields.branch,
-      base: fields.base,
-      push_script: push_script
-    }
+  def prompt(dispatch, fields, story_object, template \\ nil) do
+    template = template || implement_template()
+    where = %{repo: dispatch["repo"], branch: fields.branch, base: fields.base}
 
     fn cut_from ->
       read = Worktree.commit_file(fields.repo_path, cut_from, ".loopctl/mode", @max_mode_bytes)
 
-      with {:ok, mode} <- DispatchPolicy.delivery_mode(read),
-           :ok <- DispatchPolicy.push_helper(mode, push_script),
-           :ok <- DispatchPolicy.checkpoint_reporting(mode, reporter) do
-        {:ok, DispatchPrompt.build(story_object, Map.put(where, :mode, mode))}
+      with {:ok, mode} <- DispatchPolicy.delivery_mode(read) do
+        {:ok,
+         Templates.render(template, %{story: story_object, where: Map.put(where, :mode, mode)})}
       end
     end
+  end
+
+  # How long the forge is given to answer (`LoopctlRunner.Forge`'s own kill), and how much longer
+  # `observe/4` waits for the call around it before giving it up: a seam that ignores its timeout
+  # must not hold the run's end, and with it `session_ended`.
+  @forge_timeout_ms 30_000
+  @forge_grace_ms 2_000
+
+  @doc """
+  What `Run.execute/3` calls, through `:observe`, once a dispatch's session has ended, however it
+  ended (US-48.16): the forward stages its pull request shows, for the run to report before its
+  `session_ended`, or `[]`.
+
+  Only a `pr`-mode session gets any, read as `prompt/4` reads it: `.loopctl/mode` in the commit the
+  worktree was cut from, never the working tree the session could write. In `pr` mode the session
+  opens its pull request with `gh pr create --base <base>` and merges it into that base, and
+  nothing else tells loopctl it did — so the runner asks the forge about the dispatch's own repo,
+  branch and base and nothing else, and `LoopctlRunner.PrStages` says what that answer shows.
+  Every value reported is the forge's; none comes from session text or a file the session wrote.
+
+  `forge` is `(repo, head, base, timeout_ms) -> {:ok, list} | {:error, reason}` —
+  `LoopctlRunner.Forge.pull_requests/5` in production. Bounded: `:timeout_ms` (30 s) is what the
+  forge is given, and the call is given up `:grace_ms` (2 s) after that. A forge that fails, times
+  out, raises or answers anything else reports nothing extra and logs a warning; the run's end, its
+  `session_ended` included, goes out either way.
+  """
+  @spec observe(map(), Story.t(), function(), keyword()) :: (map() -> [map()])
+  def observe(dispatch, %Story{} = story, forge, opts \\ []) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, @forge_timeout_ms)
+    bound_ms = timeout_ms + Keyword.get(opts, :grace_ms, @forge_grace_ms)
+    where = {dispatch["repo"], story.branch, story.base}
+
+    fn context ->
+      with cut_from when is_binary(cut_from) <- context[:cut_from],
+           read =
+             Worktree.commit_file(story.repo_path, cut_from, ".loopctl/mode", @max_mode_bytes),
+           {:ok, "pr"} <- DispatchPolicy.delivery_mode(read) do
+        ask_forge(forge, where, timeout_ms, bound_ms, dispatch)
+      else
+        _not_pr -> []
+      end
+    end
+  end
+
+  defp ask_forge(forge, {repo, head, base} = where, timeout_ms, bound_ms, dispatch) do
+    task =
+      Task.async(fn ->
+        try do
+          forge.(repo, head, base, timeout_ms)
+        catch
+          kind, reason -> {:error, Run.crash_error(kind, reason)}
+        end
+      end)
+
+    answer =
+      case Task.yield(task, bound_ms) || Task.shutdown(task, :brutal_kill) do
+        {:ok, answer} -> answer
+        _ -> {:error, "the forge did not answer within #{bound_ms} ms"}
+      end
+
+    case answer do
+      {:ok, prs} ->
+        PrStages.observed(prs, head, base)
+
+      other ->
+        forge_failed(where, other, dispatch)
+    end
+  end
+
+  defp forge_failed({repo, head, base}, answer, dispatch) do
+    why =
+      case answer do
+        {:error, reason} when is_binary(reason) -> reason
+        other -> "an answer that is not {:ok, list}: #{inspect(other, limit: 5)}"
+      end
+
+    Logger.warning(
+      "could not read the forge for #{repo} #{head} into #{base} (#{why}); no stage past " <>
+        "implementing is reported for this session, and its session_ended still goes",
+      dispatch_id: dispatch["dispatch_id"]
+    )
+
+    []
+  end
+
+  # implement@1, the template a caller that names none gets: today's prompt.
+  defp implement_template do
+    {:ok, template} = Templates.fetch({"implement", 1})
+    template
   end
 
   @doc """
@@ -261,14 +342,22 @@ defmodule LoopctlRunner.DispatchRun do
   @spec story_id(String.t()) :: String.t()
   def story_id(story_id), do: "story-" <> String.downcase(story_id)
 
-  @doc "What an accepted run's `state.json` carries so its trace ships: the dispatch it serves."
+  @doc """
+  What an accepted run's `state.json` carries so its trace ships: the dispatch it serves. A
+  story-less dispatch (`spec_tune`, contract 1.30.0) has no `story_id`, and its binding carries
+  none rather than a null one.
+  """
   @spec binding(map()) :: map()
   def binding(dispatch) do
-    %{
+    binding = %{
       "dispatch_id" => dispatch["dispatch_id"],
-      "claim_epoch" => dispatch["claim_epoch"],
-      "story_id" => dispatch["story_id"]
+      "claim_epoch" => dispatch["claim_epoch"]
     }
+
+    case dispatch["story_id"] do
+      story_id when is_binary(story_id) -> Map.put(binding, "story_id", story_id)
+      _none -> binding
+    end
   end
 
   @doc """
@@ -309,9 +398,8 @@ defmodule LoopctlRunner.DispatchRun do
   `status`, `reached` and escalations a later Control reads back from `state.json`):
 
     * `[]` — an implement run's `deadline_at` passed before its session started (status
-      `deadline_passed`, from `claimed`, `worktree` or `implementing`; never a review's, below):
-      it started no session, and escalating the story
-      would say a human is needed when none is. After its deadline the claim is loopctl's lease sweep's, which releases it; the run
+      `deadline_passed`, from `claimed`, `worktree` or `implementing`): it started no session,
+      and escalating the story would say a human is needed when none is. After its deadline the claim is loopctl's lease sweep's, which releases it; the run
       records its end as settled (`terminal_reported` `skipped`), so no Control reports it later.
     * `[:escalated]` — no session ever started: the run got no worktree (`reached` `claimed`), or
       its prompt was refused (`worktree`). There is no session to say `session_ended` about, so
@@ -321,24 +409,10 @@ defmodule LoopctlRunner.DispatchRun do
       `session_ended/2` for why both go).
     * `[:session_ended]` — every other run: the session's end is a fact to report, and what
       happens to the story next is control's to decide from it.
-    * `[:judgements, :session_ended]` — a REVIEW run (`kind: "review"`), however it ended: its
-      findings and verdict first, then the `session_ended` that frees the slot. A review has no
-      stage to report — it claims nothing — so it never sends `-> escalated`, and its
-      `session_ended` goes even when no session started, because it is the ONLY message that
-      gives the slot back ("send it when the session stops without a verdict ... or after one").
-      That holds for a review whose `deadline_at` passed before its session started
-      (`deadline_passed`) too, which is why this clause is judged FIRST: the `[]` above is about
-      the implementer's CLAIM, which loopctl's lease sweep releases after the deadline, and a
-      review holds no claim — only the slot, which nothing but its `session_ended` frees. So a
-      review never ends owing nothing, and `LoopctlRunner.Control` never forgets its dispatch the
-      way it forgets a sessionless implement run's.
-      It goes last because "once that dispatch's session_ended is recorded the session is over:
-      ... a new one is dispatch_not_accepted".
   """
-  @spec end_reports(map()) :: [:judgements | :escalated | :session_ended]
+  @spec end_reports(map()) :: [:escalated | :session_ended]
   def end_reports(summary) do
     cond do
-      summary[:kind] == "review" -> [:judgements, :session_ended]
       summary[:status] == "deadline_passed" -> []
       summary[:reached] in ["claimed", "worktree"] -> [:escalated]
       summary[:escalations] not in [nil, []] -> [:escalated, :session_ended]
@@ -375,16 +449,11 @@ defmodule LoopctlRunner.DispatchRun do
       which it did not choose either, and `crashed` is what re-queues such a story rather than
       leaving it to a lease reclaim.
 
-  A REVIEW run (`kind: "review"`) is read the same way, off its status alone, because the
-  contract gives a review's `session_ended` no meaning beyond the session's end: it "only frees
-  the runner's slot: no stage effect, no retry-ceiling count, whatever `reason`". What the
-  session stated is not in it — that is the judgements' to carry. A review that prepared nothing
-  and started no session (`failed`) is `crashed`: "any end the runner did not choose and that is
-  not one of the others", and it is none of them — nothing ran to complete, and no budget or
-  usage limit was reached. So is one whose `deadline_at` passed before its session started
-  (`deadline_passed`), and one whose session that deadline stopped (`stopped_at_deadline`), for
-  an implement run's reason above: loopctl's placement ran out, and the review overran no budget
-  of its own.
+  Since contract 1.27.0 it also carries, each only when known: `turns_used`, the CLI's own
+  `num_turns` from its last result line (`StreamEvents.turns/1`), and `work_left_behind`, whether
+  the session's branch held commits no `origin` ref reached as it ended
+  (`Worktree.work_left_behind/2`). Both are recorded by loopctl with the first copy only, and are
+  not part of the report's identity, so a resend that differs in them is still answered `ok`.
 
   `usage_exhausted` is never sent: nothing the runner reads today tells a session that hit its
   account's usage limit from any other failing exit, so claiming it would be a guess — and it
@@ -393,14 +462,28 @@ defmodule LoopctlRunner.DispatchRun do
   """
   @spec session_ended(map(), map()) :: {:ok, map()} | {:error, [String.t()]}
   def session_ended(dispatch, summary) do
-    payload = %{
-      "dispatch_id" => dispatch["dispatch_id"],
-      "claim_epoch" => dispatch["claim_epoch"],
-      "reason" => session_end_reason(summary)
-    }
+    payload =
+      %{
+        "dispatch_id" => dispatch["dispatch_id"],
+        "claim_epoch" => dispatch["claim_epoch"],
+        "reason" => session_end_reason(summary)
+      }
+      |> put_opt("turns_used", turns_used(summary[:turns_used]))
+      |> put_opt("work_left_behind", left_behind(summary[:work_left_behind]))
 
     with :ok <- Contract.validate("RunnerSessionEnded", payload), do: {:ok, payload}
   end
+
+  # Contract 1.27.0's optional facts, each OMITTED when the run could not tell: never a guess, and
+  # never a value the schema would refuse the whole report for.
+  @max_turns_used Contract.schema_def("RunnerSessionEnded")
+                  |> get_in(["properties", "turns_used", "maximum"])
+
+  defp turns_used(n) when is_integer(n) and n >= 0 and n <= @max_turns_used, do: n
+  defp turns_used(_n), do: nil
+
+  defp left_behind(value) when is_boolean(value), do: value
+  defp left_behind(_value), do: nil
 
   @budgets ["wall_clock_exceeded", "max_turns_exceeded"]
 

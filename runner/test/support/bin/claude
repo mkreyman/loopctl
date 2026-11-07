@@ -6,6 +6,10 @@
 #   FAKE_CLAUDE_MODE   stream | max_turns | hang | exit_leaving_child | ...
 #   FAKE_EXIT          exit code for stream mode (default 0)
 #   FAKE_AGENTS        busy | idle | fail — what `claude agents --json` reports
+#   FAKE_RESULT_LINE   stream mode's final `result` line, replacing the default
+#   FAKE_RESULT_LINE_FILE  the same, read from this file (a line over a session_env value's cap)
+#   FAKE_SWITCH_TEXT   with FAKE_SWITCH_VERDICT / FAKE_SWITCH_RESULT_LINE: what to state instead
+#                      when the prompt contains this text
 #
 # LOOPCTL_TEST_STRAGGLERS, inherited from the suite, is where every process this file
 # detaches is recorded so the suite can end it (test/support/test_stragglers.ex).
@@ -132,6 +136,19 @@ detach() {
 
 init='{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake","cwd":"'"$here"'","permissionMode":"auto"}'
 
+# FAKE_SWITCH_TEXT: when the PROMPT (the last argument) contains this literal text, the session
+# states FAKE_SWITCH_VERDICT / FAKE_SWITCH_RESULT_LINE instead of FAKE_VERDICT / FAKE_RESULT_LINE.
+# The one way an offline eval run tells a proposed template revision from the current one.
+if [ -n "${FAKE_SWITCH_TEXT:-}" ]; then
+    case "${*: -1}" in
+        *"$FAKE_SWITCH_TEXT"*)
+            echo switched > "$state/switched"
+            [ -n "${FAKE_SWITCH_VERDICT:-}" ] && FAKE_VERDICT=$FAKE_SWITCH_VERDICT
+            [ -n "${FAKE_SWITCH_RESULT_LINE:-}" ] && FAKE_RESULT_LINE=$FAKE_SWITCH_RESULT_LINE
+            ;;
+    esac
+fi
+
 # A triage run's session states its verdict by running the verdict command with the token its
 # PROMPT carries — which is the whole point of the token, so the fake finds it the same way a
 # session would: in the prompt it was given, never in the environment.
@@ -140,35 +157,6 @@ if [ -n "${FAKE_VERDICT:-}" ]; then
     token=$(printf '%s' "$prompt" | grep -oE 'loop-verdict [A-Za-z0-9_-]+' | head -1 | cut -d' ' -f2)
     script=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-verdict' | head -1)
     printf '%s' "$FAKE_VERDICT" | "$script" "$token" > /dev/null 2>&1 || true
-fi
-
-# A review run's session reports through its two commands, with the token its PROMPT carries —
-# found the way a session would find it, never in the environment. FAKE_REVIEW_FINDINGS findings,
-# then the verdict FAKE_REVIEW_VERDICT names, then (FAKE_REVIEW_AFTER) one more finding, which the
-# command must refuse. Each exit status is recorded, so a test can say which were refused.
-if [ -n "${FAKE_REVIEW_FINDINGS:-}${FAKE_REVIEW_VERDICT:-}" ]; then
-    prompt=${*: -1}
-    finding=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-finding [A-Za-z0-9_-]+' | head -1)
-    verdict=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-review-verdict [A-Za-z0-9_-]+' | head -1)
-    # After round 1 the prompt names the one checkpoint a finding may be introduced by: name it.
-    introduced=$(printf '%s' "$prompt" | grep -oE -- '--introduced-by <[0-9a-f-]+\|none>' | head -1 |
-        sed -E 's/--introduced-by <([0-9a-f-]+)\|none>/--introduced-by \1/')
-    : > "$state/review_exits"
-    i=0
-    while [ "$i" -lt "${FAKE_REVIEW_FINDINGS:-0}" ]; do
-        i=$((i + 1))
-        printf 'defect %s: it fails when called twice\n' "$i" |
-            $finding --severity high --location "lib/app.ex:$i" $introduced > /dev/null 2>&1
-        echo "finding $?" >> "$state/review_exits"
-    done
-    if [ -n "${FAKE_REVIEW_VERDICT:-}" ]; then
-        printf '%s\n' "$FAKE_REVIEW_VERDICT" | $verdict > /dev/null 2>&1
-        echo "verdict $?" >> "$state/review_exits"
-    fi
-    if [ -n "${FAKE_REVIEW_AFTER:-}" ]; then
-        printf 'a late defect\n' | $finding --severity low $introduced > /dev/null 2>&1
-        echo "after $?" >> "$state/review_exits"
-    fi
 fi
 
 # An IO failure at the verdict path that the session cannot cause and the runner cannot parse
@@ -195,7 +183,17 @@ case "${FAKE_CLAUDE_MODE:-stream}" in
         echo '{"type":"user","parent_tool_use_id":"toolu_B","session_id":"'"$sid"'","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_B"}]}}'
         echo '{"type":"user","parent_tool_use_id":null,"session_id":"'"$sid"'","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A"}]}}'
         echo "this line is not json"
-        printf '%s' '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"'"$sid"'"}'
+        # FAKE_RESULT_LINE: the whole final result line, JSON the TEST encoded, for a session whose
+        # final message is its output (a draft's fenced json block rides its `result` text).
+        # FAKE_RESULT_LINE_FILE: the same line read from a file, for one longer than a session_env
+        # value may be (a tuning session's proposal carries whole eval cases).
+        if [ -n "${FAKE_RESULT_LINE_FILE:-}" ]; then
+            cat "$FAKE_RESULT_LINE_FILE"
+        elif [ -n "${FAKE_RESULT_LINE:-}" ]; then
+            printf '%s' "$FAKE_RESULT_LINE"
+        else
+            printf '%s' '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"'"$sid"'"}'
+        fi
         exit "${FAKE_EXIT:-0}"
         ;;
     max_turns)
@@ -246,7 +244,16 @@ ESCALATION
             echo "fake claude: the runner never recorded this session's pgid" >&2
             exit 3
         fi
-        rm -rf "$LOOP_RUN_DIR"
+        # Until it is really gone: a state write that lands WHILE rm -rf runs (the runner records
+        # stream events as this session prints) recreates an entry after rm listed the directory,
+        # so its rmdir fails and the directory survives holding a fresh state.json. That is a
+        # deletion that did not happen, not the outcome under test. Once the directory is gone no
+        # write can bring it back (AtomicFile creates no parent).
+        for _ in $(seq 1 40); do
+            rm -rf "$LOOP_RUN_DIR"
+            [ -e "$LOOP_RUN_DIR" ] || break
+            sleep 0.05
+        done
         exit 0
         ;;
     write_file)

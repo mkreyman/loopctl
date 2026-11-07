@@ -26,8 +26,8 @@ defmodule LoopctlRunner.Runs do
   When a run on this machine last succeeded, ISO 8601 in UTC, or nil — the sample's
   `last_build_at`.
 
-  Only a run that BUILDS counts: an implement run, whose state carries no `kind`. A review that
-  succeeded read a checkpoint and built nothing, and a triage run never records `succeeded`.
+  Only a run that BUILDS counts: an implement run, whose state carries no `kind`. A triage run
+  never records `succeeded`, and neither did a review an older build ran.
 
   Each `finished_at` is parsed, compared as a time and re-rendered. A value that does not parse
   (hand-edited, truncated, written without an offset) is skipped: the contract checks this

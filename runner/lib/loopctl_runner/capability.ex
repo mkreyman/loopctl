@@ -2,8 +2,7 @@ defmodule LoopctlRunner.Capability do
   @moduledoc """
   A run's capability tokens: random, written into the run directory where the command that
   requires one checks it, and handed to the session in its PROMPT and nowhere else — a triage
-  run's verdict and escalate tokens (`LoopctlRunner.TriageVerdict`) and a review run's judgement
-  token (`LoopctlRunner.ReviewJudgements`).
+  run's verdict and escalate tokens (`LoopctlRunner.TriageVerdict`).
 
   The boundary is between the session and what it dispatches: a subagent inherits the
   environment and the session's allow-rules, but is given a task, not the session's prompt, so it

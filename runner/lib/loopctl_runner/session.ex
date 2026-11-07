@@ -13,13 +13,14 @@ defmodule LoopctlRunner.Session do
   must inherit my entire user scoped claude setup"*, and *"the same claude setup means the same
   claude setup as the local agents. with the same rules and workflows. the same soul.md, the same
   claude.md, etc"*. So it runs `--permission-mode bypassPermissions`, composes no `--allowedTools`,
-  passes no `--setting-sources` and excludes no tool or MCP server. It inherits `SOUL.md`, the user
+  passes no `--setting-sources` and excludes no tool or MCP server (the verify@1 session alone
+  passes `--setting-sources user`, which keeps all of the user scope and drops only the project
+  scope of the pull request it judges: `LoopctlRunner.VerifyPrompt`). It inherits `SOUL.md`, the user
   `CLAUDE.md`, the hooks, the plugins, the agents, the skills and the MCP set. How it FINISHES is
   the repository's delivery mode, which its prompt states (`LoopctlRunner.DispatchPrompt`): in a
-  `thread` repository it commits and pushes through `loop-push` (`push_script/0`) and loopctl's
-  merge executor merges the checkpoints it records; in a `pr` repository it runs the operator's
-  delivery loop — open the PR, review, fix every finding, merge on green — because that is what
-  those files say to do.
+  `pr` repository, the one mode, it runs the operator's delivery loop — open the PR, review, fix
+  every finding, wait for green CI — because that is what those files say to do, and stops short
+  of the merge, which loopctl's merge gate decides and the runner executes (US-48.17).
 
   WHAT REMAINS IS NOT A PERMISSION. Each answers "what is physically true of an unattended
   process", never "what should an agent be allowed to do":
@@ -31,7 +32,7 @@ defmodule LoopctlRunner.Session do
       in one night when an environment key silently outranked the claude.ai login (KB b38ef90e).
       Not part of anyone's Claude setup. IT IS NOT THE LAST WORD ON THE ENVIRONMENT, though the
       unset order makes it look like one: the inherited settings are loaded AFTER both this and
-      `port_env/5`'s scrub, and an `env` block in the inherited settings is applied to the
+      `port_env/4`'s scrub, and an `env` block in the inherited settings is applied to the
       session's environment, so it is a third injection path that neither control can see. What
       that block carries is the operator's configuration, not a property of this design.
 
@@ -60,7 +61,9 @@ defmodule LoopctlRunner.Session do
   THE STORY LIFECYCLE IS NOT THIS REPO'S. Contract, claim, stage reporting, verification: all of
   it lives in the operator's skills and commands, written for exactly this job. Do not reimplement
   any of it here. The runner cuts the worktree, launches the session, watches the process, tears
-  the tree down, and reports the two stages it can actually observe.
+  the tree down, and reports the stages it can actually observe: the worktree, the session's
+  start, and (US-48.16, through `DispatchRun.observe/4`) what the forge says of a pr-mode
+  session's pull request once the session is over.
   """
 
   use GenServer
@@ -98,7 +101,9 @@ defmodule LoopctlRunner.Session do
           # Which bound stopped a `:wall_clock_exceeded` session: its own start + `wall_clock_s`,
           # or the dispatch's `deadline_at`. nil for every other end.
           stop_bound: :wall_clock | :deadline | nil,
-          duration_ms: non_neg_integer()
+          duration_ms: non_neg_integer(),
+          # `num_turns` of the CLI's last result line (`StreamEvents.turns/1`), nil without one.
+          turns_used: non_neg_integer() | nil
         }
 
   @doc """
@@ -151,16 +156,6 @@ defmodule LoopctlRunner.Session do
   def escalate_script, do: Application.app_dir(:loopctl_runner, "priv/bin/loop-escalate")
 
   @doc """
-  The absolute path of the command a session in a `thread` repository pushes its branch with.
-
-  It fetches before every push, merges what origin has that the branch lacks, and never forces,
-  because loopctl's merge executor may move a thread branch itself. It pushes only the branch
-  named by `LOOP_BRANCH`, which `port_env/5` sets, and refuses to run without it.
-  """
-  @spec push_script() :: String.t()
-  def push_script, do: Application.app_dir(:loopctl_runner, "priv/bin/loop-push")
-
-  @doc """
   Appended to the session's system prompt: how to ask for a human, since it cannot ask.
 
   A headless session has no AskUserQuestion and no hook observes a question it wanted to ask
@@ -198,7 +193,12 @@ defmodule LoopctlRunner.Session do
   defp argv(story, session_id, opts) do
     case Keyword.get(opts, :argv) do
       nil ->
-        claude_args(story, session_id, Keyword.get(opts, :system_prompt, escalation_prompt()))
+        claude_args(
+          story,
+          session_id,
+          Keyword.get(opts, :system_prompt, escalation_prompt()),
+          Keyword.get(opts, :mcp_args, [])
+        )
 
       argv when is_list(argv) ->
         checked(argv, session_id)
@@ -266,9 +266,17 @@ defmodule LoopctlRunner.Session do
   own (`LoopctlRunner.TriagePrompt.system_prompt/0`): this one tells a session to run
   `loop-escalate` and stop when a request is ambiguous, which is the commonest triage verdict, so
   a triage session launched with it ends escalated with no verdict.
+
+  `mcp_args` is spliced in before the system prompt and is `[]` on every dispatched session, so
+  their argv is unchanged by it. Only the eval harness sets it (`mcp_isolation/1`).
   """
-  @spec claude_args(Story.t(), String.t(), String.t()) :: [String.t()]
-  def claude_args(%Story{} = story, session_id, system_prompt \\ escalation_prompt()) do
+  @spec claude_args(Story.t(), String.t(), String.t(), [String.t()]) :: [String.t()]
+  def claude_args(
+        %Story{} = story,
+        session_id,
+        system_prompt \\ escalation_prompt(),
+        mcp_args \\ []
+      ) do
     # -p is a flag, not an option taking a value: the prompt is positional, so a prompt
     # starting with "-" (a markdown list, front matter) would parse as an option.
     [
@@ -286,9 +294,21 @@ defmodule LoopctlRunner.Session do
       Integer.to_string(story.max_turns)
     ] ++
       if(story.model, do: ["--model", story.model], else: []) ++
+      mcp_args ++
       ["--append-system-prompt", system_prompt] ++
       ["--", story.prompt]
   end
+
+  @doc """
+  The MCP isolation an EVAL session runs under, and nothing else ever does: `--strict-mcp-config`
+  with `--mcp-config` naming `config_path`, a file holding `{"mcpServers":{}}`. The CLI then loads
+  no MCP server at all, the operator's loopctl entry included, whose own `env` names the server and
+  its keys, so no session environment can redirect it (US-48.10, AC-48.10.5: an eval never reaches
+  the production socket). A dispatched session never gets this: it keeps the operator's MCP set,
+  as the runner's CLAUDE.md posture requires.
+  """
+  @spec mcp_isolation(String.t()) :: [String.t()]
+  def mcp_isolation(config_path), do: ["--strict-mcp-config", "--mcp-config", config_path]
 
   @impl true
   def init(opts) do
@@ -336,7 +356,6 @@ defmodule LoopctlRunner.Session do
               run_dir,
               session_id,
               config,
-              story,
               # WHERE the grant is, when one was prepared — not that there is one: the file is the
               # grant, and arming it comes after this fork (`LoopctlRunner.GitGrant`). The session
               # can compute the path anyway from its own id and HOME, so this hands over nothing
@@ -348,7 +367,14 @@ defmodule LoopctlRunner.Session do
             )
         ])
 
-      {:os_pid, os_pid} = Port.info(port, :os_pid)
+      # A launcher that exits before this line has closed its Port, and `Port.info/2` is nil for a
+      # closed one. That is a failed start, named as one: the exit is caught below, the grant is
+      # disarmed, and `run/1` reports `{:session_start_failed, :launcher_exited_at_start}`.
+      os_pid =
+        case Port.info(port, :os_pid) do
+          {:os_pid, os_pid} -> os_pid
+          nil -> exit(:launcher_exited_at_start)
+        end
 
       # The stop bound is fixed HERE, where the session has started: the earlier of this start +
       # wall_clock_s and the moment it must be signalled to be gone by the dispatch's deadline_at —
@@ -471,18 +497,18 @@ defmodule LoopctlRunner.Session do
   # should enjoy the same permissions as attended sessions -- no less."
   @credential_env ~w(ANTHROPIC_API_KEY)
 
-  @doc "Every credential name `port_env/5` unsets."
+  @doc "Every credential name `port_env/4` unsets."
   @spec credential_env() :: [String.t()]
   def credential_env, do: @credential_env
 
   @doc """
-  What `port_env/5` unsets: the billing credential and the variables that point git at another
+  What `port_env/4` unsets: the billing credential and the variables that point git at another
   repository. Unconditional: a caller's `:env` does not keep one.
   """
   @spec unset_names() :: [String.t()]
   def unset_names, do: @credential_env ++ Worktree.repo_locating_env()
 
-  defp port_env(run_dir, session_id, config, story, extra) do
+  defp port_env(run_dir, session_id, config, extra) do
     base =
       [
         {"LOOP_ESCALATE", escalate_script()},
@@ -493,7 +519,7 @@ defmodule LoopctlRunner.Session do
         {"LOOP_KILL_GRACE_S", Integer.to_string(config.kill_grace_s)},
         {"LOOP_TREE_POLL_S", Integer.to_string(config.tree_poll_s)},
         {"LOOP_TREE_FILE", Path.join(run_dir, "stderr.log.tree")}
-      ] ++ branch_env(story)
+      ]
 
     env = System.get_env()
 
@@ -507,16 +533,6 @@ defmodule LoopctlRunner.Session do
     end) ++
       Enum.map(unset_names() ++ release_env(env), &{to_charlist(&1), false})
   end
-
-  # The branch `loop-push` (`push_script/0`) is allowed to push, which it refuses to run without:
-  # the session's own, the one the runner cut its worktree on. A run with no branch of its own (a
-  # triage run's story carries "") gets none, so loop-push has nothing to push there. (A Port
-  # drops a variable whose value is empty anyway, measured on OTP 28; the guard says so here
-  # rather than leaving it to that.)
-  defp branch_env(%Story{branch: branch}) when is_binary(branch) and branch != "",
-    do: [{"LOOP_BRANCH", branch}]
-
-  defp branch_env(_story), do: []
 
   @doc """
   The names in `env` that belong to the runner's own release, which a session must not inherit.
@@ -617,7 +633,9 @@ defmodule LoopctlRunner.Session do
       exit_status: status,
       reason: reason,
       stop_bound: if(reason == :wall_clock_exceeded, do: state.stop_bound),
-      duration_ms: now_ms() - state.started_ms
+      duration_ms: now_ms() - state.started_ms,
+      # The CLI's own count from its last result line, nil when it printed none (contract 1.27.0).
+      turns_used: StreamEvents.turns(state.stream)
     }
 
     # Disarmed BEFORE the waiter hears: a result in hand means the grant is gone, so nothing

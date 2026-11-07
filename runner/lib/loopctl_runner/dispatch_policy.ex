@@ -26,13 +26,10 @@ defmodule LoopctlRunner.DispatchPolicy do
     5. `insufficient_disk` — free disk under `control.min_free_disk_mb`, or unreadable, on the
        volume of `runs_dir` OR of the repo checkout, where the worktree and its build output land;
     6. `branch_not_allowed` — the branch is outside `branch_prefixes`, or either ref is not a
-       plain ref name. A `review` dispatch is held to the second half only: its `branch` is the
-       IMPLEMENTER's, derived from whatever prefixes that machine declared, and a review never
-       cuts, writes or pushes it — it only fetches it, which a plain ref name is what makes safe.
-       Refusing one for a prefix this machine enforces on the branches it WRITES would turn away
-       every review of a story implemented elsewhere. A `triage` dispatch is held to the second
-       half too: it names the base branch as its `branch` and runs on a detached tree that is
-       never branched or pushed, so a prefix check refused every one (minis, 2026-11-06);
+       plain ref name. A dispatch whose template's archetype is not `:build`
+       (`LoopctlRunner.Templates`) is held to the second half only: a `triage` (`:judge`) names
+       the base branch as its `branch` and runs on a detached tree that is never branched or
+       pushed, so a prefix check refused every one (minis, 2026-11-06);
     7. `wall_clock_exceeds_limit`, `max_turns_exceeds_limit` — over `max_wall_clock_s` or
        `max_turns`;
     8. `token_budget_exceeds_limit` — when `control.max_token_budget` is set, a dispatch with no
@@ -49,14 +46,12 @@ defmodule LoopctlRunner.DispatchPolicy do
 
   `state` may carry `:now`, the instant the deadline is judged at; absent, it is the current time.
 
-  The refusals that read what the dispatch does not carry are decided once the run has cut its
+  The refusal that reads what the dispatch does not carry is decided once the run has cut its
   worktree: `delivery_mode/1` (the repository's `.loopctl/mode`, read from the commit the worktree
-  was cut from), and for a `thread` session `push_helper/2` (its only way to push) and
-  `checkpoint_reporting/2` (how loopctl learns what it pushed). Each refuses `other`, and each
-  fails closed: a run it refuses starts no session.
+  was cut from). It refuses `other` and fails closed: a run it refuses starts no session.
   """
 
-  alias LoopctlRunner.{Config, ControlConfig, Story}
+  alias LoopctlRunner.{Config, ControlConfig, Story, Templates}
 
   @ref_format ~r/\A[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}\z/
 
@@ -168,19 +163,18 @@ defmodule LoopctlRunner.DispatchPolicy do
   defp repo(_dispatch, _control, _config),
     do: {:refuse, "repo_not_allowed", "the dispatch names no repo"}
 
-  # The kinds that never write their `branch`, so this machine's prefixes, which bound the
-  # branches it CUTS and PUSHES, have nothing to bound. A review fetches the implementer's
-  # branch; a triage run judges the base from a detached worktree and loopctl names the base
-  # itself as `branch` (`LoopctlRunner.TriageRun`). Both keep the plain-ref check above.
-  @prefix_exempt_kinds ["review", "triage"]
-
+  # A dispatch whose template's ARCHETYPE never writes its `branch` is exempt from this machine's
+  # prefixes, which bound the branches it CUTS and PUSHES: only a `:build` run does
+  # (`Templates.prefix_exempt?/1`). A triage run (`:judge`) judges the base from a detached
+  # worktree and loopctl names the base itself as `branch` (`LoopctlRunner.TriageRun`). Either way
+  # the plain-ref check above still applies, and a dispatch with no template is never exempt.
   defp refs(%{"base_branch" => base, "branch" => branch} = dispatch, config)
        when is_binary(base) and is_binary(branch) do
     cond do
       not plain_ref?(base) or not plain_ref?(branch) ->
         {:refuse, "branch_not_allowed", "a ref is not a plain ref name"}
 
-      dispatch["kind"] in @prefix_exempt_kinds ->
+      Templates.prefix_exempt?(dispatch) ->
         :ok
 
       not Enum.any?(config.branch_prefixes, &String.starts_with?(branch, &1)) ->
@@ -213,10 +207,13 @@ defmodule LoopctlRunner.DispatchPolicy do
   The delivery mode stated by a repository's `.loopctl/mode`, given what
   `LoopctlRunner.Worktree.commit_file/4` read from the commit the worktree was cut from: a
   byte-order mark stripped, then whitespace trimmed and case folded, and it must then say
-  `thread` or `pr`. Everything else refuses the dispatch `other` — no file (`repository has no
+  `pr`. Everything else refuses the dispatch `other` — no file (`repository has no
   .loopctl/mode`), an empty one, another word, text that is not UTF-8, a file that could not be
-  read — because a mode decides whether the session opens and merges a pull request, and a
-  repository that never opted in has not asked for that.
+  read — because a mode decides whether the session opens a pull request that loopctl then
+  merges unattended, and a repository that never opted in has not asked for that.
+
+  `thread` is refused with its own detail. loopctl retired change threads in contract 1.23.0, so
+  nothing merges what a thread session pushes; a repository still saying `thread` must say `pr`.
   """
   @spec delivery_mode({:ok, binary()} | :absent | {:error, String.t()}) ::
           {:ok, String.t()} | {:refuse, String.t(), String.t()}
@@ -232,48 +229,18 @@ defmodule LoopctlRunner.DispatchPolicy do
       not String.valid?(stated) ->
         {:refuse, "other", "malformed delivery mode in .loopctl/mode: not UTF-8 text"}
 
-      String.downcase(stated) in ["thread", "pr"] ->
-        {:ok, String.downcase(stated)}
+      String.downcase(stated) == "pr" ->
+        {:ok, "pr"}
+
+      String.downcase(stated) == "thread" ->
+        {:refuse, "other",
+         "delivery mode thread in .loopctl/mode was retired with loopctl's change threads " <>
+           "(contract 1.23.0): set it to pr"}
 
       true ->
         {:refuse, "other",
          "malformed delivery mode #{inspect(String.slice(stated, 0, 40))} in .loopctl/mode: " <>
-           "expected thread or pr"}
+           "expected pr"}
     end
   end
-
-  @doc """
-  Whether a session in `mode` has what it needs to finish: a `thread` session pushes ONLY through
-  `push_script` (`LoopctlRunner.Session.push_script/0`), so a release without that executable is
-  refused `other` rather than started on a prompt naming a command that does not exist.
-  """
-  @spec push_helper(String.t(), String.t()) :: :ok | {:refuse, String.t(), String.t()}
-  def push_helper("thread", push_script) do
-    case File.stat(push_script) do
-      {:ok, %File.Stat{type: :regular, mode: mode}} when Bitwise.band(mode, 0o100) != 0 ->
-        :ok
-
-      _ ->
-        {:refuse, "other",
-         "push helper missing: #{push_script} is not an executable file in this release"}
-    end
-  end
-
-  def push_helper(_mode, _push_script), do: :ok
-
-  @doc """
-  Whether a `thread` session's pushes can reach loopctl: its merge executor merges only the
-  checkpoints the runner reports, so a thread session on a build with no checkpoint reporter
-  (`reporter`, `LoopctlRunner.CheckpointStream` in production) would push work
-  nothing ever merges. Such a run is refused `other`; a `pr` session reports nothing and needs
-  none.
-  """
-  @spec checkpoint_reporting(String.t(), module()) :: :ok | {:refuse, String.t(), String.t()}
-  def checkpoint_reporting("thread", reporter) do
-    if Code.ensure_loaded?(reporter),
-      do: :ok,
-      else: {:refuse, "other", "checkpoint reporting not available"}
-  end
-
-  def checkpoint_reporting(_mode, _reporter), do: :ok
 end

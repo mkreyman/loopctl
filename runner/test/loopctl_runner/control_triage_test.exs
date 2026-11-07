@@ -76,7 +76,9 @@ defmodule LoopctlRunner.ControlTriageTest do
           config: ctx.config,
           on_fatal: &send(test, {:fatal, &1}),
           run_supervisor: ctx.run_supervisor,
-          trace_poll_ms: 200
+          trace_poll_ms: 200,
+          # No test reaches GitHub, should an implement run ever start here.
+          forge: fn _repo, _head, _base, _timeout -> {:ok, []} end
         ],
         opts
       )

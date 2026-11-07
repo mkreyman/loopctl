@@ -110,7 +110,10 @@ defmodule LoopctlRunner.TriageRunTest do
     refute argv =~ "--allowedTools"
     assert argv =~ "--permission-mode\nbypassPermissions\n"
     refute argv =~ "--disallowedTools"
-    # No branch of its own, so nothing for loop-push to push: no LOOP_BRANCH.
+    # A dispatched session keeps the operator's MCP set: only an eval overrides it (US-48.10).
+    refute argv =~ "--strict-mcp-config"
+    refute argv =~ "--mcp-config"
+    # No LOOP_BRANCH: it served only loop-push, retired with thread mode (contract 1.23.0).
     refute File.read!(Path.join(ctx.state, "env")) =~ ~r/^LOOP_BRANCH=/m
     assert argv =~ "--agents\n"
     assert result.session.exit_status == 0

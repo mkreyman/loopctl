@@ -146,7 +146,8 @@ defmodule LoopctlRunner.Worktree do
   end
 
   @doc """
-  Cuts a DETACHED worktree at the commit `repo_path` has checked out, and returns that commit.
+  Cuts a DETACHED worktree at the commit `repo_path` has checked out — or at `commit`, when given,
+  which the repository must already hold (`fetch_commit/4`) — and returns that commit.
   No branch, so nothing a session commits there lands anywhere; `remove/4` with an empty branch
   removes it. Submodules are not touched here: `sync_submodules/3` does that, once the caller has
   recorded that the tree exists.
@@ -155,101 +156,74 @@ defmodule LoopctlRunner.Worktree do
   it has no commit checked out — with git's own words; `{:error, _}` when it has one and the tree
   could not be cut, which is a local failure and says nothing about the checkout.
   """
-  @spec create_detached(String.t(), String.t()) ::
+  @spec create_detached(String.t(), String.t(), String.t() | nil) ::
           {:ok, String.t()} | {:unreadable, String.t()} | {:error, String.t()}
-  def create_detached(repo_path, path) do
-    with {:ok, sha} <- head_commit(repo_path), do: add_detached(repo_path, path, sha)
+  def create_detached(repo_path, path, commit \\ nil) do
+    with {:ok, sha} <- cut_commit(repo_path, commit), do: add_detached(repo_path, path, sha)
   end
 
-  @doc """
-  Cuts a DETACHED worktree at `commit` — which `locate_checkpoint/4` has already found in
-  `repo_path` — for a review run, and returns that commit. The same tree `create_detached/2` cuts,
-  marked the same way and removed the same way (`remove/4` with an empty branch), at a commit
-  loopctl named rather than the one the checkout has out.
-  """
-  @spec create_detached_at(String.t(), String.t(), String.t()) ::
-          {:ok, String.t()} | {:error, String.t()} | {:error, String.t(), :tree_left}
-  def create_detached_at(repo_path, path, commit), do: add_detached(repo_path, path, commit)
+  # The commit a detached tree is cut at: the checkout's own (triage, reply_draft), or `commit`
+  # (verify, US-48.18), which must already be in the repository — `fetch_commit/4` brings it — and
+  # is resolved to the COMMIT it names, so a caller compares what it asked for with what it got.
+  defp cut_commit(repo_path, nil), do: head_commit(repo_path)
 
-  @doc """
-  Finds `commit` in `repo_path` and fetches `base` from `origin`, as a review needs both: it reads
-  a checkpoint another machine pushed to the story's branch, which this checkout has usually
-  never fetched, and names the base its change is measured against (`locate_base/3`).
-
-  When the checkout lacks the commit, the story's `branch` and the `base` come in ONE fetch. Git
-  fetches nothing at all when one ref of a fetch is missing on origin (measured, git 2.50: "fatal:
-  couldn't find remote ref"), so when that fetch fails — the branch merged and deleted, most
-  often — the base is fetched alone. Only when the commit is STILL missing is it fetched by its
-  id. Every fetch is `fetch_base/3`'s: bounded and never prompting, writing only origin's
-  remote-tracking refs for those branches, and the fetch by id no ref at all.
-
-  `{:ok, sha, base_fetched}`, where `base_fetched` is how the base's fetch went, for
-  `locate_base/3`; `{:unreadable, _}` when git will not read the checkout at all; `{:error, _}`
-  when no fetch brought the commit, naming each fetch's own failure.
-  """
-  @spec locate_checkpoint(String.t(), String.t(), String.t(), String.t()) ::
-          {:ok, String.t(), :ok | {:error, String.t()}}
-          | {:unreadable, String.t()}
-          | {:error, String.t()}
-  def locate_checkpoint(repo_path, commit, branch, base) do
+  defp cut_commit(repo_path, commit) do
     with :ok <- readable(repo_path) do
-      case commit(repo_path, commit) do
-        {:ok, sha} -> {:ok, sha, fetch_base(repo_path, base)}
-        {:error, _} -> fetch_checkpoint(repo_path, commit, branch, base)
+      case git(repo_path, ["rev-parse", "--verify", "--quiet", commit <> "^{commit}"]) do
+        {:ok, sha} -> {:ok, sha}
+        {:error, _} -> {:error, "#{commit} is not a commit #{repo_path} holds"}
       end
     end
   end
 
-  defp fetch_checkpoint(repo_path, commit, branch, base) do
-    together = fetch(repo_path, [branch_refspec(branch), branch_refspec(base)])
-    base_fetched = if together == :ok, do: :ok, else: fetch_base(repo_path, base)
-
-    case commit(repo_path, commit) do
-      {:ok, sha} -> {:ok, sha, base_fetched}
-      {:error, _} -> fetch_by_id(repo_path, commit, branch, together, base_fetched)
+  @doc """
+  The commit the worktree at `path` has checked out, read from the tree itself: `{:ok, sha}`, or
+  `{:error, reason}` with git's words.
+  """
+  @spec head(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def head(path) do
+    case git(path, ["rev-parse", "--verify", "HEAD^{commit}"]) do
+      {:ok, sha} -> {:ok, sha}
+      {:error, out} -> {:error, "#{path} has no commit checked out: #{out}"}
     end
   end
-
-  defp fetch_by_id(repo_path, commit, branch, by_branch, base_fetched) do
-    by_id = fetch(repo_path, [commit])
-
-    case commit(repo_path, commit) do
-      {:ok, sha} ->
-        {:ok, sha, base_fetched}
-
-      {:error, _} ->
-        {:error,
-         "commit #{commit} is not in #{repo_path}: origin's #{branch} " <>
-           fetched(by_branch, "does not carry it") <>
-           ", and origin " <> fetched(by_id, "would not give it by its id")}
-    end
-  end
-
-  defp fetched(:ok, said), do: said
-  defp fetched({:error, why}, _said), do: "could not be fetched (#{why})"
 
   @doc """
-  The ref that names `base` in `repo_path`, given how its fetch from origin went (`fetch_base/3`,
-  or `locate_checkpoint/4`'s): `origin/<base>` once fetched, the local `base` when that fetch
-  failed and the checkout has one, and `:none` when neither resolves. A review names it to the
-  session as the ref its change is measured against, so it must be one that resolves in the
-  scratch tree, which shares these refs.
-  """
-  @spec locate_base(String.t(), String.t(), :ok | {:error, String.t()}) ::
-          {:ok, String.t()} | :none
-  def locate_base(repo_path, base, fetched) do
-    candidates = if fetched == :ok, do: ["origin/" <> name(base), base], else: [base]
+  Makes `sha` a commit `repo_path` holds, for a detached tree to be cut at (US-48.18): `:ok` at
+  once when it already does, otherwise fetched from `origin` by its id, and — when the forge will
+  not serve a bare id — by the pull request's head ref, `refs/pull/<pr_number>/head`. Neither
+  fetch writes a ref (no destination, no `FETCH_HEAD`): the commit lands in the object store and
+  nothing the operator reads moves. `{:error, reason}` when it is still not there afterwards,
+  naming what git said.
 
-    case Enum.find(candidates, &match?({:ok, _}, commit(repo_path, &1))) do
-      nil -> :none
-      ref -> {:ok, ref}
+  The fetch is `fetch_base/3`'s — bounded, serialised per repository, never prompting — and
+  `opts` are its options.
+  """
+  @spec fetch_commit(String.t(), String.t(), pos_integer() | nil, keyword()) ::
+          :ok | {:error, String.t()}
+  def fetch_commit(repo_path, sha, pr_number, opts \\ []) do
+    if holds_commit?(repo_path, sha) do
+      :ok
+    else
+      by_id = fetch(repo_path, [sha], opts)
+
+      by_ref =
+        if holds_commit?(repo_path, sha) or not is_integer(pr_number),
+          do: :skipped,
+          else: fetch(repo_path, ["refs/pull/#{pr_number}/head"], opts)
+
+      if holds_commit?(repo_path, sha),
+        do: :ok,
+        else: {:error, "#{sha} is not on origin: #{fetch_said(by_id)}; #{fetch_said(by_ref)}"}
     end
   end
 
-  @doc "The tree `commit` records in `repo_path`, or `{:error, git's words}`."
-  @spec commit_tree(String.t(), String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def commit_tree(repo_path, commit),
-    do: git(repo_path, ["rev-parse", "--verify", "--quiet", commit <> "^{tree}"])
+  defp holds_commit?(repo_path, sha),
+    do: match?({:ok, _}, git(repo_path, ["cat-file", "-e", sha <> "^{commit}"]))
+
+  defp fetch_said(:ok), do: "fetched, and it is not there"
+  defp fetch_said(:skipped), do: "no pull request ref to try"
+  defp fetch_said({:error, reason}), do: reason
 
   defp readable(repo_path) do
     case git(repo_path, ["rev-parse", "--git-dir"]) do
@@ -292,7 +266,8 @@ defmodule LoopctlRunner.Worktree do
   end
 
   @doc """
-  Brings the reused triage tree at `path` to the commit `repo_path` has out, as a clean checkout:
+  Brings the reused triage tree at `path` to the commit `repo_path` has out (or to `commit`, as
+  `create_detached/3` takes it), as a clean checkout:
   tracked changes discarded, untracked AND ignored files removed. Cut fresh when nothing is there.
 
   Every destructive command runs only after `own_worktree?/2` has seen that `path` is the runner's
@@ -306,13 +281,13 @@ defmodule LoopctlRunner.Worktree do
   logged, and the tree is cut again. The runner's own tree, when it will not reset, is removed (it
   is scratch), and moved aside only when git will not remove it.
   """
-  @spec refresh_detached(String.t(), String.t()) ::
+  @spec refresh_detached(String.t(), String.t(), String.t() | nil) ::
           {:ok, String.t()}
           | {:unreadable, String.t()}
           | {:error, String.t()}
           | {:error, String.t(), :tree_left}
-  def refresh_detached(repo_path, path) do
-    with {:ok, sha} <- head_commit(repo_path) do
+  def refresh_detached(repo_path, path, commit \\ nil) do
+    with {:ok, sha} <- cut_commit(repo_path, commit) do
       cond do
         not present?(path) ->
           add_detached(repo_path, path, sha)
@@ -1057,10 +1032,10 @@ defmodule LoopctlRunner.Worktree do
 
   defp branch_refspec(branch), do: "+refs/heads/#{name(branch)}:#{origin_ref(branch)}"
 
-  # `refspecs` from origin, in one fetch. A bare commit id (`fetch_by_id/5`) has no destination,
+  # `refspecs` from origin, in one fetch. A bare commit id (`fetch_commit/4`) has no destination,
   # so no ref is written: the commit lands in the object store, where a detached worktree can be
   # cut at it.
-  defp fetch(repo_path, refspecs, opts \\ []) do
+  defp fetch(repo_path, refspecs, opts) do
     case System.find_executable("git") do
       nil ->
         {:error, "git is not on PATH"}
@@ -1581,6 +1556,42 @@ defmodule LoopctlRunner.Worktree do
   """
 
   defp git_stdout(dir, args), do: split_git("git", dir, args)
+
+  @doc """
+  Whether a session left work behind (`RunnerSessionEnded.work_left_behind`, contract 1.27.0):
+  `true` when `branch`, read in the checkout at `dir`, holds a commit no `origin` remote-tracking
+  ref reaches, `false` when it holds none, and nil when that cannot be told — no `origin` ref to
+  compare against, no such branch, or git failing.
+
+  The remote-tracking refs are read AS THEY ARE: nothing is fetched, so this asks nothing of the
+  network and cannot stall the run's end. A push the checkout's refs never heard of (made other
+  than from this checkout) therefore reads as left behind; a push from the session's own tree
+  updates them, and that is the push this is about. Called before the worktree is torn down.
+  """
+  @spec work_left_behind(String.t(), String.t()) :: boolean() | nil
+  def work_left_behind(dir, branch) do
+    with true <- File.dir?(dir),
+         {:ok, refs} when refs != "" <-
+           git_stdout(dir, [
+             "for-each-ref",
+             "--count=1",
+             "--format=%(refname)",
+             "refs/remotes/origin"
+           ]),
+         {:ok, count} <-
+           git_stdout(dir, [
+             "rev-list",
+             "--count",
+             "refs/heads/" <> branch,
+             "--not",
+             "--remotes=origin"
+           ]),
+         {n, ""} <- Integer.parse(String.trim(count)) do
+      n > 0
+    else
+      _ -> nil
+    end
+  end
 
   @doc false
   # git_stdout's mechanism, with the git to run passed in, so a test can run one that writes part

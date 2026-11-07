@@ -27,4 +27,19 @@ defmodule LoopctlRunner.ProcessGroupGraceTest do
     assert {:error, :timeout} = ProcessGroup.run("/bin/sh", ["-c", tidy_on_term(marker)], 500)
     assert File.exists?(marker)
   end
+
+  # A command done before its os pid is read has closed its Port, and `Port.info/2` answers nil
+  # for that: matching on `{:os_pid, _}` crashed the caller (seen as a `Forge` call on a loaded
+  # suite). Many at once, so some finish inside that window; every one must return its answer.
+  test "a command that is done before its pid is read still returns its output and status" do
+    results =
+      1..300
+      |> Task.async_stream(fn _ -> ProcessGroup.run("/bin/echo", ["done"], 5_000) end,
+        max_concurrency: 64,
+        timeout: 30_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.uniq(results) == [{:ok, "done\n", 0}]
+  end
 end

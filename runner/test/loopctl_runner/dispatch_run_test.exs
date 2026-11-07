@@ -124,16 +124,6 @@ defmodule LoopctlRunner.DispatchRunTest do
     assert DispatchRun.end_reports(%{status: "failed", reached: "claimed"}) == [:escalated]
   end
 
-  test "a review that passed its deadline_at before its session still owes its session_ended" do
-    # A review holds no claim for the lease sweep to release — only the slot, and nothing but its
-    # `session_ended` frees that. So the review clause is judged before the deadline's `[]`.
-    assert DispatchRun.end_reports(%{kind: "review", status: "deadline_passed"}) ==
-             [:judgements, :session_ended]
-
-    assert DispatchRun.end_reports(%{kind: "review", status: "stopped_at_deadline"}) ==
-             [:judgements, :session_ended]
-  end
-
   test "the binding names the dispatch, its epoch and its story" do
     assert DispatchRun.binding(@dispatch) == %{
              "dispatch_id" => @dispatch["dispatch_id"],
@@ -189,25 +179,48 @@ defmodule LoopctlRunner.DispatchRunTest do
       end
     end
 
-    test "a review's session_ended is how its session ended, and nothing else" do
-      # The contract gives it no other meaning: it "only frees the runner's slot: no stage effect,
-      # no retry-ceiling count, whatever `reason`".
-      for {status, reason} <- [
-            {"succeeded", "completed"},
-            {"escalated", "completed"},
-            {"wall_clock_exceeded", "wall_clock_exceeded"},
-            {"max_turns_exceeded", "max_turns_exceeded"},
-            # Prepared nothing and started no session: an end the runner did not choose.
-            {"failed", "crashed"},
-            {"crashed", "crashed"},
-            # loopctl's placement ran out, before the session or during it: no budget of its own.
-            {"deadline_passed", "crashed"},
-            {"stopped_at_deadline", "crashed"}
+    test "session_ended carries turns_used and work_left_behind when known (contract 1.27.0)" do
+      assert {:ok, payload} =
+               DispatchRun.session_ended(@dispatch, %{
+                 status: "succeeded",
+                 turns_used: 12,
+                 work_left_behind: false
+               })
+
+      assert payload == %{
+               "dispatch_id" => @dispatch["dispatch_id"],
+               "claim_epoch" => 3,
+               "reason" => "completed",
+               "turns_used" => 12,
+               "work_left_behind" => false
+             }
+
+      assert Contract.validate("RunnerSessionEnded", payload) == :ok
+
+      assert {:ok, %{"work_left_behind" => true, "turns_used" => 0}} =
+               DispatchRun.session_ended(@dispatch, %{
+                 status: "failed",
+                 turns_used: 0,
+                 work_left_behind: true
+               })
+    end
+
+    test "an unknown or out-of-contract turn count or left-behind is omitted, never guessed" do
+      for {turns, left} <- [
+            {nil, nil},
+            {-1, "yes"},
+            {2_147_483_648, 1},
+            {1.5, :unknown},
+            {"3", nil}
           ] do
-        summary = %{kind: "review", status: status}
-        assert {:ok, payload} = DispatchRun.session_ended(@dispatch, summary)
-        assert payload["reason"] == reason, status
-        assert Contract.validate("RunnerSessionEnded", payload) == :ok
+        assert {:ok, payload} =
+                 DispatchRun.session_ended(@dispatch, %{
+                   status: "succeeded",
+                   turns_used: turns,
+                   work_left_behind: left
+                 })
+
+        assert Map.keys(payload) |> Enum.sort() == ["claim_epoch", "dispatch_id", "reason"]
       end
     end
 
@@ -256,6 +269,136 @@ defmodule LoopctlRunner.DispatchRunTest do
                )
 
       assert Contract.validate("RunnerStageReport", payload) == :ok
+    end
+  end
+
+  describe "observe/4: what the forge says about a pr-mode session's branch (US-48.16)" do
+    import ExUnit.CaptureLog
+    import LoopctlRunner.TestSupport
+
+    @head_sha "2fd0c5233b323ca4dc6e4d793536e884c902d8bd"
+    @merge_sha "a1076b601b1651bc411b0822e1d89cc5550a03b4"
+
+    # A repository whose base commit states `mode`, and the story a dispatch of it runs.
+    defp mode_repo!(mode) do
+      repo = git_repo!(Path.join(tmp_dir!("observe"), "repo"))
+
+      if mode do
+        File.mkdir_p!(Path.join(repo, ".loopctl"))
+        File.write!(Path.join([repo, ".loopctl", "mode"]), mode)
+        git!(repo, ["add", ".loopctl/mode"])
+        git!(repo, ["commit", "-q", "-m", "mode"])
+      end
+
+      story = %LoopctlRunner.Story{
+        id: "story-1",
+        repo: "home_care_billing",
+        repo_path: repo,
+        base: "master",
+        branch: "loop/story-1",
+        prompt: nil,
+        wall_clock_s: 30,
+        max_turns: 5
+      }
+
+      {story, git!(repo, ["rev-parse", "HEAD"])}
+    end
+
+    defp observe_dispatch,
+      do: Map.put(@dispatch, "repo", "mkreyman/home_care_billing")
+
+    defp merged_pr do
+      %{
+        "number" => 3938,
+        "state" => "MERGED",
+        "headRefName" => "loop/story-1",
+        "headRefOid" => @head_sha,
+        "baseRefName" => "master",
+        "isCrossRepository" => false,
+        "mergeCommit" => %{"oid" => @merge_sha},
+        "statusCheckRollup" => []
+      }
+    end
+
+    # A forge that tells the test what it was asked, and answers `answer`.
+    defp forge(answer) do
+      test = self()
+
+      fn repo, head, base, timeout_ms ->
+        send(test, {:forge, repo, head, base, timeout_ms})
+        answer.()
+      end
+    end
+
+    test "pr mode asks the forge about THIS dispatch's repo, branch and base, and maps its answer" do
+      {story, cut_from} = mode_repo!("pr\n")
+
+      observe =
+        DispatchRun.observe(observe_dispatch(), story, forge(fn -> {:ok, [merged_pr()]} end))
+
+      assert observe.(%{cut_from: cut_from}) |> Enum.map(& &1["to"]) ==
+               ~w(reviewing pr_open ci merged)
+
+      assert_received {:forge, "mkreyman/home_care_billing", "loop/story-1", "master", 30_000}
+    end
+
+    test "the mode is the commit's, not the working tree's: a tree rewritten to pr asks nothing" do
+      {story, cut_from} = mode_repo!("thread\n")
+      File.write!(Path.join([story.repo_path, ".loopctl", "mode"]), "pr\n")
+
+      observe =
+        DispatchRun.observe(observe_dispatch(), story, forge(fn -> {:ok, [merged_pr()]} end))
+
+      assert observe.(%{cut_from: cut_from}) == []
+      refute_received {:forge, _, _, _, _}
+    end
+
+    test "thread mode, no mode at all, or no commit reports nothing new and asks no forge" do
+      for mode <- ["thread\n", nil, "threads"] do
+        {story, cut_from} = mode_repo!(mode)
+
+        observe =
+          DispatchRun.observe(observe_dispatch(), story, forge(fn -> {:ok, [merged_pr()]} end))
+
+        assert observe.(%{cut_from: cut_from}) == []
+        assert observe.(%{cut_from: nil}) == []
+        refute_received {:forge, _, _, _, _}
+      end
+    end
+
+    test "no pull request reports nothing" do
+      {story, cut_from} = mode_repo!("pr")
+      observe = DispatchRun.observe(observe_dispatch(), story, forge(fn -> {:ok, []} end))
+      assert observe.(%{cut_from: cut_from}) == []
+    end
+
+    test "a forge that fails, raises or exits reports nothing extra, with a warning" do
+      {story, cut_from} = mode_repo!("pr")
+
+      for answer <- [
+            fn -> {:error, "gh exited 1: HTTP 502"} end,
+            fn -> raise "boom" end,
+            fn -> exit(:boom) end,
+            fn -> :something_else end
+          ] do
+        observe = DispatchRun.observe(observe_dispatch(), story, forge(answer))
+
+        log = capture_log(fn -> assert observe.(%{cut_from: cut_from}) == [] end)
+        assert log =~ "could not read the forge"
+      end
+    end
+
+    test "a forge that does not answer is given up at the bound" do
+      {story, cut_from} = mode_repo!("pr")
+      hang = fn _repo, _head, _base, _timeout -> Process.sleep(:infinity) end
+      observe = DispatchRun.observe(observe_dispatch(), story, hang, timeout_ms: 50, grace_ms: 50)
+      started = System.monotonic_time(:millisecond)
+
+      log = capture_log(fn -> assert observe.(%{cut_from: cut_from}) == [] end)
+
+      assert log =~ "could not read the forge"
+      assert log =~ "did not answer within 100 ms"
+      assert System.monotonic_time(:millisecond) - started < 2_000
     end
   end
 end

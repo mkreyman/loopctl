@@ -19,11 +19,23 @@ defmodule LoopctlRunner.StreamEvents do
   @type state :: %{
           session: non_neg_integer(),
           tool_uses: %{optional(String.t()) => integer()},
-          result: String.t() | nil
+          result: String.t() | nil,
+          turns: non_neg_integer() | nil
         }
 
+  # The largest turn count `RunnerSessionEnded.turns_used` carries (contract 1.27.0).
+  @max_turns 2_147_483_647
+
   @spec new(non_neg_integer()) :: state()
-  def new(session_seq), do: %{session: session_seq, tool_uses: %{}, result: nil}
+  def new(session_seq), do: %{session: session_seq, tool_uses: %{}, result: nil, turns: nil}
+
+  @doc """
+  The `num_turns` of the last `result` line the CLI printed — the agent turns the session took,
+  which `session_ended` carries as `turns_used` (contract 1.27.0) — or nil before one, or when
+  that line carries no count the contract can hold (a non-negative integer up to 2^31 - 1).
+  """
+  @spec turns(state()) :: non_neg_integer() | nil
+  def turns(%{turns: turns}), do: turns
 
   @doc """
   The `subtype` of the last `result` line the CLI printed, or nil before one: its own statement
@@ -53,10 +65,19 @@ defmodule LoopctlRunner.StreamEvents do
     message |> register_tool_uses(seq, state, emit) |> note_result(message)
   end
 
-  defp note_result(state, %{"type" => "result", "subtype" => subtype}) when is_binary(subtype),
-    do: %{state | result: subtype}
+  defp note_result(state, %{"type" => "result"} = message) do
+    state = %{state | turns: turn_count(message["num_turns"])}
+
+    case message["subtype"] do
+      subtype when is_binary(subtype) -> %{state | result: subtype}
+      _ -> state
+    end
+  end
 
   defp note_result(state, _message), do: state
+
+  defp turn_count(n) when is_integer(n) and n >= 0 and n <= @max_turns, do: n
+  defp turn_count(_n), do: nil
 
   defp parent_for(%{"parent_tool_use_id" => id}, state) when is_binary(id) do
     case Map.fetch(state.tool_uses, id) do

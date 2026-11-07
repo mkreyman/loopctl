@@ -12,8 +12,11 @@ defmodule LoopctlRunner.TestLoopctl do
 
   use Agent
 
-  @spec start(pid()) :: {:ok, pos_integer()}
-  def start(test_pid) do
+  # How long `start/2` waits for an earlier test's connection to close (`quiesce!/1`).
+  @quiesce_ms 10_000
+
+  @spec start(pid(), keyword()) :: {:ok, pos_integer()}
+  def start(test_pid, opts \\ []) do
     state = %{
       test_pid: test_pid,
       token: "lc_test_token",
@@ -45,30 +48,63 @@ defmodule LoopctlRunner.TestLoopctl do
       # unanswered, or {:error, reason_map}; once used up every stage is acknowledged.
       stage_replies: [],
       # Replies to session_ended pushes, oldest first: :ok (ack as recorded), :replayed (ack a
-      # resend), :review (a review session's ack, `kind` and `replayed` only), :none for a push
-      # left unanswered, or {:error, reason_map}; once used up every one is acknowledged as
-      # recorded.
+      # resend), :none for a push left unanswered, or {:error, reason_map}; once used up every one
+      # is acknowledged as recorded.
       session_ended_replies: [],
-      # Replies to review_finding and review_verdict pushes, oldest first: :ok (record and ack),
-      # :replayed (ack a resend), :escalated (a verdict's ack at the round ceiling), :bare_ok for
-      # an ok with no body, :none for a push left unanswered, or {:error, reason_map}; once used up
-      # every one is acknowledged as recorded.
-      review_finding_replies: [],
-      review_verdict_replies: [],
       # Replies to triage_verdict pushes, oldest first: :ok (record and ack), :replayed (ack a
       # resend, applying nothing), :bare_ok for an ok with no body, :none for a push left
       # unanswered, or {:error, reason_map}.
-      triage_verdict_replies: []
+      triage_verdict_replies: [],
+      # Replies to agent_result pushes, oldest first, in the same vocabulary as the verdict's.
+      agent_result_replies: []
     }
 
-    case Agent.start(fn -> state end, name: __MODULE__) do
-      {:ok, _} -> :ok
-      {:error, {:already_started, _}} -> Agent.update(__MODULE__, fn _ -> state end)
+    case Agent.start(fn -> Map.put(state, :server_pids, []) end, name: __MODULE__) do
+      {:ok, _} ->
+        :ok
+
+      {:error, {:already_started, _}} ->
+        quiesce!(Keyword.get(opts, :quiesce_ms, @quiesce_ms))
+        Agent.update(__MODULE__, fn _ -> Map.put(state, :server_pids, []) end)
     end
 
     {:ok, {_ip, port}} = __MODULE__.Endpoint.server_info(:http)
     {:ok, port}
   end
+
+  # The endpoint, its runner_id and this Agent are shared by every test, and a server process
+  # answers a frame by reading `test_pid` and the scripted replies WHEN IT HANDLES IT. A previous
+  # test's Control is stopped by then, but the transport and channel processes that served it can
+  # still hold frames it sent while it was being torn down — a run's `session_escalated` after its
+  # Task.Supervisor stopped, a trace batch — and handling them after the swap delivers them to the
+  # next test and spends ITS scripted replies. So no test's state is installed until every server
+  # process of an earlier connection has exited; a connection still open after the bound is a
+  # leaked Control, and raising names it instead of letting it flake whoever runs next. The bound
+  # is `@quiesce_ms`, set above `start/2`.
+  defp quiesce!(bound_ms) do
+    pids = Agent.get(__MODULE__, &Map.get(&1, :server_pids, []))
+    refs = for pid <- pids, do: Process.monitor(pid)
+    deadline = System.monotonic_time(:millisecond) + bound_ms
+
+    for ref <- refs do
+      left = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+      after
+        left ->
+          raise "a TestLoopctl connection from an earlier test is still open after " <>
+                  "#{bound_ms}ms: a Control was left running"
+      end
+    end
+
+    :ok
+  end
+
+  @doc false
+  # Every server process that answers a runner frame: the transport at connect, the channel at join.
+  def serving(pid),
+    do: Agent.update(__MODULE__, &Map.update(&1, :server_pids, [pid], fn l -> [pid | l] end))
 
   def get(key), do: Agent.get(__MODULE__, &Map.fetch!(&1, key))
   def put(key, value), do: Agent.update(__MODULE__, &Map.put(&1, key, value))
@@ -101,18 +137,6 @@ defmodule LoopctlRunner.TestLoopctl do
     end)
   end
 
-  # Replies to checkpoint pushes, oldest first: :ok, {:error, reason_map}, or :none for a push
-  # left unanswered; :ok once the list is spent.
-  def next_checkpoint_reply do
-    Agent.get_and_update(__MODULE__, fn
-      %{checkpoint_replies: [reply | rest]} = state ->
-        {reply, %{state | checkpoint_replies: rest}}
-
-      state ->
-        {:ok, state}
-    end)
-  end
-
   def next_session_ended_reply do
     Agent.get_and_update(__MODULE__, fn
       %{session_ended_replies: [reply | rest]} = state ->
@@ -123,12 +147,13 @@ defmodule LoopctlRunner.TestLoopctl do
     end)
   end
 
-  def next_review_reply(key) do
-    Agent.get_and_update(__MODULE__, fn state ->
-      case Map.fetch!(state, key) do
-        [reply | rest] -> {reply, Map.put(state, key, rest)}
-        [] -> {:ok, state}
-      end
+  def next_agent_result_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{agent_result_replies: [reply | rest]} = state ->
+        {reply, %{state | agent_result_replies: rest}}
+
+      state ->
+        {:ok, state}
     end)
   end
 
@@ -188,6 +213,7 @@ defmodule LoopctlRunner.TestLoopctl do
 
     @impl true
     def connect(params, socket, connect_info) do
+      LoopctlRunner.TestLoopctl.serving(self())
       LoopctlRunner.TestLoopctl.notify({:connect, params})
       expected = LoopctlRunner.TestLoopctl.get(:token)
 
@@ -212,6 +238,7 @@ defmodule LoopctlRunner.TestLoopctl do
 
     @impl true
     def join("runner:" <> id, payload, socket) do
+      TestLoopctl.serving(self())
       TestLoopctl.notify({:join, id, payload})
 
       cond do
@@ -327,29 +354,6 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
-    # loopctl's idempotent recording is not modelled: the reply is scripted.
-    def handle_in("checkpoint", payload, socket) do
-      TestLoopctl.notify({:checkpoint, payload})
-
-      case Contract.validate("RunnerCheckpoint", payload) do
-        :ok ->
-          case TestLoopctl.next_checkpoint_reply() do
-            :ok ->
-              ack = %{checkpoint_id: LoopctlRunner.Session.uuid4(), seq: 1, replayed: false}
-              {:reply, {:ok, ack}, socket}
-
-            :none ->
-              {:noreply, socket}
-
-            {:error, reply} ->
-              {:reply, {:error, reply}, socket}
-          end
-
-        {:error, details} ->
-          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
-      end
-    end
-
     # loopctl's once-per-dispatch recording is not modelled: the reply is scripted. An implement
     # session's ack carries the row, as loopctl's does.
     def handle_in("session_ended", payload, socket) do
@@ -360,30 +364,9 @@ defmodule LoopctlRunner.TestLoopctl do
           case TestLoopctl.next_session_ended_reply() do
             :ok -> {:reply, {:ok, session_ended_ack(false)}, socket}
             :replayed -> {:reply, {:ok, session_ended_ack(true)}, socket}
-            :review -> {:reply, {:ok, %{kind: "review", replayed: false}}, socket}
             :none -> {:noreply, socket}
             {:error, reply} -> {:reply, {:error, reply}, socket}
           end
-
-        {:error, details} ->
-          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
-      end
-    end
-
-    # loopctl's idempotency on `<dispatch_id>:<client_seq>` is not modelled: the reply is scripted.
-    # What is modelled is the contract check, since a message failing it is `invalid_payload`.
-    def handle_in(event, payload, socket) when event in ["review_finding", "review_verdict"] do
-      {name, definition, replies} =
-        case event do
-          "review_finding" -> {:review_finding, "RunnerReviewFinding", :review_finding_replies}
-          "review_verdict" -> {:review_verdict, "RunnerReviewVerdict", :review_verdict_replies}
-        end
-
-      TestLoopctl.notify({name, payload})
-
-      case Contract.validate(definition, payload) do
-        :ok ->
-          scripted_review_reply(TestLoopctl.next_review_reply(replies), socket)
 
         {:error, details} ->
           {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
@@ -400,6 +383,22 @@ defmodule LoopctlRunner.TestLoopctl do
       case verdict_problem(payload) do
         nil -> scripted_verdict_reply(socket)
         refusal -> {:reply, {:error, refusal}, socket}
+      end
+    end
+
+    # The envelope is validated as loopctl casts it; the spec's own result schema is not modelled.
+    def handle_in("agent_result", payload, socket) do
+      TestLoopctl.notify({:agent_result, payload})
+
+      if Contract.validate("RunnerAgentResultMessage", payload) == :ok do
+        case TestLoopctl.next_agent_result_reply() do
+          :ok -> {:reply, {:ok, verdict_ack(false)}, socket}
+          :replayed -> {:reply, {:ok, verdict_ack(true)}, socket}
+          :none -> {:noreply, socket}
+          {:error, reply} -> {:reply, {:error, reply}, socket}
+        end
+      else
+        {:reply, {:error, %{reason: "invalid_payload"}}, socket}
       end
     end
 
@@ -429,29 +428,6 @@ defmodule LoopctlRunner.TestLoopctl do
         :none -> {:noreply, socket}
         {:error, reply} -> {:reply, {:error, reply}, socket}
       end
-    end
-
-    defp scripted_review_reply(:ok, socket), do: {:reply, {:ok, review_ack(false, false)}, socket}
-
-    defp scripted_review_reply(:replayed, socket),
-      do: {:reply, {:ok, review_ack(true, false)}, socket}
-
-    defp scripted_review_reply(:escalated, socket),
-      do: {:reply, {:ok, review_ack(false, true)}, socket}
-
-    defp scripted_review_reply(:bare_ok, socket), do: {:reply, :ok, socket}
-    defp scripted_review_reply(:none, socket), do: {:noreply, socket}
-    defp scripted_review_reply({:error, reply}, socket), do: {:reply, {:error, reply}, socket}
-
-    # Both acks carry the same three fields; a verdict's adds `escalated`, which a finding's schema
-    # does not forbid, so one shape serves both.
-    defp review_ack(replayed?, escalated?) do
-      %{
-        entry_id: LoopctlRunner.Session.uuid4(),
-        seq: 1,
-        replayed: replayed?,
-        escalated: escalated?
-      }
     end
 
     defp session_ended_ack(replayed?),

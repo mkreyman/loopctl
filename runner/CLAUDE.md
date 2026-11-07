@@ -102,18 +102,16 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   work. `@kinds` must never be empty (a compile-time raise refuses it): loopctl reads an empty
   array as no declaration and falls back to the ledger. Draining is how this runner stops taking
   work. Adding a kind to `@kinds` is not enough to run it: each kind needs its own accept path
-  (`Control.work/3` and `start_pending/2`) for the payload that kind carries, as `review` has.
+  (`Control.work/3` and `start_pending/2`) for the payload that kind carries, as `triage` has. A
+  string kind outside `@kinds` (`review`, retired by contract 1.23.0, included) is refused
+  `kind_not_supported` BEFORE the dispatch is validated, through `declared_kind/1`, the one site
+  that answers it.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
 - **A loop session asks for a human by running `priv/bin/loop-escalate`**, whose path the system
   prompt names — and the prompt is the ONLY path, so if that text stops reaching it a session has
   no way to ask and grinds silently to its turn limit. No hook can observe a question a headless
   session wanted to ask, so escalation must stay a command it calls; the run ends `escalated`.
-  A REVIEW session is the exception: a review claims nothing and has no stage to escalate from,
-  so it is not offered `loop-escalate`, and one that cannot review says why in its verdict. A
-  review run that ends escalated anyway is logged as an error with what it said; its
-  `session_ended` still names how the session ended, since for a review that message "only frees
-  the runner's slot: no stage effect, no retry-ceiling count, whatever `reason`".
 - **Unattended sessions run with the same authority as a locally dispatched agent, and inherit
   the operator's user-scoped Claude setup.** `--permission-mode bypassPermissions`, no
   `--allowedTools` composed at all, and no `--setting-sources ""`. Mark, 2026-09-16: *"All agents
@@ -135,7 +133,11 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   nobody sees), `--max-turns` (a budget loopctl sets per story), and the `claude-headless.sh`
   launcher with `ANTHROPIC_API_KEY` unset (a BILLING control, ~USD 300 in one night, KB
   `b38ef90e` — not part of anyone's Claude setup). The argv carries no tool list, no allow- or
-  deny-list, and no settings or MCP override.
+  deny-list, and no settings or MCP override, with one exception: `verify@1` runs with
+  `--setting-sources user` (never `""`). Its cwd is the pull-request tree, which the implementer
+  wrote, so that tree's project and local settings, hooks, skills, agents and `.mcp.json` must
+  not configure the session judging it (`lib/loopctl_runner/verify_prompt.ex`). The user scope
+  still loads in full, so the operator's setup is inherited as above.
 - **Deny by NAME with a reason per name; never deny a class and grant exceptions back.** That
   inverts who has to notice a mistake: a class deny takes every capability in the class —
   `Agent`, `SendMessage`, `WebFetch` and `Skill` under a fixed tool list, tidewave and playwright
@@ -181,42 +183,39 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   `.loopctl/mode` in the commit the worktree was cut from — a new or reset tree's HEAD before any
   session runs, or for an adopted tree the merge base of its HEAD with the base, local and
   `origin`'s, a commit the tree itself holds — never from the working tree, which the session can
-  write, and never from an unfetched remote ref that can differ from the tree (`Worktree.create/4`'s `cut_from`, `Worktree.commit_file/4`, `DispatchRun.prompt/4`).
-  A BOM, whitespace and case are set aside; only an explicit `thread` or `pr` runs. **A repository
+  write, and never from an unfetched remote ref that can differ from the tree (`Worktree.create/4`'s `cut_from`, `Worktree.commit_file/4`, `DispatchRun.prompt/3`).
+  A BOM, whitespace and case are set aside; only an explicit `pr` runs. **A repository
   with no `.loopctl/mode` is refused** (`repository has no .loopctl/mode`, reason `other`, never
-  `kind_not_supported`), because `pr` means the session merges on its own and a repository that
-  never opted in has not asked for that; an empty file or any other value is refused the same way
-  (`DispatchPolicy.delivery_mode/1`). In a `thread` repository the session commits and pushes
-  ONLY through `priv/bin/loop-push`, whose absolute path the prompt names
-  (`Session.push_script/0`), and opens no pull request, merges nothing and never force-pushes —
-  loopctl's merge executor merges the checkpoints the runner reports. In a `pr` repository it
+  `kind_not_supported`), because `pr` means an unattended session pushes and opens pull requests
+  there and a repository that never opted in has not asked for that; an empty file or any other
+  value is refused the same way
+  (`DispatchPolicy.delivery_mode/1`). `thread` is refused with its own detail: loopctl retired
+  change threads, and the `checkpoint` event a thread session's pushes reached it by, in contract
+  1.23.0, so nothing would merge what such a session pushed. In a `pr` repository the session
   follows the operator's delivery loop, which it inherits with `SOUL.md` and the user `CLAUDE.md`
   — Mark, 2026-09-16: *"the same claude setup means the same claude setup as the local agents.
   with the same rules and workflows. the same soul.md, the same claude.md, etc"* — opening the PR
-  with `gh pr create --base <the dispatch's base>` and merging only into that base. The branch and
-  the worktree stay the runner's: the pr-mode prompt tells the session not to remove the worktree,
-  delete the local branch or check the base out in it, and so to merge without `--delete-branch`.
-  `LOOP_BRANCH` names the story's branch in the session's environment, because `loop-push` refuses
-  to run without it. The contract carries the whole ladder (`claimed → worktree → implementing →
-  reviewing → pr_open → ci → merged → deployed`, since 1.12.0). The RUNNER itself commits,
-  pushes and merges nothing, and its teardown deletes a branch only when `origin`'s base already
+  with `gh pr create --base <the dispatch's base>`, running the review, and STOPPING at green CI:
+  the session never merges (US-48.17, after HCB PR #3938 merged itself past the gate). The merge
+  is loopctl's decision: once an independent verifier passed the head and the merge gate allowed
+  it, loopctl sends a `merge` instruction (contract 1.29.0) and the runner runs
+  `gh pr merge N --repo R --squash --match-head-commit SHA` and reports `ci → merged`
+  (`LoopctlRunner.MergeRun`, `Control.merge_instructed/2`). That is the only merge the runner
+  makes, and only for a run it holds at that claim epoch. The branch and the worktree stay the
+  runner's: the pr-mode prompt tells the session not to remove the worktree, delete the local
+  branch or check the base out in it. The contract carries the whole ladder (`claimed → worktree →
+  implementing → reviewing → pr_open → ci → merged → deployed`, since 1.12.0). The RUNNER itself
+  commits and pushes nothing, and its teardown deletes a branch only when `origin`'s base already
   carries its content.
-- **A thread session's pushes reach loopctl as checkpoints, from what `loop-push` RECORDS.**
-  After each push, `priv/bin/loop-push` appends `<commit_sha> <tree_sha>` to `checkpoints.log` in
-  the run's directory (`LOOP_RUN_DIR`), and exits 6 when it pushed but could not record, since an
-  unrecorded push is work nothing merges. `LoopctlRunner.CheckpointStream` and Control report each
-  line as a `checkpoint`, one in flight, oldest first, settled in `checkpoints.sent` so a restart
-  resumes (a resend is answered `replayed`). Never read the pushed commits off git instead: the
-  branch also carries the base updates loopctl's App merges into it, and whatever a branch held
-  before the run. A build without the reporter or without the script refuses a thread-mode run
-  before a session starts (`DispatchPolicy.checkpoint_reporting/2`, `push_helper/2`).
 - **The story-lifecycle protocol lives in the operator's skills and commands, NOT in this repo.**
   `loopctl-contract`, `loopctl-status`, `loopctl-mcp`, `loopctl-plan`, `loopctl-verify-artifacts`
   and `/loopctl:implement` already carry contract, claim, stage reporting and verification, and a
   session inheriting the setup gets all of them. Do not reimplement any of it here, and do not add
   a runner-side command for reporting stages: the session reports its own through the loopctl MCP
-  tools those skills call. The runner reports only the two stages it can OBSERVE — `claimed →
-  worktree` when it cuts the tree, `worktree → implementing` when the session starts — plus the
+  tools those skills call. The runner reports the stages it can OBSERVE — `claimed →
+  worktree` when it cuts the tree, `worktree → implementing` when the session starts, and, when a
+  pr-mode implement session ends, `reviewing → pr_open → ci → merged` as far as the forge shows
+  that branch's PR got (`LoopctlRunner.PrStages`, US-48.16) — plus the
   SESSION's end as `session_ended` (`completed`, `wall_clock_exceeded`, `max_turns_exceeded` or
   `crashed`, read off the run's status by `DispatchRun.session_ended/2`), from which control
   decides the story's next stage. **Never report a delivered story `-> escalated`**: that label

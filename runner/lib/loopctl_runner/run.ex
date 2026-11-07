@@ -46,15 +46,18 @@ defmodule LoopctlRunner.Run do
   @typedoc """
   What `:on_stage` is called with, in this order: `{:started, %{run_id, run_dir}}` once
   `state.json` exists; `{:worktree, %{branch, worktree_path}}` once the worktree exists;
-  `{:implementing, %{}}` as the session starts; and `{:finished, summary}` however the run ends
-  (a raise included, just before it is re-raised), whose summary names the stage the run
-  `reached`. A run that never gets a worktree goes from `:started` straight to `:finished`, and one
-  whose prompt is refused from `:worktree` to `:finished`.
+  `{:implementing, %{}}` as the session starts; `{:observed, stages}` once the session is over,
+  when the run's `:observe` saw any (each `%{"to" => stage, "effects" => map}`, in order, already
+  in `state.json` as `observed_stages`); and `{:finished, summary}` however the run ends (a raise
+  included, just before it is re-raised), whose summary names the stage the run `reached`. A run
+  that never gets a worktree goes from `:started` straight to `:finished`, and one whose prompt is
+  refused from `:worktree` to `:finished`.
   """
   @type stage_event ::
           {:started, %{run_id: String.t(), run_dir: String.t()}}
           | {:worktree, %{branch: String.t(), worktree_path: String.t()}}
           | {:implementing, map()}
+          | {:observed, [map()]}
           | {:finished, map()}
 
   @doc """
@@ -65,7 +68,11 @@ defmodule LoopctlRunner.Run do
   `:on_stage` (a one-argument function called with each `t:stage_event/0`), and `:prompt` (a
   one-argument function given the commit the worktree was cut from and returning `{:ok, prompt}`
   or `{:refuse, reason, detail}`, called once the worktree exists and replacing `story.prompt`:
-  `LoopctlRunner.DispatchRun.prompt/4`). A refusal starts no session: the worktree is torn down
+  `LoopctlRunner.DispatchRun.prompt/4`), `:observe` (a one-argument function given
+  `%{cut_from: commit}` once a session that started is over, however it ended, and returning the
+  stages it saw, which the run records and announces as `{:observed, stages}`:
+  `LoopctlRunner.DispatchRun.observe/4`), and `:mcp_args` (default `[]`; only the eval harness
+  sets it, to `LoopctlRunner.Session.mcp_isolation/1`). A refusal starts no session: the worktree is torn down
   and the run ends `refused`, its error naming the reason. A builder that raises tears the
   worktree down too, and the run crashes.
 
@@ -112,8 +119,7 @@ defmodule LoopctlRunner.Run do
 
   @doc """
   A caught crash as a run's `error`: the kind first — an exit or a throw has no exception message
-  — and the banner, cut to 500 characters. `LoopctlRunner.ReviewRun` reports its crashes the same
-  way.
+  — and the banner, cut to 500 characters.
   """
   @spec crash_error(atom(), term()) :: String.t()
   def crash_error(kind, reason),
@@ -140,7 +146,7 @@ defmodule LoopctlRunner.Run do
       error: error,
       escalations: escalations,
       reached: recorded_reached(run_dir),
-      # Where its thread session's pushes are recorded, which its end reports wait on.
+      # Where the run lives on disk.
       run_dir: run_dir
     }
   end
@@ -255,16 +261,26 @@ defmodule LoopctlRunner.Run do
     # `reached` is recorded so a Control that did not see the run end can still report its
     # terminal stage from the right place.
     # A run that passed its deadline owes nothing, and `RunState.finish/2` says so in this write.
-    RunState.finish(run_dir, %{
-      status: result.status,
-      reached: summary.reached,
-      finished_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-    })
+    # The session's turn count and whether it left work behind go beside it too, so the
+    # `session_ended` a later Control rebuilds from here says what this one's said.
+    RunState.finish(
+      run_dir,
+      %{
+        status: result.status,
+        reached: summary.reached,
+        finished_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+      }
+      |> put_known(:turns_used, summary.turns_used)
+      |> put_known(:work_left_behind, summary.work_left_behind)
+    )
 
     Trace.close(trace)
     Process.put(@summary_key, summary)
     Map.merge(result, %{run_id: run_id, run_dir: run_dir})
   end
+
+  defp put_known(map, _key, nil), do: map
+  defp put_known(map, key, value), do: Map.put(map, key, value)
 
   # The stage is recorded before it is announced and before what it stands for happens, so a run
   # that dies in it is reported from where it really was (`unfinished/2`).
@@ -273,7 +289,7 @@ defmodule LoopctlRunner.Run do
     stage(opts, event)
   end
 
-  @doc "Calls the run's `:on_stage` with `event`, when it has one. `ReviewRun` reports through it too."
+  @doc "Calls the run's `:on_stage` with `event`, when it has one."
   @spec stage(keyword(), term()) :: term()
   def stage(opts, event) do
     case Keyword.get(opts, :on_stage) do
@@ -292,7 +308,11 @@ defmodule LoopctlRunner.Run do
       exit_status: result.session && result.session.exit_status,
       escalations: escalations(run_dir),
       reached: reached(result),
-      # Where its thread session's pushes are recorded, which its end reports wait on.
+      # Contract 1.27.0's two optional facts about the session, nil when not known: the CLI's own
+      # turn count, and whether its branch held commits origin's refs did not reach at its end.
+      turns_used: result.session && Map.get(result.session, :turns_used),
+      work_left_behind: Map.get(result, :work_left_behind),
+      # Where the run lives on disk.
       run_dir: run_dir
     }
   end
@@ -382,6 +402,9 @@ defmodule LoopctlRunner.Run do
 
         case prompted(story, created.cut_from, run_dir, trace, run_seq, path, opts) do
           {:ok, story} ->
+            # The commit the tree was cut from travels to what runs after the session
+            # (`observe_session/4`), which reads the delivery mode from it as the prompt did.
+            opts = Keyword.put(opts, :cut_from, created.cut_from)
             run_session(config, story, run_dir, trace, run_seq, path, opts)
 
           {:refuse, reason, detail} ->
@@ -503,6 +526,7 @@ defmodule LoopctlRunner.Run do
            run_dir: run_dir,
            trace: trace,
            parent: run_seq,
+           mcp_args: Keyword.get(opts, :mcp_args, []),
            env:
              Config.session_env_for(config, story.repo, story.id, Keyword.fetch!(opts, :run_id)) ++
                Keyword.get(opts, :env, [])
@@ -513,10 +537,60 @@ defmodule LoopctlRunner.Run do
           {nil, "session monitor crashed: #{inspect(reason)}"}
       end
 
+    # Read from the tree BEFORE teardown, which may delete the branch it asks about.
+    left_behind = Worktree.work_left_behind(path, story.branch)
     teardown = teardown(story, trace, run_seq, path, opts)
     record_worktree(run_dir, story, path, teardown, opts)
+    observe_session(run_dir, trace, run_seq, opts)
 
-    %{status: session_status(session), session: session, teardown: teardown, error: error}
+    %{
+      status: session_status(session),
+      session: session,
+      teardown: teardown,
+      error: error,
+      work_left_behind: left_behind
+    }
+  end
+
+  # US-48.16: what the run's `:observe` sees once the session is over, however it ended — for a
+  # pr-mode dispatch, the stages its pull request reached (`DispatchRun.observe/4`). Written to
+  # `state.json` BEFORE it is announced, as `reached` is before each stage, so a Control that never
+  # saw the announcement — it died, or this task did — still reports it from what is on disk.
+  # Announced before `:finished`, so its stage reports queue ahead of the run's end. An observer
+  # that raises costs the run nothing but the observation.
+  defp observe_session(run_dir, trace, run_seq, opts) do
+    case Keyword.get(opts, :observe) do
+      nil ->
+        :ok
+
+      observe ->
+        observed = observed(observe, %{cut_from: Keyword.get(opts, :cut_from)}, trace, run_seq)
+
+        if observed != [] do
+          RunState.update(run_dir, %{observed_stages: observed})
+          stage(opts, {:observed, observed})
+        end
+
+        :ok
+    end
+  end
+
+  defp observed(observe, context, trace, run_seq) do
+    observed =
+      case observe.(context) do
+        list when is_list(list) ->
+          Enum.filter(list, &match?(%{"to" => to} when is_binary(to), &1))
+
+        _other ->
+          []
+      end
+
+    Trace.emit(trace, "forge.observed", run_seq, %{"stages" => Enum.map(observed, & &1["to"])})
+    observed
+  catch
+    kind, reason ->
+      Trace.emit(trace, "forge.failed", run_seq, %{"error" => crash_error(kind, reason)})
+      []
   end
 
   defp teardown(story, trace, run_seq, path, opts) do
@@ -545,8 +619,7 @@ defmodule LoopctlRunner.Run do
   A run's status from how its session ended: `succeeded` for an exit 0, `failed` for any other
   exit, `stopped_at_deadline` for a session the dispatch's `deadline_at` stopped, the session's own
   stop reason otherwise, and `crashed` for anything that is not a session's end — no session, or
-  one whose monitor crashed. Shared with `LoopctlRunner.ReviewRun`, so the two kinds cannot name
-  one ending differently.
+  one whose monitor crashed.
   """
   @spec session_status(term()) :: String.t()
   def session_status(%{reason: :exited, exit_status: 0}), do: "succeeded"

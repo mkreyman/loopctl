@@ -32,7 +32,7 @@
   },
   "session_env": {
     "home_care_billing": {
-      "TEST_DB_BASE": "home_care_billing_loop_{story}_test"
+      "TEST_DB_BASE": "hcb_loop_{story}"
     }
   }
 }

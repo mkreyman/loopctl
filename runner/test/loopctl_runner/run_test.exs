@@ -148,8 +148,8 @@ defmodule LoopctlRunner.RunTest do
     refute env =~ ~r/^ANTHROPIC_API_KEY PRESENT$/m
     refute env =~ ~r/^(RELEASE_ROOT|RELEASE_COOKIE|EMU|RELEASE_PATH) PRESENT$/m
     assert env =~ ~r/^LOOP_MODE=1$/m
-    # The branch loop-push may push, which it refuses to run without: the story's own.
-    assert env =~ ~r|^LOOP_BRANCH=loop/s1$|m
+    # LOOP_BRANCH served only loop-push, retired with thread mode (contract 1.23.0).
+    refute env =~ ~r/^LOOP_BRANCH=/m
     argv = File.read!(Path.join(state, "argv"))
     # The session runs with the authority a locally dispatched agent has, and inherits the
     # operator's user-scoped setup: no permission mode that denies, no pre-allow list, no
@@ -158,6 +158,9 @@ defmodule LoopctlRunner.RunTest do
     assert argv =~ "--permission-prompts\nnone\n"
     refute argv =~ "--setting-sources"
     refute argv =~ "--allowedTools"
+    # A dispatched session keeps the operator's MCP set: only an eval overrides it (US-48.10).
+    refute argv =~ "--strict-mcp-config"
+    refute argv =~ "--mcp-config"
     # `auto` is a different thing and still wrong: its classifier approves what it judges safe,
     # which is how the 2026-09-14 run ran docker exec psql.
     refute argv =~ "\nauto\n"
@@ -489,6 +492,183 @@ defmodule LoopctlRunner.RunTest do
     end
   end
 
+  describe "the session's turns and the work it left behind (contract 1.27.0)" do
+    defp finished_summary(root, state) do
+      restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+      test = self()
+
+      try do
+        config = config!(root)
+        {:ok, story} = Story.from_map(story_map(), config)
+
+        on_stage = fn
+          {:finished, summary} -> send(test, {:finished, summary})
+          _ -> :ok
+        end
+
+        result = Run.execute(config, story, on_stage: on_stage)
+        assert_received {:finished, summary}
+        {result, summary}
+      after
+        restore.()
+      end
+    end
+
+    test "the CLI's num_turns is the run's turns_used, recorded beside it", %{
+      root: root,
+      state: state
+    } do
+      {result, summary} = finished_summary(root, state)
+
+      assert summary.turns_used == 2
+      # No origin in this fixture: whether work was left behind cannot be told, so it is absent.
+      assert summary.work_left_behind == nil
+      assert {:ok, recorded} = RunState.read(result.run_dir)
+      assert recorded["turns_used"] == 2
+      refute Map.has_key?(recorded, "work_left_behind")
+    end
+
+    test "a branch origin's refs reach in full left nothing behind, read before teardown", %{
+      root: root,
+      state: state
+    } do
+      repo = Path.join(root, "repo")
+      origin = Path.join(root, "origin.git")
+      File.mkdir_p!(origin)
+      git!(origin, ["init", "-q", "--bare", "-b", "master"])
+      git!(repo, ["remote", "add", "origin", origin])
+      git!(repo, ["push", "-q", "origin", "master"])
+      git!(repo, ["fetch", "-q", "origin"])
+
+      {result, summary} = finished_summary(root, state)
+
+      assert summary.work_left_behind == false
+      assert {:ok, %{"work_left_behind" => false}} = RunState.read(result.run_dir)
+    end
+  end
+
+  describe ":observe, after the session (US-48.16)" do
+    @observed [
+      %{"to" => "reviewing", "effects" => %{}},
+      %{
+        "to" => "pr_open",
+        "effects" => %{"pr_number" => 7, "head_sha" => String.duplicate("a", 40)}
+      }
+    ]
+
+    # Runs the fixture story with `observe` and the stage events sent to the test.
+    defp observed_run!(root, state, fake_vars, observe, prompt \\ nil) do
+      restore = fake_env!(state, fake_vars)
+      test = self()
+
+      try do
+        config = config!(root)
+        {:ok, story} = Story.from_map(story_map(), config)
+
+        opts =
+          [observe: observe, on_stage: &send(test, {:stage, &1})] ++
+            if(prompt, do: [prompt: prompt], else: [])
+
+        Run.execute(config, story, opts)
+      after
+        restore.()
+      end
+    end
+
+    defp stage_events(acc \\ []) do
+      receive do
+        {:stage, event} -> stage_events([elem(event, 0) | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
+    end
+
+    test "is given the commit the tree was cut from, persists what it saw, then announces it", %{
+      root: root,
+      state: state
+    } do
+      test = self()
+
+      observe = fn context ->
+        send(test, {:observe_called, context})
+        @observed
+      end
+
+      result = observed_run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], observe)
+
+      assert result.status == "succeeded"
+      base = git!(Path.join(root, "repo"), ["rev-parse", "master"])
+      assert_received {:observe_called, %{cut_from: ^base}}
+      assert_received {:stage, {:observed, @observed}}
+      # In order: the session, then what the forge showed, then the run's end.
+      assert stage_events() == [:started, :worktree, :implementing, :finished]
+
+      # On disk BEFORE it is announced, so a Control that never saw the announcement resends it.
+      assert {:ok, %{"observed_stages" => @observed, "reached" => "implementing"}} =
+               RunState.read(result.run_dir)
+
+      assert "forge.observed" in types(events!(result))
+    end
+
+    test "is called for a session that failed too, since any end can follow a pull request", %{
+      root: root,
+      state: state
+    } do
+      result =
+        observed_run!(
+          root,
+          state,
+          [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_EXIT", "7"}],
+          fn _ -> @observed end
+        )
+
+      assert result.status == "failed"
+      assert_received {:stage, {:observed, @observed}}
+    end
+
+    test "nothing observed announces nothing and records nothing", %{root: root, state: state} do
+      result = observed_run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], fn _ -> [] end)
+
+      assert result.status == "succeeded"
+      refute_received {:stage, {:observed, _}}
+      assert {:ok, state_json} = RunState.read(result.run_dir)
+      refute Map.has_key?(state_json, "observed_stages")
+    end
+
+    test "an observer that raises costs the run nothing but the observation", %{
+      root: root,
+      state: state
+    } do
+      result =
+        observed_run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], fn _ -> raise "forge" end)
+
+      assert result.status == "succeeded"
+      refute_received {:stage, {:observed, _}}
+      assert_received {:stage, {:finished, %{status: "succeeded"}}}
+      assert "forge.failed" in types(events!(result))
+    end
+
+    test "a run that started no session observes nothing", %{root: root, state: state} do
+      test = self()
+
+      result =
+        observed_run!(
+          root,
+          state,
+          [{"FAKE_CLAUDE_MODE", "stream"}],
+          fn _ ->
+            send(test, :observe_called)
+            @observed
+          end,
+          fn _cut_from -> {:refuse, "other", "repository has no .loopctl/mode"} end
+        )
+
+      assert result.status == "refused"
+      refute_received :observe_called
+      refute_received {:stage, {:observed, _}}
+    end
+  end
+
   test "a non-zero exit fails the run and still tears down", %{root: root, state: state} do
     result = run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_EXIT", "7"}])
     assert result.status == "failed"
@@ -653,8 +833,6 @@ defmodule LoopctlRunner.RunTest do
       assert_received {:stage, {:finished, summary}}
       refute_received {:stage, {:worktree, _}}
       assert DispatchRun.end_reports(summary) == []
-      # The run's directory, where a thread session's pushes are recorded: Control holds the
-      # run's end reports until they are checkpoints.
       assert summary.run_dir == result.run_dir
     end
 

@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.22.0",
+        "contract_version" => "1.30.0",
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,8 +20,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.22.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.22.0"
+  test "the vendored contract is v1.30.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.30.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
@@ -317,19 +317,44 @@ defmodule LoopctlRunner.ContractTest do
     dispatch = Contract.schema_def("RunnerDispatch")["properties"]
     assert dispatch["story"] == Contract.schema_def("RunnerStory")
     assert dispatch["triage"] == Contract.schema_def("RunnerTriage")
-    assert dispatch["review"] == Contract.schema_def("RunnerReview")
+    assert dispatch["verify"] == Contract.schema_def("RunnerVerify")
+  end
+
+  test "1.23.0 retired the review kind: no review object, no review messages" do
+    dispatch = Contract.schema_def("RunnerDispatch")
+    refute Map.has_key?(dispatch["properties"], "review")
+    # 1.26.0 (US-48.9) added reply_draft, 1.28.0 (US-48.18) verify, 1.30.0 (US-48.13) spec_tune.
+    assert dispatch["properties"]["kind"]["enum"] |> Enum.sort() ==
+             ["implement", "reply_draft", "spec_tune", "triage", "verify"]
+
+    connection = Contract.connection()
+
+    for event <- ~w(checkpoint review_finding review_verdict thread_entry) do
+      refute Map.has_key?(connection["events"], event), event
+      refute Map.has_key?(connection["errors"], event), event
+    end
   end
 
   test "the declaration is exactly the kinds the accept path can actually run" do
     # Widening @kinds declares a capability loopctl then sends, and a declared kind with no accept
     # path of its own is refused as `other` — suppressing nothing, recording nothing, and soaking
-    # that kind for as long as it is declared. `implement`, `review` (1.21.0) and `triage` each
-    # have one; `triage` is declared because its verdict now carries the `lens_verdicts` Gate A
-    # reads (1.15.0), without which every triage would escalate.
-    assert LoopctlRunner.Control.kinds() == ["implement", "review", "triage"]
-    # Each is one loopctl sends at all: a declared kind it does not know is ignored, not refused.
+    # that kind for as long as it is declared. `implement` and `triage` each have one; `triage` is
+    # declared because its verdict carries the `lens_verdicts` Gate A reads (1.15.0), without which
+    # every triage would escalate. `review` left `dispatchable_kinds` in 1.23.0, and `reply_draft`
+    # joined it in 1.26.0, run on triage's detached-tree accept path and answered by agent_result.
+    # `verify` joined in 1.28.0 on the same path, over the story and the pull request's head, and
+    # `spec_tune` in 1.30.0, the one story-less kind, over the repo at its base.
+    assert LoopctlRunner.Control.kinds() == [
+             "implement",
+             "triage",
+             "reply_draft",
+             "verify",
+             "spec_tune"
+           ]
+
+    # And they are every kind loopctl sends, so nothing it sends is soaked as undeclared.
     dispatchable = Contract.connection()["dispatchable_kinds"]
-    assert Enum.all?(LoopctlRunner.Control.kinds(), &(&1 in dispatchable))
+    assert Enum.sort(LoopctlRunner.Control.kinds()) == Enum.sort(dispatchable)
   end
 
   test "each constraint the contract declares is enforced" do

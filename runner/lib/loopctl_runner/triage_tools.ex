@@ -312,6 +312,9 @@ defmodule LoopctlRunner.TriageTools do
   @doc """
   The argv for a triage session: the implement session's containment with this set in place of
   that one, and the lenses supplied rather than inherited.
+
+  Options: `:max_turns` (required), `:model`, and `:mcp_args` (default `[]`, set only by the eval
+  harness: `LoopctlRunner.Session.mcp_isolation/1`).
   """
   @spec claude_args(String.t(), String.t(), String.t(), keyword()) :: [String.t()]
   def claude_args(prompt, session_id, system_prompt, opts) do
@@ -332,6 +335,7 @@ defmodule LoopctlRunner.TriageTools do
       agents_json()
     ] ++
       if(opts[:model], do: ["--model", opts[:model]], else: []) ++
+      Keyword.get(opts, :mcp_args, []) ++
       ["--append-system-prompt", system_prompt] ++
       ["--", prompt]
   end

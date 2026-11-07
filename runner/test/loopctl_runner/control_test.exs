@@ -32,7 +32,16 @@ defmodule LoopctlRunner.ControlTest do
   defp start_control(config, opts \\ []) do
     test = self()
     # Unlinked, and with the fatal hook reporting to the test instead of stopping the VM.
-    opts = Keyword.merge([config: config, on_fatal: &send(test, {:fatal, &1})], opts)
+    # A forge with no pull requests unless a test passes its own: no test reaches GitHub.
+    opts =
+      Keyword.merge(
+        [
+          config: config,
+          on_fatal: &send(test, {:fatal, &1}),
+          forge: fn _repo, _head, _base, _timeout -> {:ok, []} end
+        ],
+        opts
+      )
 
     {:ok, pid} =
       case opts[:name] do
@@ -57,10 +66,11 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.22.0"
+    # 1.30.0 or later is what loopctl requires before it sends `spec_tune` (US-48.13).
+    assert join["contract_version"] == "1.30.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
-    assert join["kinds"] == ["implement", "review", "triage"]
+    assert join["kinds"] == ["implement", "triage", "reply_draft", "verify", "spec_tune"]
     # Non-empty ON THE WIRE, which is where it decides anything: loopctl reads an empty array as
     # no declaration at all and falls back to its permanent ledger.
     refute join["kinds"] == []
@@ -68,6 +78,16 @@ defmodule LoopctlRunner.ControlTest do
     # The SAME set DispatchPolicy enforces (contract 1.14.0): an undeclared prefix makes loopctl
     # derive branches this machine refuses.
     assert join["branch_prefixes"] == ctx.config.branch_prefixes
+    # `specs` (AC-48.8.1) goes exactly when the vendored RunnerJoin names it: absent under 1.24.0,
+    # the registry's entries for the declared kinds once 1.25.0 is vendored.
+    joined_specs = Map.take(join, ["specs"])
+
+    if Map.has_key?(Contract.schema_def("RunnerJoin")["properties"], "specs") do
+      assert joined_specs == %{"specs" => LoopctlRunner.Templates.specs(Control.kinds())}
+    else
+      assert joined_specs == %{}
+    end
+
     assert %{"sampled_at" => _, "free_disk_mb" => _} = join["sample"]
 
     assert_receive {:test_loopctl, {:status, status}}, 5_000
@@ -512,223 +532,6 @@ defmodule LoopctlRunner.ControlTest do
 
       assert log =~ "dispatch not answered: it carries no usable dispatch_id and claim_epoch"
       refute log =~ "refused"
-    end
-  end
-
-  describe "checkpoints" do
-    @cp_dispatch "5b1f0a3e-2c4d-4e6f-8a9b-0c1d2e3f4a5b"
-    @cp_commit String.duplicate("a", 40)
-    @cp_tree String.duplicate("b", 40)
-
-    # A run loop-push has recorded pushes in, bound to its dispatch at claim epoch 2.
-    defp pushed_run(ctx, lines) do
-      run_dir = Path.join(ctx.config.runs_dir, "pushed-run")
-      File.mkdir_p!(run_dir)
-
-      LoopctlRunner.RunState.update(run_dir, %{
-        "dispatch_id" => @cp_dispatch,
-        "claim_epoch" => 2,
-        # Finished: its last pushes are still reported after the session is gone.
-        "status" => "succeeded"
-      })
-
-      File.write!(
-        Path.join(run_dir, "checkpoints.log"),
-        Enum.map_join(lines, &"#{&1} #{@cp_tree}\n")
-      )
-
-      run_dir
-    end
-
-    defp cp_sent(run_dir) do
-      case File.read(Path.join(run_dir, "checkpoints.sent")) do
-        {:ok, raw} -> JSON.decode!(raw)
-        _ -> nil
-      end
-    end
-
-    defp checkpoint_control(ctx, poll_ms \\ 100, opts \\ []) do
-      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
-      {pid, _ref} = start_control(slow, Keyword.merge([checkpoint_poll_ms: poll_ms], opts))
-      pid
-    end
-
-    defp count_checkpoints(n \\ 0) do
-      receive do
-        {:test_loopctl, {:checkpoint, _}} -> count_checkpoints(n + 1)
-      after
-        0 -> n
-      end
-    end
-
-    test "a run whose log ends mid-line does not hold the runs after it", ctx do
-      stuck = Path.join(ctx.config.runs_dir, "a-stuck-run")
-      File.mkdir_p!(stuck)
-
-      LoopctlRunner.RunState.update(stuck, %{
-        "dispatch_id" => LoopctlRunner.Session.uuid4(),
-        "claim_epoch" => 2,
-        "status" => "succeeded"
-      })
-
-      File.write!(Path.join(stuck, "checkpoints.log"), "#{@cp_commit} #{@cp_tree}")
-      pushed_run(ctx, [@cp_commit])
-      checkpoint_control(ctx)
-
-      assert_receive {:test_loopctl, {:checkpoint, %{"dispatch_id" => @cp_dispatch}}}, 5_000
-    end
-
-    test "a checkpoint loopctl never answers is sent again", ctx do
-      TestLoopctl.put(:checkpoint_replies, [:none])
-      run_dir = pushed_run(ctx, [@cp_commit])
-      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
-      start_control(slow, checkpoint_poll_ms: 50, checkpoint_reply_ms: 200)
-
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 3_000
-      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 3_000)
-    end
-
-    test "a last line loopctl keeps refusing unrecognised is given up in the end", ctx do
-      TestLoopctl.put(
-        :checkpoint_replies,
-        # More refusals than any line is tried: settled only by giving up, after thirty tries.
-        List.duplicate({:error, %{reason: "something_new"}}, 200)
-      )
-
-      run_dir = pushed_run(ctx, [@cp_commit])
-      checkpoint_control(ctx, 1, checkpoint_max_backoff_ms: 5)
-
-      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 15_000)
-      assert count_checkpoints() in 29..31
-    end
-
-    test "one run's rate limit holds back only that run", ctx do
-      TestLoopctl.put(:checkpoint_replies, [
-        {:error, %{reason: "rate_limited", min_interval_ms: 3_600_000}}
-      ])
-
-      pushed_run(ctx, [@cp_commit])
-      other = Path.join(ctx.config.runs_dir, "other-run")
-      File.mkdir_p!(other)
-
-      LoopctlRunner.RunState.update(other, %{
-        "dispatch_id" => "6c2f0a3e-2c4d-4e6f-8a9b-0c1d2e3f4a5b",
-        "claim_epoch" => 1,
-        "status" => "succeeded"
-      })
-
-      second = String.duplicate("d", 40)
-      File.write!(Path.join(other, "checkpoints.log"), "#{second} #{@cp_tree}\n")
-      checkpoint_control(ctx)
-
-      # Whichever run is refused first waits; the other's commit still goes.
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => refused}}}, 5_000
-      other_commit = if refused == second, do: @cp_commit, else: second
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^other_commit}}}, 3_000
-    end
-
-    test "a settle that cannot be written backs the run off instead of resending at once", ctx do
-      run_dir = pushed_run(ctx, [@cp_commit])
-      # A directory where the progress file goes: every settle write fails.
-      File.mkdir_p!(Path.join([run_dir, "checkpoints.sent", "x"]))
-      checkpoint_control(ctx, 50)
-
-      assert_receive {:test_loopctl, {:checkpoint, _}}, 5_000
-      Process.sleep(1_000)
-      # Backing off from 50 ms and doubling: a handful in a second, never a loop.
-      assert count_checkpoints() <= 6
-    end
-
-    test "a rate_limited interval past what a timer takes is bounded, and the line resent", ctx do
-      TestLoopctl.put(:checkpoint_replies, [
-        {:error, %{reason: "rate_limited", min_interval_ms: 5_000_000_000}}
-      ])
-
-      run_dir = pushed_run(ctx, [@cp_commit])
-      pid = checkpoint_control(ctx)
-
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 3_000
-      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 3_000)
-      assert Process.alive?(pid)
-    end
-
-    test "a failing line a later one follows is given up; the last line never is", ctx do
-      second = String.duplicate("c", 40)
-      failures = List.duplicate({:error, %{reason: "internal_error"}}, 8)
-      # Eight failures of the first line give it up; eight more of the last do not.
-      TestLoopctl.put(:checkpoint_replies, failures ++ failures)
-      run_dir = pushed_run(ctx, [@cp_commit, second])
-      checkpoint_control(ctx, 2)
-
-      for _ <- 1..8,
-          do: assert_receive({:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000)
-
-      for _ <- 1..9,
-          do: assert_receive({:test_loopctl, {:checkpoint, %{"commit_sha" => ^second}}}, 5_000)
-
-      :ok = wait_until(fn -> match?(%{"sent" => 2}, cp_sent(run_dir)) end, 3_000)
-    end
-
-    test "each recorded push is reported once, oldest first, and settled", ctx do
-      second = String.duplicate("c", 40)
-      run_dir = pushed_run(ctx, [@cp_commit, second])
-      checkpoint_control(ctx)
-
-      assert_receive {:test_loopctl, {:checkpoint, first}}, 5_000
-
-      assert first == %{
-               "dispatch_id" => @cp_dispatch,
-               "claim_epoch" => 2,
-               "commit_sha" => @cp_commit,
-               "tree_sha" => @cp_tree
-             }
-
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^second}}}, 3_000
-      :ok = wait_until(fn -> match?(%{"sent" => 2}, cp_sent(run_dir)) end, 3_000)
-      refute_receive {:test_loopctl, {:checkpoint, _}}, 500
-
-      # A push recorded later is found by the next poll.
-      File.write!(Path.join(run_dir, "checkpoints.log"), "#{@cp_commit} #{@cp_tree}\n", [:append])
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 3_000
-    end
-
-    test "a claim-ending refusal stops the run's checkpoints and ends its claim", ctx do
-      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "not_claimant"}}])
-      run_dir = pushed_run(ctx, [@cp_commit, String.duplicate("c", 40)])
-      checkpoint_control(ctx)
-
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
-      :ok = wait_until(fn -> cp_sent(run_dir) == %{"stopped" => "not_claimant"} end, 3_000)
-      assert LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, @cp_dispatch, 2)
-      refute_receive {:test_loopctl, {:checkpoint, _}}, 500
-    end
-
-    test "a refusal of those bytes settles that line and the next goes", ctx do
-      second = String.duplicate("c", 40)
-      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "checkpoint_conflict"}}])
-      run_dir = pushed_run(ctx, [@cp_commit, second])
-      checkpoint_control(ctx)
-
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^second}}}, 3_000
-      :ok = wait_until(fn -> match?(%{"sent" => 2}, cp_sent(run_dir)) end, 3_000)
-    end
-
-    test "rate_limited and a transient failure send the same line again", ctx do
-      TestLoopctl.put(:checkpoint_replies, [
-        {:error, %{reason: "rate_limited", min_interval_ms: 50}},
-        {:error, %{reason: "internal_error"}}
-      ])
-
-      run_dir = pushed_run(ctx, [@cp_commit])
-      checkpoint_control(ctx)
-
-      for _ <- 1..3,
-          do: assert_receive({:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000)
-
-      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 3_000)
     end
   end
 
@@ -1568,7 +1371,10 @@ defmodule LoopctlRunner.ControlTest do
       assert next_session_ended() == %{
                "dispatch_id" => id,
                "claim_epoch" => 3,
-               "reason" => "completed"
+               "reason" => "completed",
+               # The fake CLI's result line says num_turns 2; with no origin the runner cannot
+               # tell what it left behind, so `work_left_behind` is omitted (contract 1.27.0).
+               "turns_used" => 2
              }
 
       # The run's state is bound to the dispatch, so its trace ships.
@@ -1602,64 +1408,43 @@ defmodule LoopctlRunner.ControlTest do
       repo
     end
 
-    defp push_helper!(ctx) do
-      helper = Path.join(ctx.root, "loop-push")
-      File.write!(helper, "#!/bin/sh\nexit 0\n")
-      File.chmod!(helper, 0o755)
-      helper
-    end
-
-    # Any module this build has stands in for the checkpoint reporter.
-    @reporter __MODULE__
-
-    test "a repository in thread mode gets the thread prompt and LOOP_BRANCH", ctx do
+    test "a repository still in thread mode is refused before a session, naming the retirement",
+         ctx do
+      # loopctl retired change threads in contract 1.23.0, so nothing merges a thread session's
+      # pushes: the run is refused rather than started on work that could never land.
       commit_mode!(ctx, "thread\n")
-      helper = push_helper!(ctx)
 
-      {pid, topic} =
-        accepting_control(ctx, "stream", %{},
-          push_script: helper,
-          checkpoint_reporter: @reporter
-        )
-
-      dispatch = story_dispatch()
-      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      {pid, topic} = accepting_control(ctx, "stream")
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
       assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
       assert %{"to" => "worktree"} = next_stage()
-      assert %{"to" => "implementing"} = next_stage()
-      assert %{"reason" => "completed"} = next_session_ended()
+
+      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+      assert reason =~ "run ended refused"
+      assert reason =~ "delivery mode thread in .loopctl/mode was retired"
       runs_done(pid)
+      refute_receive {:test_loopctl, {:session_ended, _}}, 500
 
-      argv = File.read!(Path.join(ctx.fake, "argv"))
-      assert argv =~ "Delivery mode: thread\n"
-      assert argv =~ helper
-      refute argv =~ "Delivery mode: pr\n"
-
-      # loop-push refuses to run without the branch it may push.
-      assert File.read!(Path.join(ctx.fake, "env")) =~
-               ~r/^LOOP_BRANCH=#{Regex.escape(dispatch["branch"])}$/m
+      refute File.exists?(Path.join(ctx.fake, "argv"))
+      refute File.exists?(Path.join(ctx.fake, "env"))
     end
 
     test "the mode is the commit the tree was cut from, not an unfetched origin ref", ctx do
       # refs/remotes/origin/master says pr and was never fetched past; the local master the
-      # worktree is cut from says thread. The session starts in thread's tree, so thread it is.
+      # worktree is cut from says thread. The run reads thread's tree, so it is refused.
       repo = Path.join(ctx.root, "repo")
       git!(repo, ["update-ref", "refs/remotes/origin/master", git!(repo, ["rev-parse", "HEAD"])])
       commit_mode!(ctx, "thread\n")
 
-      {pid, topic} =
-        accepting_control(ctx, "stream", %{},
-          push_script: push_helper!(ctx),
-          checkpoint_reporter: @reporter
-        )
-
+      {pid, topic} = accepting_control(ctx, "stream")
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
       assert %{"to" => "worktree"} = next_stage()
-      assert %{"to" => "implementing"} = next_stage()
-      assert %{"reason" => "completed"} = next_session_ended()
+
+      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+      assert reason =~ "delivery mode thread in .loopctl/mode was retired"
       runs_done(pid)
 
-      assert File.read!(Path.join(ctx.fake, "argv")) =~ "Delivery mode: thread\n"
+      refute File.exists?(Path.join(ctx.fake, "argv"))
     end
 
     test "a repository with no .loopctl/mode is refused before a session, never run as pr", ctx do
@@ -1676,45 +1461,6 @@ defmodule LoopctlRunner.ControlTest do
       assert reason =~ "run ended refused"
       assert reason =~ "other: repository has no .loopctl/mode"
       runs_done(pid)
-      refute_receive {:test_loopctl, {:session_ended, _}}, 500
-
-      refute File.exists?(Path.join(ctx.fake, "argv"))
-    end
-
-    test "a thread repository on a build without checkpoint reporting is refused", ctx do
-      commit_mode!(ctx, "thread\n")
-
-      # A build whose reporter module is missing.
-      {pid, topic} =
-        accepting_control(ctx, "stream", %{},
-          push_script: push_helper!(ctx),
-          checkpoint_reporter: LoopctlRunner.NoCheckpointReporter
-        )
-
-      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
-      assert %{"to" => "worktree"} = next_stage()
-
-      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
-      assert reason =~ "checkpoint reporting not available"
-      runs_done(pid)
-
-      refute File.exists?(Path.join(ctx.fake, "argv"))
-    end
-
-    test "a thread repository on a release without loop-push is refused before a session", ctx do
-      commit_mode!(ctx, "thread\n")
-      missing = Path.join(ctx.root, "no-such-loop-push")
-
-      {pid, topic} = accepting_control(ctx, "stream", %{}, push_script: missing)
-      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
-      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
-      assert %{"to" => "worktree"} = next_stage()
-
-      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
-      assert reason =~ "run ended refused"
-      assert reason =~ "push helper missing: #{missing}"
-      runs_done(pid)
-      # No session existed, so there is no session end to report.
       refute_receive {:test_loopctl, {:session_ended, _}}, 500
 
       refute File.exists?(Path.join(ctx.fake, "argv"))
@@ -1778,7 +1524,9 @@ defmodule LoopctlRunner.ControlTest do
       assert next_session_ended() == %{
                "dispatch_id" => dispatch["dispatch_id"],
                "claim_epoch" => 3,
-               "reason" => "max_turns_exceeded"
+               "reason" => "max_turns_exceeded",
+               # The fake CLI's error_max_turns result line says num_turns 5 (contract 1.27.0).
+               "turns_used" => 5
              }
 
       runs_done(pid)
@@ -2010,52 +1758,16 @@ defmodule LoopctlRunner.ControlTest do
       :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
     end
 
-    test "a thread run's session_ended waits until its recorded pushes are checkpoints", ctx do
-      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "internal_error"}}])
-      {pid, _ref} = start_accepting(ctx, %{}, checkpoint_poll_ms: 300)
-      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
-
-      dispatch = story_dispatch()
-      binding = DispatchRun.binding(dispatch)
-      run_dir = Path.join(ctx.config.runs_dir, "thread-run")
-      File.mkdir_p!(run_dir)
-      LoopctlRunner.RunState.update(run_dir, Map.put(binding, "status", "failed"))
-      commit = String.duplicate("a", 40)
-
-      File.write!(
-        Path.join(run_dir, "checkpoints.log"),
-        "#{commit} #{String.duplicate("b", 40)}\n"
-      )
-
-      send(
-        pid,
-        {:run_stage, binding,
-         {:finished, %{status: "failed", reached: "implementing", run_dir: run_dir}}}
-      )
-
-      # The first checkpoint fails, so the crashed session's end is held behind it...
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
-      refute_receive {:test_loopctl, {:session_ended, _}}, 250
-
-      # ...until the resend is recorded, and only then does it go.
-      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
-      assert %{"reason" => "crashed"} = next_session_ended(5_000)
-    end
-
-    test "a stage report still queued when the run ends is not held behind its checkpoints",
+    test "a run's session_ended is never held behind a checkpoints.log an older build left",
          ctx do
-      TestLoopctl.put(
-        :checkpoint_replies,
-        List.duplicate({:error, %{reason: "internal_error"}}, 50)
-      )
-
-      TestLoopctl.put(:stage_replies, [{:error, %{reason: "rate_limited", min_interval_ms: 400}}])
-      {pid, _ref} = start_accepting(ctx, %{}, checkpoint_poll_ms: 100)
+      # Thread-mode checkpoint reporting retired with contract 1.23.0: loopctl answers the
+      # checkpoint event unknown_event, so an end held behind one would never be sent.
+      {pid, _ref} = start_accepting(ctx, %{}, [])
       :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
 
       dispatch = story_dispatch()
       binding = DispatchRun.binding(dispatch)
-      run_dir = Path.join(ctx.config.runs_dir, "thread-run")
+      run_dir = Path.join(ctx.config.runs_dir, "old-thread-run")
       File.mkdir_p!(run_dir)
       LoopctlRunner.RunState.update(run_dir, Map.put(binding, "status", "failed"))
 
@@ -2064,18 +1776,14 @@ defmodule LoopctlRunner.ControlTest do
         "#{String.duplicate("a", 40)} #{String.duplicate("b", 40)}\n"
       )
 
-      send(pid, {:run_stage, binding, {:implementing, %{}}})
-      assert %{"to" => "implementing"} = next_stage(5_000)
-
-      # Ended while that report waits out its rate limit: it still goes, the end does not.
       send(
         pid,
         {:run_stage, binding,
          {:finished, %{status: "failed", reached: "implementing", run_dir: run_dir}}}
       )
 
-      assert %{"to" => "implementing"} = next_stage(3_000)
-      refute_receive {:test_loopctl, {:session_ended, _}}, 300
+      assert %{"reason" => "crashed"} = next_session_ended(5_000)
+      refute File.exists?(Path.join(run_dir, "checkpoints.sent"))
     end
 
     test "a run outliving its Control reports its stages to the one that replaces it", ctx do
@@ -2656,8 +2364,10 @@ defmodule LoopctlRunner.ControlTest do
       end)
     end
 
-    test "a restarted Control holds a finished thread run's end for its checkpoints", ctx do
-      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "internal_error"}}])
+    test "a restarted Control sends a finished run's end at once, whatever checkpoints.log it left",
+         ctx do
+      # An older build's thread run left recorded pushes; nothing reports them now (contract
+      # 1.23.0), so its end is not held behind them.
       dispatch = story_dispatch()
       run_dir = Path.join(ctx.config.runs_dir, "recovered-thread-run")
       File.mkdir_p!(run_dir)
@@ -2671,22 +2381,55 @@ defmodule LoopctlRunner.ControlTest do
         })
       )
 
-      commit = String.duplicate("a", 40)
-
       File.write!(
         Path.join(run_dir, "checkpoints.log"),
-        "#{commit} #{String.duplicate("b", 40)}\n"
+        "#{String.duplicate("a", 40)} #{String.duplicate("b", 40)}\n"
       )
 
       capture_log(fn ->
-        {pid, _ref} = start_accepting(ctx, %{}, checkpoint_poll_ms: 300)
+        {pid, _ref} = start_accepting(ctx, %{}, [])
         :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
 
-        assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
-        refute_receive {:test_loopctl, {:session_ended, _}}, 250
-        assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
         assert %{"reason" => "crashed"} = next_session_ended(5_000)
       end)
+    end
+
+    test "a restarted Control retires an unreported review run an older build left, sending nothing",
+         ctx do
+      # Contract 1.23.0 retired the review kind: its judgements' events answer unknown_event, and
+      # the stage stream an implement end goes through would move the implementer's story.
+      dispatch = %{story_dispatch() | "kind" => "review"}
+      run_dir = Path.join(ctx.config.runs_dir, "old-review-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "kind" => "review",
+          "status" => "succeeded",
+          "reached" => "implementing"
+        })
+      )
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_accepting(ctx, %{}, [])
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+          :ok =
+            wait_until(
+              fn ->
+                match?({:ok, %{"terminal_reported" => "retired_kind"}}, RunState.read(run_dir))
+              end,
+              5_000
+            )
+
+          refute_receive {:test_loopctl, {:session_ended, _}}, 500
+          refute_receive {:test_loopctl, {:stage, _}}, 100
+        end)
+
+      assert log =~ "this runner no longer runs review"
     end
 
     test "a restarted Control honours a claim end recorded beside a finished run", ctx do
@@ -2890,6 +2633,385 @@ defmodule LoopctlRunner.ControlTest do
                reply
 
       assert detail =~ "under #{repo_path}"
+    end
+
+    # --- US-48.16: a pr-mode session's pull request, read from the forge ---
+
+    @head_sha "2fd0c5233b323ca4dc6e4d793536e884c902d8bd"
+    @merge_sha "a1076b601b1651bc411b0822e1d89cc5550a03b4"
+
+    defp forge_pr(dispatch, overrides) do
+      Map.merge(
+        %{
+          "number" => 3938,
+          "state" => "MERGED",
+          "headRefName" => dispatch["branch"],
+          "headRefOid" => @head_sha,
+          "baseRefName" => dispatch["base_branch"],
+          "isCrossRepository" => false,
+          "mergeCommit" => %{"oid" => @merge_sha},
+          "statusCheckRollup" => []
+        },
+        overrides
+      )
+    end
+
+    # A forge that tells the test what it was asked and answers `answer`.
+    defp forge_answering(answer) do
+      test = self()
+
+      fn repo, head, base, _timeout ->
+        send(test, {:forge_asked, repo, head, base})
+        answer
+      end
+    end
+
+    defp observed_list(dispatch, overrides),
+      do:
+        LoopctlRunner.PrStages.observed(
+          [forge_pr(dispatch, overrides)],
+          dispatch["branch"],
+          "master"
+        )
+
+    # Every message to the test, stage reports and session_ended, in arrival order, up to and
+    # including the session_ended.
+    defp reports_through_session_ended(acc \\ []) do
+      receive do
+        {:test_loopctl, {:stage, payload}} ->
+          reports_through_session_ended([{:stage, payload["from"], payload["to"], payload} | acc])
+
+        {:test_loopctl, {:session_ended, payload}} ->
+          Enum.reverse([{:session_ended, payload["reason"]} | acc])
+      after
+        15_000 -> flunk("no session_ended; got #{inspect(Enum.reverse(acc))}")
+      end
+    end
+
+    defp transitions(reports),
+      do:
+        Enum.map(reports, fn
+          {:stage, from, to, _payload} -> {from, to}
+          other -> other
+        end)
+
+    test "TC-48.16.1: a merged pull request is reported up to merged, then session_ended", ctx do
+      dispatch = story_dispatch()
+
+      {_pid, topic} =
+        accepting_control(ctx, "stream", %{},
+          forge: forge_answering({:ok, [forge_pr(dispatch, %{})]})
+        )
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      reports = reports_through_session_ended()
+
+      assert transitions(reports) == [
+               {"claimed", "worktree"},
+               {"worktree", "implementing"},
+               {"implementing", "reviewing"},
+               {"reviewing", "pr_open"},
+               {"pr_open", "ci"},
+               {"ci", "merged"},
+               {:session_ended, "completed"}
+             ]
+
+      # Asked about THIS dispatch's repo, branch and base.
+      assert_received {:forge_asked, "mkreyman/fixture", branch, "master"}
+      assert branch == dispatch["branch"]
+
+      effects = for {:stage, _, to, p} <- reports, into: %{}, do: {to, {p["edge"], p["effects"]}}
+      assert effects["reviewing"] == {"forward", nil}
+      assert effects["pr_open"] == {"forward", %{"pr_number" => 3938, "head_sha" => @head_sha}}
+      assert effects["ci"] == {"forward", %{"head_sha" => @head_sha}}
+      assert effects["merged"] == {"forward", %{"merge_sha" => @merge_sha}}
+    end
+
+    test "TC-48.16.2: an open pull request whose checks are not green stops at pr_open", ctx do
+      dispatch = story_dispatch()
+      open = forge_pr(dispatch, %{"state" => "OPEN", "mergeCommit" => nil})
+
+      {_pid, topic} = accepting_control(ctx, "stream", %{}, forge: forge_answering({:ok, [open]}))
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert transitions(reports_through_session_ended()) == [
+               {"claimed", "worktree"},
+               {"worktree", "implementing"},
+               {"implementing", "reviewing"},
+               {"reviewing", "pr_open"},
+               {:session_ended, "completed"}
+             ]
+    end
+
+    test "TC-48.16.2: an open pull request with green CI is reported through ci", ctx do
+      {pid, _topic} = accepting_control(ctx, "stream")
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+
+      green = [%{"__typename" => "CheckRun", "status" => "COMPLETED", "conclusion" => "SUCCESS"}]
+      observed = observed_list(dispatch, %{"state" => "OPEN", "statusCheckRollup" => green})
+
+      send(pid, {:run_stage, binding, {:implementing, %{}}})
+      send(pid, {:run_stage, binding, {:observed, observed}})
+
+      send(
+        pid,
+        {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+      )
+
+      assert transitions(reports_through_session_ended()) == [
+               {"worktree", "implementing"},
+               {"implementing", "reviewing"},
+               {"reviewing", "pr_open"},
+               {"pr_open", "ci"},
+               {:session_ended, "completed"}
+             ]
+    end
+
+    test "TC-48.16.2: no pull request reports nothing beyond implementing", ctx do
+      dispatch = story_dispatch()
+      {_pid, topic} = accepting_control(ctx, "stream", %{}, forge: forge_answering({:ok, []}))
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert transitions(reports_through_session_ended()) == [
+               {"claimed", "worktree"},
+               {"worktree", "implementing"},
+               {:session_ended, "completed"}
+             ]
+
+      assert_received {:forge_asked, _, _, _}
+    end
+
+    test "a forge that fails reports nothing extra, and session_ended still goes", ctx do
+      dispatch = story_dispatch()
+
+      log =
+        capture_log(fn ->
+          {_pid, topic} =
+            accepting_control(ctx, "stream", %{},
+              forge: forge_answering({:error, "gh exited 1: HTTP 502"})
+            )
+
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+          assert transitions(reports_through_session_ended()) == [
+                   {"claimed", "worktree"},
+                   {"worktree", "implementing"},
+                   {:session_ended, "completed"}
+                 ]
+        end)
+
+      assert log =~ "could not read the forge for mkreyman/fixture"
+    end
+
+    test "a thread-mode repository reports nothing new and asks no forge", ctx do
+      # AC-48.16.5. A thread repository's prompt is refused before any session (contract 1.23.0
+      # retired thread mode), so there is no session end to observe at all.
+      File.write!(Path.join([ctx.root, "repo", ".loopctl", "mode"]), "thread\n")
+      git!(Path.join(ctx.root, "repo"), ["commit", "-q", "-am", "thread"])
+      dispatch = story_dispatch()
+
+      {_pid, topic} =
+        accepting_control(ctx, "stream", %{},
+          forge: forge_answering({:ok, [forge_pr(dispatch, %{})]})
+        )
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
+      assert %{"from" => "worktree", "to" => "escalated"} = next_stage()
+      refute_receive {:test_loopctl, {:stage, _}}, 500
+      refute_received {:forge_asked, _, _, _}
+    end
+
+    test "a refused observed stage stops the sequence, logged, and session_ended goes", ctx do
+      TestLoopctl.put(:stage_replies, [:ok, :ok, {:error, %{reason: "effect_conflict"}}])
+      {pid, _topic} = accepting_control(ctx, "stream")
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+
+      log =
+        capture_log(fn ->
+          send(pid, {:run_stage, binding, {:implementing, %{}}})
+          send(pid, {:run_stage, binding, {:observed, observed_list(dispatch, %{})}})
+
+          send(
+            pid,
+            {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+          )
+
+          assert transitions(reports_through_session_ended()) == [
+                   {"worktree", "implementing"},
+                   {"implementing", "reviewing"},
+                   {"reviewing", "pr_open"},
+                   {:session_ended, "completed"}
+                 ]
+
+          # Never retried, and nothing after it.
+          refute_receive {:test_loopctl, {:stage, _}}, 500
+        end)
+
+      assert log =~ "loopctl refused the stage reviewing -> pr_open"
+      assert log =~ "effect_conflict"
+    end
+
+    test "an observed stage given up after internal_error stops the sequence too", ctx do
+      internal = {:error, %{reason: "internal_error"}}
+      TestLoopctl.put(:stage_replies, [:ok, internal, internal, internal])
+      {pid, _topic} = accepting_control(ctx, "stream")
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+
+      capture_log(fn ->
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        send(pid, {:run_stage, binding, {:observed, observed_list(dispatch, %{})}})
+
+        send(
+          pid,
+          {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+        )
+
+        assert transitions(reports_through_session_ended()) == [
+                 {"worktree", "implementing"},
+                 {"implementing", "reviewing"},
+                 {"implementing", "reviewing"},
+                 {"implementing", "reviewing"},
+                 {:session_ended, "completed"}
+               ]
+
+        refute_receive {:test_loopctl, {:stage, _}}, 500
+      end)
+    end
+
+    test "stages loopctl already holds are not re-sent: the rest go from the row's stage", ctx do
+      # The session reported reviewing, pr_open and ci itself; loopctl's refusal names the row.
+      TestLoopctl.put(:stage_replies, [:ok, {:error, %{reason: "stale_stage", stage: "ci"}}, :ok])
+      {pid, _topic} = accepting_control(ctx, "stream")
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+
+      send(pid, {:run_stage, binding, {:implementing, %{}}})
+      send(pid, {:run_stage, binding, {:observed, observed_list(dispatch, %{})}})
+
+      send(
+        pid,
+        {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+      )
+
+      reports = reports_through_session_ended()
+
+      assert transitions(reports) == [
+               {"worktree", "implementing"},
+               {"implementing", "reviewing"},
+               {"ci", "merged"},
+               {:session_ended, "completed"}
+             ]
+
+      assert {:stage, "ci", "merged", %{"effects" => %{"merge_sha" => @merge_sha}}} =
+               Enum.at(reports, 2)
+    end
+
+    test "a row already at merged takes none of the observed stages, and session_ended goes",
+         ctx do
+      TestLoopctl.put(:stage_replies, [:ok, {:error, %{reason: "stale_stage", stage: "merged"}}])
+      {pid, _topic} = accepting_control(ctx, "stream")
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+
+      send(pid, {:run_stage, binding, {:implementing, %{}}})
+      send(pid, {:run_stage, binding, {:observed, observed_list(dispatch, %{})}})
+
+      send(
+        pid,
+        {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+      )
+
+      assert transitions(reports_through_session_ended()) == [
+               {"worktree", "implementing"},
+               {"implementing", "reviewing"},
+               {:session_ended, "completed"}
+             ]
+    end
+
+    test "a stale_stage naming a row BEHIND the observed stage stops the sequence", ctx do
+      TestLoopctl.put(:stage_replies, [:ok, {:error, %{reason: "stale_stage", stage: "worktree"}}])
+
+      {pid, _topic} = accepting_control(ctx, "stream")
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+
+      capture_log(fn ->
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        send(pid, {:run_stage, binding, {:observed, observed_list(dispatch, %{})}})
+
+        send(
+          pid,
+          {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+        )
+
+        assert transitions(reports_through_session_ended()) == [
+                 {"worktree", "implementing"},
+                 {"implementing", "reviewing"},
+                 {:session_ended, "completed"}
+               ]
+      end)
+    end
+
+    test "a fresh Control resends a finished run's observed stages from disk, then its end",
+         ctx do
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "observed-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "succeeded",
+          "reached" => "implementing",
+          "observed_stages" => observed_list(dispatch, %{})
+        })
+      )
+
+      {_pid, _topic} = accepting_control(ctx, "stream")
+
+      assert transitions(reports_through_session_ended()) == [
+               {"implementing", "reviewing"},
+               {"reviewing", "pr_open"},
+               {"pr_open", "ci"},
+               {"ci", "merged"},
+               {:session_ended, "completed"}
+             ]
+
+      :ok = wait_until(end_recorded(run_dir, true))
+    end
+
+    test "a fresh Control's session_ended carries the turns and left-behind the run recorded",
+         ctx do
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "counted-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "max_turns_exceeded",
+          "reached" => "implementing",
+          "turns_used" => 9,
+          "work_left_behind" => true
+        })
+      )
+
+      {_pid, _topic} = accepting_control(ctx, "stream")
+
+      assert next_session_ended(5_000) == %{
+               "dispatch_id" => dispatch["dispatch_id"],
+               "claim_epoch" => 3,
+               "reason" => "max_turns_exceeded",
+               "turns_used" => 9,
+               "work_left_behind" => true
+             }
     end
 
     test "a fresh Control reports the end of a finished run loopctl never acknowledged", ctx do
@@ -3643,12 +3765,7 @@ defmodule LoopctlRunner.ControlTest do
       assert_receive {:delivered, ^message}, 1_000
     end
 
-    # Every kind the vendored contract dispatches is declared now, so no schema-valid dispatch can
-    # draw `kind_not_supported`: a kind outside the contract's enum is refused `other` by validation
-    # first. That is the right answer — it is a malformed message, not a statement of capability —
-    # and `declared_kind/1` stays for the vendoring that adds a kind this runner does not run.
-    test "a dispatch without a story, or of a kind the contract does not name, is refused as other",
-         ctx do
+    test "a dispatch without a story, or malformed, is refused as other", ctx do
       {pid, topic} = accepting_control(ctx, "stream")
 
       no_story = story_dispatch() |> Map.delete("story")
@@ -3658,19 +3775,6 @@ defmodule LoopctlRunner.ControlTest do
       assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
       assert detail == "the dispatch carries no story"
 
-      undeclared = story_dispatch(%{"kind" => "deploy"})
-      refute "deploy" in LoopctlRunner.Control.kinds()
-      TestLoopctl.Endpoint.broadcast(topic, "dispatch", undeclared)
-      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
-
-      assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
-      assert detail =~ "RunnerDispatch.kind"
-
-      # And nothing the contract dispatches is undeclared, which is why the refusal above is the
-      # only one an unknown kind can draw.
-      dispatchable = Contract.connection()["dispatchable_kinds"]
-      assert Enum.sort(dispatchable) == Enum.sort(LoopctlRunner.Control.kinds())
-
       malformed = story_dispatch() |> put_in(["story", "title"], String.duplicate("a", 201))
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", malformed)
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
@@ -3678,9 +3782,54 @@ defmodule LoopctlRunner.ControlTest do
       assert %{"reason" => "other", "detail" => detail} = reply
       assert detail =~ "story.title"
 
+      # A kind that is not a string is malformed, not an undeclared capability.
+      mistyped = story_dispatch(%{"kind" => 7})
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", mistyped)
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert %{"reason" => "other", "detail" => detail} = reply
+      assert detail =~ "RunnerDispatch.kind"
+
       refute_receive {:test_loopctl, {:stage, _}}, 500
       assert Control.info(pid).runs_in_flight == []
       assert RunState.all(ctx.config.runs_dir) == []
+    end
+
+    # Contract 1.23.0 retired `review`: its enum and `dispatchable_kinds` no longer name it, so a
+    # review dispatch would fail validation as `other`. It is refused `kind_not_supported` instead,
+    # as any kind this runner does not run is — a statement of capability, judged before the
+    # message's shape, so loopctl never reads the refusal as a malformed message it might resend.
+    test "a review dispatch, or any kind this runner does not run, is refused kind_not_supported",
+         ctx do
+      {pid, topic} = accepting_control(ctx, "stream")
+
+      for kind <- ["review", "deploy"] do
+        refute kind in LoopctlRunner.Control.kinds()
+        dispatch = story_dispatch(%{"kind" => kind})
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+        assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+
+        assert %{
+                 "dispatch_id" => id,
+                 "decision" => "refused",
+                 "reason" => "kind_not_supported",
+                 "detail" =>
+                   "this runner runs only: implement, triage, reply_draft, verify, spec_tune"
+               } = reply
+
+        assert id == dispatch["dispatch_id"]
+        assert Contract.validate("RunnerDispatchReply", reply) == :ok
+      end
+
+      # And nothing the contract dispatches is undeclared.
+      dispatchable = Contract.connection()["dispatchable_kinds"]
+      assert Enum.sort(dispatchable) == Enum.sort(LoopctlRunner.Control.kinds())
+
+      # No session started: no stage, no run directory, nothing in flight.
+      refute_receive {:test_loopctl, {:stage, _}}, 500
+      refute_receive {:test_loopctl, {:session_ended, _}}, 100
+      assert Control.info(pid).runs_in_flight == []
+      assert RunState.all(ctx.config.runs_dir) == []
+      refute File.exists?(Path.join(ctx.fake, "argv"))
     end
 
     test "a dispatch arriving while one runs is refused at_capacity", ctx do

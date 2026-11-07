@@ -2,7 +2,9 @@ defmodule LoopctlRunner.PendingVerdicts do
   @moduledoc """
   Triage verdict messages that have been pushed and not yet settled, kept on disk so a Control
   that dies before the acknowledgement still delivers them: `<run_dir>/verdict_message.json`, the
-  message exactly as it was built.
+  message exactly as it was built. A `:draft` run's `agent_result` (US-48.9) is kept in the same
+  file under the same rules; the Control tells the two apart by the message's `spec` key
+  (`LoopctlRunner.AgentResult.message?/1`).
 
   Shaped like `LoopctlRunner.PendingStarts`, and stored in the run directory rather than in a
   directory of its own because that is where everything else about the run already is — the

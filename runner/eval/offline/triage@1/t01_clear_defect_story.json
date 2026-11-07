@@ -1,0 +1,19 @@
+{
+  "verdict": {
+    "outcome": "story",
+    "confidence": "high",
+    "evidence": ["lib/tiny_app.ex:12"],
+    "story": {
+      "title": "TinyApp.total/1 returns the sum of upload sizes",
+      "description": "total/1 reduces with size - acc, so total([2, 3]) is 1 rather than 5. It should add the sizes.",
+      "acceptance_criteria": ["TinyApp.total([2, 3]) returns 5", "TinyApp.total([]) still returns 0"],
+      "test_cases": ["total of two sizes is their sum"],
+      "touches": ["lib/tiny_app.ex", "test/tiny_app_test.exs"]
+    },
+    "lens_verdicts": [
+      {"lens": "analyst", "outcome": "story", "confidence": "high", "escalation_reasons": []},
+      {"lens": "architect", "outcome": "story", "confidence": "high", "escalation_reasons": []},
+      {"lens": "engineer", "outcome": "story", "confidence": "high", "escalation_reasons": []}
+    ]
+  }
+}

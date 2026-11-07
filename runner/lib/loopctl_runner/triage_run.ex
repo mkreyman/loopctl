@@ -72,27 +72,83 @@ defmodule LoopctlRunner.TriageRun do
   refusal of the dispatch rather than a report about a run.
 
   Every detail is cut to the contract's `maxLength` before it leaves, in codepoints.
+
+  ## A `:draft` template's run (US-48.9)
+
+  `reply_draft@1` runs HERE too, because everything up to the session is the same: the fenced
+  report, the detached tree, the budgets, the deadline and the claim check. Its template's
+  archetype changes four things and nothing else: no tokens are minted and no lenses granted (the
+  session dispatches nothing); the argv is `ReplyDraftPrompt.claude_args/3`, which carries no tool
+  list, like every unattended session's; the result is read from the session's final message
+  (`LoopctlRunner.AgentResult.from_stdout/2`) rather than from `verdict.json`; and the message
+  recorded is an `agent_result`. Its outcome is `{:agent_result, {id, version}, result}`, or `{:no_result,
+  detail}` for every run that produced none — `agent_result` has no incomplete form, so such a run
+  sends NOTHING and is recorded failed here and in the log; loopctl's heal sweep frees the slot
+  and the next pass may draft the ticket again (`rerun: :next_pass`).
+
+  ## A `verify@1` run (US-48.18)
+
+  verify@1 runs here as well, and every template that answers with `agent_result`
+  (`LoopctlRunner.Templates.agent_result?/1`) shares the draft's outcome shapes: a result, or
+  `{:no_result, detail}` and nothing sent — so a verify that cannot state a well-formed verdict is
+  never a pass, it lapses and loopctl places the story again. What verify changes is its SUBJECT
+  and its TREE. The subject is the story and the pull request (`subject/2`), not a report, and the
+  run's directory and `record_id` are named by the story. The tree is cut at the pull request's
+  head rather than at the checkout's commit: before the cut the head is fetched from `origin`
+  (`Worktree.fetch_commit/4`, by id and then by `refs/pull/<n>/head`; the base is fetched beside
+  it, best effort, so the session's diff base is fresh), and after it the tree's own HEAD must BE
+  the dispatch's head, or nothing is judged. That head is recorded in `state.json` as
+  `judged_head` before the session starts, and it — never anything the session says — is the
+  `head_sha` the result carries (`LoopctlRunner.VerifyResult`), read back from there by a
+  restarted Control too. `:fetch_commit` and `:fetch_base` replace the two fetches
+  (`Worktree.fetch_commit/4`, `Worktree.fetch_base/3`).
+
+  ## A `spec_tuner@1` run (US-48.13)
+
+  The `spec_tune` dispatch runs here too: a `:draft` answered by `agent_result`, on the same
+  detached tree at the checkout's commit, and the one run that names NO story — its directory and
+  `record_id` are its `dispatch_id`. Before the tree is cut, `LoopctlRunner.SpecTune.prepare/2`
+  loads the target's eval set and renders the target template's current text, which the prompt
+  (`LoopctlRunner.SpecTunerPrompt`) carries beside the fenced traces; a set that will not load
+  ends the run with no result. After the session, the result is not what the session said but
+  what the CRITIC made of it (`LoopctlRunner.SpecTune.critique/4`): the eval harness, run over the
+  set and the proposed cases with and without the proposed diff, inside this run's own directory.
+  The critic runs only in the run that holds the session's end — a run read back from disk is
+  `{:no_result, _}`, never re-scored by whoever found it. `:critic` (a keyword list of
+  `LoopctlRunner.Eval.run_cases/2` options, laid over this runner's launcher, grant and projects
+  directories) is how a supervisor names the eval directory, and a test its fake CLI.
+
+  `:prompt_transform` is the harness's: a function applied to the rendered prompt before any
+  session starts (`{:ok, prompt}` or `{:error, reason}`, the latter running no session), which is
+  how a proposed revision is scored without a template being written.
   """
 
   require Logger
 
   alias LoopctlRunner.{
+    AgentResult,
     ClaimEnded,
     Config,
     Contract,
     Owner,
     PendingVerdicts,
+    ReplyDraftPrompt,
     Run,
     RunState,
     ScratchRun,
     Session,
+    SpecTune,
+    SpecTunerPrompt,
     Story,
+    Templates,
     Trace,
     TriageDispatch,
     TriagePrompt,
     TriageTools,
     TriageVerdict,
     Uuid,
+    VerifyPrompt,
+    VerifyResult,
     Worktree,
     WorktreeLock
   }
@@ -158,6 +214,8 @@ defmodule LoopctlRunner.TriageRun do
           | {:incomplete, String.t(), String.t()}
           | {:error, String.t()}
           | {:deadline_passed, String.t()}
+          | {:agent_result, Templates.key(), map()}
+          | {:no_result, String.t()}
 
   @type result :: %{
           run_id: String.t(),
@@ -171,10 +229,15 @@ defmodule LoopctlRunner.TriageRun do
 
   Options: `:binding` (written into `state.json`, the dispatch this run answers), `:on_start`
   (called with `%{run_id:, run_dir:}` the moment the run directory and its state exist), `:lenses`
-  (default `TriageTools.lenses/0`), `:wall_clock_s`, `:max_turns`, `:model`, `:run_id`, and
+  (default `TriageTools.lenses/0`), `:template` (the `LoopctlRunner.Templates` entry whose prompt
+  the session is given, default triage@1), `:wall_clock_s`, `:max_turns`, `:model`, `:run_id`,
+  `:mcp_args` (default `[]`; only the eval harness sets it, to
+  `LoopctlRunner.Session.mcp_isolation/1`), and
   `:deadline_at` (the dispatch's stop bound, a `DateTime`: the session is stopped in time to be gone
   by it, `Story.stop_after/4`, and a run past `Story.check_deadline/4` when it begins, or when its
-  session would start, ends `{:deadline_passed, _}` having started no session).
+  session would start, ends `{:deadline_passed, _}` having started no session). A `spec_tune` run
+  is bounded by the EARLIER of `:deadline_at` and its own start + `:wall_clock_s`, absent
+  `:deadline_at` included, because its critic starts sessions after its own (`run_bound/4`).
 
   `:on_start` is what makes this run's directory reachable by whoever is supervising it BEFORE the
   run ends, which is the only moment that matters when it does not end normally: a task killed
@@ -184,18 +247,94 @@ defmodule LoopctlRunner.TriageRun do
   `Run.execute/3` reports.
   """
   @spec execute(Config.t(), map(), String.t(), keyword()) :: result()
-  def execute(%Config{} = config, triage, repo, opts \\ []) do
+  def execute(%Config{} = config, subject, repo, opts \\ []) do
     run_id = Keyword.get_lazy(opts, :run_id, &Session.uuid4/0)
 
     # The owner before anything is written: a state recorded without its start reads as an
     # orphan, and the next implement dispatch's reap would kill this run's session.
-    with {:ok, record} <- record_id(triage),
+    with {:ok, record} <- record_id(subject, template(opts)),
          {:ok, owner} <- owner() do
-      start(config, triage, repo, record, run_id, owner, opts)
+      start(config, subject, repo, record, run_id, owner, opts)
     else
-      {:error, reason} -> %{run_id: run_id, run_dir: nil, session: nil, outcome: {:error, reason}}
+      {:error, reason} ->
+        %{
+          run_id: run_id,
+          run_dir: nil,
+          session: nil,
+          outcome: drafted({:error, reason}, template(opts))
+        }
     end
   end
+
+  @doc """
+  What a dispatch of `template` is run over, read from the dispatch and validated: the `triage`
+  object for triage@1 and reply_draft@1, and for verify@1 a map of the `story` object, the
+  `verify` object (`{pr_number, head_sha}`, contract 1.28.0), and the dispatch's `branch` and
+  `base_branch`. `:none` when the dispatch carries none, `{:error, detail}` when it is
+  malformed. The one reading Control's accept path and the eval harness share.
+  """
+  @spec subject(Templates.t(), map()) :: {:ok, map()} | :none | {:error, String.t()}
+  def subject(%{id: "verify"}, dispatch) do
+    with {:ok, story} <- verify_story(dispatch),
+         {:ok, verify} <- verify_object(dispatch) do
+      {:ok,
+       %{
+         "story" => story,
+         "verify" => verify,
+         "branch" => dispatch["branch"],
+         "base_branch" => dispatch["base_branch"]
+       }}
+    end
+  end
+
+  def subject(%{kind: "spec_tune"} = template, dispatch), do: SpecTune.subject(template, dispatch)
+
+  def subject(_template, dispatch), do: TriageDispatch.triage_object(dispatch)
+
+  defp verify_story(dispatch) do
+    case LoopctlRunner.DispatchRun.story_object(dispatch) do
+      {:ok, story} -> {:ok, story}
+      :none -> {:error, "the verify dispatch carries no story"}
+      {:error, detail} -> {:error, detail}
+    end
+  end
+
+  # The contract bounds both fields; checked again here because a verify with no head to judge
+  # would be a verdict about nothing, and the head is about to name a commit and a path.
+  @head ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
+
+  defp verify_object(%{"verify" => %{"pr_number" => pr, "head_sha" => head}})
+       when is_integer(pr) and pr > 0 and is_binary(head) do
+    if head =~ @head,
+      do: {:ok, %{"pr_number" => pr, "head_sha" => head}},
+      else: {:error, "the verify dispatch's head_sha is not a full commit id"}
+  end
+
+  defp verify_object(%{"verify" => _}),
+    do: {:error, "the verify dispatch's verify object is malformed"}
+
+  defp verify_object(_dispatch), do: {:error, "the verify dispatch carries no verify object"}
+
+  # An `agent_result` run's outcome in its own two shapes: a result, or none. `agent_result` has
+  # no incomplete form, so every way such a run can fail to produce one — the session's, the
+  # runner's, a budget refused — is `{:no_result, detail}`, and nothing is sent for it. A triage
+  # run's outcome passes through untouched.
+  defp drafted(outcome, template) do
+    if Templates.agent_result?(template), do: no_result_unless_stated(outcome), else: outcome
+  end
+
+  defp no_result_unless_stated(outcome) do
+    case outcome do
+      {:agent_result, _key, _result} = result -> result
+      {:deadline_passed, _} = passed -> passed
+      {:no_result, _} = none -> none
+      {:incomplete, _reason, detail} -> {:no_result, detail(detail)}
+      {:error, detail} -> {:no_result, detail(detail)}
+    end
+  end
+
+  defp agent_result?(opts), do: Templates.agent_result?(template(opts))
+  defp verify?(opts), do: template(opts).id == "verify"
 
   defp owner do
     case Owner.current() do
@@ -208,20 +347,34 @@ defmodule LoopctlRunner.TriageRun do
   # object — the accept path does — and a record_id carrying `/` or `..` would put the run
   # directory outside runs_dir, where RunState.all/1 and the reaper's glob cannot see it: a run
   # nothing reaps and nothing reports.
-  defp record_id(%{"record_id" => id}) when is_binary(id) do
+  # A verify run is named by its story, as a triage run is by its record.
+  defp record_id(%{"story" => %{"id" => id}}, %{id: "verify"}), do: uuid(id, "story id")
+  defp record_id(_subject, %{id: "verify"}), do: {:error, "the verify subject names no story"}
+  # A tuning run names no story and no record: it is named by its dispatch (US-48.13).
+  defp record_id(%{"dispatch_id" => id}, %{kind: "spec_tune"}), do: uuid(id, "dispatch_id")
+
+  defp record_id(_subject, %{kind: "spec_tune"}),
+    do: {:error, "the spec_tune subject names no dispatch"}
+
+  defp record_id(%{"record_id" => id}, _template), do: uuid(id, "record_id")
+  defp record_id(_triage, _template), do: {:error, "the triage object names no record_id"}
+
+  defp uuid(id, what) when is_binary(id) do
     if Uuid.valid?(id),
       do: {:ok, String.downcase(id)},
-      else: {:error, "record_id #{inspect(id)} is not a uuid"}
+      else: {:error, "#{what} #{inspect(id)} is not a uuid"}
   end
 
-  defp record_id(_triage), do: {:error, "the triage object names no record_id"}
+  defp uuid(id, what), do: {:error, "#{what} #{inspect(id)} is not a uuid"}
 
   defp start(config, triage, repo, record, run_id, owner, opts) do
+    template = template(opts)
+    opts = run_bound(config, template, opts, DateTime.utc_now())
     # THE deadline guard before anything that costs work: the reap can fetch, and the run mints,
     # fetches and cuts. Judged again immediately before the session (`judge/8`).
     deadline = check_deadline(config, opts)
-    _reaped = reap(config, owner, deadline)
-    run_dir = run_dir(config, record, run_id)
+    _reaped = reap(config, owner, deadline, template.kind)
+    run_dir = run_dir(config, template.kind, record, run_id)
 
     # BEFORE the state, not after: `state.json` at `running` carries this BEAM's live owner, so a
     # task killed between writing it and announcing it leaves a run nothing can close — the
@@ -235,7 +388,9 @@ defmodule LoopctlRunner.TriageRun do
       Keyword.get(opts, :binding, %{})
       |> Map.merge(%{
         "run_id" => run_id,
-        "kind" => "triage",
+        # The template's kind, which is what a restarting Control reads to know how this run
+        # reports: `triage` by its verdict, `reply_draft` by its agent_result.
+        "kind" => template.kind,
         "record_id" => record,
         "repo" => repo,
         "status" => "running"
@@ -247,7 +402,13 @@ defmodule LoopctlRunner.TriageRun do
     )
 
     {:ok, trace} = Trace.start_link(Path.join(run_dir, "trace.ndjson"), run_id)
-    seq = Trace.emit(trace, "triage.started", nil, %{"record_id" => record, "repo" => repo})
+
+    seq =
+      Trace.emit(trace, "triage.started", nil, %{
+        "record_id" => record,
+        "repo" => repo,
+        "kind" => template.kind
+      })
 
     result =
       case deadline do
@@ -270,7 +431,8 @@ defmodule LoopctlRunner.TriageRun do
           %{run_id: run_id, run_dir: run_dir, session: nil, outcome: {:deadline_passed, detail}}
       end
 
-    finish(trace, seq, run_dir, result, Keyword.get(opts, :binding, %{}))
+    result = %{result | outcome: drafted(result.outcome, template)}
+    finish(trace, seq, run_dir, result, Keyword.get(opts, :binding, %{}), template)
     result
   end
 
@@ -290,10 +452,35 @@ defmodule LoopctlRunner.TriageRun do
       }
   end
 
+  # A tuning run's ONE bound, fixed at its start (US-48.13): the earlier of the dispatch's
+  # `deadline_at` and this run's start + `wall_clock_seconds`. A tuning run is the one run that
+  # starts sessions after its own — the critic's, one per case per pass — and loopctl sends its
+  # dispatch with NO `deadline_at` (`Loopctl.Agents.Tuning.send_tuning`), so a bound read from the
+  # dispatch alone bounded nothing: the critic outlived the dispatch's wall clock, loopctl's
+  # Capacity heal released the reservation (`replied_at` + `wall_clock_seconds` + grace), and the
+  # result the run finally sent was refused `unknown_dispatch`. Put in `:deadline_at`, it is aimed
+  # by the same `Story.stop_by/3` arithmetic as every session's stop: the tuning session's
+  # (`Story.stop_after/4`), and the critic's, which starts no case whose whole session no longer
+  # fits (`Eval.run_cases/2`) — so a run that cannot finish in time sends no result at all. Every
+  # other run starts one session, whose own start + wall clock already bounds it, and is untouched.
+  defp run_bound(config, %{kind: "spec_tune"}, opts, now) do
+    by_clock = DateTime.add(now, wall_clock_s(config, opts), :second)
+
+    bound =
+      case Keyword.get(opts, :deadline_at) do
+        %DateTime{} = deadline -> Enum.min([deadline, by_clock], DateTime)
+        nil -> by_clock
+      end
+
+    Keyword.put(opts, :deadline_at, bound)
+  end
+
+  defp run_bound(_config, _template, opts, _now), do: opts
+
   # What an implement run does before it starts (`ScratchRun.reap/3` says why, and guards it). A
   # run past its deadline does no work at all, and a reap is work.
-  defp reap(_config, _owner, {:passed, _detail}), do: :skipped
-  defp reap(config, owner, :ok), do: ScratchRun.reap(config, owner, "triage")
+  defp reap(_config, _owner, {:passed, _detail}, _kind), do: :skipped
+  defp reap(config, owner, :ok, kind), do: ScratchRun.reap(config, owner, kind)
 
   # Guarded, and the guard is the point: this runs OUTSIDE the try below, before the state or the
   # trace exists, so a callback that raises would take the run down before it had written anything
@@ -314,9 +501,9 @@ defmodule LoopctlRunner.TriageRun do
   # Guarded too: `RunState.update/2` writes and renames, and a full volume or a run directory the
   # session removed would otherwise raise HERE — leaving state.json at "running" with this BEAM's
   # live owner recorded, which is precisely the combination the reaper will never clean up.
-  defp finish(trace, seq, run_dir, result, binding) do
+  defp finish(trace, seq, run_dir, result, binding, template) do
     name = outcome_name(result.outcome)
-    record(run_dir, binding, result.outcome)
+    record(run_dir, binding, result.outcome, template)
     Trace.emit(trace, "triage.finished", seq, %{"outcome" => name})
     Trace.close(trace)
 
@@ -341,11 +528,15 @@ defmodule LoopctlRunner.TriageRun do
   end
 
   defp prepare_and_judge(config, triage, repo, run_dir, run_id, trace, seq, opts) do
+    commit = cut_at(triage, opts)
+
     with {:ok, name, path} <- checkout(config, repo),
          :ok <- budgets(config, opts),
-         {:ok, token} <- mint(run_dir, &TriageVerdict.mint_token/1),
-         {:ok, escalate} <- mint(run_dir, &TriageVerdict.mint_escalate_token/1),
-         {:ok, tree} <- detached_tree(config, path, run_dir, run_id, trace, seq, opts[:owner]) do
+         {:ok, opts} <- spec_tune_context(config, triage, run_dir, opts),
+         :ok <- fetch_head(path, triage, trace, seq, opts),
+         {:ok, tokens} <- tokens(run_dir, opts),
+         {:ok, tree} <-
+           detached_tree(config, path, commit, run_dir, run_id, trace, seq, opts[:owner]) do
       # EVERYTHING after a successful cut is inside this try, so no way out of it — a return, a
       # raise, an exit — leaves the tree or its lock behind. `created` is recorded FIRST, before
       # the submodules: a raise in them is a tree that exists, which the release path removes or
@@ -363,24 +554,239 @@ defmodule LoopctlRunner.TriageRun do
                 seq: seq
               })
 
-            lenses = Keyword.get(opts, :lenses, TriageTools.lenses())
-
-            args = [
-              token: token,
-              escalate_token: escalate,
-              lenses: lenses,
-              missing_submodules: missing
-            ]
-
-            {:ok, TriagePrompt.build(triage, repo, args)}
+            template(opts)
+            |> render(triage, repo, tokens, missing, base_rules(path, triage, opts))
+            |> sized(opts)
+            |> transformed(opts)
           end)
 
-        with {:ok, prompt} <- prompt do
+        with {:ok, prompt} <- prompt,
+             :ok <- judged_head(tree, commit, run_dir, trace, seq) do
           judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts)
         end
       after
         release_tree(config, tree, run_dir, run_id, trace, seq)
       end
+    end
+  end
+
+  # The commit a verify run's tree is cut at: the dispatch's head. Every other run cuts at the
+  # checkout's own commit (nil).
+  defp cut_at(%{"verify" => %{"head_sha" => head}}, opts) do
+    if verify?(opts), do: head
+  end
+
+  defp cut_at(_subject, _opts), do: nil
+
+  # A verify run's head, made a commit the checkout holds before anything is cut at it, and the
+  # base fetched beside it so `origin/<base>` — the session's diff base — is not stale. The base
+  # fetch is best effort: a stale base widens the diff the session reads, and a run refused for
+  # it would judge nothing at all. Every other run fetches nothing.
+  defp fetch_head(path, %{"verify" => verify, "base_branch" => base}, trace, seq, opts) do
+    if verify?(opts) do
+      fetch_base = Keyword.get(opts, :fetch_base, &Worktree.fetch_base/3)
+      fetch_commit = Keyword.get(opts, :fetch_commit, &Worktree.fetch_commit/4)
+
+      with {:error, reason} <- fetch_base.(path, base, []) do
+        Trace.emit(trace, "verify.base_not_fetched", seq, %{"error" => reason})
+      end
+
+      case fetch_commit.(path, verify["head_sha"], verify["pr_number"], []) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Trace.emit(trace, "verify.head_not_fetched", seq, %{"error" => reason})
+          {:unreported, "the pull request's head could not be fetched: #{reason}"}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp fetch_head(_path, _subject, _trace, _seq, _opts), do: :ok
+
+  # A verify session's repository rules, read from the BASE in the checkout (`VerifyPrompt.
+  # base_rules/2`) — never from the tree, which is the pull request's. Every other run reads none.
+  defp base_rules(path, %{"base_branch" => base}, opts) do
+    if verify?(opts),
+      do: Keyword.put(opts, :base_rules, VerifyPrompt.base_rules(path, base)),
+      else: opts
+  end
+
+  defp base_rules(_path, _subject, opts), do: opts
+
+  # The tree a verify session judges must BE at the dispatch's head, read off the tree itself:
+  # the head the result carries is this one (`VerifyResult`), so a tree anywhere else — a head
+  # that named a tag, a reset that landed elsewhere — would state a verdict about one commit in
+  # the name of another. Recorded in `state.json` before the session starts, so a Control that
+  # finds the run dead completes the result from the same value. Every other run has no head.
+  defp judged_head(_tree, nil, _run_dir, _trace, _seq), do: :ok
+
+  defp judged_head(tree, commit, run_dir, trace, seq) do
+    case Worktree.head(tree.path) do
+      {:ok, ^commit} ->
+        prepared(fn ->
+          RunState.update(run_dir, %{"judged_head" => commit})
+          Trace.emit(trace, "verify.head", seq, %{"head_sha" => commit})
+          :ok
+        end)
+
+      {:ok, other} ->
+        Trace.emit(trace, "verify.head_mismatch", seq, %{"head_sha" => other})
+
+        {:unreported,
+         "the tree is at #{other}, not at the pull request's head #{commit}; nothing is judged"}
+
+      {:error, reason} ->
+        {:unreported, reason}
+    end
+  end
+
+  # A tuning run's context (US-48.13), read before anything is cut: the target template's current
+  # text and its eval set, which the prompt carries and the critic scores against, and the options
+  # the critic's harness runs with. A set that will not load is the runner failing to prepare the
+  # run, so `no_verdict_written` — which a `:draft` reads as `{:no_result, _}`, sending nothing.
+  # Every other run passes its options through untouched.
+  defp spec_tune_context(config, subject, run_dir, opts) do
+    if template(opts).kind == "spec_tune" do
+      critic = critic_opts(config, run_dir, opts)
+
+      case SpecTune.prepare(subject,
+             eval_dir: critic[:eval_dir] || "eval",
+             scratch_dir: critic[:scratch_dir]
+           ) do
+        {:ok, context} ->
+          {:ok,
+           opts
+           |> Keyword.put(:spec_tune_context, context)
+           |> Keyword.put(:spec_tune_subject, subject)
+           |> Keyword.put(:critic_opts, critic)}
+
+        {:error, reason} ->
+          {:unreported, "the tuning run's eval set could not be prepared: #{reason}"}
+      end
+    else
+      {:ok, opts}
+    end
+  end
+
+  # What the critic's harness runs with: this runner's own launcher, grant and projects
+  # directories, a scratch and a results directory inside the run's own, and whatever the
+  # supervisor passed as `:critic` over those (the eval directory; a test's fake CLI). The run's
+  # bound (`run_bound/4`: the dispatch's `deadline_at` or the run's start + wall clock, whichever is
+  # earlier, never nil here) is put LAST, over all of them: the critic's sessions run inside the
+  # tuning dispatch's time, so every one of them must be gone by the instant its own session is,
+  # and nothing the supervisor passes may loosen that. Their runs are recorded in the run's
+  # `RunState.nested_runs_dir/1`, put last for the same reason: that is where the reaper finds the
+  # critic's sessions after a BEAM that died mid-critic, and a run recorded anywhere else would
+  # outlive it unreaped.
+  defp critic_opts(config, run_dir, opts) do
+    [
+      launcher: config.claude_launcher,
+      grant_dir: config.grant_dir,
+      projects_dir: config.claude_projects_dir,
+      scratch_dir: Path.join(run_dir, "critic"),
+      results_dir: Path.join(run_dir, "critic-results")
+    ]
+    |> Keyword.merge(Keyword.get(opts, :critic, []))
+    |> Keyword.put(:deadline_at, Keyword.get(opts, :deadline_at))
+    |> Keyword.put(:runs_dir, RunState.nested_runs_dir(run_dir))
+  end
+
+  # A prompt travels as ONE argv string, and Linux refuses a single argument over 128 KiB
+  # (MAX_ARG_STRLEN) — at exec, as a launch failure that names nothing. A tuning prompt carries a
+  # whole eval set beside the traces, so it is held under that before anything starts. Every other
+  # template's prompt is bounded by the contract's own caps.
+  @max_prompt_bytes 120_000
+
+  defp sized(prompt, opts) do
+    if template(opts).kind == "spec_tune" and byte_size(prompt) > @max_prompt_bytes,
+      do:
+        {:unreported,
+         "the tuning prompt is #{byte_size(prompt)} bytes, over #{@max_prompt_bytes}"},
+      else: {:ok, prompt}
+  end
+
+  # `:prompt_transform` (the eval harness's, US-48.13): applied to the RENDERED prompt, so a
+  # proposed revision is scored without a template ever being written. One it refuses runs no
+  # session.
+  defp transformed({:ok, prompt}, opts) do
+    case Keyword.get(opts, :prompt_transform) do
+      nil ->
+        {:ok, prompt}
+
+      transform ->
+        case transform.(prompt) do
+          {:ok, changed} -> {:ok, changed}
+          {:error, why} -> {:unreported, "the prompt transform refused this prompt: #{why}"}
+        end
+    end
+  end
+
+  defp transformed(refused, _opts), do: refused
+
+  @doc false
+  # The prompt `template` renders for `subject` with the given tokens and no missing submodules:
+  # what `LoopctlRunner.SpecTune.template_text/2` shows a tuning session as the current text.
+  @spec render_prompt(Templates.t(), map(), String.t(), :none | {String.t(), String.t()}) ::
+          String.t()
+  def render_prompt(template, subject, repo, tokens),
+    do: render(template, subject, repo, tokens, [], lenses: TriageTools.lenses())
+
+  # The verdict and escalate tokens a triage session's prompt carries. A session that answers with
+  # `agent_result` (a `:draft`, verify@1) states its result in its final message and runs neither
+  # command, so nothing is minted for it.
+  defp tokens(run_dir, opts) do
+    if agent_result?(opts) do
+      {:ok, :none}
+    else
+      with {:ok, token} <- mint(run_dir, &TriageVerdict.mint_token/1),
+           {:ok, escalate} <- mint(run_dir, &TriageVerdict.mint_escalate_token/1) do
+        {:ok, {token, escalate}}
+      end
+    end
+  end
+
+  defp render(%{id: "verify"} = template, subject, repo, :none, missing, opts),
+    do:
+      Templates.render(template, %{
+        verify: subject,
+        repo: repo,
+        opts: [missing_submodules: missing, base_rules: opts[:base_rules]]
+      })
+
+  defp render(%{kind: "spec_tune"} = template, subject, repo, :none, _missing, opts),
+    do:
+      Templates.render(template, %{
+        spec_tune: subject,
+        repo: repo,
+        context: Keyword.fetch!(opts, :spec_tune_context)
+      })
+
+  defp render(%{archetype: :draft} = template, triage, repo, :none, _missing, _opts),
+    do: Templates.render(template, %{triage: triage, repo: repo})
+
+  defp render(template, triage, repo, {token, escalate}, missing, opts) do
+    args = [
+      token: token,
+      escalate_token: escalate,
+      lenses: Keyword.get(opts, :lenses, TriageTools.lenses()),
+      missing_submodules: missing
+    ]
+
+    Templates.render(template, %{triage: triage, repo: repo, opts: args})
+  end
+
+  # The template the prompt is rendered from: the one `Control.work/3` resolved, or triage@1.
+  defp template(opts) do
+    case Keyword.fetch(opts, :template) do
+      {:ok, template} ->
+        template
+
+      :error ->
+        {:ok, template} = Templates.fetch({"triage", 1})
+        template
     end
   end
 
@@ -467,7 +873,7 @@ defmodule LoopctlRunner.TriageRun do
       # `:session` is the session's own report or nil; a failure to supervise it is not a
       # report, and it is already carried in the outcome.
       session: if(match?({:session_failed, _}, session), do: nil, else: session),
-      outcome: outcome(run_dir, session)
+      outcome: outcome(run_dir, session, template(opts), opts)
     }
   end
 
@@ -551,12 +957,12 @@ defmodule LoopctlRunner.TriageRun do
   # with `{:tree_left, _}` when that removal failed too. `not_prepared` is only ever the entry of a
   # run that has no tree; one that was left is recorded `created`, as the tree it is, and given back
   # exactly as a finished run's is — so the reaper retries a removal that fails here.
-  defp detached_tree(config, path, run_dir, run_id, trace, seq, owner) do
+  defp detached_tree(config, path, commit, run_dir, run_id, trace, seq, owner) do
     with {:ok, tree} <- prepared(fn -> claim_tree(config, path, run_id, owner) end) do
       result =
         prepared(fn ->
           ScratchRun.record_tree(run_dir, tree, "creating")
-          cut(path, tree)
+          cut(path, tree, commit)
         end)
 
       case result do
@@ -590,11 +996,12 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  defp cut(path, %{shared?: true, path: tree}),
-    do: tree_result(Worktree.refresh_detached(path, tree))
+  # `commit` nil is the checkout's own; a verify run's is the pull request's head.
+  defp cut(path, %{shared?: true, path: tree}, commit),
+    do: tree_result(Worktree.refresh_detached(path, tree, commit))
 
-  defp cut(path, %{shared?: false, path: tree}),
-    do: tree_result(Worktree.create_detached(path, tree))
+  defp cut(path, %{shared?: false, path: tree}, commit),
+    do: tree_result(Worktree.create_detached(path, tree, commit))
 
   defp tree_result({:error, reason}), do: {:unreported, reason}
   defp tree_result({:error, reason, :tree_left}), do: {:tree_left, reason}
@@ -658,9 +1065,10 @@ defmodule LoopctlRunner.TriageRun do
     max_turns = max_turns(config, opts)
 
     argv =
-      TriageTools.claude_args(prompt, session_id, TriagePrompt.system_prompt(),
+      argv(template(opts), prompt, session_id,
         max_turns: max_turns,
-        model: Keyword.get(opts, :model)
+        model: Keyword.get(opts, :model),
+        mcp_args: Keyword.get(opts, :mcp_args, [])
       )
 
     # A Story only to satisfy what Session records about a run; nothing in the argv comes from it,
@@ -695,6 +1103,20 @@ defmodule LoopctlRunner.TriageRun do
     )
   end
 
+  # A `:draft` session's argv has no lenses and no tool list (`ReplyDraftPrompt.claude_args/3`); a
+  # `:judge` session's carries its lenses and the triage system prompt.
+  defp argv(%{id: "verify"}, prompt, session_id, args),
+    do: VerifyPrompt.claude_args(prompt, session_id, args)
+
+  defp argv(%{kind: "spec_tune"}, prompt, session_id, args),
+    do: SpecTunerPrompt.claude_args(prompt, session_id, args)
+
+  defp argv(%{archetype: :draft}, prompt, session_id, args),
+    do: ReplyDraftPrompt.claude_args(prompt, session_id, args)
+
+  defp argv(_template, prompt, session_id, args),
+    do: TriageTools.claude_args(prompt, session_id, TriagePrompt.system_prompt(), args)
+
   # What the run produced, judged in the order that tells the truth: a verdict the session wrote
   # is the answer even if the session then failed, because it stated it; only then does how the
   # session ended matter.
@@ -708,10 +1130,33 @@ defmodule LoopctlRunner.TriageRun do
   outcome belongs here, with the run, or the two answers drift and the second one to reach loopctl
   is refused permanently.
   """
-  @spec outcome_on_disk(String.t()) :: outcome()
-  def outcome_on_disk(run_dir), do: outcome(run_dir, nil)
+  @spec outcome_on_disk(String.t(), Templates.t() | nil) :: outcome()
+  def outcome_on_disk(run_dir, template \\ nil), do: outcome(run_dir, nil, template, [])
 
-  defp outcome(run_dir, session) do
+  # A `:draft` run's answer is the result its session's final message stated, and it wins over how
+  # the session ended for the same reason a verdict does: the session stated it. Without one, the
+  # session's ending says why, when it says more than "it finished" — but every such outcome is
+  # `{:no_result, _}` once `drafted/2` has read it, because nothing is sent for it.
+  defp outcome(
+         run_dir,
+         session,
+         %{result_event: "agent_result", id: id, version: version} = t,
+         opts
+       ) do
+    case stated_result(run_dir, t, session, opts) do
+      {:ok, result} ->
+        {:agent_result, {id, version}, result}
+
+      {:error, reason} ->
+        case session do
+          %{reason: :exited, exit_status: 0} -> {:no_result, detail(reason)}
+          nil -> {:no_result, detail(reason)}
+          ended -> drafted(incomplete(run_dir, ended), t)
+        end
+    end
+  end
+
+  defp outcome(run_dir, session, _template, _opts) do
     case TriageVerdict.read(run_dir) do
       {:ok, verdict} -> {:verdict, note_bare_escalation(verdict)}
       {:error, :none} -> incomplete(run_dir, session)
@@ -723,6 +1168,42 @@ defmodule LoopctlRunner.TriageRun do
       {:error, {:unreadable, reason}} -> unreadable(run_dir, reason)
     end
   end
+
+  # A verify result is the session's verdict at the head the RUNNER recorded checking out
+  # (`judged_head/5`), read from `state.json` so a run judged dead completes it the same way. No
+  # recorded head is no result: nothing the session says can stand in for it.
+  defp stated_result(run_dir, %{id: "verify", version: version}, _session, _opts) do
+    case RunState.read(run_dir) do
+      {:ok, %{"judged_head" => head}} when is_binary(head) ->
+        AgentResult.from_stdout(run_dir, {"verify", version},
+          complete: &VerifyResult.complete(&1, head)
+        )
+
+      _ ->
+        {:error, "the run recorded no head it checked out, so no verdict can name one"}
+    end
+  end
+
+  # A tuning run's result is the CRITIC's, built from the session's proposal by the eval harness
+  # (`SpecTune.critique/4`) — and only here, in the run that holds the session's end. A run read
+  # back from disk after it died (`outcome_on_disk/2`, no session) is never scored by whoever
+  # found it: scoring runs the harness, which is the run's work, not a supervisor's. Its result
+  # was recorded before its death or it has none, and then nothing is sent.
+  defp stated_result(_run_dir, %{kind: "spec_tune"}, nil, _opts),
+    do: {:error, "the tuning run ended before its critic scored the proposal"}
+
+  defp stated_result(run_dir, %{kind: "spec_tune", id: id, version: version}, _session, opts) do
+    context = Keyword.fetch!(opts, :spec_tune_context)
+    subject = Keyword.fetch!(opts, :spec_tune_subject)
+    eval_opts = Keyword.fetch!(opts, :critic_opts)
+
+    AgentResult.from_stdout(run_dir, {id, version},
+      complete: &SpecTune.critique(&1, subject, context, eval_opts)
+    )
+  end
+
+  defp stated_result(run_dir, %{id: id, version: version}, _session, _opts),
+    do: AgentResult.from_stdout(run_dir, {id, version})
 
   # Logged and SENT, never refused — `TriageVerdict.bare_escalation?/1` carries the argument. It is
   # said here because this is the one moment the runner holds the verdict and knows it is about to
@@ -815,10 +1296,13 @@ defmodule LoopctlRunner.TriageRun do
   # Guarded like everything else on this path, and skipped for a run with no dispatch to answer
   # (`execute/4` called without a binding): there is nobody to report to.
   # A run past its deadline owes no message: nothing is recorded for a restart to resend.
-  defp record(_run_dir, _binding, {:deadline_passed, _detail}), do: :ok
+  defp record(_run_dir, _binding, {:deadline_passed, _detail}, _template), do: :ok
 
-  defp record(run_dir, %{"dispatch_id" => _, "claim_epoch" => _} = binding, outcome) do
-    case TriageDispatch.verdict_message(binding, outcome) do
+  # A draft run with no result owes no message: `agent_result` has no incomplete form.
+  defp record(_run_dir, _binding, {:no_result, _detail}, _template), do: :ok
+
+  defp record(run_dir, %{"dispatch_id" => _, "claim_epoch" => _} = binding, outcome, template) do
+    case message(binding, outcome, template) do
       {:ok, payload} ->
         with {:error, reason} <- PendingVerdicts.write(run_dir, payload) do
           Logger.error("the triage run's outcome could not be recorded: #{inspect(reason)}")
@@ -836,16 +1320,33 @@ defmodule LoopctlRunner.TriageRun do
       Logger.error("the triage run's outcome could not be recorded: #{inspect({kind, reason})}")
   end
 
-  defp record(_run_dir, _binding, _outcome), do: :ok
+  defp record(_run_dir, _binding, _outcome, _template), do: :ok
+
+  # The one message the outcome states: a `:draft`'s agent_result, a `:judge`'s verdict.
+  defp message(binding, outcome, _template), do: message(binding, outcome)
+
+  @doc """
+  The one message `outcome` states for the dispatch `binding` names: a `:draft`'s `agent_result`,
+  a `:judge`'s `triage_verdict`. The SAME constructor the run records with and Control pushes
+  with, so a restart never rebuilds different bytes.
+  """
+  @spec message(map(), outcome()) :: {:ok, map()} | {:error, [String.t()]}
+  def message(binding, {:agent_result, key, result}),
+    do: AgentResult.message(binding, key, result)
+
+  def message(binding, outcome), do: TriageDispatch.verdict_message(binding, outcome)
 
   defp outcome_name({:deadline_passed, _}), do: "deadline_passed"
   defp outcome_name({:verdict, _}), do: "verdict"
   defp outcome_name({:incomplete, reason, _}), do: "incomplete:#{reason}"
   defp outcome_name({:error, _}), do: "failed"
+  defp outcome_name({:agent_result, _key, _result}), do: "agent_result"
+  # Recorded as FAILED: the run produced nothing loopctl can be told about.
+  defp outcome_name({:no_result, _}), do: "failed:no_result"
 
-  defp run_dir(config, record, run_id) do
+  defp run_dir(config, kind, record, run_id) do
     stamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%SZ")
-    dir = Path.join(config.runs_dir, "triage-#{record}-#{stamp}-#{binary_part(run_id, 0, 8)}")
+    dir = Path.join(config.runs_dir, "#{kind}-#{record}-#{stamp}-#{binary_part(run_id, 0, 8)}")
     File.mkdir_p!(dir)
     dir
   end

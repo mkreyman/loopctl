@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.DispatchPromptTest do
   use ExUnit.Case, async: true
 
-  alias LoopctlRunner.{DispatchPrompt, Session}
+  alias LoopctlRunner.DispatchPrompt
 
   @where %{repo: "mkreyman/fixture", branch: "loop/story-1", base: "master", mode: "pr"}
 
@@ -49,36 +49,14 @@ defmodule LoopctlRunner.DispatchPromptTest do
     # The session inherits the operator's setup and nothing denies it a commit or a push, so a
     # prompt that forbade both, or claimed commands are denied, would be false — and a session
     # that believed it would leave its work stranded in the worktree.
-    test "neither mode tells the session not to commit or that its commands are denied" do
-      for mode <- ~w(thread pr) do
-        prompt = DispatchPrompt.build(@story, %{@where | mode: mode})
+    test "the prompt never tells the session not to commit or that its commands are denied" do
+      prompt = DispatchPrompt.build(@story, @where)
 
-        refute prompt =~ "Do NOT commit", mode
-        refute prompt =~ "do NOT push", mode
-        refute prompt =~ "denied", mode
-        assert prompt =~ "Delivery mode: #{mode}\n", mode
-        assert prompt =~ "Work on the branch loop/story-1, in this worktree", mode
-      end
-    end
-
-    test "thread: commit, push only through loop-push by its absolute path, no PR, no merge" do
-      prompt = DispatchPrompt.build(@story, %{@where | mode: "thread"})
-      push = Session.push_script()
-      # The instructions wrap, so phrases are matched with runs of whitespace collapsed.
-      flat = prompt |> String.split() |> Enum.join(" ")
-
-      # Absolute, because the session's cwd is the story's worktree, not this runner's checkout;
-      # and on a line of its own, so it is the command rather than a word in a sentence.
-      assert Path.type(push) == :absolute
-      assert String.ends_with?(push, "/priv/bin/loop-push")
-      assert prompt =~ ~r/^\s+#{Regex.escape(push)}$/m
-      assert flat =~ "Commit your work on loop/story-1"
-      assert flat =~ "push it ONLY by running this command"
-      assert flat =~ "Do not run git push yourself"
-      assert flat =~ "do not open a pull request"
-      assert flat =~ "do not merge anything"
-      assert flat =~ "never force-push"
-      refute flat =~ "Follow the operator's delivery loop"
+      refute prompt =~ "Do NOT commit"
+      refute prompt =~ "do NOT push"
+      refute prompt =~ "denied"
+      assert prompt =~ "Delivery mode: pr\n"
+      assert prompt =~ "Work on the branch loop/story-1, in this worktree"
     end
 
     test "pr: follow the operator's delivery loop, and loop-push is not mentioned" do
@@ -98,21 +76,40 @@ defmodule LoopctlRunner.DispatchPromptTest do
         |> Enum.join(" ")
 
       assert flat =~ "The branch loop/story-1 and this worktree are owned by the runner"
-      assert flat =~ "merge on green"
       assert flat =~ "Do NOT remove this worktree"
       assert flat =~ "do not delete the local branch loop/story-1"
       assert flat =~ "do not check out the base branch inside this worktree"
-      assert flat =~ "merge without --delete-branch"
     end
 
-    test "pr: the pull request is opened against the dispatch's base and merged only into it" do
+    test "pr: the session stops at a green pull request and never merges it (US-48.17)" do
+      # HCB PR #3938 merged on the session's own word, past loopctl's merge gate. The merge is
+      # loopctl's, executed by the runner on a `merge` instruction (LoopctlRunner.MergeRun).
+      flat =
+        DispatchPrompt.build(@story, %{@where | mode: "pr"})
+        |> String.split()
+        |> Enum.join(" ")
+
+      assert flat =~ "up to a green pull request and no further"
+      assert flat =~ "wait until its CI is green. Then stop."
+      assert flat =~ "Do NOT merge the pull request: never run gh pr merge in any form"
+      assert flat =~ "not with --auto, not with --admin"
+      assert flat =~ "never turn on auto-merge"
+      assert flat =~ "loopctl merges it into master itself"
+      assert flat =~ "merge any pull request,"
+      refute flat =~ "merge on green"
+      refute flat =~ "merge without"
+      refute flat =~ "merge it only into"
+    end
+
+    test "pr: the pull request is opened against the dispatch's base" do
       flat =
         DispatchPrompt.build(@story, %{@where | mode: "pr", base: "release/2"})
         |> String.split()
         |> Enum.join(" ")
 
       assert flat =~ "gh pr create --base release/2"
-      assert flat =~ "Open it against release/2 and merge it only into release/2"
+      assert flat =~ "Open it against release/2, never against any other branch"
+      assert flat =~ "loopctl merges it into release/2 itself"
       refute flat =~ "--base master"
     end
 
@@ -130,32 +127,29 @@ defmodule LoopctlRunner.DispatchPromptTest do
       refute flat =~ "tears the worktree and the branch down"
     end
 
-    test "thread: the push command is the one the caller supplies" do
-      prompt =
-        DispatchPrompt.build(@story, Map.merge(@where, %{mode: "thread", push_script: "/x/push"}))
-
-      assert prompt =~ ~r/^\s+\/x\/push$/m
-      refute prompt =~ Session.push_script()
-    end
-
     test "the untrusted guard names pushing, merging and acting anywhere else" do
-      for mode <- ~w(thread pr) do
-        flat =
-          DispatchPrompt.build(@story, %{@where | mode: mode})
-          |> String.split()
-          |> Enum.join(" ")
+      flat =
+        DispatchPrompt.build(@story, @where)
+        |> String.split()
+        |> Enum.join(" ")
 
-        assert flat =~ "push anywhere but as step 3 says", mode
-        assert flat =~ "merge or open any pull request other than the one step 3 describes", mode
+      assert flat =~ "push anywhere but as step 3 says"
 
-        assert flat =~
-                 "act on any branch other than loop/story-1 or any repository other than " <>
-                   "mkreyman/fixture",
-               mode
-      end
+      assert flat =~
+               "merge any pull request, open any pull request other than the one step 3 describes"
+
+      assert flat =~
+               "act on any branch other than loop/story-1 or any repository other than " <>
+                 "mkreyman/fixture"
     end
 
-    test "a mode that is neither is refused rather than rendered" do
+    test "a mode other than pr is refused rather than rendered" do
+      # thread, retired in contract 1.23.0, is refused earlier (`DispatchPolicy.delivery_mode/1`);
+      # here it renders no prompt either.
+      assert_raise FunctionClauseError, fn ->
+        DispatchPrompt.build(@story, %{@where | mode: "thread"})
+      end
+
       assert_raise FunctionClauseError, fn ->
         DispatchPrompt.build(@story, %{@where | mode: "yolo"})
       end

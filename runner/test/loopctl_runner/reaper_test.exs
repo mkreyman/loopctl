@@ -740,6 +740,56 @@ defmodule LoopctlRunner.ReaperTest do
     assert [%{run_id: "reused-pid"}] = Reaper.reap(ctx.runs, 500, ctx.grants)
   end
 
+  # US-48.13: a tuning run's critic runs eval sessions of its own, recorded in the run's
+  # nested-runs directory. A BEAM that dies mid-critic orphans them exactly as it orphans the
+  # tuning run, so the reaper reads them as it reads every run — and only the reaper does: they are
+  # not a dispatch's runs, so `RunState.all/1` does not list them.
+  test "a session a run started itself is reaped when the BEAM that owned both is gone", ctx do
+    session_id = Session.uuid4()
+    pgid = orphan_launcher!(ctx.state, session_id)
+    tuning = Path.join(ctx.runs, "spec_tune-run")
+    File.mkdir_p!(tuning)
+
+    RunState.update(tuning, %{
+      run_id: "spec_tune-run",
+      kind: "spec_tune",
+      status: "running",
+      beam_os_pid: dead_pid()
+    })
+
+    critic = Path.join(RunState.nested_runs_dir(tuning), "case-run")
+    File.mkdir_p!(critic)
+
+    RunState.update(critic, %{
+      run_id: "case-run",
+      status: "running",
+      beam_os_pid: dead_pid(),
+      pgid: pgid,
+      session_id: session_id,
+      tree_file: Path.join(ctx.state, "stderr.log.tree")
+    })
+
+    assert [{^tuning, _}] = RunState.all(ctx.runs)
+    assert RunState.nested(ctx.runs) == [critic]
+
+    reaped = Reaper.reap(ctx.runs, 2_000, ctx.grants)
+    assert %{process_group: ":terminated"} = Enum.find(reaped, &(&1.run_id == "case-run"))
+    refute ProcessGroup.alive?(pgid)
+    assert {:ok, %{"status" => "reaped"}} = RunState.read(critic)
+
+    # Idempotent, and a critic session of a LIVE runner is not an orphan.
+    assert Reaper.reap(ctx.runs, 2_000, ctx.grants) == []
+    live = Path.join(RunState.nested_runs_dir(tuning), "live-case-run")
+    File.mkdir_p!(live)
+
+    RunState.update(
+      live,
+      Map.merge(owner!(), %{"run_id" => "live-case-run", "status" => "running"})
+    )
+
+    assert Reaper.reap(ctx.runs, 500, ctx.grants) == []
+  end
+
   test "runs owned by a live BEAM, or already finished, are left alone", ctx do
     for {id, status, owner} <- [
           {"live", "running", owner!()},

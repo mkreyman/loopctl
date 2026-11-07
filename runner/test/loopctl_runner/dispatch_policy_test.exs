@@ -211,19 +211,31 @@ defmodule LoopctlRunner.DispatchPolicyTest do
     assert reason(decide(ctx, %{@dispatch | "base_branch" => "-x"})) == "branch_not_allowed"
   end
 
-  test "review and triage are held to plain ref names only, never to the prefixes", ctx do
-    # Neither writes its `branch`: a review fetches the implementer's, and loopctl sends a
-    # triage with the BASE as its branch, run on a detached tree. On 2026-11-06 minis
-    # (prefixes ["loop/"]) refused every triage dispatch `master is outside ["loop/"]`.
-    for kind <- ["review", "triage"] do
-      assert {:accept, _} = decide(ctx, %{@dispatch | "kind" => kind, "branch" => "master"})
+  test "triage is held to plain ref names only, never to the prefixes", ctx do
+    # It never writes its `branch`: loopctl sends a triage with the BASE as its branch, run on a
+    # detached tree. On 2026-11-06 minis (prefixes ["loop/"]) refused every triage dispatch
+    # `master is outside ["loop/"]`.
+    assert {:accept, _} = decide(ctx, %{@dispatch | "kind" => "triage", "branch" => "master"})
 
-      assert reason(decide(ctx, %{@dispatch | "kind" => kind, "branch" => "loop/../master"})) ==
-               "branch_not_allowed"
-    end
+    assert reason(decide(ctx, %{@dispatch | "kind" => "triage", "branch" => "loop/../master"})) ==
+             "branch_not_allowed"
+
+    # A retired review kind has no exemption left to claim.
+    assert reason(decide(ctx, %{@dispatch | "kind" => "review", "branch" => "master"})) ==
+             "branch_not_allowed"
 
     # The branches this machine DOES write stay inside its prefixes.
     assert reason(decide(ctx, %{@dispatch | "branch" => "master"})) == "branch_not_allowed"
+  end
+
+  test "reply_draft (:draft) is exempt from the prefixes too, and still held to plain refs",
+       ctx do
+    # US-48.9: a draft writes no branch at all — loopctl names the base for both refs.
+    draft = %{@dispatch | "kind" => "reply_draft", "branch" => "master"}
+    assert {:accept, _} = decide(ctx, draft)
+
+    assert reason(decide(ctx, %{draft | "branch" => "loop/../master"})) == "branch_not_allowed"
+    assert reason(decide(ctx, %{draft | "base_branch" => "-x"})) == "branch_not_allowed"
   end
 
   test "wall clock and turns over this runner's own limits are refused", ctx do
@@ -269,22 +281,27 @@ defmodule LoopctlRunner.DispatchPolicyTest do
   end
 
   describe "delivery_mode/1" do
-    test "thread and pr, after a byte-order mark, whitespace and case are set aside" do
-      for raw <- ["thread", "thread\n", "  Thread \r\n", "\uFEFFthread\n", "THREAD"] do
-        assert DispatchPolicy.delivery_mode({:ok, raw}) == {:ok, "thread"}, inspect(raw)
-      end
-
-      for raw <- ["pr", "PR\n", "\uFEFF pr "] do
+    test "pr, after a byte-order mark, whitespace and case are set aside" do
+      for raw <- ["pr", "PR\n", "\uFEFF pr ", "  Pr \r\n"] do
         assert DispatchPolicy.delivery_mode({:ok, raw}) == {:ok, "pr"}, inspect(raw)
       end
     end
 
-    test "no file refuses: pr merges on its own, and a repository that never opted in did not ask" do
+    test "thread is refused as retired, however it is spelled" do
+      # loopctl retired change threads in contract 1.23.0: nothing merges a thread session's pushes.
+      for raw <- ["thread", "thread\n", "  Thread \r\n", "\uFEFFthread\n", "THREAD"] do
+        assert {:refuse, "other", detail} = DispatchPolicy.delivery_mode({:ok, raw}), inspect(raw)
+        assert detail =~ "delivery mode thread in .loopctl/mode was retired"
+        assert detail =~ "set it to pr"
+      end
+    end
+
+    test "no file refuses: pr merges unattended, and a repository that never opted in did not ask" do
       assert DispatchPolicy.delivery_mode(:absent) ==
                {:refuse, "other", "repository has no .loopctl/mode"}
     end
 
-    test "an empty file refuses too: only an explicit thread or pr runs" do
+    test "an empty file refuses too: only an explicit pr runs" do
       for raw <- ["", "\n", "\uFEFF  \n"] do
         assert {:refuse, "other", detail} = DispatchPolicy.delivery_mode({:ok, raw}), inspect(raw)
         assert detail =~ "malformed delivery mode \"\" in .loopctl/mode"
@@ -304,43 +321,6 @@ defmodule LoopctlRunner.DispatchPolicyTest do
     test "a mode that could not be read refuses too" do
       assert {:refuse, "other", detail} = DispatchPolicy.delivery_mode({:error, "too large"})
       assert detail =~ "could not be read: too large"
-    end
-  end
-
-  describe "push_helper/2" do
-    setup do
-      {:ok, dir: tmp_dir!("push-helper")}
-    end
-
-    test "a thread session needs an executable push helper", %{dir: dir} do
-      helper = Path.join(dir, "loop-push")
-
-      assert {:refuse, "other", "push helper missing: " <> _} =
-               DispatchPolicy.push_helper("thread", helper)
-
-      File.write!(helper, "#!/bin/sh\n")
-      File.chmod!(helper, 0o644)
-      assert {:refuse, "other", _} = DispatchPolicy.push_helper("thread", helper)
-
-      File.chmod!(helper, 0o755)
-      assert DispatchPolicy.push_helper("thread", helper) == :ok
-    end
-
-    test "a pr session does not", %{dir: dir} do
-      assert DispatchPolicy.push_helper("pr", Path.join(dir, "absent")) == :ok
-    end
-  end
-
-  describe "checkpoint_reporting/2" do
-    test "a thread session needs a checkpoint reporter this build has" do
-      assert DispatchPolicy.checkpoint_reporting("thread", LoopctlRunner.NoSuchReporter) ==
-               {:refuse, "other", "checkpoint reporting not available"}
-
-      assert DispatchPolicy.checkpoint_reporting("thread", DispatchPolicy) == :ok
-    end
-
-    test "a pr session does not" do
-      assert DispatchPolicy.checkpoint_reporting("pr", LoopctlRunner.NoSuchReporter) == :ok
     end
   end
 end

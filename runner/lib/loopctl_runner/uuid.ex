@@ -5,8 +5,7 @@ defmodule LoopctlRunner.Uuid do
   `valid?/1` is the contract's `format: uuid`, in either case: an id loopctl sends, or one this
   runner minted, checked before it names a file, a directory or a glob. `lowercase?/1` is the
   stricter reading, for a value that is only ever written lowercase and whose uppercase spelling
-  would therefore be a different string naming the same thing: the operator's `runner_id`, and a
-  checkpoint id a finding's `introduced_by` names.
+  would therefore be a different string naming the same thing: the operator's `runner_id`.
   """
 
   @doc "Whether `value` is a uuid, in either case."

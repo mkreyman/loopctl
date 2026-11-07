@@ -408,7 +408,16 @@ defmodule LoopctlRunner.ProcessGroup do
             end
       ])
 
-    {:os_pid, os_pid} = Port.info(port, :os_pid)
+    # A command that is done before this line runs (a fast `gh`/`git` answer on a loaded machine)
+    # has already closed its Port, and `Port.info/2` is nil for a closed one. Its output and its
+    # `exit_status` were sent before the close, so they are in this mailbox and `collect/5` reads
+    # them; only the kill on expiry needs the pid, and a Port already gone has nothing to kill.
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, os_pid} -> os_pid
+        nil -> nil
+      end
+
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     collect(port, os_pid, deadline, [], Keyword.get(opts, :term_grace_ms, 0))
   end
@@ -446,14 +455,17 @@ defmodule LoopctlRunner.ProcessGroup do
       {^port, {:exit_status, status}} -> {:ok, IO.iodata_to_binary(acc), status}
     after
       remaining ->
-        target = if leader?(os_pid), do: "-#{os_pid}", else: "#{os_pid}"
-
-        unless grace_ms > 0 and terminated?(port, target, grace_ms) do
-          System.cmd("kill", ["-KILL", "--", target], stderr_to_stdout: true)
-          await_exit(port, System.monotonic_time(:millisecond) + 2_000)
-        end
-
+        if os_pid, do: kill_expired(port, os_pid, grace_ms)
         {:error, :timeout}
+    end
+  end
+
+  defp kill_expired(port, os_pid, grace_ms) do
+    target = if leader?(os_pid), do: "-#{os_pid}", else: "#{os_pid}"
+
+    unless grace_ms > 0 and terminated?(port, target, grace_ms) do
+      System.cmd("kill", ["-KILL", "--", target], stderr_to_stdout: true)
+      await_exit(port, System.monotonic_time(:millisecond) + 2_000)
     end
   end
 

@@ -1,0 +1,12 @@
+{
+  "verdict": {
+    "outcome": "escalate",
+    "confidence": "medium",
+    "escalation_reasons": ["workflow_change_not_defect_fix", "total/1 returning a number is its intended behaviour; emailing the operator is a new workflow, not a fix"],
+    "lens_verdicts": [
+      {"lens": "analyst", "outcome": "escalate", "confidence": "high", "escalation_reasons": ["workflow_change_not_defect_fix"]},
+      {"lens": "architect", "outcome": "story", "confidence": "medium", "escalation_reasons": []},
+      {"lens": "engineer", "outcome": "story", "confidence": "medium", "escalation_reasons": []}
+    ]
+  }
+}

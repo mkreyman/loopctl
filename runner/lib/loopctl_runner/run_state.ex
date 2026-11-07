@@ -34,6 +34,26 @@ defmodule LoopctlRunner.RunState do
     end)
   end
 
+  # The runs a run starts ITSELF, recorded inside its own directory: a tuning run's critic sessions
+  # (US-48.13), each an eval case's whole run with its own state.json, process group and tree. One
+  # level below the run, never beside it, so nothing that reads `all/1` — Control's restart, trace
+  # shipping, the run count — mistakes one for a dispatch's run; the reaper is what reads them
+  # (`nested/1`), because a BEAM that dies mid-critic leaves their sessions as orphaned as its own.
+  @nested "nested-runs"
+
+  @doc "The directory the runs `run_dir`'s run starts itself are recorded in."
+  @spec nested_runs_dir(String.t()) :: String.t()
+  def nested_runs_dir(run_dir), do: Path.join(run_dir, @nested)
+
+  @doc "Every run directory a run under `runs_dir` started itself (`nested_runs_dir/1`), in path order."
+  @spec nested(String.t()) :: [String.t()]
+  def nested(runs_dir) do
+    runs_dir
+    |> Path.join("*/#{@nested}/*/state.json")
+    |> Path.wildcard()
+    |> Enum.map(&Path.dirname/1)
+  end
+
   @doc """
   Records that the run at `run_dir` now owns the worktree at `path`.
 

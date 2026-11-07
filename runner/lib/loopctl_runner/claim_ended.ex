@@ -5,7 +5,7 @@ defmodule LoopctlRunner.ClaimEnded do
   not a run of the claim has a directory yet, and read by name.
 
   Everything that must honour the end reads it: a run immediately before it starts its session
-  (`LoopctlRunner.Run`, `LoopctlRunner.TriageRun`, `LoopctlRunner.ReviewRun`), so a claim that
+  (`LoopctlRunner.Run`, `LoopctlRunner.TriageRun`), so a claim that
   ended before its session existed never starts one; a Control starting over, which stops any
   session of such a claim still running (`all/1`); and what would otherwise send that dispatch's
   work — a restarted stream, a triage verdict.

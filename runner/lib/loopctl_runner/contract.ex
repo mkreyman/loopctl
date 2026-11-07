@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.22.0).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.30.0).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
@@ -289,6 +289,11 @@ defmodule LoopctlRunner.Contract do
   @untrusted_leaves ~w(untrusted detail)
   @verdict_definition "runnertriageverdict"
   @verdict_property "verdict"
+  # An `agent_result`'s `result` (1.25.0) is the session's own statement, composed by a draft
+  # session that had just read the reporter's words, so every leaf under it is untrusted too —
+  # as the result validated alone (`LoopctlRunner.AgentResult`, path `result`) and inside the
+  # message. Its envelope (`dispatch_id`, `claim_epoch`, `spec`) is loopctl's and still shown.
+  @result_property "result"
 
   defp shown(value, path) do
     segments = path |> String.downcase() |> String.split(".")
@@ -304,7 +309,8 @@ defmodule LoopctlRunner.Contract do
   defp untrusted_path?(segments) do
     List.last(segments) in @untrusted_leaves or
       List.first(segments) == @verdict_definition or
-      @verdict_property in segments
+      @verdict_property in segments or
+      @result_property in segments
   end
 
   defp codepoints(value), do: value |> String.codepoints() |> length()

@@ -13,8 +13,28 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.22.0. It
-declares `implement`, `review` and `triage`. A triage session dispatches three read-only lenses,
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.30.0. It
+declares every kind the contract dispatches, the list `@kinds` in `LoopctlRunner.Control`
+(`LoopctlRunner.Control.kinds/0`), which includes `spec_tune` (template `spec_tuner@1`,
+US-48.13). A
+`verify` session (template `verify@1`, a `:judge`, contract 1.28.0) judges a pull request at
+the head loopctl names: the runner fetches that commit, cuts a detached tree at it, and the
+session reviews the diff against the story's acceptance criteria and ends with one fenced JSON
+`{"verdict": "pass" | "reject", "findings": [...]}` block. The runner adds the head it actually
+checked out and sends it as `agent_result`; a block that does not parse, a `pass` carrying
+findings, or a head that does not match sends nothing (`LoopctlRunner.VerifyPrompt`,
+`LoopctlRunner.VerifyResult`). It never pushes, comments, merges or reports custody: loopctl
+applies the verdict under its own verifier dispatch. Because its cwd is the implementer's tree, it
+alone runs with `--setting-sources user`: the operator's user-scoped setup applies, and the pull
+request's own `CLAUDE.md`, `.claude/` settings, hooks, agents and skills, and `.mcp.json` do not.
+The repository's rules reach it from the base instead: `CLAUDE.md` as `origin/<base>` holds it,
+in the prompt, up to 32 KiB (`LoopctlRunner.VerifyPrompt.base_rules/2`). A
+`reply_draft` session (template `reply_draft@1`, a `:draft`, contract 1.26.0) runs on triage's
+detached tree, reads the code (nothing it does there is pushed), writes a reply to the reporter that a person reviews
+before anything is sent, and ends with one fenced JSON `{"body": ...}` block. The runner checks
+that block against the spec's schema (non-blank, at most 3000 characters, no other key) and
+sends it as `agent_result`; a draft that fails the check sends nothing and the run counts as
+failed (`LoopctlRunner.ReplyDraftPrompt`, `LoopctlRunner.AgentResult`). A triage session dispatches three read-only lenses,
 each ending its report with its own outcome and confidence, and states one verdict with the
 per-lens `lens_verdicts` (contract 1.15.0) beside it, which is what Gate A reads
 (`LoopctlRunner.TriagePrompt`, `LoopctlRunner.TriageVerdict`). Lens verdicts that fail the
@@ -23,31 +43,48 @@ contract are dropped rather than the verdict, which loopctl then escalates.
 The daemon has a dispatch accept path, off by default. With `control.accepts_dispatches` false
 (the default) it reports `draining: true` and refuses every `dispatch` with `dispatches_disabled`.
 With it true, a dispatch passes the local allow-list (`LoopctlRunner.DispatchPolicy`: draining,
-capacity, free disk, repo, branch prefix, wall clock, turns, token budget), must be an `implement`
-dispatch, and must carry a well-formed `story` object (typed on the dispatch since contract 1.5.0); anything
+capacity, free disk, repo, branch prefix, wall clock, turns, token budget), must be of a kind this
+runner declares, and an `implement` or `verify` dispatch must carry a well-formed `story` object (typed on the dispatch since contract 1.5.0); anything
 else is refused
 with a reason. An accepted dispatch runs `claude -p` in a worktree on the dispatch's branch, with a
 prompt built from a fixed local template in which every story field is fenced as untrusted data.
 The session runs `--permission-mode bypassPermissions` and inherits the operator's user-scoped
 Claude setup — the same authority and the same rules a locally dispatched agent has. It implements
 and tests, then finishes as the repository's delivery mode says, which the prompt states. The mode
-is `.loopctl/mode` in the commit the worktree was cut from, never the working tree's: in a `thread`
-repository it commits and pushes through `priv/bin/loop-push` and opens no PR, and loopctl's merge
-executor merges; with `pr` it runs the operator's delivery loop — a PR opened with `gh pr create
---base <base>`, review, merge into that base only — leaving the worktree and the branch, which are
-the runner's, for the runner to remove once the branch has shipped. A repository with no
+is `.loopctl/mode` in the commit the worktree was cut from, never the working tree's, and the one
+mode is `pr`: the session runs the operator's delivery loop up to an open pull request — a PR
+opened with `gh pr create --base <base>` and reviewed — and never merges it (US-48.17; its prompt
+says so). The merge is loopctl's: once its merge gate allows a head, it sends a `merge`
+instruction, and the runner carries out exactly that one (`LoopctlRunner.MergeRun`, `gh pr merge
+--squash --match-head-commit`). The session leaves the worktree and the branch, which are the
+runner's, for the runner to remove once the branch has shipped. A repository with no
 `.loopctl/mode`, an empty one or any other value is refused before a session starts
-(`repository has no .loopctl/mode` for the first): only an explicit `thread` or `pr` runs.
-**Thread mode needs PR #60 (`priv/bin/loop-push`) and then PR #59 (checkpoint reporting)**: until
-both land a thread-mode run is refused `push helper missing` or `checkpoint reporting not
-available`. Teardown removes a shipped branch's worktree by merged content. The runner itself
+(`repository has no .loopctl/mode` for the first): only an explicit `pr` runs. A repository that
+still says `thread` is refused naming the retirement: loopctl removed change threads in contract
+1.23.0, so nothing would merge what a thread session pushed. Teardown removes a shipped branch's worktree by merged content. The runner itself
 commits nothing. The session inherits the environment an attended session has, except the runner's own release environment and
 `ANTHROPIC_API_KEY` (a billing control).
 
-Each accepted run reports the two delivery stages the runner observes (`stage`): `claimed ->
-worktree` and `worktree -> implementing`. The stages after that are the session's to report,
-because the session delivers. However the run ends, the runner then reports the SESSION's end with
-`session_ended` (contract 1.16.0): `completed` for a session that exited 0 on its own,
+Each accepted run reports the delivery stages the runner observes (`stage`): `claimed ->
+worktree` and `worktree -> implementing` as they happen, and, for a pr-mode implement session,
+what the forge says of its pull request once the session is over (US-48.16). Before its
+`session_ended`, however the session ended, the runner asks
+`gh pr list --repo <repo> --head <branch> --base <base> --state all --limit 5 --json
+number,state,headRefName,headRefOid,baseRefName,isCrossRepository,mergeCommit,mergedAt,statusCheckRollup`
+(bounded at 30 s, with `GH_TOKEN`/`GITHUB_TOKEN` let through and prompts off) and reports, over
+edge `forward`, in order and only as far as it saw: `-> reviewing` and `-> pr_open` (`pr_number`,
+`head_sha`) for an open or merged PR from this repo's branch into that base, `-> ci` (`head_sha`)
+once every check on it is green or it merged, and `-> merged` (`merge_sha`) once it merged. The
+newest matching PR decides; a closed-unmerged PR, a fork's PR, or no PR reports nothing more. A
+stage loopctl already holds is skipped, not re-sent; a refusal stops the rest, logged and not
+retried; a forge that fails or times out reports nothing more and logs a warning. The stages are
+written to the run's `state.json` before they are sent, so a restarted runner sends them too.
+Thread, triage, review and reply-draft runs report none of this. Anything else past
+`implementing` is the session's to report. However the run ends, the runner then reports the
+SESSION's end with `session_ended` (contract 1.16.0), carrying since 1.27.0 `turns_used` (the
+CLI's last result line's `num_turns`) and `work_left_behind` (`git rev-list --count <branch> --not
+--remotes=origin` in the worktree before teardown, on the local remote-tracking refs, no fetch:
+non-zero is true), each omitted when the runner could not tell: `completed` for a session that exited 0 on its own,
 `wall_clock_exceeded` or `max_turns_exceeded` for one that hit that budget, and `crashed` for any
 other end — a non-zero exit, a park, a run that died. Control decides the story's next stage from
 that reason. `-> escalated` (edge `session_escalated`) is reported only where it is the truth: for
@@ -156,7 +193,8 @@ What the log says in each failure:
 | a metric cannot be read | `health sample omitted: cannot read <metric>`, once, until `health sample readable again` |
 | a dispatch arrives | `dispatch <id> received`, then either `dispatch <id> refused (<reason>): <detail>` and `dispatch_reply sent: refused (<reason>)`, or `dispatch <id> accepted: run of story-<story_id> starts once loopctl records it` and `dispatch_reply sent: accepted`; then `loopctl recorded the dispatch_reply`, all with `dispatch_id`, `story_id` and `claim_epoch` |
 | a dispatch is refused `other` | `the dispatch carries no story`, `the dispatch story <field> ...` for a malformed story, or `the dispatch does not make a runnable story: ...` |
-| a dispatch names a kind this runner does not declare | refused `kind_not_supported`, detail `this runner runs only: implement, review, triage`. Every kind the vendored contract dispatches is declared, so today a kind outside it is refused `other` by validation first |
+| a dispatch names a kind this runner does not declare | refused `kind_not_supported`, detail `this runner runs only: ` followed by `LoopctlRunner.Control.kinds/0` joined with `, `, judged before the dispatch is validated: a `review` dispatch (the kind contract 1.23.0 retired) draws this, as any other unknown string kind does. A `kind` that is not a string is malformed and refused `other` |
+| a restart finds an unreported run of a retired kind | `the unreported end of dispatch <id>'s review run (<run_dir>) is not sent: this runner no longer runs review`, once; the run is recorded `terminal_reported: retired_kind` and never reported |
 | a dispatch arrives again | `dispatch <id> was already accepted and started here; answering accepted again, starting nothing`; a different `claim_epoch` is refused `other` |
 | an accepted run moves | `stage report sent: claimed -> worktree`, then `loopctl recorded the stage claimed -> worktree`, and the same for `worktree -> implementing`. Reports outstanding when the channel closes are resent after the rejoin |
 | an accepted run ends | `session_ended sent: <reason>`, then `loopctl recorded session_ended (<reason>)` — with `; it was a resend, and loopctl applied nothing a second time` on a replay. A session that escalated first reports `-> escalated` with edge `session_escalated` and reason `run ended escalated; session exit reason ...; the session escalated: <text>`; a run with no session reports only that `-> escalated`, naming its status |
@@ -187,8 +225,11 @@ and `stderr.log`, plus `trace_ship.json` once its trace is fully shipped or give
 ### Per-repo session environment
 
 `session_env` in the runner config adds environment variables to every session for one repo, e.g.
-`{"home_care_billing": {"TEST_DB_BASE": "home_care_billing_loop_{story}_test"}}`, so a branch's
-migration never touches the checkout's test database. In a value, `{story}` becomes 8 hex of a hash
+`{"home_care_billing": {"TEST_DB_BASE": "hcb_loop_{story}"}}`, so a branch's
+migration never touches the checkout's test database. Keep such a name as short as the repo's own
+default: home_care_billing appends a worktree partition and its race lane a pid to `TEST_DB_BASE`,
+and budgets 22 bytes for it against Postgres's 63 (`lib/mix/tasks/hcb.test.partitioned.ex`), so the
+longer `home_care_billing_loop_{story}_test` made its push gate refuse every loop push. In a value, `{story}` becomes 8 hex of a hash
 of the story id, stable across that story's runs, and `{run}` the first 8 hex of the run id. Prefer
 `{story}`: nothing drops what a session creates, so `{run}` leaves a new database behind on every
 run, while `{story}` reuses one per story, as the story's worktree is reused. Names the runner sets
@@ -210,6 +251,63 @@ through a Port, writes `trace.ndjson`, `stdout.ndjson`, `stderr.log` and `state.
 run directory, stops the session on its wall-clock budget or when it is parked, and removes the
 worktree unless it holds work — or repositories of its own. It prints one JSON summary line and
 exits 0 on success, 1 on a failed session, 2 on a refusal.
+
+### Eval harness (US-48.10)
+
+```bash
+mix loopctl_runner.eval triage@1                    # one spec version
+mix loopctl_runner.eval reply_draft                 # every version of a spec
+mix loopctl_runner.eval implement@1 --keep-scratch  # keep the built fixture and run dirs
+mix loopctl_runner.eval triage@1 --cli test/support/bin   # offline, on the suite's fake CLI
+```
+
+A case is `eval/<spec>@<version>/<case>.json`: the `RunnerDispatch` loopctl would send (`input`),
+the fixture it runs against (`fixture`), and what must hold of the result (`expectations`:
+`schema_valid`, `outcomes_allowed`, `escalation_codes`, `lens_agreement`, `forbidden`,
+`screens`, `rubric`). `LoopctlRunner.Eval.Case` documents the shape and refuses a case that
+breaks it. Each case goes through the runner's own launcher and session path, the same
+`Run`/`TriageRun` a dispatch reaches, with no control socket: nothing connects to loopctl. The
+message is read off disk and built with the runner's own builders, as the daemon would have
+pushed it.
+
+The harness only checks out fixtures: `eval/fixtures/<name>.json` manifests that build a
+deterministic git repo (fixed author, dates and contents, so the same manifest always builds the
+same sha). A case whose `fixture.repo` resolves outside `eval/fixtures` or the run's scratch
+directory, symlinks included, refuses the whole run before any case runs. verify@1 judges a pull
+request, so its cases use `tiny_app_pr`, whose history runs past a case's base: the base is the
+case's `fixture.commit`, the head the one its `input.verify.head_sha` names, and its outcome is
+the verdict (`pass` or `reject`), not `agent_result`.
+
+Results go to `eval/results/<spec>@<version>/<case>.json` (`--results-dir` to move them) in the
+format loopctl replays through its screens: `format`, `spec`, `case`, `machine`, `recorded_at`,
+`input`, `event`, `message`, `runner_outcome`, `expected`. The task prints a table and exits
+non-zero naming every failing case. `rubric` is never scored; the table says
+`rubric unjudged` for a person to read the result. `screens` names the loopctl screens the
+recorded message is expected to trip (`gate_a`, `gate_b`, `draft_injection`,
+`draft_dispatchable` for triage; `injection_detector_draft` for reply_draft; none for implement).
+Triage and reply cases dispatch against `acme/widgets`, the repo loopctl's tests configure, so
+Gate B replays them cleanly.
+
+`--cli <dir>` puts a fake `claude` first on the session's PATH (through the repo's session
+environment, not this process's) and plays `eval/offline/<spec>@<version>/<case>.json`. The
+committed files under `eval/results/` were recorded that way, and their `machine` says so.
+Without `--cli` the real CLI runs, which is a paid model call.
+
+**implement@1 results are machine-dependent.** A build session runs the fixture's own
+`mix test` on whatever Elixir, OTP and toolchain the machine has, so its outcome depends on the
+machine as much as on the model. `machine` records the hostname for that reason: compare
+implement results only across runs from the same machine. loopctl does not replay them.
+
+**An eval session loads no MCP server.** Every session the harness launches gets
+`--strict-mcp-config --mcp-config <scratch>/mcp-none.json`, a file holding `{"mcpServers":{}}`
+(`LoopctlRunner.Session.mcp_isolation/1`). This is the one place the runner overrides the MCP
+set, for AC-48.10.5, which says an eval never reaches the production socket. The operator's
+loopctl MCP entry names its own `LOOPCTL_SERVER` and keys in its `env`, so no session
+environment could redirect it: the only way to keep an eval session off production loopctl is
+not to load that server. It applies to evals only. A dispatched session's argv carries no MCP
+flag (the builders' `:mcp_args` option defaults to `[]`, and nothing on the dispatch path sets
+it), so dispatched sessions keep the operator's MCP set as the posture rule in CLAUDE.md
+requires. An eval session still inherits the rest of `~/.claude`.
 
 ## Why this repo is private, and what would make it public
 

@@ -62,7 +62,7 @@ never as a query parameter. Rotating that key through `/api_keys` is refused; ro
 `DELETE /api/v1/runners/:id` and re-enrolling.
 
 **Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
-(`contract_version` 1.22.0), vendored into this repo rather than re-typed. The join payload must
+(`contract_version` 1.30.0), vendored into this repo rather than re-typed. The join payload must
 declare `machine` exactly equal to the enrolled name. It SHOULD also declare `kinds`, the
 dispatch kinds this machine runs: the field is optional, and since 1.6.0 a PRESENT AND NON-EMPTY
 one is the only thing loopctl consults for that runner. Absent or empty is read as
@@ -295,20 +295,20 @@ one night, KB `b38ef90e`), not part of anyone's Claude setup.
 session runs, or for an adopted tree the merge base of its HEAD and the base — read once the tree
 is cut and never from the working tree, which the session can write, nor from an unfetched remote
 ref, which can differ from what the tree holds; the read is bounded and opens nothing on disk. A
-byte-order mark, surrounding whitespace and case are set aside. `thread` means commit, push only
-through `priv/bin/loop-push` (fetch first, merge origin's commits, never force; it pushes only the
-branch `LOOP_BRANCH` names), open no pull request and merge nothing, because loopctl's merge
-executor merges the checkpoints the runner reports. `pr` means the operator's delivery loop, which
-the session inherits with his setup, with the pull request opened against the dispatch's base
-(`gh pr create --base <base>`) and merged only into it — except that the branch and the worktree
-are the runner's, so the session removes neither, checks the base out in neither, and merges
-without `--delete-branch`. **Nothing else runs, absence included**: a repository with no
-`.loopctl/mode` is refused `repository has no .loopctl/mode`, because `pr` merges autonomously and
-a repository that never opted in has not asked for that; an empty file or any other value is
-refused naming what it said. A `thread` repository is also refused on a build without `loop-push`
-or without checkpoint reporting, which thread mode needs: `loop-push` records each push in the
-run's `checkpoints.log`, and the runner reports each line as a `checkpoint`
-(`LoopctlRunner.CheckpointStream`). Pr mode's promise that the runner removes a shipped branch's worktree holds because
+byte-order mark, surrounding whitespace and case are set aside. The one mode is `pr`, the operator's delivery loop, which
+the session inherits with his setup, up to a reviewed pull request opened against the dispatch's
+base (`gh pr create --base <base>`) — and the session never merges it (US-48.17; its prompt says
+so). The branch and the worktree are the runner's, so the session removes neither and checks the
+base out in neither. The merge is loopctl's decision: once its merge gate allows a head (CI green,
+verify@1's verdict at that head), loopctl sends a `merge` instruction (contract 1.29.0), and the
+runner, not the session, merges exactly that head (`LoopctlRunner.MergeRun`, `gh pr merge
+--squash --match-head-commit`). **Nothing else runs, absence included**: a repository with no
+`.loopctl/mode` is refused `repository has no .loopctl/mode`, because a `pr` repository's pull
+requests are merged without a person (by loopctl's gate and the runner's merge) and a repository
+that never opted in has not asked for that; an empty file or any other value is
+refused naming what it said. `thread` is refused naming its retirement: loopctl removed change
+threads, and the `checkpoint` event a thread session's pushes reached it by, in contract 1.23.0,
+so nothing would merge what such a session pushed. Pr mode's promise that the runner removes a shipped branch's worktree holds because
 teardown decides by merged content.
 
 **`auto` is not used, for its own reason.** Its classifier approves whatever it judges safe:

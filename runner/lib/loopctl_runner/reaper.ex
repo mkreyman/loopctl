@@ -47,7 +47,9 @@ defmodule LoopctlRunner.Reaper do
   @type reaped :: %{run_id: String.t(), process_group: String.t(), worktree: String.t()}
 
   @doc """
-  Reaps every orphan under `runs_dir`, and sweeps leaked subagent git grants out of `grant_dir`.
+  Reaps every orphan under `runs_dir` — each run directory, and each run one of them started
+  itself (`LoopctlRunner.RunState.nested/1`, a tuning run's critic sessions) — and sweeps leaked
+  subagent git grants out of `grant_dir`.
 
   THE GRANT DIRECTORY IS REQUIRED, with no default: a default right in production is destructive
   in a test, which drives this same path and must never sweep the operator's real `~/.claude`.
@@ -75,11 +77,14 @@ defmodule LoopctlRunner.Reaper do
       swept -> Logger.info("reaper: removed #{length(swept)} leaked subagent git grant(s)")
     end
 
+    # A run's own and every run it started itself (`RunState.nested/1`): a tuning run's critic
+    # sessions are orphaned by the same BEAM death as the tuning run, and have the same state.
     orphans =
       runs_dir
       |> Path.join("*/state.json")
       |> Path.wildcard()
       |> Enum.map(&Path.dirname/1)
+      |> Kernel.++(RunState.nested(runs_dir))
       |> Enum.filter(&orphan?/1)
       |> Enum.map(fn run_dir ->
         {:ok, state} = RunState.read(run_dir)

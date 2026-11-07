@@ -74,6 +74,40 @@ defmodule LoopctlRunner.StreamEventsTest do
     assert StreamEvents.result(state) == "error_max_turns"
   end
 
+  test "the last result line's num_turns is the session's turns, and nothing else sets them" do
+    {emit, _events} = recorder()
+
+    feed = fn lines ->
+      Enum.reduce(lines, StreamEvents.new(9), &StreamEvents.handle_line(&1, &2, emit))
+    end
+
+    assert StreamEvents.turns(StreamEvents.new(9)) == nil
+
+    assert StreamEvents.turns(
+             feed.([
+               ~s({"type":"result","subtype":"success","num_turns":1}),
+               ~s({"type":"assistant","num_turns":40,"message":{"content":[]}}),
+               ~s({"type":"result","subtype":"success","num_turns":7})
+             ])
+           ) == 7
+
+    # Not a count the contract can carry (0..2147483647): omitted rather than guessed.
+    for bad <- [~s(-1), ~s(1.5), ~s("3"), ~s(null), ~s(2147483648)] do
+      assert StreamEvents.turns(
+               feed.([~s({"type":"result","subtype":"success","num_turns":#{bad}})])
+             ) ==
+               nil
+    end
+
+    # A later result line with no count clears an earlier one: the count is the LAST line's.
+    assert StreamEvents.turns(
+             feed.([
+               ~s({"type":"result","subtype":"success","num_turns":3}),
+               ~s({"type":"result","subtype":"success"})
+             ])
+           ) == nil
+  end
+
   test "nested dispatches nest" do
     events =
       feed([

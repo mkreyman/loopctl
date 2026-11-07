@@ -1,11 +1,11 @@
 defmodule LoopctlRunner.ScratchRun do
   @moduledoc """
-  What a run on a SCRATCH tree shares — a triage run (`LoopctlRunner.TriageRun`) and a review run
-  (`LoopctlRunner.ReviewRun`): a detached worktree under the runner's `runs_dir`, recorded
-  `scratch` in `state.json` before it is cut, so the reaper removes it whatever it holds, and
-  removed at the run's teardown with the Claude project directory its unique cwd made.
+  What a run on a SCRATCH tree needs — a triage run (`LoopctlRunner.TriageRun`): a detached
+  worktree under the runner's `runs_dir`, recorded `scratch` in `state.json` before it is cut,
+  so the reaper removes it whatever it holds, and removed at the run's teardown with the Claude
+  project directory its unique cwd made.
 
-  `kind` is the run's kind as its log lines name it ("triage", "review").
+  `kind` is the run's kind as its log lines name it ("triage").
   """
 
   require Logger
