@@ -2614,12 +2614,57 @@ defmodule Loopctl.Fixtures do
       head_sha: Map.fetch!(attrs, :head_sha),
       # US-48.18: the verification was made AT this head. `:verified_head_sha` overrides it
       # (`nil` for a story verified before the column existed, another sha for a stale one).
-      verified_head_sha: Map.get(attrs, :verified_head_sha, Map.fetch!(attrs, :head_sha))
+      verified_head_sha: Map.get(attrs, :verified_head_sha, Map.fetch!(attrs, :head_sha)),
+      # US-48.17: the runner holding the claim, when the test needs one (default none).
+      runner_id: Map.get(attrs, :runner_id)
     })
 
     fixture(:triage_verdict, %{tenant_id: tenant_id, story_id: story.id})
 
     %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
+  end
+
+  # A `:merge_ready_story` the merge job can instruct (US-48.17): on a HUMAN-ANCHORED tenant
+  # (`:tenant` supplies one, `:trust_tier` overrides the tier), its stage row naming a runner
+  # (`fixture(:stage_runner)`), and an ACCEPTED implement ledger row for that runner at the
+  # claim's epoch 0 — the dispatch the instruction names. `:repo` defaults to "acme/widgets",
+  # `:head_sha` to 40 `a`s. Returns the `:merge_ready_story` map plus `tenant`, `runner`,
+  # `dispatch_id`, `repo` and `head`.
+  def fixture(:merge_instruction_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    head = Map.get(attrs, :head_sha, String.duplicate("a", 40))
+    repo = Map.get(attrs, :repo, "acme/widgets")
+
+    tenant =
+      Map.get_lazy(attrs, :tenant, fn ->
+        fixture(:tenant, %{trust_tier: Map.get(attrs, :trust_tier, :human_anchored)})
+      end)
+
+    runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+
+    ctx =
+      fixture(:merge_ready_story, %{
+        tenant_id: tenant.id,
+        repo: repo,
+        head_sha: head,
+        runner_id: runner.id
+      })
+
+    ledger =
+      fixture(:accepted_dispatch, %{
+        tenant_id: tenant.id,
+        runner: runner,
+        story_id: ctx.story_id,
+        claim_epoch: 0
+      })
+
+    Map.merge(ctx, %{
+      tenant: tenant,
+      runner: runner,
+      dispatch_id: ledger.dispatch_id,
+      repo: repo,
+      head: head
+    })
   end
 
   # A pull-request-route story waiting for `verify@1` (US-48.18): a human-anchored tenant with

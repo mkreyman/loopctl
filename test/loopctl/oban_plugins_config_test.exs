@@ -469,6 +469,34 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-48.17: MergeSweepWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.MergeSweepWorker} -> true
+          {_schedule, Loopctl.Workers.MergeSweepWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs every minute", %{entry: entry} do
+      assert entry,
+             "expected a MergeSweepWorker crontab entry — without one a verified pr-route " <>
+               "story is never instructed to merge, its claim lapses at ci, and a vanished " <>
+               "runner is never noticed."
+
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "StoryCompletionWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

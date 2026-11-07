@@ -1095,6 +1095,35 @@ defmodule Loopctl.Runners.DispatchLedger do
     |> where_holds_claim()
   end
 
+  @doc """
+  The dispatch that ran the claim of `claim_epoch`: the newest implement row of that claim its
+  runner ACCEPTED (the same rows `claim_route_query/3` reads), as `%{dispatch_id, runner_id}`,
+  or `nil`. For `Loopctl.Delivery.MergeExecution` (US-48.17), whose merge instruction names
+  the dispatch the runner reports the merge under — `RunnerStages` accepts a `stage` message
+  only for this runner's ACCEPTED dispatch at the story's epoch, and an accepted row stays
+  `accepted` after its session ends. A read with no lock: both values are written with the row
+  and never change, and the stage report it leads to is fenced on the story's epoch.
+  """
+  @spec claim_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
+          %{dispatch_id: Ecto.UUID.t(), runner_id: Ecto.UUID.t()} | nil
+  def claim_dispatch(tenant_id, story_id, claim_epoch) do
+    {:ok, found} =
+      in_tenant(tenant_id, fn ->
+        from(r in DispatchRecord,
+          where: r.status in ^@route_statuses,
+          where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+          where: r.claim_epoch == ^claim_epoch,
+          order_by: [desc: r.inserted_at],
+          limit: 1,
+          select: %{dispatch_id: r.dispatch_id, runner_id: r.runner_id}
+        )
+        |> where_holds_claim()
+        |> Repo.one()
+      end)
+
+    found
+  end
+
   defp session_of(%DispatchRecord{} = record) do
     %{
       kind: record.kind,

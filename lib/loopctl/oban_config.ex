@@ -702,6 +702,13 @@ defmodule Loopctl.ObanConfig do
            # scheduling it unconditionally starts nothing. Keep in sync with the crontab
            # assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.VerifyDispatchWorker},
+           # US-48.17: the pr route's merge. Holds a verified story's claim open while its
+           # runner is live, escalates it over :runner_gone when the runner vanishes, and
+           # enqueues the per-head merge instruction job. Only the instruction is behind
+           # `:dispatch_driver_enabled`; the hold and the runner-gone escalation are not, for
+           # the reason StoryCompletionWorker's entry below gives. Local reads only, bounded
+           # per run. Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.MergeSweepWorker},
            # #803 §3: the loop's LAST transition, `verified -> done`. Nothing in `lib/` wrote
            # that edge, so a story that passed every gate stopped one stage from the end for
            # ever — `verified` had no writable edge out at all, not even for an operator. NOT

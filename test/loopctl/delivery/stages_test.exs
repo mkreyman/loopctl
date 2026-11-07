@@ -2060,7 +2060,11 @@ defmodule Loopctl.Delivery.StagesTest do
                "release_id" => nil,
                "trunk_verified_sha" => nil,
                # Head-keyed (US-48.18): a verification is of one head, retracted with it.
-               "verified_head_sha" => nil
+               "verified_head_sha" => nil,
+               # Head-keyed (US-48.17): a merge instruction names one head, and the runner's
+               # absence clock is the wait for that head's merge.
+               "merge_instruction" => nil,
+               "runner_absence" => nil
              }
 
       # And the next attempt can record its own head again.

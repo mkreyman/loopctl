@@ -272,6 +272,26 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_info({:runner_dispatch, dispatch, _slot_generation}, socket),
     do: dispatch_to_socket(dispatch, socket)
 
+  # A MERGE INSTRUCTION (contract 1.29.0, US-48.17), behind the same two checks as a dispatch,
+  # nearest the push: only the sole live socket pushes it, and never on a halted tenant — a
+  # merge is the outward effect custody exists to gate. There is no ledger decision and no slot
+  # to release: an instruction claims nothing, and one that is not pushed is pushed again by
+  # `Loopctl.Delivery.MergeExecution`'s resend.
+  def handle_info({:runner_merge_instruction, instruction}, socket) do
+    cond do
+      not sole_live_socket?(socket) ->
+        log_merge_not_pushed(socket, instruction, "not the only live socket for this runner")
+
+      Runners.custody_halted?(socket.assigns.tenant_id) ->
+        log_merge_not_pushed(socket, instruction, "tenant custody halted")
+
+      true ->
+        push(socket, "merge", instruction)
+    end
+
+    {:noreply, socket}
+  end
+
   def handle_info(:recheck, socket) do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
@@ -976,6 +996,14 @@ defmodule LoopctlWeb.RunnerChannel do
     )
 
     :ok
+  end
+
+  defp log_merge_not_pushed(socket, instruction, why) do
+    Logger.warning(
+      "runner #{socket.assigns.runner.id} merge instruction not pushed: #{why} " <>
+        "tenant_id=#{socket.assigns.tenant_id} story_id=#{instruction.story_id} " <>
+        "head_sha=#{instruction.head_sha} claim_epoch=#{instruction.claim_epoch}"
+    )
   end
 
   defp dispatch_to_socket(dispatch, socket) do

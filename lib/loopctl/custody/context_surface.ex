@@ -45,11 +45,14 @@ defmodule Loopctl.Custody.ContextSurface do
   # worker or a runner report with no plug in front of it: `VerifierPlacement` mints the root
   # verifier dispatch and binds `verifier_dispatch_id`, `VerifyVerdict` reports, reviews and
   # verifies, and `ImplementerStart` starts the claimed story.
+  # US-48.17 adds `MergeExecution`, the Oban-driven merge job: it escalates, holds a claim's
+  # lease open and instructs a runner to MERGE, and no route reaches it.
   @halt_enforcing_contexts [
     "Loopctl.Delivery.Placement",
     "Loopctl.Agents.VerifierPlacement",
     "Loopctl.Agents.VerifyVerdict",
-    "Loopctl.Delivery.ImplementerStart"
+    "Loopctl.Delivery.ImplementerStart",
+    "Loopctl.Delivery.MergeExecution"
   ]
 
   @doc """

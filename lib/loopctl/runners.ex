@@ -630,6 +630,57 @@ defmodule Loopctl.Runners do
     end
   end
 
+  @doc """
+  Hands a MERGE INSTRUCTION (`RunnerMergeInstruction`, contract 1.29.0, US-48.17) to the
+  runner holding a story's claim: control decided the merge, the runner executes it.
+
+  The same checks `dispatch/3` makes before its broadcast, in the same order, minus the
+  ledger: the payload is cast against the contract, the tenant is not halted, the runner is
+  authorized and has exactly one live socket — and that socket JOINED declaring a contract
+  version that understands `merge` (`{:error, :runner_contract_too_old}` otherwise: an older
+  runner would ignore the event, and the story would wait out every resend for nothing).
+
+  Then it broadcasts `{:runner_merge_instruction, instruction}` on `dispatch_topic/1`, and the
+  runner's channel pushes `"merge"` after re-checking, nearest the push, that it is still the
+  only live socket and the tenant is still not halted. No ledger row and no slot: an
+  instruction claims nothing and starts no session.
+
+  `:ok` means handed to the runner's channel, not executed and not acknowledged — the
+  runner's `ci -> merged` stage report is the answer, and `Loopctl.Delivery.MergeExecution`
+  resends when none arrives. A node of an EARLIER release ignores the message (its channel's
+  catch-all `handle_info/2`), which the same resend covers during a rolling deploy.
+  """
+  @spec instruct_merge(term(), term(), term()) ::
+          :ok
+          | {:error,
+             {:invalid, [String.t()]}
+             | :tenant_halted
+             | :not_authorized
+             | :runner_not_connected
+             | :runner_ambiguous
+             | :runner_contract_too_old
+             | term()}
+  def instruct_merge(tenant_id, runner_id, payload) do
+    with {:ok, instruction} <- RunnerContract.cast_merge_instruction(payload),
+         {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
+         :ok <- not_halted(tenant_id),
+         :ok <- runner_authorized(tenant_id, runner_id),
+         {:ok, meta} <- single_live_socket(tenant_id, runner_id),
+         :ok <- merge_supported(meta) do
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        dispatch_topic(runner_id),
+        {:runner_merge_instruction, instruction}
+      )
+    end
+  end
+
+  defp merge_supported(meta) do
+    if RunnerContract.merge_instruction_supported?(Map.get(meta, :contract_version)),
+      do: :ok,
+      else: {:error, :runner_contract_too_old}
+  end
+
   defp not_exhausted(tenant_id, runner_id, dispatch_id) do
     if usage_exhausted?(tenant_id, runner_id) and
          is_nil(DispatchLedger.get_record(tenant_id, dispatch_id)),

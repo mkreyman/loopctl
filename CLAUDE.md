@@ -235,7 +235,7 @@ marker and restored the claim → force-unclaim → backfill-to-verified launder
 (`lib/loopctl/changes/review_custody.ex`). A story with a change binding is a chg story, and
 its chg root is the `chg_root_dispatch_id` of the one intake source that delivered the bound
 change's events (any other count: no root, nobody qualifies). On such a story
-`record_review/4` runs `chg_review/4` (`lib/loopctl/progress.ex:2731`) AFTER
+`record_review/4` runs `chg_review/4` (`lib/loopctl/progress.ex:2790`) AFTER
 `validate_not_self_review/3`, never instead: the reviewer's LIVE lineage must be a STRICT
 descendant of the root (`chg_reviewer_required`, the root's own key included), then
 `commit_sha` must be the sha of an APPLIED `submitted` event of the CURRENT binding
@@ -247,9 +247,9 @@ revoked or not — an expired chg key's live lineage is `[]`, which reject would
 rooted at a `chg_root_dispatch_id` ANY intake source of the tenant names, live or revoked,
 either mode, is refused `chg_root_cannot_verify` by verify, reject, verify-all, bulk
 verify/reject, backfill and bulk mark-complete (`refuse_chg_root_verifier/2`,
-`progress.ex:2619`; `BulkOperations.refuse_chg_root/3`, `bulk_operations.ex:394`) and
+`progress.ex:2975`; `BulkOperations.refuse_chg_root/3`, `bulk_operations.ex:394`) and
 `chg_root_review_only` by claim, bulk claim and report (`refuse_chg_root_actor/3`,
-`progress.ex:272`). Both halves read the lineage through ONE function,
+`progress.ex:275`). Both halves read the lineage through ONE function,
 `ReviewCustody.caller_lineage/2` (minting lineage, else the call's live one), and the
 controllers resolve it through ONE helper, `LoopctlWeb.CustodyLineage.chg_root_opts/1`. The refusal is judged before any story is read, so no other caller's
 answer changes, and it records no custody violation. What the chg gate does NOT prove: every
@@ -262,9 +262,9 @@ landed event's own transaction over the control-only edge `:review_missing`
 fails CLOSED: a refused escalation rolls the whole landing back (`:busy`, or
 `change_event_failed`, logged and counted) so chg redelivers it — the merge never commits
 without its hold. Such a story is never verified: every path that reaches `verified` —
-verify and verify-all through `chg_landed_review/2` (`progress.ex:3008`), bulk verify
+verify and verify-all through `chg_landed_review/2` (`progress.ex:3067`), bulk verify
 through `process_verify/3` (`bulk_operations.ex:433`), backfill and bulk mark-complete
-through `guard_backfill/3` (`progress.ex:3119`) — calls one function,
+through `guard_backfill/3` (`progress.ex:3178`) — calls one function,
 `ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:208`). It refuses a chg story with
 `review_missing_escalated` while its stage is escalated over `:review_missing` (a human
 resolves it) and with `chg_review_not_for_landed_revision` unless a chg review names its

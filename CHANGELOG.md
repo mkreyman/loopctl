@@ -6,6 +6,28 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Control decides the pull-request merge, and the runner executes it (US-48.17,
+  2026-11-07).** A new pass (`MergeSweepWorker`, every minute) runs the merge gate, as control,
+  over each pull-request story at `ci` that is verified at its head. On `allow` it sends the
+  runner holding the claim a `merge` instruction, and the runner merges exactly that head and
+  reports `ci -> merged`. Only sending the instruction is behind `DISPATCH_DRIVER_ENABLED`.
+  - **Runner contract 1.29.0** (minor): a new control -> runner event, `merge`
+    (`RunnerMergeInstruction`: `dispatch_id`, `claim_epoch`, `story_id`, `repo`, `pr_number`,
+    `head_sha`, `merge_method` = `squash`). Re-vendor `priv/runner_contract/v1.json` and
+    declare 1.29.0 on join. A runner that joins on an older version is never sent a merge, and
+    its pull-request stories escalate `merge_unanswered`.
+  - **A pull-request merge with no gate allow for its head escalates `ungated_merge`.** The
+    merge is recorded and then escalated in the same transaction, and the reason names the
+    merge commit and the head. A runner that still merges on its own (before contract 1.29.0)
+    therefore escalates every pull-request merge it reports. chg stories are not affected.
+  - **A pull-request story's claim no longer lapses at `ci`.** loopctl holds it open while the
+    runner is connected, never past the implement dispatch's credential expiry. A story whose
+    runner has been gone for ten minutes escalates `runner_gone` instead of going back to the
+    queue. `renew_story_claim` is unchanged.
+  - **Migration `20261107200000_add_merge_instruction_and_runner_absence`** adds
+    `story_stages.merge_instruction` and `story_stages.runner_absence`, and two stage-event
+    names. No backfill and no manual step. Its rollback refuses while any row carries either
+    new event.
 - **Control verifies pull-request stories at `ci` under an independent verifier (US-48.18,
   2026-11-07).** A new `verify@1` pass (`VerifyDispatchWorker`, every minute, behind
   `DISPATCH_DRIVER_ENABLED`) mints a verifier dispatch as a new root under the tenant's

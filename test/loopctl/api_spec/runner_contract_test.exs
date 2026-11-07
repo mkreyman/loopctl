@@ -41,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "fc8d4c39de335cc99f9fd1b0350eee66a2954522bdc96bddeb49c77cb8376ccc"
+  @digest "5b4eda63d0d109e5e4ea364f718b147a7072a084ba50db6db2b50bc52e4aab5e"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -75,8 +75,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.28.0"
-      assert schema["x-contract-version"] == "1.28.0"
+      assert RunnerContract.version() == "1.29.0"
+      assert schema["x-contract-version"] == "1.29.0"
 
       # 1.28.0 (US-48.18): the verifier is a kind a runner may be sent, it is never implied by
       # silence, and its verdict schema is published with the other agent_result specs.
@@ -96,6 +96,26 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # ...and neither control-only edge is a transition a runner may report.
       refute Enum.any?(connection["stage_transitions"], fn t ->
                t["edge"] in ["verify_rejected", "no_independent_verifier_runner"]
+             end)
+
+      # 1.29.0 (US-48.17): control decides the merge and pushes `merge`; the runner executes
+      # it. Outbound only (no reply, never inbound), squash only, every identity required.
+      assert connection["events"]["merge"] == "RunnerMergeInstruction"
+      refute "merge" in RunnerContract.inbound_events()
+      refute Map.has_key?(connection["replies"], "merge")
+
+      assert %{
+               "type" => "object",
+               "additionalProperties" => false,
+               "properties" => %{"merge_method" => %{"enum" => ["squash"]}}
+             } = merge = schema["$defs"]["RunnerMergeInstruction"]
+
+      assert Enum.sort(merge["required"]) ==
+               ~w(claim_epoch dispatch_id head_sha merge_method pr_number repo story_id)
+
+      # ...and none of its three control-only edges is a transition a runner may report.
+      refute Enum.any?(connection["stage_transitions"], fn t ->
+               t["edge"] in ["runner_gone", "merge_unanswered", "ungated_merge"]
              end)
 
       # 1.26.0 (US-48.9): the reply drafter is a kind a runner may be sent.

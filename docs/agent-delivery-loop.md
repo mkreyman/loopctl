@@ -99,6 +99,7 @@ The full list is in the OpenAPI spec for the endpoint and in the `place_dispatch
 A claim carries a lease (`claimed_until`) and a fence (`claim_epoch`). Every report a runner makes names the epoch, so a runner that lost its claim cannot move a story someone else now holds.
 
 - **Renew:** an agent renews its lease with `renew_story_claim`. A claim the driver placed is capped at the dispatch deadline, and renewing past the cap is refused with 409 `lease_cap_reached`.
+- **Held at `ci`, on the pull-request route:** while a story waits at `ci` for its verification and its merge, loopctl holds the claim open itself (`MergeSweepWorker`, every minute). It extends the claim only while it can see the runner holding the claim connected, and never past the implement dispatch's own credential expiry. The epoch never changes, and a session still cannot extend its own capped claim. A story whose runner has had no connection for ten minutes is escalated over `runner_gone`, not re-queued: its pull request is open, and re-queuing would start a new session on finished work.
 - **Expire:** a claim nobody renews is reclaimed by `ReclaimExpiredClaimsWorker`.
 - **Release below the ceiling:** a release that counts against the retry ceiling (a crashed session or a lost lease) re-contracts the story for the next placement.
 - **Release at the ceiling:** at `DISPATCH_MAX_ATTEMPTS` the release escalates the story instead, and `escalation_reason` carries the count.
@@ -106,7 +107,7 @@ A claim carries a lease (`claimed_until`) and a fence (`claim_epoch`). Every rep
 
 ## 6. Review, CI and the merge gate
 
-The session on the runner implements the story, reviews it, opens the pull request and reports each stage. A runner may move a story forward only through the stages it holds, plus the edges that send it back to `implementing`: red CI, review findings, a moved base, or a refused merge.
+The session on the runner implements the story, reviews it, opens the pull request, waits for green CI and reports each stage. On the pull-request route the session does NOT merge: loopctl decides the merge and tells the runner to do it (see "The merge, on the pull-request route" below). A runner may move a story forward only through the stages it holds, plus the edges that send it back to `implementing`: red CI, review findings, a moved base, or a refused merge.
 
 ### Verification at `ci`
 
@@ -132,7 +133,7 @@ An orchestrator key that no dispatch minted cannot reject a pull-request story (
 
 ### The merge gate
 
-Before a merge, an orchestrator or operator calls `merge_precondition` (`POST /api/v1/stories/:id/merge-precondition`) with an orchestrator or user key. A runner session cannot call it, so the unattended driver alone does not take a story past `ci`. The story must be at `ci`. The gate re-runs both delivery gates over the real diff, using the lens verdicts that triage recorded rather than anything the caller sends. It also checks these, and refuses on any one:
+The merge gate decides whether a story at `ci` may merge. On the pull-request route loopctl runs it itself, as described in the next section. An orchestrator or operator can also call `merge_precondition` (`POST /api/v1/stories/:id/merge-precondition`) with an orchestrator or user key. A runner session cannot call it. The story must be at `ci`. The gate re-runs both delivery gates over the real diff, using the lens verdicts that triage recorded rather than anything the caller sends. It also checks these, and refuses on any one:
 
 - custody, at the current head: a story verified at another head, or at no recorded head, is refused `verified_for_other_head`. Any move that clears the head also clears the verification;
 - a hard size bound of 12 files and 1,000 changed lines;
@@ -145,6 +146,25 @@ Before a merge, an orchestrator or operator calls `merge_precondition` (`POST /a
 | `already_merged` | The pull request is already merged; nothing to do. |
 | `head_moved` | The pull request's head changed since CI ran. The story goes back to `implementing` over `base_moved`, and the recorded head is cleared, so the gate is not called again until the story is back at `ci`. |
 | `unevaluated` | 503 with `Retry-After`. After repeated `unevaluated` answers the story escalates. |
+
+### The merge, on the pull-request route
+
+Control decides the merge and the runner executes it. Every minute, `MergeSweepWorker` reads each pull-request-route story at `ci`. For a story verified at its recorded head, with no merge instruction outstanding for that head, it enqueues one `MergeInstructionWorker` job. The job is unique per story and head. It does these steps:
+
+1. It runs the merge gate over the recorded head, as control.
+2. On `allow`, it sends a `merge` message (runner contract 1.29.0) to the runner holding the claim. The message names the claim's dispatch, the epoch, the story, the repository, the pull request, the head and the merge method, `squash`.
+3. It records the instruction on the stage row (`merge_instruction`) and as a `merge_instructed` stage event.
+
+The runner merges exactly that head (`gh pr merge --squash --match-head-commit`) and reports `ci -> merged` with the merge commit. The other answers of the gate:
+
+- **`refuse`:** the gate has already escalated the story over `merge_gate`.
+- **`head_moved`:** the gate has already sent the story back to `implementing`.
+- **`unevaluated`:** the job waits for the forge's `Retry-After`, or 60 seconds when the forge gave none.
+- **`already_merged`, at the head the gate allowed:** loopctl records `ci -> merged` itself.
+
+The instruction is sent again when no merge is reported within ten minutes, up to three times. Each resend runs the gate again, so a merge the runner made but never reported is found and recorded. A send that could not reach the runner (it is not connected, or it joined on a contract older than 1.29.0) is retried each minute, up to ten times. When either limit is reached, the story is escalated over `merge_unanswered`. Only the instruction is behind `DISPATCH_DRIVER_ENABLED`. Holding the claim and escalating a gone runner are not, because they start no session.
+
+**An ungated merge is escalated.** A pull-request-route `ci -> merged` for a head the gate never allowed (a session that merged on its own) is recorded, because the merge happened, and is then escalated over `ungated_merge` in the same transaction. The reason names the merge commit and the head. A runner's report is answered with the stage `escalated`. A runner that has not adopted contract 1.29.0 still merges on its own, so on the pull-request route every merge it reports escalates. This is intended: it is the merge that was never gated. A chg story is not judged by this check; chg lands its own changes.
 
 ### Gate B on the repositories that gate the loop
 
@@ -160,7 +180,7 @@ The exact glob lists live in the operator's knowledge base (article `4a86157b`),
 
 ## 7. After the merge
 
-- **`merged` to `deployed`, for a pull-request story:** a pull-request session reports up to `merged` and ends. `PostDeployVerification` then reads the story at `merged`: when a successful deployment of the target environment carries the merge commit, it writes `deployed` itself, with that deployment's id as `release_id`, and goes straight on to verify. A story with no such deployment waits at `merged` inside the same bounds a `deployed` story waits in, and escalates from `merged` over `verification_failed` when they run out. A chg story (one with a change binding) is not read at `merged`: chg reports its own `deployed`.
+- **`merged` to `deployed`, for a pull-request story:** the runner reports `merged` after it makes the merge loopctl instructed, and the session ends. `PostDeployVerification` then reads the story at `merged`: when a successful deployment of the target environment carries the merge commit, it writes `deployed` itself, with that deployment's id as `release_id`, and goes straight on to verify. A story with no such deployment waits at `merged` inside the same bounds a `deployed` story waits in, and escalates from `merged` over `verification_failed` when they run out. A chg story (one with a change binding) is not read at `merged`: chg reports its own `deployed`.
 - **`deployed` to `verified`, or to `escalated`:** `PostDeployVerification` compares the merge commit with the repository's deployment records.
 - **Forge access:** these reads need a token for the repository: its `(tenant, repository)` pair in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, or a tenant token ([deploy/FLY_SECRETS.md](../deploy/FLY_SECRETS.md)). Without one the story waits as a forge fault and escalates at that bound.
 - **`verified` to `done`:** `Loopctl.Delivery.Completion` moves the story on once its GitHub issue is closed, or once it has no issue to close.
@@ -173,6 +193,10 @@ The exact glob lists live in the operator's knowledge base (article `4a86157b`),
 | `story_stage` shows `escalated` | Read `escalation_reason`, which is untrusted session text. Then `resolve_escalation` with `to: queued` to work it again, or `done` / `failed`. It needs a user key that no dispatch minted, so a session cannot resolve its own escalation. |
 | A story is held by a session that is gone | `force_unclaim_story` (orchestrator key; `exact_role`). A delivery story then goes to `escalated` over `operator_released` instead of back to the queue. Re-queue it with `resolve_escalation`. |
 | A dispatch key must stop working | `revoke_dispatch` revokes it and every dispatch below it. Use a user key; an orchestrator key that no dispatch minted is refused with 403 `unlineaged_revoke_forbidden`. |
+| `escalated` over `ungated_merge` | A pull request was merged at a head the merge gate never allowed. The merge stands on GitHub. Review the merged change, then `resolve_escalation`. |
+| `escalated` over `runner_gone` | The runner holding a pull-request story at `ci` lost its connection for ten minutes. The pull request is still open. Check the machine, then `resolve_escalation`. |
+| `escalated` over `merge_unanswered` | The gate allowed the head, but no merge was reported after the instruction limit. Read `escalation_reason` for the last send outcome. Check that the runner joined on contract 1.29.0 or later. |
+| A verified pull-request story waits at `ci` and nothing merges | `DISPATCH_DRIVER_ENABLED` is off, or no runner is connected for the story. |
 | `stage: null` | The loop has never touched this story. |
 
 A session escalates its own story with `escalate_story`, using an agent key held by the claimant.

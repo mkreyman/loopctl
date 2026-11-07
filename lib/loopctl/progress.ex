@@ -1877,6 +1877,65 @@ defmodule Loopctl.Progress do
   end
 
   @doc """
+  Holds a driver-placed claim open while its story waits at `ci` for the merge gate
+  (US-48.17, AC-48.17.3): moves `claim_lease_cap` and `claimed_until` FORWARD to `until`, in a
+  transaction of its own on `Loopctl.Repo` under the tenant's RLS context, with the story
+  locked `FOR NO KEY UPDATE`.
+
+  CONTROL extends the lease here, never the runner, and only from facts control holds:
+  `Loopctl.Delivery.MergeExecution` calls it for a story whose stage row is at `ci` on the
+  pull-request route and whose runner it can see live, with `until` already bounded by the
+  implement dispatch's own credential expiry. That is why `renew_claim/3` still writes nothing
+  on a capped claim (#879): a session's word extending its own claim is exactly what the cap
+  exists to refuse, and this path takes no word from the session at all.
+
+  The same rules as `reanchor_dispatch_lease/3`, through the same private writer: only a LIVE
+  claim at `claim_epoch` is moved, only forward, never revived, and the epoch is never
+  touched, so a zombie holding an older epoch stays fenced. A move writes a
+  `claim_lease_reanchored` audit-log entry with both leases and both caps.
+
+  - `{:ok, story}` — moved, or returned as it was (an uncapped claim, or a cap already later)
+  - `{:error, :stale_claim_epoch}` — the story is gone or at another epoch
+  - `{:error, :claim_not_live}` — the claim at that epoch has ended
+  - `{:error, changeset}` — the write or its audit entry was refused; nothing moved
+  """
+  @spec extend_ci_hold_lease(Ecto.UUID.t(), Ecto.UUID.t(), %{
+          claim_epoch: non_neg_integer(),
+          until: DateTime.t(),
+          actor_label: String.t()
+        }) ::
+          {:ok, Story.t()}
+          | {:error, :stale_claim_epoch | :claim_not_live | Ecto.Changeset.t()}
+  def extend_ci_hold_lease(tenant_id, story_id, %{
+        claim_epoch: epoch,
+        until: %DateTime{} = until,
+        actor_label: label
+      }) do
+    Repo.with_tenant(tenant_id, fn ->
+      story =
+        Repo.one(
+          from s in Story,
+            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+            lock: "FOR NO KEY UPDATE"
+        )
+
+      case hold_claim_open(story, epoch, until, label) do
+        {:ok, story} -> story
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  defp hold_claim_open(%Story{claim_epoch: epoch} = story, epoch, until, label) do
+    if live_claim?(story, DateTime.utc_now()),
+      do: move_cap_forward(Repo, story, until, label),
+      else: {:error, :claim_not_live}
+  end
+
+  defp hold_claim_open(_gone_or_another_claim, _epoch, _until, _label),
+    do: {:error, :stale_claim_epoch}
+
+  @doc """
   True while the story's claim is live: it is in a claimed status and its lease has not
   passed. A NULL lease is a claim made before leases existed, which nothing expires.
   """

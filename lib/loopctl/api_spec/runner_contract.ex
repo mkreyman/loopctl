@@ -36,6 +36,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"agent_result"` | `RunnerAgentResultMessage` (since 1.25.0) | `RunnerAgentResultAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `already_recorded`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
+  | control -> runner | `"merge"` | `RunnerMergeInstruction` (since 1.29.0, pushed only by `Loopctl.Runners.instruct_merge/3`) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
   | (1.5.0) an implement dispatch carries a `RunnerStory`, and a runner may refuse a kind with `kind_not_supported` | | | | |
   | (1.6.0) a runner DECLARES the kinds it runs on join (`RunnerJoin.kinds`); where present it is the only thing consulted | | | | |
@@ -64,6 +65,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.26.0) A REPLY DRAFTER (Epic 48, US-48.9). `reply_draft` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a support ticket whose triage ended `reject` or `escalated`, built from spec `reply_draft@1`. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back, as for `triage`), carries the same fenced `triage` object a triage dispatch does (`RunnerTriage`: the reporter's words, data, never instructions) and no `story`, and the session answers with ONE `agent_result` whose `result` is `{body}`, the drafted reply, validated against `reply_draft@1`'s schema, which is PUBLISHED as `x-connection.agent_result_schemas["reply_draft@1"]` (every spec that reports through `agent_result` appears there, keyed `<id>@<version>`, in the same keyword set as `$defs`), so a runner validates against loopctl's schema rather than a copy of it. The session reads; it writes no repository and sends nothing anywhere: loopctl stores the draft for a person, who sends it or not. Only a runner that DECLARES `reply_draft` on join, and holds `reply_draft@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run drafts: a 1.25.0 copy has no `reply_draft` kind | | | | |
   | (1.27.0) A SESSION END SAYS WHAT IT SPENT AND WHAT IT LEFT (Epic 48, US-48.11, AC-48.11.2). `RunnerSessionEnded` gains two OPTIONAL fields: `turns_used` (an integer from 0 to `RunnerSessionEnded.max_turns_used/0`, the agent turns the session took) and `work_left_behind` (a boolean: `true` when, at exit, the session's branch had commits that were not on the remote, `false` when it had none; OMITTED when the runner could not tell). loopctl stores both on the dispatch's ledger row with the report, beside the turn budget the dispatch was placed under, and the escalation inbox and the run-outcome ledger read them from there; a value of the wrong type or range is `invalid_payload`, as for any field. Still RECORDED ONCE PER DISPATCH, and identity is still judged on `reason` alone: a resend whose `dispatch_id`, `claim_epoch` and `reason` match is answered `ok` with `replayed: true` even when its two new fields differ or are absent, and the FIRST recording's values stand; a different `reason` is `already_recorded` as before. OPTIONAL — a 1.26.0 runner that sends neither gets exactly today's behaviour, its run's figures shown as not known. RE-VENDOR to send them: a 1.26.0 copy declares neither field | | | | |
   | (1.28.0) A VERIFIER (Epic 48, US-48.18). `verify` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a story at `ci` on a pull-request route whose recorded head has no verification, built from spec `verify@1`, to a runner whose agent is NOT the implementer's. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back), carries the story (`RunnerStory`, as an implement dispatch does — `story` is now allowed on `implement` and `verify`) and a REQUIRED `verify` object (`RunnerVerify`: `pr_number`, `head_sha`, the pull request and the head to judge), allowed on a `verify` dispatch alone. The session reads the pull request's diff at that head against the story's acceptance criteria, writes nothing, and answers with ONE `agent_result` whose `result` is `{verdict, head_sha, findings}` — `verdict` `pass` or `reject`, `head_sha` the head it judged, `findings` at most ten short strings — validated against `verify@1`'s schema, published as `x-connection.agent_result_schemas["verify@1"]`. The session holds NO credential that can report, review or verify the story: loopctl applies the verdict itself, under a verifier dispatch it minted apart from the implementer's, and drops a verdict for a head that is no longer the story's. A `reject` sends the story back to work over the control-only edge `verify_rejected` with the findings as its reason; `x-connection.stage_transitions` is unchanged because no runner may report it. Only a runner that DECLARES `verify` on join, and holds `verify@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run verifications: a 1.27.0 copy has no `verify` kind and no `RunnerVerify` | | | | |
+  | (1.29.0) CONTROL DECIDES THE MERGE, THE RUNNER EXECUTES IT (Epic 48, US-48.17). On the pull-request route a session stops at a green pull request and does NOT merge. loopctl runs its merge gate over the recorded head once the story is verified at it, and on an allow pushes the new control -> runner event `merge` (`RunnerMergeInstruction`: `dispatch_id`, `claim_epoch`, `story_id`, `repo`, `pr_number`, `head_sha`, `merge_method` = `squash`) to the runner holding the claim. The runner merges exactly that head (`gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha>`) and reports `stage` `ci -> merged` with `effects.merge_sha`, as before; a pull request already merged at that head is reported the same way, a moved head as `ci -> implementing` over `base_moved`, any other refusal as `session_escalated`. No reply. The instruction may be pushed again for the same head when no merge was reported within the answer window, at most `MergeExecution.max_sends/0` times, after which the story is escalated over a new CONTROL-ONLY edge, `merge_unanswered`. Two more control-only edges: `runner_gone` (`ci -> escalated`, the runner holding the claim had no live socket past a bound while the story waited at `ci`) and `ungated_merge` (`merged -> escalated`, taken in the same transaction as a `ci -> merged` reported on the pull-request route for a head the gate never allowed: the merge is recorded and then escalated, so the ack's `stage` is `escalated`). None is runner-reportable and `x-connection.stage_transitions` is unchanged. While the story waits at `ci` loopctl holds the claim open itself, so a capped claim no longer lapses there; `renew_claim` is unchanged. Only a runner that JOINED declaring 1.29.0 or later is sent `merge`: an older one is never instructed, and its pull-request-route stories wait at `ci` and are escalated `merge_unanswered`. RE-VENDOR, and declare 1.29.0 on join, to receive merges: a 1.28.0 copy has no `merge` event and no `RunnerMergeInstruction` | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -297,6 +299,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   carries `disconnecting: "join_refused_not_authorized"` instead, and the socket is closed
   only after that reply has been sent.
 
+  ## Merge instructions (since 1.29.0)
+
+  On the pull-request route the session does not merge. Once loopctl's merge gate allows the
+  recorded head, loopctl pushes `"merge"` (`RunnerMergeInstruction`) to the runner holding the
+  claim, on the same topic and behind the same two checks as a dispatch: it is the only live
+  socket for the runner, and the tenant is not halted. The runner merges exactly `head_sha`
+  with `--match-head-commit` and reports the merge as a `stage` message under the
+  instruction's `dispatch_id` and `claim_epoch`. The instruction carries no reply; the stage
+  report is the answer, and an instruction with no report inside the answer window is pushed
+  again, a bounded number of times, before the story is escalated.
+
   ## Rate limits
 
   Published in `x-connection.limits`, and enforced per channel:
@@ -416,7 +429,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.28.0"
+  @version "1.29.0"
+
+  # The first version whose runner understands a `merge` push (US-48.17). A runner that joined
+  # declaring an older one is never sent one: it would ignore the event, and the story would
+  # wait out every resend before escalating.
+  @merge_instruction_since "1.29.0"
   @major 1
 
   defmodule ByteRule do
@@ -2745,6 +2763,63 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerMergeInstruction do
+    @moduledoc false
+    require OpenApiSpex
+
+    # CONTROL DECIDES THE MERGE, THE RUNNER EXECUTES IT (since 1.29.0, US-48.17). Pushed by
+    # `Loopctl.Delivery.MergeExecution` only after `Loopctl.Delivery.MergePrecondition` recorded
+    # an allow for exactly `head_sha`. Every value is loopctl's own, off the stage row and the
+    # ledger, never a runner's.
+    @merge_methods ~w(squash)
+
+    @doc "The merge methods loopctl instructs."
+    @spec merge_methods() :: [String.t()]
+    def merge_methods, do: @merge_methods
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerMergeInstruction",
+        description:
+          "Since 1.29.0. Pushed as `merge` on the runner's topic: loopctl's merge gate " <>
+            "ALLOWED `head_sha` of pull request `pr_number` in `repo`, and the runner holding " <>
+            "the claim is to merge it. Merge exactly that head and nothing else — " <>
+            "`gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha>` — " <>
+            "then report `stage` `ci -> merged` (edge `forward`) under `dispatch_id` and " <>
+            "`claim_epoch`, with `effects.merge_sha` the merge commit GitHub returned. When the " <>
+            "pull request is ALREADY merged at `head_sha`, report that merge the same way. " <>
+            "When GitHub refuses because the head is no longer `head_sha`, report " <>
+            "`ci -> implementing` over `base_moved`; any other refusal, report " <>
+            "`ci -> escalated` over `session_escalated` with the refusal as `reason`. No " <>
+            "reply. It may be pushed more than once for one head when no merge was reported " <>
+            "within the answer window; a second instruction for a head already merged is " <>
+            "answered by reporting that merge again, which is idempotent. Only a runner that " <>
+            "JOINED declaring 1.29.0 or later is sent one.",
+        type: :object,
+        required: [
+          :dispatch_id,
+          :claim_epoch,
+          :story_id,
+          :repo,
+          :pr_number,
+          :head_sha,
+          :merge_method
+        ],
+        additionalProperties: false,
+        properties: %{
+          dispatch_id: %Schema{type: :string, format: :uuid},
+          claim_epoch: %Schema{type: :integer, minimum: 0},
+          story_id: %Schema{type: :string, format: :uuid},
+          repo: %Schema{type: :string, pattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+          pr_number: %Schema{type: :integer, minimum: 1},
+          head_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+          merge_method: %Schema{type: :string, enum: @merge_methods}
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerTraceAck do
     @moduledoc false
     require OpenApiSpex
@@ -2787,6 +2862,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerTraceCursor,
     RunnerTraceAck,
     RunnerDisconnecting,
+    RunnerMergeInstruction,
     RunnerStage,
     RunnerStageReport
   ]
@@ -3368,6 +3444,33 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       end
     end
   end
+
+  @doc """
+  Validates an outbound `merge` instruction (`RunnerMergeInstruction`, since 1.29.0) before it
+  is pushed. Returns the declared fields only, with atom keys, or `{:error, {:invalid, _}}`.
+  Outbound is validated for the reason `cast_dispatch/1` gives: a push the runner cannot parse
+  is an instruction silently lost, and nothing undeclared may reach the machine.
+  """
+  @spec cast_merge_instruction(term()) :: {:ok, map()} | {:error, term()}
+  def cast_merge_instruction(payload) do
+    with {:ok, cast} <- cast(payload, RunnerMergeInstruction.schema()) do
+      {:ok, known_fields(cast, RunnerMergeInstruction.schema())}
+    end
+  end
+
+  @doc """
+  Whether a runner that joined declaring `version` understands a `merge` push (1.29.0). A
+  version that does not parse, or none at all, does not.
+  """
+  @spec merge_instruction_supported?(term()) :: boolean()
+  def merge_instruction_supported?(version) when is_binary(version) do
+    case Version.parse(version) do
+      {:ok, parsed} -> Version.compare(parsed, @merge_instruction_since) != :lt
+      :error -> false
+    end
+  end
+
+  def merge_instruction_supported?(_version), do: false
 
   defp dispatch_shape_errors(dispatch) do
     kind_errors(dispatch) ++
@@ -4059,6 +4162,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace_cursor" => "RunnerTraceCursor",
           "trace_event" => "RunnerTraceEvent",
           "disconnecting" => "RunnerDisconnecting",
+          "merge" => "RunnerMergeInstruction",
           "stage" => "RunnerStageReport",
           "triage_verdict" => "RunnerTriageVerdictMessage",
           "session_ended" => "RunnerSessionEnded",

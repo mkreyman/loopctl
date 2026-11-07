@@ -215,12 +215,16 @@ defmodule Loopctl.Tenants.TierCapabilities do
   # `Loopctl.Agents.VerifierPlacement` mints the root verifier dispatch and binds
   # `verifier_dispatch_id`, `Loopctl.Agents.VerifyVerdict` reports, reviews and verifies, and
   # `Loopctl.Delivery.ImplementerStart` starts the claimed story.
+  #
+  # US-48.17 adds `Loopctl.Delivery.MergeExecution`: an Oban job that runs the merge gate and
+  # instructs the runner holding the claim to merge, with no controller in front of it.
   @gated_contexts %{
     chain_of_custody: [
       "Loopctl.Delivery.Placement",
       "Loopctl.Agents.VerifierPlacement",
       "Loopctl.Agents.VerifyVerdict",
-      "Loopctl.Delivery.ImplementerStart"
+      "Loopctl.Delivery.ImplementerStart",
+      "Loopctl.Delivery.MergeExecution"
     ]
   }
 

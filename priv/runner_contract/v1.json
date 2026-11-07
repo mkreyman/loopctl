@@ -543,6 +543,52 @@
       ],
       "type": "object"
     },
+    "RunnerMergeInstruction": {
+      "additionalProperties": false,
+      "description": "Since 1.29.0. Pushed as `merge` on the runner's topic: loopctl's merge gate ALLOWED `head_sha` of pull request `pr_number` in `repo`, and the runner holding the claim is to merge it. Merge exactly that head and nothing else — `gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha>` — then report `stage` `ci -> merged` (edge `forward`) under `dispatch_id` and `claim_epoch`, with `effects.merge_sha` the merge commit GitHub returned. When the pull request is ALREADY merged at `head_sha`, report that merge the same way. When GitHub refuses because the head is no longer `head_sha`, report `ci -> implementing` over `base_moved`; any other refusal, report `ci -> escalated` over `session_escalated` with the refusal as `reason`. No reply. It may be pushed more than once for one head when no merge was reported within the answer window; a second instruction for a head already merged is answered by reporting that merge again, which is idempotent. Only a runner that JOINED declaring 1.29.0 or later is sent one.",
+      "properties": {
+        "claim_epoch": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "head_sha": {
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "type": "string"
+        },
+        "merge_method": {
+          "enum": [
+            "squash"
+          ],
+          "type": "string"
+        },
+        "pr_number": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repo": {
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "story_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "story_id",
+        "repo",
+        "pr_number",
+        "head_sha",
+        "merge_method"
+      ],
+      "type": "object"
+    },
     "RunnerSample": {
       "description": "A self-measured health sample. Connected is not able-to-build: a wedged machine still answers heartbeats, so the control plane treats a stale sample as a breached threshold.",
       "properties": {
@@ -1983,6 +2029,7 @@
       "dispatch": "RunnerDispatch",
       "dispatch_reply": "RunnerDispatchReply",
       "join": "RunnerJoin",
+      "merge": "RunnerMergeInstruction",
       "session_ended": "RunnerSessionEnded",
       "stage": "RunnerStageReport",
       "status": "RunnerStatus",
@@ -2285,5 +2332,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.28.0"
+  "x-contract-version": "1.29.0"
 }
