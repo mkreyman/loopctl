@@ -32,7 +32,10 @@ defmodule Loopctl.Agents.TuningFlowTest do
 
   setup :verify_on_exit!
 
-  @reply_timeout 2_000
+  # A wait, not a delay: assert_reply/assert_push return as soon as the message lands, so
+  # the bound only matters when it never does. 2_000 ran out with an empty mailbox under a
+  # loaded full suite (2026-11-07) on a test that passes alone in milliseconds.
+  @reply_timeout 10_000
   @budgets %{wall_clock_seconds: 900, max_turns: 30}
 
   setup do
