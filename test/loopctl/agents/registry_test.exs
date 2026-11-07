@@ -173,7 +173,10 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.3: the candidate builder and the two `candidates/1` that delegate to it.
       "lib/loopctl/agents/candidates.ex",
       "lib/loopctl/delivery/dispatch_driver.ex",
-      "lib/loopctl/delivery/triage_dispatcher.ex"
+      "lib/loopctl/delivery/triage_dispatcher.ex",
+      # US-48.4: the `:judge` pass, and the cron caller that runs it with `triage@1`.
+      "lib/loopctl/agents/dispatcher.ex",
+      "lib/loopctl/workers/triage_dispatch_worker.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

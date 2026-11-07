@@ -2,12 +2,12 @@ defmodule Loopctl.Workers.TriageDispatchWorker do
   @moduledoc """
   Asks a runner to triage what intake has detected, once a minute (issue #803 §4).
 
-  The cron caller of `Loopctl.Delivery.TriageDispatcher.run/1`, which owns the selection and
-  every refusal. Same shape, same cadence and the same reasons as
-  `Loopctl.Workers.DispatchDriverWorker`: a candidate is local statements plus one push to an
-  already-connected socket, so the bound is AdminRepo's three-connection pool rather than
-  anyone's rate limit, and a remainder is the next pass's first candidates because the read is
-  oldest-first.
+  The cron caller of `Loopctl.Agents.Dispatcher.run/2` with `triage@1`
+  (`Loopctl.Agents.Specs.TriageV1`, US-48.4), which owns the selection and every refusal. Same
+  shape, same cadence and the same reasons as `Loopctl.Workers.DispatchDriverWorker`: a
+  candidate is local statements plus one push to an already-connected socket, so the bound is
+  AdminRepo's three-connection pool rather than anyone's rate limit, and a remainder is the next
+  pass's first candidates because the read is oldest-first.
 
   OFF with the driver. `:dispatch_driver_enabled` gates both, so an operator turns the
   unattended loop on once rather than reaching a state where stories are triaged and never
@@ -16,7 +16,8 @@ defmodule Loopctl.Workers.TriageDispatchWorker do
 
   use Oban.Worker, queue: :default, max_attempts: 3
 
-  alias Loopctl.Delivery.TriageDispatcher
+  alias Loopctl.Agents.Dispatcher
+  alias Loopctl.Agents.Specs.TriageV1
 
   require Logger
 
@@ -28,7 +29,7 @@ defmodule Loopctl.Workers.TriageDispatchWorker do
           | {:error, {:all_candidates_errored, pos_integer()}}
           | {:cancel, {:misconfigured, atom()}}
   def perform(%Oban.Job{}) do
-    case TriageDispatcher.run(@batch) do
+    case Dispatcher.run(TriageV1.spec(), limit: @batch) do
       {:ok, results} -> report(results)
       {:error, {_shape, key}} -> misconfigured(key)
     end
@@ -46,7 +47,7 @@ defmodule Loopctl.Workers.TriageDispatchWorker do
   declares `triage` yet, which is every machine until the runners ship their accept path — and
   neither is `:blocked`, which the dispatcher already surfaces at ERROR naming the tenant.
   """
-  @spec run_result([TriageDispatcher.outcome()]) ::
+  @spec run_result([Dispatcher.outcome()]) ::
           :ok | {:error, {:all_candidates_errored, pos_integer()}}
   #
   # A stranded row's outcome (`{:stranded, _}`) is left out of BOTH counts: one whose
@@ -60,9 +61,24 @@ defmodule Loopctl.Workers.TriageDispatchWorker do
   defp all_errored(count, count) when count > 0, do: {:error, {:all_candidates_errored, count}}
   defp all_errored(_errored, _total), do: :ok
 
-  defp report(results) do
+  @doc """
+  The outcome summary a pass logs, or `nil` for a pass with nothing to say (no line is logged).
+
+  An operator's log search reads this line, so its shape is pinned on recorded passes
+  (`Loopctl.Agents.DispatcherTest`).
+  """
+  @spec summary([Dispatcher.outcome()]) :: String.t() | nil
+  def summary(results) when is_list(results) do
     tally = Enum.frequencies(results)
-    if map_size(tally) > 0, do: Logger.info("TriageDispatchWorker: #{inspect(tally)}")
+    if map_size(tally) > 0, do: "TriageDispatchWorker: #{inspect(tally)}"
+  end
+
+  defp report(results) do
+    case summary(results) do
+      nil -> :ok
+      line -> Logger.info(line)
+    end
+
     run_result(results)
   end
 

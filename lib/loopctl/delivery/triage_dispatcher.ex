@@ -9,6 +9,15 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   in `lib/` built the dispatch. So the trio ran only where a person ran it, and a real ticket
   stopped at `detected` for ever.
 
+  ## The pass runs from `triage@1` (US-48.4)
+
+  Every function here is `Loopctl.Agents.Dispatcher` over `Loopctl.Agents.Specs.TriageV1`:
+  the candidates, the payload (`:triage_payload`), the refs (`:source_base_branch` for both
+  `branch` and `base_branch`), the too-large escalation (the `:payload_too_large` screen), the
+  transient/blocked classification and the `:stranded_triaged_unbound` sweep. The cron caller,
+  `Loopctl.Workers.TriageDispatchWorker`, calls the dispatcher with the spec directly; this
+  module keeps the triage-named entry points the suite and the runbooks use.
+
   ## It claims NOTHING, and that is the difference from `Placement.place/4`
 
   An implement dispatch claims the story: the session works on it, and the claim is what the
@@ -18,7 +27,8 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   `claimed`, which is the stage an implement session reports from.
 
   The dispatch carries the story's CURRENT `claim_epoch` instead, which is what the ledger
-  fences against and what the verdict's transitions are checked on when it comes back.
+  fences against and what the verdict's transitions are checked on when it comes back. That is
+  the `:judge` archetype, and `Loopctl.Agents.Dispatcher.run/2` runs no other.
 
   ## Eligibility, and why triage is stricter about the runner than implement is
 
@@ -37,8 +47,8 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   Its own, and unset by default like the driver's: a triage session reads a ticket and answers,
   so it is a fraction of an implement run, and inheriting the implement budgets would hand a
   reading session a day of wall clock. `:triage_wall_clock_seconds` and `:triage_max_turns`
-  have NO DEFAULT for the reason `DispatchDriver` states: a default here is loopctl's guess
-  quietly becoming the operator's cost policy.
+  (the spec's `budgets` pair) have NO DEFAULT for the reason `DispatchDriver` states: a default
+  here is loopctl's guess quietly becoming the operator's cost policy.
 
   ## What it does NOT do
 
@@ -48,8 +58,9 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   What stops a SECOND dispatch going out for a story already being triaged is `candidates/1`,
   which excludes any story holding an unreleased triage dispatch. The `dispatch_id` itself is
-  generated fresh per attempt, like the driver's; see the comment above `dispatch/4` for why
-  deriving it from the story blocked re-triage permanently.
+  generated fresh per attempt, like the driver's; see the comment above
+  `Loopctl.Agents.Dispatcher`'s payload builder for why deriving it from the story blocked
+  re-triage permanently.
 
   A story it can never dispatch does NOT sit here silently. `:triage_too_large` — a ticket
   whose rendered object will not fit the contract's bound — is ESCALATED, because it is the
@@ -59,69 +70,10 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   excluded by the query, the second logs and is rare), so neither can head-of-line the queue.
   """
 
-  import Ecto.Query
-
-  alias Loopctl.Agents.Candidates
+  alias Loopctl.Agents.Dispatcher
   alias Loopctl.Agents.Specs.TriageV1
-  alias Loopctl.Delivery.Stages
-  alias Loopctl.Delivery.StoryStage
-  alias Loopctl.Delivery.TriagePayload
-  alias Loopctl.Delivery.TriageVerdictRecord
-  alias Loopctl.GitRef
-  alias Loopctl.Intake
-  alias Loopctl.Repo
-  alias Loopctl.Runners
-  alias Loopctl.Runners.DispatchRecord
-  alias Loopctl.Runners.Runner
-  alias Loopctl.Runners.Selection
-  alias Loopctl.WorkBreakdown.Story
 
-  require Logger
-
-  @type outcome ::
-          :dispatched
-          | :no_runner
-          | :deferred
-          | :blocked
-          | :escalated
-          | :errored
-          | {:stranded, :escalated | :blocked | :errored}
-
-  @kind "triage"
-
-  # REFUSALS THAT CLEAR BY THEMSELVES, and the difference from `:blocked` is what an operator
-  # reads. A contended capacity reservation, a runner that just filled its last slot, a tenant
-  # at its admission cap: every one of these is the fleet being busy, and the story is a
-  # candidate again in a minute. Calling them `:blocked` would put "somebody must change
-  # something" in the log for a queue that is working exactly as intended — and the live case
-  # is ordinary, because a story stays at `detected` until its verdict comes back, so a pass
-  # that runs while its triage session is live meets its own reservation.
-  #
-  # A race is transient too, and classing one as `:blocked` is the same lie in the other
-  # direction: `:stale_claim_epoch` is the story's epoch moving between `fetch_story/2` and
-  # `record_sent/3`, and `:runner_not_connected` / `:runner_ambiguous` are the runner dropping
-  # its socket between the Presence read in `Selection.runners/3` and the push. Every one of
-  # them is gone by the next pass and none has an action a person could take. Telling an
-  # operator to intervene on the conditions that fix themselves is how the log stops being
-  # read at all.
-  #
-  # `:dispatch_already_replied` is NOT here any more, and that is the correction that matters:
-  # it used to be classed transient while being the most permanent state this pass could reach
-  # — an accepted session that died left it for ever, logged at `info` as the fleet being busy.
-  # It is now unreachable in that shape (`candidates/1` excludes a story with an unreleased
-  # dispatch), so what is left is a genuine race against a reply landing mid-pass, and a race
-  # is `:blocked` only if it cannot clear. This one clears when the ledger row releases.
-  @transient [
-    :capacity_busy,
-    :busy,
-    :admission_limit_reached,
-    :runner_at_capacity,
-    :rate_limited,
-    :stale_claim_epoch,
-    :runner_not_connected,
-    :runner_ambiguous,
-    :dispatch_already_replied
-  ]
+  @type outcome :: Dispatcher.outcome()
 
   @doc """
   Stories at `detected` that came from an intake record, are under a project bound to exactly
@@ -166,34 +118,15 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   Public so the selection is falsifiable rather than buried in the pass.
   """
-  @spec candidates(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
-  def candidates(limit) when is_integer(limit) and limit > 0 do
-    TriageV1.spec()
-    |> Candidates.query(limit: limit)
-    |> Loopctl.AdminRepo.all()
-    |> Enum.map(&Map.take(&1, [:tenant_id, :story_id]))
-  end
+  @spec candidates(pos_integer()) :: [Dispatcher.candidate()]
+  def candidates(limit) when is_integer(limit) and limit > 0,
+    do: Dispatcher.candidates(TriageV1.spec(), limit)
 
   @doc "The budgets a triage session runs under, or `{:error, {:unset, key}}`."
   @spec budgets() ::
-          {:ok, %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}}
+          {:ok, Dispatcher.budgets()}
           | {:error, {:unset, atom()} | {:over_contract_maximum, atom()}}
-  def budgets do
-    alias Loopctl.Delivery.DispatchDriver
-
-    with {:ok, seconds} <-
-           DispatchDriver.normalise_budget(
-             Application.get_env(:loopctl, :triage_wall_clock_seconds),
-             :triage_wall_clock_seconds
-           ),
-         {:ok, turns} <-
-           DispatchDriver.normalise_budget(
-             Application.get_env(:loopctl, :triage_max_turns),
-             :triage_max_turns
-           ) do
-      {:ok, %{wall_clock_seconds: seconds, max_turns: turns}}
-    end
-  end
+  def budgets, do: Dispatcher.budgets(TriageV1.spec())
 
   @doc """
   One pass: ask a runner to triage what has been detected.
@@ -203,292 +136,25 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   while nothing places the result, or the reverse — and the thing being authorised is the
   same: sessions started on someone's machines with nobody watching.
   """
-  @spec run(pos_integer()) :: {:ok, [outcome()]} | {:error, term()}
-  def run(limit) when is_integer(limit) and limit > 0 do
-    alias Loopctl.Delivery.DispatchDriver
-
-    if DispatchDriver.enabled?() do
-      with {:ok, budgets} <- budgets(), do: {:ok, run_with(limit, budgets)}
-    else
-      {:ok, []}
-    end
-  end
-
-  # THE STRANDED SWEEP IS NOT BOUND BY THE PASS'S `limit`. A stranded row whose escalation
-  # keeps failing is not touched, so it keeps its place at the head of the oldest-first
-  # ranking; with the pass's own `limit` (a handful of candidates), that many failing rows held
-  # every stranded slot for ever and no later half-taken story was finished. A row is stranded
-  # only when the SECOND transaction of the too-large route failed, so the set is small by
-  # construction; the cap only bounds a pathological pass.
-  @stranded_sweep 500
+  @spec run(pos_integer()) ::
+          {:ok, [outcome()]} | {:error, {:unset, atom()} | {:over_contract_maximum, atom()}}
+  def run(limit) when is_integer(limit) and limit > 0,
+    do: Dispatcher.run(TriageV1.spec(), limit: limit)
 
   @doc "The pass itself, on budgets already decided — the seam a test can reach."
-  @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
-          [outcome()]
+  @spec run_with(pos_integer(), Dispatcher.budgets()) :: [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    finished = @stranded_sweep |> stranded() |> Enum.map(&finish_stranded/1)
+    {:ok, outcomes} =
+      Dispatcher.run(TriageV1.spec(), limit: limit, budgets: budgets, enabled?: true)
 
-    {outcomes, _cache} =
-      limit
-      |> candidates()
-      |> Enum.map_reduce(%{}, fn candidate, cache -> attempt(candidate, budgets, cache) end)
-
-    finished ++ outcomes
+    outcomes
   end
 
   @doc """
-  Stories this module's own too-large route left HALF-TAKEN: at `triaged` with no triage
-  dispatch bound, no live triage dispatch, and no triage verdict ever recorded. "No verdict"
-  implies "nothing bound": only a verdict's own step, and the migration's backfill from a
-  recorded verdict, ever write `triage_dispatch_id`, so the query reads the verdict alone.
-
-  The route is two transitions in two transactions (`Stages` refuses to nest them), so a
-  failure of the second leaves the row at `triaged`. Nothing else reaches `triaged` without a
-  verdict — a verdict's own step binds its dispatch in the same transaction — and
-  `candidates/1` reads only `detected`, so without this the row stayed there for ever. Each pass
-  finishes such a row over the same route; its first transition answers `:stale_stage` and the
-  second applies.
+  Stories the too-large route left HALF-TAKEN: `triage@1`'s `:stranded_triaged_unbound`
+  sweep (`Loopctl.Agents.Dispatcher.swept/3`).
   """
-  @spec stranded(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
-  def stranded(limit) when is_integer(limit) and limit > 0 do
-    # RANKED PER TENANT, oldest first within each: the first row of EVERY tenant before any
-    # tenant's second. Rows whose escalation keeps failing are not touched, so they keep their
-    # place; ranked across all tenants at once, one tenant's failures held every slot and no
-    # other tenant's stranded row was ever finished (`ReclaimExpiredClaimsWorker` ranks its
-    # candidates the same way, for the same reason).
-    ranked =
-      from s in StoryStage,
-        left_join: d in DispatchRecord,
-        on:
-          d.tenant_id == s.tenant_id and d.story_id == s.story_id and d.kind == ^@kind and
-            is_nil(d.released_at),
-        left_join: v in TriageVerdictRecord,
-        on: v.tenant_id == s.tenant_id and v.story_id == s.story_id,
-        where: s.stage == :triaged,
-        where: is_nil(d.id) and is_nil(v.id),
-        select: %{
-          tenant_id: s.tenant_id,
-          story_id: s.story_id,
-          updated_at: s.updated_at,
-          rank:
-            over(row_number(),
-              partition_by: s.tenant_id,
-              order_by: [asc: s.updated_at, asc: s.story_id]
-            )
-        }
-
-    Loopctl.AdminRepo.all(
-      from r in subquery(ranked),
-        order_by: [asc: r.rank, asc: r.updated_at, asc: r.story_id],
-        limit: ^limit,
-        select: %{tenant_id: r.tenant_id, story_id: r.story_id}
-    )
-  end
-
-  # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
-  # the head of every later batch too. The pass cache carries only whether a tenant's
-  # `:no_runner` note has been logged (`Loopctl.Runners.Selection.note_no_runner/3`), as
-  # `Loopctl.Delivery.DispatchDriver`'s does.
-  #
-  # `:runner_exhausted` is `Runners.dispatch/3` refusing a machine that ran dry after
-  # `Selection.runners/3` chose it: this story found no runner, which is what `:no_runner`
-  # says, and the next pass selects again.
-  defp attempt(candidate, budgets, cache) do
-    case send_triage(candidate, budgets) do
-      :ok ->
-        {:dispatched, cache}
-
-      {:error, reason} when reason in [:no_runner, :runner_exhausted] ->
-        {:no_runner, Selection.note_no_runner(cache, "TriageDispatcher", candidate)}
-
-      {:error, :triage_too_large} ->
-        {escalate_too_large(candidate), cache}
-
-      {:error, reason} when reason in @transient ->
-        {deferred(candidate, reason), cache}
-
-      {:error, reason} ->
-        {blocked(candidate, reason), cache}
-    end
-  rescue
-    error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
-  catch
-    kind, value -> {errored(candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
-  end
-
-  defp send_triage(%{tenant_id: tenant_id, story_id: story_id}, budgets) do
-    with {:ok, story} <- fetch_story(tenant_id, story_id),
-         {:ok, record} <- Intake.get_record(tenant_id, story.intake_record_id),
-         {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
-         :ok <- usable_base_branch(source),
-         {:ok, triage} <- TriagePayload.build(record),
-         [%Runner{} = runner | _] <- Selection.runners(tenant_id, @kind, source.repo_full_name) do
-      Runners.dispatch(tenant_id, runner.id, dispatch(story, source, triage, budgets))
-    else
-      {:error, reason} -> {:error, reason}
-      [] -> {:error, :no_runner}
-    end
-  end
-
-  # THE SECOND HALF OF #874 ROUND 2 FINDING 1, and the half that covers rows written before it.
-  # `Source.validate_base_branch/1` now refuses a value that is not a git ref name at the WRITE,
-  # but a row enrolled or repointed earlier was checked only for length — and this module is
-  # the one dispatch path that never goes through `DispatchPayload.fill/3`, whose second
-  # `validate_refs/2` call is what judges a value the intake source supplied. `dispatch/4`
-  # below puts `source.base_branch` in as BOTH `branch` and `base_branch`, so without this the
-  # legacy row reaches git on a dev machine.
-  #
-  # It lands on `blocked/2` — "BLOCKED until somebody changes something" — which is exactly
-  # what this is: an operator has to repoint the source, and no later pass can change it. The
-  # reason is a bare atom so the value is not echoed into the log; the story id names the row
-  # to go and look at.
-  defp usable_base_branch(%{base_branch: branch}) do
-    if GitRef.valid_name?(branch) and byte_size(branch) <= 255,
-      do: :ok,
-      else: {:error, :invalid_base_branch}
-  end
-
-  # FRESH PER ATTEMPT, as `DispatchDriver` generates one. It was derived from the story and its
-  # epoch, so that a second pass during a live session re-sent the same id and the ledger
-  # answered it as the retry it was. That worked and cost too much: nothing bumps `claim_epoch`
-  # on an unclaimed `detected` story, so the id could NEVER differ, and a dispatch that ended
-  # badly left a permanent block — `:dispatch_id_conflict` against any other runner, or
-  # `:dispatch_already_replied` for ever once a session accepted and then died. What the
-  # derivation was protecting is now a predicate in `candidates/1`: a story with an unreleased
-  # triage dispatch is not a candidate at all, and `Capacity.heal/3` is what ends that.
-  defp dispatch(story, source, triage, budgets) do
-    %{
-      "dispatch_id" => Ecto.UUID.generate(),
-      "story_id" => story.id,
-      "kind" => @kind,
-      "repo" => source.repo_full_name,
-      # A triage session READS the repository; it is not expected to commit. It is given the
-      # base branch as its branch rather than a new one so nothing invites it to cut a
-      # worktree, and `base_branch` is the source's own — `master` on a repository that has
-      # not said otherwise, `main` where an operator set it.
-      "branch" => source.base_branch,
-      "base_branch" => source.base_branch,
-      "claim_epoch" => story.claim_epoch,
-      "wall_clock_seconds" => budgets.wall_clock_seconds,
-      "max_turns" => budgets.max_turns,
-      "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
-    }
-  end
-
-  # A TICKET NO SESSION CAN BE ASKED TO READ NEEDS A PERSON, NOT ANOTHER PASS. `TriagePayload`
-  # says so in its own moduledoc — "its caller escalates it to a human" — and this is the only
-  # caller. Logged and left, it was an ERROR line a minute for ever about a condition that
-  # cannot change by itself, on a story that then also sat at the head of the oldest-first
-  # ranking (`candidates/1` has no size predicate and cannot have one; the bound is on the
-  # RENDERED object).
-  #
-  # `detected` has no edge to `escalated`, so this takes the route the machine already has for
-  # exactly this conclusion: `detected -> triaged -> escalated` on `:triage_escalate`, which is
-  # what an escalating verdict takes. Two transactions, and the second failing leaves the story
-  # at `triaged` — where nothing re-dispatches it, which is correct: this pass never sends a
-  # triaged story, and an operator reading `triaged` with no verdict is looking at a story that
-  # needs them either way.
-  #
-  # IT BINDS NO DISPATCH, deliberately (epic 44, US-44.1): no verdict decided this story, so
-  # `triage_dispatch_id` stays NULL — no session may take it out of `triaged`, and this route,
-  # which names no session dispatch, still may. The migration that added the column leaves these
-  # rows NULL for the same reason (`20260923130000_add_story_stages_triage_dispatch_id.exs`).
-  #
-  # `actor_role: :agent` with an EMPTY lineage, stated: this is a worker holding no credential,
-  # and `:agent` keeps the human-only edges out of reach whatever the default becomes.
-  # ONE STRANDED ROW MAY NOT KILL THE PASS either: `stranded/1` ranks oldest-first, so a row
-  # whose escalation raises would head every later pass and no detected story would ever be
-  # triaged again. The same rescue `attempt/3` gives a candidate.
-  #
-  # Every outcome is TAGGED `{:stranded, outcome}`: `TriageDispatchWorker.run_result/1` judges
-  # the pass by its CANDIDATES, and a stranded row that keeps failing — raising or refused —
-  # reappears every pass, so counted among them it either hid a pass whose every candidate
-  # errored or failed passes that only re-ran the same escalation.
-  defp finish_stranded(row) do
-    {:stranded, escalate_too_large(row)}
-  rescue
-    error -> {:stranded, errored(row, Exception.format(:error, error, __STACKTRACE__))}
-  catch
-    kind, value -> {:stranded, errored(row, Exception.format(kind, value, __STACKTRACE__))}
-  end
-
-  defp escalate_too_large(%{tenant_id: tenant_id, story_id: story_id}) do
-    case fetch_story(tenant_id, story_id) do
-      {:ok, story} -> escalate_route(tenant_id, story)
-      {:error, reason} -> blocked(%{tenant_id: tenant_id, story_id: story_id}, reason)
-    end
-  end
-
-  defp escalate_route(tenant_id, story) do
-    opts = [
-      claim_epoch: story.claim_epoch,
-      actor_label: "worker:triage_dispatcher",
-      actor_role: :agent,
-      actor_lineage: []
-    ]
-
-    route = [
-      {{:detected, :triaged, :forward}, nil},
-      {{:triaged, :escalated, :triage_escalate}, "triage_dispatch:triage_too_large"}
-    ]
-
-    Enum.reduce_while(route, :escalated, fn {transition, reason}, _acc ->
-      case Stages.advance(tenant_id, story.id, transition, Keyword.put(opts, :reason, reason)) do
-        {:ok, _row} ->
-          {:cont, :escalated}
-
-        # Already taken — by a verdict that landed between the size refusal and here, or by the
-        # first half of an earlier attempt at this route. The next transition still applies.
-        {:error, :stale_stage} ->
-          {:cont, :escalated}
-
-        {:error, reason} ->
-          {:halt,
-           blocked(%{tenant_id: tenant_id, story_id: story.id}, {:escalate_failed, reason})}
-      end
-    end)
-  end
-
-  defp fetch_story(tenant_id, story_id) do
-    {:ok, story} =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.one(from s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id)
-      end)
-
-    if story, do: {:ok, story}, else: {:error, :story_not_found}
-  end
-
-  # A state only a person clears — no intake source on the project, a record that is gone, a
-  # ticket too large to describe within the contract — logged at ERROR for the reason
-  # `DispatchDriver` gives: a queue that never drains while every pass reports `:ok` at `info`
-  # is indistinguishable from an empty one.
-  defp blocked(candidate, reason) do
-    Logger.error(
-      "TriageDispatcher: BLOCKED until somebody changes something: " <>
-        "story_id=#{candidate.story_id} reason=#{inspect(reason)}",
-      tenant_id: candidate.tenant_id
-    )
-
-    :blocked
-  end
-
-  defp deferred(candidate, reason) do
-    Logger.info(
-      "TriageDispatcher: leaving for the next pass: story_id=#{candidate.story_id} " <>
-        "reason=#{inspect(reason)}",
-      tenant_id: candidate.tenant_id
-    )
-
-    :deferred
-  end
-
-  defp errored(candidate, detail) do
-    Logger.error(
-      "TriageDispatcher: candidate failed, continuing with the rest of the pass: " <>
-        "story_id=#{candidate.story_id} detail=#{detail}",
-      tenant_id: candidate.tenant_id
-    )
-
-    :errored
-  end
+  @spec stranded(pos_integer()) :: [Dispatcher.candidate()]
+  def stranded(limit) when is_integer(limit) and limit > 0,
+    do: Dispatcher.swept(TriageV1.spec(), :stranded_triaged_unbound, limit)
 end

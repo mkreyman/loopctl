@@ -2,11 +2,11 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
   @moduledoc """
   `triage@1`, a `:judge`: today's triage dispatch, transcribed (US-48.2).
 
-  `candidates` is READ: `TriageDispatcher.candidates/1` is `Loopctl.Agents.Candidates.query/2`
-  over it (US-48.3). The rest of the behaviour still lives in `Loopctl.Delivery.TriageDispatcher`
-  (the stranded sweep, the payload, the budgets) and `Loopctl.Delivery.TriageVerdict` (routes,
-  screens, the draft); `Loopctl.Agents.RegistryTest` holds the two equal until later stories
-  move it onto this description.
+  The DISPATCH half is read: `Loopctl.Agents.Dispatcher.run/2` runs the pass from `candidates`
+  (US-48.3), `payload`, `refs`, `budgets`, `kind`, `sweeps` and the `:payload_too_large` screen
+  (US-48.4). The RESULT half still lives in `Loopctl.Delivery.TriageVerdict` (the outcome
+  routes, the gate and draft screens, the draft); `Loopctl.Agents.RegistryTest` holds the two
+  equal until a later story moves it onto this description.
 
   - **Claims nothing.** The dispatch echoes the story's current `claim_epoch`.
   - **Every outcome passes through `triaged` first**, and the transition out of it is
