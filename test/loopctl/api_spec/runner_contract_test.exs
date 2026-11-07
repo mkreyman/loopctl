@@ -41,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "5d2a292f8de6cfde4ff5751888ce6dc2f5a0a949180c6e22e0634d794ed4508e"
+  @digest "fc8d4c39de335cc99f9fd1b0350eee66a2954522bdc96bddeb49c77cb8376ccc"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -75,8 +75,28 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.27.0"
-      assert schema["x-contract-version"] == "1.27.0"
+      assert RunnerContract.version() == "1.28.0"
+      assert schema["x-contract-version"] == "1.28.0"
+
+      # 1.28.0 (US-48.18): the verifier is a kind a runner may be sent, it is never implied by
+      # silence, and its verdict schema is published with the other agent_result specs.
+      assert "verify" in connection["dispatchable_kinds"]
+      refute "verify" in RunnerContract.Kinds.implied_by_silence()
+
+      assert %{
+               "type" => "object",
+               "required" => ["verdict", "head_sha", "findings"],
+               "additionalProperties" => false,
+               "properties" => %{
+                 "verdict" => %{"enum" => ["pass", "reject"]},
+                 "findings" => %{"maxItems" => 10}
+               }
+             } = connection["agent_result_schemas"]["verify@1"]
+
+      # ...and neither control-only edge is a transition a runner may report.
+      refute Enum.any?(connection["stage_transitions"], fn t ->
+               t["edge"] in ["verify_rejected", "no_independent_verifier_runner"]
+             end)
 
       # 1.26.0 (US-48.9): the reply drafter is a kind a runner may be sent.
       assert "reply_draft" in connection["dispatchable_kinds"]

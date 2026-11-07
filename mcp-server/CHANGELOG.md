@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.9.1 — 2026-11-07 (verify@1)
+
+### Changed
+
+- **`reject_story`**'s description names its new refusal: 409 `caller_lineage_required` for a
+  key no dispatch minted on a pull-request-route story (loopctl US-48.18), which control now
+  verifies and rejects through its own verifier dispatch.
+
 ## 3.9.0 — 2026-11-07 (the escalation inbox)
 
 ### Added

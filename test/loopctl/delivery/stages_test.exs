@@ -737,7 +737,8 @@ defmodule Loopctl.Delivery.StagesTest do
       pr_number: 821,
       merge_sha: String.duplicate("d", 64),
       release_id: "v421",
-      merge_gate_allowed_sha: String.duplicate("1", 40)
+      merge_gate_allowed_sha: String.duplicate("1", 40),
+      verified_head_sha: String.duplicate("3", 40)
     }
 
     @others %{
@@ -748,7 +749,8 @@ defmodule Loopctl.Delivery.StagesTest do
       pr_number: 822,
       merge_sha: String.duplicate("f", 40),
       release_id: "v422",
-      merge_gate_allowed_sha: String.duplicate("2", 40)
+      merge_gate_allowed_sha: String.duplicate("2", 40),
+      verified_head_sha: String.duplicate("4", 40)
     }
 
     test "a replay of every outward stage finds and reuses its recorded identity" do
@@ -2056,7 +2058,9 @@ defmodule Loopctl.Delivery.StagesTest do
                "post_deploy_unresolved" => nil,
                # The release and chg's trunk verification are merge-keyed too (US-47.4).
                "release_id" => nil,
-               "trunk_verified_sha" => nil
+               "trunk_verified_sha" => nil,
+               # Head-keyed (US-48.18): a verification is of one head, retracted with it.
+               "verified_head_sha" => nil
              }
 
       # And the next attempt can record its own head again.

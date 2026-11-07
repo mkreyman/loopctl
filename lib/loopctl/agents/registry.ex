@@ -17,7 +17,11 @@ defmodule Loopctl.Agents.Registry do
   `DispatchPayload.budget_keys/1` reads the spec's `budgets`. `reply_draft@1` (US-48.9) is the
   first spec that is not a transcription: its `:draft` pass runs through the same
   `Loopctl.Agents.Dispatcher`, from `Loopctl.Workers.ReplyDraftDispatchWorker`, and its result
-  through `Loopctl.Agents.AgentResult`. Later stories move the rest of
+  through `Loopctl.Agents.AgentResult`. `verify@1` (US-48.18) is a `:judge` whose pass runs
+  through the same `Dispatcher`, from `Loopctl.Workers.VerifyDispatchWorker`, but places each
+  candidate through `Loopctl.Agents.VerifierPlacement` (a verifier dispatch rooted apart from
+  the implementer's), and whose verdict is applied by `Loopctl.Agents.VerifyVerdict`. Later
+  stories move the rest of
   each dispatch kind onto its spec, each with an
   equivalence test; until then `Loopctl.Agents.RegistryTest` binds the registry to the lists it
   must agree with — `RunnerContract.Kinds.all/0`, the `runner_dispatches_kind` CHECK,
@@ -31,7 +35,7 @@ defmodule Loopctl.Agents.Registry do
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs
 
-  @modules [Specs.TriageV1, Specs.ImplementV1, Specs.ReplyDraftV1]
+  @modules [Specs.TriageV1, Specs.ImplementV1, Specs.ReplyDraftV1, Specs.VerifyV1]
 
   @specs Enum.map(@modules, & &1.spec())
 

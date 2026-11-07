@@ -210,8 +210,18 @@ defmodule Loopctl.Tenants.TierCapabilities do
   # Placement is filed under `chain_of_custody` rather than `dispatch` because the claim is
   # what it is for — the mint is how it gets a lineage to claim under. Modules are STRINGS for
   # symmetry with the controller map, though these carry no cross-layer dependency.
+  #
+  # US-48.18 adds three of the same shape, each reached with no controller in front of it:
+  # `Loopctl.Agents.VerifierPlacement` mints the root verifier dispatch and binds
+  # `verifier_dispatch_id`, `Loopctl.Agents.VerifyVerdict` reports, reviews and verifies, and
+  # `Loopctl.Delivery.ImplementerStart` starts the claimed story.
   @gated_contexts %{
-    chain_of_custody: ["Loopctl.Delivery.Placement"]
+    chain_of_custody: [
+      "Loopctl.Delivery.Placement",
+      "Loopctl.Agents.VerifierPlacement",
+      "Loopctl.Agents.VerifyVerdict",
+      "Loopctl.Delivery.ImplementerStart"
+    ]
   }
 
   @learn_more "https://loopctl.com/wiki/chain-of-custody"

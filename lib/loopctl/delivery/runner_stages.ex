@@ -105,6 +105,7 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   require Logger
 
+  alias Loopctl.Delivery.ImplementerStart
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -183,13 +184,42 @@ defmodule Loopctl.Delivery.RunnerStages do
            {stage.from, stage.to, stage.edge},
            opts
          ) do
-      {:ok, row} -> {:ok, row}
-      {:error, :stale_stage} -> resolve_replay(tenant_id, session, stage)
+      {:ok, row} -> {:ok, follow_start(tenant_id, runner_id, row)}
+      {:error, :stale_stage} -> resolve_replay(tenant_id, runner_id, session, stage)
       {:error, :not_found} -> {:error, :unknown_story_stage}
       {:error, :effect_conflict} -> effect_conflict(tenant_id, session.story_id)
       {:error, reason} -> {:error, classify(reason)}
     end
   end
+
+  # THE CUSTODY STATE FOLLOWS THE STAGE INTO `implementing` (US-48.18). The claim minted a
+  # `start_cap` for the session dispatch and nothing spent it, so `agent_status` stayed
+  # `:assigned` and the story could never be reported. `ImplementerStart.ensure_started/3`
+  # spends it with the identity the CLAIM recorded — never this message's data — and is a
+  # no-op on a story already started (`ci -> implementing`, a replay).
+  #
+  # AFTER the advance commits and outside its transaction, deliberately: the start is a
+  # custody write on `AdminRepo`, and the advance is not refused for a start that fails. A
+  # failure is logged and the verdict path starts the story again before it reports, so the
+  # runner's ack never depends on it.
+  defp follow_start(tenant_id, runner_id, %StoryStage{stage: :implementing} = row) do
+    case ImplementerStart.ensure_started(tenant_id, row.story_id,
+           actor_label: "runner:" <> runner_id
+         ) do
+      {:ok, _} ->
+        row
+
+      {:error, reason} ->
+        Logger.warning(
+          "story did not start with its stage; the verdict path retries it: " <>
+            "tenant_id=#{tenant_id} story_id=#{row.story_id} reason=#{inspect(reason)}"
+        )
+
+        row
+    end
+  end
+
+  defp follow_start(_tenant_id, _runner_id, row), do: row
 
   # --- session_ended (contract 1.16.0, US-44.3) ------------------------------------------
 
@@ -813,7 +843,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   # that can put the row at `to` under this epoch is this claim's own session, because every
   # other writer bumps the epoch. Two copies of one message resolve the same way whichever
   # order they land in.
-  defp resolve_replay(tenant_id, session, stage) do
+  defp resolve_replay(tenant_id, runner_id, session, stage) do
     %{to: to, claim_epoch: epoch} = stage
 
     case Stages.get(tenant_id, session.story_id) do
@@ -821,7 +851,7 @@ defmodule Loopctl.Delivery.RunnerStages do
         {:error, :unknown_story_stage}
 
       %StoryStage{stage: ^to, claim_epoch: ^epoch} = row ->
-        replayed_effects_agree(row, stage, tenant_id, session)
+        replayed_effects_agree(row, stage, tenant_id, runner_id, session)
 
       # THE REFUSAL CARRIES THE ROW (#849). The contract's remedy for `stale_stage` is "re-read
       # the story and send the transition that applies", and until this carried the row there
@@ -849,12 +879,12 @@ defmodule Loopctl.Delivery.RunnerStages do
   # is at the destination without that identity, so this is a different message that happens
   # to share a stage, and accepting it would let an effect be attached after the chain entry
   # that should have named it.
-  defp replayed_effects_agree(row, stage, tenant_id, session) do
+  defp replayed_effects_agree(row, stage, tenant_id, runner_id, session) do
     supplied = Map.get(stage, :effects, %{})
 
     if Enum.all?(supplied, fn {effect, value} -> Map.get(row, effect) == value end) do
       release_on_replay(tenant_id, session, stage)
-      {:ok, row}
+      {:ok, follow_start(tenant_id, runner_id, row)}
     else
       {:error, {:effect_conflict, recorded_effects(row)}}
     end

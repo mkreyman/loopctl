@@ -42,15 +42,19 @@ defmodule Loopctl.Agents.Spec do
   takes on a verdict.
 
   Effects follow the same rule one column along: a `:build` spec may name only
-  `StageMachine.reportable_effects/0`, a `:judge` spec only the control-written triage binding
-  and the drafted story, and a `:draft` spec only its stored artifact (`:reply_draft`, US-48.9).
+  `StageMachine.reportable_effects/0`, a `:judge` spec only the control-written triage binding,
+  the drafted story and the verifier's verdict with the head it binds (`:verify_verdict`,
+  `:verified_head_sha`, US-48.18), and a `:draft` spec only its stored artifact
+  (`:reply_draft`, US-48.9).
 
-  ## A `:draft` may name NO transition at all
+  ## A `:draft` may name NO transition at all, and so may a verifier
 
   A `:draft`'s output is a stored artifact a person releases, never a stage edge, so its routes
-  may be the empty list: `[]` states "this outcome or screen moves nothing", and only a `:draft`
-  may say it. A `:judge` or `:build` route is always a non-empty list of transitions, because
-  its outcome is what moves the story.
+  may be the empty list: `[]` states "this outcome or screen moves nothing". A `:judge` that
+  names `:verify_verdict` may say it too (US-48.18): a verifier's `pass` moves no stage — it
+  writes custody and the head it was made at — and a stale verdict is dropped, moving nothing.
+  Every other `:judge` route, and every `:build` route, is a non-empty list of transitions,
+  because its outcome is what moves the story.
 
   What stays code whatever a spec says: claiming and the session-dispatch mint, operator-key
   resolution, the `implementer_dispatch_id` / `triage_dispatch_id` bindings, what
@@ -92,13 +96,16 @@ defmodule Loopctl.Agents.Spec do
 
   `agent_result` is the one generic result message: `{dispatch_id, claim_epoch, spec: {id,
   version}, result}`, with `result` validated against the named spec's `result_schema`
-  (`Loopctl.Agents.AgentResult`). Only a `:draft` spec may name it, and a spec names it if and
-  only if it carries a `result_schema`. A `:judge` answers with its own verdict message,
-  because its outcome drives custody edges that need their own screens (`triage_verdict`); a
-  `:build` answers with `stage` and `session_ended`, because each of its reports is one
+  (`Loopctl.Agents.AgentResult`). A `:draft` spec may name it, and so may a `:judge` that names
+  the `:verify_verdict` effect (US-48.18); a spec names it if and only if it carries a
+  `result_schema`. Any other `:judge` answers with its own verdict message, because its
+  outcome drives custody edges that need their own screens (`triage_verdict`); a `:build`
+  answers with `stage` and `session_ended`, because each of its reports is one
   runner-reportable transition. A `:draft` drives no transition and writes no effect, so a
   schema-validated object is the whole of what it can say — which is what makes one generic
-  message safe for it.
+  message safe for it. A verifier's object is safe for a different reason: nothing in it is
+  custody identity. `Loopctl.Agents.VerifyVerdict` applies it in a job, under the verifier
+  dispatch CONTROL minted, after re-checking the head and the stage under the story lock.
   """
 
   alias Loopctl.Agents.Candidates
@@ -168,14 +175,19 @@ defmodule Loopctl.Agents.Spec do
   # `:fenced_intake_report` — `TriagePayload.build/1`, the reporter's words fenced, riding the
   # dispatch's `triage` object (`RunnerTriage`); read by `triage@1` and `reply_draft@1`.
   # `:story_payload` — `StoryPayload` / `ImplementerInput.story_object/2` (a `RunnerStory`).
-  @payloads [:fenced_intake_report, :story_payload]
+  # `:verify_payload` — `Loopctl.Agents.VerifierPlacement`: the story object plus the pull
+  # request and the head to judge (`RunnerVerify`), read off the stage row (US-48.18).
+  @payloads [:fenced_intake_report, :story_payload, :verify_payload]
 
   # Where each ref field's value comes from.
   @ref_sources [
     # The intake source's `base_branch`, checked with `GitRef.valid_name?/1`.
     :source_base_branch,
     # Derived per story from the TARGET runner's `branch_prefixes` (`DispatchPayload.fill/3`).
-    :story_branch_for_runner_prefixes
+    :story_branch_for_runner_prefixes,
+    # The branch the stage row recorded at `worktree` — the pull request's head branch, which a
+    # verifier reads and never writes (US-48.18).
+    :stage_branch
   ]
 
   # The eligibility facts decided BEFORE the ledger row is written (`Runners.Selection`,
@@ -218,6 +230,10 @@ defmodule Loopctl.Agents.Spec do
   @agent_result "agent_result"
   @agent_result_archetypes [:draft]
 
+  # The one effect that lets a `:judge` answer through `agent_result`, and name an empty route
+  # (US-48.18): see the moduledoc.
+  @verify_effect :verify_verdict
+
   @screens [
     # `TriagePayload.build/1` refusing a ticket whose rendered object exceeds the contract.
     :payload_too_large,
@@ -236,17 +252,25 @@ defmodule Loopctl.Agents.Spec do
     # `Loopctl.ReplyDrafts.screen/1`: a drafted reply scanned with the drafted-story screen's
     # own detector and signal set (`TriageVerdict.draft_flags/1`); a refusal is stored as a
     # refused row, never as a draft (US-48.9).
-    :injection_detector_draft
+    :injection_detector_draft,
+    # `Loopctl.Agents.VerifyVerdict`: a verdict whose head is not the stage row's current head,
+    # or a story no longer at `ci`, is dropped and the drop recorded (US-48.18). Moves nothing.
+    :verdict_stale,
+    # `Loopctl.Agents.VerifierPlacement`: every runner able to take the dispatch is the
+    # implementer's own agent, so nothing can verify the story (US-48.18).
+    :no_independent_verifier_runner
   ]
 
   # Row writes a result can drive: the stage machine's side-effect identities plus the drafted
   # story row `TriageVerdict` writes.
   # `:reply_draft` is the `reply_drafts` row `Loopctl.ReplyDrafts.write_result/2` writes in the
   # ledger's own transaction (US-48.9).
-  @effects StageMachine.effects() ++ [:story_draft, :reply_draft]
+  # `:verify_verdict` is the verifier's verdict, applied by `Loopctl.Agents.VerifyVerdict` in a
+  # job enqueued once the ledger write commits (US-48.18).
+  @effects StageMachine.effects() ++ [:story_draft, :reply_draft, :verify_verdict]
 
   @archetype_effects %{
-    judge: [:triage_dispatch_id, :story_draft],
+    judge: [:triage_dispatch_id, :story_draft, :verify_verdict, :verified_head_sha],
     build: StageMachine.reportable_effects(),
     draft: [:reply_draft]
   }
@@ -375,9 +399,9 @@ defmodule Loopctl.Agents.Spec do
   @doc """
   Whether `spec`'s session answers with the generic `agent_result` message (contract 1.25.0):
   it names `"agent_result"` in `result` and carries the `result_schema` that message's
-  `result` is validated against. Only a `:draft` spec can, which `new!/2` holds at compile
-  time; the check here reads both halves anyway, so a struct built some other way never reads
-  as reporting through a message it has no schema for.
+  `result` is validated against. Only a `:draft` spec, or a `:judge` naming `:verify_verdict`,
+  can, which `new!/2` holds at compile time; the check here reads both halves anyway, so a
+  struct built some other way never reads as reporting through a message it has no schema for.
   """
   @spec reports_agent_result?(t()) :: boolean()
   def reports_agent_result?(%__MODULE__{result: result, result_schema: schema}),
@@ -407,11 +431,11 @@ defmodule Loopctl.Agents.Spec do
     schema = spec.result_schema
 
     cond do
-      names? and spec.archetype not in @agent_result_archetypes ->
+      names? and not agent_result_archetype?(spec) ->
         {:error,
          "#{label(spec)} (archetype #{inspect(spec.archetype)}) names result " <>
-           "#{inspect(@agent_result)}; only a #{inspect(@agent_result_archetypes)} spec " <>
-           "answers through agent_result"}
+           "#{inspect(@agent_result)}; only a #{inspect(@agent_result_archetypes)} spec, or " <>
+           "a :judge naming the #{inspect(@verify_effect)} effect, answers through agent_result"}
 
       names? and not match?(%OpenApiSpex.Schema{type: :object}, schema) ->
         {:error,
@@ -427,6 +451,18 @@ defmodule Loopctl.Agents.Spec do
         :ok
     end
   end
+
+  defp agent_result_archetype?(%__MODULE__{archetype: archetype})
+       when archetype in @agent_result_archetypes,
+       do: true
+
+  defp agent_result_archetype?(spec), do: verifier?(spec)
+
+  # A `:judge` naming the verifier's verdict effect (US-48.18).
+  defp verifier?(%__MODULE__{archetype: :judge, effects: effects}) when is_list(effects),
+    do: @verify_effect in effects
+
+  defp verifier?(_spec), do: false
 
   defp exact_fields(fields) do
     keys = Keyword.keys(fields)
@@ -569,13 +605,15 @@ defmodule Loopctl.Agents.Spec do
           {name, route} <- map,
           do: {"#{field}.#{name}", route}
 
+    empty_ok? = spec.archetype == :draft or verifier?(spec)
+
     Enum.find_value(routes, :ok, fn {where, route} ->
-      route_error(spec.archetype, label, where, route)
+      route_error(empty_ok?, label, where, route)
     end)
   end
 
-  defp route_error(:draft, _label, _where, []), do: nil
-  defp route_error(_archetype, label, where, route), do: route_error(label, where, route)
+  defp route_error(true, _label, _where, []), do: nil
+  defp route_error(_empty_ok?, label, where, route), do: route_error(label, where, route)
 
   defp route_error(label, where, route) when is_list(route) and route != [] do
     case Enum.reject(route, &(&1 in StageMachine.transitions())) do

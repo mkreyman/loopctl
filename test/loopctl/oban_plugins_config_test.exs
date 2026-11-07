@@ -441,6 +441,34 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-48.18: VerifyDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.VerifyDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.VerifyDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs every minute", %{entry: entry} do
+      assert entry,
+             "expected a VerifyDispatchWorker crontab entry — without one no pr-route story " <>
+               "is ever verified and the merge gate refuses every one. Safe to schedule " <>
+               "unconditionally: it is off unless DISPATCH_DRIVER_ENABLED is set."
+
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "StoryCompletionWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

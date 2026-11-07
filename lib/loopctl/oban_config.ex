@@ -696,6 +696,12 @@ defmodule Loopctl.ObanConfig do
            # starts nothing. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.ReplyDraftDispatchWorker},
+           # US-48.18: verify@1 — a runner apart from the implementer's verifies each pr-route
+           # story at `ci` whose head is unverified; without it the merge gate refuses every
+           # pr-route story. Behind `:dispatch_driver_enabled` like every unattended pass, so
+           # scheduling it unconditionally starts nothing. Keep in sync with the crontab
+           # assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.VerifyDispatchWorker},
            # #803 §3: the loop's LAST transition, `verified -> done`. Nothing in `lib/` wrote
            # that edge, so a story that passed every gate stopped one stage from the end for
            # ever — `verified` had no writable edge out at all, not even for an operator. NOT

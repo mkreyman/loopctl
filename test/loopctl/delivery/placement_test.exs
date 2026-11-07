@@ -1685,7 +1685,16 @@ defmodule Loopctl.Delivery.PlacementTest do
                :story_id,
                :token_budget,
                :triage,
+               :verify,
                :wall_clock_seconds
+             ]
+
+      # `verify` (contract 1.28.0) is the third nested object: the pull request number and the
+      # head sha to judge, both loopctl's own values off the stage row. Neither is a credential
+      # — the verifier dispatch's key never leaves loopctl (US-48.18).
+      assert RunnerContract.RunnerVerify.schema().properties |> Map.keys() |> Enum.sort() == [
+               :head_sha,
+               :pr_number
              ]
 
       # `triage` (contract 1.7.0) is the second nested object and is pinned for the same

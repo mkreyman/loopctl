@@ -108,9 +108,33 @@ A claim carries a lease (`claimed_until`) and a fence (`claim_epoch`). Every rep
 
 The session on the runner implements the story, reviews it, opens the pull request and reports each stage. A runner may move a story forward only through the stages it holds, plus the edges that send it back to `implementing`: red CI, review findings, a moved base, or a refused merge.
 
+### Verification at `ci`
+
+A session cannot verify its own work, so loopctl verifies a pull-request story with a second session on a different machine. Every minute, `VerifyDispatchWorker` (the `verify@1` spec, behind `DISPATCH_DRIVER_ENABLED`) picks the stories at `ci` whose recorded head has not been verified. For each one it does these steps:
+
+1. It mints a verifier dispatch as a new root, under the tenant's operator key (a user key that no dispatch minted). The dispatch is for a runner whose agent is not the implementer's.
+2. It binds that dispatch to the story as its verifier.
+3. It sends the runner a `verify` dispatch with the pull request number and head. That dispatch carries no credential.
+
+The runner answers with `agent_result` (`verdict`, `head_sha`, `findings`):
+
+- **`pass`:** loopctl reports, reviews and verifies the story as the verifier dispatch. Then it records the head it judged as `verified_head_sha` and revokes the dispatch.
+- **`reject`:** the story goes back to `implementing` over `verify_rejected`, with the findings as the reason.
+- **A verdict for a head the story no longer has, from a runner that is not the verifier's, or for a story no longer at `ci`:** loopctl drops it and records an audit row. Nothing moves.
+
+| You see | Do |
+|---|---|
+| `escalated` over `no_independent_verifier_runner` | The implementer's agent is the only one the tenant has. Enroll a second runner, then `resolve_escalation`. |
+| Stories wait at `ci` and no `verify` dispatch is sent | No connected runner declares the `verify` kind (runner contract 1.28.0), or the only runners that do belong to the implementer's agent and are busy. |
+| `no_operator_key` at ERROR | The tenant has no user key that no dispatch minted. |
+
+An orchestrator key that no dispatch minted cannot reject a pull-request story (409 `caller_lineage_required`): control verifies it.
+
+### The merge gate
+
 Before a merge, an orchestrator or operator calls `merge_precondition` (`POST /api/v1/stories/:id/merge-precondition`) with an orchestrator or user key. A runner session cannot call it, so the unattended driver alone does not take a story past `ci`. The story must be at `ci`. The gate re-runs both delivery gates over the real diff, using the lens verdicts that triage recorded rather than anything the caller sends. It also checks these, and refuses on any one:
 
-- custody;
+- custody, at the current head: a story verified at another head, or at no recorded head, is refused `verified_for_other_head`. Any move that clears the head also clears the verification;
 - a hard size bound of 12 files and 1,000 changed lines;
 - the change is not to the loop's own deploy repository.
 
@@ -159,7 +183,7 @@ Every variable is documented, with its default and what breaks when it is wrong,
 
 - **Driver switch:** `DISPATCH_DRIVER_ENABLED`. Turn it on last. Do not set it `false` as a Fly secret, which overrides and persists; change the `fly.toml` `[env]` line instead.
 - **Dispatch budgets:** `DISPATCH_WALL_CLOCK_SECONDS`, `DISPATCH_MAX_TURNS`, `DISPATCH_MAX_ATTEMPTS` (no default; unset means the first counted release escalates).
-- **Triage budgets:** `TRIAGE_WALL_CLOCK_SECONDS`, `TRIAGE_MAX_TURNS`. Reply drafting spends these too.
+- **Triage budgets:** `TRIAGE_WALL_CLOCK_SECONDS`, `TRIAGE_MAX_TURNS`. Reply drafting and verification spend these too.
 - **Reply drafts:** `DRAFT_DISPATCH_ENABLED`, off unless `true` or `1`, and only while the driver switch is on too. It asks a runner declaring the `reply_draft` kind to draft a reply for each support ticket triage rejected or escalated. loopctl stores each draft and never sends it; read them with `reply_draft_list` (a user key).
 - **Leases:** `STORY_CLAIM_LEASE_SECONDS`, `DISPATCH_LEASE_GRACE_SECONDS`.
 - **Tenant cap:** `RUNNER_MAX_IN_FLIGHT_SESSIONS`.

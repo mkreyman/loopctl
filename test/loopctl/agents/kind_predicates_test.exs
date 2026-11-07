@@ -32,7 +32,7 @@ defmodule Loopctl.Agents.KindPredicatesTest do
   @old_default_kind "implement"
 
   # Registry kinds the oracle predates: added by a later story, so not in its budget table.
-  @kinds_added_since ["reply_draft"]
+  @kinds_added_since ["reply_draft", "verify"]
 
   defp old_implement_kind?(kind), do: is_nil(kind) or kind in @old_implement_kinds
 

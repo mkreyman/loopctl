@@ -455,7 +455,9 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       stage: :ci,
       claim_epoch: 0,
       pr_number: 4242,
-      head_sha: @head
+      head_sha: @head,
+      # US-48.18: custody is bound to the head it was verified at.
+      verified_head_sha: @head
     })
 
     fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})

@@ -18,6 +18,7 @@ defmodule Loopctl.Agents.RegistryTest do
   alias Loopctl.Agents.Specs.ImplementV1
   alias Loopctl.Agents.Specs.ReplyDraftV1
   alias Loopctl.Agents.Specs.TriageV1
+  alias Loopctl.Agents.Specs.VerifyV1
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.Delivery.DispatchPayload
@@ -25,7 +26,7 @@ defmodule Loopctl.Agents.RegistryTest do
   alias Loopctl.Delivery.TriageVerdict
 
   describe "lookup" do
-    test "holds triage@1 as a :judge, implement@1 as a :build and reply_draft@1 as a :draft" do
+    test "holds triage@1 and verify@1 as :judge, implement@1 as a :build, reply_draft@1 a :draft" do
       assert {:ok, %Spec{archetype: :judge, kind: "triage"} = triage} =
                Registry.fetch("triage", 1)
 
@@ -35,16 +36,21 @@ defmodule Loopctl.Agents.RegistryTest do
       assert {:ok, %Spec{archetype: :draft, kind: "reply_draft"} = reply_draft} =
                Registry.fetch("reply_draft", 1)
 
+      assert {:ok, %Spec{archetype: :judge, kind: "verify"} = verify} =
+               Registry.fetch("verify", 1)
+
       assert triage == TriageV1.spec()
       assert implement == ImplementV1.spec()
       assert reply_draft == ReplyDraftV1.spec()
-      assert Registry.all() == [triage, implement, reply_draft]
+      assert verify == VerifyV1.spec()
+      assert Registry.all() == [triage, implement, reply_draft, verify]
     end
 
     test "for_kind/1 finds each kind's spec and refuses an unknown one" do
       assert {:ok, %Spec{id: "triage"}} = Registry.for_kind("triage")
       assert {:ok, %Spec{id: "implement"}} = Registry.for_kind("implement")
       assert {:ok, %Spec{id: "reply_draft"}} = Registry.for_kind("reply_draft")
+      assert {:ok, %Spec{id: "verify"}} = Registry.for_kind("verify")
       assert Registry.for_kind("review") == {:error, :unknown_kind}
     end
 
@@ -132,6 +138,24 @@ defmodule Loopctl.Agents.RegistryTest do
       assert Enum.sort(ImplementV1.spec().effects) == Enum.sort(StageMachine.reportable_effects())
     end
 
+    test "verify@1's stage effect is control-written and its edges are not runner-reportable" do
+      spec = VerifyV1.spec()
+
+      assert spec.effects -- [:verify_verdict] == [:verified_head_sha]
+      assert :verified_head_sha in StageMachine.control_written_effects()
+
+      named = Spec.named_transitions(spec)
+
+      assert {:ci, :implementing, :verify_rejected} in named
+      assert {:ci, :escalated, :no_independent_verifier_runner} in named
+
+      for transition <- named,
+          do: refute(transition in StageMachine.runner_transitions(), inspect(transition))
+
+      assert Spec.reports_agent_result?(spec)
+      refute Spec.holds_claim?(spec)
+    end
+
     test "triage@1's only stage-machine effect is the control-written triage binding" do
       stage_effects = TriageV1.spec().effects -- [:story_draft]
 
@@ -208,7 +232,9 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.12: a run's outcome row names the spec {id, version} its dispatch ran under.
       "lib/loopctl/agents/outcomes.ex",
       # US-48.11: an inbox row names the spec {id, version} of the dispatch that parked it.
-      "lib/loopctl/delivery/escalation_inbox.ex"
+      "lib/loopctl/delivery/escalation_inbox.ex",
+      # US-48.18: the cron caller that runs the verifier pass with `verify@1`.
+      "lib/loopctl/workers/verify_dispatch_worker.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do
@@ -220,7 +246,7 @@ defmodule Loopctl.Agents.RegistryTest do
           Path.wildcard("lib/loopctl/agents/specs/*.ex")
 
       # Non-vacuous: the pattern matches the registry's own files, and the scan sees lib/web.
-      assert length(own) == 5
+      assert length(own) == 6
       assert Enum.all?(own, &(&1 |> File.read!() |> String.match?(reference)))
       assert Enum.any?(sources, &String.starts_with?(&1, "lib/loopctl_web/"))
 

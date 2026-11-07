@@ -41,7 +41,16 @@ defmodule Loopctl.Custody.ContextSurface do
   # Module names as STRINGS, mirroring `TierCapabilities`' two maps — the scan compares them
   # against `defmodule` lines in source text, and a compile-time reference would make this
   # module depend on every context it lists.
-  @halt_enforcing_contexts ["Loopctl.Delivery.Placement"]
+  # US-48.18 adds three routeless entry points of the same shape, each reached from an Oban
+  # worker or a runner report with no plug in front of it: `VerifierPlacement` mints the root
+  # verifier dispatch and binds `verifier_dispatch_id`, `VerifyVerdict` reports, reviews and
+  # verifies, and `ImplementerStart` starts the claimed story.
+  @halt_enforcing_contexts [
+    "Loopctl.Delivery.Placement",
+    "Loopctl.Agents.VerifierPlacement",
+    "Loopctl.Agents.VerifyVerdict",
+    "Loopctl.Delivery.ImplementerStart"
+  ]
 
   @doc """
   Context modules that enforce the custody halt themselves. Bound to the modules that actually

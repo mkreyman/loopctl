@@ -11,6 +11,9 @@ defmodule Loopctl.Delivery.StoryStage do
   - `merge_gate_allowed_sha` — the head the merge precondition ALLOWED (#803). Not an
     effect the loop performs but the record that one was authorised, so an already-merged
     pull request can be told from one merged around the gate. Cleared with `head_sha`.
+  - `verified_head_sha` — the head the story was VERIFIED at (US-48.18): control writes it at
+    `ci` once a `verify@1` pass for that head has reported, reviewed and verified the story.
+    Cleared with `head_sha`, and the merge precondition requires it to equal the recorded head.
   - `merge_gate_unevaluated` — `%{"head_sha" => sha, "count" => n}`, consecutive merge-gate
     evaluations at one head that produced NO verdict because the forge was transiently
     unavailable (#803). The gate escalates once it passes its bound, so a fault that never
@@ -61,6 +64,7 @@ defmodule Loopctl.Delivery.StoryStage do
     field :merge_sha, :string
     field :release_id, :string
     field :merge_gate_allowed_sha, :string
+    field :verified_head_sha, :string
     field :merge_gate_unevaluated, :map
     field :post_deploy_unresolved, :map
     field :trunk_verified_sha, :string

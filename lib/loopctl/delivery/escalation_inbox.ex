@@ -26,7 +26,7 @@ defmodule Loopctl.Delivery.EscalationInbox do
   | `budget_reported` (`session_ended` `wall_clock_exceeded` / `max_turns_exceeded`) | `budget_exhausted` |
   | `attempts_exhausted` (crashes and lost runners up to the retry ceiling), `session_escalated` (the session parked it itself) | `session_failed` |
   | `triage_escalate` | `triage_escalated` |
-  | `merge_gate`, `verification_failed`, `review_missing` | `gate_refused` |
+  | `merge_gate`, `verification_failed`, `review_missing`, `no_independent_verifier_runner` (US-48.18: only the implementer's own agent can take the verification) | `gate_refused` |
   | `operator_released` | `operator_released` |
   | `change_outside_lifecycle`, `reverted_after_verify` | `other` |
 
@@ -111,6 +111,7 @@ defmodule Loopctl.Delivery.EscalationInbox do
     merge_gate: :gate_refused,
     verification_failed: :gate_refused,
     review_missing: :gate_refused,
+    no_independent_verifier_runner: :gate_refused,
     operator_released: :operator_released,
     change_outside_lifecycle: :other,
     reverted_after_verify: :other

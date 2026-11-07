@@ -9,7 +9,8 @@ defmodule Loopctl.Agents.AgentResult do
   1. the spec is one loopctl HOLDS (an entry of `Loopctl.Agents.Registry.all/0` with that id
      AND version), else `invalid_payload`;
   2. it REPORTS THROUGH `agent_result` (`Loopctl.Agents.Spec.reports_agent_result?/1`: a
-     `:draft` with a result schema), else `invalid_payload` — `triage@1` keeps
+     `:draft`, or the `:judge` `verify@1`, with a result schema), else `invalid_payload` —
+     `triage@1` keeps
      `triage_verdict` and `implement@1` keeps `stage` and `session_ended`, because their
      results drive custody edges that a schema check alone cannot judge;
   3. `result` satisfies THAT spec's `result_schema` (`RunnerContract.cast_agent_result/2`),
@@ -41,6 +42,18 @@ defmodule Loopctl.Agents.AgentResult do
   ledger's own transaction, so the two commit together, once per dispatch. A refused body is
   not kept on the ledger row either. Nothing is sent anywhere (`Loopctl.ReplyDrafts`).
 
+  ## `verify@1`'s verdict (US-48.18)
+
+  `verify@1` names `:verify_verdict`: once the ledger write has COMMITTED — recorded or
+  replayed — `VerifyVerdict.enqueue/1` inserts `Loopctl.Workers.VerifyVerdictWorker`, and that
+  job — `Loopctl.Agents.VerifyVerdict` — reads the verdict back off the ledger row and reports,
+  reviews and verifies the story, or sends it back to work, under the verifier dispatch control
+  minted. It runs after the commit because `oban_jobs` is not readable under the ledger's RLS
+  role; a verdict whose insert was lost is enqueued by the minute sweep
+  (`VerifyVerdict.enqueue_unapplied/1`). Nothing in the verdict is custody identity: the job checks it was answered by the
+  runner whose agent the verifier dispatch names, for the head the story still has, and drops
+  it otherwise.
+
   ## The audit row is enums and counts, never the session's words
 
   The result was composed by a session that may have read attacker-controllable text, so —
@@ -61,6 +74,7 @@ defmodule Loopctl.Agents.AgentResult do
   alias Loopctl.Agents.Outcomes
   alias Loopctl.Agents.Registry
   alias Loopctl.Agents.Spec
+  alias Loopctl.Agents.VerifyVerdict
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
   alias Loopctl.Audit
@@ -93,11 +107,12 @@ defmodule Loopctl.Agents.AgentResult do
           {:ok, %{record: DispatchRecord.t(), replayed?: boolean()}} | {:error, error()}
   def apply(tenant_id, runner_id, %{} = message, opts \\ []) do
     with {:ok, %{spec: spec, result: validated, screened: screened}} <- admit(message, opts),
-         {stored, effect} = effects(screened, validated),
+         {stored, effect} = effects(spec, screened, validated),
          attrs = record_attrs(spec, validated, stored),
          {:ok, {outcome, record}} <-
            DispatchLedger.record_agent_result(tenant_id, runner_id, message, attrs, effect) do
       if outcome == :recorded, do: audit(tenant_id, record, spec, validated)
+      if :verify_verdict in spec.effects, do: VerifyVerdict.enqueue(record)
       {:ok, %{record: record, replayed?: outcome == :replayed}}
     end
   end
@@ -154,12 +169,15 @@ defmodule Loopctl.Agents.AgentResult do
   # A refused body is stored NOWHERE: the draft row is `refused` with the screen's codes, and the
   # ledger row keeps the screen's name in place of the result (`ReplyDrafts.withheld_result/1`).
   # The digest is still over the result as sent, so a byte-identical resend still replays.
-  defp effects(nil, validated), do: {validated, fn _record -> :ok end}
+  #
+  # `:verify_verdict` (US-48.18) has no in-transaction effect: `apply/4` enqueues its job after
+  # the commit (see the moduledoc).
+  defp effects(_spec, nil, validated), do: {validated, fn _record -> :ok end}
 
   #
   # The stored row's status is then the run's `draft_screen` outcome signal (US-48.12), read
   # back from the row the effect wrote, in the same transaction.
-  defp effects(screened, validated) do
+  defp effects(_spec, screened, validated) do
     {ReplyDrafts.withheld_result(screened) || validated,
      fn record ->
        with :ok <- ReplyDrafts.write_result(record, screened),

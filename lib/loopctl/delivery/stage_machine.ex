@@ -125,6 +125,18 @@ defmodule Loopctl.Delivery.StageMachine do
     landed revision (a policy auto-approval, or a review loopctl never accepted). chg lands on
     its own authority, so the merge stands and nothing is cleared; the story is held for a
     human and is never verified without one
+
+  The VERIFY edges (US-48.18), both taken by CONTROL from `ci`, neither runner-reportable:
+
+  - `:verify_rejected` — ci -> implementing, when the independently rooted verifier session
+    of `verify@1` answers `reject` for the story's CURRENT head
+    (`Loopctl.Agents.VerifyVerdict`). The findings are the reason. Its own edge rather than
+    `:review_findings` or `:ci_red`, because both of those are a runner's own report and `ci`
+    is a runner source stage: reusing one would let an implementing session write the
+    verifier's verdict about itself
+  - `:no_independent_verifier_runner` — ci -> escalated, when the only runners able to take a
+    `verify` dispatch are the implementer's own agent (`Loopctl.Agents.VerifierPlacement`).
+    Nothing can verify the story without a person adding a machine
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
 
@@ -268,7 +280,11 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
-                   {:merged, :implementing, :merge_refused}
+                   {:merged, :implementing, :merge_refused},
+                   # US-48.18: the verifier's reject, and no machine apart from the
+                   # implementer's to verify on. Both CONTROL-ONLY (see the moduledoc).
+                   {:ci, :implementing, :verify_rejected},
+                   {:ci, :escalated, :no_independent_verifier_runner}
                  ] ++
                  @budget_exceeded ++
                  @released ++
@@ -419,7 +435,14 @@ defmodule Loopctl.Delivery.StageMachine do
     # `record_effect/5`'s idempotence is exactly the semantics an allow needs: the same
     # head twice is the same allow, and a DIFFERENT head is `:effect_conflict` rather than
     # a silent re-grant.
-    merge_gate_allowed_sha: [:ci]
+    merge_gate_allowed_sha: [:ci],
+    # THE HEAD A VERIFICATION WAS MADE AT (US-48.18). Written by CONTROL at `ci`
+    # (`Loopctl.Agents.VerifyVerdict`) once report, review and verify have committed for a
+    # `pass` naming this head, and only when the row's `head_sha` is still that head. A
+    # verification is about a commit; `stories.verified_status` alone names none, so a story
+    # verified at X that came back to `ci` at Y read as verified at Y. Head-keyed below, and
+    # read by `Loopctl.Delivery.MergePrecondition`'s custody fact.
+    verified_head_sha: [:ci]
   }
 
   # Identities that stop describing the story when an edge is taken, cleared by that edge.
@@ -435,7 +458,7 @@ defmodule Loopctl.Delivery.StageMachine do
   # commit, and the count would escalate a fresh head on its predecessor's blips.
   # `head_keyed/0` is what the drift guard reads, so a new head-bound field cannot be added
   # to one clause and forgotten in the others.
-  @head_keyed [:head_sha, :merge_gate_allowed_sha, :merge_gate_unevaluated]
+  @head_keyed [:head_sha, :merge_gate_allowed_sha, :merge_gate_unevaluated, :verified_head_sha]
 
   # Everything BOUND TO THE MERGE, cleared wherever `merge_sha` is. The same rule as
   # `@head_keyed` one identity along: post-deploy verification's unresolved count is kept
@@ -468,11 +491,18 @@ defmodule Loopctl.Delivery.StageMachine do
   #   is the RECORD OF A VERDICT, and the same rule that keeps `:merge_gate` off the wire
   #   keeps its allow off too: a session may not report the outcome of a check it does not
   #   perform, and here it would not merely report it but GRANT it.
+  # - `verified_head_sha` — written by `Loopctl.Agents.VerifyVerdict` (US-48.18). The record of
+  #   the VERIFIER'S verdict about the head; a session reporting it would certify its own work.
   #
   # Anything the gate writes in future goes here as well. The test in
   # `runner_contract_test.exs` binds this list to the wire schema in both directions, so a new
   # effect that belongs on neither side goes red rather than reaching a runner.
-  @control_written_effects [:runner_id, :merge_gate_allowed_sha, :triage_dispatch_id]
+  @control_written_effects [
+    :runner_id,
+    :merge_gate_allowed_sha,
+    :triage_dispatch_id,
+    :verified_head_sha
+  ]
 
   @reportable_effects @effect_stages
                       |> Map.keys()
@@ -520,6 +550,8 @@ defmodule Loopctl.Delivery.StageMachine do
           | :reverted
           | :reverted_after_verify
           | :change_outside_lifecycle
+          | :verify_rejected
+          | :no_independent_verifier_runner
 
   @type effect ::
           :runner_id
@@ -531,6 +563,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :release_id
           | :merge_gate_allowed_sha
           | :triage_dispatch_id
+          | :verified_head_sha
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to

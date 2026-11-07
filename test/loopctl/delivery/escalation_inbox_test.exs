@@ -47,6 +47,7 @@ defmodule Loopctl.Delivery.EscalationInboxTest do
         merge_gate: :gate_refused,
         verification_failed: :gate_refused,
         review_missing: :gate_refused,
+        no_independent_verifier_runner: :gate_refused,
         operator_released: :operator_released,
         change_outside_lifecycle: :other,
         reverted_after_verify: :other

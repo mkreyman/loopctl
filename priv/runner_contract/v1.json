@@ -84,7 +84,7 @@
       "type": "object"
     },
     "RunnerDispatch": {
-      "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch runs as the machine's user. Since 1.5.0 an `implement` dispatch carries the story as TYPED FIELDS (`story`) and never a prompt — the runner composes its own from them. `story` is allowed only on an `implement` dispatch and its `id` must equal `story_id`. Only the kinds in `x-connection.dispatchable_kinds` are sent; a runner that does not do a kind answers `kind_not_supported`. Since 1.6.0 that answer is NOT permanent for a runner that declares `kinds` on join: the declaration decides, so the same kind IS sent again on a later connection that declares it, and a handler must not assume one refusal ends the matter. It is suppressed for the rest of the connection it was given on, and stays permanent only for a runner that declares nothing. Declared in contract v1; emitted from #803.",
+      "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch runs as the machine's user. Since 1.5.0 an `implement` dispatch carries the story as TYPED FIELDS (`story`) and never a prompt — the runner composes its own from them. `story` is allowed only on an `implement` or (since 1.28.0) `verify` dispatch and its `id` must equal `story_id`; a `verify` dispatch also carries `verify` (`RunnerVerify`). Only the kinds in `x-connection.dispatchable_kinds` are sent; a runner that does not do a kind answers `kind_not_supported`. Since 1.6.0 that answer is NOT permanent for a runner that declares `kinds` on join: the declaration decides, so the same kind IS sent again on a later connection that declares it, and a handler must not assume one refusal ends the matter. It is suppressed for the rest of the connection it was given on, and stays permanent only for a runner that declares nothing. Declared in contract v1; emitted from #803.",
       "properties": {
         "base_branch": {
           "maxLength": 255,
@@ -114,7 +114,8 @@
           "enum": [
             "triage",
             "implement",
-            "reply_draft"
+            "reply_draft",
+            "verify"
           ],
           "type": "string"
         },
@@ -240,6 +241,25 @@
             "html_url",
             "untrusted",
             "truncated"
+          ],
+          "type": "object"
+        },
+        "verify": {
+          "additionalProperties": false,
+          "description": "Since 1.28.0. Rides a `verify` dispatch and no other: the pull request and the head to judge. Read the pull request's diff AT `head_sha` against the story's acceptance criteria and answer one `agent_result` naming the same `head_sha`.",
+          "properties": {
+            "head_sha": {
+              "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+              "type": "string"
+            },
+            "pr_number": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pr_number",
+            "head_sha"
           ],
           "type": "object"
         },
@@ -1600,6 +1620,25 @@
         "exhausted"
       ],
       "type": "object"
+    },
+    "RunnerVerify": {
+      "additionalProperties": false,
+      "description": "Since 1.28.0. Rides a `verify` dispatch and no other: the pull request and the head to judge. Read the pull request's diff AT `head_sha` against the story's acceptance criteria and answer one `agent_result` naming the same `head_sha`.",
+      "properties": {
+        "head_sha": {
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "type": "string"
+        },
+        "pr_number": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pr_number",
+        "head_sha"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://loopctl.com/runner_contract/v1.json",
@@ -1620,6 +1659,41 @@
         },
         "required": [
           "body"
+        ],
+        "type": "object"
+      },
+      "verify@1": {
+        "additionalProperties": false,
+        "properties": {
+          "findings": {
+            "description": "What fails, one finding per entry; empty on a `pass`. On a `reject` they are the reason the story goes back to work.",
+            "items": {
+              "maxLength": 300,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "head_sha": {
+            "description": "The head the session judged: the dispatch's `verify.head_sha`. A verdict for any other head is dropped.",
+            "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+            "type": "string"
+          },
+          "verdict": {
+            "description": "`pass` when the pull request at `head_sha` meets every acceptance criterion, `reject` otherwise.",
+            "enum": [
+              "pass",
+              "reject"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict",
+          "head_sha",
+          "findings"
         ],
         "type": "object"
       }
@@ -1649,7 +1723,8 @@
     "dispatchable_kinds": [
       "triage",
       "implement",
-      "reply_draft"
+      "reply_draft",
+      "verify"
     ],
     "error_fields": {
       "agent_result": {
@@ -2210,5 +2285,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.27.0"
+  "x-contract-version": "1.28.0"
 }

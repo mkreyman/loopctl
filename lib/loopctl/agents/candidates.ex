@@ -22,12 +22,22 @@ defmodule Loopctl.Agents.Candidates do
   | `:triage_set_aside` | TRIAGE set it aside: its stage is `failed` or `escalated` and its latest transition is the one triage takes there, `triaged -> failed` on `:triage_reject` or `triaged -> escalated` on `:triage_escalate` (US-48.9) |
   | `:ticket_required` | its record carries a `ticket_id` (a support ticket), whatever its source says |
   | `:no_reply_draft` | no `reply_drafts` row names it, drafted or refused (US-48.9) |
+  | `:pr_route_source` | its single source is in mode `pr` (US-48.18) |
+  | `:head_unverified` | its stage row records a `head_sha` and no `verified_head_sha` equal to it (US-48.18) |
+  | `:implementer_dispatched` | it names an implementer dispatch and an assigned agent: there is someone to verify apart from (US-48.18) |
+  | `:no_live_verifier_dispatch` | the verifier dispatch it names, if any, is revoked or expired: no verification is in flight (US-48.18) |
 
   `validate/1` holds the combinations together: exactly one STAGE predicate (`{:stage, stage}`,
   or `:triage_set_aside`, which decides the stage itself), at most one intake-record predicate
   and one status list, `:issue_not_closed`, `:requires_ticket_if_source_says` and
-  `:ticket_required` only with a record joined, and the source-flag ticket predicate only with
-  the single source it reads the flag from.
+  `:ticket_required` only with a record joined, and the source-flag ticket predicate and
+  `:pr_route_source` only with the single source they read.
+
+  `:head_unverified` is the complement of the merge job's own read (US-48.17), which takes
+  `verified_head_sha == head_sha`: a story at `ci` is a candidate for exactly one of the two.
+  `:no_live_verifier_dispatch` is what keeps a second verification from starting while one is
+  in flight: the verifier's ledger row is released the moment its verdict arrives, before the
+  verdict is applied, so `:no_live_dispatch_of_self` alone would let the next pass place again.
 
   `:triage_set_aside` reads the story's LATEST transition, not merely its stage, because both
   stages have other ways in: an implement session escalates over `:session_escalated`, a budget
@@ -67,6 +77,7 @@ defmodule Loopctl.Agents.Candidates do
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.ReplyDrafts.ReplyDraft
@@ -87,6 +98,10 @@ defmodule Loopctl.Agents.Candidates do
           | :triage_set_aside
           | :ticket_required
           | :no_reply_draft
+          | :pr_route_source
+          | :head_unverified
+          | :implementer_dispatched
+          | :no_live_verifier_dispatch
 
   @type order :: :round_robin_project_tenant
 
@@ -110,7 +125,11 @@ defmodule Loopctl.Agents.Candidates do
                        :dependencies_met,
                        :triage_set_aside,
                        :ticket_required,
-                       :no_reply_draft
+                       :no_reply_draft,
+                       :pr_route_source,
+                       :head_unverified,
+                       :implementer_dispatched,
+                       :no_live_verifier_dispatch
                      ]
 
   @orders [:round_robin_project_tenant]
@@ -270,7 +289,9 @@ defmodule Loopctl.Agents.Candidates do
      "one of #{inspect(@record_predicates)}"},
     {:requires_ticket_if_source_says, [:single_active_source],
      ":single_active_source, the source it reads triage_requires_ticket from"},
-    {:ticket_required, @record_predicates, "one of #{inspect(@record_predicates)}"}
+    {:ticket_required, @record_predicates, "one of #{inspect(@record_predicates)}"},
+    {:pr_route_source, [:single_active_source],
+     ":single_active_source, the source whose mode it reads"}
   ]
 
   defp check_needs(predicates) do
@@ -313,7 +334,8 @@ defmodule Loopctl.Agents.Candidates do
         select: %{
           tenant_id: src.tenant_id,
           project_id: src.project_id,
-          requires_ticket: fragment("bool_or(?)", src.triage_requires_ticket)
+          requires_ticket: fragment("bool_or(?)", src.triage_requires_ticket),
+          pr_mode: fragment("bool_and(? = 'pr')", src.mode)
         }
 
     join(query, :inner, [story: st], b in subquery(bound_projects),
@@ -411,6 +433,41 @@ defmodule Loopctl.Agents.Candidates do
         select: 1
 
     where(query, not exists(subquery(drafted)))
+  end
+
+  defp apply_predicate(:pr_route_source, query, _kind),
+    do: where(query, [source: b], b.pr_mode)
+
+  defp apply_predicate(:head_unverified, query, _kind) do
+    where(
+      query,
+      [stage: s],
+      not is_nil(s.head_sha) and
+        (is_nil(s.verified_head_sha) or s.verified_head_sha != s.head_sha)
+    )
+  end
+
+  defp apply_predicate(:implementer_dispatched, query, _kind) do
+    where(
+      query,
+      [story: st],
+      not is_nil(st.implementer_dispatch_id) and not is_nil(st.assigned_agent_id)
+    )
+  end
+
+  # In flight = the dispatch the story names is neither revoked nor past its expiry. The
+  # verdict job revokes it once applied; one whose session died expires on its own, and the
+  # next pass places afresh.
+  defp apply_predicate(:no_live_verifier_dispatch, query, _kind) do
+    live =
+      from d in Dispatch,
+        where:
+          d.tenant_id == parent_as(:story).tenant_id and
+            d.id == parent_as(:story).verifier_dispatch_id,
+        where: is_nil(d.revoked_at) and d.expires_at > fragment("now()"),
+        select: 1
+
+    where(query, not exists(subquery(live)))
   end
 
   defp apply_predicate({:agent_status_in, statuses}, query, _kind),

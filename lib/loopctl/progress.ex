@@ -22,6 +22,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.AuditChain
   alias Loopctl.Capabilities
   alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Changes.TrunkEvidence
@@ -766,25 +767,18 @@ defmodule Loopctl.Progress do
         # nil, which downgrades validate_not_self_verify/2 from lineage separation
         # to plain agent-id equality. On failure, fall back to flagging the story
         # so an operator/re-review picks it up instead of losing the gate silently.
-        case story
-             |> Ecto.Changeset.change(verifier_dispatch_id: verifier.id)
-             |> AdminRepo.update() do
-          {:ok, _updated} ->
-            # No verify_cap is minted: see verify_story/4 for why L1 cannot gate
-            # verify. The selection itself is the gate — it writes
-            # verifier_dispatch_id, which validate_not_self_verify/2 enforces.
-            tenant_id
-            |> Loopctl.AuditChain.append(%{
-              action: "verifier_selected",
-              actor_lineage: [],
-              entity_type: "story",
-              entity_id: story_id,
-              payload: %{"verifier_dispatch_id" => verifier.id}
-            })
-            # Post-commit append: the verifier_dispatch_id write above has already
-            # committed, so a discarded failure would leave the chain missing an entry
-            # for a custody decision that DID happen. See AuditChain.log_append_failure/4.
-            |> Loopctl.AuditChain.log_append_failure("verifier_selected", tenant_id, story_id)
+        #
+        # No verify_cap is minted: see verify_story/4 for why L1 cannot gate
+        # verify. The selection itself is the gate — it writes
+        # verifier_dispatch_id, which validate_not_self_verify/2 enforces.
+        #
+        # The write and its `verifier_selected` chain entry commit TOGETHER (US-48.18,
+        # `write_verifier_selection/4`, shared with `bind_verifier_dispatch/4`). They used
+        # to be two commits, so a failed append left the column naming a verifier the chain
+        # never recorded.
+        case record_rotating_verifier(tenant_id, story, verifier.id) do
+          :ok ->
+            :ok
 
           {:error, reason} ->
             flag_verifier_needed(tenant_id, story_id, story, "assign_failed", reason)
@@ -800,6 +794,278 @@ defmodule Loopctl.Progress do
              :verifier_seed_unavailable
            ] ->
         flag_verifier_needed(tenant_id, story_id, story, to_string(reason), nil)
+    end
+  end
+
+  defp record_rotating_verifier(tenant_id, story, verifier_dispatch_id) do
+    AdminRepo.transaction(fn ->
+      case write_verifier_selection(tenant_id, story, verifier_dispatch_id, %{}) do
+        {:ok, _updated, entry} -> entry
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, entry} -> AuditChain.announce_entry(entry)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # THE WRITE-AND-AUDIT HALF of choosing a verifier, shared by the rotating selection above
+  # and `bind_verifier_dispatch/4` (US-48.18): `verifier_dispatch_id` and its chained
+  # `verifier_selected` entry, INSIDE the caller's `AdminRepo` transaction, so the column never
+  # names a verifier the chain does not record. The entry is returned unannounced; the caller
+  # announces it once its transaction has committed.
+  defp write_verifier_selection(tenant_id, %Story{} = story, verifier_dispatch_id, payload) do
+    with {:ok, updated} <-
+           story
+           |> Ecto.Changeset.change(verifier_dispatch_id: verifier_dispatch_id)
+           |> AdminRepo.update(),
+         {:ok, entry} <-
+           AuditChain.append_in_admin_transaction(tenant_id, %{
+             action: "verifier_selected",
+             actor_lineage: [],
+             entity_type: "story",
+             entity_id: story.id,
+             payload: Map.put(payload, "verifier_dispatch_id", verifier_dispatch_id)
+           }) do
+      {:ok, updated, entry}
+    else
+      {:error, %Ecto.Changeset{}} -> {:error, :verifier_not_recorded}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Binds `verifier_dispatch_id` to a verifier dispatch CONTROL minted for this story (US-48.18,
+  `Loopctl.Agents.VerifierPlacement`), with a chained `verifier_selected` entry, in ONE
+  transaction under the story lock.
+
+  The binding is what `merge_custody_status/1` and `verify_recorded_separation/2` read, so it
+  is refused — fail closed — unless the dispatch is provably independent of the implementer:
+
+  - `:not_found` — no such story in the tenant
+  - `:missing_implementer_dispatch` — the story names no implementer dispatch, so there is
+    nothing to show separation FROM
+  - `:unresolvable_dispatch_lineage` — the verifier dispatch is not in the tenant, or either
+    lineage is EMPTY (an unloadable implementer dispatch resolves to `[]`, and `[]` shares no
+    prefix with anything, so reading it as independent would pass vacuously)
+  - `:verifier_not_for_story` — the dispatch was minted for another story (or none)
+  - `:dispatch_revoked` — the dispatch is revoked
+  - `:verifier_shares_root` — the two lineages share a root (`Dispatches.lineage_shares_prefix?/2`)
+  - `:verifier_same_agent` — the verifier's agent is the story's `assigned_agent_id` or the
+    implementer dispatch's agent, or the verifier names no agent at all
+
+  A story that is already verified, or reported done, when a NEW verifier is bound carries a
+  verification from an earlier cycle at another head (a fresh binding is only ever made for a
+  head with no verification), so it is retired first in the same transaction
+  (`invalidate_verification/3`): the new verifier reports, reviews and verifies from scratch,
+  and nothing it skips as "already done" can be a predecessor's.
+
+  Options: `:actor_label`.
+  """
+  @spec bind_verifier_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Story.t()} | {:error, atom()}
+  def bind_verifier_dispatch(tenant_id, story_id, verifier_dispatch_id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(story_id) and is_binary(verifier_dispatch_id) do
+    result =
+      AdminRepo.transaction(fn ->
+        with {:ok, story} <- lock_story(tenant_id, story_id),
+             {:ok, verifier} <- bindable_verifier(tenant_id, story, verifier_dispatch_id),
+             {:ok, story, retired} <- retire_earlier_verification(tenant_id, story, opts),
+             {:ok, updated, entry} <-
+               write_verifier_selection(tenant_id, story, verifier.id, %{
+                 "source" => "verify_placement"
+               }) do
+          {updated, Enum.reject([retired, entry], &is_nil/1)}
+        else
+          {:error, reason} -> AdminRepo.rollback(reason)
+        end
+      end)
+
+    case result do
+      {:ok, {updated, entries}} ->
+        Enum.each(entries, &AuditChain.announce_entry/1)
+        {:ok, updated}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp bindable_verifier(_tenant_id, %Story{implementer_dispatch_id: nil}, _id),
+    do: {:error, :missing_implementer_dispatch}
+
+  defp bindable_verifier(tenant_id, %Story{} = story, verifier_dispatch_id) do
+    with {:ok, verifier} <- verifier_dispatch(tenant_id, verifier_dispatch_id) do
+      {impl_lineage, impl_agent} = implementer_identity(tenant_id, story)
+
+      cond do
+        verifier.story_id != story.id ->
+          {:error, :verifier_not_for_story}
+
+        not is_nil(verifier.revoked_at) ->
+          {:error, :dispatch_revoked}
+
+        impl_lineage == [] or verifier.lineage_path == [] ->
+          {:error, :unresolvable_dispatch_lineage}
+
+        Dispatches.lineage_shares_prefix?(impl_lineage, verifier.lineage_path) ->
+          {:error, :verifier_shares_root}
+
+        same_agent?(verifier, story, impl_agent) ->
+          {:error, :verifier_same_agent}
+
+        true ->
+          {:ok, verifier}
+      end
+    end
+  end
+
+  # The implementer dispatch row's lineage and agent; `{[], nil}` when it does not load.
+  defp implementer_identity(tenant_id, story) do
+    case Dispatches.get_dispatch(tenant_id, story.implementer_dispatch_id) do
+      {:ok, d} -> {d.lineage_path, d.agent_id}
+      _ -> {[], nil}
+    end
+  end
+
+  # A verifier naming no agent cannot be shown apart from anyone, so it counts as the same.
+  defp same_agent?(%{agent_id: nil}, _story, _impl_agent), do: true
+
+  defp same_agent?(%{agent_id: agent_id}, story, impl_agent),
+    do: agent_id == story.assigned_agent_id or agent_id == impl_agent
+
+  defp verifier_dispatch(tenant_id, id) do
+    case Dispatches.get_dispatch(tenant_id, id) do
+      {:ok, dispatch} -> {:ok, dispatch}
+      {:error, _} -> {:error, :unresolvable_dispatch_lineage}
+    end
+  end
+
+  defp retire_earlier_verification(tenant_id, %Story{} = story, opts) do
+    if verification_to_retire?(story) do
+      apply_invalidation(AdminRepo, tenant_id, story, "verifier_rebound", opts)
+    else
+      {:ok, story, nil}
+    end
+  end
+
+  @doc """
+  Retires a story's verification because the head it was made at is gone (US-48.18): every
+  edge that clears a pr-route story's `head_sha` calls this IN ITS OWN TRANSACTION
+  (`Loopctl.Delivery.Stages`), so a story verified at head X that returns to work can never
+  reach the merge gate at head Y still reading `:verified`.
+
+  `verified_status` goes back to `:unverified` (`verified_at` cleared), a `:reported_done`
+  story goes back to `:implementing` — the report was about the old head too, and
+  `validate_verifiable/1` would otherwise refuse the next verify as a re-verify — and a chained
+  `verification_invalidated` entry records it. A story with nothing to retire (neither verified
+  nor reported done) is left alone: `{:ok, :unchanged, nil}`.
+
+  Runs INSIDE the caller's transaction on `opts[:repo]` — `Loopctl.Repo` (a stage transition,
+  under its tenant) or `Loopctl.AdminRepo` (a claim release) — and raises outside one. It
+  takes the story `FOR NO KEY UPDATE`; the caller already holds a lock at least that strong, so
+  this adds no wait. The chain entry is returned UNANNOUNCED: the caller announces it after its
+  commit.
+
+  Options: `:repo` (required), `:cause` (recorded on the entry, e.g. the edge), `:actor_label`.
+  """
+  @spec invalidate_verification(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, :invalidated, AuditChain.Entry.t()} | {:ok, :unchanged, nil} | {:error, term()}
+  def invalidate_verification(tenant_id, story_id, opts) do
+    repo = Keyword.fetch!(opts, :repo)
+
+    unless repo.in_transaction?(),
+      do: raise(ArgumentError, "invalidate_verification/3 runs inside the caller's transaction")
+
+    story =
+      repo.one(
+        from s in Story,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+          lock: "FOR NO KEY UPDATE"
+      )
+
+    cond do
+      is_nil(story) ->
+        {:error, :not_found}
+
+      verification_to_retire?(story) ->
+        with {:ok, _updated, entry} <-
+               apply_invalidation(repo, tenant_id, story, Keyword.get(opts, :cause), opts) do
+          {:ok, :invalidated, entry}
+        end
+
+      true ->
+        {:ok, :unchanged, nil}
+    end
+  end
+
+  @doc """
+  `invalidate_verification/3` in its OWN `AdminRepo` transaction, for a caller that holds none
+  (US-48.18: `Loopctl.Agents.VerifyVerdict`, when the head it verified moved before
+  `verified_head_sha` was written). The chain entry is announced after the commit.
+
+  Options: `:cause`, `:actor_label`.
+  """
+  @spec retire_verification(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: :ok | {:error, term()}
+  def retire_verification(tenant_id, story_id, opts \\ []) do
+    AdminRepo.transaction(fn ->
+      case invalidate_verification(tenant_id, story_id, Keyword.put(opts, :repo, AdminRepo)) do
+        {:ok, _, entry} -> entry
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, entry} ->
+        AuditChain.announce_entry(entry)
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verification_to_retire?(%Story{verified_status: :verified}), do: true
+  defp verification_to_retire?(%Story{agent_status: :reported_done}), do: true
+  defp verification_to_retire?(%Story{}), do: false
+
+  defp apply_invalidation(repo, tenant_id, %Story{} = story, cause, opts) do
+    agent_status =
+      if story.agent_status == :reported_done, do: :implementing, else: story.agent_status
+
+    append =
+      if repo == AdminRepo,
+        do: &AuditChain.append_in_admin_transaction/2,
+        else: &AuditChain.append_in_tenant_transaction/2
+
+    with {:ok, updated} <-
+           story
+           |> Ecto.Changeset.change(%{
+             verified_status: :unverified,
+             verified_at: nil,
+             agent_status: agent_status
+           })
+           |> repo.update(),
+         {:ok, entry} <-
+           append.(tenant_id, %{
+             action: "verification_invalidated",
+             actor_lineage: [],
+             entity_type: "story",
+             entity_id: story.id,
+             payload: %{
+               "cause" => if(cause, do: to_string(cause)),
+               "actor_label" => Keyword.get(opts, :actor_label),
+               "old_verified_status" => to_string(story.verified_status),
+               "old_agent_status" => to_string(story.agent_status)
+             }
+           }) do
+      {:ok, updated, entry}
+    else
+      {:error, %Ecto.Changeset{}} -> {:error, :verification_not_invalidated}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -4065,8 +4331,19 @@ defmodule Loopctl.Progress do
   # REJECT is exempt. Sending work back is the remediation path, not a certification —
   # refusing it strands a bad story at reported_done with no way out — and the recorded
   # and agent-id comparisons below still apply.
-  defp unlineaged_caller(story, orchestrator_agent_id, :reject),
-    do: verify_recorded_separation(story, orchestrator_agent_id)
+  #
+  # EXCEPT ON THE PR ROUTE (US-48.18, AC-48.18.5). A pr-route story is reported, reviewed and
+  # verified by CONTROL under its own verifier dispatch, and its remediation path is the
+  # verifier's own `:verify_rejected` edge — nothing is stranded by refusing anyone else. And a
+  # runner session inherits the operator's MCP set, which holds unlineaged legacy orchestrator
+  # keys: exempt here, any session could reject a sibling story it never touched and send
+  # another machine's work back. So the exemption does not reach a story whose stage row is on
+  # a pr-mode source (`Loopctl.Intake.pr_route?/3`), which is refused like a verify.
+  defp unlineaged_caller(story, orchestrator_agent_id, :reject) do
+    if Loopctl.Intake.pr_route?(AdminRepo, story.tenant_id, story.id),
+      do: {:error, :caller_lineage_required},
+      else: verify_recorded_separation(story, orchestrator_agent_id)
+  end
 
   defp unlineaged_caller(_story, _orchestrator_agent_id, :verify),
     do: {:error, :caller_lineage_required}

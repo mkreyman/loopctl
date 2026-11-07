@@ -2567,7 +2567,7 @@ defmodule Loopctl.Fixtures do
 
   # A story the merge precondition can judge (#803, US-45.4): reported done and verified by
   # separate dispatches, its repository bound to an intake source requiring the `test` check,
-  # its stage row at `ci` on PR 4242 at `:head_sha`, and a triage verdict. Pass `:tenant_id`,
+  # its stage row at `ci` on PR 4242 at `:head_sha` and verified at it, and a triage verdict. Pass `:tenant_id`,
   # `:repo` and `:head_sha`. Returns `%{tenant_id:, project_id:, story_id:}`, the context the
   # merge tests run on.
   def fixture(:merge_ready_story, attrs) do
@@ -2611,12 +2611,93 @@ defmodule Loopctl.Fixtures do
       stage: :ci,
       claim_epoch: 0,
       pr_number: 4242,
-      head_sha: Map.fetch!(attrs, :head_sha)
+      head_sha: Map.fetch!(attrs, :head_sha),
+      # US-48.18: the verification was made AT this head. `:verified_head_sha` overrides it
+      # (`nil` for a story verified before the column existed, another sha for a stale one).
+      verified_head_sha: Map.get(attrs, :verified_head_sha, Map.fetch!(attrs, :head_sha))
     })
 
     fixture(:triage_verdict, %{tenant_id: tenant_id, story_id: story.id})
 
     %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
+  end
+
+  # A pull-request-route story waiting for `verify@1` (US-48.18): a human-anchored tenant with
+  # an unlineaged operator `:user` key, a `pr`-mode intake source for `:repo` (default
+  # "acme/widgets"), two runners on DIFFERENT agents (`implementer_runner`, `verifier_runner`),
+  # and a story CLAIMED by the implementer runner's agent under root dispatch A — the shape
+  # `Placement` leaves: `agent_status` `:assigned` (its start never spent), `assigned_agent_id`
+  # and `implementer_dispatch_id` set — with its stage row at `ci` on PR 77 at `:head_sha`
+  # (default 40 `a`s), on branch "loop/us-1", `verified_head_sha` unset. `:trust_tier`
+  # overrides the tenant's tier, `:tenant` supplies one. Returns a map of every row.
+  def fixture(:verify_ready_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    head = Map.get(attrs, :head_sha, String.duplicate("a", 40))
+    repo = Map.get(attrs, :repo, "acme/widgets")
+
+    tenant =
+      Map.get_lazy(attrs, :tenant, fn ->
+        fixture(:tenant, %{trust_tier: Map.get(attrs, :trust_tier, :human_anchored)})
+      end)
+
+    {_raw, operator_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+    project = fixture(:project, %{tenant_id: tenant.id})
+    epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+    {_secret, source} =
+      fixture(:intake_source, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        repo_full_name: repo
+      })
+
+    implementer_runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+    verifier_runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+
+    story =
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, project_id: project.id})
+
+    {:ok, %{dispatch: implementer}} =
+      Dispatches.create_dispatch(tenant.id, %{
+        role: :agent,
+        agent_id: implementer_runner.agent_id,
+        story_id: story.id
+      })
+
+    story =
+      story
+      |> Ecto.Changeset.change(%{
+        agent_status: :assigned,
+        assigned_agent_id: implementer_runner.agent_id,
+        implementer_dispatch_id: implementer.id,
+        claim_epoch: 1
+      })
+      |> AdminRepo.update!()
+
+    stage =
+      fixture(:story_stage, %{
+        tenant_id: tenant.id,
+        story_id: story.id,
+        stage: :ci,
+        claim_epoch: 1,
+        runner_id: implementer_runner.id,
+        branch: "loop/us-1",
+        pr_number: 77,
+        head_sha: head
+      })
+
+    %{
+      tenant: tenant,
+      operator_key: operator_key,
+      project: project,
+      source: source,
+      implementer_runner: implementer_runner,
+      verifier_runner: verifier_runner,
+      implementer: implementer,
+      story: story,
+      stage: stage,
+      head: head
+    }
   end
 
   # A delivery stage row inserted DIRECTLY at any stage (#803), bypassing

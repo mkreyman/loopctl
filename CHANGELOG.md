@@ -6,6 +6,30 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Control verifies pull-request stories at `ci` under an independent verifier (US-48.18,
+  2026-11-07).** A new `verify@1` pass (`VerifyDispatchWorker`, every minute, behind
+  `DISPATCH_DRIVER_ENABLED`) mints a verifier dispatch as a new root under the tenant's
+  operator key for a runner whose agent is not the implementer's, and sends that runner a
+  `verify` dispatch. On `pass` control reports, reviews and verifies the story and records the
+  head it judged. On `reject` the story goes back to `implementing` with the findings. A
+  verdict for a head the story no longer has is dropped. When the implementer's own agent is
+  the only one the tenant has, the story escalates `no_independent_verifier_runner`.
+  - **Runner contract 1.28.0** (minor): `verify` is a dispatchable kind, and its dispatch
+    carries `verify: {pr_number, head_sha}`. Re-vendor `priv/runner_contract/v1.json`. A
+    runner gets `verify` dispatches only if it declares the kind when it joins, and until one
+    does, every pull-request story waits at `ci`.
+  - **The merge gate is bound to the head.** A story verified at another head, or at no
+    recorded head, is refused `verified_for_other_head`. A story verified before this release
+    has no recorded head, so it is verified again before it can merge. Any move that clears a
+    pull-request story's head (`base_moved`, `ci_red`, a reject) also clears its verification.
+  - **`POST /api/v1/stories/:id/reject` and bulk reject refuse a key no dispatch minted on a
+    pull-request story** with 409 `caller_lineage_required`. Such keys can still reject any
+    other story.
+  - **The tenant operator key a pass acts as can no longer be a dispatch-minted `:user` key.**
+    A tenant whose only `:user` key was minted by a dispatch is reported `no_operator_key`.
+  - **Migration `20261107190000_add_verified_head_sha_and_verify_kind`** adds
+    `story_stages.verified_head_sha` and `verify` to the dispatch-kind CHECK. No backfill and
+    no manual step.
 - **Pull-request stories now close their GitHub issue after the deploy (US-48.16,
   2026-11-07).** Post-deploy verification also reads stories at `merged`: once a successful
   deployment carries the merge commit it writes `deployed` (the deployment id as

@@ -76,6 +76,16 @@ defmodule Loopctl.Agents.Dispatcher do
   What the session returns is not this module's: it arrives as `agent_result` and
   `Loopctl.Agents.AgentResult` runs the spec's effect.
 
+  ## The verifier pass (US-48.18)
+
+  A `:judge` whose payload is `:verify_payload` (`verify@1`) is PLACED rather than pushed:
+  each candidate goes through `Loopctl.Agents.VerifierPlacement.place/4`, which mints a
+  verifier dispatch rooted apart from the implementer's under the tenant's operator key,
+  binds it to the story and pushes a `verify` dispatch whose id is that dispatch's. The pass
+  hands it the operator key (`operator_key/2`, as for a `:build`), the spec's runner selection
+  and the push. Its outcomes are the `:judge` pass's; `:escalated` is a story whose only
+  runners are its implementer's agent's.
+
   ## Behind `:dispatch_driver_enabled`
 
   The SAME switch as `Loopctl.Delivery.DispatchDriver`, read once per pass
@@ -113,6 +123,7 @@ defmodule Loopctl.Agents.Dispatcher do
 
   alias Loopctl.Agents.Candidates
   alias Loopctl.Agents.Spec
+  alias Loopctl.Agents.VerifierPlacement
   alias Loopctl.Delivery.DispatchDriver
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
@@ -212,6 +223,10 @@ defmodule Loopctl.Agents.Dispatcher do
   # The ref sources and payload builders a `:build` pass can hand `Placement.place/4`.
   @build_ref_sources [:source_base_branch, :story_branch_for_runner_prefixes]
   @build_payloads [:story_payload]
+
+  # The ref sources `VerifierPlacement.place/4` resolves: the stage row's branch (the pull
+  # request's own) and the intake source's base branch.
+  @verify_ref_sources [:stage_branch, :source_base_branch]
 
   # The sweeps this pass can run, and the tag each one's outcomes carry.
   @sweep_tags %{stranded_triaged_unbound: :stranded}
@@ -397,6 +412,22 @@ defmodule Loopctl.Agents.Dispatcher do
       |> candidates(limit)
       |> Enum.map_reduce(%{}, fn candidate, cache ->
         attempt_build(spec, candidate, budgets, place, cache)
+      end)
+
+    outcomes
+  end
+
+  # THE VERIFIER PASS (US-48.18): a `:judge` whose candidates are placed, not pushed. Each one
+  # goes through `VerifierPlacement.place/4`, handed the operator key this pass resolved, the
+  # spec's runner selection and the push — never an identity a caller of `run/2` supplied.
+  defp pass(%Spec{archetype: :judge, payload: :verify_payload} = spec, limit, budgets, opts) do
+    dispatch = Keyword.get(opts, :dispatch, &Runners.dispatch/3)
+
+    {outcomes, _cache} =
+      spec
+      |> candidates(limit)
+      |> Enum.map_reduce(%{}, fn candidate, cache ->
+        attempt_verify(spec, candidate, budgets, dispatch, cache)
       end)
 
     outcomes
@@ -621,6 +652,64 @@ defmodule Loopctl.Agents.Dispatcher do
     if story, do: {:ok, story}, else: {:error, :story_not_found}
   end
 
+  # ── the verifier pass ───────────────────────────────────────────────────────────────────────
+
+  # No selectable runner is `:no_runner`; a refusal that clears by itself is
+  # `:deferred`; a state only a person clears is `:blocked`; an escalation is `:escalated`.
+  @verify_blocked [
+    :no_operator_key,
+    :tenant_halted,
+    :custody_tier_required,
+    :invalid_branch,
+    :invalid_base_branch,
+    :missing_implementer_dispatch,
+    :unresolvable_dispatch_lineage
+  ]
+
+  @verify_deferred [:not_verifiable, :not_pr_route] ++ @transient
+
+  defp attempt_verify(spec, %{tenant_id: tenant_id} = candidate, budgets, dispatch, cache) do
+    {key, cache} = operator_key(tenant_id, cache)
+
+    result =
+      with {:ok, key} <- key do
+        VerifierPlacement.place(tenant_id, candidate.story_id, budgets,
+          api_key: key,
+          runners: &runners(spec, tenant_id, &1),
+          dispatch: dispatch,
+          actor_label: actor_label(spec)
+        )
+      end
+
+    case result do
+      {:ok, :dispatched} ->
+        {:dispatched, cache}
+
+      {:ok, :escalated} ->
+        {:escalated, cache}
+
+      {:error, reason} when reason in [:no_runner, :runner_exhausted] ->
+        {:no_runner, Selection.note_no_runner(cache, label(spec), candidate)}
+
+      {:error, reason} when reason in @verify_blocked ->
+        {blocked(spec, candidate, reason), cache}
+
+      {:error, reason} when reason in @verify_deferred ->
+        {deferred(spec, candidate, reason), cache}
+
+      {:error, {:verifier_mint_failed, _} = reason} ->
+        {deferred(spec, candidate, reason), cache}
+
+      {:error, reason} ->
+        {blocked(spec, candidate, reason), cache}
+    end
+  rescue
+    error -> {errored(spec, candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
+  catch
+    kind, value ->
+      {errored(spec, candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
+  end
+
   # ── the :build pass ─────────────────────────────────────────────────────────────────────────
 
   # ONE STORY MAY NOT KILL THE PASS, the lesson `TriageTriggerWorker` records: the read is
@@ -758,12 +847,25 @@ defmodule Loopctl.Agents.Dispatcher do
       :error ->
         now = DateTime.utc_now()
 
+        # NOT A KEY A DISPATCH MINTED (US-48.18, AC-48.18.5). A dispatch may mint a `:user`
+        # key, and such a key carries that dispatch's lineage, so `place/4`'s root ceiling
+        # refuses it (`root_dispatch_forbidden`) — or, worse, a dispatch-minted operator would
+        # become the ROOT every verifier dispatch hangs from, inside the very tree it must be
+        # separate from. Any dispatch row naming the key excludes it, revoked or not: a key's
+        # lineage is its dispatch row, and a revoked dispatch's key is not an operator's.
         key =
           Loopctl.AdminRepo.one(
             from k in Loopctl.Auth.ApiKey,
+              as: :key,
               where: k.tenant_id == ^tenant_id and k.role == :user,
               where: is_nil(k.revoked_at),
               where: is_nil(k.expires_at) or k.expires_at > ^now,
+              where:
+                not exists(
+                  from d in Loopctl.Dispatches.Dispatch,
+                    where: d.tenant_id == ^tenant_id and d.api_key_id == parent_as(:key).id,
+                    select: 1
+                ),
               order_by: [asc: k.inserted_at],
               limit: 1
           )
@@ -791,6 +893,27 @@ defmodule Loopctl.Agents.Dispatcher do
     do: "#{id}_dispatch:#{payload_builder(spec).too_large}"
 
   # ── what this pass can run ──────────────────────────────────────────────────────────────────
+
+  # The verifier pass: no sweep (a placement that fails revokes what it minted, so nothing is
+  # left half-taken), only refs it resolves itself, and both of the screens it takes.
+  defp runnable!(%Spec{archetype: :judge, payload: :verify_payload} = spec) do
+    unsupported =
+      [
+        {:refs, Enum.uniq(Keyword.values(spec.refs)) -- @verify_ref_sources},
+        {:sweeps, Map.keys(spec.sweeps)},
+        {:screens, [:no_independent_verifier_runner, :verdict_stale] -- Map.keys(spec.screens)}
+      ]
+      |> Enum.reject(fn {_field, values} -> values == [] end)
+
+    if unsupported == [],
+      do: :ok,
+      else:
+        raise(
+          ArgumentError,
+          "#{spec.id}@#{spec.version}: Loopctl.Agents.Dispatcher cannot run the verifier " <>
+            "pass over " <> inspect(unsupported)
+        )
+  end
 
   defp runnable!(%Spec{archetype: :judge} = spec) do
     unsupported =

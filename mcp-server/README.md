@@ -276,7 +276,7 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 
 | Tool | Description |
 |---|---|
-| `verify_story` | Orchestrator verifies a reported_done story. Transitions reported_done -> verified. Under the signed profile, pass the `claim` from `custody_sign_claim`. Refused 409 `chg_root_cannot_verify` for a key descending from an intake source's `chg_root_dispatch_id` (loopctl US-47.5). |
+| `verify_story` | Orchestrator verifies a reported_done story. Transitions reported_done -> verified. Under the signed profile, pass the `claim` from `custody_sign_claim`. Refused 409 `chg_root_cannot_verify` for a key descending from an intake source's `chg_root_dispatch_id` (loopctl US-47.5), and 409 `caller_lineage_required` for a key no dispatch minted on a pull-request-route story (loopctl US-48.18): control verifies and rejects those through its own verifier dispatch. |
 | `reject_story` | Orchestrator rejects a story with a reason. The reject releases the claim, and a delivery story may be re-contracted or escalated in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain entry was refused) means the WHOLE call rolled back: the story is unchanged, and a re-run meets the same server-side condition until an operator acts. Refused 409 `chg_root_cannot_verify` for a key descending from an intake source's `chg_root_dispatch_id` (loopctl US-47.5). |
 
 ### Bulk Tools (orchestrator key)

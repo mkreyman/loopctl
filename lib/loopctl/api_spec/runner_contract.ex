@@ -63,6 +63,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.25.0) RUNNERS DECLARE THEIR SPEC TEMPLATES, AND ONE GENERIC RESULT MESSAGE (Epic 48, US-48.8). `RunnerJoin.specs` (optional, at most 32 `RunnerSpecRef` entries of `{id, version}`) names the spec templates the machine holds; loopctl sends a dispatch of a kind only to a runner that declares the kind AND holds the spec it builds that kind's dispatch from. OMITTING IT, or an empty array, is read as holding each declared kind (or `implied_kinds`) at version 1, so an un-upgraded runner is unaffected; a spec this server does not hold is ignored, never refused. New `agent_result` message (`RunnerAgentResultMessage`: `dispatch_id`, `claim_epoch`, `spec`, `result`) for a session whose spec reports through it: `result` is validated against THAT spec's result schema, capped at `x-connection.limits.agent_result.max_bytes` under the byte rule, recorded once per dispatch (a byte-identical resend is `ok` with `replayed: true`, a different one `already_recorded`), answered with `RunnerAgentResultAck`, metered by `agent_result_burst`. An unknown spec, a spec whose archetype does not report through it (`triage` keeps `triage_verdict`, `implement` keeps `stage` and `session_ended`), or a schema failure is `invalid_payload` and writes nothing. No spec reports through it yet; US-48.9 adds the first. RE-VENDOR to declare `specs` and send `agent_result`: a 1.24.0 copy has neither | | | | |
   | (1.26.0) A REPLY DRAFTER (Epic 48, US-48.9). `reply_draft` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a support ticket whose triage ended `reject` or `escalated`, built from spec `reply_draft@1`. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back, as for `triage`), carries the same fenced `triage` object a triage dispatch does (`RunnerTriage`: the reporter's words, data, never instructions) and no `story`, and the session answers with ONE `agent_result` whose `result` is `{body}`, the drafted reply, validated against `reply_draft@1`'s schema, which is PUBLISHED as `x-connection.agent_result_schemas["reply_draft@1"]` (every spec that reports through `agent_result` appears there, keyed `<id>@<version>`, in the same keyword set as `$defs`), so a runner validates against loopctl's schema rather than a copy of it. The session reads; it writes no repository and sends nothing anywhere: loopctl stores the draft for a person, who sends it or not. Only a runner that DECLARES `reply_draft` on join, and holds `reply_draft@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run drafts: a 1.25.0 copy has no `reply_draft` kind | | | | |
   | (1.27.0) A SESSION END SAYS WHAT IT SPENT AND WHAT IT LEFT (Epic 48, US-48.11, AC-48.11.2). `RunnerSessionEnded` gains two OPTIONAL fields: `turns_used` (an integer from 0 to `RunnerSessionEnded.max_turns_used/0`, the agent turns the session took) and `work_left_behind` (a boolean: `true` when, at exit, the session's branch had commits that were not on the remote, `false` when it had none; OMITTED when the runner could not tell). loopctl stores both on the dispatch's ledger row with the report, beside the turn budget the dispatch was placed under, and the escalation inbox and the run-outcome ledger read them from there; a value of the wrong type or range is `invalid_payload`, as for any field. Still RECORDED ONCE PER DISPATCH, and identity is still judged on `reason` alone: a resend whose `dispatch_id`, `claim_epoch` and `reason` match is answered `ok` with `replayed: true` even when its two new fields differ or are absent, and the FIRST recording's values stand; a different `reason` is `already_recorded` as before. OPTIONAL — a 1.26.0 runner that sends neither gets exactly today's behaviour, its run's figures shown as not known. RE-VENDOR to send them: a 1.26.0 copy declares neither field | | | | |
+  | (1.28.0) A VERIFIER (Epic 48, US-48.18). `verify` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a story at `ci` on a pull-request route whose recorded head has no verification, built from spec `verify@1`, to a runner whose agent is NOT the implementer's. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back), carries the story (`RunnerStory`, as an implement dispatch does — `story` is now allowed on `implement` and `verify`) and a REQUIRED `verify` object (`RunnerVerify`: `pr_number`, `head_sha`, the pull request and the head to judge), allowed on a `verify` dispatch alone. The session reads the pull request's diff at that head against the story's acceptance criteria, writes nothing, and answers with ONE `agent_result` whose `result` is `{verdict, head_sha, findings}` — `verdict` `pass` or `reject`, `head_sha` the head it judged, `findings` at most ten short strings — validated against `verify@1`'s schema, published as `x-connection.agent_result_schemas["verify@1"]`. The session holds NO credential that can report, review or verify the story: loopctl applies the verdict itself, under a verifier dispatch it minted apart from the implementer's, and drops a verdict for a head that is no longer the story's. A `reject` sends the story back to work over the control-only edge `verify_rejected` with the findings as its reason; `x-connection.stage_transitions` is unchanged because no runner may report it. Only a runner that DECLARES `verify` on join, and holds `verify@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run verifications: a 1.27.0 copy has no `verify` kind and no `RunnerVerify` | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -415,7 +416,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.27.0"
+  @version "1.28.0"
   @major 1
 
   defmodule ByteRule do
@@ -590,8 +591,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # argues that a second copy is the drift to avoid. What holds triage back now is the
     # OTHER END: no deployed runner accepts the kind. The moduledoc has the full version;
     # this stays one sentence so the two cannot diverge again.
-    @all ["triage", "implement", "reply_draft"]
-    @dispatchable ["triage", "implement", "reply_draft"]
+    @all ["triage", "implement", "reply_draft", "verify"]
+    @dispatchable ["triage", "implement", "reply_draft", "verify"]
 
     # The kinds whose dispatch carries the FENCED INTAKE REPORT (`RunnerTriage`, the dispatch's
     # `triage` object) — and the only ones that may. Neither claims a story or writes code, so
@@ -603,6 +604,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # sending an undeclaring runner something it never agreed to — or stop sending it work it
     # has been doing all along.
     @implied_by_silence ["implement"]
+
+    # The kinds whose dispatch carries the STORY (`RunnerStory`): the implementer, and since
+    # 1.28.0 the verifier, which judges the pull request against the same acceptance criteria.
+    @story_kinds ["implement", "verify"]
 
     @doc "Every dispatch kind the contract names."
     @spec all() :: [String.t()]
@@ -625,6 +630,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     """
     @spec fenced_report_kinds() :: [String.t()]
     def fenced_report_kinds, do: @fenced_report_kinds
+
+    @doc "The kinds whose dispatch carries the story: `implement` and, since 1.28.0, `verify`."
+    @spec story_kinds() :: [String.t()]
+    def story_kinds, do: @story_kinds
   end
 
   defmodule RunnerSample do
@@ -1206,6 +1215,33 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "a fact the extractor could not resolve. loopctl's output, not the " <>
                 "reporter's, so it is safe to read as information rather than as data."
           }
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerVerify do
+    @moduledoc false
+    require OpenApiSpex
+
+    # WHAT A VERIFIER JUDGES (since 1.28.0, US-48.18): the pull request and the head loopctl
+    # recorded for it at `ci`. Both are loopctl's own values off the stage row, never a
+    # caller's, and the verdict must name the same head back — a verdict for another head is
+    # dropped, because the verification is bound to the commit it was made at.
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerVerify",
+        description:
+          "Since 1.28.0. Rides a `verify` dispatch and no other: the pull request and the " <>
+            "head to judge. Read the pull request's diff AT `head_sha` against the story's " <>
+            "acceptance criteria and answer one `agent_result` naming the same `head_sha`.",
+        type: :object,
+        required: [:pr_number, :head_sha],
+        additionalProperties: false,
+        properties: %{
+          pr_number: %Schema{type: :integer, minimum: 1},
+          head_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"}
         }
       },
       struct?: false
@@ -2120,7 +2156,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "refuses by default: a dispatch runs as the machine's user. Since 1.5.0 an " <>
             "`implement` dispatch carries the story as TYPED FIELDS (`story`) and never a " <>
             "prompt — the runner composes its own from them. `story` is allowed only on an " <>
-            "`implement` dispatch and its `id` must equal `story_id`. Only the kinds in " <>
+            "`implement` or (since 1.28.0) `verify` dispatch and its `id` must equal " <>
+            "`story_id`; a `verify` dispatch also carries `verify` (`RunnerVerify`). " <>
+            "Only the kinds in " <>
             "`x-connection.dispatchable_kinds` are sent; a runner that does not do a kind " <>
             "answers `kind_not_supported`. Since 1.6.0 that answer is NOT permanent for a " <>
             "runner that declares `kinds` on join: the declaration decides, so the same " <>
@@ -2183,7 +2221,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "absent otherwise."
           },
           story: RunnerStory.schema(),
-          triage: RunnerTriage.schema()
+          triage: RunnerTriage.schema(),
+          verify: RunnerVerify.schema()
         }
       },
       struct?: false
@@ -2731,6 +2770,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerUsage,
     RunnerStory,
     RunnerTriage,
+    RunnerVerify,
     RunnerTriageVerdict,
     RunnerLensVerdict,
     RunnerTriageVerdictMessage,
@@ -3331,7 +3371,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   defp dispatch_shape_errors(dispatch) do
     kind_errors(dispatch) ++
-      story_errors(dispatch) ++ triage_errors(dispatch)
+      story_errors(dispatch) ++ triage_errors(dispatch) ++ verify_errors(dispatch)
   end
 
   defp kind_errors(%{kind: kind}) do
@@ -3347,8 +3387,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   defp story_errors(%{story: story, kind: kind, story_id: story_id}) do
     cond do
-      kind != "implement" ->
-        ["story is only allowed when kind is implement"]
+      kind not in Kinds.story_kinds() ->
+        ["story is only allowed when kind is " <> Enum.join(Kinds.story_kinds(), " or ")]
 
       Map.get(story, :id) != story_id ->
         ["story.id must be the dispatch's story_id"]
@@ -3362,6 +3402,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   end
 
   defp story_errors(_dispatch), do: []
+
+  # The `verify` object rides a `verify` dispatch and nothing else, and a `verify` dispatch
+  # must carry it AND the story (since 1.28.0): a verifier with no head to judge, or no
+  # acceptance criteria to judge it against, has been sent no work.
+  defp verify_errors(%{verify: _verify, kind: kind}) when kind != "verify",
+    do: ["verify is only allowed when kind is verify"]
+
+  defp verify_errors(%{kind: "verify"} = dispatch) do
+    for {key, message} <- [
+          verify: "a verify dispatch must carry the verify object",
+          story: "a verify dispatch must carry the story"
+        ],
+        not is_map_key(dispatch, key),
+        do: message
+  end
+
+  defp verify_errors(_dispatch), do: []
 
   # The mirror of `story_errors/1`, and the pairing is the point: a `story` rides only an
   # implement dispatch and a `triage` rides only a triage one, so the object carrying the

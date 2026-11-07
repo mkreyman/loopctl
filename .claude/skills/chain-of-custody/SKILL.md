@@ -97,7 +97,7 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
   `progress.ex:755-802`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:807`) instead of
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:1075`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -283,7 +283,7 @@ correct behavior; do not add a workaround.
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
 (`progress.ex:563-586`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:835-840`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:1103-1108`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the

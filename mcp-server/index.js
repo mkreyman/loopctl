@@ -5055,7 +5055,9 @@ const TOOLS = [
       "re-run meets the same server-side condition until an operator acts. Refused 409 " +
       "chg_root_cannot_verify when the key descends from an intake source's " +
       "chg_root_dispatch_id (loopctl US-47.5): reject is a custody decision chg-server's " +
-      "keys never make.",
+      "keys never make. Refused 409 caller_lineage_required for a key no dispatch minted " +
+      "on a pull-request-route story (loopctl US-48.18): control verifies and rejects those " +
+      "through its own verifier dispatch.",
     inputSchema: {
       type: "object",
       properties: {
