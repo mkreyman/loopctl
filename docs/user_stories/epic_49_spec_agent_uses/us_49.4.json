@@ -1,0 +1,81 @@
+{
+  "id": "US-49.4",
+  "title": "decision_digest@1: a daily draft of the decision defaults Mark may overrule",
+  "epic": {
+    "id": "epic_49",
+    "name": "Spec agent uses"
+  },
+  "priority": "medium",
+  "phase": "spec_agent_uses",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "one stored digest a day of every decision-default post across my repositories' channels, grouped by repository and ordered by what an overrule would change",
+    "so_that": "I can find the defaults worth overruling without reading every channel (sampled 2026-11-07: 14 such posts on home_care_billing in under 14 hours)"
+  },
+  "rationale": "US-48.15 ranked this fourth and the only candidate that removes Mark's own time. CLAUDE.md asks every session to post the defaults it chose under decision-default:<repo>:pr<N>-<slug>; nothing gathers them.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-49.4.1",
+      "description": "Registry entry decision_digest@1 with archetype :draft, run once a day by cron over the tenant's channel posts whose key starts decision-default: and that are newer than the previous digest."
+    },
+    {
+      "id": "AC-49.4.2",
+      "description": "The draft lists every such post once (none dropped, none invented), each with repository, PR, the overrule location the post names, and a class from a closed enum: user_visible, schema, dependency, money_or_phi, harness, other."
+    },
+    {
+      "id": "AC-49.4.3",
+      "description": "Post bodies are untrusted: the dispatch carries them fenced, the stored draft passes the injection screen, and the digest sends nothing and writes no channel post."
+    },
+    {
+      "id": "AC-49.4.4",
+      "description": "An MCP tool lists and reads digests with a user key; releasing, editing or discarding one is recorded and appended to the outcome row as released / edited / discarded."
+    },
+    {
+      "id": "AC-49.4.5",
+      "description": "Coverage check run by control, not the agent: the count of listed post ids equals the count of matching posts; a mismatch stores the draft flagged incomplete."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-49.4.1",
+      "name": "every post appears once",
+      "type": "integration",
+      "steps": [
+        "seed 12 decision-default posts and 5 other posts",
+        "run the digest with a stub runner result"
+      ],
+      "expected_results": [
+        "12 entries, coverage check passes"
+      ]
+    },
+    {
+      "id": "TC-49.4.2",
+      "name": "a dropped post flags the draft",
+      "type": "integration",
+      "steps": [
+        "stub result omits one post"
+      ],
+      "expected_results": [
+        "draft stored, flagged incomplete"
+      ]
+    },
+    {
+      "id": "TC-49.4.3",
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": [
+        "posts in two tenants"
+      ],
+      "expected_results": [
+        "tenant A's digest names only tenant A's posts"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Where it is delivered (email, a channel post) is Mark's to set; the coded default stores it and sends nothing, like reply_draft@1."
+  ],
+  "dependencies": [
+    "US-48.9",
+    "US-48.12"
+  ]
+}

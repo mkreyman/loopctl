@@ -1,0 +1,77 @@
+{
+  "id": "US-49.5",
+  "title": "red_master_judge@1: one verdict and one claim for a red master, before any session starts a fix",
+  "epic": {
+    "id": "epic_49",
+    "name": "Spec agent uses"
+  },
+  "priority": "medium",
+  "phase": "spec_agent_uses",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "a red master run to be judged once (culprit commit, class of failure) and the claim posted by control before any session reproduces it",
+    "so_that": "sessions stop fixing the same red master in parallel, which on 2026-11-01 cost three sessions two duplicate fixes and their CI runs (KB b00f57c6)"
+  },
+  "rationale": "US-48.15 ranked this fifth. KB b00f57c6's rule is that a session reads the channel for a claim first; a claim that exists before any session notices makes the rule a mechanism.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-49.5.1",
+      "description": "Registry entry red_master_judge@1 with archetype :judge, triggered by a failed push run on the default branch of an enrolled repository, once per (repository, head sha)."
+    },
+    {
+      "id": "AC-49.5.2",
+      "description": "The verdict carries the failing test ids, a class from a closed enum (date_or_time, flake, regression, infra, unknown) and a culprit commit or null; control validates each test id against the run's own failure list and drops any it does not contain."
+    },
+    {
+      "id": "AC-49.5.3",
+      "description": "Control, not the agent, writes one channel post under master-fix:<repo>:<head-short> naming the verdict and files one master-red issue; a second red run at the same head writes nothing."
+    },
+    {
+      "id": "AC-49.5.4",
+      "description": "The outcome row records human_override when the commit that turns master green touches none of the files the verdict's culprit touched, and duplicate_fixes as the number of PRs naming any of the failing tests opened after the post."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-49.5.1",
+      "name": "one verdict per head",
+      "type": "integration",
+      "steps": [
+        "deliver two failed runs at one head"
+      ],
+      "expected_results": [
+        "one dispatch, one post, one issue"
+      ]
+    },
+    {
+      "id": "TC-49.5.2",
+      "name": "invented test ids are dropped",
+      "type": "unit",
+      "steps": [
+        "verdict names a test absent from the run"
+      ],
+      "expected_results": [
+        "that id not in the post"
+      ]
+    },
+    {
+      "id": "TC-49.5.3",
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": [
+        "red runs in two tenants"
+      ],
+      "expected_results": [
+        "each tenant's channel carries only its own post"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Revert versus fix-forward stays with chg's auto-revert and the humans; this judge only names and claims.",
+    "The master-red issue it files can be admitted by US-49.1's admit_labels."
+  ],
+  "dependencies": [
+    "US-49.1",
+    "US-48.12"
+  ]
+}

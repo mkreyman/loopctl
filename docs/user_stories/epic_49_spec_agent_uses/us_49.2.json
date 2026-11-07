@@ -1,0 +1,95 @@
+{
+  "id": "US-49.2",
+  "title": "flake_fix@1: a build spec that fixes a flaky test and is verified by repeated reruns",
+  "epic": {
+    "id": "epic_49",
+    "name": "Spec agent uses"
+  },
+  "priority": "high",
+  "phase": "spec_agent_uses",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "a test-flakiness issue that chg's master verifier files to be fixed by a spec agent and verified by rerunning the test under load on another runner",
+    "so_that": "the 45 HCB flaky-test issues a month stop costing sessions and CI re-runs"
+  },
+  "rationale": "US-48.15 ranked this second. chg already files each flake with its record and a KB finding; the verifier criterion is mechanical. It is also the second :build spec, the PRD's test that a new agent needs no new loopctl modules.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-49.2.1",
+      "description": "Registry entry flake_fix@1 with archetype :build, candidates admitted by the test-flakiness label (US-49.1's admit_labels), and its own runner template {id, version}; adding it creates no new loopctl module outside lib/loopctl/agents/specs/."
+    },
+    {
+      "id": "AC-49.2.2",
+      "description": "The spec's merge-gate screen refuses a diff that touches files outside test/** and test/support/**, adds @tag :skip or @moduletag :skip, deletes a test, or raises a timeout without a code change beside it; a refused diff escalates over merge_gate."
+    },
+    {
+      "id": "AC-49.2.3",
+      "description": "The verify dispatch for a flake_fix story carries the test id and a rerun count (default 30, a per-tenant knob that cannot move authority); the verifier passes only when every rerun is green at the recorded head."
+    },
+    {
+      "id": "AC-49.2.4",
+      "description": "The outcome row records merged, reverted, verify verdict, and recurred: true when a new test-flakiness issue names the same test file and test name within 14 days of the merge, from the intake event, never from session text."
+    },
+    {
+      "id": "AC-49.2.5",
+      "description": "Eval cases (US-48.10) for flake_fix@1 are synthetic: a time-of-day test, a shared-state test, a load timeout."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-49.2.1",
+      "name": "a skip is refused",
+      "type": "unit",
+      "steps": [
+        "screen a diff that adds @tag :skip"
+      ],
+      "expected_results": [
+        "refuse"
+      ]
+    },
+    {
+      "id": "TC-49.2.2",
+      "name": "a non-test file is refused",
+      "type": "unit",
+      "steps": [
+        "screen a diff touching lib/"
+      ],
+      "expected_results": [
+        "refuse"
+      ]
+    },
+    {
+      "id": "TC-49.2.3",
+      "name": "recurrence is recorded from intake",
+      "type": "integration",
+      "steps": [
+        "merge a flake_fix story",
+        "deliver a new test-flakiness issue naming the same test 3 days later"
+      ],
+      "expected_results": [
+        "recurred true on the original row"
+      ]
+    },
+    {
+      "id": "TC-49.2.4",
+      "name": "registry test holds the kind lists equal",
+      "type": "unit",
+      "steps": [
+        "run the registry test"
+      ],
+      "expected_results": [
+        "flake_fix appears in RunnerContract.Kinds and the ledger kind CHECK"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "A flake whose cause is in lib/ (a real race) is out of scope by design: the screen escalates it, and a human routes it as a deferred-finding.",
+    "The rerun belongs to the verifier, so the implementer's own green reruns count for nothing (no self-certification)."
+  ],
+  "dependencies": [
+    "US-49.1",
+    "US-48.10",
+    "US-48.12",
+    "US-48.18"
+  ]
+}
