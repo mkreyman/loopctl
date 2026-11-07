@@ -77,7 +77,12 @@ kill_timeout = 90
   # typical run finishes well inside them and a runaway is capped near an hour rather
   # than a day. Expect roughly USD 10-20 per implement run at these figures; lower them
   # to cap harder, raise them only with a measured run that needed it.
-  DISPATCH_WALL_CLOCK_SECONDS = "3600"
+  # Raised to 7200 on 2026-11-07 from that measured run: the first pr-route implement on
+  # home_care_billing (story ddb4fcc1, HCB #3922) committed its fix in 21 minutes, then spent
+  # the rest of the hour on HCB's pre-push gate and was killed at 3600 s mid-push, before its
+  # PR existed. A pr-route run also carries the review, CI (~10 min) and merge. At ~USD 10 per
+  # 30 minutes this caps a runaway near USD 40. Mark's to lower.
+  DISPATCH_WALL_CLOCK_SECONDS = "7200"
   DISPATCH_MAX_TURNS = "200"
 
   # THE FLEET MULTIPLIER. The two budgets above bound ONE session; what we actually spend is
@@ -122,7 +127,9 @@ kill_timeout = 90
   # a human while the workers log clean `:dispatched` tallies and the loop reads as working.
   # There is no error to notice. CHECK THE FIRST TRIAGE RUNS against these numbers, and
   # raise them from what those runs actually took.
-  TRIAGE_WALL_CLOCK_SECONDS = "600"
+  # Measured 2026-11-07: the first ticket triage (HCB #3922, minis) returned its verdict 602 s
+  # after dispatch, against this 600 s budget. Raised to 1200 (2x the measured run).
+  TRIAGE_WALL_CLOCK_SECONDS = "1200"
   TRIAGE_MAX_TURNS = "40"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
   # started machine's 6PN address and connects to the node of the same release there; the
