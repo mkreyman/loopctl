@@ -135,6 +135,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.Agents.Outcomes
   alias Loopctl.Agents.Registry
   alias Loopctl.Agents.Spec
   alias Loopctl.Delivery.Stages
@@ -839,15 +840,23 @@ defmodule Loopctl.Runners.DispatchLedger do
          :ok <- epoch_matches(record, message.claim_epoch, current),
          :ok <- story_fence(record, current),
          :ok <- accepted(record) do
-      record
-      |> Ecto.Changeset.change(
-        session_ended_reason: attrs.reason,
-        session_ended_digest: attrs.digest,
-        session_ended_at: DateTime.utc_now(),
-        counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling
-      )
-      |> Repo.update!()
-      |> then(&{:recorded, session_of(&1)})
+      ended_at = DateTime.utc_now()
+
+      recorded =
+        record
+        |> Ecto.Changeset.change(
+          session_ended_reason: attrs.reason,
+          session_ended_digest: attrs.digest,
+          session_ended_at: ended_at,
+          counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling
+        )
+        |> Repo.update!()
+
+      # The run's outcome row (US-48.12), in THIS transaction: a session end is never recorded
+      # without its outcome or the reverse. Only on the first recording — a replay returns above.
+      :ok = Outcomes.record_end_in(Repo, recorded, attrs.reason, now: ended_at)
+
+      {:recorded, session_of(recorded)}
     end
   end
 
@@ -927,16 +936,21 @@ defmodule Loopctl.Runners.DispatchLedger do
     with :ok <- kind_is(record, attrs.kind),
          :ok <- own_epoch(record, message.claim_epoch),
          :ok <- accepted(record) do
+      result_at = DateTime.utc_now()
+
       recorded =
         record
         |> Ecto.Changeset.change(
           agent_result: attrs.result,
           agent_result_spec: attrs.spec,
           agent_result_digest: attrs.digest,
-          agent_result_at: DateTime.utc_now()
+          agent_result_at: result_at
         )
         |> Repo.update!()
 
+      # The run's outcome row (US-48.12) BEFORE the effect, so the effect's own signal
+      # (`Outcomes.observe_reply_draft/3`) lands on it — all in this one transaction.
+      :ok = Outcomes.record_end_in(Repo, recorded, "agent_result", now: result_at)
       :ok = effect.(recorded)
       _ = Capacity.release(Repo, recorded, recorded.slot_generation)
 

@@ -3237,6 +3237,46 @@ defmodule Loopctl.Fixtures do
     story
   end
 
+  # US-48.12: an `agent_run_outcomes` row written DIRECTLY, for a read test (the summary, the
+  # endpoint); the write paths are `Loopctl.Agents.Outcomes`' own, exercised through the events
+  # that drive them. `:story` defaults to a fresh `fixture(:stage_story)` of `:tenant_id`;
+  # `:spec_id`, `:spec_version`, `:archetype`, `:end_reason`, `:elapsed_s`, `:turns`,
+  # `:signals` and `:inserted_at` shape the row. Written on `Loopctl.Repo`.
+  def fixture(:agent_run_outcome, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    story =
+      Map.get_lazy(attrs, :story, fn -> fixture(:stage_story, %{tenant_id: tenant_id}) end)
+
+    now = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    spec_id = Map.get(attrs, :spec_id, "implement")
+
+    row = %Loopctl.Agents.RunOutcome{
+      tenant_id: tenant_id,
+      dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+      story_id: story.id,
+      project_id: story.project_id,
+      kind: Map.get(attrs, :kind, spec_id),
+      spec_id: spec_id,
+      spec_version: Map.get(attrs, :spec_version, 1),
+      archetype: Map.get(attrs, :archetype, "build"),
+      prompt_template_id: spec_id,
+      prompt_template_version: Map.get(attrs, :spec_version, 1),
+      started_at: DateTime.add(now, -Map.get(attrs, :elapsed_s, 60), :second),
+      ended_at: Map.get(attrs, :ended_at, now),
+      elapsed_s: Map.get(attrs, :elapsed_s, 60),
+      turns: Map.get(attrs, :turns),
+      end_reason: Map.get(attrs, :end_reason, "completed"),
+      signals: Map.get(attrs, :signals, %{}),
+      inserted_at: now,
+      updated_at: now
+    }
+
+    {:ok, inserted} = Loopctl.Repo.with_tenant(tenant_id, fn -> Loopctl.Repo.insert!(row) end)
+    inserted
+  end
+
   # US-48.9: a `reply_drafts` row for a fresh `:set_aside_story` of `:tenant_id` (or for
   # `:story`), `drafted` with `:body` by default. `:inserted_at` orders a page; `:project_id`
   # files several stories' drafts under one project, for a page of more than one. Written on

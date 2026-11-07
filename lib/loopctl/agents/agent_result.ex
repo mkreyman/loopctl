@@ -28,9 +28,10 @@ defmodule Loopctl.Agents.AgentResult do
   ## Where a result goes (until US-48.12)
 
   On the dispatch's ledger row — `agent_result`, `agent_result_spec`, `agent_result_digest`,
-  `agent_result_at` — the storage `session_ended` already uses for "one report per dispatch".
-  US-48.12 adds the outcome ledger a result feeds. A `:draft` result moves no story: that is
-  what the archetype MEANS, and why one generic message is safe for it.
+  `agent_result_at` — the storage `session_ended` already uses for "one report per dispatch",
+  and on the run's outcome row (`Loopctl.Agents.Outcomes`, US-48.12), in the same transaction.
+  A `:draft` result moves no story: that is what the archetype MEANS, and why one generic
+  message is safe for it.
 
   ## The spec's effect, in the same transaction (US-48.9)
 
@@ -57,6 +58,7 @@ defmodule Loopctl.Agents.AgentResult do
 
   require Logger
 
+  alias Loopctl.Agents.Outcomes
   alias Loopctl.Agents.Registry
   alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract
@@ -64,6 +66,7 @@ defmodule Loopctl.Agents.AgentResult do
   alias Loopctl.Audit
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.ReplyDrafts
+  alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
 
@@ -153,9 +156,15 @@ defmodule Loopctl.Agents.AgentResult do
   # The digest is still over the result as sent, so a byte-identical resend still replays.
   defp effects(nil, validated), do: {validated, fn _record -> :ok end}
 
+  #
+  # The stored row's status is then the run's `draft_screen` outcome signal (US-48.12), read
+  # back from the row the effect wrote, in the same transaction.
   defp effects(screened, validated) do
     {ReplyDrafts.withheld_result(screened) || validated,
-     fn record -> ReplyDrafts.write_result(record, screened) end}
+     fn record ->
+       with :ok <- ReplyDrafts.write_result(record, screened),
+            do: Outcomes.observe_reply_draft(Repo, record)
+     end}
   end
 
   # Everything written is loopctl's: the kind and the label from the registry entry, the

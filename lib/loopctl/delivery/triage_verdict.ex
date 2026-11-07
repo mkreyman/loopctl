@@ -133,6 +133,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   require Logger
 
+  alias Loopctl.Agents.Outcomes
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.Audit
@@ -426,7 +427,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
          :ok <- epoch_matches(session, message),
          {:ok, leave} <- route(message, spec),
          {:ok, row} <- bound(tenant_id, session.story_id, message.dispatch_id),
-         {:ok, record, replayed?} <- record(tenant_id, session, message) do
+         {:ok, record, replayed?} <- record(tenant_id, session, message, leave) do
       ctx = %{
         tenant_id: tenant_id,
         runner_id: runner_id,
@@ -555,11 +556,11 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # `{:ok, record, replayed?}`. The lens entries are keyed by lens once stored, so their arrival
   # order is not part of what was said: sorted before hashing, a resend that rebuilt the list in
   # another order is still the same verdict rather than a permanent `already_recorded`.
-  defp record(tenant_id, session, message) do
+  defp record(tenant_id, session, message, leave) do
     digest = message |> sort_lens_verdicts() |> TriageVerdictRecord.digest()
 
     with :none <- recorded(tenant_id, message.dispatch_id, digest),
-         do: insert_record(tenant_id, session, message, digest)
+         do: insert_record(tenant_id, session, message, digest, leave)
   end
 
   # INSIDE `with_tenant/2`, because `triage_verdicts` is RLS-scoped and a read with no tenant
@@ -592,7 +593,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
-  defp insert_record(tenant_id, session, message, digest) do
+  defp insert_record(tenant_id, session, message, digest, {_from, destination, _edge}) do
     verdict = Map.get(message, :verdict)
 
     attrs = %{
@@ -612,7 +613,9 @@ defmodule Loopctl.Delivery.TriageVerdict do
       payload_digest: digest
     }
     |> TriageVerdictRecord.create_changeset(attrs)
-    |> then(fn changeset -> in_tenant(tenant_id, fn -> Repo.insert(changeset) end) end)
+    |> then(fn changeset ->
+      in_tenant(tenant_id, fn -> insert_with_outcome(changeset, message, attrs, destination) end)
+    end)
     |> case do
       {:ok, record} ->
         {:ok, record, false}
@@ -628,12 +631,41 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
+  # The verdict row and its run outcome (US-48.12) in the one tenant transaction: the outcome
+  # is recorded only by the delivery that inserted the verdict, so a resend records nothing.
+  defp insert_with_outcome(changeset, message, attrs, destination) do
+    with {:ok, record} <- Repo.insert(changeset) do
+      :ok = record_outcome(record.tenant_id, message, attrs, destination)
+      {:ok, record}
+    end
+  end
+
   # The unique index racing another delivery of the SAME verdict — a rejoin whose old channel is
   # still draining, two sockets, two nodes. Re-read and compare rather than refusing:
   # `already_recorded` is published as PERMANENT, so a conforming runner would never resend and
   # the documented close of this race could not happen.
   defp raced(tenant_id, dispatch_id, digest) do
     with :none <- recorded(tenant_id, dispatch_id, digest), do: {:error, :already_recorded}
+  end
+
+  # The triage run's outcome row (US-48.12), in the verdict record's own transaction: the
+  # verdict is the session's end. The `verdict` signal is the outcome's enum and the stage
+  # the spec routes it to — the destination a human's later resolution is judged against
+  # (`Loopctl.Agents.Outcomes`). Enums only, never the session's prose.
+  defp record_outcome(tenant_id, message, attrs, destination) do
+    {end_reason, value} =
+      case attrs.outcome do
+        nil ->
+          {"triage_incomplete",
+           %{"incomplete" => attrs.incomplete_reason, "destination" => to_string(destination)}}
+
+        outcome ->
+          {"triage_verdict", %{"outcome" => outcome, "destination" => to_string(destination)}}
+      end
+
+    Outcomes.record_result_in(Repo, tenant_id, message.dispatch_id, end_reason, [
+      {"verdict", value, "triage_verdict"}
+    ])
   end
 
   defp unique_violation?(%Ecto.Changeset{errors: errors}) do

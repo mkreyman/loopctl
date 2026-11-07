@@ -16,6 +16,7 @@ defmodule Loopctl.Progress do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Outcomes
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Artifacts.VerificationResult
@@ -2435,6 +2436,11 @@ defmodule Loopctl.Progress do
       multi =
         Multi.new()
         |> Multi.insert(:review_record, changeset)
+        # The review's counts on the story's build run's outcome row (US-48.12), in this
+        # transaction. Always `{:ok, :ok}`: it adds no refusal this function can return.
+        |> Multi.run(:run_outcome, fn repo, %{review_record: review} ->
+          {:ok, Outcomes.observe_review(repo, tenant_id, story_id, review)}
+        end)
         |> enqueue_knowledge_extraction(tenant_id)
         |> maybe_chain_signed_claim(tenant_id, story_id, opts)
 

@@ -197,6 +197,14 @@ defmodule Loopctl.Delivery.RunnerStages do
   # kill again if the work is retried, so neither re-queues: control escalates to a human.
   @budget_reasons ~w(wall_clock_exceeded max_turns_exceeded)
 
+  @doc """
+  The `session_ended` reasons that are the session's budget running out — the ones this
+  module escalates instead of re-queueing, and the ones `Loopctl.Agents.Outcomes` counts as
+  budget exhausted.
+  """
+  @spec budget_reasons() :: [String.t()]
+  def budget_reasons, do: @budget_reasons
+
   # How many times the budget escalation re-reads a row that moved under it before telling the
   # runner to resend. The row moving is another message of the same session landing between
   # the read and the compare-and-set; it settles in one or two re-reads or not at all.

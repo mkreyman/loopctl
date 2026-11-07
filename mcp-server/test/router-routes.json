@@ -21,6 +21,7 @@
     ["GET","/api/v1/admin/violators","LoopctlWeb.AdminViolatorController",":index"],
     ["POST","/api/v1/admin/violators/:id/ignore","LoopctlWeb.AdminViolatorController",":ignore"],
     ["POST","/api/v1/admin/violators/:id/resolve","LoopctlWeb.AdminViolatorController",":resolve"],
+    ["GET","/api/v1/agent_specs/:spec_id/outcomes","LoopctlWeb.AgentOutcomeController",":summary"],
     ["GET","/api/v1/agents","LoopctlWeb.AgentController",":index"],
     ["GET","/api/v1/agents/:id","LoopctlWeb.AgentController",":show"],
     ["POST","/api/v1/agents/register","LoopctlWeb.AgentController",":register"],

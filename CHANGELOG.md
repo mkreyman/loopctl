@@ -57,6 +57,15 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Run-outcome ledger per agent spec version (2026-11-07, US-48.12).** Migration
+  `20261107170000` adds the RLS table `agent_run_outcomes`: one row per runner dispatch, keyed
+  by the spec `{id, version}` it ran under, with the session's end and the signals later
+  events prove (merge-gate decision, CI result, merge, review counts, a human's override of
+  a triage verdict, a re-queue after a budget kill, the draft screen). New
+  `GET /api/v1/agent_specs/:spec_id/outcomes?window_days=` (any key, agent role up, default
+  30 days, at most 365; 400 outside that) returns per-version counts, rates and medians;
+  loopctl-mcp-server 3.8.0 exposes it as `agent_outcomes`. `turns` and cost stay null: no
+  runner message reports them yet.
 - **Reply drafts for tickets triage set aside (2026-11-07, US-48.9).** For a story whose
   intake record carries a support `ticket_id` and which triage rejected or escalated, a runner
   session drafts a reply (agent spec `reply_draft@1`, dispatch kind `reply_draft`, runner

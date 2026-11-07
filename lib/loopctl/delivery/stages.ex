@@ -134,6 +134,7 @@ defmodule Loopctl.Delivery.Stages do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Outcomes
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth.Role
@@ -716,6 +717,10 @@ defmodule Loopctl.Delivery.Stages do
     row = put_effects(row, effects, opts)
     release_session_slot(row, to, opts)
     record_issue_closure(row, story, transition)
+    # What this transition proves about a run's work (US-48.12) — a merge, a CI verdict, a
+    # gate refusal, a human's resolution — on the run's outcome row, in THIS transaction.
+    # BEFORE the chain append, like the two writes above; it takes no lock that order names.
+    :ok = Outcomes.observe_transition(Repo, previous, row, transition)
     {row, maybe_chain(row, previous, transition, reason, opts)}
   end
 
@@ -1219,6 +1224,9 @@ defmodule Loopctl.Delivery.Stages do
       |> Map.merge(%{"effect" => Atom.to_string(effect), "value" => event_value(value)})
 
     insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
+    # The merge gate's ALLOW is this effect (`merge_gate_allowed_sha`); its outcome signal
+    # (US-48.12) is written here, in the write's own transaction. Every other effect: nothing.
+    :ok = Outcomes.observe_effect(Repo, row, effect)
     row
   end
 

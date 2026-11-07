@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.8.0 — 2026-11-07 (agent outcomes)
+
+### Added
+
+- **`agent_outcomes`** reads an agent spec's track record from the run-outcome ledger (loopctl
+  US-48.12, `GET /api/v1/agent_specs/:spec_id/outcomes`): per spec version, newest first, the
+  runs recorded in the last `window_days` (default 30, at most 365) and how many succeeded,
+  were overridden by a human or exhausted their budget, each also as a rate, with the median
+  elapsed seconds and turns. Any tenant key reads it (`role: :agent`); `LOOPCTL_AGENT_KEY` is
+  the tool's own key, after `LOOPCTL_API_KEY`.
+
 ## 3.7.0 — 2026-11-07 (reply drafts)
 
 ### Added

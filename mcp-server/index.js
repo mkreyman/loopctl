@@ -73,6 +73,7 @@ import {
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 import { changeBindingGet as changeBindingGetRequest } from "./lib/change-bindings.js";
+import { agentOutcomes } from "./lib/agent-outcomes.js";
 import {
   clearGithubCredential as clearGithubCredentialRequest,
   githubCredential as githubCredentialRequest,
@@ -3455,6 +3456,18 @@ async function changeBindingGet(args) {
 
   return toContent(
     await changeBindingGetRequest(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, key),
+    }),
+  );
+}
+
+// US-48.12: a READ of the run-outcome ledger, `role: :agent` with the hierarchy — keyed as
+// changeBindingGet is, LOOPCTL_AGENT_KEY as an OVERRIDE so `resolveKey`'s order holds.
+async function agentOutcomesRead(args) {
+  const key = process.env.LOOPCTL_AGENT_KEY;
+
+  return toContent(
+    await agentOutcomes(args, {
       apiCall: (method, path, body) => apiCall(method, path, body, key),
     }),
   );
@@ -8743,6 +8756,41 @@ const TOOLS = [
     },
   },
   {
+    name: "agent_outcomes",
+    description:
+      "AN AGENT SPEC'S TRACK RECORD, per version, from the run-outcome ledger (GET " +
+      "/api/v1/agent_specs/:spec_id/outcomes, loopctl US-48.12). Every runner dispatch ends " +
+      "in one outcome row keyed by its spec {id, version}; this summarises one spec's rows " +
+      "recorded in the last `window_days` (default 30, at most 365), newest version first: " +
+      "`runs`, `ended`, `successes` (a build whose work merged, a triage verdict no human " +
+      "overrode, a reply draft stored `drafted`), `human_overrides`, `budget_exhausted` " +
+      "(sessions ended wall_clock_exceeded or max_turns_exceeded), each also as a rate, and " +
+      "`median_elapsed_s` / `median_turns` (null when no run carries one — no runner reports " +
+      "turns yet). Every figure comes from an event loopctl recorded (session end, verdict, " +
+      "merge-gate decision, merge, review, a human's resolution), never from session text. " +
+      "A spec with no runs in the window answers `versions: []`.\n\n" +
+      "Any key of the tenant may read it (`role: :agent` with the hierarchy), so the key is " +
+      "the usual order with LOOPCTL_AGENT_KEY as this tool's own: LOOPCTL_API_KEY when set, " +
+      "else LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY. REFUSES: 400 for a malformed spec_id " +
+      "or a window_days outside 1..365; 401 for no key or one that does not authenticate; " +
+      "429 when rate limited. No 403: every key role clears the gate. A malformed spec_id " +
+      "or window_days is refused locally (status 0, nothing sent).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spec_id: {
+          type: "string",
+          description: "The agent spec id: triage, implement or reply_draft.",
+        },
+        window_days: {
+          type: "integer",
+          description: "The window in days back from now. Default 30, at most 365.",
+        },
+      },
+      required: ["spec_id"],
+    },
+  },
+  {
     name: "change_binding_get",
     description:
       "THE CHG CHANGES BOUND TO A STORY (GET /api/v1/stories/:id/changes, loopctl US-47.7): " +
@@ -10330,6 +10378,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "change_binding_get":
       return await changeBindingGet(args);
+
+    case "agent_outcomes":
+      return await agentOutcomesRead(args);
 
     case "resolve_escalation":
       return await resolveEscalation(args);

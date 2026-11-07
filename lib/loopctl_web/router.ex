@@ -494,6 +494,10 @@ defmodule LoopctlWeb.Router do
     # (ticket-derived text); loopctl never sends one.
     get "/projects/:project_id/reply_drafts", ReplyDraftController, :index
 
+    # US-48.12: an agent spec's track record, per version, from the run-outcome ledger. A
+    # read of counts and enums, agent-role.
+    get "/agent_specs/:spec_id/outcomes", AgentOutcomeController, :summary
+
     # Epic management
     get "/projects/:project_id/epics", EpicController, :index
     post "/projects/:project_id/epics", EpicController, :create
