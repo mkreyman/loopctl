@@ -51,7 +51,7 @@ Per-PR cost of an agent-built change, from KB `0f23eefd` (HCB, 397 PRs): first c
 
 ## 2. Candidate uses
 
-Every candidate dispatches through loopctl's existing custody: a `:build` run is verified by `verify@1` under a separately rooted dispatch on a different runner (US-48.18), merged only on the merge gate's `allow` (US-48.17), and a `:draft` reaches nobody until a human releases it.
+Every candidate dispatches through loopctl's existing custody: a `:build` run is verified by `verify@1` under a separately rooted dispatch on a runner of a different agent than the implementer's (US-48.18), merged only on the merge gate's `allow` (US-48.17), and a `:draft` reaches nobody until a human releases it.
 
 | Candidate | Archetype | Trigger | Input | What a human still decides | Custody risk | US-48.12 outcome signal |
 |---|---|---|---|---|---|---|

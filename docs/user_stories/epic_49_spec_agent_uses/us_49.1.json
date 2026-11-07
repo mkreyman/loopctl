@@ -28,7 +28,7 @@
     },
     {
       "id": "AC-49.1.4",
-      "description": "The story is verified by verify@1 under a dispatch whose root and runner are not the implementer's; a verifier that would share either is refused and the story escalates over no_independent_verifier_runner."
+      "description": "The story is verified by verify@1 under VerifierPlacement's rules: a separately rooted dispatch, placed on a runner whose agent is neither the story's assigned agent nor the implementer dispatch's agent. While such a runner exists but is busy, the pass answers no_runner and a later pass retries; only when the tenant has no live runner of another agent does the story escalate over no_independent_verifier_runner."
     },
     {
       "id": "AC-49.1.5",

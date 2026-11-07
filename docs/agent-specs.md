@@ -398,7 +398,9 @@ a programming error, never a run-time state.
 
 A runner is sent a dispatch of kind `K` only when it declares `K` on join and holds the spec the
 registry has for `K` (`Runners.declared_specs/1`). A runner that sends no `specs` is read as
-holding version 1 of the spec for each kind it declares. A runner that sends a list is held to it.
+holding version 1 of the spec for each kind it declares, and so is one that sends an empty list
+(`Runners.declared_specs/1` reads only a non-empty list). A runner that sends a non-empty list is
+held to it.
 A spec the runner names that loopctl does not hold makes nothing eligible.
 
 ## The runner contract

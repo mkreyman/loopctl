@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-49.2.1",
-      "description": "Registry entry flake_fix@1 with archetype :build, candidates admitted by the test-flakiness label (US-49.1's admit_labels), and its own runner template {id, version}; adding it creates no new loopctl module outside lib/loopctl/agents/specs/."
+      "description": "Registry entry flake_fix@1 with archetype :build, a dispatch kind of its own, and its own runner template {id, version}. Candidates has no label predicate and nothing routes a queued story to one :build kind over another, so this story adds both to Loopctl.Agents.Candidates (never a bespoke query): a predicate selecting stories whose intake issue carries the test-flakiness label (admitted to triage by US-49.1's admit_labels), and its negation on implement@1's read, so each queued story is a candidate for exactly one :build kind."
     },
     {
       "id": "AC-49.2.2",
