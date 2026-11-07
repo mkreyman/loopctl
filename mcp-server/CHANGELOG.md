@@ -14,9 +14,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   recommend retry, re-triage, take-over or close, with the whole runbook attached.
 - **`escalation_playbook`** returns the same runbook as a tool (whole, or one `reason_class`).
   Local: sends nothing.
-- **`escalation_list` rows carry a `remedy`**: what the class means, which `resolve_escalation`
-  target fits, a warning when the change already merged, and where to find the runner's unpushed
-  commits when it left some.
+- **`escalation_list` carries remedies**: the page's `remedies` holds, once per class present,
+  what the class means and which `resolve_escalation` target fits; each row's `remedy` adds a
+  warning when the change already merged and where to find the runner's unpushed commits when
+  it left some.
 
 ## 3.10.1 — 2026-11-07
 

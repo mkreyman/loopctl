@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  classRemedy,
   playbook,
   REMEDIES,
   remedyFor,
@@ -54,19 +55,22 @@ describe("remedies cover the server's reason classes", () => {
 });
 
 describe("remedyFor", () => {
-  test("gives the class's meaning and options", () => {
+  test("a row's remedy points at its class and carries no class text", () => {
     const r = remedyFor({ story_id: STORY, reason_class: "triage_escalated", edge: "triage_escalate" });
-    assert.equal(r.meaning, REMEDIES.triage_escalated.meaning);
-    assert.deepEqual(r.options, REMEDIES.triage_escalated.options);
-    assert.match(r.take_over, /escalation_playbook/);
-    assert.equal(r.warning, undefined);
-    assert.equal(r.salvage, undefined);
+    assert.deepEqual(r, { see: "remedies.triage_escalated" });
   });
 
   test("an unknown or missing class falls back to other", () => {
-    assert.equal(remedyFor({ reason_class: "new_class" }).meaning, REMEDIES.other.meaning);
-    assert.equal(remedyFor({}).meaning, REMEDIES.other.meaning);
-    assert.equal(remedyFor(null).meaning, REMEDIES.other.meaning);
+    assert.equal(remedyFor({ reason_class: "new_class" }).see, "remedies.other");
+    assert.equal(remedyFor({}).see, "remedies.other");
+    assert.equal(remedyFor(null).see, "remedies.other");
+  });
+
+  test("classRemedy gives the class's meaning, options and take-over pointer", () => {
+    const r = classRemedy("triage_escalated");
+    assert.equal(r.meaning, REMEDIES.triage_escalated.meaning);
+    assert.deepEqual(r.options, REMEDIES.triage_escalated.options);
+    assert.match(r.take_over, /escalation_playbook \{reason_class: "triage_escalated"\}/);
   });
 
   test("a merged-change edge warns against re-queuing", () => {
@@ -95,26 +99,36 @@ describe("remedyFor", () => {
   });
 
   test("the returned options are a copy, so a caller cannot edit the table", () => {
-    const r = remedyFor({ reason_class: "other" });
+    const r = classRemedy("other");
     r.options.push("x");
     assert.ok(!REMEDIES.other.options.includes("x"));
   });
 });
 
 describe("withRemedies", () => {
-  test("adds remedy to every row and keeps the rest of the page", () => {
+  test("puts each present class's text on the page once and a pointer on each row", () => {
     const page = {
       data: [
         { story_id: STORY, reason_class: "operator_released" },
+        { story_id: STORY, reason_class: "session_failed" },
         { story_id: STORY, reason_class: "session_failed" },
       ],
       next_cursor: "c1",
     };
     const out = withRemedies(page);
     assert.equal(out.next_cursor, "c1");
-    assert.equal(out.data[0].remedy.meaning, REMEDIES.operator_released.meaning);
-    assert.equal(out.data[1].remedy.meaning, REMEDIES.session_failed.meaning);
+    assert.deepEqual(Object.keys(out.remedies).sort(), ["operator_released", "session_failed"]);
+    assert.equal(out.remedies.session_failed.meaning, REMEDIES.session_failed.meaning);
+    assert.deepEqual(
+      out.data.map((r) => r.remedy.see),
+      ["remedies.operator_released", "remedies.session_failed", "remedies.session_failed"],
+    );
+    assert.equal(out.data[1].remedy.meaning, undefined, "no class text repeated per row");
     assert.equal(page.data[0].remedy, undefined, "the input page is not mutated");
+  });
+
+  test("an empty page carries empty remedies", () => {
+    assert.deepEqual(withRemedies({ data: [], next_cursor: null }).remedies, {});
   });
 
   test("an error or an unexpected shape passes through untouched", () => {
@@ -138,6 +152,19 @@ describe("playbook", () => {
     const book = playbook({ reason_class: "budget_exhausted" });
     assert.deepEqual(Object.keys(book.by_reason_class), ["budget_exhausted"]);
     assert.deepEqual(book.take_over, TAKE_OVER_STEPS);
+  });
+
+  test("null or an empty reason_class means the whole runbook, as escalation_list reads it", () => {
+    for (const value of [null, ""]) {
+      const book = playbook({ reason_class: value });
+      assert.equal(book.error, undefined, String(value));
+      assert.deepEqual(Object.keys(book.by_reason_class).sort(), [...REASON_CLASSES].sort());
+    }
+  });
+
+  test("take-over step 4 branches from the repo's base branch, not a fixed master", () => {
+    assert.match(TAKE_OVER_STEPS[3], /base_branch/);
+    assert.doesNotMatch(TAKE_OVER_STEPS[3], /branch from master/);
   });
 
   test("an unknown class is refused locally", () => {
@@ -188,6 +215,18 @@ describe("wiring in index.js and the README", () => {
     const start = INDEX_SRC.indexOf("async function escalationListRead(");
     const handler = INDEX_SRC.slice(start, INDEX_SRC.indexOf("\n}\n", start));
     assert.match(handler, /withRemedies\(/);
+  });
+
+  test("escalation_list's tool description tells sessions about the remedies", () => {
+    const start = INDEX_SRC.indexOf('name: "escalation_list"');
+    const decl = INDEX_SRC.slice(start, INDEX_SRC.indexOf('name: "escalation_playbook"', start));
+    assert.match(decl, /`remedies`/);
+    assert.match(decl, /ALREADY MERGED/);
+    assert.match(decl, /`salvage`/);
+  });
+
+  test("an unknown prompt is an invalid-params error, not an internal one", () => {
+    assert.match(INDEX_SRC, /new McpError\(ErrorCode\.InvalidParams, `Unknown prompt/);
   });
 
   test("the server declares prompts and answers both prompt requests", () => {
