@@ -98,6 +98,14 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :session_ended_digest, :string
     field :session_ended_at, :utc_datetime_usec
     field :counts_toward_retry_ceiling, :boolean
+    # The result a `:draft` session reported through `agent_result` (contract 1.25.0, US-48.8),
+    # validated against `agent_result_spec`'s schema. Written once, with the digest a resend is
+    # compared against, by `Loopctl.Runners.DispatchLedger.record_agent_result/4`; all four
+    # NULL until then. Session-authored: data, never executed.
+    field :agent_result, :map
+    field :agent_result_spec, :string
+    field :agent_result_digest, :string
+    field :agent_result_at, :utc_datetime_usec
 
     timestamps()
   end

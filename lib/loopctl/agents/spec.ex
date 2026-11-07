@@ -66,6 +66,9 @@ defmodule Loopctl.Agents.Spec do
     `:judge` pass sends to the first runner `Selection.runners/3` returns and nothing else.
   - `budgets` — the `{wall_clock_key, max_turns_key}` config pair.
   - `result` — the runner messages the session answers with.
+  - `result_schema` — for a spec that answers with the generic `agent_result` message
+    (contract 1.25.0, US-48.8), the `OpenApiSpex.Schema` of an OBJECT its `result` must
+    satisfy; `nil` for every other spec. See "Which specs answer through `agent_result`".
   - `screens` — `%{screen => route}`: the route each control screen takes when it refuses.
   - `outcomes` — `%{outcome => route}`: what each result outcome drives.
   - `effects` — the row writes the result drives.
@@ -77,6 +80,18 @@ defmodule Loopctl.Agents.Spec do
   A route is a non-empty list of `{from, to, edge}` transitions: taken in order for a judge's
   outcome, a screen or a sweep, and the set a single report may carry for a build's `stage`
   result (one transition per message).
+
+  ## Which specs answer through `agent_result` (US-48.8)
+
+  `agent_result` is the one generic result message: `{dispatch_id, claim_epoch, spec: {id,
+  version}, result}`, with `result` validated against the named spec's `result_schema`
+  (`Loopctl.Agents.AgentResult`). Only a `:draft` spec may name it, and a spec names it if and
+  only if it carries a `result_schema`. A `:judge` answers with its own verdict message,
+  because its outcome drives custody edges that need their own screens (`triage_verdict`); a
+  `:build` answers with `stage` and `session_ended`, because each of its reports is one
+  runner-reportable transition. A `:draft` drives no transition and writes no effect, so a
+  schema-validated object is the whole of what it can say — which is what makes one generic
+  message safe for it.
   """
 
   alias Loopctl.Agents.Candidates
@@ -97,6 +112,7 @@ defmodule Loopctl.Agents.Spec do
     :advance_on,
     :budgets,
     :result,
+    :result_schema,
     :screens,
     :outcomes,
     :effects,
@@ -124,6 +140,7 @@ defmodule Loopctl.Agents.Spec do
           advance_on: [atom()],
           budgets: {atom(), atom()},
           result: [String.t()],
+          result_schema: OpenApiSpex.Schema.t() | nil,
           screens: %{optional(atom()) => route()},
           outcomes: %{optional(String.t()) => route()},
           effects: [atom()],
@@ -186,7 +203,12 @@ defmodule Loopctl.Agents.Spec do
   ]
 
   # Runner messages a session answers with (`RunnerContract.inbound_events/0`).
-  @results ["triage_verdict", "stage", "session_ended"]
+  @results ["triage_verdict", "stage", "session_ended", "agent_result"]
+
+  # The generic result message (contract 1.25.0) and the one archetype that may name it. See
+  # the moduledoc's "Which specs answer through `agent_result`".
+  @agent_result "agent_result"
+  @agent_result_archetypes [:draft]
 
   @screens [
     # `TriagePayload.build/1` refusing a ticket whose rendered object exceeds the contract.
@@ -336,6 +358,17 @@ defmodule Loopctl.Agents.Spec do
 
   def holds_claim?(_not_a_kind), do: false
 
+  @doc """
+  Whether `spec`'s session answers with the generic `agent_result` message (contract 1.25.0):
+  it names `"agent_result"` in `result` and carries the `result_schema` that message's
+  `result` is validated against. Only a `:draft` spec can, which `new!/2` holds at compile
+  time; the check here reads both halves anyway, so a struct built some other way never reads
+  as reporting through a message it has no schema for.
+  """
+  @spec reports_agent_result?(t()) :: boolean()
+  def reports_agent_result?(%__MODULE__{result: result, result_schema: schema}),
+    do: @agent_result in result and match?(%OpenApiSpex.Schema{type: :object}, schema)
+
   # ── validation ──────────────────────────────────────────────────────────────────────────────
 
   defp validate(fields) do
@@ -346,8 +379,38 @@ defmodule Loopctl.Agents.Spec do
          :ok <- check_routes(spec),
          :ok <- check_archetype_transitions(spec),
          :ok <- check_archetype_effects(spec),
-         :ok <- check_archetype_advance(spec) do
+         :ok <- check_archetype_advance(spec),
+         :ok <- check_agent_result(spec) do
       {:ok, spec}
+    end
+  end
+
+  # `agent_result` is named by a `:draft` spec and by nothing else, and a spec names it if and
+  # only if it carries an object `result_schema` — so no `agent_result` can arrive for a spec
+  # with nothing to validate it against, and no schema sits on a spec that never reads it.
+  defp check_agent_result(spec) do
+    names? = @agent_result in spec.result
+    schema = spec.result_schema
+
+    cond do
+      names? and spec.archetype not in @agent_result_archetypes ->
+        {:error,
+         "#{label(spec)} (archetype #{inspect(spec.archetype)}) names result " <>
+           "#{inspect(@agent_result)}; only a #{inspect(@agent_result_archetypes)} spec " <>
+           "answers through agent_result"}
+
+      names? and not match?(%OpenApiSpex.Schema{type: :object}, schema) ->
+        {:error,
+         "#{label(spec)} names result #{inspect(@agent_result)} and must carry a " <>
+           "result_schema: an OpenApiSpex.Schema of type :object, got #{inspect(schema)}"}
+
+      not names? and not is_nil(schema) ->
+        {:error,
+         "#{label(spec)} carries a result_schema but does not name result " <>
+           "#{inspect(@agent_result)}; only an agent_result spec reads one"}
+
+      true ->
+        :ok
     end
   end
 

@@ -186,7 +186,11 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.7: the cron caller that runs the `:build` pass with `implement@1`.
       "lib/loopctl/workers/dispatch_driver_worker.ex",
       # US-48.5: the triage result's outcomes, screens and effects.
-      "lib/loopctl/delivery/triage_verdict.ex"
+      "lib/loopctl/delivery/triage_verdict.ex",
+      # US-48.8: the generic `agent_result` message, and the runner eligibility check that
+      # asks whether a runner holds the spec a kind runs under.
+      "lib/loopctl/agents/agent_result.ex",
+      "lib/loopctl/runners.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

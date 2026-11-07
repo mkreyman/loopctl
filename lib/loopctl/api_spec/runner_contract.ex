@@ -33,6 +33,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts, effects}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage`, `effect_conflict`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | `"session_ended"` | `RunnerSessionEnded` (since 1.16.0) | `RunnerSessionEndedAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | `"triage_verdict"` | `RunnerTriageVerdictMessage` (since 1.9.0) | `RunnerTriageVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `stale_stage`, `audit_chain_append_failed`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
+  | runner -> control | `"agent_result"` | `RunnerAgentResultMessage` (since 1.25.0) | `RunnerAgentResultAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `already_recorded`, `claim_epoch_mismatch`, `wrong_dispatch_kind`, `internal_error` |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
@@ -59,6 +60,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.22.0) ONE CODE, ONE MEANING, then WHICH REFUSALS END THE CLAIM (loopctl#920). Two codes were each answered both when the claim was over and when one message was wrong, so those halves get codes of their own: `claim_epoch_mismatch` (was `stale_claim_epoch`: the message's epoch is not its own dispatch's while the claim stands; `stale_claim_epoch` now means only that the claim moved) and `wrong_dispatch_kind` (was `unknown_dispatch`: this runner's dispatch of another kind; `unknown_dispatch` now means not this runner's, or gone). Both are permanent for that one message. A runner that JOINS declaring 1.22.0 or later gets the new codes; an older one keeps getting the old. Then `x-connection.claim_ending_errors`, keyed by work event with no `"*"` (`unknown_dispatch` and `stale_claim_epoch` on every work event except `stale_claim_epoch` on `triage_verdict`, whose resend is the reclaim repair; `not_claimant` on `checkpoint`; `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` on the judgements), and `x-connection.claim_ending_remedy`: send that dispatch no more of its work and stop its session; its `session_ended` on exit is sent as always, resent on `rate_limited`, and final on any permanent refusal. `claim_not_live` is not claim-ending: it is also answered once review is requested, while the session still reports its stages. RE-VENDOR, and declare 1.22.0 on join, to get the split codes and derive the set | | | | |
   | (1.23.0) THE CHANGE THREAD AND REVIEW SURFACE IS RETIRED (loopctl#984; Epic 45 was deleted and its successor, Epic 47, hears about a change from chg rather than from a runner). Gone: the `checkpoint`, `thread_entry`, `review_finding` and `review_verdict` messages with their schemas, acks, buckets, limits and refusal codes; the `review` dispatch kind and the dispatch's `review` object; the `kind` field of `RunnerSessionEndedAck`. Any of the four events is now answered `unknown_event`, and a join declaring `review` is admitted as before (the join never refuses a kind) and is simply never sent one. This NARROWS the contract, which a minor version otherwise may not do. It is a minor anyway: loopctl can no longer create a dispatch that would make a runner send one of these messages, production held no thread checkpoint, entry or review when it shipped, and a major would have refused the join of every connected runner until each re-vendored. RE-VENDOR to drop the dead events from your copy | | | | |
   | (1.24.0) `x-connection.limits.lens_verdicts.max_bytes` PUBLISHES the cap on a message's three `lens_verdicts` together, under the byte rule. It has been enforced since 1.15.0 and was stated only in the field's prose, so a runner could not check it without re-typing a number. The field maxima do not imply it: three lenses at every maximum measure 8,402 bytes in ASCII and about twice that in characters outside the Basic Multilingual Plane, so a schema-valid set can still be refused `invalid_payload`. Nothing changes on the wire. RE-VENDOR to check it locally | | | | |
+  | (1.25.0) RUNNERS DECLARE THEIR SPEC TEMPLATES, AND ONE GENERIC RESULT MESSAGE (Epic 48, US-48.8). `RunnerJoin.specs` (optional, at most 32 `RunnerSpecRef` entries of `{id, version}`) names the spec templates the machine holds; loopctl sends a dispatch of a kind only to a runner that declares the kind AND holds the spec it builds that kind's dispatch from. OMITTING IT, or an empty array, is read as holding each declared kind (or `implied_kinds`) at version 1, so an un-upgraded runner is unaffected; a spec this server does not hold is ignored, never refused. New `agent_result` message (`RunnerAgentResultMessage`: `dispatch_id`, `claim_epoch`, `spec`, `result`) for a session whose spec reports through it: `result` is validated against THAT spec's result schema, capped at `x-connection.limits.agent_result.max_bytes` under the byte rule, recorded once per dispatch (a byte-identical resend is `ok` with `replayed: true`, a different one `already_recorded`), answered with `RunnerAgentResultAck`, metered by `agent_result_burst`. An unknown spec, a spec whose archetype does not report through it (`triage` keeps `triage_verdict`, `implement` keeps `stage` and `session_ended`), or a schema failure is `invalid_payload` and writes nothing. No spec reports through it yet; US-48.9 adds the first. RE-VENDOR to declare `specs` and send `agent_result`: a 1.24.0 copy has neither | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -401,7 +403,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.24.0"
+  @version "1.25.0"
   @major 1
 
   defmodule ByteRule do
@@ -697,12 +699,56 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerSpecRef do
+    @moduledoc false
+    require OpenApiSpex
+
+    # ONE AGENT SPEC, NAMED (since 1.25.0, US-48.8): `{id, version}`, the key loopctl's spec
+    # registry and the runner's template registry are both keyed by. This module names the
+    # shape only and never reads the registry, so the contract stays a leaf of it.
+    # One declaration, inlined in the two places it is carried — `RunnerJoin.specs` (what a
+    # runner holds) and `RunnerAgentResultMessage.spec` (which spec a result answers) — so the
+    # two cannot drift.
+    #
+    # `additionalProperties: false` because this is a KEY, not a capability declaration: an
+    # extra member is a runner that means something this contract does not say, and refusing it
+    # is cheaper than guessing. The `id` pattern is the spec module's own id format, and
+    # `maxLength` bounds what Presence replicates per entry.
+    @max_id_length 64
+
+    @doc "The longest spec id the wire admits."
+    @spec max_id_length() :: pos_integer()
+    def max_id_length, do: @max_id_length
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerSpecRef",
+        description:
+          "One agent spec, named by `{id, version}` (since 1.25.0): the key loopctl's spec " <>
+            "registry and the runner's template registry share.",
+        type: :object,
+        required: [:id, :version],
+        additionalProperties: false,
+        properties: %{
+          id: %Schema{type: :string, pattern: "^[a-z][a-z0-9_]*$", maxLength: @max_id_length},
+          version: %Schema{type: :integer, minimum: 1}
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerJoin do
     @moduledoc false
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.Kinds
     alias Loopctl.ApiSpec.RunnerContract.RunnerSample
+    alias Loopctl.ApiSpec.RunnerContract.RunnerSpecRef
+
+    # A SIZE bound on `specs`, for the reason `@max_declared_kinds` is one: the declaration is
+    # replicated by Presence for the life of the socket and echoed on the pool read.
+    @max_declared_specs 32
 
     # A SIZE bound on `kinds`, deliberately not `length(Kinds.all())`. Tying it to the
     # vocabulary would refuse the join of a runner declaring a kind a later version adds, or
@@ -895,6 +941,28 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "prefix leaving no room for that refuses the placement, not the join. " <>
                 "Per-CONNECTION, so declare it on EVERY join — a machine whose " <>
                 "configuration changed applies it by reconnecting."
+          },
+          # WHICH SPEC TEMPLATES THIS MACHINE HOLDS (1.25.0, US-48.8). Eligibility for a kind
+          # is DERIVED from it at the decision (`Loopctl.Runners.kind_supported/4`) and stored
+          # nowhere else — the same shape as `kinds`. Like `kinds` it never refuses a join over
+          # WHICH specs it names: a spec this server does not hold is carried and simply never
+          # matches. SHAPE is enforced (`RunnerSpecRef`, the count).
+          specs: %Schema{
+            type: :array,
+            maxItems: @max_declared_specs,
+            items: RunnerSpecRef.schema(),
+            description:
+              "The agent spec templates this machine holds, as `{id, version}` (since " <>
+                "1.25.0). loopctl sends a dispatch of a kind only to a runner holding the " <>
+                "spec it builds that kind's dispatch from — the kind must ALSO be in " <>
+                "`kinds`. Omitting it, or sending an EMPTY array, is read as holding each " <>
+                "declared kind (or `implied_kinds`) at version 1, which is what every runner " <>
+                "built before this field holds, so an un-upgraded runner is unaffected. A " <>
+                "spec this server does not hold is IGNORED, not refused, so a runner " <>
+                "upgraded ahead of loopctl still connects; a declaration naming only specs " <>
+                "this server does not hold for a kind leaves that kind unsendable to the " <>
+                "machine. At most #{@max_declared_specs} entries. Per-CONNECTION, so declare " <>
+                "it on EVERY join."
           },
           sample: RunnerSample.schema()
         }
@@ -1812,6 +1880,117 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerAgentResultMessage do
+    @moduledoc """
+    The `agent_result` message a runner sends when a session of a spec that reports through it
+    is FINISHED (1.25.0, US-48.8).
+
+    ONE MESSAGE FOR EVERY SUCH SPEC, so a new spec ships as a spec, a template and an eval set
+    rather than a new socket event. The envelope names the dispatch, its epoch and the spec;
+    `result` is the session's object, validated by loopctl against THAT spec's result schema
+    (`Loopctl.Agents.AgentResult`), which is why its shape is not published here: the wire
+    bounds it (`max_result_bytes/0`, the byte rule, no NUL, no over-wide number) and the spec
+    decides it.
+
+    Only a spec whose archetype reports through `agent_result` may be named. `triage@1` keeps
+    `triage_verdict` and `implement@1` keeps `stage` and `session_ended`; naming either here,
+    or a spec loopctl does not hold, or a `result` its schema refuses, is `invalid_payload` and
+    writes nothing.
+
+    IDEMPOTENT PER DISPATCH, as `triage_verdict` is: a byte-identical resend is answered `ok`
+    with `replayed: true`, and a DIFFERENT result for the same dispatch is `already_recorded`,
+    permanently.
+
+    SESSION-AUTHORED AND UNTRUSTED: loopctl records `result` as data on the dispatch and never
+    executes it; nothing the session wrote reaches the audit log, which carries the spec's
+    registry id and version and the result's size only.
+    """
+
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerSpecRef
+
+    # The same budget as a triage verdict, for the same frame: a result arrives INBOUND over
+    # the 64 KB socket, and `RunnerTriageVerdict`'s arithmetic for that frame is the one that
+    # holds here. Measured under the byte rule on `result` alone; the envelope is small.
+    @max_result_bytes 48_000
+
+    @doc "The largest `result`, under the byte rule."
+    @spec max_result_bytes() :: pos_integer()
+    def max_result_bytes, do: @max_result_bytes
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerAgentResultMessage",
+        description:
+          "What a runner sends when a session of a spec reporting through `agent_result` is " <>
+            "finished (since 1.25.0). `spec` names the spec the dispatch was built from; " <>
+            "`result` is validated by loopctl against THAT spec's result schema, so its shape " <>
+            "is the spec's and not this message's. Refused `invalid_payload`, with nothing " <>
+            "written, when the spec is not one loopctl holds, when its archetype does not " <>
+            "report through this message (`triage` answers with `triage_verdict`, " <>
+            "`implement` with `stage` and `session_ended`), or when `result` fails the spec's " <>
+            "schema. At most #{@max_result_bytes} bytes of `result` under the byte rule " <>
+            "(`x-connection.limits.agent_result`). IDEMPOTENT PER DISPATCH: a byte-identical " <>
+            "resend is answered `ok` with `replayed: true`; a DIFFERENT result for the same " <>
+            "dispatch is refused `already_recorded`, permanently. SESSION-AUTHORED AND " <>
+            "UNTRUSTED: recorded as data, never executed.",
+        type: :object,
+        required: [:dispatch_id, :claim_epoch, :spec, :result],
+        properties: %{
+          dispatch_id: %Schema{type: :string, format: :uuid},
+          claim_epoch: %Schema{
+            type: :integer,
+            minimum: 0,
+            description: "The `claim_epoch` of the dispatch being answered, echoed."
+          },
+          spec: RunnerSpecRef.schema(),
+          result: %Schema{
+            type: :object,
+            additionalProperties: true,
+            description:
+              "The session's result object. Validated against the named spec's result " <>
+                "schema by loopctl; at most #{@max_result_bytes} bytes under the byte rule."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerAgentResultAck do
+    @moduledoc """
+    The reply to an `agent_result` (1.25.0). The same two fields as `RunnerTriageVerdictAck`,
+    for the same reason: `replayed` is how a runner tells a fresh record from a resend.
+    """
+
+    require OpenApiSpex
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerAgentResultAck",
+        description: "The reply to an accepted `agent_result`.",
+        type: :object,
+        required: [:recorded_at, :replayed],
+        properties: %{
+          recorded_at: %Schema{
+            type: :string,
+            format: :"date-time",
+            description:
+              "When the result was FIRST recorded — unchanged by a resend, so it dates the " <>
+                "original delivery rather than the latest one."
+          },
+          replayed: %Schema{
+            type: :boolean,
+            description:
+              "False on the delivery that recorded this result, true on any resend of it."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
@@ -2494,6 +2673,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerLensVerdict,
     RunnerTriageVerdictMessage,
     RunnerTriageVerdictAck,
+    RunnerSpecRef,
+    RunnerAgentResultMessage,
+    RunnerAgentResultAck,
     RunnerSessionEnded,
     RunnerSessionEndedAck,
     RunnerDispatch,
@@ -2587,6 +2769,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          already_recorded unknown_story_stage audit_chain_append_failed claim_epoch_mismatch
          wrong_dispatch_kind internal_error),
+    # Since 1.25.0. `invalid_payload` also covers the three refusals that are about the SPEC
+    # rather than the envelope — not one loopctl holds, an archetype that does not report
+    # through this message, a `result` the spec's schema refuses — each with a `details`
+    # entry saying which, and all permanent. `already_recorded` means what it means on
+    # `triage_verdict`. No `stale_claim_epoch` and no `stale_stage`: the dispatch claims
+    # nothing and the result moves no story, so its agreement with its own dispatch
+    # (`claim_epoch_mismatch`) is the whole fence.
+    "agent_result" =>
+      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted already_recorded
+         claim_epoch_mismatch wrong_dispatch_kind internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
@@ -2654,6 +2846,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "rate_limited" => ~w(min_interval_ms),
       "invalid_payload" => ~w(details)
     },
+    "agent_result" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details)
+    },
     "unknown_event" => %{}
   }
 
@@ -2664,7 +2860,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
   @inbound_events ~w(status dispatch_reply trace trace_cursor stage triage_verdict
-                     session_ended)
+                     session_ended agent_result)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -2691,6 +2887,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # rather than against a flood: a runner reconnecting after a deploy may have several
   # finished sessions to report at once, and each one refused is one it has to hold.
   @session_ended_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
+
+  # One result per session, like a verdict (1.25.0): sized against losing a run's output to a
+  # token bucket, not against a flood, and at the verdict's own size for that reason.
+  @agent_result_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
 
   # THE REFUSALS NO RESEND CAN CLEAR, published so a runner branches on the contract rather
   # than on a list it copied into its own source. Asked for by the `loopctl-runner`
@@ -2741,7 +2941,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "dispatch_reply" => ~w(unknown_dispatch stale_claim_epoch),
     "trace" => ~w(unknown_dispatch stale_claim_epoch),
     "stage" => ~w(unknown_dispatch stale_claim_epoch),
-    "triage_verdict" => ~w(unknown_dispatch)
+    "triage_verdict" => ~w(unknown_dispatch),
+    # 1.25.0: as `triage_verdict` — the dispatch is not this runner's, or gone.
+    "agent_result" => ~w(unknown_dispatch)
   }
 
   @claim_ending_remedy "The claim the refused message ran under is over: send that dispatch " <>
@@ -2864,6 +3066,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec session_ended_burst() :: %{String.t() => pos_integer()}
   def session_ended_burst, do: @session_ended_burst
+
+  @doc """
+  The `agent_result` bucket (1.25.0). See the note above `@agent_result_burst`.
+  """
+  @spec agent_result_burst() :: %{String.t() => pos_integer()}
+  def agent_result_burst, do: @agent_result_burst
 
   @doc """
   The refusal codes no resend can clear, per event (1.9.0).
@@ -3552,6 +3760,51 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
+  @doc """
+  Validates an `agent_result` ENVELOPE (1.25.0): `dispatch_id`, `claim_epoch`, `spec` and a
+  `result` object of at most `RunnerAgentResultMessage.max_result_bytes/0` under the byte rule,
+  with no NUL and no over-wide number at any depth. Returns the envelope with atom keys —
+  `spec` as `%{id:, version:}` — and `result` EXACTLY as sent, string keys and all.
+
+  The result's SHAPE is not checked here: it is the named spec's, and which spec that is, and
+  whether it may be named, is `Loopctl.Agents.AgentResult`'s call against loopctl's registry.
+  That module validates `result` with `cast_agent_result/2`.
+  """
+  @spec cast_agent_result_message(term()) :: {:ok, map()} | {:error, term()}
+  def cast_agent_result_message(payload) do
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerAgentResultMessage.schema()) do
+      message = known_fields(cast, RunnerAgentResultMessage.schema())
+      # The result as SENT, not as cast: an undeclared object is passed through by the cast
+      # anyway, and the spec's schema reads it from the runner's own keys.
+      message = %{message | result: Map.fetch!(payload, "result")}
+
+      if ByteRule.bytes(message.result) > RunnerAgentResultMessage.max_result_bytes(),
+        do:
+          {:error,
+           {:invalid,
+            [
+              "result exceeds #{RunnerAgentResultMessage.max_result_bytes()} bytes under the " <>
+                "byte rule"
+            ]}},
+        else: {:ok, message}
+    end
+  end
+
+  @doc """
+  Validates an `agent_result`'s `result` against a spec's `result_schema` (1.25.0). Returns
+  the declared fields only, with atom keys, or `{:error, {:invalid, messages}}`. The schema is
+  the SPEC's — a compiled agent spec's, never request data — so the same cast every
+  other inbound object goes through decides it.
+  """
+  @spec cast_agent_result(term(), Schema.t()) :: {:ok, map()} | {:error, term()}
+  def cast_agent_result(result, %Schema{type: :object} = schema) do
+    with :ok <- values_ok(result),
+         {:ok, cast} <- cast(result, schema) do
+      {:ok, known_fields(cast, schema)}
+    end
+  end
+
   @doc "Validates a `trace_cursor` payload. Returns `{:ok, %{run_id: run_id}}`."
   @spec cast_trace_cursor(term()) :: {:ok, map()} | {:error, term()}
   def cast_trace_cursor(payload) do
@@ -3678,6 +3931,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "stage" => "RunnerStageReport",
           "triage_verdict" => "RunnerTriageVerdictMessage",
           "session_ended" => "RunnerSessionEnded",
+          "agent_result" => "RunnerAgentResultMessage",
           "story" => "RunnerStory"
         },
         # The kinds loopctl will actually send. `RunnerDispatch.kind`'s enum is the
@@ -3693,7 +3947,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace" => "RunnerTraceAck",
           "trace_cursor" => "RunnerTraceAck",
           "triage_verdict" => "RunnerTriageVerdictAck",
-          "session_ended" => "RunnerSessionEndedAck"
+          "session_ended" => "RunnerSessionEndedAck",
+          "agent_result" => "RunnerAgentResultAck"
         },
         "errors" => @error_reasons,
         "limits" => %{
@@ -3709,6 +3964,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "dispatch_reply_burst" => @dispatch_reply_burst,
           "triage_verdict_burst" => @triage_verdict_burst,
           "session_ended_burst" => @session_ended_burst,
+          "agent_result_burst" => @agent_result_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
           # The clamp control applies to `RunnerUsage.resets_at` (since 1.17.0), in seconds from
@@ -3724,7 +3980,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           # The cap on the three `lens_verdicts` together (1.24.0). Enforced since 1.15.0 and
           # stated only in prose until now; the field maxima do not imply it once a string
           # holds characters outside the Basic Multilingual Plane.
-          "lens_verdicts" => %{"max_bytes" => RunnerLensVerdict.max_bytes()}
+          "lens_verdicts" => %{"max_bytes" => RunnerLensVerdict.max_bytes()},
+          # The cap on an `agent_result`'s `result` (1.25.0). Not a JSON Schema keyword, and
+          # the result's own shape is the spec's, so this is the one bound the wire publishes.
+          "agent_result" => %{"max_bytes" => RunnerAgentResultMessage.max_result_bytes()},
+          # The longest `RunnerSpecRef.id` (1.25.0), also published as its `maxLength`.
+          "spec_id_max_length" => RunnerSpecRef.max_id_length()
         },
         # The transition table a `stage` message is checked against, published so a runner
         # can refuse an impossible transition locally instead of learning it from a refusal.

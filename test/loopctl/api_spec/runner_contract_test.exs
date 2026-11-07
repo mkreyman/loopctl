@@ -39,7 +39,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "24021b5557a8608982e42bb66ab927b1721ffa37d384a41cfa8d8a01a11a4113"
+  @digest "5f5cc30bb5d6ed109a9aa4b016059bb67c2dc10253518e4adae4e15d3ee4c140"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -73,8 +73,23 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.24.0"
-      assert schema["x-contract-version"] == "1.24.0"
+      assert RunnerContract.version() == "1.25.0"
+      assert schema["x-contract-version"] == "1.25.0"
+
+      # 1.25.0 (US-48.8): the generic result message, its cap and burst, and the spec id bound.
+      assert connection["events"]["agent_result"] == "RunnerAgentResultMessage"
+
+      assert connection["limits"]["agent_result"] == %{
+               "max_bytes" => RunnerContract.RunnerAgentResultMessage.max_result_bytes()
+             }
+
+      assert connection["limits"]["agent_result_burst"] == RunnerContract.agent_result_burst()
+
+      assert connection["limits"]["spec_id_max_length"] ==
+               RunnerContract.RunnerSpecRef.max_id_length()
+
+      assert schema["$defs"]["RunnerJoin"]["properties"]["specs"]["items"] ==
+               schema["$defs"]["RunnerAgentResultMessage"]["properties"]["spec"]
 
       # 1.24.0: the cap on a message's three lens verdicts is published, from its declaration.
       assert connection["limits"]["lens_verdicts"] == %{
@@ -97,7 +112,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck",
                "triage_verdict" => "RunnerTriageVerdictAck",
-               "session_ended" => "RunnerSessionEndedAck"
+               "session_ended" => "RunnerSessionEndedAck",
+               "agent_result" => "RunnerAgentResultAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -1808,6 +1824,195 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     end
   end
 
+  describe "cast_join/1 specs (contract 1.25.0, AC-48.8.1)" do
+    test "absent, the join is the pre-1.25.0 one and carries no specs" do
+      assert {:ok, meta} = RunnerContract.cast_join(@join)
+      refute Map.has_key?(meta, :specs)
+    end
+
+    test "a list of {id, version} is carried with atom keys" do
+      specs = [%{"id" => "triage", "version" => 1}, %{"id" => "reply_draft", "version" => 2}]
+
+      assert {:ok, %{specs: [%{id: "triage", version: 1}, %{id: "reply_draft", version: 2}]}} =
+               RunnerContract.cast_join(Map.put(@join, "specs", specs))
+    end
+
+    test "every item is exactly {id, version}, both required" do
+      for bad <- [
+            %{"id" => "triage"},
+            %{"version" => 1},
+            %{"id" => "triage", "version" => 1, "extra" => true},
+            %{"id" => "Triage", "version" => 1},
+            %{"id" => "1triage", "version" => 1},
+            %{"id" => "tri-age", "version" => 1},
+            %{"id" => String.duplicate("a", 65), "version" => 1},
+            %{"id" => "triage", "version" => 0},
+            %{"id" => "triage", "version" => 1.5},
+            "triage@1"
+          ] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_join(Map.put(@join, "specs", [bad])),
+               inspect(bad)
+      end
+
+      assert {:ok, %{specs: [%{id: id}]}} =
+               RunnerContract.cast_join(
+                 Map.put(@join, "specs", [%{"id" => String.duplicate("a", 64), "version" => 1}])
+               )
+
+      assert byte_size(id) == RunnerContract.RunnerSpecRef.max_id_length()
+    end
+
+    test "at most 32 specs" do
+      specs = for n <- 1..33, do: %{"id" => "s#{n}", "version" => 1}
+
+      assert {:error, {:invalid, [_ | _]}} =
+               RunnerContract.cast_join(Map.put(@join, "specs", specs))
+
+      assert {:ok, %{specs: kept}} =
+               RunnerContract.cast_join(Map.put(@join, "specs", Enum.take(specs, 32)))
+
+      assert length(kept) == 32
+    end
+
+    test "the published shape is the one cast applies" do
+      join = RunnerContract.json_schema()["$defs"]["RunnerJoin"]
+      refute "specs" in join["required"]
+
+      assert %{
+               "type" => "array",
+               "maxItems" => 32,
+               "items" => %{
+                 "type" => "object",
+                 "required" => ["id", "version"],
+                 "additionalProperties" => false,
+                 "properties" => %{
+                   "id" => %{
+                     "type" => "string",
+                     "pattern" => "^[a-z][a-z0-9_]*$",
+                     "maxLength" => 64
+                   },
+                   "version" => %{"type" => "integer", "minimum" => 1}
+                 }
+               }
+             } = join["properties"]["specs"]
+    end
+  end
+
+  describe "cast_agent_result_message/1 (contract 1.25.0, AC-48.8.2)" do
+    defp agent_result_msg(attrs) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "claim_epoch" => 3,
+          "spec" => %{"id" => "reply_draft", "version" => 1},
+          "result" => %{"reply" => "thanks", "nested" => %{"k" => [1, 2]}}
+        },
+        attrs
+      )
+    end
+
+    test "admits the envelope and carries the result VERBATIM for the spec's own schema" do
+      payload = agent_result_msg(%{"undeclared" => "dropped"})
+
+      assert {:ok, message} = RunnerContract.cast_agent_result_message(payload)
+
+      assert message == %{
+               dispatch_id: payload["dispatch_id"],
+               claim_epoch: 3,
+               spec: %{id: "reply_draft", version: 1},
+               result: %{"reply" => "thanks", "nested" => %{"k" => [1, 2]}}
+             }
+    end
+
+    test "every field is required, and result must be an object" do
+      for key <- ~w(dispatch_id claim_epoch spec result) do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_agent_result_message(Map.delete(agent_result_msg(%{}), key)),
+               key
+      end
+
+      for bad <- ["text", [1], 3, nil] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => bad})),
+               inspect(bad)
+      end
+    end
+
+    test "the spec reference has the join's shape" do
+      for bad <- [%{"id" => "Reply", "version" => 1}, %{"id" => "reply", "version" => 0}] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_agent_result_message(agent_result_msg(%{"spec" => bad}))
+      end
+    end
+
+    test "a result over the byte cap is refused, one at the cap is not" do
+      cap = RunnerContract.RunnerAgentResultMessage.max_result_bytes()
+      overhead = ByteRule.bytes(%{"reply" => ""})
+      per_char = ByteRule.constants()["per_string_char"]
+      fits = div(cap - overhead, per_char)
+
+      at_cap = %{"reply" => String.duplicate("a", fits)}
+      assert ByteRule.bytes(at_cap) <= cap
+
+      assert {:ok, _} =
+               RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => at_cap}))
+
+      over = %{"reply" => String.duplicate("a", fits + 1)}
+      assert ByteRule.bytes(over) > cap
+
+      assert {:error, {:invalid, [message]}} =
+               RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => over}))
+
+      assert message =~ "#{cap} bytes"
+    end
+
+    test "a NUL or an over-wide number anywhere in the result is refused" do
+      for bad <- [
+            %{"reply" => "a\u0000b"},
+            %{"a\u0000" => "b"},
+            %{"deep" => [%{"n" => Integer.pow(10, ByteRule.max_number_digits())}]}
+          ] do
+        assert {:error, {:invalid, [_]}} =
+                 RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => bad}))
+      end
+    end
+
+    test "cast_agent_result/2 applies a spec's schema and keeps only what it declares" do
+      schema = %OpenApiSpex.Schema{
+        type: :object,
+        required: [:reply],
+        properties: %{reply: %OpenApiSpex.Schema{type: :string, maxLength: 5}}
+      }
+
+      assert {:ok, %{reply: "hi"}} =
+               RunnerContract.cast_agent_result(%{"reply" => "hi", "x" => 1}, schema)
+
+      assert {:error, {:invalid, [_ | _]}} =
+               RunnerContract.cast_agent_result(%{"reply" => "toolong"}, schema)
+
+      assert {:error, {:invalid, [_ | _]}} = RunnerContract.cast_agent_result(%{}, schema)
+
+      assert {:error, {:invalid, [_]}} =
+               RunnerContract.cast_agent_result(%{"reply" => "a\u0000"}, schema)
+    end
+
+    test "is published as an event with a declared reply, refusals and a bucket" do
+      connection = RunnerContract.json_schema()["x-connection"]
+
+      assert "agent_result" in RunnerContract.inbound_events()
+
+      for code <- ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted
+                     already_recorded claim_epoch_mismatch wrong_dispatch_kind internal_error) do
+        assert code in connection["errors"]["agent_result"], code
+      end
+
+      assert RunnerContract.permanent_error?("agent_result", "already_recorded")
+      assert RunnerContract.permanent_error?("agent_result", "invalid_payload")
+      refute RunnerContract.permanent_error?("agent_result", "rate_limited")
+    end
+  end
+
   describe "the triage verdict message (1.9.0)" do
     defp verdict_msg(attrs) do
       Map.merge(
@@ -2598,7 +2803,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "dispatch_reply" => live_or_gone,
                "trace" => live_or_gone,
                "stage" => live_or_gone,
-               "triage_verdict" => ~w(unknown_dispatch)
+               "triage_verdict" => ~w(unknown_dispatch),
+               "agent_result" => ~w(unknown_dispatch)
              }
     end
 

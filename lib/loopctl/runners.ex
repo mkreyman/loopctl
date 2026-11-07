@@ -97,6 +97,7 @@ defmodule Loopctl.Runners do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.Agents.Registry, as: AgentSpecs
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.AuditChain
@@ -994,6 +995,9 @@ defmodule Loopctl.Runners do
       kind in suppressed_kinds(meta) ->
         {:error, :kind_not_supported}
 
+      not holds_spec_for?(meta, kind) ->
+        {:error, :kind_not_supported}
+
       source == :declared ->
         :ok
 
@@ -1003,6 +1007,46 @@ defmodule Loopctl.Runners do
       true ->
         :ok
     end
+  end
+
+  # The spec loopctl would run under `kind` must be one the runner HOLDS (contract 1.25.0,
+  # US-48.8). Decided from the registry entry for the kind, never from the runner's list: a
+  # declared spec loopctl does not hold makes nothing eligible, and a kind with no registry
+  # entry is refused rather than sent to a machine that cannot say it holds its spec.
+  defp holds_spec_for?(meta, kind) do
+    case AgentSpecs.for_kind(kind) do
+      {:ok, spec} -> %{id: spec.id, version: spec.version} in declared_specs(meta)
+      {:error, :unknown_kind} -> false
+    end
+  end
+
+  @doc """
+  The agent specs a runner's join meta says it holds, as `%{id, version}` maps
+  (`RunnerJoin.specs`, contract 1.25.0).
+
+  A runner that sent no `specs` — every runner older than 1.25.0 — is read as holding VERSION
+  1 of the spec for each kind it declares (or, declaring no kinds, for each kind silence
+  implies), because version 1 is what every such runner was built against. That keeps an old
+  runner's eligibility exactly what it was. A runner that sent a list is held to it: a spec it
+  does not name is a spec it cannot run, so the kind that spec serves is not dispatched to it.
+
+  Like `declared_kinds/1`, read live at the decision from the meta and stored nowhere else.
+  An empty list reads as absence: `cast_join/1` admits `[]`, and it states nothing.
+  """
+  @spec declared_specs(map()) :: [%{id: String.t(), version: pos_integer()}]
+  def declared_specs(%{specs: [_ | _] = specs}) do
+    for %{id: id, version: version} <- specs,
+        is_binary(id) and is_integer(version),
+        do: %{id: id, version: version}
+  end
+
+  def declared_specs(meta) when is_map(meta) do
+    {_source, kinds} = declared_kinds(meta)
+
+    for kind <- kinds,
+        {:ok, spec} <- [AgentSpecs.for_kind(kind)],
+        spec.version == 1,
+        do: %{id: spec.id, version: 1}
   end
 
   @doc """

@@ -14,6 +14,8 @@ defmodule Loopctl.Fixtures do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.Agents.Spec, as: AgentSpec
+  alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.ReviewRecord
@@ -129,6 +131,37 @@ defmodule Loopctl.Fixtures do
   end
 
   # A conforming runner join payload; `attrs` (string keys, "machine" among them) override.
+  # US-48.8: a TEST-ONLY `:draft` spec that reports through the generic `agent_result`
+  # message. No production spec does yet (US-48.9 adds `reply_draft@1`), so the agent_result
+  # path is exercised with this one, injected through `Loopctl.Agents.AgentResult.apply/4`'s
+  # `:specs` option — never added to `Loopctl.Agents.Registry`. Built from `triage@1`'s fields
+  # (its kind, candidates and control-only routes are all a `:draft` may name), validated by
+  # the same `Spec.new!/2` a spec module compiles through.
+  def build(:agent_result_spec, attrs) do
+    schema = %OpenApiSpex.Schema{
+      type: :object,
+      required: [:reply],
+      additionalProperties: false,
+      properties: %{
+        reply: %OpenApiSpex.Schema{type: :string, maxLength: 200},
+        tone: %OpenApiSpex.Schema{type: :string, enum: ["plain", "warm"]}
+      }
+    }
+
+    TriageV1.spec()
+    |> Map.from_struct()
+    |> Map.merge(%{
+      id: "echo_draft",
+      archetype: :draft,
+      effects: [],
+      result: ["agent_result"],
+      result_schema: schema
+    })
+    |> Map.merge(Enum.into(attrs, %{}))
+    |> Enum.to_list()
+    |> AgentSpec.new!(__ENV__)
+  end
+
   def build(:runner_join_payload, attrs) do
     Map.merge(
       %{

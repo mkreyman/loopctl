@@ -8530,6 +8530,11 @@ const TOOLS = [
       "no_conforming_branch, and when a machine refuses dispatches with branch_not_allowed — a " +
       "runner that ENFORCES a prefix and declares none shows [] here, which is that " +
       "misconfiguration made visible. Per-CONNECTION, like kinds. " +
+      "specs (runner contract 1.25.0) is the agent specs the machine declared it holds, as " +
+      "{id, version}, or null when it declared none, which loopctl reads as version 1 of the " +
+      "spec of each kind in kinds. A kind is sent only to a machine holding the spec loopctl " +
+      "runs it under, so a machine whose kinds names a kind it is never sent is explained " +
+      "here: it lists that spec at another version, or not at all. Per-CONNECTION, like kinds. " +
       "usage_exhausted_until (runner contract 1.17.0) is until when the machine's SUBSCRIPTION " +
       "is exhausted, or null: while it is in the future nothing is placed on the machine and " +
       "place_dispatch refuses 409 runner_exhausted. It is the EFFECTIVE value — the latest of " +

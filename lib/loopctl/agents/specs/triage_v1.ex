@@ -53,6 +53,8 @@ defmodule Loopctl.Agents.Specs.TriageV1 do
     advance_on: [],
     budgets: {:triage_wall_clock_seconds, :triage_max_turns},
     result: ["triage_verdict"],
+    # A `:judge` answers with its own verdict message, never the generic `agent_result`.
+    result_schema: nil,
     screens: %{
       payload_too_large: [
         {:detected, :triaged, :forward},

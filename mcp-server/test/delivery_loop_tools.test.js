@@ -592,6 +592,13 @@ describe("the wiring in index.js", () => {
       assert.match(pool, /1\.14\.0/);
     });
 
+    test("runner_pool's row and description name specs (contract 1.25.0)", () => {
+      const pool = row("runner_pool");
+
+      assert.match(pool, /`specs` \(runner contract 1\.25\.0\)/);
+      assert.match(stripComments(INDEX_SRC), /"specs \(runner contract 1\.25\.0\) is the agent specs/);
+    });
+
     test("place_dispatch's row says to omit branch, and names all three refusals", () => {
       const place = row("place_dispatch");
 

@@ -1,5 +1,70 @@
 {
   "$defs": {
+    "RunnerAgentResultAck": {
+      "description": "The reply to an accepted `agent_result`.",
+      "properties": {
+        "recorded_at": {
+          "description": "When the result was FIRST recorded — unchanged by a resend, so it dates the original delivery rather than the latest one.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "replayed": {
+          "description": "False on the delivery that recorded this result, true on any resend of it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded_at",
+        "replayed"
+      ],
+      "type": "object"
+    },
+    "RunnerAgentResultMessage": {
+      "description": "What a runner sends when a session of a spec reporting through `agent_result` is finished (since 1.25.0). `spec` names the spec the dispatch was built from; `result` is validated by loopctl against THAT spec's result schema, so its shape is the spec's and not this message's. Refused `invalid_payload`, with nothing written, when the spec is not one loopctl holds, when its archetype does not report through this message (`triage` answers with `triage_verdict`, `implement` with `stage` and `session_ended`), or when `result` fails the spec's schema. At most 48000 bytes of `result` under the byte rule (`x-connection.limits.agent_result`). IDEMPOTENT PER DISPATCH: a byte-identical resend is answered `ok` with `replayed: true`; a DIFFERENT result for the same dispatch is refused `already_recorded`, permanently. SESSION-AUTHORED AND UNTRUSTED: recorded as data, never executed.",
+      "properties": {
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch being answered, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "result": {
+          "additionalProperties": true,
+          "description": "The session's result object. Validated against the named spec's result schema by loopctl; at most 48000 bytes under the byte rule.",
+          "type": "object"
+        },
+        "spec": {
+          "additionalProperties": false,
+          "description": "One agent spec, named by `{id, version}` (since 1.25.0): the key loopctl's spec registry and the runner's template registry share.",
+          "properties": {
+            "id": {
+              "maxLength": 64,
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "type": "string"
+            },
+            "version": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "spec",
+        "result"
+      ],
+      "type": "object"
+    },
     "RunnerDisconnecting": {
       "description": "Pushed as `disconnecting` on the runner's topic immediately before loopctl closes the runner's connection itself. `runner_revoked` and `no_longer_authorized` mean the credential no longer works: do not reconnect until re-enrolled. `server_shutdown` means the node is stopping: reconnect. `join_refused_not_authorized` arrives as the `disconnecting` field of a refused join's error reply, because an unjoined topic cannot carry a push.",
       "properties": {
@@ -345,6 +410,31 @@
             "free_disk_mb"
           ],
           "type": "object"
+        },
+        "specs": {
+          "description": "The agent spec templates this machine holds, as `{id, version}` (since 1.25.0). loopctl sends a dispatch of a kind only to a runner holding the spec it builds that kind's dispatch from — the kind must ALSO be in `kinds`. Omitting it, or sending an EMPTY array, is read as holding each declared kind (or `implied_kinds`) at version 1, which is what every runner built before this field holds, so an un-upgraded runner is unaffected. A spec this server does not hold is IGNORED, not refused, so a runner upgraded ahead of loopctl still connects; a declaration naming only specs this server does not hold for a kind leaves that kind unsendable to the machine. At most 32 entries. Per-CONNECTION, so declare it on EVERY join.",
+          "items": {
+            "additionalProperties": false,
+            "description": "One agent spec, named by `{id, version}` (since 1.25.0): the key loopctl's spec registry and the runner's template registry share.",
+            "properties": {
+              "id": {
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$",
+                "type": "string"
+              },
+              "version": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "id",
+              "version"
+            ],
+            "type": "object"
+          },
+          "maxItems": 32,
+          "type": "array"
         }
       },
       "required": [
@@ -560,6 +650,26 @@
       },
       "required": [
         "replayed"
+      ],
+      "type": "object"
+    },
+    "RunnerSpecRef": {
+      "additionalProperties": false,
+      "description": "One agent spec, named by `{id, version}` (since 1.25.0): the key loopctl's spec registry and the runner's template registry share.",
+      "properties": {
+        "id": {
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "version"
       ],
       "type": "object"
     },
@@ -1486,6 +1596,9 @@
   "title": "loopctl runner contract",
   "x-connection": {
     "claim_ending_errors": {
+      "agent_result": [
+        "unknown_dispatch"
+      ],
       "dispatch_reply": [
         "unknown_dispatch",
         "stale_claim_epoch"
@@ -1509,6 +1622,20 @@
       "implement"
     ],
     "error_fields": {
+      "agent_result": {
+        "already_recorded": [],
+        "claim_epoch_mismatch": [],
+        "dispatch_not_accepted": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "unknown_dispatch": [],
+        "wrong_dispatch_kind": []
+      },
       "dispatch_reply": {
         "already_replied": [],
         "claim_epoch_mismatch": [],
@@ -1650,6 +1777,16 @@
       }
     },
     "errors": {
+      "agent_result": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "dispatch_not_accepted",
+        "already_recorded",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
+        "internal_error"
+      ],
       "dispatch_reply": [
         "rate_limited",
         "invalid_payload",
@@ -1736,6 +1873,7 @@
       ]
     },
     "events": {
+      "agent_result": "RunnerAgentResultMessage",
       "disconnecting": "RunnerDisconnecting",
       "dispatch": "RunnerDispatch",
       "dispatch_reply": "RunnerDispatchReply",
@@ -1753,6 +1891,13 @@
       "implement"
     ],
     "limits": {
+      "agent_result": {
+        "max_bytes": 48000
+      },
+      "agent_result_burst": {
+        "capacity": 4,
+        "refill_interval_ms": 1000
+      },
       "dispatch_reply_burst": {
         "capacity": 8,
         "refill_interval_ms": 250
@@ -1780,6 +1925,7 @@
         "capacity": 4,
         "refill_interval_ms": 1000
       },
+      "spec_id_max_length": 64,
       "stage_burst": {
         "capacity": 12,
         "refill_interval_ms": 250
@@ -1924,6 +2070,7 @@
       ]
     },
     "replies": {
+      "agent_result": "RunnerAgentResultAck",
       "session_ended": "RunnerSessionEndedAck",
       "trace": "RunnerTraceAck",
       "trace_cursor": "RunnerTraceAck",
@@ -2033,5 +2180,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.24.0"
+  "x-contract-version": "1.25.0"
 }

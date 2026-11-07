@@ -66,6 +66,17 @@ All notable changes to loopctl are documented here.
   rest stay `detected` and use no runner. A format filter, not authentication: anyone who can
   open an issue can type the format. Set it with `POST`/`PATCH /api/v1/intake/sources` or the
   `intake_source_enroll` / `intake_source_update` tools; anything but a JSON boolean is a 422.
+- **Runner contract 1.25.0: runners declare the agent specs they hold, and `:draft` results
+  come back through one `agent_result` message (US-48.8).** `RunnerJoin.specs` is an optional
+  list of `{id, version}` (at most 32). A kind is dispatched only to a runner holding the spec
+  loopctl runs it under; a runner sending no `specs` is read as holding version 1 of each
+  declared kind's spec, so every runner already deployed is eligible exactly as before.
+  `GET /api/v1/runners/pool` returns the declaration as `specs` (null when none), and
+  loopctl-mcp-server 3.6.1's `runner_pool` describes it. Migration
+  `20261107120000_add_runner_dispatches_agent_result` adds four nullable columns to
+  `runner_dispatches` (no backfill, no manual step) where a validated result is recorded once
+  per dispatch. No production spec reports through `agent_result` yet, so every one is refused
+  `invalid_payload` today. Minor: re-vendor to declare `specs`.
 - **Runner contract 1.24.0** publishes `x-connection.limits.lens_verdicts.max_bytes`, the cap
   on a triage verdict's three lens verdicts together. Minor: a runner should re-vendor to read
   the cap rather than hard-code it.

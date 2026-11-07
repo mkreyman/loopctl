@@ -112,6 +112,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
   require Logger
 
+  alias Loopctl.Agents.AgentResult
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.Delivery.RunnerStages
@@ -139,6 +140,9 @@ defmodule LoopctlWeb.RunnerChannel do
   @session_ended_capacity RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
   @session_ended_refill_ms RunnerContract.session_ended_burst()
                            |> Map.fetch!("refill_interval_ms")
+  @agent_result_capacity RunnerContract.agent_result_burst() |> Map.fetch!("capacity")
+  @agent_result_refill_ms RunnerContract.agent_result_burst()
+                          |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -178,6 +182,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:stage_bucket, :full)
        |> assign(:verdict_bucket, :full)
        |> assign(:session_ended_bucket, :full)
+       |> assign(:agent_result_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -421,6 +426,30 @@ defmodule LoopctlWeb.RunnerChannel do
       fn message ->
         with {:ok, held} <- RunnerStages.held_dispatch(tenant_id, runner.id, message.dispatch_id),
              do: end_session(tenant_id, runner, message, held)
+      end
+    )
+  end
+
+  # What a `:draft` session produced (contract 1.25.0, US-48.8): the ONE generic result
+  # message, validated against the named spec's own `result_schema`. `triage_verdict` and
+  # `session_ended` stay, because their results move custody edges a schema cannot judge;
+  # `AgentResult.apply/4` refuses any spec that does not report through this message.
+  #
+  # The tenant and the runner are this socket's assigns, never the payload's. IDEMPOTENT for
+  # the reason `triage_verdict` is: the session that wrote the result has stopped, so a
+  # runner's only move after a transient refusal is to resend the same bytes.
+  defp handle_message("agent_result", payload, socket) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    bucketed(
+      socket,
+      "agent_result",
+      RunnerContract.cast_agent_result_message(payload),
+      {:agent_result_bucket, @agent_result_capacity, @agent_result_refill_ms},
+      fn message ->
+        with {:ok, %{record: record, replayed?: replayed?}} <-
+               AgentResult.apply(tenant_id, runner.id, message),
+             do: {:ok, %{recorded_at: record.agent_result_at, replayed: replayed?}}
       end
     )
   end

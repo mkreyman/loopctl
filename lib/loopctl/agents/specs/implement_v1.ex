@@ -63,6 +63,8 @@ defmodule Loopctl.Agents.Specs.ImplementV1 do
     advance_on: [:runner_exhausted, :no_conforming_branch],
     budgets: {:dispatch_wall_clock_seconds, :dispatch_max_turns},
     result: ["stage", "session_ended"],
+    # A `:build` answers with `stage` and `session_ended`, never the generic `agent_result`.
+    result_schema: nil,
     screens: %{
       story_not_dispatchable: [{:claimed, :escalated, :session_escalated}]
     },

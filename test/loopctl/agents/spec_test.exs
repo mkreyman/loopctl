@@ -11,6 +11,8 @@ defmodule Loopctl.Agents.SpecTest do
 
   use ExUnit.Case, async: true
 
+  import Loopctl.Fixtures
+
   alias Loopctl.Agents.Spec
   alias Loopctl.Agents.Specs.ImplementV1
   alias Loopctl.Agents.Specs.TriageV1
@@ -271,6 +273,73 @@ defmodule Loopctl.Agents.SpecTest do
     test "a duplicated field fails to compile" do
       message = (fields(TriageV1) ++ [rerun: :next_pass]) |> refused()
       assert message =~ "duplicated field(s) [:rerun]"
+    end
+  end
+
+  # US-48.8 (AC-48.8.2): which specs answer through the generic `agent_result` message, and
+  # what they must declare to do so.
+  describe "the agent_result rule" do
+    defp draft_fields, do: build(:agent_result_spec, %{}) |> Map.from_struct() |> Enum.to_list()
+
+    test "a :draft spec with a result schema compiles and reports through agent_result" do
+      spec = compile(draft_fields()).spec()
+
+      assert spec.archetype == :draft
+      assert spec.result == ["agent_result"]
+      assert %OpenApiSpex.Schema{type: :object} = spec.result_schema
+      assert Spec.reports_agent_result?(spec)
+    end
+
+    test "triage@1 and implement@1 carry no result schema and do not report through it" do
+      for module <- [TriageV1, ImplementV1] do
+        assert module.spec().result_schema == nil
+        refute Spec.reports_agent_result?(module.spec())
+      end
+    end
+
+    test "a :judge spec naming agent_result fails to compile" do
+      message =
+        TriageV1
+        |> fields()
+        |> put(:result, ["agent_result"])
+        |> put(:result_schema, build(:agent_result_spec, %{}).result_schema)
+        |> refused()
+
+      assert message =~ "archetype :judge"
+      assert message =~ "agent_result"
+    end
+
+    test "a :build spec naming agent_result fails to compile" do
+      message =
+        ImplementV1
+        |> fields()
+        |> put(:result, ["stage", "agent_result"])
+        |> put(:result_schema, build(:agent_result_spec, %{}).result_schema)
+        |> refused()
+
+      assert message =~ "archetype :build"
+    end
+
+    test "agent_result with no result schema fails to compile" do
+      message = draft_fields() |> put(:result_schema, nil) |> refused()
+      assert message =~ "result_schema"
+    end
+
+    test "a result schema on a spec that does not name agent_result fails to compile" do
+      message =
+        TriageV1
+        |> fields()
+        |> put(:result_schema, build(:agent_result_spec, %{}).result_schema)
+        |> refused()
+
+      assert message =~ "result_schema"
+    end
+
+    test "a result schema that is not an object schema fails to compile" do
+      message =
+        draft_fields() |> put(:result_schema, %OpenApiSpex.Schema{type: :string}) |> refused()
+
+      assert message =~ "result_schema"
     end
   end
 

@@ -851,6 +851,80 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
+  @doc """
+  Records the result a `:draft` session reported through `agent_result` (contract 1.25.0,
+  US-48.8) on its dispatch's ledger row, as `runner_id` in `tenant_id`, EXACTLY ONCE.
+
+  `message` is the cast envelope (`dispatch_id`, `claim_epoch`); `attrs` is what
+  `Loopctl.Agents.AgentResult` derived from loopctl's own registry and the validated result:
+  `kind` (the spec's dispatch kind), `spec` (`"<id>@<version>"`), `result` and `digest`.
+
+  Under the dispatch row's lock, in order:
+
+  - a row carrying a result already: the SAME digest is `:replayed` whatever has happened to
+    the row's status since, and a DIFFERENT one is `:already_recorded` — the session cannot
+    restate its result, so the two sides disagree and no resend settles it;
+  - the row is this runner's in this tenant (`:unknown_dispatch` otherwise, whoever else's it
+    is), of the spec's kind (`:wrong_dispatch_kind`), at the message's own epoch
+    (`:claim_epoch_mismatch`), and ACCEPTED (`:dispatch_not_accepted` — no session ran).
+
+  Nothing is fenced on the story's claim epoch: a `:draft` dispatch claims nothing and this
+  write moves no story, so the message's agreement with its own dispatch is the whole check.
+  A value Postgres refuses is `:rejected_by_database` and a lock that could not be had is
+  `:capacity_busy`, as for a reply.
+  """
+  @spec record_agent_result(Ecto.UUID.t(), Ecto.UUID.t(), map(), map()) ::
+          {:ok, {:recorded | :replayed, DispatchRecord.t()}}
+          | {:error,
+             :unknown_dispatch
+             | :wrong_dispatch_kind
+             | :claim_epoch_mismatch
+             | :dispatch_not_accepted
+             | :already_recorded
+             | :rejected_by_database
+             | :capacity_busy}
+  def record_agent_result(tenant_id, runner_id, message, attrs) do
+    context = %{operation: :record_agent_result, dispatch_id: message.dispatch_id, run_id: nil}
+
+    runner_write(tenant_id, runner_id, context, [], fn ->
+      with {:ok, record} <- held(tenant_id, runner_id, message.dispatch_id, lock: true) do
+        agent_result(record, message, attrs)
+      end
+    end)
+    |> flatten()
+  end
+
+  # Each clause returns its result BARE, as `session_end/4`'s do.
+  defp agent_result(%DispatchRecord{agent_result_digest: digest} = record, _message, attrs)
+       when is_binary(digest) do
+    if digest == attrs.digest,
+      do: {:replayed, record},
+      else: {:error, :already_recorded}
+  end
+
+  defp agent_result(%DispatchRecord{} = record, message, attrs) do
+    with :ok <- kind_is(record, attrs.kind),
+         :ok <- own_epoch(record, message.claim_epoch),
+         :ok <- accepted(record) do
+      record
+      |> Ecto.Changeset.change(
+        agent_result: attrs.result,
+        agent_result_spec: attrs.spec,
+        agent_result_digest: attrs.digest,
+        agent_result_at: DateTime.utc_now()
+      )
+      |> Repo.update!()
+      |> then(&{:recorded, &1})
+    end
+  end
+
+  defp kind_is(%DispatchRecord{kind: kind}, wanted) do
+    if kind_answers?(kind, wanted), do: :ok, else: {:error, :wrong_dispatch_kind}
+  end
+
+  defp own_epoch(%DispatchRecord{claim_epoch: epoch}, epoch), do: :ok
+  defp own_epoch(%DispatchRecord{}, _epoch), do: {:error, :claim_epoch_mismatch}
+
   defp implement_dispatch(%DispatchRecord{kind: kind}) do
     if Spec.holds_claim?(kind), do: :ok, else: {:error, :wrong_dispatch_kind}
   end

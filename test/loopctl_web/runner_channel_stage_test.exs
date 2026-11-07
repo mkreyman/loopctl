@@ -681,4 +681,94 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert tokens == capacity - 1
     end
   end
+
+  describe "agent_result (US-48.8, contract 1.25.0)" do
+    # The mechanism — the spec lookup, the schema, the ledger write, the audit row — is covered
+    # without a socket in `Loopctl.Agents.AgentResultTest`, which injects a `:draft` spec. What
+    # is here is the WIRING with the PRODUCTION registry, which holds no spec that reports
+    # through this message: every result is refused before anything is written, and the
+    # refusal reaches the wire as the contract's published code.
+    defp agent_result(dispatch_id, spec, result),
+      do: stage_message(dispatch_id, %{"spec" => spec, "result" => result})
+
+    defp nothing_recorded!(tenant_id, dispatch_id) do
+      record = DispatchLedger.get_record(tenant_id, dispatch_id)
+      assert record.agent_result == nil
+      assert record.agent_result_spec == nil
+      assert record.agent_result_digest == nil
+      assert record.agent_result_at == nil
+    end
+
+    defp spec(id, version), do: %{"id" => id, "version" => version}
+
+    test "a spec loopctl does not hold is refused invalid_payload and records nothing", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      ref = push(channel, "agent_result", agent_result(dispatch_id, spec("reply_draft", 1), %{}))
+
+      assert_reply ref,
+                   :error,
+                   %{reason: "invalid_payload", details: ["spec is not one loopctl holds"]},
+                   reply_timeout()
+
+      nothing_recorded!(runner.tenant_id, dispatch_id)
+    end
+
+    test "triage@1 and implement@1 keep their own messages, so agent_result refuses them",
+         ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      for spec <- [spec("triage", 1), spec("implement", 1)] do
+        ref = push(channel, "agent_result", agent_result(dispatch_id, spec, %{"x" => 1}))
+
+        assert_reply ref,
+                     :error,
+                     %{
+                       reason: "invalid_payload",
+                       details: ["spec does not report through agent_result"]
+                     },
+                     reply_timeout()
+      end
+
+      nothing_recorded!(runner.tenant_id, dispatch_id)
+    end
+
+    test "a malformed envelope is refused at the cast and spends nothing of the bucket", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+      cap = RunnerContract.RunnerAgentResultMessage.max_result_bytes()
+
+      for payload <- [
+            Map.delete(agent_result(dispatch_id, spec("reply_draft", 1), %{}), "result"),
+            agent_result(dispatch_id, spec("reply_draft", 1), "text"),
+            agent_result(dispatch_id, spec("Reply", 1), %{}),
+            agent_result(dispatch_id, spec("reply_draft", 1), %{"r" => "a\u0000"}),
+            agent_result(dispatch_id, spec("reply_draft", 1), %{
+              "r" => String.duplicate("a", cap)
+            })
+          ] do
+        ref = push(channel, "agent_result", payload)
+        assert_reply ref, :error, %{reason: "invalid_payload", details: [_ | _]}, reply_timeout()
+      end
+
+      assert :sys.get_state(channel.channel_pid).assigns.agent_result_bucket == :full
+      nothing_recorded!(runner.tenant_id, dispatch_id)
+    end
+
+    test "is metered by its own published bucket", ctx do
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+      %{"capacity" => capacity} = RunnerContract.agent_result_burst()
+      payload = agent_result(dispatch_id, spec("reply_draft", 1), %{})
+
+      for _ <- 1..capacity do
+        ref = push(channel, "agent_result", payload)
+        assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
+      end
+
+      ref = push(channel, "agent_result", payload)
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: _}, reply_timeout()
+
+      # Its own bucket: the stage bucket is untouched.
+      assert :sys.get_state(channel.channel_pid).assigns.stage_bucket == :full
+    end
+  end
 end
