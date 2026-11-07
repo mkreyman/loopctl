@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.11.0 — 2026-11-07 (the stuck-story playbook)
+
+### Added
+
+- **`stuck_story` prompt**, the server's first MCP prompt: in Claude Code it is
+  `/mcp__loopctl__stuck_story [story_id]`. It has the session diagnose an escalated story and
+  recommend retry, re-triage, take-over or close, with the whole runbook attached.
+- **`escalation_playbook`** returns the same runbook as a tool (whole, or one `reason_class`).
+  Local: sends nothing.
+- **`escalation_list` carries remedies**: the page's `remedies` holds, once per class present,
+  what the class means and which `resolve_escalation` target fits; each row's `remedy` adds a
+  warning when the change already merged and where to find the runner's unpushed commits when
+  it left some.
+
 ## 3.10.1 — 2026-11-07
 
 ### Fixed
