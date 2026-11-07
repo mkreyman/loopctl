@@ -33,6 +33,10 @@
     {
       "id": "AC-49.6.5",
       "description": "Raising a spec's live version is a merged change to the registry, never an API call, so the spec_tuner (which writes no template and opens no PR) still cannot promote its own draft."
+    },
+    {
+      "id": "AC-49.6.6",
+      "description": "A spec_tune dispatch whose target spec's version differs from the template it names (e.g. target triage@3, template triage@1) loads its eval set and returns a result. Today the runner's SpecTune.prepare/2 loads the set keyed by the target's id@version while Eval.Case requires each case's spec@version to name a template the runner holds, so that set can never load and the tuning run ends without a result (found in the round-2 review of mkreyman/loopctl-runner#91). Key eval sets by template, or let a case name the target spec independently of its template; either way one rule, held by a runner test."
     }
   ],
   "test_cases": [
@@ -80,6 +84,17 @@
       ],
       "expected_results": [
         "each tenant's ledger and outcome rows carry only its own dispatch's spec"
+      ]
+    },
+    {
+      "id": "TC-49.6.5",
+      "name": "a tuning run whose target outran its template still scores",
+      "type": "integration",
+      "steps": [
+        "runner holds template triage@1 and an eval set for it; a spec_tune dispatch targets triage@3 naming template triage@1"
+      ],
+      "expected_results": [
+        "the eval set loads and the run returns an agent_result with per-case scores"
       ]
     }
   ],
