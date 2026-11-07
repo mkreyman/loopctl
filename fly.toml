@@ -72,18 +72,19 @@ kill_timeout = 90
 
   # THE BUDGETS ARE A COST POLICY, not a timeout, and they have no defaults on purpose
   # (config/runtime.exs:177) — a default would be our guess quietly becoming Mark's
-  # spend. Calibrated against the ONE measured unattended run (2026-09-14, one story):
-  # 28.8 minutes, 108 turns, about USD 10.40. Both implement numbers are ~2x that, so a
-  # typical run finishes well inside them and a runaway is capped near an hour rather
-  # than a day. Expect roughly USD 10-20 per implement run at these figures; lower them
-  # to cap harder, raise them only with a measured run that needed it.
-  # Raised to 7200 on 2026-11-07 from that measured run: the first pr-route implement on
-  # home_care_billing (story ddb4fcc1, HCB #3922) committed its fix in 21 minutes, then spent
-  # the rest of the hour on HCB's pre-push gate and was killed at 3600 s mid-push, before its
-  # PR existed. A pr-route run also carries the review, CI (~10 min) and merge. At ~USD 10 per
-  # 30 minutes this caps a runaway near USD 40. Mark's to lower.
+  # spend. Lower them to cap harder; raise them only with a measured run that needed it.
+  # Two measured runs set them:
+  #  - 2026-09-14, one story, no PR route: 28.8 minutes, 108 turns (~3.75 a minute), about
+  #    USD 10.40. That set 3600 s / 200 turns, ~2x the run.
+  #  - 2026-11-07, the first pr-route run on home_care_billing (story ddb4fcc1, HCB #3922):
+  #    the fix was committed in 21 minutes, then the rest of the hour went to HCB's pre-push
+  #    gate and the session was killed at 3600 s mid-push, before its PR existed. A pr-route
+  #    run also carries the review, CI (~10 minutes) and the merge.
+  # So 7200 s, and turns raised with it at the measured rate (two hours at ~3.75 a minute
+  # is ~450; 400 keeps the pair bounded together). A runaway is capped near two hours and
+  # about USD 40. Mark's to lower.
   DISPATCH_WALL_CLOCK_SECONDS = "7200"
-  DISPATCH_MAX_TURNS = "200"
+  DISPATCH_MAX_TURNS = "400"
 
   # THE FLEET MULTIPLIER. The two budgets above bound ONE session; what we actually spend is
   # that times how many run at once, so the multiplier belongs next to the multiplicand or
@@ -113,22 +114,23 @@ kill_timeout = 90
   # each: declared capacity 12, spend held at 2 concurrent (roughly USD 20-40/hour) until
   # this line is deliberately raised. Raise it when several runs have landed reviewable
   # work, not before.
-  RUNNER_MAX_IN_FLIGHT_SESSIONS = "2"
+  # 3 since 2026-11-07: Mark put ryzen and x1 in the implementer pool beside minis ("minis
+  # shouldn't be the only available implementer"), each declaring one session, and a cap of 2
+  # would leave one of the three idle by policy. Roughly USD 30-60/hour at full use.
+  RUNNER_MAX_IN_FLIGHT_SESSIONS = "3"
 
   # A TRIAGE session reads a ticket and answers with a verdict — a fraction of an
   # implement run — so it gets its own far smaller pair (#803 §4). Inheriting the
-  # implement numbers would hand a reading session an hour of wall clock.
+  # implement numbers would hand a reading session two hours of wall clock.
   #
-  # UNLIKE THE IMPLEMENT PAIR, THIS ONE IS ASSERTED, NOT MEASURED. The implement budgets
-  # are 2x a real run; no triage run has ever been measured, so 600/40 is a reasoned guess.
-  # What a too-small guess looks like: the runner reports `wall_clock_exceeded` or
-  # `no_verdict_written` (runner_contract.ex:1463), and TriageVerdict.route/1
-  # (triage_verdict.ex:230) escalates EVERY incomplete reason — so every ticket escalates to
-  # a human while the workers log clean `:dispatched` tallies and the loop reads as working.
-  # There is no error to notice. CHECK THE FIRST TRIAGE RUNS against these numbers, and
-  # raise them from what those runs actually took.
-  # Measured 2026-11-07: the first ticket triage (HCB #3922, minis) returned its verdict 602 s
-  # after dispatch, against this 600 s budget. Raised to 1200 (2x the measured run).
+  # ONE MEASURED RUN. 600 s / 40 turns was a reasoned guess until 2026-11-07, when the first
+  # ticket triage (HCB #3922, minis) returned its verdict 602 s after dispatch: right at the
+  # budget. Raised to 1200 s, 2x that run. What a too-small budget looks like: the runner
+  # reports `wall_clock_exceeded` or `no_verdict_written` (runner_contract.ex:1463), and
+  # TriageVerdict.route/1 (triage_verdict.ex:230) escalates EVERY incomplete reason — so
+  # every ticket escalates to a human while the workers log clean `:dispatched` tallies and
+  # the loop reads as working. There is no error to notice. Keep checking triage runs
+  # against these numbers.
   TRIAGE_WALL_CLOCK_SECONDS = "1200"
   TRIAGE_MAX_TURNS = "40"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
