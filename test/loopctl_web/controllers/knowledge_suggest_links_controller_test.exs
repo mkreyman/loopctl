@@ -651,12 +651,12 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
       # The DI seam runs the REAL override→timeout path: a tight 50ms SET LOCAL
       # statement_timeout on a deliberately slow, tenant-scoped query → genuine
-      # query_canceled (57014), bounded near 50ms (never the full 1s sleep).
+      # query_canceled (57014), bounded near 50ms (never the full 30s sleep).
       expect(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn t, _a, _o ->
         slow =
           from(a in Loopctl.Knowledge.Article,
             where: a.tenant_id == ^t,
-            where: fragment("pg_sleep(1) IS NULL")
+            where: fragment("pg_sleep(30) IS NULL")
           )
 
         Loopctl.HeavyRead.all(t, slow, statement_timeout: 50)
@@ -673,9 +673,11 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       body = json_response(resp_conn, 504)
       assert body["error"]["code"] == "db_statement_timeout"
 
-      # Bounded near the 50ms server-side timeout, NOT held for the 1s pg_sleep
-      # (generous CI headroom; the precise timing assertion is in the unit test).
-      assert elapsed_us / 1_000 < 900,
+      # NOT held for the 30s pg_sleep. The sleep is far longer than the bound so the
+      # bound can tell the two apart under suite load: with a 1s sleep and a 900ms
+      # bound, a loaded full suite took 1855ms on a request whose timeout DID fire.
+      # The precise timing assertion is in the unit test.
+      assert elapsed_us / 1_000 < 10_000,
              "request should fast-fail near the timeout, took #{elapsed_us / 1_000}ms"
     end
   end
