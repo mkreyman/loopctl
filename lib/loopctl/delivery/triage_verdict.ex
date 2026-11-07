@@ -440,6 +440,62 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
+  @typedoc "A screen `screen_message/2` names as refusing, and the codes it refused with."
+  @type refusal :: {atom(), [String.t()]}
+
+  @type screen_option ::
+          {:spec, Spec.t()}
+          | {:resolve_repo, (-> {:ok, String.t()} | {:error, term()})}
+          | {:story, Story.t()}
+
+  @doc """
+  Every screen `apply/4` would run over a cast `triage_verdict` message, with NOTHING read or
+  written: the refusing screens, in the order they run, each with its codes (US-48.10).
+
+  It is how a recorded eval result is replayed (`Loopctl.DeliveryGates.Measurement.EvalReplay`),
+  so it is built from the same functions the live pass calls, not a copy of them: the route
+  (`route/2`), the verdict screens and their codes (`screen_verdict/4`, whose decision is what
+  the triage step records under `gate_screen`), and the draft as it would be written and
+  screened (`screen_draft/2`). What it supplies in place of a read:
+
+  - `:resolve_repo` (required) — what `repo_for_story/2` answers live: the story's one live
+    intake source's repository, `{:ok, repo}` or `{:error, reason}`. Called only when Gate B
+    is named and the route queues, exactly as live.
+  - `:story` — the stub row the draft replaces (`%Story{}` by default); the draft screens read
+    its `metadata` and judge the draft as `ImplementerInput.story_object/2` would.
+  - `:spec` — `triage@1` by default.
+
+  A draft screen refusal is listed AFTER the verdict screens', as live: the triage step records
+  the verdict screens' codes first, and the draft's refusal decides the route out of `triaged`.
+  Only the first refusing draft screen is listed, because live stops at it. A write-time
+  refusal of the draft row (a changeset the database refuses) is not a screen and is not here.
+
+  `{:error, reason}` is a message no route applies to — the refusal `apply/4` would answer.
+  """
+  @spec screen_message(map(), [screen_option()]) :: {:ok, [refusal()]} | {:error, error()}
+  def screen_message(%{} = message, opts) do
+    spec = Keyword.get_lazy(opts, :spec, &TriageV1.spec/0)
+    resolve_repo = Keyword.fetch!(opts, :resolve_repo)
+    story = Keyword.get(opts, :story, %Story{})
+    :ok = runnable!(spec)
+
+    with {:ok, leave} <- route(message, spec),
+         {:ok, draft} <- drafted_story(leave, message) do
+      {_decision, refused} = screen_verdict(spec, leave, message, resolve_repo)
+      {:ok, refused ++ draft_refusal(story, draft)}
+    end
+  end
+
+  defp draft_refusal(_story, nil), do: []
+
+  defp draft_refusal(story, draft) do
+    case screen_draft(story, draft) do
+      {:ok, _attrs} -> []
+      {:error, {:draft_flagged, signals}} -> [{:draft_injection, signals}]
+      {:error, {:draft_not_dispatchable, violations}} -> [{:draft_dispatchable, violations}]
+    end
+  end
+
   # A verdict answers a TRIAGE dispatch and nothing else (US-44.1 review). The ledger row is
   # what says which kind this dispatch is; without the check, the runner holding a story's
   # IMPLEMENT dispatch could record a triage verdict for it — with lens verdicts of its own
@@ -858,15 +914,26 @@ defmodule Loopctl.Delivery.TriageVerdict do
   #
   # "An accepted verdict" is the outcome whose route QUEUES the story (`story` in `triage@1`),
   # read off the route the spec gave it rather than off the outcome's name.
-  defp draft(%{leave: leave, message: %{verdict: %{} = verdict}} = ctx) do
+  defp draft(%{leave: leave, message: message} = ctx) do
+    case drafted_story(leave, message) do
+      {:ok, nil} -> :ok
+      {:ok, draft} -> write_drafted(ctx, draft)
+      {:error, _reason} = missing -> missing
+    end
+  end
+
+  # The draft a message carries for THIS route: `nil` when the route does not queue (or the
+  # message is an `incomplete`), the verdict's `story` when it does. Shared by the live write
+  # and `screen_message/2`, so both decide "is there a draft to screen" the same way.
+  defp drafted_story(leave, %{verdict: %{} = verdict}) do
     cond do
-      not queues?(leave) -> :ok
-      is_map(Map.get(verdict, :story)) -> write_drafted(ctx, verdict.story)
+      not queues?(leave) -> {:ok, nil}
+      is_map(Map.get(verdict, :story)) -> {:ok, verdict.story}
       true -> missing_draft(verdict)
     end
   end
 
-  defp draft(_ctx), do: :ok
+  defp drafted_story(_leave, _message), do: {:ok, nil}
 
   defp write_drafted(ctx, draft) do
     %{tenant_id: tenant_id, session: %{story_id: story_id}} = ctx
@@ -925,6 +992,12 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp drafted(other), do: other
 
   defp write_draft(story, draft) do
+    with {:ok, attrs} <- screen_draft(story, draft), do: write(story, attrs)
+  end
+
+  # THE DRAFT AS IT WOULD BE WRITTEN, and every draft screen over it: `{:ok, attrs}` or the
+  # first screen's refusal. Reads and writes nothing, so `screen_message/2` runs exactly this.
+  defp screen_draft(story, draft) do
     attrs = %{
       title: Untrusted.sanitise(Map.get(draft, :title)),
       description: Untrusted.sanitise(Map.get(draft, :description)),
@@ -932,7 +1005,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
       metadata: draft_metadata(story, draft)
     }
 
-    with :ok <- draft_screens(story, attrs), do: write(story, attrs)
+    with :ok <- draft_screens(story, attrs), do: {:ok, attrs}
   end
 
   # EVERY DRAFT SCREEN, IN ORDER, on every draft: the first refusal stands. Not filtered by the
@@ -1214,29 +1287,46 @@ defmodule Loopctl.Delivery.TriageVerdict do
   #
   # THE SPEC SAYS WHICH VERDICT SCREENS RUN: each of `@verdict_screens` it names, in that order,
   # so Gate A's codes come before Gate B's.
-  defp screen(%{leave: leave, message: %{verdict: %{} = verdict} = message} = ctx) do
-    reasons =
+  defp screen(ctx) do
+    resolve_repo = fn -> repo_for_story(ctx.tenant_id, ctx.session.story_id) end
+    {decision, _refused} = screen_verdict(ctx.spec, ctx.leave, ctx.message, resolve_repo)
+    decision
+  end
+
+  # The verdict screens' decision, and which named screen refused with which codes. The
+  # repository Gate B reads is a FUNCTION, called only when Gate B is named and the route
+  # queues, so the live path reads the intake source exactly when it did before.
+  defp screen_verdict(spec, leave, %{verdict: %{} = verdict} = message, resolve_repo) do
+    refused =
       if queues?(leave),
         do:
-          Enum.flat_map(
-            named_verdict_screens(ctx.spec),
-            &verdict_screen(&1, ctx, message, verdict)
+          for(
+            screen <- named_verdict_screens(spec),
+            reasons <- [verdict_screen(screen, message, verdict, resolve_repo)],
+            reasons != [],
+            do: {screen, reasons}
           ),
         else: []
 
-    if reasons == [], do: :queue, else: {:escalate, screen_codes(reasons)}
+    decision =
+      case Enum.flat_map(refused, &elem(&1, 1)) do
+        [] -> :queue
+        reasons -> {:escalate, screen_codes(reasons)}
+      end
+
+    {decision, Enum.map(refused, fn {screen, reasons} -> {screen, screen_codes(reasons)} end)}
   end
 
-  defp screen(_ctx), do: :queue
+  defp screen_verdict(_spec, _leave, _message, _resolve_repo), do: {:queue, []}
 
   defp named_verdict_screens(spec),
     do: Enum.filter(@verdict_screens, &Map.has_key?(spec.screens, &1))
 
-  defp verdict_screen(:gate_a, _ctx, message, _verdict),
+  defp verdict_screen(:gate_a, message, _verdict, _resolve_repo),
     do: gate_a_screen(Map.get(message, :lens_verdicts))
 
-  defp verdict_screen(:gate_b, ctx, _message, verdict),
-    do: gate_b_screen(ctx.tenant_id, ctx.session.story_id, verdict)
+  defp verdict_screen(:gate_b, _message, verdict, resolve_repo),
+    do: gate_b_screen(resolve_repo.(), verdict)
 
   # The first attempt's decision, off the triage event it wrote. The `gate_screen` KEY is the
   # refusal — it is written only when the screen refused — so its presence decides, never its
@@ -1275,10 +1365,10 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
-  defp gate_b_screen(tenant_id, story_id, verdict) do
+  defp gate_b_screen(repo, verdict) do
     touches = get_in(verdict, [:story, :touches]) || []
 
-    case repo_for_story(tenant_id, story_id) do
+    case repo do
       {:ok, repo} -> GateB.triage_screen(DeliveryGates.load_triggers(), repo, touches)
       {:error, reason} -> [{:repository_unresolved, reason}]
     end

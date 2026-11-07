@@ -201,7 +201,10 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.9: the cron caller that runs the `:draft` pass with `reply_draft@1`.
       "lib/loopctl/workers/reply_draft_dispatch_worker.ex",
       # US-48.9: the runner contract publishes each agent_result spec's result schema.
-      "lib/loopctl/api_spec/runner_contract.ex"
+      "lib/loopctl/api_spec/runner_contract.ex",
+      # US-48.10: a recorded eval result names its spec, and its replay looks it up to pick
+      # the event the spec answers with and the screens that run over it.
+      "lib/loopctl/delivery_gates/measurement/eval_replay.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do

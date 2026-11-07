@@ -88,19 +88,43 @@ defmodule Loopctl.Agents.AgentResult do
   """
   @spec apply(Ecto.UUID.t(), Ecto.UUID.t(), map(), [{:specs, [Spec.t()]}]) ::
           {:ok, %{record: DispatchRecord.t(), replayed?: boolean()}} | {:error, error()}
-  def apply(tenant_id, runner_id, %{spec: spec_ref, result: result} = message, opts \\ []) do
-    specs = Keyword.get_lazy(opts, :specs, &Registry.all/0)
-
-    with {:ok, spec} <- held_spec(specs, spec_ref),
-         :ok <- reports_here(spec),
-         {:ok, validated} <- RunnerContract.cast_agent_result(result, spec.result_schema),
-         {stored, effect} = effects(spec, validated),
+  def apply(tenant_id, runner_id, %{} = message, opts \\ []) do
+    with {:ok, %{spec: spec, result: validated, screened: screened}} <- admit(message, opts),
+         {stored, effect} = effects(screened, validated),
          attrs = record_attrs(spec, validated, stored),
          {:ok, {outcome, record}} <-
            DispatchLedger.record_agent_result(tenant_id, runner_id, message, attrs, effect) do
       if outcome == :recorded, do: audit(tenant_id, record, spec, validated)
       {:ok, %{record: record, replayed?: outcome == :replayed}}
     end
+  end
+
+  @doc """
+  Everything `apply/4` decides about a cast `agent_result` message BEFORE it writes: steps 1-3
+  of the moduledoc (the spec is held, reports here, and the result satisfies its schema), then
+  the spec's screen over the validated result. Reads and writes nothing.
+
+  `screened` is `Loopctl.ReplyDrafts.screen/1`'s answer for a spec naming `:reply_draft`
+  (`{:drafted, body}` or `{:refused, :injection_detector_draft, signals}`), `nil` for a spec
+  with no screened effect. `apply/4` is this followed by the write, so a recorded eval result
+  replayed through it (US-48.10) meets the same checks a live one does.
+  """
+  @spec admit(map(), [{:specs, [Spec.t()]}]) ::
+          {:ok, %{spec: Spec.t(), result: map(), screened: ReplyDrafts.screened() | nil}}
+          | {:error, {:invalid, [String.t()]}}
+  def admit(%{spec: spec_ref, result: result}, opts \\ []) do
+    specs = Keyword.get_lazy(opts, :specs, &Registry.all/0)
+
+    with {:ok, spec} <- held_spec(specs, spec_ref),
+         :ok <- reports_here(spec),
+         {:ok, validated} <- RunnerContract.cast_agent_result(result, spec.result_schema) do
+      {:ok, %{spec: spec, result: validated, screened: screen(spec, validated)}}
+    end
+  end
+
+  # `:reply_draft` screens the body first (`ReplyDrafts.screen/1`, `:injection_detector_draft`).
+  defp screen(%Spec{effects: effects}, validated) do
+    if :reply_draft in effects, do: ReplyDrafts.screen(validated.body)
   end
 
   # The registry's own entry. A refusal names no runner-supplied value: the spec reference is
@@ -123,19 +147,15 @@ defmodule Loopctl.Agents.AgentResult do
   # is what that name does. The effect runs inside the ledger's transaction, once, on a result
   # that was recorded rather than replayed (`DispatchLedger.record_agent_result/5`).
   #
-  # `:reply_draft` screens the body first (`ReplyDrafts.screen/1`, `:injection_detector_draft`).
+  # The body was screened by `admit/2` (`screened` is `nil` for a spec naming no `:reply_draft`).
   # A refused body is stored NOWHERE: the draft row is `refused` with the screen's codes, and the
   # ledger row keeps the screen's name in place of the result (`ReplyDrafts.withheld_result/1`).
   # The digest is still over the result as sent, so a byte-identical resend still replays.
-  defp effects(%Spec{effects: effects}, validated) do
-    if :reply_draft in effects do
-      screened = ReplyDrafts.screen(validated.body)
+  defp effects(nil, validated), do: {validated, fn _record -> :ok end}
 
-      {ReplyDrafts.withheld_result(screened) || validated,
-       fn record -> ReplyDrafts.write_result(record, screened) end}
-    else
-      {validated, fn _record -> :ok end}
-    end
+  defp effects(screened, validated) do
+    {ReplyDrafts.withheld_result(screened) || validated,
+     fn record -> ReplyDrafts.write_result(record, screened) end}
   end
 
   # Everything written is loopctl's: the kind and the label from the registry entry, the
