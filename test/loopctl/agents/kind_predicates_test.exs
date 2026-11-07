@@ -116,11 +116,11 @@ defmodule Loopctl.Agents.KindPredicatesTest do
       refute Spec.holds_claim?("reply_draft")
     end
 
-    test "US-48.13: spec_tune spends the triage budget and holds no claim" do
+    test "US-48.13: spec_tune spends its own budget and holds no claim" do
       assert "spec_tune" in registry_kinds()
 
       assert DispatchPayload.budget_keys("spec_tune") ==
-               {:ok, {:triage_wall_clock_seconds, :triage_max_turns}}
+               {:ok, {:spec_tune_wall_clock_seconds, :spec_tune_max_turns}}
 
       refute Spec.holds_claim?("spec_tune")
     end

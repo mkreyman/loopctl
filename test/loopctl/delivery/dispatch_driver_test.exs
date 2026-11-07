@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.DispatchDriver
   alias Loopctl.Delivery.Placement
@@ -367,6 +368,24 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
         assert DispatchDriver.normalise_budget(value, :dispatch_max_turns) ==
                  {:error, {:unset, :dispatch_max_turns}}
       end
+    end
+
+    test "every budget key a spec may name has a ceiling" do
+      # A key with no `budget_maximum/1` clause raises FunctionClauseError inside the pass, so
+      # a spec naming it would crash its worker every run instead of refusing by key.
+      for {wall_clock, turns} <- Spec.budget_pairs() do
+        assert DispatchDriver.normalise_budget(60, wall_clock) == {:ok, 60}
+        assert DispatchDriver.normalise_budget(10, turns) == {:ok, 10}
+      end
+    end
+
+    test "the spec_tune wall clock is held to the contract's ceiling" do
+      max = RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+
+      assert DispatchDriver.normalise_budget(max, :spec_tune_wall_clock_seconds) == {:ok, max}
+
+      assert DispatchDriver.normalise_budget(max + 1, :spec_tune_wall_clock_seconds) ==
+               {:error, {:over_contract_maximum, :spec_tune_wall_clock_seconds}}
     end
   end
 

@@ -16,9 +16,10 @@ defmodule Loopctl.Agents.Specs.SpecTunerV1 do
     runs as trace entries — loopctl's own failure codes and decisions, and the story's text
     rendered by `Loopctl.Delivery.Untrusted.render/2`, the fence triage uses — with the
     target's template `{id, version}` and eval-set identity. The runner assembles the prompt.
-  - **Budgets** — the TRIAGE pair: a tuning run reads traces and runs the eval harness, a
-    reading session the size of a triage run, and a separate pair would be one more figure to
-    set before the loop can run.
+  - **Budgets** — its own pair, `SPEC_TUNE_WALL_CLOCK_SECONDS` / `SPEC_TUNE_MAX_TURNS`: the
+    runner bounds a tuning run by this wall clock, and the critic runs every eval case under
+    both the current and the proposed template, each with that case's whole wall clock, so a
+    triage-sized budget can never hold it. Unset, no tuning run is dispatched.
   - **Result** — the generic `agent_result` against `result_schema` below: new cases, the
     proposed template diff, and the eval scores of current and proposed templates per case.
   - **Effect** — `:tuning_draft`: `Loopctl.Agents.Tuning.write_result/2` answers the pending
@@ -106,7 +107,7 @@ defmodule Loopctl.Agents.Specs.SpecTunerV1 do
       :subscription_not_exhausted
     ],
     advance_on: [],
-    budgets: {:triage_wall_clock_seconds, :triage_max_turns},
+    budgets: {:spec_tune_wall_clock_seconds, :spec_tune_max_turns},
     result: ["agent_result"],
     result_schema: %Schema{
       type: :object,

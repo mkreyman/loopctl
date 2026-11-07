@@ -152,7 +152,9 @@ defmodule Loopctl.FlyTomlTest do
           {"DISPATCH_WALL_CLOCK_SECONDS", :dispatch_wall_clock_seconds},
           {"DISPATCH_MAX_TURNS", :dispatch_max_turns},
           {"TRIAGE_WALL_CLOCK_SECONDS", :triage_wall_clock_seconds},
-          {"TRIAGE_MAX_TURNS", :triage_max_turns}
+          {"TRIAGE_MAX_TURNS", :triage_max_turns},
+          {"SPEC_TUNE_WALL_CLOCK_SECONDS", :spec_tune_wall_clock_seconds},
+          {"SPEC_TUNE_MAX_TURNS", :spec_tune_max_turns}
         ] do
       test "#{var} is inside the bound DispatchDriver enforces" do
         value = env_table("fly.toml")[unquote(var)]
