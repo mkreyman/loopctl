@@ -431,7 +431,8 @@ defmodule Loopctl.Agents.Spec do
     end
   end
 
-  # `agent_result` is named by a `:draft` spec and by nothing else, and a spec names it if and
+  # `agent_result` is named by a `:draft` spec, or by a `:judge` naming the `:verify_verdict`
+  # effect, and by nothing else; a spec names it if and
   # only if it carries an object `result_schema` — so no `agent_result` can arrive for a spec
   # with nothing to validate it against, and no schema sits on a spec that never reads it.
   defp check_agent_result(spec) do

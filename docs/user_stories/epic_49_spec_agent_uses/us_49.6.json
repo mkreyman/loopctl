@@ -1,0 +1,94 @@
+{
+  "id": "US-49.6",
+  "title": "Land a tuned spec version: the dispatch names {id, version}, and the runner runs the version it names",
+  "epic": {
+    "id": "epic_49",
+    "name": "Spec agent uses"
+  },
+  "priority": "high",
+  "phase": "spec_agent_uses",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "a merged spec_tuner draft (a template at version 2 or later) to be the version the next dispatch of that kind actually runs",
+    "so_that": "the improvement loop US-48.13 built closes; today a proposed draft can be scored and merged but never runs, because the runner picks version 1 of every kind"
+  },
+  "rationale": "Found while documenting Epic 48 (US-48.14). The runner resolves a dispatch's template with Templates.for_dispatch/1, which keys on kind alone and holds only version-1 templates (@by_kind in lib/loopctl_runner/templates.ex). The runner contract's dispatch payload carries no spec field; only agent_result names {id, version}. So no code path exists for running a version-2 template, and every tuning draft with to_version > 1 is unreachable.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-49.6.1",
+      "description": "loopctl's registry names one LIVE version per spec id, and every dispatch payload loopctl sends carries spec {id, version} for that live version; the runner contract is bumped (minor) and the vendored copy in loopctl-runner stays byte-identical."
+    },
+    {
+      "id": "AC-49.6.2",
+      "description": "The runner resolves a dispatch by the {id, version} it names (Templates.fetch/1). A dispatch naming a version this runner does not hold is refused with a stable code and is never run on a different version."
+    },
+    {
+      "id": "AC-49.6.3",
+      "description": "A runner on the earlier contract, which sends no spec field, keeps getting dispatches only for version-1 specs; loopctl never sends a version > 1 to a runner whose declared templates do not include it."
+    },
+    {
+      "id": "AC-49.6.4",
+      "description": "agent_result's spec must equal the dispatch's spec; a mismatch is refused, so an outcome row can never be credited to a version that did not run."
+    },
+    {
+      "id": "AC-49.6.5",
+      "description": "Raising a spec's live version is a merged change to the registry, never an API call, so the spec_tuner (which writes no template and opens no PR) still cannot promote its own draft."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-49.6.1",
+      "name": "the named version runs",
+      "type": "integration",
+      "steps": [
+        "registry lists triage live at version 2; runner declares triage@1 and triage@2",
+        "place a triage dispatch"
+      ],
+      "expected_results": [
+        "payload spec is {triage, 2}",
+        "runner renders triage@2"
+      ]
+    },
+    {
+      "id": "TC-49.6.2",
+      "name": "a runner without the version is not sent it",
+      "type": "integration",
+      "steps": [
+        "runner declares only triage@1; live version is 2"
+      ],
+      "expected_results": [
+        "no triage dispatch is placed on that runner"
+      ]
+    },
+    {
+      "id": "TC-49.6.3",
+      "name": "mismatched result spec is refused",
+      "type": "unit",
+      "steps": [
+        "dispatch named triage@2; agent_result names triage@1"
+      ],
+      "expected_results": [
+        "result refused, no outcome row"
+      ]
+    },
+    {
+      "id": "TC-49.6.4",
+      "name": "tenant isolation",
+      "type": "integration",
+      "steps": [
+        "two tenants, each with a triage dispatch"
+      ],
+      "expected_results": [
+        "each tenant's ledger and outcome rows carry only its own dispatch's spec"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Spans loopctl (registry live version, payload, contract) and loopctl-runner (Templates.for_dispatch/1 keyed on spec, declared templates).",
+    "The runner's join already declares {id, version} pairs (Templates.specs/1, contract 1.25.0), so loopctl's capability matching can key on them."
+  ],
+  "dependencies": [
+    "US-48.8",
+    "US-48.13"
+  ]
+}
