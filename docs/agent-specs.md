@@ -236,8 +236,11 @@ What each value means:
   which every machine is misconfigured still reports the state that needs a person. Any other
   refusal concerns the story or has already spent something, so advancing on it would loop.
 - **`budgets`**: the config pairs `DispatchDriver.normalise_budget/2` has a ceiling for. The triage
-  pair (`TRIAGE_WALL_CLOCK_SECONDS`, `TRIAGE_MAX_TURNS`) budgets every reading session; the
-  dispatch pair budgets implement sessions. Both have no default, by design (`deploy/FLY_SECRETS.md`).
+  pair (`TRIAGE_WALL_CLOCK_SECONDS`, `TRIAGE_MAX_TURNS`) budgets the reading sessions (triage,
+  verify, reply_draft); the dispatch pair budgets implement sessions; the spec_tune pair
+  (`SPEC_TUNE_WALL_CLOCK_SECONDS`, `SPEC_TUNE_MAX_TURNS`) budgets `spec_tuner@1`, whose run holds
+  two replays of every eval case of its target. None has a default, by design
+  (`deploy/FLY_SECRETS.md`).
 - **`result_schema`**: published to runners as `x-connection.agent_result_schemas["<id>@<version>"]`
   in the contract, so a runner validates against loopctl's schema rather than a copy.
 - **`screens`**: `:payload_too_large` is `TriagePayload.build/1` refusing a ticket too large to

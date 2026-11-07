@@ -222,8 +222,16 @@ defmodule Loopctl.Agents.Spec do
   # The config pairs `DispatchDriver.normalise_budget/2` has a ceiling for.
   @budget_pairs [
     {:triage_wall_clock_seconds, :triage_max_turns},
-    {:dispatch_wall_clock_seconds, :dispatch_max_turns}
+    {:dispatch_wall_clock_seconds, :dispatch_max_turns},
+    {:spec_tune_wall_clock_seconds, :spec_tune_max_turns}
   ]
+
+  @doc """
+  The budget pairs a spec may name. Each key needs a ceiling in
+  `DispatchDriver.normalise_budget/2`, which a test checks against this list.
+  """
+  @spec budget_pairs() :: [{atom(), atom()}]
+  def budget_pairs, do: @budget_pairs
 
   # Runner messages a session answers with (`RunnerContract.inbound_events/0`).
   @results ["triage_verdict", "stage", "session_ended", "agent_result"]

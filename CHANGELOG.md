@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`spec_tuner@1` has its own budget pair: `SPEC_TUNE_WALL_CLOCK_SECONDS` and
+  `SPEC_TUNE_MAX_TURNS` (2026-11-07).** It spent the triage pair until now, but the runner
+  bounds a whole tuning run by that wall clock and the run replays every eval case twice, so a
+  1200 s budget could never finish one. `fly.toml` sets 14400 s and 80 turns. Neither has a
+  default: with `DRAFT_DISPATCH_ENABLED` on and either unset, the weekly tuning job cancels
+  naming the key. Self-hosters who enabled tuning must set both before deploying. Triage,
+  verify and reply_draft budgets are unchanged.
 - **The improvement loop: `spec_tuner@1` proposes prompt-template changes, and loopctl never
   applies them (US-48.13, 2026-11-07).** A weekly pass (`SpecTunerDispatchWorker`, Mondays
   06:00 UTC, behind `DISPATCH_DRIVER_ENABLED` and `DRAFT_DISPATCH_ENABLED`) takes each

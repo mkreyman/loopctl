@@ -240,12 +240,13 @@ defmodule Loopctl.Delivery.DispatchDriver do
   defp budget_maximum(key)
        when key in [
               :dispatch_wall_clock_seconds,
-              :triage_wall_clock_seconds
+              :triage_wall_clock_seconds,
+              :spec_tune_wall_clock_seconds
             ],
        do: RunnerContract.RunnerDispatch.max_wall_clock_seconds()
 
   defp budget_maximum(key)
-       when key in [:dispatch_max_turns, :triage_max_turns],
+       when key in [:dispatch_max_turns, :triage_max_turns, :spec_tune_max_turns],
        do: :infinity
 
   @doc "True when an operator has turned the driver on. Defaults to FALSE."

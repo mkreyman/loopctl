@@ -248,6 +248,23 @@ case System.get_env("TRIAGE_MAX_TURNS") && Integer.parse(System.get_env("TRIAGE_
   _ -> :ok
 end
 
+# US-48.13: the spec_tuner@1 run's own budgets. A tuning run is one proposing session plus the
+# runner's eval critic, which runs every case of the target's set under the current and the
+# proposed template, each with its whole case wall clock (the runner bounds the run by
+# `wall_clock_seconds`). That is hours, not the minutes a triage read takes, so it cannot ride
+# the triage pair. No default, same policy.
+case System.get_env("SPEC_TUNE_WALL_CLOCK_SECONDS") &&
+       Integer.parse(System.get_env("SPEC_TUNE_WALL_CLOCK_SECONDS")) do
+  {seconds, ""} when seconds > 0 -> config :loopctl, :spec_tune_wall_clock_seconds, seconds
+  _ -> :ok
+end
+
+case System.get_env("SPEC_TUNE_MAX_TURNS") &&
+       Integer.parse(System.get_env("SPEC_TUNE_MAX_TURNS")) do
+  {turns, ""} when turns > 0 -> config :loopctl, :spec_tune_max_turns, turns
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects

@@ -133,6 +133,14 @@ kill_timeout = 90
   # against these numbers.
   TRIAGE_WALL_CLOCK_SECONDS = "1200"
   TRIAGE_MAX_TURNS = "40"
+
+  # spec_tuner@1's own pair (US-48.13). The runner bounds the WHOLE tuning run by this wall
+  # clock, and its critic replays every eval case of the target spec under the current and the
+  # proposed template, each with that case's own full wall clock — so the triage pair cannot
+  # hold it. 14400 s fits a 4-case triage@1 set (4 x 2 x 1200 s = 9600 s) plus the reading
+  # session; a target spec with more cases needs more. Unused while DRAFT_DISPATCH_ENABLED is off.
+  SPEC_TUNE_WALL_CLOCK_SECONDS = "14400"
+  SPEC_TUNE_MAX_TURNS = "80"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
   # started machine's 6PN address and connects to the node of the same release there; the
   # node name and IPv6 distribution come from rel/env.sh.eex. Not a secret: it names no
