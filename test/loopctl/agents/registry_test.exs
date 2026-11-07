@@ -83,7 +83,9 @@ defmodule Loopctl.Agents.RegistryTest do
                Enum.sort(RunnerContract.RunnerTriageVerdict.outcomes())
     end
 
-    test "each outcome's route is TriageVerdict's: the triage step, then its @routes entry" do
+    # Since US-48.5 TriageVerdict READS these routes, so this is the wiring, not a comparison:
+    # the old table's values are held by the oracle in `triage_verdict_spec_test.exs`.
+    test "each outcome's route is the one TriageVerdict applies: the triage step, then one more" do
       outcomes = TriageV1.spec().outcomes
 
       for {outcome, leave} <- TriageVerdict.routes() do
@@ -180,7 +182,9 @@ defmodule Loopctl.Agents.RegistryTest do
       # US-48.6: `Spec.holds_claim?/1`, the budget keys and the default kind.
       "lib/loopctl/delivery/dispatch_payload.ex",
       "lib/loopctl/delivery/placement.ex",
-      "lib/loopctl/runners/dispatch_ledger.ex"
+      "lib/loopctl/runners/dispatch_ledger.ex",
+      # US-48.5: the triage result's outcomes, screens and effects.
+      "lib/loopctl/delivery/triage_verdict.ex"
     ]
 
     test "only the modules a story moved onto the registry name it or a spec" do
