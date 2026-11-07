@@ -88,7 +88,7 @@ describe("remedyFor", () => {
       run: { work_left_behind: "true", branch: "loop/abc" },
     });
     assert.match(r.salvage, /loop\/abc/);
-    assert.ok(r.salvage.includes(`.claude/worktrees/loop-${STORY}`));
+    assert.ok(r.salvage.includes(`.claude/worktrees/loop-story-${STORY}`));
   });
 
   test("no salvage line unless the runner said \"true\"", () => {
