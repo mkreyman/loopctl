@@ -216,10 +216,52 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       assert body["error"]["stage"] == "implementing"
     end
 
+    test "a human sends a story triage escalated back to be triaged again", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {operator_key, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      story = fixture(:ledger_story, %{tenant_id: tenant.id})
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: tenant.id,
+        story_id: story.id,
+        stage: :escalated,
+        triage_dispatch_id: Ecto.UUID.generate(),
+        escalation_reason: "triage_verdict:verdict_invalid"
+      })
+
+      body =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{
+          "to" => "detected",
+          "reason" => "the runner discarded its verdict"
+        })
+        |> json_response(200)
+
+      assert body["stage"]["stage"] == "detected"
+      assert Stages.get(tenant.id, story.id).triage_dispatch_id == nil
+    end
+
+    test "a story an implementer worked is refused re-triage, naming what it holds",
+         %{conn: conn} do
+      %{story: story, operator_key: operator_key} = escalated_story()
+
+      body =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "detected"})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "not_retriageable"
+      assert "assigned_agent_id" in body["error"]["held"]
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
+    end
+
     test "a target the stage machine does not have is refused", %{conn: conn} do
       %{story: story, operator_key: operator_key} = escalated_story()
 
-      # `escalated` leads to `queued`, `done` or `failed` and nowhere else. Sending a story
+      # `escalated` leads to `detected`, `queued`, `done` or `failed` and nowhere else. Sending a story
       # straight back to `implementing` would skip the claim it no longer has.
       conn
       |> auth(operator_key)
@@ -486,7 +528,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
       shapes = [
         # the controller's own, before `Escalations` is reached
-        {:error, :bad_request, "to must be one of queued, done, failed"},
+        {:error, :bad_request, "to must be one of detected, queued, done, failed"},
         # Escalations' own vocabulary
         {:error, :not_found},
         {:error, :busy},

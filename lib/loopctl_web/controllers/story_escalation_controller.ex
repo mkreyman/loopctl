@@ -26,6 +26,12 @@ defmodule LoopctlWeb.StoryEscalationController do
   alias Loopctl.Dispatches
   alias OpenApiSpex.Schema
 
+  # The stages `resolve` may send a story to: exactly the `{:escalated, to, :human_resolution}`
+  # edges the stage machine declares, read from it so the guard, the 400 and the OpenAPI enum
+  # cannot drift from the transitions the machine will take.
+  @targets for {:escalated, to, :human_resolution} <- StageMachine.transitions(),
+               do: Atom.to_string(to)
+
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:escalate]
@@ -155,7 +161,8 @@ defmodule LoopctlWeb.StoryEscalationController do
     summary: "Resolve an escalated story, as a human",
     description:
       "Moves a story off `escalated` over `:human_resolution` — the edge the stage machine " <>
-        "reserves for a person. `to` is `queued` (send it back to be worked), `done` " <>
+        "reserves for a person. `to` is `detected` (send it back to be TRIAGED again, only " <>
+        "for a story no implementer touched), `queued` (send it back to be worked), `done` " <>
         "(accept it as finished) or `failed` (close it as not going to happen).\n\n" <>
         "Requires a role of at least `user` on a key NO DISPATCH MINTED, which is what the " <>
         "machine itself means by a human: a session cannot escalate and then resolve its " <>
@@ -168,7 +175,7 @@ defmodule LoopctlWeb.StoryEscalationController do
          type: :object,
          required: [:to],
          properties: %{
-           to: %Schema{type: :string, enum: ~w(queued done failed)},
+           to: %Schema{type: :string, enum: @targets},
            reason: %Schema{
              type: :string,
              description: "Optional note recorded on the transition, in the operator's words."
@@ -178,14 +185,15 @@ defmodule LoopctlWeb.StoryEscalationController do
     responses: %{
       200 => {"The story's new stage row", "application/json", Schemas.StoryStageResponse},
       400 =>
-        {"`to` is missing or not one of queued, done, failed", "application/json",
+        {"`to` is missing or not one of detected, queued, done, failed", "application/json",
          Schemas.ErrorResponse},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"The story is not escalated (`not_escalated`, naming the stage it IS at), or the " <>
-           "stage machine has no such transition (`invalid_transition`)", "application/json",
-         Schemas.ErrorResponse},
+        {"The story is not escalated (`not_escalated`, naming the stage it IS at), `to` is " <>
+           "`detected` for a story an implementer already worked (`not_retriageable`, naming " <>
+           "the stage-row identities it holds in `held`), or the stage machine has no such " <>
+           "transition (`invalid_transition`)", "application/json", Schemas.ErrorResponse},
       # 846.8 review round 2. Resolving to `queued` RELEASES THE CLAIM first
       # (`prepare_story/6`), so every refusal `Progress.force_unclaim_story/3` and
       # `Progress.contract_story/4` can return is a refusal of this endpoint — and two of
@@ -251,6 +259,21 @@ defmodule LoopctlWeb.StoryEscalationController do
           }
         })
 
+      {:error, {:not_retriageable, held}} ->
+        conn
+        |> put_status(409)
+        |> json(%{
+          error: %{
+            status: 409,
+            code: "not_retriageable",
+            message:
+              "An implementer already worked this story (its stage row holds " <>
+                Enum.join(held, ", ") <>
+                "), so it cannot go back to triage. Resolve it to queued, done or failed.",
+            held: held
+          }
+        })
+
       other ->
         other
     end
@@ -258,8 +281,8 @@ defmodule LoopctlWeb.StoryEscalationController do
 
   defp resolution_target(params) do
     case Map.get(params, "to") do
-      to when to in ~w(queued done failed) -> {:ok, String.to_existing_atom(to)}
-      _ -> {:error, :bad_request, "to must be one of queued, done, failed"}
+      to when to in @targets -> {:ok, String.to_existing_atom(to)}
+      _ -> {:error, :bad_request, "to must be one of #{Enum.join(@targets, ", ")}"}
     end
   end
 

@@ -56,6 +56,7 @@ import {
   mergePrecondition as mergePreconditionRequest,
   placeDispatch as placeDispatchRequest,
   resolveEscalation as resolveEscalationRequest,
+  RESOLUTION_TARGETS,
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
 import {
@@ -8717,8 +8718,12 @@ const TOOLS = [
     name: "resolve_escalation",
     description:
       "MOVE AN ESCALATED STORY OFF `escalated`, as a human (POST /api/v1/stories/:id/stage/" +
-      "resolve): `queued` sends it back to be worked, `done` accepts it as finished, `failed` " +
-      "closes it as not going to happen. This is the other half of escalate_story, which a " +
+      "resolve): `detected` sends it back to be TRIAGED again, `queued` sends it back to be " +
+      "worked, `done` accepts it as finished, `failed` closes it as not going to happen. " +
+      "`detected` is for a story triage escalated (e.g. triage_verdict:verdict_invalid) and " +
+      "is refused 409 not_retriageable, naming what it holds in `held`, for a story an " +
+      "implementer was assigned or worked; `queued` on a triage escalation skips triage " +
+      "entirely. This is the other half of escalate_story, which a " +
       "session uses instead of asking a question — and until this existed a parked story " +
       "stayed parked for ever.\n\n" +
       "Requires LOOPCTL_USER_KEY and a key no dispatch minted, which is what the stage machine " +
@@ -8730,7 +8735,7 @@ const TOOLS = [
         story_id: { type: "string", description: "The story UUID." },
         to: {
           type: "string",
-          enum: ["queued", "done", "failed"],
+          enum: RESOLUTION_TARGETS,
           description: "Where to send it.",
         },
         reason: {
