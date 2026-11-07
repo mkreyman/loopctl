@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-48.11.3",
-      "description": "Filters: reason_class, project_id, since. The endpoint is user-role (it surfaces work for a human to resolve) and reads only; resolving stays resolve_escalation."
+      "description": "Filters: reason_class, project_id, since. The endpoint is agent-role (role: :agent, so any authenticated key reads it, including a dashboard's low-privilege key) and reads only; resolving stays resolve_escalation, which keeps its user-role, human-only gate."
     },
     {
       "id": "AC-48.11.4",
