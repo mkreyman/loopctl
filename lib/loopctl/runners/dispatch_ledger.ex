@@ -135,6 +135,8 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.Agents.Registry
+  alias Loopctl.Agents.Spec
   alias Loopctl.Delivery.Stages
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
@@ -143,9 +145,6 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
   alias Loopctl.WorkBreakdown.Story
-
-  # The `kind`s that are an implement session; NULL is one too (see `implement_kind?/1`).
-  @implement_kinds ["implement"]
 
   # Retention (see "Retention" in the moduledoc). The batch is one DELETE statement's worth of
   # rows and the budget is one tenant's worth per run: both bound how long a single statement
@@ -607,12 +606,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   The session a runner is running under `dispatch_id`: `{:ok, %{kind:, story_id:,
   claim_epoch:, slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
 
-  KIND-SCOPED, IMPLEMENT BY DEFAULT: a row of another kind is refused
+  KIND-SCOPED, CLAIM-HOLDING BY DEFAULT: a row of another kind is refused
   (`:wrong_dispatch_kind`, contract 1.22.0), so a consumer cannot forget the kind. A triage
   dispatch holds no claim, so it may not reach an implement path through a fence on epoch or
   story. A caller that wants
   another kind asks for it: `kind: "triage"` (`Loopctl.Delivery.TriageVerdict`), or `kind:
-  :any`. Implement means `implement_kind?/1`.
+  :any`. The default, `:holds_claim`, means `Loopctl.Agents.Spec.holds_claim?/1`.
 
   For the `stage` path (#803, contract 1.4.0), which needs the story the dispatch is for and
   the slot generation to release when the session ends. It is a READ and takes no lock: the
@@ -655,7 +654,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         |> Repo.one()
       end)
 
-    wanted = Keyword.get(opts, :kind, :implement)
+    wanted = Keyword.get(opts, :kind, :holds_claim)
 
     case result do
       nil -> {:error, :unknown_dispatch}
@@ -698,7 +697,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   For the lease reclaim, which must not re-queue a claim a budget kill ended
   (`Loopctl.Progress.reclaim_expired_claim/3`). Only an implement session's end counts
-  (`where_implement_kind/1`): another kind's budget kill or exhausted subscription says
+  (`where_holds_claim/1`): another kind's budget kill or exhausted subscription says
   nothing about the implementer's. A read with no
   lock: every field it returns is
   final once the report is recorded, and the reclaim re-checks the claim under the story lock.
@@ -724,7 +723,7 @@ defmodule Loopctl.Runners.DispatchLedger do
           order_by: [asc: r.session_ended_at],
           limit: 1
         )
-        |> where_implement_kind()
+        |> where_holds_claim()
         |> Repo.one()
       end)
 
@@ -853,25 +852,25 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   defp implement_dispatch(%DispatchRecord{kind: kind}) do
-    if implement_kind?(kind), do: :ok, else: {:error, :wrong_dispatch_kind}
+    if Spec.holds_claim?(kind), do: :ok, else: {:error, :wrong_dispatch_kind}
   end
 
   defp implement_only(dispatch, value),
-    do: if(implement_kind?(dispatch.kind), do: value, else: nil)
+    do: if(Spec.holds_claim?(dispatch.kind), do: value, else: nil)
 
   @doc """
-  Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
-  written before `kind` existed, when `implement` was the only kind sent. The ONE reading of
-  that rule, for every path that must refuse a triage session a claim to report on. `where_implement_kind/1` is the same
-  rule as a query filter.
+  `Loopctl.Agents.Spec.holds_claim?/1` as a filter on a query whose first binding is a ledger
+  row: a kind in `Loopctl.Agents.Registry.claim_holding_kinds/0`, or a NULL kind when the
+  predicate reads `nil` as claim-holding (a row written before `kind` existed).
   """
-  @spec implement_kind?(String.t() | nil) :: boolean()
-  def implement_kind?(kind), do: is_nil(kind) or kind in @implement_kinds
+  @spec where_holds_claim(Ecto.Queryable.t()) :: Ecto.Query.t()
+  def where_holds_claim(query) do
+    kinds = Registry.claim_holding_kinds()
 
-  @doc "`implement_kind?/1` as a filter on a query whose first binding is a ledger row."
-  @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
-  def where_implement_kind(query),
-    do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
+    if Spec.holds_claim?(nil),
+      do: where(query, [r], is_nil(r.kind) or r.kind in ^kinds),
+      else: where(query, [r], r.kind in ^kinds)
+  end
 
   @doc """
   The refusal for a message whose `claim_epoch` is not its own dispatch's, decided by the
@@ -907,7 +906,8 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   @doc """
   Whether a row of `kind` answers for `wanted`, the kind a session accessor asks for:
-  `:implement` (the default everywhere, `implement_kind?/1`), a named kind, or `:any`.
+  `:holds_claim` (the default everywhere, `Loopctl.Agents.Spec.holds_claim?/1`), a named
+  kind, or `:any`.
 
   For the accessors that read the row WHATEVER its kind and then decide, so that a row of the
   wrong kind is `:wrong_dispatch_kind` (contract 1.22.0, loopctl#920) rather than
@@ -915,9 +915,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   in that message, while `:unknown_dispatch` says the dispatch is not this runner's or is gone.
   Neither answer reads another runner's or tenant's row, so the split leaks nothing.
   """
-  @spec kind_answers?(String.t() | nil, :implement | :any | String.t()) :: boolean()
+  @spec kind_answers?(String.t() | nil, :holds_claim | :any | String.t()) :: boolean()
   def kind_answers?(_kind, :any), do: true
-  def kind_answers?(kind, :implement), do: implement_kind?(kind)
+  def kind_answers?(kind, :holds_claim), do: Spec.holds_claim?(kind)
   def kind_answers?(kind, wanted) when is_binary(wanted), do: kind == wanted
 
   # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
@@ -943,7 +943,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       limit: 1,
       select: %{branch: r.branch, base_branch: r.base_branch}
     )
-    |> where_implement_kind()
+    |> where_holds_claim()
   end
 
   defp session_of(%DispatchRecord{} = record) do
@@ -1033,7 +1033,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
         where: r.dispatch_id == ^dispatch_id and not is_nil(s.claim_lease_cap)
       )
-      |> where_implement_kind()
+      |> where_holds_claim()
       |> Repo.exists?()
 
     if capped?, do: :no_key_update, else: :share
@@ -1059,7 +1059,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   # is not a refusal.
   #
   # ONLY AN IMPLEMENT ACCEPTANCE gets here with a `%Story{}`: `reply_story_lock/3` takes the
-  # write lock only for an implement dispatch (`where_implement_kind/1`), so no other kind's
+  # write lock only for an implement dispatch (`where_holds_claim/1`), so no other kind's
   # acceptance moves the implementer's lease. That lock choice is the one place the kind is decided for this path.
   defp reanchor_lease(
          %DispatchRecord{replied_at: %DateTime{} = replied_at} = record,

@@ -43,6 +43,8 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   import Ecto.Query
 
+  alias Loopctl.Agents.Registry
+  alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Delivery.DispatchDriver
   alias Loopctl.Delivery.Stages
@@ -55,6 +57,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   @type error ::
           :story_not_found
+          | {:invalid, [String.t()]}
           | {:no_intake_source, Ecto.UUID.t()}
           | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}
           | {:unset, atom()}
@@ -91,7 +94,11 @@ defmodule Loopctl.Delivery.DispatchPayload do
   rather than after.
 
   `kind` decides which budgets are read: an `implement` session and a `triage` session are
-  different pieces of work with different costs, and the operator sets them separately.
+  different pieces of work with different costs, and the operator sets them separately. The
+  pair is the kind's agent spec's `budgets` (`budget_keys/1`); a dispatch naming no `kind` is
+  `Loopctl.Agents.Registry.default_kind/0`. A kind no spec describes gets NO budget: it is
+  `{:invalid, [message]}` here, before anything is minted, rather than spending against
+  another kind's policy.
 
   ## Options
 
@@ -116,7 +123,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   @spec fill(Ecto.UUID.t(), map(), keyword()) :: {:ok, map()} | {:error, error()}
   def fill(tenant_id, %{} = dispatch, opts \\ []) when is_binary(tenant_id) and is_list(opts) do
     story_id = Map.get(dispatch, "story_id")
-    kind = Map.get(dispatch, "kind", "implement")
+    kind = Map.get(dispatch, "kind", Registry.default_kind())
     prefixes = Keyword.get(opts, :branch_prefixes, [])
     policy = Keyword.get(opts, :prefix_policy, :refuse)
 
@@ -428,9 +435,8 @@ defmodule Loopctl.Delivery.DispatchPayload do
     if Map.has_key?(dispatch, "wall_clock_seconds") and Map.has_key?(dispatch, "max_turns") do
       {:ok, dispatch}
     else
-      {clock_key, turns_key} = budget_keys(kind)
-
-      with {:ok, seconds} <- budget(clock_key),
+      with {:ok, {clock_key, turns_key}} <- kind_budget_keys(kind),
+           {:ok, seconds} <- budget(clock_key),
            {:ok, turns} <- budget(turns_key) do
         {:ok,
          dispatch
@@ -440,15 +446,43 @@ defmodule Loopctl.Delivery.DispatchPayload do
     end
   end
 
-  @doc """
-  The `{wall_clock_key, max_turns_key}` config pair a dispatch of `kind` spends against.
+  defp kind_budget_keys(kind) do
+    case budget_keys(kind) do
+      {:ok, keys} ->
+        {:ok, keys}
 
-  Public so `Loopctl.Agents.RegistryTest` can hold each agent spec's `budgets` equal to the
-  pair this module actually reads; `fill_budgets/2` is its only caller in `lib/`.
+      {:error, :unknown_kind} ->
+        {:error,
+         {:invalid,
+          [
+            "kind #{inspect(kind)} is not a dispatch kind any agent spec describes, so it has " <>
+              "no budget"
+          ]}}
+    end
+  end
+
+  @doc """
+  The `{wall_clock_key, max_turns_key}` config pair a dispatch of `kind` spends against: the
+  `budgets` of the kind's agent spec (US-48.6). `nil` is
+  `Loopctl.Agents.Registry.default_kind/0`, as `Loopctl.Agents.Spec.holds_claim?/1` reads it.
+
+  `{:error, :unknown_kind}` for any kind no spec describes. It FAILS CLOSED: before US-48.6 an
+  unknown kind silently spent the implement budget.
+
+  Public so `Loopctl.Agents.RegistryTest` and `Loopctl.Agents.KindPredicatesTest` can read the
+  pair this module actually spends against; `fill_budgets/2` is its only caller in `lib/`.
   """
-  @spec budget_keys(String.t()) :: {atom(), atom()}
-  def budget_keys("triage"), do: {:triage_wall_clock_seconds, :triage_max_turns}
-  def budget_keys(_implement), do: {:dispatch_wall_clock_seconds, :dispatch_max_turns}
+  @spec budget_keys(term()) :: {:ok, {atom(), atom()}} | {:error, :unknown_kind}
+  def budget_keys(nil), do: budget_keys(Registry.default_kind())
+
+  def budget_keys(kind) when is_binary(kind) do
+    case Registry.for_kind(kind) do
+      {:ok, %Spec{budgets: budgets}} -> {:ok, budgets}
+      {:error, :unknown_kind} = error -> error
+    end
+  end
+
+  def budget_keys(_not_a_kind), do: {:error, :unknown_kind}
 
   defp budget(key), do: DispatchDriver.normalise_budget(Application.get_env(:loopctl, key), key)
 
