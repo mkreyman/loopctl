@@ -93,6 +93,8 @@ kill_timeout = 90
   # default, because a verify reject now carries its findings to the next implement
   # (#1032) and a second attempt is worth paying for. The code keeps no default (#875); this
   # line is production's choice. Worst case per story is two runs at the budgets above.
+  # A Fly secret of the same name OUTRANKS this line: if `fly secrets list -a loopctl`
+  # shows DISPATCH_MAX_ATTEMPTS, `fly secrets unset` it or an edit here does nothing.
   DISPATCH_MAX_ATTEMPTS = "2"
 
   # THE FLEET MULTIPLIER. The two budgets above bound ONE session; what we actually spend is

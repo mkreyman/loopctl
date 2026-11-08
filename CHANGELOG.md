@@ -15,8 +15,8 @@ All notable changes to loopctl are documented here.
   out, and nothing re-dispatched it; the session that was finally placed was told nothing about
   the open pull request or what was wrong. The reject now releases the claim as a counted
   attempt, so `DISPATCH_MAX_ATTEMPTS` decides on the spot: below it the story is re-placed, at
-  it it is escalated `attempts_exhausted` for a person, and
-  `resolve_escalation` to `queued` re-places it.
+  the ceiling it is escalated `attempts_exhausted` for a person, and `resolve_escalation` to
+  `queued` re-places it.
   - **Runner contract 1.31.0** (minor, additive): an `implement` dispatch may carry `rework`
     (`pr_number`, `rejected_head_sha`, `findings`), and only an `implement` dispatch. The
     session continues the open pull request on the same branch and opens no second one.
