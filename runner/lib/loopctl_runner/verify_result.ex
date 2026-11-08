@@ -27,9 +27,22 @@ defmodule LoopctlRunner.VerifyResult do
 
   `findings` absent is `[]`. A `reject` with none is admitted: loopctl sends the story back
   saying no finding was named, which is still the truth of what the session said.
+
+  ## A reject's findings are clipped, never the reason to lose it
+
+  A `reject` whose findings overrun verify@1's bounds is still a reject. Each finding longer than
+  the schema's `maxLength` (counted in code points, as loopctl counts) is cut to fit and ends in
+  `…`, and findings past `maxItems` are dropped, the last kept one saying how many were. Refusing
+  it instead sent nothing, so the verifier lapsed, loopctl placed the story again, and the next
+  session wrote the same long finding: on 2026-11-08 HCB story 900.224's reject was lost this way
+  on one finding over the 300-character cap. Clipping changes only the wording a rework session reads, never the
+  verdict, and a `pass` is untouched because it carries no findings to clip.
   """
 
+  alias LoopctlRunner.{AgentResult, Contract}
+
   @keys ~w(verdict findings head_sha)
+  @ellipsis "…"
 
   @doc """
   The verify@1 result for `stated` (the session's decoded block) judged at `head`, the commit the
@@ -51,7 +64,53 @@ defmodule LoopctlRunner.VerifyResult do
         {:error, "the session's verdict is pass but it names findings"}
 
       true ->
-        {:ok, %{"verdict" => stated["verdict"], "findings" => findings, "head_sha" => head}}
+        {:ok,
+         %{
+           "verdict" => stated["verdict"],
+           "findings" => fit(stated, findings),
+           "head_sha" => head
+         }}
     end
+  end
+
+  # Only a reject's findings are fitted, and only when EVERY one is a finding the schema admits
+  # apart from its length: judged against verify@1's own items schema with `maxLength` removed,
+  # before anything is cut or dropped. Otherwise the list reaches the schema as stated and is
+  # refused there, so a blank finding is never dressed in an ellipsis nor dropped unseen past
+  # maxItems, and a malformed block is still never sent.
+  defp fit(%{"verdict" => "reject"}, findings) when is_list(findings) do
+    if Enum.all?(findings, &admitted_but_for_length?/1),
+      do: findings |> cap_count() |> Enum.map(&clip/1),
+      else: findings
+  end
+
+  defp fit(_stated, findings), do: findings
+
+  defp admitted_but_for_length?(finding) do
+    {:ok, schema} = AgentResult.schema({"verify", 1})
+    item = schema |> get_in(["properties", "findings", "items"]) |> Map.delete("maxLength")
+    Contract.validate_against(item, finding, "finding") == :ok
+  end
+
+  defp cap_count(findings) do
+    max = AgentResult.verify_max_findings()
+
+    case Enum.split(findings, max) do
+      {kept, []} ->
+        kept
+
+      {kept, dropped} ->
+        {head, [last]} = Enum.split(kept, max - 1)
+        head ++ [clip_to(last, " (#{length(dropped)} more finding(s) cut)")]
+    end
+  end
+
+  defp clip(finding), do: clip_to(finding, "")
+
+  # `finding` with `suffix` appended, cut so the whole fits the schema's maxLength in code points.
+  # The cut is `Contract.fit/3`'s, so it never splits a character.
+  defp clip_to(finding, suffix) do
+    room = AgentResult.verify_max_finding_length() - Contract.codepoints(suffix)
+    Contract.fit(finding, room, @ellipsis) <> suffix
   end
 end

@@ -260,7 +260,10 @@ defmodule LoopctlRunner.DispatchRunTest do
       # "e" and a combining accent: one grapheme, two codepoints.
       long = String.duplicate(<<?e::utf8, 0x0301::utf8>>, 3000)
       reason = DispatchRun.end_reason(%{status: "failed", escalations: [long]})
-      assert length(String.codepoints(reason)) == 4000
+      # At most the cap, and cut on a grapheme boundary: the grapheme that would straddle code
+      # point 4000 is dropped whole, so the reason still ends in a complete accented "e".
+      assert length(String.codepoints(reason)) in 3999..4000
+      assert String.last(reason) == <<?e::utf8, 0x0301::utf8>>
 
       assert {:ok, payload} =
                DispatchRun.stage_report(@dispatch, "implementing", "escalated",

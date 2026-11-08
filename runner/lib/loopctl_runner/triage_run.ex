@@ -185,7 +185,7 @@ defmodule LoopctlRunner.TriageRun do
   # output is discarded rather than retried — the detail is the least important field in the
   # message and would take the verdict down with it.
   # `|| raise`, for the same reason the enum above has its guard: `get_in/2` answers nil rather
-  # than raising, and a nil cap makes `Enum.take/2` raise inside every incomplete outcome — so a
+  # than raising, and a nil cap makes `Contract.fit/3` raise inside every incomplete outcome — so a
   # vendored contract that renamed `detail` would turn each one into a crash caught by the run's
   # own guard, which is `{:error, _}`, which has no wire form. The hole this module closes would
   # reopen at vendor time with nothing naming it.
@@ -193,11 +193,8 @@ defmodule LoopctlRunner.TriageRun do
               |> get_in(["properties", "detail", "maxLength"]) ||
                 raise("the vendored contract publishes no maxLength for a triage verdict detail")
 
-  # Codepoints, not graphemes: the schema's maxLength is the looser count and loopctl refuses by
-  # the stricter one, exactly as `DispatchRun.cap_reason/1` already does for a stage reason.
-  defp detail(text) do
-    text |> String.codepoints() |> Enum.take(@max_detail) |> Enum.join()
-  end
+  # Codepoints, as loopctl refuses by: `Contract.fit/3`, the one cut every sent string takes.
+  defp detail(text), do: Contract.fit(text, @max_detail)
 
   # The one constructor: every reason leaves through here, so a reason added later cannot forget
   # the cap by being written as a bare tuple. NOT called `incomplete/2` — that arity is the

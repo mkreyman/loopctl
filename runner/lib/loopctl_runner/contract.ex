@@ -313,7 +313,42 @@ defmodule LoopctlRunner.Contract do
       @result_property in segments
   end
 
-  defp codepoints(value), do: value |> String.codepoints() |> length()
+  @doc """
+  The length of `text` as the contract's `maxLength` counts it, and loopctl refuses by: code
+  points, never graphemes (see the `maxLength` keyword above).
+  """
+  @spec codepoints(String.t()) :: non_neg_integer()
+  def codepoints(text), do: text |> String.codepoints() |> length()
+
+  @doc """
+  `text` cut to at most `max` code points, the ONE rule every cap the runner applies to a string
+  it sends uses. Text that fits is returned unchanged; text that does not is cut on a GRAPHEME
+  boundary, so no character is split into a dangling joiner or a bare combining mark, and ends in
+  `ellipsis` (counted inside `max`) — or, when the ellipsis alone would not fit, in nothing.
+
+  `max` must be an integer: a nil cap (a renamed contract key read through `get_in/2`) raises
+  here rather than comparing as larger than every length and sending the text uncut.
+  """
+  @spec fit(String.t(), non_neg_integer(), String.t()) :: String.t()
+  def fit(text, max, ellipsis \\ "") when is_integer(max) and max >= 0 do
+    ellipsis = if codepoints(ellipsis) <= max, do: ellipsis, else: ""
+
+    if codepoints(text) <= max,
+      do: text,
+      else: whole_graphemes(text, max - codepoints(ellipsis)) <> ellipsis
+  end
+
+  defp whole_graphemes(text, budget) do
+    text
+    |> String.graphemes()
+    |> Enum.reduce_while({[], 0}, fn grapheme, {kept, used} ->
+      used = used + codepoints(grapheme)
+      if used <= budget, do: {:cont, {[grapheme | kept], used}}, else: {:halt, {kept, used}}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+    |> Enum.join()
+  end
 
   defp type_of(value) when is_binary(value), do: "a string"
   defp type_of(value) when is_list(value), do: "a list"

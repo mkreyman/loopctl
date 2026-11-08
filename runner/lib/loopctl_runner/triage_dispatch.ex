@@ -53,7 +53,7 @@ defmodule LoopctlRunner.TriageDispatch do
              )
 
   # `|| raise` for the reason `TriageRun` gives for the same cap: `get_in/2` answers nil on a
-  # renamed key, and `Enum.take/2` with a nil count raises inside the one path that reports a run
+  # renamed key, and `Contract.fit/3` with a nil cap raises inside the one path that reports a run
   # the runner itself failed — turning a reportable outcome into a crash at vendor time.
   @max_detail Contract.schema_def(@message)
               |> get_in(["properties", "detail", "maxLength"]) ||
@@ -231,7 +231,7 @@ defmodule LoopctlRunner.TriageDispatch do
 
   @doc "A reason cut to the message's own `detail` cap, in codepoints as loopctl counts it."
   @spec detail(String.t()) :: String.t()
-  def detail(text), do: text |> String.codepoints() |> Enum.take(@max_detail) |> Enum.join()
+  def detail(text), do: Contract.fit(text, @max_detail)
 
   @doc """
   Whether a message states exactly one of `verdict` and `incomplete`, which is the rule loopctl

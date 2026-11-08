@@ -1023,4 +1023,44 @@ defmodule LoopctlRunner.ContractTest do
       end
     end
   end
+
+  describe "fit/3, the one code-point cut" do
+    test "text that fits is returned unchanged, ellipsis or not" do
+      assert Contract.fit("hello", 5) == "hello"
+      assert Contract.fit("hello", 5, "…") == "hello"
+    end
+
+    test "an overlong text is cut to max code points, the ellipsis counted inside" do
+      assert Contract.fit("abcdefgh", 5) == "abcde"
+      assert Contract.fit("abcdefgh", 5, "…") == "abcd…"
+    end
+
+    test "the cut never splits a grapheme, so no joiner or combining mark is left dangling" do
+      # "e" + U+0301 is one grapheme of two code points; a family emoji is one grapheme of five.
+      combining = "abc" <> "é" <> "xyz"
+      family = "ab" <> "👨‍👩‍👧" <> "cd"
+
+      assert Contract.fit(combining, 4) == "abc"
+      assert Contract.fit(combining, 5) == "abcé"
+      assert Contract.fit(family, 6, "…") == "ab…"
+
+      for {text, max} <- [{combining, 4}, {family, 6}] do
+        assert Contract.codepoints(Contract.fit(text, max, "…")) <= max
+      end
+    end
+
+    test "an ellipsis that does not fit the cap is left off, so the result never overruns it" do
+      assert Contract.fit("abcdef", 0, "…") == ""
+      assert Contract.fit("abcdef", 2, "...") == "ab"
+    end
+
+    test "a nil cap raises rather than sending the text uncut" do
+      assert_raise FunctionClauseError, fn -> Contract.fit("abc", nil) end
+    end
+
+    test "codepoints/1 counts code points, not graphemes" do
+      assert Contract.codepoints("é") == 2
+      assert String.length("é") == 1
+    end
+  end
 end

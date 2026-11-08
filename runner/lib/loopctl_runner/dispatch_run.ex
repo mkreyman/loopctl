@@ -389,9 +389,7 @@ defmodule LoopctlRunner.DispatchRun do
   `maxLength` counts graphemes, which is looser, and loopctl refuses by codepoints.
   """
   @spec cap_reason(String.t()) :: String.t()
-  def cap_reason(reason) do
-    reason |> String.codepoints() |> Enum.take(@max_reason) |> Enum.join()
-  end
+  def cap_reason(reason), do: Contract.fit(reason, @max_reason)
 
   @doc """
   What a run's end is reported as, in the order it goes out, from the run's summary (or the
