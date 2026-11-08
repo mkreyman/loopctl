@@ -35,10 +35,10 @@ defmodule Loopctl.Workers.EscalationDigestWorkerTest do
       assert post_count(story.tenant_id) == 1
     end
 
-    test "TC-48.11.2: two runs, two projects — one post for the project with a row, none for the other" do
+    test "TC-48.11.2: two runs, two projects — one post per project, whatever its reason class" do
       %{story: busy} = fixture(:escalated_story, %{escalated_at: two_hours_ago()})
 
-      # Same tenant, another project: escalated, but not over a budget.
+      # Same tenant, another project: escalated at a refused merge gate, not over a budget.
       %{story: other} =
         fixture(:escalated_story, %{
           tenant_id: busy.tenant_id,
@@ -53,11 +53,14 @@ defmodule Loopctl.Workers.EscalationDigestWorkerTest do
       assert :ok = perform_job(EscalationDigestWorker, %{})
       assert :ok = perform_job(EscalationDigestWorker, %{})
 
-      assert [post] =
-               AdminRepo.all(from(p in ChannelPost, where: p.tenant_id == ^busy.tenant_id))
+      by_project =
+        AdminRepo.all(from(p in ChannelPost, where: p.tenant_id == ^busy.tenant_id))
+        |> Map.new(&{&1.project_id, &1.body})
 
-      assert post.project_id == busy.project_id
-      assert post.body =~ busy.id
+      assert map_size(by_project) == 2
+      assert by_project[busy.project_id] =~ "#{busy.id} budget_exhausted"
+      assert by_project[other.project_id] =~ "#{other.id} gate_refused"
+      refute by_project[busy.project_id] =~ other.id
     end
 
     test "an escalation younger than an hour is not digested yet" do
