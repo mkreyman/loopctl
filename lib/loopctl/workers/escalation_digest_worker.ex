@@ -1,9 +1,14 @@
 defmodule Loopctl.Workers.EscalationDigestWorker do
   @moduledoc """
   Posts the daily escalation digest (US-48.11, AC-48.11.5): for every tenant holding an
-  escalated story, one post on each project's coordination channel that has
-  `budget_exhausted` rows older than an hour — count, story ids, `work_left_behind`. The
-  selection, the body and the idempotency are `Loopctl.Delivery.EscalationInbox.post_digest/2`'s.
+  escalated story, one post on each project's coordination channel that has escalated rows of
+  any reason class older than an hour — the count per class, story ids with their class,
+  `work_left_behind`. The selection, the body and the idempotency are
+  `Loopctl.Delivery.EscalationInbox.post_digest/2`'s.
+
+  Every class, not only `budget_exhausted` (2026-11-08): a triage escalation or a refused merge
+  gate waits on a person exactly as a timed-out session does, and was surfaced nowhere unless
+  somebody thought to run `escalation_list`.
 
   Mark, 2026-11-07: "make sure that implementations that timed out can be found and surfaced
   to be worked on again." The inbox makes them findable; this makes them SEEN, by whoever reads

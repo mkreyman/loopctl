@@ -60,9 +60,10 @@ defmodule Loopctl.Delivery.EscalationInbox do
 
   ## The digest
 
-  `post_digest/2` posts one channel post per project of the tenant that holds
-  `budget_exhausted` rows escalated more than an hour before `now`: the count, the story ids
-  and `work_left_behind` — never `escalation_reason`, which is untrusted text and would reach
+  `post_digest/2` posts one channel post per project of the tenant that holds escalated rows
+  of any reason class escalated more than an hour before `now`: the count per class, the story
+  ids with their class, and `work_left_behind` — never `escalation_reason`, which is untrusted
+  text and would reach
   every peer session's SessionStart preview. Its key is `escalation-digest:<project>:<UTC
   date>`, and the post slot's unique index makes a second run on the same day a no-op
   (`:already_posted`) rather than a second post.
@@ -508,8 +509,8 @@ defmodule Loopctl.Delivery.EscalationInbox do
 
   @doc """
   Posts `tenant_id`'s escalation digest as of `now`: one post on each project's coordination
-  channel that holds `budget_exhausted` rows escalated more than an hour before `now`. Posts
-  nothing for a project with none.
+  channel that holds escalated rows of ANY reason class escalated more than an hour before
+  `now`, with the count per class. Posts nothing for a project with none.
 
   Idempotent per project per UTC day of `now`: the post's `key` carries both, and a second run
   that day answers `:already_posted` for that project. Returns one outcome per project posted
@@ -518,40 +519,45 @@ defmodule Loopctl.Delivery.EscalationInbox do
   @spec post_digest(Ecto.UUID.t(), DateTime.t()) :: [digest_outcome()]
   def post_digest(tenant_id, %DateTime{} = now) when is_binary(tenant_id) do
     cutoff = DateTime.add(now, -@digest_min_age_seconds, :second)
-    filters = [reason_class: :budget_exhausted, escalated_before: cutoff]
+    filters = [escalated_before: cutoff]
 
     case project_counts(tenant_id, filters) do
-      [] -> []
+      empty when map_size(empty) == 0 -> []
       counts -> post_counted(tenant_id, counts, filters, now)
     end
   end
 
-  # The TRUE count per project, in SQL, before any row is read: reading a bounded page
-  # tenant-wide and grouping it afterwards undercounted every project past the bound and gave
-  # a project whose rows were all older than the newest page no digest at all.
+  # The TRUE count per project and reason class, in SQL, before any row is read: reading a
+  # bounded page tenant-wide and grouping it afterwards undercounted every project past the
+  # bound and gave a project whose rows were all older than the newest page no digest at all.
+  # SQL groups by the stored edge; the class is `reason_class/1`'s, the one mapping.
   defp project_counts(tenant_id, filters) do
     {:ok, counts} =
       Repo.with_tenant(tenant_id, fn ->
         from(r in subquery(escalated_rows(tenant_id)),
-          group_by: r.project_id,
-          select: {r.project_id, count(r.stage_id)}
+          group_by: [r.project_id, r.edge],
+          select: {r.project_id, r.edge, count(r.stage_id)}
         )
         |> filter(filters)
         |> Repo.all()
       end)
 
-    counts
+    Enum.reduce(counts, %{}, fn {project_id, edge, count}, acc ->
+      Map.update(acc, project_id, %{reason_class(edge) => count}, fn by_class ->
+        Map.update(by_class, reason_class(edge), count, &(&1 + count))
+      end)
+    end)
   end
 
   # The system agent is resolved only once something qualifies, so a quiet tenant gains no row.
   defp post_counted(tenant_id, counts, filters, now) do
     case digest_agent(tenant_id) do
       {:ok, agent_id} ->
-        for {project_id, count} <- counts do
+        for {project_id, by_class} <- counts do
           {:ok, %{data: rows}} =
             read(tenant_id, [{:project_id, project_id} | filters], @digest_ids_listed)
 
-          post_project(tenant_id, project_id, agent_id, {rows, count}, now)
+          post_project(tenant_id, project_id, agent_id, {rows, by_class}, now)
         end
 
       {:error, reason} ->
@@ -569,46 +575,56 @@ defmodule Loopctl.Delivery.EscalationInbox do
   def digest_agent_name, do: @digest_agent_name
 
   @doc """
-  The digest body for one project on `now`'s UTC day: `count` qualifying stories, of which
-  `rows` (the newest, at most #{@digest_ids_listed}) are named. `count` defaults to the rows
-  given. Never names a reason.
+  The digest body for one project on `now`'s UTC day: the stories counted in `by_class` (a
+  count per reason class), of which `rows` (the newest, at most #{@digest_ids_listed}) are
+  named with their class. `by_class` defaults to the classes of the rows given. Never names a
+  reason: a class is derived from the edge, never from the reason text.
   """
-  @spec digest_body([entry()], DateTime.t(), non_neg_integer() | nil) :: String.t()
-  def digest_body(rows, %DateTime{} = now, count \\ nil) do
+  @spec digest_body([entry()], DateTime.t(), %{reason_class() => non_neg_integer()} | nil) ::
+          String.t()
+  def digest_body(rows, %DateTime{} = now, by_class \\ nil) do
     {listed, _unlisted} = Enum.split(rows, @digest_ids_listed)
-    count = max(count || length(rows), length(listed))
+    by_class = by_class || Enum.frequencies_by(listed, &row_class/1)
+    count = max(by_class |> Map.values() |> Enum.sum(), length(listed))
     unlisted = count - length(listed)
 
     lines =
       Enum.map(listed, fn row ->
-        "- #{row.story_id} work_left_behind=#{work_left_behind(row)}"
+        "- #{row.story_id} #{row_class(row)} work_left_behind=#{work_left_behind(row)}"
       end)
 
     more = if unlisted == 0, do: [], else: ["- and #{unlisted} more"]
+
+    classes =
+      @classes
+      |> Enum.filter(&Map.has_key?(by_class, &1))
+      |> Enum.map_join(", ", &"#{&1} #{Map.fetch!(by_class, &1)}")
 
     Enum.join(
       [
         "Escalation digest #{Date.to_iso8601(DateTime.to_date(now))} (UTC): #{count} " <>
           "#{if count == 1, do: "story is", else: "stories are"} parked at escalated in this " <>
-          "project because the implement session ran out of budget (wall clock or turns) " <>
-          "more than an hour ago."
+          "project, each for more than an hour. By reason class: #{classes}."
       ] ++
         lines ++
         more ++
         [
-          "List them with escalation_list (reason_class: budget_exhausted). Work one again " <>
-            "with resolve_escalation to: queued, on a user key."
+          "List them with escalation_list; each row carries its remedy, and escalation_playbook " <>
+            "gives every class's. Re-queue one with resolve_escalation to: queued, on a user key."
         ],
       "\n"
     )
   end
 
+  defp row_class(%{reason_class: class}) when class in @classes, do: class
+  defp row_class(_row), do: :other
+
   defp work_left_behind(%{run: %{work_left_behind: value}}), do: value
   defp work_left_behind(_row), do: :unknown
 
-  defp post_project(tenant_id, project_id, agent_id, {rows, count}, now) do
+  defp post_project(tenant_id, project_id, agent_id, {rows, by_class}, now) do
     attrs = %{
-      body: digest_body(rows, now, count),
+      body: digest_body(rows, now, by_class),
       key: digest_key(project_id, now),
       session_id: @digest_session
     }

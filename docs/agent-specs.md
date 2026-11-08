@@ -757,8 +757,11 @@ a `role: :user` key behind `RequireHumanAnchor`. The stage machine also refuses 
 minted, so a session cannot resolve the escalation it raised.
 
 `Loopctl.Workers.EscalationDigestWorker` runs daily. For each tenant it posts one coordination
-channel post per project holding `budget_exhausted` rows escalated more than an hour earlier: the
-count, the story ids and `work_left_behind`. It never posts `escalation_reason`, which is untrusted
+channel post per project holding escalated rows of any reason class, escalated more than an hour
+earlier: the count per class, the story ids with their class, and `work_left_behind`. Every class,
+because a triage escalation or a refused merge gate waits on a person exactly as a timed-out
+session does. The class is derived from the edge, never from the reason; it never posts
+`escalation_reason`, which is untrusted
 text and would reach every peer session's channel preview. The key is
 `escalation-digest:<project>:<UTC date>`, so a second run on the same day is `:already_posted`.
 It posts as the per-tenant system agent `system:escalation-digest`, a reserved prefix no key can
