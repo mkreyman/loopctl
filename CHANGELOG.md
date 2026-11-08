@@ -6,6 +6,10 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A ticket-requiring intake source no longer makes stories for ticketless issues
+  (2026-11-08).** With `triage_requires_ticket` set, an issue that carries no support ticket
+  stays an intake record and gets no "Triage pending" story; it is promoted if a ticket
+  appears later. Triage already skipped them, so they only cluttered the target epic.
 - **Production retries a story once before escalating (2026-11-08).** `fly.toml [env]` sets
   `DISPATCH_MAX_ATTEMPTS = "2"`: the first counted release (a lost lease, a crash, a `verify@1`
   reject) re-places the story, the second escalates `attempts_exhausted`. The code still has

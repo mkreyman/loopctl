@@ -119,8 +119,10 @@ defmodule Loopctl.Intake.Source do
     # before the field existed. True: only an issue whose intake record carries a `ticket_id`,
     # which `Loopctl.Intake.TicketFacts` keeps only when one `#HCB-xxxxxxxx` Ticket line and
     # one HomeCareBilling footer agree, as on an issue HomeCareBilling filed from a support
-    # ticket; any other stays at `detected` and costs nothing. Read at dispatch time, so an
-    # issue edited into or out of the format is judged as it stands. A FORMAT FILTER, not
+    # ticket. Any other record gets no story (`Loopctl.Workers.TriageTriggerWorker` leaves it
+    # `pending_triage`), and a story already waiting is not a triage candidate
+    # (`Loopctl.Agents.Candidates`). Both read the record as it stands, so an issue edited into
+    # the format is promoted and triaged on the next pass. A FORMAT FILTER, not
     # authentication: anyone who can open an issue can type both lines (a description that
     # repeats them voids them instead), so it separates HCB's ticket issues from issues filed
     # any other way, and trusts the repository's own write access for the rest.

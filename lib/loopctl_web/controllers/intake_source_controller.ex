@@ -109,7 +109,9 @@ defmodule LoopctlWeb.IntakeSourceController do
                                 "filed from a support ticket, recognised by the single " <>
                                 "`#HCB-xxxxxxxx` Ticket line intake extracts as " <>
                                 "`ticket_ref`, confirmed by its footer; every other issue " <>
-                                "stays detected and costs nothing. Read at dispatch time. A " <>
+                                "stays a pending_triage intake record and gets no story, " <>
+                                "and is promoted if it later gains a ticket. A story " <>
+                                "already waiting is filtered at triage. A " <>
                                 "format filter, not authentication: anyone who can open an " <>
                                 "issue can type the format. NOT nullable: null, a string " <>
                                 "(`true` and `0` as strings included) or any other " <>
