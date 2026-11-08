@@ -174,6 +174,7 @@ defmodule Loopctl.Delivery.Placement do
   alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
+  alias Loopctl.Delivery.Rework
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryPayload
@@ -1080,13 +1081,30 @@ defmodule Loopctl.Delivery.Placement do
              actor_lineage: session.lineage_path,
              actor_label: Keyword.get(opts, :actor_label, "control:dispatch")
            ) do
-        {:ok, object} -> {:ok, Map.put(dispatch, "story", object)}
-        {:error, reason} -> {:error, reason}
+        {:ok, object} ->
+          {:ok, dispatch |> Map.put("story", object) |> put_rework(tenant_id, story.id)}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     else
       {:ok, dispatch}
     end
   end
+
+  # A story the verifier rejected goes back to work on the pull request it already has, and
+  # the session is told so (contract 1.31.0, `Loopctl.Delivery.Rework`). Implement only: the
+  # contract refuses `rework` on any other kind. A caller-supplied `rework` is REPLACED, never
+  # kept, as a caller's `deadline_at` is — what a session is told to fix is loopctl's record,
+  # not the placing caller's.
+  defp put_rework(%{"kind" => "implement"} = dispatch, tenant_id, story_id) do
+    case Rework.for_story(tenant_id, story_id) do
+      nil -> Map.delete(dispatch, "rework")
+      rework -> Map.put(dispatch, "rework", rework)
+    end
+  end
+
+  defp put_rework(dispatch, _tenant_id, _story_id), do: Map.delete(dispatch, "rework")
 
   # WHETHER THE DISPATCH CARRIES A STORY OBJECT: its `kind` NAMED, and that kind's spec holding
   # a claim (`Spec.holds_claim?/1`, the `:build` archetype). This replaced a literal

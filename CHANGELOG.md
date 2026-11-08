@@ -6,6 +6,17 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A `verify@1` reject sends the story back to work at once, with the findings (2026-11-08).**
+  The reject used to leave the story at `implementing` with its claim held until the lease ran
+  out, and nothing re-dispatched it; the session that was finally placed was told nothing about
+  the open pull request or what was wrong. The reject now releases the claim as a counted
+  attempt, so `DISPATCH_MAX_ATTEMPTS` decides on the spot: below it the story is re-placed, at
+  it (production's unset default is 0) it is escalated `attempts_exhausted` for a person, and
+  `resolve_escalation` to `queued` re-places it.
+  - **Runner contract 1.31.0** (minor, additive): an `implement` dispatch may carry `rework`
+    (`pr_number`, `rejected_head_sha`, `findings`), and only an `implement` dispatch. The
+    session continues the open pull request on the same branch and opens no second one.
+    Re-vendor `priv/runner_contract/v1.json` to act on it; an older runner ignores the field.
 - **`spec_tuner@1` has its own budget pair: `SPEC_TUNE_WALL_CLOCK_SECONDS` and
   `SPEC_TUNE_MAX_TURNS` (2026-11-07).** It spent the triage pair until now, but the runner
   bounds a whole tuning run by that wall clock and the run replays every eval case twice, so a

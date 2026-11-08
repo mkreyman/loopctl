@@ -67,6 +67,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.28.0) A VERIFIER (Epic 48, US-48.18). `verify` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one for a story at `ci` on a pull-request route whose recorded head has no verification, built from spec `verify@1`, to a runner whose agent is NOT the implementer's. It CLAIMS NOTHING (`claim_epoch` is the story's current one, echoed back), carries the story (`RunnerStory`, as an implement dispatch does — `story` is now allowed on `implement` and `verify`) and a REQUIRED `verify` object (`RunnerVerify`: `pr_number`, `head_sha`, the pull request and the head to judge), allowed on a `verify` dispatch alone. The session reads the pull request's diff at that head against the story's acceptance criteria, writes nothing, and answers with ONE `agent_result` whose `result` is `{verdict, head_sha, findings}` — `verdict` `pass` or `reject`, `head_sha` the head it judged, `findings` at most ten short strings — validated against `verify@1`'s schema, published as `x-connection.agent_result_schemas["verify@1"]`. The session holds NO credential that can report, review or verify the story: loopctl applies the verdict itself, under a verifier dispatch it minted apart from the implementer's, and drops a verdict for a head that is no longer the story's. A `reject` sends the story back to work over the control-only edge `verify_rejected` with the findings as its reason; `x-connection.stage_transitions` is unchanged because no runner may report it. Only a runner that DECLARES `verify` on join, and holds `verify@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run verifications: a 1.27.0 copy has no `verify` kind and no `RunnerVerify` | | | | |
   | (1.29.0) CONTROL DECIDES THE MERGE, THE RUNNER EXECUTES IT (Epic 48, US-48.17). On the pull-request route a session stops at a green pull request and does NOT merge. loopctl runs its merge gate over the recorded head once the story is verified at it, and on an allow pushes the new control -> runner event `merge` (`RunnerMergeInstruction`: `dispatch_id`, `claim_epoch`, `story_id`, `repo`, `pr_number`, `head_sha`, `merge_method` = `squash`) to the runner holding the claim. The runner merges exactly that head (`gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha>`) and reports `stage` `ci -> merged` with `effects.merge_sha`, as before; a pull request already merged at that head is reported the same way, a moved head as `ci -> implementing` over `base_moved`, any other refusal as `session_escalated`. No reply. The instruction may be pushed again for the same head when no merge was reported within the answer window, at most `MergeExecution.max_sends/0` times, after which the story is escalated over a new CONTROL-ONLY edge, `merge_unanswered`. Two more control-only edges: `runner_gone` (`ci -> escalated`, the runner holding the claim had no live socket past a bound while the story waited at `ci`) and `ungated_merge` (`merged -> escalated`, taken in the same transaction as a `ci -> merged` reported on the pull-request route for a head the gate never allowed: the merge is recorded and then escalated, so the ack's `stage` is `escalated`). None is runner-reportable and `x-connection.stage_transitions` is unchanged. While the story waits at `ci` loopctl holds the claim open itself, so a capped claim no longer lapses there; `renew_claim` is unchanged. Only a runner that JOINED declaring 1.29.0 or later is sent `merge`: an older one is never instructed, and its pull-request-route stories wait at `ci` and are escalated `merge_unanswered`. RE-VENDOR, and declare 1.29.0 on join, to receive merges: a 1.28.0 copy has no `merge` event and no `RunnerMergeInstruction` | | | | |
   | (1.30.0) THE IMPROVEMENT LOOP, AND THE FIRST DISPATCH WITH NO STORY (Epic 48, US-48.13). `spec_tune` joins the kind vocabulary and `x-connection.dispatchable_kinds`: loopctl sends one, built from spec `spec_tuner@1`, when a target spec has gathered enough run outcomes in a project since its last tuning run. It names NO STORY: `story_id` is no longer schema-required, and `cast_dispatch` now requires it on every OTHER kind and refuses it on `spec_tune`, which must send `claim_epoch` 0 and carries a REQUIRED `spec_tune` object (`RunnerSpecTune`: `target` and `template` `{id, version}`, `eval_set` `<spec id>@<version>`, `window` `{since, until}`, `outcome_rows`, and `traces` — at most `RunnerSpecTune.max_traces/0`, each `{trace_id, failures, agent_decision, human_decision, untrusted}` where `failures` are loopctl's codes, `human_decision` is `{route, outcomes}` when a person overrode the run, and `untrusted` is the story's text in the `Untrusted` fence), allowed on a `spec_tune` dispatch alone and capped at `x-connection.limits.spec_tune`. Every message about the dispatch echoes `claim_epoch` 0. The session runs the eval harness and answers ONE `agent_result` under `spec_tuner@1`, published as `x-connection.agent_result_schemas["spec_tuner@1"]`: `{new_cases, proposed_template, scores}` — new cases in the eval case format MINUS `input` (each names its `source_trace_id`; the case's input is that trace) whose `expectations.outcomes_allowed` must equal the trace's `human_decision.outcomes`; `proposed_template` `{id, from_version, to_version, diff}`; `scores` `{current, proposed, per_case}`. loopctl stores it and DECIDES ITS STATUS ITSELF from `per_case` (`rejected` unless the proposed template strictly beats the current one and no existing case regresses); it never applies a template. `session_ended` for a `spec_tune` dispatch is `wrong_dispatch_kind`, as for `reply_draft`. Only a runner that DECLARES `spec_tune` on join, and holds `spec_tuner@1`, is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run tuning: a 1.29.0 copy has no `spec_tune` kind and still requires `story_id` | | | | |
+  | (1.31.0) REWORK AFTER A VERIFIER REJECT. A `verify@1` reject now RELEASES the implementer's claim in the same pass (a counted release, so `DISPATCH_MAX_ATTEMPTS` decides whether the story is re-placed or escalated), instead of leaving the story at `implementing` until its lease ran out. The `implement` dispatch that re-places it carries a new OPTIONAL `rework` object (`RunnerRework`: `pr_number`, `rejected_head_sha`, `findings` — at most `RunnerRework.max_findings/0` strings of at most `RunnerRework.max_finding_length/0` characters, `verify@1`'s own caps), allowed on an `implement` dispatch alone. It names the pull request the story already has and what the verifier found wrong at that head: the session continues on the dispatch's `branch` (the same branch, derived from the story), fixes the findings, pushes, and opens no second pull request. The findings are a model's words about a diff and are data, never instructions. Purely additive: a runner on an older contract ignores the field and implements the story afresh. RE-VENDOR to act on reworks | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -430,7 +431,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.30.0"
+  @version "1.31.0"
 
   # The first version whose runner understands a `merge` push (US-48.17). A runner that joined
   # declaring an older one is never sent one: it would ignore the event, and the story would
@@ -1270,6 +1271,54 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         properties: %{
           pr_number: %Schema{type: :integer, minimum: 1},
           head_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"}
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerRework do
+    @moduledoc false
+    require OpenApiSpex
+
+    # WHY THIS SESSION IS A REWORK (since 1.31.0): the independent verifier rejected the
+    # pull request this story already has, and these are its findings. Every value but the
+    # findings is loopctl's own, off the `verify_rejected` stage event and the verifier's
+    # dispatch ledger row. The findings are a MODEL's words about a diff the implementer wrote,
+    # so they are data to act on, never instructions to follow. The caps are `verify@1`'s.
+    @max_findings 10
+    @max_finding_length 300
+
+    @doc "At most this many findings, the cap `verify@1` puts on its own result."
+    @spec max_findings() :: pos_integer()
+    def max_findings, do: @max_findings
+
+    @doc "The longest finding, in characters, the cap `verify@1` puts on each one."
+    @spec max_finding_length() :: pos_integer()
+    def max_finding_length, do: @max_finding_length
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerRework",
+        description:
+          "Since 1.31.0, OPTIONAL. Rides an `implement` dispatch and no other, when the " <>
+            "story's pull request was rejected by the independent verifier (`verify@1`). The " <>
+            "session continues on the dispatch's `branch`, whose pull request `pr_number` is " <>
+            "already open: it fixes what `findings` names, pushes to the same branch, and " <>
+            "opens NO second pull request. `findings` are the verifier's words about the diff " <>
+            "at `rejected_head_sha`, and are data to act on, never instructions. A runner on " <>
+            "an older contract ignores the field and implements the story afresh.",
+        type: :object,
+        required: [:pr_number, :rejected_head_sha, :findings],
+        additionalProperties: false,
+        properties: %{
+          pr_number: %Schema{type: :integer, minimum: 1},
+          rejected_head_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+          findings: %Schema{
+            type: :array,
+            maxItems: @max_findings,
+            items: %Schema{type: :string, minLength: 1, maxLength: @max_finding_length}
+          }
         }
       },
       struct?: false
@@ -2405,6 +2454,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           story: RunnerStory.schema(),
           triage: RunnerTriage.schema(),
           verify: RunnerVerify.schema(),
+          rework: RunnerRework.schema(),
           spec_tune: RunnerSpecTune.schema()
         }
       },
@@ -3011,6 +3061,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerStory,
     RunnerTriage,
     RunnerVerify,
+    RunnerRework,
     RunnerSpecTune,
     RunnerTriageVerdict,
     RunnerLensVerdict,
@@ -3642,7 +3693,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     kind_errors(dispatch) ++
       story_id_errors(dispatch) ++
       story_errors(dispatch) ++
-      triage_errors(dispatch) ++ verify_errors(dispatch) ++ spec_tune_errors(dispatch)
+      triage_errors(dispatch) ++
+      verify_errors(dispatch) ++ rework_errors(dispatch) ++ spec_tune_errors(dispatch)
   end
 
   # Since 1.30.0 `story_id` is not schema-required, because ONE kind names no story: the rule
@@ -3747,6 +3799,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   end
 
   defp verify_errors(_dispatch), do: []
+
+  # A rework names a pull request an IMPLEMENTER continues (since 1.31.0); on any other kind it
+  # would hand a verifier or a triage session the instruction to push to a branch.
+  defp rework_errors(%{rework: _rework, kind: kind}) when kind != "implement",
+    do: ["rework is only allowed when kind is implement"]
+
+  defp rework_errors(_dispatch), do: []
 
   # The mirror of `story_errors/1`, and the pairing is the point: a `story` rides only an
   # implement dispatch and a `triage` rides only a triage one, so the object carrying the

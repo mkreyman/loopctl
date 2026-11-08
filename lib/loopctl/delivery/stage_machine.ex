@@ -130,7 +130,9 @@ defmodule Loopctl.Delivery.StageMachine do
 
   - `:verify_rejected` — ci -> implementing, when the independently rooted verifier session
     of `verify@1` answers `reject` for the story's CURRENT head
-    (`Loopctl.Agents.VerifyVerdict`). The findings are the reason. Its own edge rather than
+    (`Loopctl.Agents.VerifyVerdict`). The findings are the reason. The same pass then releases
+    the claim over `:claim_released`, a counted attempt, so the story is re-placed with a
+    `rework` (`Loopctl.Delivery.Rework`) or escalated at the retry ceiling. Its own edge rather than
     `:review_findings` or `:ci_red`, because both of those are a runner's own report and `ci`
     is a runner source stage: reusing one would let an implementing session write the
     verifier's verdict about itself
