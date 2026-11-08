@@ -3300,6 +3300,7 @@ defmodule Loopctl.Fixtures do
         repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
         webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
         revoked_at: Map.get(attrs, :revoked_at),
+        triage_requires_ticket: Map.get(attrs, :triage_requires_ticket, false),
         inserted_at: now,
         updated_at: now
       })
@@ -3309,6 +3310,7 @@ defmodule Loopctl.Fixtures do
         tenant_id: tenant_id,
         source_id: source.id,
         project_id: project_id,
+        ticket_id: Map.get(attrs, :ticket_id),
         issue_number: Map.get(attrs, :issue_number, System.unique_integer([:positive])),
         untrusted_title: Map.get(attrs, :untrusted_title, "a reported problem"),
         # Overridable so a test can build a record the triage payload cannot fit: the bound

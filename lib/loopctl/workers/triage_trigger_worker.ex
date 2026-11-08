@@ -242,6 +242,7 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # is no next run for this record: it is excluded from every later read. A log line that says
   # the opposite of what happens is worse than the clause it saves.
   defp disposition(:source_revoked), do: :skip
+  defp disposition(:ticket_required), do: :skip
 
   # Everything else self-heals on the next pass — see "Escalate what a human must clear" above.
   defp disposition(_reason), do: :retry
@@ -310,6 +311,11 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
     resolves to no source OF THIS TENANT is kept — `promote/1` fails that closed with
     `:source_not_found` and the record escalates, which is a data inconsistency somebody has
     to look at rather than something to drop silently;
+  - the TICKET: a source with `triage_requires_ticket` promotes only a record carrying a
+    `ticket_id`. Any other record stays `pending_triage` and makes no story, because triage
+    would never take it (`Loopctl.Agents.Candidates`, `:requires_ticket_if_source_says`) and
+    a story nobody will work is clutter in the epic. Excluded from the read for the same
+    reason a revoked source is; a record that gains a ticket later is promoted then;
   - the STAGE ROW: its absence is what makes a record a candidate, story or no story.
 
   Neither join can multiply a row — `stories_intake_record_uidx` permits one story per
@@ -337,6 +343,7 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
       on: st.story_id == s.id and st.tenant_id == s.tenant_id,
       where: r.status == :pending_triage,
       where: is_nil(src.id) or is_nil(src.revoked_at),
+      where: is_nil(src.id) or not src.triage_requires_ticket or not is_nil(r.ticket_id),
       where: is_nil(st.id),
       order_by: [asc: r.inserted_at, asc: r.id],
       limit: @batch,
