@@ -258,6 +258,9 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # first read after its `ticket_id` is set promotes it.
   defp disposition(:ticket_required), do: :skip
 
+  # Its issue is closed. Excluded from the read too; it returns once a reopen sets issue_state.
+  defp disposition(:issue_closed), do: :skip
+
   # Everything else self-heals on the next pass — see "Escalate what a human must clear" above.
   defp disposition(_reason), do: :retry
 
@@ -331,7 +334,9 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
     a story nobody will work is clutter in the epic. Excluded from the read for the same
     reason a revoked source is; a record that gains a ticket later is promoted then;
   - the ISSUE STATE: a record whose issue is closed makes no story, the same rule triage
-    applies (`:issue_not_closed`). A reopened issue arrives as a new generation record;
+    applies (`:issue_not_closed`). Such a record has no story and no closure row, so a reopen
+    is applied to the SAME record (`Loopctl.Intake`, a reopen of a record with no story yet):
+    its `issue_state` goes back to open and the next read promotes it;
   - the STAGE ROW: its absence is what makes a record a candidate, story or no story.
 
   Neither join can multiply a row — `stories_intake_record_uidx` permits one story per

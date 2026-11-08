@@ -211,11 +211,22 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
           ticket_id: Ecto.UUID.generate()
         })
 
-      record |> Ecto.Changeset.change(issue_state: "closed") |> AdminRepo.update!()
+      closed = record |> Ecto.Changeset.change(issue_state: "closed") |> AdminRepo.update!()
 
       refute record.id in candidate_ids(tenant)
       assert :ok = run(tenant)
       assert story_for(record.id) == nil
+
+      # The race backstop: promote/1 refuses it on its own.
+      assert {:error, :issue_closed} = TriageTrigger.promote(closed)
+
+      # A reopen of a record with no story is applied to the same record (Loopctl.Intake), so
+      # its issue_state goes back to open and the next run promotes it.
+      closed |> Ecto.Changeset.change(issue_state: "open") |> AdminRepo.update!()
+
+      assert record.id in candidate_ids(tenant)
+      assert :ok = run(tenant)
+      assert %Story{} = story_for(record.id)
     end
 
     test "a source that does not require a ticket still promotes a ticketless record", %{
