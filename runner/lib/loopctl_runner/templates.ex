@@ -225,8 +225,8 @@ defmodule LoopctlRunner.Templates do
   @doc """
   Renders `template`'s prompt from its inputs:
 
-    * implement@1 — `%{story: story_object, where: %{repo, branch, base, mode}}`
-      (`DispatchPrompt.build/2`);
+    * implement@1 — `%{story: story_object, where: %{repo, branch, base, mode, rework}}`
+      (`DispatchPrompt.build/2`), `rework` being the dispatch's (contract 1.31.0) or `nil`;
     * triage@1 — `%{triage: triage_object, repo: repo, opts: opts}` (`TriagePrompt.build/3`);
     * reply_draft@1 — `%{triage: triage_object, repo: repo}` (`ReplyDraftPrompt.build/2`);
     * verify@1 — `%{verify: subject, repo: repo, opts: opts}` (`VerifyPrompt.build/3`), the

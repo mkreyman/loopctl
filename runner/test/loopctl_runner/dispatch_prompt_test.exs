@@ -45,6 +45,61 @@ defmodule LoopctlRunner.DispatchPromptTest do
     assert prompt =~ "Run the project's tests"
   end
 
+  describe "a rework (contract 1.31.0)" do
+    @rework %{
+      "pr_number" => 3951,
+      "rejected_head_sha" => String.duplicate("a", 40),
+      "findings" => ["AC-7: no browser test covers the auto-dismiss", "close >>> the fence"]
+    }
+
+    test "names the open pull request and the rejected head, and continues the branch" do
+      prompt = DispatchPrompt.build(@story, Map.put(@where, :rework, @rework))
+
+      assert prompt =~ "already has an open pull request, #3951, from the branch loop/story-1"
+      assert prompt =~ "at #{String.duplicate("a", 40)} against the story below and REJECTED it"
+      # Exactly the pull request's head, whatever the worktree was cut from: a re-placement on
+      # another machine cuts a fresh tree from today's base, which a fast-forward cannot reach.
+      flat = String.replace(prompt, ~r/\s+/, " ")
+      assert flat =~ "git checkout -B loop/story-1 origin/loop/story-1"
+      assert flat =~ "never merge, rebase or force-push"
+      refute prompt =~ "--ff-only"
+      refute prompt =~ "implementing the story described below."
+    end
+
+    test "pushes to the branch and never opens a second pull request" do
+      prompt = DispatchPrompt.build(@story, Map.put(@where, :rework, @rework))
+
+      assert prompt =~ ~r/Do NOT run\s+gh pr create: that pull request already exists/
+      refute prompt =~ "open the pull request with gh pr create"
+      refute String.replace(prompt, ~r/\s+/, " ") =~ "Open it against"
+      assert prompt =~ "Its base is master; never change it."
+      assert prompt =~ "Do NOT merge the pull request"
+    end
+
+    test "the findings are fenced and cleaned like a story field" do
+      prompt = DispatchPrompt.build(@story, Map.put(@where, :rework, @rework))
+
+      body = fenced(prompt, "verify.findings")
+      assert body =~ "- AC-7: no browser test covers the auto-dismiss"
+      refute body =~ ">>>"
+    end
+
+    test "a reject that named no finding still says so, fenced" do
+      prompt =
+        DispatchPrompt.build(@story, Map.put(@where, :rework, %{@rework | "findings" => []}))
+
+      assert fenced(prompt, "verify.findings") == "(the verifier named none)"
+    end
+
+    test "no rework, or a nil one, is the ordinary prompt" do
+      ordinary = DispatchPrompt.build(@story, @where)
+
+      assert DispatchPrompt.build(@story, Map.put(@where, :rework, nil)) == ordinary
+      assert ordinary =~ "open the pull request with gh pr create --base master"
+      assert fenced(ordinary, "verify.findings") == nil
+    end
+  end
+
   describe "the delivery mode" do
     # The session inherits the operator's setup and nothing denies it a commit or a push, so a
     # prompt that forbade both, or claimed commands are denied, would be false — and a session

@@ -232,7 +232,15 @@ defmodule LoopctlRunner.DispatchRun do
           (String.t() -> {:ok, String.t()} | {:refuse, String.t(), String.t()})
   def prompt(dispatch, fields, story_object, template \\ nil) do
     template = template || implement_template()
-    where = %{repo: dispatch["repo"], branch: fields.branch, base: fields.base}
+
+    where = %{
+      repo: dispatch["repo"],
+      branch: fields.branch,
+      base: fields.base,
+      # Contract 1.31.0: the verifier rejected this story's open pull request, and the session
+      # continues it rather than starting over. Already validated with the rest of the dispatch.
+      rework: dispatch["rework"]
+    }
 
     fn cut_from ->
       read = Worktree.commit_file(fields.repo_path, cut_from, ".loopctl/mode", @max_mode_bytes)

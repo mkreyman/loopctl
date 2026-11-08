@@ -1424,6 +1424,38 @@ defmodule LoopctlRunner.RunTest do
     end
   end
 
+  # The wiring: the dispatch's `rework` (contract 1.31.0) reaches the prompt the session gets.
+  test "a dispatch carrying a rework renders the rework prompt", %{root: root} do
+    alias LoopctlRunner.DispatchRun
+
+    repo = Path.join(root, "repo")
+    File.mkdir_p!(Path.join(repo, ".loopctl"))
+    File.write!(Path.join([repo, ".loopctl", "mode"]), "pr\n")
+    git!(repo, ["add", ".loopctl/mode"])
+    git!(repo, ["commit", "-q", "-m", "mode"])
+    cut_from = git!(repo, ["rev-parse", "master"])
+
+    fields = %{repo: "fixture", repo_path: repo, base: "master", branch: "loop/s1"}
+    story = %{"id" => LoopctlRunner.Session.uuid4(), "title" => "t"}
+
+    rework = %{
+      "pr_number" => 41,
+      "rejected_head_sha" => String.duplicate("b", 40),
+      "findings" => ["AC-2 unmet"]
+    }
+
+    dispatch = %{"repo" => "mkreyman/fixture", "rework" => rework}
+
+    assert {:ok, prompt} = DispatchRun.prompt(dispatch, fields, story).(cut_from)
+    assert prompt =~ "already has an open pull request, #41, from the branch loop/s1"
+    assert prompt =~ "AC-2 unmet"
+
+    assert {:ok, ordinary} =
+             DispatchRun.prompt(Map.delete(dispatch, "rework"), fields, story).(cut_from)
+
+    refute ordinary =~ "#41"
+  end
+
   test "a re-run adopting a worktree takes it over in the registry", %{root: root, state: state} do
     first = run!(root, state, [{"FAKE_CLAUDE_MODE", "write_file"}])
     assert {:ok, %{"worktree" => %{"status" => "kept"}}} = RunState.read(first.run_dir)
