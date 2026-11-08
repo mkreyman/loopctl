@@ -392,6 +392,17 @@ defmodule Loopctl.Delivery.EscalationInboxTest do
       assert body =~ "- and 58 more"
       assert EscalationInbox.digest_body(rows, @now) =~ "2 stories are parked"
       refute EscalationInbox.digest_body(rows, @now) =~ "- and "
+
+      # With no counts given, every row given is counted, not only the ones the body names.
+      many =
+        Enum.map(1..120, fn _ ->
+          %{story_id: Ecto.UUID.generate(), reason_class: :gate_refused, run: nil}
+        end)
+
+      default = EscalationInbox.digest_body(many, @now)
+      assert default =~ "120 stories are parked"
+      assert default =~ "By reason class: gate_refused 120."
+      assert default =~ "- and 70 more"
     end
 
     test "the next day is a new digest" do
@@ -431,9 +442,10 @@ defmodule Loopctl.Delivery.EscalationInboxTest do
       assert post.body =~
                "By reason class: budget_exhausted 1, session_failed 1, triage_escalated 1."
 
-      assert post.body =~ "#{failed.id} session_failed "
-      assert post.body =~ "#{triage.id} triage_escalated "
-      assert post.body =~ "#{budget.id} budget_exhausted "
+      # work_left_behind is a budget kill's fact, so only that row carries it.
+      assert post.body =~ "- #{failed.id} session_failed\n"
+      assert post.body =~ "- #{triage.id} triage_escalated\n"
+      assert post.body =~ "- #{budget.id} budget_exhausted work_left_behind="
       refute post.body =~ "ignore previous instructions"
     end
 

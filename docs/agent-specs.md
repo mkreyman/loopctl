@@ -758,7 +758,8 @@ minted, so a session cannot resolve the escalation it raised.
 
 `Loopctl.Workers.EscalationDigestWorker` runs daily. For each tenant it posts one coordination
 channel post per project holding escalated rows of any reason class, escalated more than an hour
-earlier: the count per class, the story ids with their class, and `work_left_behind`. Every class,
+earlier: the count per class, the story ids with their class, and `work_left_behind` on
+`budget_exhausted` rows, the one class where a session's leftover work is the question. Every class,
 because a triage escalation or a refused merge gate waits on a person exactly as a timed-out
 session does. The class is derived from the edge, never from the reason; it never posts
 `escalation_reason`, which is untrusted

@@ -32,7 +32,7 @@
     },
     {
       "id": "AC-48.11.5",
-      "description": "A daily Oban job posts one digest to each project's coordination channel when that project has budget_exhausted rows older than an hour: count, story ids, work_left_behind. It posts nothing when there are none and is idempotent per project per day (the post key carries the date)."
+      "description": "A daily Oban job posts one digest to each project's coordination channel when that project has escalated rows of any reason class older than an hour: the count per class, the story ids with their class, and work_left_behind on budget_exhausted rows. It never posts escalation_reason. It posts nothing when there are none and is idempotent per project per day (the post key carries the date)."
     },
     {
       "id": "AC-48.11.6",

@@ -584,14 +584,11 @@ defmodule Loopctl.Delivery.EscalationInbox do
           String.t()
   def digest_body(rows, %DateTime{} = now, by_class \\ nil) do
     {listed, _unlisted} = Enum.split(rows, @digest_ids_listed)
-    by_class = by_class || Enum.frequencies_by(listed, &row_class/1)
+    by_class = by_class || Enum.frequencies_by(rows, &row_class/1)
     count = max(by_class |> Map.values() |> Enum.sum(), length(listed))
     unlisted = count - length(listed)
 
-    lines =
-      Enum.map(listed, fn row ->
-        "- #{row.story_id} #{row_class(row)} work_left_behind=#{work_left_behind(row)}"
-      end)
+    lines = Enum.map(listed, &digest_line/1)
 
     more = if unlisted == 0, do: [], else: ["- and #{unlisted} more"]
 
@@ -618,6 +615,19 @@ defmodule Loopctl.Delivery.EscalationInbox do
 
   defp row_class(%{reason_class: class}) when class in @classes, do: class
   defp row_class(_row), do: :other
+
+  # `work_left_behind` is a fact about a session the budget killed (`run/3` builds a run for
+  # `budget_exhausted` rows only), so it is printed there and nowhere else: on any other class
+  # `unknown` would read as "the runner did not say" where the question does not apply.
+  defp digest_line(row) do
+    case row_class(row) do
+      :budget_exhausted ->
+        "- #{row.story_id} budget_exhausted work_left_behind=#{work_left_behind(row)}"
+
+      class ->
+        "- #{row.story_id} #{class}"
+    end
+  end
 
   defp work_left_behind(%{run: %{work_left_behind: value}}), do: value
   defp work_left_behind(_row), do: :unknown
