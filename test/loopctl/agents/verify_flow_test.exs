@@ -23,6 +23,7 @@ defmodule Loopctl.Agents.VerifyFlowTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Delivery.ImplementerStart
+  alias Loopctl.Delivery.Rework
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -509,10 +510,19 @@ defmodule Loopctl.Agents.VerifyFlowTest do
                  answer(ctx, payload, %{"verdict" => "reject", "findings" => findings})
                )
 
+      # Released at once as a counted attempt, below the test ceiling: back in the queue for
+      # the driver, with the pull request kept for the next session.
       row = stage(ctx)
-      assert row.stage == :implementing
+      assert row.stage == :queued
       assert row.head_sha == nil
       assert row.verified_head_sha == nil
+      assert row.pr_number == 77
+      assert row.attempts["claim_released"] == 1
+
+      released = story(ctx)
+      assert released.agent_status == :contracted
+      assert is_nil(released.assigned_agent_id)
+      assert released.verified_status == :unverified
 
       assert [event] =
                AdminRepo.all(
@@ -521,8 +531,109 @@ defmodule Loopctl.Agents.VerifyFlowTest do
                )
 
       assert inspect(event.data) =~ "no test covers the empty list"
-      assert story(ctx).verified_status == :unverified
+      assert event.data["payload"]["verify"]["dispatch_id"] == b.id
       refute is_nil(dispatch(b.id).revoked_at)
+
+      # What the next implement dispatch is told (contract 1.31.0).
+      assert Rework.for_story(ctx.tenant.id, ctx.story.id) == %{
+               "pr_number" => 77,
+               "rejected_head_sha" => ctx.head,
+               "findings" => findings
+             }
+
+      # ...on the branch the pull request was opened on, which the release keeps.
+      assert is_binary(row.branch)
+      assert {_rework, branch} = Rework.for_placement(ctx.tenant.id, ctx.story.id)
+      assert branch == row.branch
+    end
+
+    test "a retried job whose reject committed but whose release was lost releases the claim",
+         ctx do
+      payload = placed!(ctx)
+      b = dispatch(payload["dispatch_id"])
+      args = answer(ctx, payload, %{"verdict" => "reject", "findings" => ["AC-1 unmet"]})
+      row = stage(ctx)
+
+      # The first attempt's reject, committed, and then the job died: no revoke, no release.
+      assert {:ok, _row} =
+               Stages.advance(ctx.tenant.id, ctx.story.id, {:ci, :implementing, :verify_rejected},
+                 claim_epoch: story(ctx).claim_epoch,
+                 event_data: %{
+                   "verify" => %{
+                     "dispatch_id" => b.id,
+                     "head_sha" => ctx.head,
+                     "pr_number" => row.pr_number,
+                     "branch" => row.branch
+                   }
+                 },
+                 actor_label: "test:crashed_verdict",
+                 actor_role: :agent,
+                 actor_lineage: []
+               )
+
+      assert stage(ctx).stage == :implementing
+
+      assert {:ok, :rejected} = VerifyVerdict.apply(args)
+      assert stage(ctx).stage == :queued
+      assert stage(ctx).attempts["claim_released"] == 1
+      refute is_nil(dispatch(b.id).revoked_at)
+
+      # A third run finds the claim released and releases nothing more.
+      assert {:ok, _} = VerifyVerdict.apply(args)
+      assert stage(ctx).attempts["claim_released"] == 1
+    end
+
+    test "a story never rejected, or one re-triaged since its reject, carries no rework", ctx do
+      assert Rework.for_story(ctx.tenant.id, ctx.story.id) == nil
+
+      payload = placed!(ctx)
+
+      assert {:ok, :rejected} =
+               VerifyVerdict.apply(
+                 answer(ctx, payload, %{"verdict" => "reject", "findings" => ["AC-1 unmet"]})
+               )
+
+      refute is_nil(Rework.for_story(ctx.tenant.id, ctx.story.id))
+
+      # A later transition into `detected` (a human re-triage) starts the story over.
+      row = stage(ctx)
+
+      AdminRepo.insert!(%StageEvent{
+        tenant_id: ctx.tenant.id,
+        story_stage_id: row.id,
+        story_id: ctx.story.id,
+        event: "transitioned",
+        from_stage: "escalated",
+        to_stage: "detected",
+        edge: "human_resolution",
+        claim_epoch: row.claim_epoch,
+        lock_version: row.lock_version + 1,
+        data: %{}
+      })
+
+      assert Rework.for_story(ctx.tenant.id, ctx.story.id) == nil
+    end
+
+    test "rework is refused on any kind but implement by the contract" do
+      dispatch = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "story_id" => Ecto.UUID.generate(),
+        "kind" => "triage",
+        "repo" => "o/r",
+        "base_branch" => "main",
+        "branch" => "loop/x",
+        "claim_epoch" => 1,
+        "wall_clock_seconds" => 60,
+        "max_turns" => 5,
+        "rework" => %{
+          "pr_number" => 1,
+          "rejected_head_sha" => String.duplicate("a", 40),
+          "findings" => []
+        }
+      }
+
+      assert {:error, errors} = RunnerContract.cast_dispatch(dispatch)
+      assert inspect(errors) =~ "rework is only allowed when kind is implement"
     end
   end
 

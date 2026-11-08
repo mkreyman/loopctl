@@ -52,8 +52,11 @@ defmodule Loopctl.Agents.VerifyVerdict do
 
   ## `reject`
 
-  `{:ci, :implementing, :verify_rejected}`, the findings as its reason, with a row guard that
-  the head is still the judged one. Then B is revoked.
+  `{:ci, :implementing, :verify_rejected}`, the findings as its reason and B's id, the head and
+  the pull request on the event, with a row guard that the head is still the judged one. Then B
+  is revoked and the implementer's claim is released as a counted attempt, so the retry ceiling
+  re-places or escalates the story at once; the re-placed implement dispatch carries the
+  findings (`Loopctl.Delivery.Rework`).
 
   ## Failures
 
@@ -70,6 +73,7 @@ defmodule Loopctl.Agents.VerifyVerdict do
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Audit
   alias Loopctl.Delivery.ImplementerStart
+  alias Loopctl.Delivery.Rework
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Dispatches
@@ -238,12 +242,34 @@ defmodule Loopctl.Agents.VerifyVerdict do
       %StoryStage{verified_head_sha: ^judged} when is_binary(judged) ->
         if story.verified_status == :verified, do: {:already, :verified}, else: :pending
 
+      %StoryStage{stage: :implementing} = row ->
+        released_on_retry(tenant_id, row, dispatch_id)
+
       _ ->
         :pending
     end
   end
 
   defp already_applied(_tenant_id, _story, _dispatch_id, _args), do: :pending
+
+  # A job re-run after its reject committed and before the claim release ran. The reject is
+  # recorded, so it is not applied again; the release, which nothing else would make, is made
+  # now, and so is B's revoke, which runs first on the first attempt and may be the step the
+  # crash took. Anything that moved the story since (a release, a new claim, a later
+  # transition) leaves this `:pending`, and the stale-verdict drop below answers it as before.
+  defp released_on_retry(tenant_id, row, dispatch_id) do
+    if Rework.unreleased_reject?(tenant_id, row, dispatch_id) do
+      case Dispatches.get_dispatch(tenant_id, dispatch_id) do
+        {:ok, %Dispatch{revoked_at: nil} = b} -> revoke(tenant_id, b)
+        _ -> :ok
+      end
+
+      release_for_rework(tenant_id, row.story_id)
+      {:already, :rejected}
+    else
+      :pending
+    end
+  end
 
   # ── the checks ──────────────────────────────────────────────────────────────────────────────
 
@@ -306,6 +332,14 @@ defmodule Loopctl.Agents.VerifyVerdict do
     case Stages.advance(tenant_id, story.id, {:ci, :implementing, :verify_rejected},
            claim_epoch: story.claim_epoch,
            reason: rejection_reason(args["findings"]),
+           event_data: %{
+             "verify" => %{
+               "dispatch_id" => verifier.id,
+               "head_sha" => head,
+               "pr_number" => stage.pr_number,
+               "branch" => stage.branch
+             }
+           },
            actor_label: @actor_label,
            actor_role: :agent,
            actor_lineage: [],
@@ -315,6 +349,7 @@ defmodule Loopctl.Agents.VerifyVerdict do
          ) do
       {:ok, _row} ->
         revoke(tenant_id, verifier)
+        release_for_rework(tenant_id, story.id)
         {:ok, :rejected}
 
       {:error, reason} when reason in [:verdict_stale, :stale_stage, :stale_claim_epoch] ->
@@ -323,6 +358,42 @@ defmodule Loopctl.Agents.VerifyVerdict do
       {:error, reason} ->
         fail(tenant_id, story.id, verifier, reason)
     end
+  end
+
+  # THE CLAIM GOES BACK WITH THE REJECT. The implementer's session ended at the green pull
+  # request, so nothing holds the claim but its lease, and nothing re-dispatches a story at
+  # `implementing`: left alone it sat there until the lease cap lapsed, which the ci hold had
+  # pushed hours out (900.224, 2026-11-08). Released as a COUNTED attempt, so the retry ceiling
+  # decides now — re-placed below it, with the findings riding the next implement dispatch
+  # (`Loopctl.Delivery.Rework`), escalated at it.
+  #
+  # After the reject commits, never inside it: a refused release leaves the reject standing
+  # and the lease reclaim as the backstop it was before, rather than undoing the verdict.
+  defp release_for_rework(tenant_id, story_id) do
+    case Progress.force_unclaim_story(tenant_id, story_id,
+           actor_label: @actor_label,
+           actor_lineage: [],
+           release_cause: :attempt
+         ) do
+      {:ok, _story} ->
+        :ok
+
+      other ->
+        Logger.error(
+          "verify reject recorded but the claim was not released; the lease reclaim will: " <>
+            "tenant_id=#{tenant_id} story_id=#{story_id} result=#{inspect(other)}",
+          tenant_id: tenant_id,
+          story_id: story_id
+        )
+    end
+  rescue
+    error ->
+      Logger.error(
+        "verify reject recorded but the claim release raised; the lease reclaim will: " <>
+          "tenant_id=#{tenant_id} story_id=#{story_id} error=#{Exception.message(error)}",
+        tenant_id: tenant_id,
+        story_id: story_id
+      )
   end
 
   defp report(tenant_id, story_id, verifier) do
