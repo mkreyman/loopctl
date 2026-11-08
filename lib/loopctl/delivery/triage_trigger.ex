@@ -89,6 +89,7 @@ defmodule Loopctl.Delivery.TriageTrigger do
           | :story_number_exhausted
           | :source_not_found
           | :ticket_required
+          | :issue_closed
           | {:stage_not_opened, :not_found | :busy}
           | {:intake_record_already_linked, Ecto.UUID.t() | nil}
           | :epic_not_found
@@ -99,12 +100,14 @@ defmodule Loopctl.Delivery.TriageTrigger do
 
   Returns `{:ok, story}` — including when the story already existed, see the moduledoc — or
   `{:error, reason}`. The caller retries the record on `:no_target_epic` and skips it on
-  `:ticket_required` (a ticketless record on a source with `triage_requires_ticket`).
+  `:ticket_required` (a ticketless record on a source with `triage_requires_ticket`) and
+  `:issue_closed` (its issue is closed; a reopen makes it promotable again).
   """
   @spec promote(Record.t()) :: {:ok, map()} | {:error, error()}
   def promote(%Record{} = record) do
     with {:ok, source} <- live_source(record),
          :ok <- ticket_admitted(source, record),
+         :ok <- issue_open(record),
          {:ok, epic_id} <- target_epic(source),
          {:ok, story} <- create(record, source, epic_id),
          {:ok, _row} <- opened(record.tenant_id, story.id) do
@@ -152,6 +155,11 @@ defmodule Loopctl.Delivery.TriageTrigger do
     do: {:error, :ticket_required}
 
   defp ticket_admitted(%Source{}, %Record{}), do: :ok
+
+  # Only an open issue gets a story: triage never takes a closed one (`:issue_not_closed`).
+  # A reopen writes `issue_state` back onto the same record, which then promotes.
+  defp issue_open(%Record{issue_state: "closed"}), do: {:error, :issue_closed}
+  defp issue_open(%Record{}), do: :ok
 
   defp target_epic(%Source{target_epic_id: nil}), do: {:error, :no_target_epic}
   defp target_epic(%Source{target_epic_id: id}), do: {:ok, id}
