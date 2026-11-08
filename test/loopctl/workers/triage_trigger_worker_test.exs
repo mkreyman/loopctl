@@ -203,6 +203,21 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       assert story_for(record.id) == nil
     end
 
+    test "a record whose issue is closed makes no story", %{tenant: tenant} do
+      {_source, record} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant.id,
+          triage_requires_ticket: true,
+          ticket_id: Ecto.UUID.generate()
+        })
+
+      record |> Ecto.Changeset.change(issue_state: "closed") |> AdminRepo.update!()
+
+      refute record.id in candidate_ids(tenant)
+      assert :ok = run(tenant)
+      assert story_for(record.id) == nil
+    end
+
     test "a source that does not require a ticket still promotes a ticketless record", %{
       tenant: tenant
     } do

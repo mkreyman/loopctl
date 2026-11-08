@@ -330,6 +330,8 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
     would never take it (`Loopctl.Agents.Candidates`, `:requires_ticket_if_source_says`) and
     a story nobody will work is clutter in the epic. Excluded from the read for the same
     reason a revoked source is; a record that gains a ticket later is promoted then;
+  - the ISSUE STATE: a record whose issue is closed makes no story, the same rule triage
+    applies (`:issue_not_closed`). A reopened issue arrives as a new generation record;
   - the STAGE ROW: its absence is what makes a record a candidate, story or no story.
 
   Neither join can multiply a row — `stories_intake_record_uidx` permits one story per
@@ -358,6 +360,7 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
       where: r.status == :pending_triage,
       where: is_nil(src.id) or is_nil(src.revoked_at),
       where: is_nil(src.id) or not src.triage_requires_ticket or not is_nil(r.ticket_id),
+      where: is_nil(r.issue_state) or r.issue_state != "closed",
       where: is_nil(st.id),
       order_by: [asc: r.inserted_at, asc: r.id],
       limit: @batch,
