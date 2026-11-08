@@ -86,6 +86,15 @@ kill_timeout = 90
   DISPATCH_WALL_CLOCK_SECONDS = "7200"
   DISPATCH_MAX_TURNS = "400"
 
+  # THE RETRY CEILING (US-44.4). Counted releases a story may take and still be re-placed:
+  # a lease that ran out, a runner crash, a verify@1 reject. A release retries while the
+  # count INCLUDING it is below this, so "2" is one retry: the second counted release
+  # escalates attempts_exhausted to a person. Mark said on 2026-11-08 to give one retry by
+  # default, because a verify reject now carries its findings to the next implement
+  # (#1032) and a second attempt is worth paying for. The code keeps no default (#875); this
+  # line is production's choice. Worst case per story is two runs at the budgets above.
+  DISPATCH_MAX_ATTEMPTS = "2"
+
   # THE FLEET MULTIPLIER. The two budgets above bound ONE session; what we actually spend is
   # that times how many run at once, so the multiplier belongs next to the multiplicand or
   # the block states half a cost policy. This is the TENANT-WIDE admission cap

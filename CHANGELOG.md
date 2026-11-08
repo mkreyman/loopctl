@@ -6,12 +6,16 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Production retries a story once before escalating (2026-11-08).** `fly.toml [env]` sets
+  `DISPATCH_MAX_ATTEMPTS = "2"`: the first counted release (a lost lease, a crash, a `verify@1`
+  reject) re-places the story, the second escalates `attempts_exhausted`. The code still has
+  no default, so a self-hosted deploy that leaves it unset keeps escalating on the first.
 - **A `verify@1` reject sends the story back to work at once, with the findings (2026-11-08).**
   The reject used to leave the story at `implementing` with its claim held until the lease ran
   out, and nothing re-dispatched it; the session that was finally placed was told nothing about
   the open pull request or what was wrong. The reject now releases the claim as a counted
   attempt, so `DISPATCH_MAX_ATTEMPTS` decides on the spot: below it the story is re-placed, at
-  it (production's unset default is 0) it is escalated `attempts_exhausted` for a person, and
+  it it is escalated `attempts_exhausted` for a person, and
   `resolve_escalation` to `queued` re-places it.
   - **Runner contract 1.31.0** (minor, additive): an `implement` dispatch may carry `rework`
     (`pr_number`, `rejected_head_sha`, `findings`), and only an `implement` dispatch. The
