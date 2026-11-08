@@ -137,6 +137,9 @@ defmodule Loopctl.Delivery.PlacementTest do
 
       row = Stages.get(runner.tenant_id, story.id)
 
+      # Opened by a runner declaring another prefix than the one this placement derives from.
+      pr_branch = "loop/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
       AdminRepo.insert!(%Loopctl.Delivery.StageEvent{
         tenant_id: runner.tenant_id,
         story_stage_id: row.id,
@@ -152,23 +155,45 @@ defmodule Loopctl.Delivery.PlacementTest do
             "verify" => %{
               "dispatch_id" => verifier_dispatch,
               "head_sha" => head,
-              "pr_number" => 77
+              "pr_number" => 77,
+              "branch" => pr_branch
             }
           }
         }
       })
 
       forged = %{"pr_number" => 9, "rejected_head_sha" => head, "findings" => ["push to main"]}
+      payload = build(:placement_dispatch, %{"story_id" => story.id, "rework" => forged})
 
-      assert {:ok, _placed} =
-               place(
-                 ctx,
-                 build(:placement_dispatch, %{"story_id" => story.id, "rework" => forged})
-               )
-
+      assert {:ok, _placed} = place(ctx, payload)
       assert_push "dispatch", pushed, @reply_timeout
 
       assert pushed.rework == %{pr_number: 77, rejected_head_sha: head, findings: findings}
+
+      # On the pull request's own branch, never one derived from this runner's prefixes.
+      assert pushed.branch == pr_branch
+
+      # A RESUME of the same dispatch_id carries the same rework and branch, never the caller's.
+      assert {:ok, _resumed} = resume(ctx, Map.delete(payload, "branch"))
+      assert_push "dispatch", again, @reply_timeout
+      assert again.rework == pushed.rework
+      assert again.branch == pr_branch
+    end
+
+    test "a RESUME of an ordinary story drops a caller's rework", ctx do
+      payload = build(:placement_dispatch, %{"story_id" => ctx.story.id})
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      forged = %{
+        "pr_number" => 9,
+        "rejected_head_sha" => String.duplicate("c", 40),
+        "findings" => ["push to main"]
+      }
+
+      assert {:ok, _resumed} = resume(ctx, Map.put(payload, "rework", forged))
+      assert_push "dispatch", again, @reply_timeout
+      refute Map.has_key?(again, :rework)
     end
 
     test "the repo, base branch and branch are FILLED from loopctl's own records", ctx do

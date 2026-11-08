@@ -712,6 +712,8 @@ defmodule Loopctl.Delivery.Placement do
          # (`DispatchLedger.record_reply/3`).
          {:ok, dispatch} <- lease_capable(dispatch),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
+      # A re-send carries the rework the first send did, and never the caller's.
+      dispatch = put_rework(dispatch, tenant_id, story, :match)
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
   end
@@ -1082,7 +1084,7 @@ defmodule Loopctl.Delivery.Placement do
              actor_label: Keyword.get(opts, :actor_label, "control:dispatch")
            ) do
         {:ok, object} ->
-          {:ok, dispatch |> Map.put("story", object) |> put_rework(tenant_id, story.id)}
+          {:ok, dispatch |> Map.put("story", object) |> put_rework(tenant_id, story, :pin)}
 
         {:error, reason} ->
           {:error, reason}
@@ -1097,14 +1099,40 @@ defmodule Loopctl.Delivery.Placement do
   # contract refuses `rework` on any other kind. A caller-supplied `rework` is REPLACED, never
   # kept, as a caller's `deadline_at` is — what a session is told to fix is loopctl's record,
   # not the placing caller's.
-  defp put_rework(%{"kind" => "implement"} = dispatch, tenant_id, story_id) do
-    case Rework.for_story(tenant_id, story_id) do
-      nil -> Map.delete(dispatch, "rework")
-      rework -> Map.put(dispatch, "rework", rework)
+  #
+  # THE BRANCH GOES WITH IT. The session is told to continue the pull request on the dispatch's
+  # `branch`, so on a new placement (`:pin`) that branch is the one the pull request was opened
+  # on, replacing the name `fill/3` derived from the TARGET runner's prefixes: a story re-placed
+  # on a runner declaring other prefixes would otherwise push beside its own pull request. The
+  # ledger records the pinned name, so a resume re-sends it. On a resume (`:match`) the ledger's
+  # branch already won (`pin_recorded_branch/2`), and a rework is attached only when it names
+  # the same branch: a rework for a branch the session is not on would describe other work.
+  # The pinned name is held to the same ref checks as any other (`validate_refs/2`); one that
+  # fails them could never have carried the pull request, so the rework is dropped instead.
+  defp put_rework(%{"kind" => "implement"} = dispatch, tenant_id, %Story{} = story, policy) do
+    case {Rework.for_placement(tenant_id, story.id), policy} do
+      {nil, _policy} ->
+        Map.delete(dispatch, "rework")
+
+      {{rework, nil}, _policy} ->
+        Map.put(dispatch, "rework", rework)
+
+      {{rework, branch}, :pin} ->
+        pinned = Map.put(dispatch, "branch", branch)
+
+        case DispatchPayload.validate_refs(pinned, story) do
+          :ok -> Map.put(pinned, "rework", rework)
+          {:error, _reason} -> Map.delete(dispatch, "rework")
+        end
+
+      {{rework, branch}, :match} ->
+        if dispatch["branch"] == branch,
+          do: Map.put(dispatch, "rework", rework),
+          else: Map.delete(dispatch, "rework")
     end
   end
 
-  defp put_rework(dispatch, _tenant_id, _story_id), do: Map.delete(dispatch, "rework")
+  defp put_rework(dispatch, _tenant_id, _story, _policy), do: Map.delete(dispatch, "rework")
 
   # WHETHER THE DISPATCH CARRIES A STORY OBJECT: its `kind` NAMED, and that kind's spec holding
   # a claim (`Spec.holds_claim?/1`, the `:build` archetype). This replaced a literal

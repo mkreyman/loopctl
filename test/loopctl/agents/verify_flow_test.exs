@@ -540,6 +540,47 @@ defmodule Loopctl.Agents.VerifyFlowTest do
                "rejected_head_sha" => ctx.head,
                "findings" => findings
              }
+
+      # ...on the branch the pull request was opened on, which the release keeps.
+      assert is_binary(row.branch)
+      assert {_rework, branch} = Rework.for_placement(ctx.tenant.id, ctx.story.id)
+      assert branch == row.branch
+    end
+
+    test "a retried job whose reject committed but whose release was lost releases the claim",
+         ctx do
+      payload = placed!(ctx)
+      b = dispatch(payload["dispatch_id"])
+      args = answer(ctx, payload, %{"verdict" => "reject", "findings" => ["AC-1 unmet"]})
+      row = stage(ctx)
+
+      # The first attempt's reject, committed, and then the job died: no revoke, no release.
+      assert {:ok, _row} =
+               Stages.advance(ctx.tenant.id, ctx.story.id, {:ci, :implementing, :verify_rejected},
+                 claim_epoch: story(ctx).claim_epoch,
+                 event_data: %{
+                   "verify" => %{
+                     "dispatch_id" => b.id,
+                     "head_sha" => ctx.head,
+                     "pr_number" => row.pr_number,
+                     "branch" => row.branch
+                   }
+                 },
+                 actor_label: "test:crashed_verdict",
+                 actor_role: :agent,
+                 actor_lineage: []
+               )
+
+      assert stage(ctx).stage == :implementing
+
+      assert {:ok, :rejected} = VerifyVerdict.apply(args)
+      assert stage(ctx).stage == :queued
+      assert stage(ctx).attempts["claim_released"] == 1
+      refute is_nil(dispatch(b.id).revoked_at)
+
+      # A third run finds the claim released and releases nothing more.
+      assert {:ok, _} = VerifyVerdict.apply(args)
+      assert stage(ctx).attempts["claim_released"] == 1
     end
 
     test "a story never rejected, or one re-triaged since its reject, carries no rework", ctx do

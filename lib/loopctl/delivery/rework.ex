@@ -40,6 +40,7 @@ defmodule Loopctl.Delivery.Rework do
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerRework
   alias Loopctl.Delivery.StageEvent
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
@@ -53,10 +54,26 @@ defmodule Loopctl.Delivery.Rework do
   The rework object for the story's next implement dispatch, or `nil` when there is none.
   """
   @spec for_story(Ecto.UUID.t(), Ecto.UUID.t()) :: map() | nil
-  def for_story(tenant_id, story_id) when is_binary(tenant_id) and is_binary(story_id) do
+  def for_story(tenant_id, story_id) do
+    case for_placement(tenant_id, story_id) do
+      {rework, _branch} -> rework
+      nil -> nil
+    end
+  end
+
+  @doc """
+  The rework object and the branch its pull request was opened on, or `nil`.
+
+  The branch is the stage's at the reject (`payload.verify.branch`), `nil` on a reject recorded
+  before it was written there. A new placement pins the dispatch's `branch` to it: otherwise it
+  derives a name from the TARGET runner's declared prefixes, which need not be the prefixes of
+  the runner that opened the pull request, and the session would push beside it.
+  """
+  @spec for_placement(Ecto.UUID.t(), Ecto.UUID.t()) :: {map(), String.t() | nil} | nil
+  def for_placement(tenant_id, story_id) when is_binary(tenant_id) and is_binary(story_id) do
     with %StageEvent{} = reject <- latest_reject(tenant_id, story_id),
          false <- overtaken?(tenant_id, story_id, reject),
-         %{"dispatch_id" => dispatch_id, "head_sha" => head, "pr_number" => pr} <-
+         %{"dispatch_id" => dispatch_id, "head_sha" => head, "pr_number" => pr} = verify <-
            get_in(reject.data, ["payload", "verify"]),
          true <- is_integer(pr) and pr >= 1 and is_binary(head) and head =~ @sha,
          %DispatchRecord{
@@ -65,11 +82,38 @@ defmodule Loopctl.Delivery.Rework do
            story_id: ^story_id,
            agent_result: %{} = result
          } <- DispatchLedger.get_record(tenant_id, dispatch_id) do
-      %{"pr_number" => pr, "rejected_head_sha" => head, "findings" => findings(result)}
+      {%{"pr_number" => pr, "rejected_head_sha" => head, "findings" => findings(result)},
+       branch(verify)}
     else
       _ -> nil
     end
   end
+
+  @doc """
+  Whether the reject `dispatch_id` recorded is still the story's last transition, with its
+  claim never released: the row sits at `implementing` under the claim epoch the reject wrote,
+  and no transition followed it. A release takes a new epoch, so it cannot pass. Judged on
+  transitions rather than the row's `lock_version`, which effect events also bump.
+  `Loopctl.Agents.VerifyVerdict` asks this on a retried job, so a release lost to a crash
+  between the reject's commit and the release is made on the retry.
+  """
+  @spec unreleased_reject?(Ecto.UUID.t(), StoryStage.t(), Ecto.UUID.t()) :: boolean()
+  def unreleased_reject?(tenant_id, %StoryStage{stage: :implementing} = row, dispatch_id)
+      when is_binary(dispatch_id) do
+    case latest_reject(tenant_id, row.story_id) do
+      %StageEvent{claim_epoch: epoch, data: data} = reject when epoch == row.claim_epoch ->
+        get_in(data, ["payload", "verify", "dispatch_id"]) == dispatch_id and
+          not transitioned_since?(tenant_id, row.story_id, reject)
+
+      _ ->
+        false
+    end
+  end
+
+  def unreleased_reject?(_tenant_id, _row, _dispatch_id), do: false
+
+  defp branch(%{"branch" => branch}) when is_binary(branch) and branch != "", do: branch
+  defp branch(_verify), do: nil
 
   # Ordered by the row's `lock_version`, which every transition bumps: a clock tie between two
   # events in one second cannot reorder them.
@@ -87,6 +131,16 @@ defmodule Loopctl.Delivery.Rework do
     |> events(story_id)
     |> where([e], e.event == "transitioned" and e.to_stage in @overtaken_by)
     |> where([e], e.lock_version > ^version)
+    |> select([e], e.id)
+    |> limit(1)
+    |> one(tenant_id)
+    |> is_binary()
+  end
+
+  defp transitioned_since?(tenant_id, story_id, %StageEvent{lock_version: version}) do
+    tenant_id
+    |> events(story_id)
+    |> where([e], e.event == "transitioned" and e.lock_version > ^version)
     |> select([e], e.id)
     |> limit(1)
     |> one(tenant_id)

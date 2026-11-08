@@ -73,6 +73,7 @@ defmodule Loopctl.Agents.VerifyVerdict do
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Audit
   alias Loopctl.Delivery.ImplementerStart
+  alias Loopctl.Delivery.Rework
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Dispatches
@@ -241,12 +242,34 @@ defmodule Loopctl.Agents.VerifyVerdict do
       %StoryStage{verified_head_sha: ^judged} when is_binary(judged) ->
         if story.verified_status == :verified, do: {:already, :verified}, else: :pending
 
+      %StoryStage{stage: :implementing} = row ->
+        released_on_retry(tenant_id, row, dispatch_id)
+
       _ ->
         :pending
     end
   end
 
   defp already_applied(_tenant_id, _story, _dispatch_id, _args), do: :pending
+
+  # A job re-run after its reject committed and before the claim release ran. The reject is
+  # recorded, so it is not applied again; the release, which nothing else would make, is made
+  # now, and so is B's revoke, which runs first on the first attempt and may be the step the
+  # crash took. Anything that moved the story since (a release, a new claim, a later
+  # transition) leaves this `:pending`, and the stale-verdict drop below answers it as before.
+  defp released_on_retry(tenant_id, row, dispatch_id) do
+    if Rework.unreleased_reject?(tenant_id, row, dispatch_id) do
+      case Dispatches.get_dispatch(tenant_id, dispatch_id) do
+        {:ok, %Dispatch{revoked_at: nil} = b} -> revoke(tenant_id, b)
+        _ -> :ok
+      end
+
+      release_for_rework(tenant_id, row.story_id)
+      {:already, :rejected}
+    else
+      :pending
+    end
+  end
 
   # ── the checks ──────────────────────────────────────────────────────────────────────────────
 
@@ -313,7 +336,8 @@ defmodule Loopctl.Agents.VerifyVerdict do
              "verify" => %{
                "dispatch_id" => verifier.id,
                "head_sha" => head,
-               "pr_number" => stage.pr_number
+               "pr_number" => stage.pr_number,
+               "branch" => stage.branch
              }
            },
            actor_label: @actor_label,
