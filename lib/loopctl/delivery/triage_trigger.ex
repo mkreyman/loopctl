@@ -98,7 +98,8 @@ defmodule Loopctl.Delivery.TriageTrigger do
   Creates the story for `record` and opens its delivery stage at `detected`.
 
   Returns `{:ok, story}` — including when the story already existed, see the moduledoc — or
-  `{:error, reason}`. The caller retries the record on `:no_target_epic`.
+  `{:error, reason}`. The caller retries the record on `:no_target_epic` and skips it on
+  `:ticket_required` (a ticketless record on a source with `triage_requires_ticket`).
   """
   @spec promote(Record.t()) :: {:ok, map()} | {:error, error()}
   def promote(%Record{} = record) do

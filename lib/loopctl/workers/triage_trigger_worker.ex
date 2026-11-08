@@ -72,6 +72,16 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   `:source_revoked` therefore reaches the loop only as a race (revoked between the read and
   the promote) and is handled there as a skip for the same reason.
 
+  ## A ticketless record on a ticket-requiring source is excluded the same way
+
+  A source with `triage_requires_ticket` triages only records carrying a `ticket_id`
+  (`Loopctl.Agents.Candidates`), so a story for any other record is one nothing will take.
+  The read excludes such a record for the revoked-source reason, the batch slot, and
+  `promote/1` refuses it with `:ticket_required` as the race backstop, a skip. Unlike
+  revocation this is not permanent: an `edited` delivery re-extracts the ticket facts, and the
+  first read after `ticket_id` is set promotes the record. Not escalated: there is no question
+  for a person in an issue that was not filed from a ticket.
+
   ## Escalate what a human must clear; retry everything else
 
   Five reasons cannot clear themselves, so retrying them is a loop that never ends:
@@ -242,6 +252,10 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # is no next run for this record: it is excluded from every later read. A log line that says
   # the opposite of what happens is worse than the clause it saves.
   defp disposition(:source_revoked), do: :skip
+
+  # A ticketless record on a ticket-requiring source (see the moduledoc). Also reachable only
+  # as a race, since the read excludes it, but unlike a revoked source it DOES come back: the
+  # first read after its `ticket_id` is set promotes it.
   defp disposition(:ticket_required), do: :skip
 
   # Everything else self-heals on the next pass — see "Escalate what a human must clear" above.

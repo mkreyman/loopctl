@@ -9327,8 +9327,8 @@ const TOOLS = [
             "Optional, false when omitted. WHICH ISSUES ARE TRIAGED. False: every issue the " +
             "webhook delivers. True: only an issue HomeCareBilling filed from a support " +
             "ticket (its single `#HCB-xxxxxxxx` Ticket line confirmed by the HomeCareBilling " +
-            "footer, recorded as `ticket_id`); every other issue stays `detected` and costs " +
-            "nothing. A format filter, not authentication. Anything but a boolean is refused " +
+            "footer, recorded as `ticket_id`); every other issue stays an intake record with " +
+            "no story until it gains a ticket. A format filter, not authentication. Anything but a boolean is refused " +
             "(422). Changed " +
             "later with intake_source_update.",
         },
@@ -9491,9 +9491,10 @@ const TOOLS = [
             "WHICH ISSUES ARE TRIAGED. True: only an issue HomeCareBilling filed from a " +
             "support ticket (its single `#HCB-xxxxxxxx` Ticket line confirmed by the " +
             "HomeCareBilling footer, recorded as `ticket_id`) is sent to triage; a format " +
-            "filter, not authentication. Every other issue stays `detected` and costs " +
-            "nothing. False: every issue is triaged. Read at dispatch time, so it reaches the " +
-            "stories already waiting. Null is refused; omit the field to leave it alone.",
+            "filter, not authentication. Every other issue stays an intake record with no " +
+            "story until it gains a ticket. False: every issue is promoted and triaged. Read " +
+            "on every pass, so it reaches the stories and records already waiting. Null is " +
+            "refused; omit the field to leave it alone.",
         },
       },
       required: ["source_id"],

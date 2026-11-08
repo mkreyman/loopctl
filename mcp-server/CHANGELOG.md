@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.11.2 — 2026-11-08
+
+### Fixed
+
+- `intake_source_enroll` and `intake_source_update` described `triage_requires_ticket` as
+  leaving every ticketless issue at `detected`. With loopctl's intake change such an issue
+  stays an intake record and gets no story until it gains a ticket; the descriptions now say so.
+
 ## 3.11.1 — 2026-11-07
 
 ### Fixed
