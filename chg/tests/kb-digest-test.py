@@ -81,37 +81,60 @@ assert dg.due_days("2026-11-08", "2026-11-10", 7) == ["2026-11-09"]
 assert dg.due_days("2026-11-09", "2026-11-10", 7) == []
 assert dg.due_days("2026-01-01", "2026-11-10", 2) == ["2026-11-08", "2026-11-09"]
 
-# write(): keyed on the day's tag, no novelty skip, and only a stored outcome counts
+# write(): an already-tagged day is skipped; otherwise a forced create keyed on the day's tag
 class FakeKB:
-    CREATED, DEDUPLICATED, GATED_TO_DRAFT = "created", "deduplicated", "gated_to_draft"
-    SKIPPED, IDEMPOTENT_REPLAY = "skipped", "idempotent_replay"
+    def __init__(self, answer, seen=False):
+        self.answer, self.seen, self.posts, self.seen_calls = answer, seen, [], []
 
-    def __init__(self, outcome):
-        self.outcome, self.calls = outcome, []
+    def tag_seen(self, project_id, tag):
+        self.seen_calls.append((project_id, tag))
+        if isinstance(self.seen, Exception):
+            raise self.seen
+        return self.seen
 
-    def create_article_ex(self, title, body, project_id, **kw):
-        self.calls.append(kw)
-        if isinstance(self.outcome, Exception):
-            raise self.outcome
-        return None, self.outcome
+    def api(self, method, path, *roles, body=None):
+        self.posts.append((method, path, body))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
 
-for outcome, want in (("created", True), ("gated_to_draft", True), ("idempotent_replay", True),
-                      ("deduplicated", False), ("skipped", False)):
-    kb = FakeKB(outcome)
-    assert dg.write(kb, art, "p") == (want, outcome), outcome
-    assert kb.calls[0]["hub_of"] == art["tags"][3] and "skip_low_novelty" not in kb.calls[0]
-stored, outcome = dg.write(FakeKB(RuntimeError("503")), art, "p")
-assert not stored and "503" in outcome
+tag = art["tags"][3]
+kb = FakeKB({"data": {"id": "a1"}})
+assert dg.write(kb, art, "p") == (True, "created")
+assert kb.seen_calls == [("p", tag)]
+method, path, sent = kb.posts[0]
+assert (method, path) == ("POST", "/api/v1/articles")
+# the gate is bypassed, never asked to skip, and the key is the tag's, not the body's
+assert sent["force"] is True and "skip_low_novelty" not in sent
+assert sent["idempotency_key"].startswith(tag + "-") and sent["tags"] == art["tags"]
+assert sent["category"] == "finding" and sent["project_id"] == "p"
+k2 = FakeKB({"data": {"id": "a1"}})
+dg.write(k2, dict(art, body="rendered differently"), "p")
+assert k2.posts[0][2]["idempotency_key"] == sent["idempotency_key"]
+k3 = FakeKB({"data": {"id": "a1"}})
+dg.write(k3, art, "q")
+assert k3.posts[0][2]["idempotency_key"] != sent["idempotency_key"]
+# a key replay (a race with another run) holds the day's article: it advances
+assert dg.write(FakeKB({"deduplicated": True, "data": {"id": "a1"}}), art, "p") == (True, "replayed")
+# an already-tagged day posts nothing
+kb = FakeKB({"data": {"id": "a1"}}, seen=True)
+assert dg.write(kb, art, "p") == (True, "already stored") and kb.posts == []
+# no article in the answer, a post error or a list error leaves the day for the next run
+for kb, needle in ((FakeKB({"data": None, "skipped": True}), "no article"),
+                   (FakeKB(RuntimeError("503")), "503"),
+                   (FakeKB({"data": {"id": "a1"}}, seen=RuntimeError("list 503")), "503")):
+    done, outcome = dg.write(kb, art, "p")
+    assert not done and needle in outcome, outcome
 
-# the real client's outcome names match the ones write() is tested against
-import sys as _sys
+# the real client has the two calls write() makes, with the shapes it uses
+import inspect, sys as _sys
 _sys.path.insert(0, str(dg.sync.CLIENT_DIR))
 try:
     import loopctl_client_core as core
-    for n in ("CREATED", "DEDUPLICATED", "GATED_TO_DRAFT", "SKIPPED", "IDEMPOTENT_REPLAY"):
-        assert getattr(core, n) == getattr(FakeKB, n), n
+    assert list(inspect.signature(core.tag_seen).parameters)[:2] == ["project_id", "tag"]
+    assert "body" in inspect.signature(core.api).parameters
 except ImportError as e:  # the client needs requests, which chg's venv supplies
-    print(f"kb-digest-test: client constants not checked ({e})")
+    print(f"kb-digest-test: client signatures not checked ({e})")
 
 d = Path(tempfile.mkdtemp())
 assert dg.load_state(d / "none.json") == {"last_done": None}

@@ -17,12 +17,12 @@ test, read from GitHub alone:
     in three or more, within the `--lookback` days ending that day.
 
 Like chg-kb-sync it is off the merge path (reads GitHub, writes the KB, from cron). A day's
-digest carries the capture tag `idem-chgdigest-<digest of repo and day>`, so a retry sends
-the same server-enforced idempotency key, seeded on that tag and the project and never on
-the body, so a rerun writes nothing twice even when the day renders differently.
-~/.chg/kb-digest/<repo>.json holds the last day written; a run writes every day after it up
-to yesterday, at most `--catch-up` days back, and stops at the first day the KB did not
-store (an error, or a dedup onto another article) so the next run starts there.
+digest carries the tag `idem-chgdigest-<digest of repo and day>`; a day already carrying it
+is not posted again, and the post's idempotency key is seeded on it, so a rerun writes
+nothing twice even when the day renders differently. ~/.chg/kb-digest/<repo>.json holds
+the last day written; a run writes every day after it up to yesterday, at most
+`--catch-up` days back, and stops at the first day not stored so the next run starts there
+(write() says why digests bypass the novelty gate).
 Exit 0 when every due day was written or had nothing to report, 1 when a write failed,
 2 on bad arguments, a missing claude-config checkout, an unreadable state file or a GitHub
 that did not answer.
@@ -157,19 +157,32 @@ def clip(s, n):
 
 
 def write(kb, art, project_id):
-    """(stored, outcome) for one day's article. A digest is the only article of its day's
-    tag, so it is keyed like a hub: on the tag and project, not the body, which a rerun
-    may render differently. No skip_low_novelty: consecutive digests share a template, and
-    the gate would drop a day as a near-duplicate of the one before. Stored means the KB
-    holds this day's article: new, held as a draft, or our own earlier write replayed; a
-    semantic dedup onto someone else's article or an error stored nothing."""
+    """(done, outcome) for one day's article; done advances the day, and only when the KB
+    holds an article for that day.
+
+    A digest is a keyed record, one per repo and day, not a lesson to dedup, so it is
+    posted with `force: true`, which bypasses the server's semantic novelty gate. Through
+    the gate, consecutive digests share a template (11-09 scored 0.93 against 11-08,
+    2026-11-10), so a quiet day could be answered `duplicate` onto another article and
+    stored nowhere, and a rerun of a stored day came back `deduplicated` (similarity 1.0)
+    before its idempotency key was looked at (measured 2026-11-10, KB affc45a3). Identity is kept by
+    the two things the gate never touches: the day's tag, checked first on the lag-free
+    list endpoint, and an idempotency key seeded on that tag and the project, which the
+    ungated create also honours, for a race between the check and the post."""
+    tag = art["tags"][3]
     try:
-        _, outcome = kb.create_article_ex(art["title"], art["body"], project_id,
-                                          category="finding", tags=art["tags"],
-                                          hub_of=art["tags"][3])
+        if kb.tag_seen(project_id, tag):
+            return True, "already stored"
+        res = kb.api("POST", "/api/v1/articles", "AGENT", "USER", body={
+            "title": art["title"], "body": art["body"], "category": "finding",
+            "project_id": project_id, "tags": art["tags"], "force": True,
+            "idempotency_key": f"{tag}-{hashlib.sha1(project_id.encode()).hexdigest()[:12]}"})
     except Exception as e:
         return False, f"error: {e}"
-    return outcome in (kb.CREATED, kb.GATED_TO_DRAFT, kb.IDEMPOTENT_REPLAY), outcome
+    data = res.get("data") if isinstance(res.get("data"), dict) else {}
+    if not data.get("id"):
+        return False, f"no article in the answer: {json.dumps(res)[:300]}"
+    return True, "replayed" if res.get("deduplicated") else "created"
 
 
 def due_days(last_done, today, catch_up):
