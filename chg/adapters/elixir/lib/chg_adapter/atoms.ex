@@ -3,20 +3,28 @@ defmodule ChgAdapter.Atoms do
   Makes every compiling VM number the project's atoms the same way.
 
   OTP 26+ orders the atom keys of a map of up to 32 keys by atom index: the order the VM
-  first saw each atom.
-  The parallel compiler meets atoms in a different order on every build, so code a
-  compile generates by iterating a map (struct field lists, encoder field orders, a
-  LiveView's change tracking) comes out differently in two builds of one commit, and
-  coverage selection counts each such module altered. On HomeCareBilling 467 of 2995
-  modules differed between two clean builds.
+  first saw each atom. A larger map (a hash map) iterates in an order that also follows
+  each atom's index, not its text: the same 40 atoms made in two orders iterate in two
+  orders (OTP 28, mac-mini, 2026-11-09). The parallel compiler meets atoms in a
+  different order on every build, so code a compile generates by iterating a map (struct
+  field lists, encoder field orders, a LiveView's change tracking) comes out differently
+  in two builds of one commit, and coverage selection counts each such module altered.
+  On HomeCareBilling 467 of 2995 modules differed between two clean builds.
 
   `mix chg.compile` therefore writes the atoms a compile will meet (every literal atom
   and alias in the project's sources, and every atom in its dependencies' and the
   toolchain's beams) to a file, sorted, and starts `mix compile` with `preload/0` run
   before anything else: each VM then makes those atoms first, in the same order, from the
-  same starting table. Two atoms both on the list are ordered the same way in every
-  build, even when the lists differ (a commit added a literal), so only atoms a compile
-  invents (`:"\#{name}_id"`) still vary.
+  same starting table, so two compiles of one commit agree, and only atoms a compile
+  invents (`:"\#{name}_id"`) still vary. Across commits the lists differ: a commit that
+  adds a literal moves the index of every atom sorted after it. A small map keeps its
+  order, since only the atoms' relative order counts there. A hash map does not. A module
+  Mix does not recompile keeps the order of the commit it was compiled at, so on another
+  commit's `_build` it can digest differently from a clean build of the same source (#91:
+  LiveView's change tracking over 75 assigns). `ChgAdapter.Select` compares a module's
+  digest only when a change can reach it, which keeps that out of selection, except on a
+  change the module graph does not see (config, deps, the toolchain), where every module
+  is compared and such a module selects the tests that ran it: more tests, never fewer.
 
   The atoms the VM makes while it boots (`:state`, `:temporary`, most struct field names)
   come before the list, and a VM booting on many schedulers makes them in a different
