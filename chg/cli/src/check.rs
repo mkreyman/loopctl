@@ -3,10 +3,11 @@
 //! snapshot build path (`scratch::check_at_build`), or the live tree when that path
 //! cannot be used.
 //!
-//! Static runs first and a failure stops there, as the gate it replaces does. `affected`
-//! that breaks the contract fails closed to the whole suite (`chg adapter exec`'s rule),
-//! and the whole suite runs as shard 1 of 1. A `run` or `shard` that breaks the contract
-//! is an `error`, never a pass.
+//! Static runs first and a failure stops there, as the gate it replaces does, unless the
+//! caller skips it because static passed on the commit elsewhere (`chg verify
+//! --no-static`). `affected` that breaks the contract fails closed to the whole suite
+//! (`chg adapter exec`'s rule), and the whole suite runs as shard 1 of 1. A `run` or
+//! `shard` that breaks the contract is an `error`, never a pass.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -101,8 +102,19 @@ pub fn run(repo: &Path, base: &str, all: bool) -> Verdict {
         all,
         None,
         exec::default_timeout(CommandName::Shard),
+        Static::Run,
     )
 }
+
+/// Whether the check runs the adapter's `static` command first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Static {
+    Run,
+    /// Static ran on this commit elsewhere (a CI job): skip it, and say so in the reason.
+    Skip,
+}
+
+const STATIC_SKIPPED: &str = "static skipped: it ran on this commit elsewhere (--no-static)";
 
 /// `run`, and when the whole suite runs, the adapter also writes a coverage record of it
 /// to `record` (`cover.rs`). `shard_cap` bounds the whole-suite run.
@@ -112,9 +124,13 @@ pub fn run_recording(
     all: bool,
     record: Option<&Path>,
     shard_cap: Duration,
+    stat: Static,
 ) -> Verdict {
     let started = Instant::now();
-    let mut v = check(repo, base, all, record, shard_cap);
+    let mut v = check(repo, base, all, record, shard_cap, stat);
+    if stat == Static::Skip {
+        v.reason = format!("{}; {STATIC_SKIPPED}", v.reason);
+    }
     v.ms = started.elapsed().as_millis() as u64;
     v
 }
@@ -125,50 +141,19 @@ fn check(
     all: bool,
     record: Option<&Path>,
     shard_cap: Duration,
+    stat: Static,
 ) -> Verdict {
     let values = |pairs: &[(&'static str, String)]| -> BTreeMap<&'static str, String> {
         pairs.iter().cloned().collect()
     };
 
-    let t = Instant::now();
-    let st = adapter::invoke(
-        repo,
-        CommandName::Static,
-        values(&[("base", base.to_string())]),
-        None,
-        exec::default_timeout(CommandName::Static),
-    );
-    let static_ms = t.elapsed().as_millis() as u64;
-    match st {
-        Invoked::Ok(_) => {}
-        Invoked::Failed(Document::Static(s)) => {
-            return Verdict {
-                verdict: Outcome::Fail,
-                reason: format!("{} static check(s) failed", s.failures.len()),
-                failures: s
-                    .failures
-                    .iter()
-                    .map(|f| {
-                        let at = match (&f.file, f.line) {
-                            (Some(file), Some(line)) => format!(" {file}:{line}"),
-                            (Some(file), None) => format!(" {file}"),
-                            _ => String::new(),
-                        };
-                        format!("{}{at} {}", f.check, f.message)
-                    })
-                    .collect(),
-                static_ms,
-                ..Verdict::skipped("")
-            };
-        }
-        Invoked::Failed(_) => unreachable!("static only returns a static document"),
-        Invoked::Broken(why) => {
-            return Verdict {
-                static_ms,
-                ..Verdict::error(format!("static {why}"))
-            };
-        }
-    }
+    let static_ms = match stat {
+        Static::Skip => 0,
+        Static::Run => match run_static(repo, base) {
+            Ok(ms) => ms,
+            Err(v) => return *v,
+        },
+    };
 
     let t = Instant::now();
     let affected = if all {
@@ -266,5 +251,44 @@ fn check(
             reason: format!("{mode} tests: {why}"),
             ..base_verdict
         },
+    }
+}
+
+/// Runs the adapter's `static` command: its duration, or the verdict that ends the check.
+fn run_static(repo: &Path, base: &str) -> Result<u64, Box<Verdict>> {
+    let t = Instant::now();
+    let st = adapter::invoke(
+        repo,
+        CommandName::Static,
+        BTreeMap::from([("base", base.to_string())]),
+        None,
+        exec::default_timeout(CommandName::Static),
+    );
+    let static_ms = t.elapsed().as_millis() as u64;
+    match st {
+        Invoked::Ok(_) => Ok(static_ms),
+        Invoked::Failed(Document::Static(s)) => Err(Box::new(Verdict {
+            verdict: Outcome::Fail,
+            reason: format!("{} static check(s) failed", s.failures.len()),
+            failures: s
+                .failures
+                .iter()
+                .map(|f| {
+                    let at = match (&f.file, f.line) {
+                        (Some(file), Some(line)) => format!(" {file}:{line}"),
+                        (Some(file), None) => format!(" {file}"),
+                        _ => String::new(),
+                    };
+                    format!("{}{at} {}", f.check, f.message)
+                })
+                .collect(),
+            static_ms,
+            ..Verdict::skipped("")
+        })),
+        Invoked::Failed(_) => unreachable!("static only returns a static document"),
+        Invoked::Broken(why) => Err(Box::new(Verdict {
+            static_ms,
+            ..Verdict::error(format!("static {why}"))
+        })),
     }
 }

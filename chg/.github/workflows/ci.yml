@@ -97,13 +97,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # apt uses mirrors.edge.kernel.org, and each apt command is capped at 5 minutes: on
+      # 2026-11-09 archive.ubuntu.com stopped answering, and apt waited out the job's
+      # 10-minute cap twice. A mirror list with archive.ubuntu.com as fallback still hung
+      # (apt fell over to it for some files); kernel.org alone took 13 s. The container is
+      # named, so a cancelled job (whose docker client the runner kills, leaving the
+      # container running) is still removed.
       - name: shellcheck, and the volume setup test as root in a container
         run: |
-          docker run --rm --privileged -v "$PWD:/w:ro" -w /w ubuntu:24.04 bash -euc '
-            apt-get update -q >/dev/null && apt-get install -yq xfsprogs git sudo shellcheck >/dev/null
+          docker run --rm --name "chg-volume-setup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --privileged -v "$PWD:/w:ro" -w /w ubuntu:24.04 bash -euc '
+            sed -i -E "s#http://(archive|security)\.ubuntu\.com/ubuntu/?#http://mirrors.edge.kernel.org/ubuntu/#" /etc/apt/sources.list.d/ubuntu.sources
+            apt="-q -o Acquire::http::Timeout=20 -o Acquire::Retries=3"
+            timeout 300 apt-get $apt update >/dev/null
+            timeout 300 apt-get $apt install -y xfsprogs git sudo shellcheck >/dev/null
             shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh scripts/ci-rust-toolchain.sh
             useradd -m ci && echo "ci ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/ci
             sudo -u ci sudo bash tests/volume-setup-test.sh'
+      - name: remove the container if the job was cancelled
+        if: always()
+        run: docker rm -f "chg-volume-setup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >/dev/null 2>&1 || true
 
   # The Mix adapter (adapters/elixir): its unit tests, and an integration test that
   # installs it as an archive and drives a fixture project through every task, including

@@ -110,9 +110,9 @@ enum Top {
         #[command(subcommand)]
         command: ShadowCmd,
     },
-    /// Run the whole suite (static checks included) on a trunk commit in this tree, and
-    /// on green fast-forward `verified/<branch>` on the remote to it; never backwards, and
-    /// never forced (story S8). Prints a JSON report. Exit 0 green (or nothing to do: the
+    /// Run the whole suite (static checks included, unless --no-static) on a trunk commit
+    /// in this tree, and on green fast-forward `verified/<branch>` on the remote to it;
+    /// never backwards, and never forced (story S8). Prints a JSON report. Exit 0 green (or nothing to do: the
     /// ref is already there, or a newer commit is verified), 1 red, 2 no verdict.
     Verify {
         #[arg(long)]
@@ -128,6 +128,12 @@ enum Top {
         /// Do not run the suite: it already passed on this commit (a CI job). Only advance.
         #[arg(long)]
         no_run: bool,
+        /// Skip the static checks (format, lint, types): a CI job on the same push gates
+        /// them on this commit. Run verify only after that job PASSED (`needs:` on it), or
+        /// a static failure reaches the ref unchecked. The suite, its coverage record and
+        /// the ref advance run as usual; a test failure still holds the ref.
+        #[arg(long, conflicts_with = "no_run")]
+        no_static: bool,
         /// Run the suite but leave the ref alone.
         #[arg(long)]
         no_push: bool,
@@ -482,6 +488,7 @@ fn main() -> ExitCode {
             remote,
             ref_name,
             no_run,
+            no_static,
             no_push,
             failures_out,
             tests_timeout_secs,
@@ -492,6 +499,7 @@ fn main() -> ExitCode {
                 remote: &remote,
                 ref_name: &ref_name,
                 no_run,
+                no_static,
                 push: !no_push,
                 tests_timeout: Duration::from_secs(tests_timeout_secs),
             },

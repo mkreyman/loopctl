@@ -328,6 +328,56 @@ fn verify_moves_the_ref_forward_on_green_and_never_back() {
     assert_eq!(env.remote_ref("verified/master"), Some(c4));
 }
 
+#[test]
+fn no_static_runs_the_suite_and_records_without_calling_static() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    // Static would fail here: --no-static must not run it, and the suite decides.
+    let c1 = env.commit(".chg/static-red", "x\n");
+
+    let out = env.chg().args(["verify", "--no-static"]).output().unwrap();
+    let r = json(&out);
+    assert_eq!(out.status.code(), Some(0), "{r}");
+    assert_eq!(r["outcome"], "advanced", "{r}");
+    assert_eq!(r["verdict"]["mode"], "all", "{r}");
+    assert_eq!(r["verdict"]["static_ms"], 0, "{r}");
+    assert!(
+        r["verdict"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("static skipped"),
+        "{r}"
+    );
+    assert_eq!(r["cover"], "published", "{r}");
+    assert_eq!(env.remote_ref("verified/master"), Some(c1));
+    let calls = env.calls();
+    assert!(!calls.contains("static "), "static ran: {calls}");
+    assert!(calls.contains("shard "), "the suite did not run: {calls}");
+
+    // A test failure still holds the ref.
+    env.commit(".chg/broken", "test/a_test.exs:1\n");
+    let out = env.chg().args(["verify", "--no-static"]).output().unwrap();
+    let r = json(&out);
+    assert_eq!(
+        (out.status.code(), r["outcome"].as_str()),
+        (Some(1), Some("held")),
+        "{r}"
+    );
+
+    // Without the flag, static runs and fails as before.
+    let out = env.chg().arg("verify").output().unwrap();
+    let r = json(&out);
+    assert_eq!(out.status.code(), Some(1), "{r}");
+    assert_eq!(r["verdict"]["reason"], "1 static check(s) failed", "{r}");
+
+    // --no-run already skips everything; the two together are refused.
+    let out = env
+        .chg()
+        .args(["verify", "--no-run", "--no-static"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
 /// good -> c1 -> merge of a side branch whose commit breaks test/c_test.exs (a test it
 /// adds) -> c3 -> c4 (bad).
 fn history(env: &Env) -> (String, String, String, String) {

@@ -6,12 +6,13 @@ Every command works through the repo's adapter (`.chg/adapter.toml`), so it serv
 
 ## Commands
 
-- `chg verify [--sha S] [--ref verified/master] [--remote origin] [--no-run] [--no-push] [--failures-out F] [--tests-timeout-secs N]` runs `static` and then the whole suite (`shard 1/1`) on `S` (default HEAD) in this tree, which must be exactly `S`. The whole-suite run is capped at `N` seconds (default `exec::SUITE_TIMEOUT_SECS`, 2700, above `chg check`'s 1200: a verifier shares a CI runner, where contention stretches a normal run past 20 minutes); a run that hits the cap is an `error` verdict and holds the ref. `chg culprit` takes the same flag for its whole-suite run on `<bad>`. On green it pushes `S` to `refs/heads/<ref>` on the remote:
+- `chg verify [--sha S] [--ref verified/master] [--remote origin] [--no-run | --no-static] [--no-push] [--failures-out F] [--tests-timeout-secs N]` runs `static` (unless `--no-static`) and then the whole suite (`shard 1/1`) on `S` (default HEAD) in this tree, which must be exactly `S`. The whole-suite run is capped at `N` seconds (default `exec::SUITE_TIMEOUT_SECS`, 2700, above `chg check`'s 1200: a verifier shares a CI runner, where contention stretches a normal run past 20 minutes); a run that hits the cap is an `error` verdict and holds the ref. `chg culprit` takes the same flag for its whole-suite run on `<bad>`. On green it pushes `S` to `refs/heads/<ref>` on the remote:
   - **Forward only.** The ref moves only to a commit that descends from where it is. The push is never forced, so the remote refuses anything else.
   - **Already there:** nothing runs (`already`).
   - **A newer commit is already verified:** nothing runs (`superseded`). The same applies when a racing verifier moved the ref first.
   - **Red:** the ref stays (`held`), and `F` gets the failing test ids, one per line. When static checks failed, `F` is empty: a lint or compile failure is not a test that can be searched with, so it is left to a person.
   - **`--no-run`:** advances only. Use it for a CI job whose suite already passed on `S`.
+  - **`--no-static`:** skips `static` and runs the suite, the coverage record and the advance as usual. Use it where a CI job on the same push gates format, lint and type checks on `S`, and make the verify job depend on that job passing (`needs:`): with `--no-static`, chg holds no static evidence of its own, so a verify that runs alongside a red lint job still advances the ref. A static failure is not a coverage fact, and running it twice on a shared runner can exceed the 900 s static cap before the suite starts. The report has `static_ms: 0` and its reason says static was skipped. It cannot be combined with `--no-run`.
 
   Exit 0 green or nothing to do, 1 red, 2 no verdict.
 
