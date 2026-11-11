@@ -1,0 +1,294 @@
+{
+  "id": "US-47.10",
+  "title": "Issue #986 item 3: a reopen after the loop ended starts the issue's next intake generation",
+  "epic": {
+    "id": "epic_47",
+    "name": "Change Protocol (loopctl half)"
+  },
+  "priority": "high",
+  "phase": "change_protocol",
+  "story": {
+    "as_a": "operator",
+    "i_want_to": "have an issue that chg reopens after its fix shipped come back to triage as a new piece of work",
+    "so_that": "a recurrence of a fixed failure is worked again, and the first fix keeps its own record, story and closure"
+  },
+  "rationale": "chg closes an issue it filed only after the failure's fingerprint has been quiet for some days after the merge, and reopens it if the failure comes back. Loopctl.Intake.apply_plan/3 wrote that reopen onto the issue's one intake record, whose story had already merged or shipped. TriageTriggerWorker.candidates/1 excludes any record whose story has a stage row, so the recurrence was never triaged. The unique indexes allowed one record per issue, one story per record and one closure per record, so a second fix had nowhere to go.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-47.10.1",
+      "description": "intake_records carries generation, an integer NOT NULL DEFAULT 1 with a CHECK of at least 1. The issue's unique index is (tenant_id, source_id, issue_number, generation) and replaces (tenant_id, source_id, issue_number). stories_intake_record_uidx and intake_issue_closures_record_uidx are unchanged, because each generation is its own record."
+    },
+    {
+      "id": "AC-47.10.2",
+      "description": "Every issues delivery applies to the issue's NEWEST generation, decided AFTER the row lock: ensure_record/2 locks the newest record FOR UPDATE, then a fresh statement checks for a newer generation and, if one exists, locks that instead, until the locked row is the newest. A delivery queued behind a bump lands on the new generation."
+    },
+    {
+      "id": "AC-47.10.3",
+      "description": "A reopened delivery that would be applied (newer than the newest record, or the same second with different content) starts generation N+1 when the newest record's loop has ended. The loop has ended when the record has an intake_issue_closures row, or its story's stage is merged, deployed, verified or done. The reopen's content is applied to the new record, which is pending_triage and a TriageTriggerWorker candidate."
+    },
+    {
+      "id": "AC-47.10.4",
+      "description": "A reopen of a record whose story is still in flight, escalated, or failed without a closure, or that has no story, starts nothing and is applied to that record as before. No action other than reopened starts a generation."
+    },
+    {
+      "id": "AC-47.10.5",
+      "description": "The earlier generation's record, story and closure are never written again."
+    },
+    {
+      "id": "AC-47.10.6",
+      "description": "A redelivered reopen (same X-GitHub-Delivery) is a duplicate and starts nothing. An older delivery arriving after the bump changes neither generation. A reopen older than what the newest record holds starts nothing."
+    },
+    {
+      "id": "AC-47.10.7",
+      "description": "Two concurrent reopens start one generation between them, and an edit racing a bump lands on the new generation. A bump holds generation N's lock while it inserts N+1, and every delivery re-checks for a newer generation once it holds the lock. The unique generation index is a backstop that raises on a conflict."
+    },
+    {
+      "id": "AC-47.10.8",
+      "description": "A new generation inherits its predecessor's escalation (status, reasons, escalated_at). An escalated issue is not put back into the triage queue by a reopen. The new record gets its own intake_escalated audit entry carrying the inherited reasons, inherited_from_generation and inherited_from_record_id."
+    },
+    {
+      "id": "AC-47.10.9",
+      "description": "A closure recorded for a later generation's story is its own intake_issue_closures row, addressed at the same issue number."
+    },
+    {
+      "id": "AC-47.10.10",
+      "description": "Tenant isolation: another tenant's records, stories and closures for the same repository and issue number neither end this tenant's loop nor receive its generations."
+    },
+    {
+      "id": "AC-47.10.11",
+      "description": "Before adding its resolution label to an OPEN issue, the issue closer removes every other loopctl resolution label the issue carries (PullRequestSource.remove_label/3; a 404 is success), so a later generation's close carries exactly one. The removal comes before the add, so a crash between them leaves no resolution label and the retry adds ours. A failed removal is a forge fault (transient backs off, permanent abandons), never a pass. A closed issue is never written to, so step 1's exactly-one-label check is unchanged."
+    },
+    {
+      "id": "AC-47.10.12",
+      "description": "A closed issue carrying exactly one loopctl resolution label, this closure's own, is recorded closed only when the closure has stamped labelled_at. Otherwise it is abandoned closed_by_other, because the label may be an earlier generation's. The closer stamps labelled_at when it finds its own label already on the open issue, as well as when it adds it, so its own crash window between close and record still reads as ours."
+    },
+    {
+      "id": "AC-47.10.13",
+      "description": "The issue closer abandons a pending closure whose intake record is not the issue's newest generation with superseded_by_generation, before any forge call. A story can end the loop at merged or deployed before its verdict writes the closure, and that closure must not close the reopened issue with the earlier fix's message."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-47.10.1",
+      "verifies": [
+        "AC-47.10.1",
+        "AC-47.10.2",
+        "AC-47.10.3"
+      ],
+      "name": "a reopen after done starts generation 2, which the drain promotes",
+      "type": "integration",
+      "preconditions": [
+        "issue 42 opened, promoted, and its story at done"
+      ],
+      "steps": [
+        "deliver a newer reopened for issue 42",
+        "run the triage drain"
+      ],
+      "expected_results": [
+        "two generations, the second pending_triage with the reopen's content",
+        "generation 2 is a candidate and generation 1 is not",
+        "generation 2 gets its own story"
+      ]
+    },
+    {
+      "id": "TC-47.10.2",
+      "verifies": [
+        "AC-47.10.3"
+      ],
+      "name": "each end stage, and a closure alone, ends the loop",
+      "type": "integration",
+      "preconditions": [
+        "a finished issue per stage in merged, deployed, verified, done, and one failed with a closure"
+      ],
+      "steps": [
+        "deliver a reopened for each"
+      ],
+      "expected_results": [
+        "each issue has generations 1 and 2"
+      ]
+    },
+    {
+      "id": "TC-47.10.3",
+      "verifies": [
+        "AC-47.10.4"
+      ],
+      "name": "a reopen mid-flight does not bump",
+      "type": "integration",
+      "preconditions": [
+        "issues whose stories are at implementing, escalated, failed without a closure, and an issue with no story"
+      ],
+      "steps": [
+        "deliver a reopened for each, and a newer edited for a finished issue"
+      ],
+      "expected_results": [
+        "each issue keeps one generation, carrying the delivered content"
+      ]
+    },
+    {
+      "id": "TC-47.10.4",
+      "verifies": [
+        "AC-47.10.6"
+      ],
+      "name": "redelivered reopen and older deliveries around the bump",
+      "type": "integration",
+      "preconditions": [
+        "a finished issue"
+      ],
+      "steps": [
+        "deliver a reopened, then the same delivery id again, then a distinct newer reopened",
+        "deliver an edited stamped before the reopen",
+        "on another finished issue, deliver a close and then an older reopen"
+      ],
+      "expected_results": [
+        "the redelivery is a duplicate, and the issue has exactly two generations",
+        "the stale edit changes neither generation",
+        "the stale reopen starts nothing"
+      ]
+    },
+    {
+      "id": "TC-47.10.5",
+      "verifies": [
+        "AC-47.10.7"
+      ],
+      "name": "a reopen or an edit racing a bump lands on the new generation",
+      "type": "integration",
+      "preconditions": [
+        "a committed finished issue",
+        "a holder transaction that has locked generation 1 and inserted generation 2"
+      ],
+      "steps": [
+        "deliver a reopened, and separately an edited, from a second connection",
+        "commit the holder"
+      ],
+      "expected_results": [
+        "the contender waits, then records",
+        "exactly generations 1 and 2 exist, the contender's content is on generation 2, and generation 1 is unchanged"
+      ]
+    },
+    {
+      "id": "TC-47.10.6",
+      "verifies": [
+        "AC-47.10.5",
+        "AC-47.10.9"
+      ],
+      "name": "generation 1 is untouched and a closure on generation 2 is its own row",
+      "type": "integration",
+      "preconditions": [
+        "a finished issue with a closure on its story"
+      ],
+      "steps": [
+        "deliver reopened, edited and closed",
+        "promote generation 2 and record its closure"
+      ],
+      "expected_results": [
+        "generation 1's record, story, stage and closure equal what they were",
+        "generation 2's closure is a second row on its own record, at the same issue number"
+      ]
+    },
+    {
+      "id": "TC-47.10.7",
+      "verifies": [
+        "AC-47.10.8",
+        "AC-47.10.3"
+      ],
+      "name": "escalation is inherited, and a same-second reopen is marked ambiguous",
+      "type": "integration",
+      "preconditions": [
+        "a finished issue later escalated by an injection edit",
+        "a finished issue closed at second T"
+      ],
+      "steps": [
+        "deliver a benign reopened to the first",
+        "deliver a reopened at second T to the second"
+      ],
+      "expected_results": [
+        "the first issue's generation 2 is escalated with the same reasons and is not a candidate, with its own intake_escalated entry naming generation 1",
+        "the second issue's generation 2 is open with order_ambiguous set at T"
+      ]
+    },
+    {
+      "id": "TC-47.10.8",
+      "verifies": [
+        "AC-47.10.10"
+      ],
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": [
+        "two tenants with sources for the same repository; tenant B's issue 42 finished with a closure, tenant A's issue 42 with no story"
+      ],
+      "steps": [
+        "deliver a reopened to tenant A, then to tenant B"
+      ],
+      "expected_results": [
+        "tenant A keeps one generation and its loop has not ended",
+        "tenant B gets generation 2 and tenant A is unchanged"
+      ]
+    },
+    {
+      "id": "TC-47.10.9",
+      "verifies": [
+        "AC-47.10.11"
+      ],
+      "name": "a later generation's close carries exactly one resolution label",
+      "type": "unit",
+      "preconditions": [
+        "an open issue carrying the earlier generation's resolution-shipped label"
+      ],
+      "steps": [
+        "close it for a not_actionable verdict",
+        "close it for a shipped verdict",
+        "close it with the removal failing transiently once, then again",
+        "close it with the add failing after the removal, then again"
+      ],
+      "expected_results": [
+        "the different verdict ends with only resolution-not-actionable, removed before added",
+        "the same verdict removes and adds nothing",
+        "the failed removal defers with nothing added, and the retry closes with one label",
+        "the retry finds nothing stale and closes with one label"
+      ]
+    },
+    {
+      "id": "TC-47.10.10",
+      "verifies": [
+        "AC-47.10.12"
+      ],
+      "name": "an earlier generation's same-verdict label does not make another actor's close ours",
+      "type": "unit",
+      "preconditions": [
+        "a pending shipped closure with no labelled_at"
+      ],
+      "steps": [
+        "read an issue closed by another actor carrying resolution-shipped",
+        "separately: find resolution-shipped on the open issue, fail the close, then read the issue closed",
+        "separately: a closure with labelled_at set reads the issue closed with its label"
+      ],
+      "expected_results": [
+        "abandoned closed_by_other, nothing closed",
+        "labelled_at is stamped on the first attempt and the retry records closed",
+        "recorded closed (the generation-1 crash window)"
+      ]
+    },
+    {
+      "id": "TC-47.10.11",
+      "verifies": [
+        "AC-47.10.13"
+      ],
+      "name": "an earlier generation's closure written after the bump is superseded",
+      "type": "integration",
+      "preconditions": [
+        "issue 42's story at deployed, then reopened into generation 2"
+      ],
+      "steps": [
+        "record generation 1's shipped closure",
+        "run the closer on it"
+      ],
+      "expected_results": [
+        "no forge call is made",
+        "the closure is abandoned superseded_by_generation",
+        "the newest generation's own closure is not superseded"
+      ]
+    }
+  ],
+  "technical_notes": "Migration 20261019180000_add_generation_to_intake_records. CHANGELOG states the rolling-deploy window: until a machine is replaced, the previous release fails issues deliveries because its ON CONFLICT target no longer has a matching index. Readers by record id (TriageTriggerWorker, TriageTrigger, TriageDispatcher, TriagePayload, IssueClosures, IssueCloser, Stages, Completion) are per generation and need no change. The race test is a sync module listed in test_suite_hygiene_test.exs, because the sandbox cannot run two transactions against each other. The closer's stale-label removal adds remove_label/3 to Loopctl.Delivery.PullRequestSource (GitHub: DELETE issues/:n/labels/:name, the label percent-encoded as one path segment, 404 read as success) and a fail-closed default stub in DataCase.",
+  "dependencies": []
+}

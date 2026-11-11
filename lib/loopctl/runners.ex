@@ -97,6 +97,7 @@ defmodule Loopctl.Runners do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.Agents.Registry, as: AgentSpecs
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.AuditChain
@@ -629,6 +630,57 @@ defmodule Loopctl.Runners do
     end
   end
 
+  @doc """
+  Hands a MERGE INSTRUCTION (`RunnerMergeInstruction`, contract 1.29.0, US-48.17) to the
+  runner holding a story's claim: control decided the merge, the runner executes it.
+
+  The same checks `dispatch/3` makes before its broadcast, in the same order, minus the
+  ledger: the payload is cast against the contract, the tenant is not halted, the runner is
+  authorized and has exactly one live socket — and that socket JOINED declaring a contract
+  version that understands `merge` (`{:error, :runner_contract_too_old}` otherwise: an older
+  runner would ignore the event, and the story would wait out every resend for nothing).
+
+  Then it broadcasts `{:runner_merge_instruction, instruction}` on `dispatch_topic/1`, and the
+  runner's channel pushes `"merge"` after re-checking, nearest the push, that it is still the
+  only live socket and the tenant is still not halted. No ledger row and no slot: an
+  instruction claims nothing and starts no session.
+
+  `:ok` means handed to the runner's channel, not executed and not acknowledged — the
+  runner's `ci -> merged` stage report is the answer, and `Loopctl.Delivery.MergeExecution`
+  resends when none arrives. A node of an EARLIER release ignores the message (its channel's
+  catch-all `handle_info/2`), which the same resend covers during a rolling deploy.
+  """
+  @spec instruct_merge(term(), term(), term()) ::
+          :ok
+          | {:error,
+             {:invalid, [String.t()]}
+             | :tenant_halted
+             | :not_authorized
+             | :runner_not_connected
+             | :runner_ambiguous
+             | :runner_contract_too_old
+             | term()}
+  def instruct_merge(tenant_id, runner_id, payload) do
+    with {:ok, instruction} <- RunnerContract.cast_merge_instruction(payload),
+         {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
+         :ok <- not_halted(tenant_id),
+         :ok <- runner_authorized(tenant_id, runner_id),
+         {:ok, meta} <- single_live_socket(tenant_id, runner_id),
+         :ok <- merge_supported(meta) do
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        dispatch_topic(runner_id),
+        {:runner_merge_instruction, instruction}
+      )
+    end
+  end
+
+  defp merge_supported(meta) do
+    if RunnerContract.merge_instruction_supported?(Map.get(meta, :contract_version)),
+      do: :ok,
+      else: {:error, :runner_contract_too_old}
+  end
+
   defp not_exhausted(tenant_id, runner_id, dispatch_id) do
     if usage_exhausted?(tenant_id, runner_id) and
          is_nil(DispatchLedger.get_record(tenant_id, dispatch_id)),
@@ -994,6 +1046,9 @@ defmodule Loopctl.Runners do
       kind in suppressed_kinds(meta) ->
         {:error, :kind_not_supported}
 
+      not holds_spec_for?(meta, kind) ->
+        {:error, :kind_not_supported}
+
       source == :declared ->
         :ok
 
@@ -1003,6 +1058,46 @@ defmodule Loopctl.Runners do
       true ->
         :ok
     end
+  end
+
+  # The spec loopctl would run under `kind` must be one the runner HOLDS (contract 1.25.0,
+  # US-48.8). Decided from the registry entry for the kind, never from the runner's list: a
+  # declared spec loopctl does not hold makes nothing eligible, and a kind with no registry
+  # entry is refused rather than sent to a machine that cannot say it holds its spec.
+  defp holds_spec_for?(meta, kind) do
+    case AgentSpecs.for_kind(kind) do
+      {:ok, spec} -> %{id: spec.id, version: spec.version} in declared_specs(meta)
+      {:error, :unknown_kind} -> false
+    end
+  end
+
+  @doc """
+  The agent specs a runner's join meta says it holds, as `%{id, version}` maps
+  (`RunnerJoin.specs`, contract 1.25.0).
+
+  A runner that sent no `specs` — every runner older than 1.25.0 — is read as holding VERSION
+  1 of the spec for each kind it declares (or, declaring no kinds, for each kind silence
+  implies), because version 1 is what every such runner was built against. That keeps an old
+  runner's eligibility exactly what it was. A runner that sent a list is held to it: a spec it
+  does not name is a spec it cannot run, so the kind that spec serves is not dispatched to it.
+
+  Like `declared_kinds/1`, read live at the decision from the meta and stored nowhere else.
+  An empty list reads as absence: `cast_join/1` admits `[]`, and it states nothing.
+  """
+  @spec declared_specs(map()) :: [%{id: String.t(), version: pos_integer()}]
+  def declared_specs(%{specs: [_ | _] = specs}) do
+    for %{id: id, version: version} <- specs,
+        is_binary(id) and is_integer(version),
+        do: %{id: id, version: version}
+  end
+
+  def declared_specs(meta) when is_map(meta) do
+    {_source, kinds} = declared_kinds(meta)
+
+    for kind <- kinds,
+        {:ok, spec} <- [AgentSpecs.for_kind(kind)],
+        spec.version == 1,
+        do: %{id: spec.id, version: 1}
   end
 
   @doc """

@@ -1,0 +1,69 @@
+{
+  "id": "US-48.13",
+  "title": "The improvement loop: failures become eval cases and proposed prompt versions",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "each spec's recorded failures turned into new eval cases and a proposed next prompt version that must beat the current one on the eval set",
+    "so_that": "the agents improve as they work, and no change to an agent's behaviour ships without measured evidence and a human landing it"
+  },
+  "rationale": "Mark, 2026-11-07: \"we need some kind of a feedback loop built-in, so these agents would self-improve as they work.\" The KB's god-mode cycle (4efb55d0): production runs, traces, new evals, harness changes, run again; and its caution (3b35b25e) that the human stays where 'good' is decided. The PRD keeps prompts on the runner, keyed {id, version}, so an improvement is a new template version landed by PR, never a row an agent writes.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.13.1",
+      "description": "spec_tuner@1, a :draft spec, runs weekly per spec with enough outcome rows (threshold in its spec). Its input is the spec's US-48.12 failures (human overrides, budget kills, gate refusals, high review-finding counts) as fenced, untrusted traces, the current template and the current eval set."
+    },
+    {
+      "id": "AC-48.13.2",
+      "description": "Its stored draft (no stage edge, nothing sent) holds: new eval cases distilled from the failures, in the US-48.10 case format with the human's actual decision as the expected answer, and a proposed template revision as a diff against the current {id, version}."
+    },
+    {
+      "id": "AC-48.13.3",
+      "description": "The eval harness (US-48.10) runs current and proposed versions on the enlarged set and attaches both scores to the draft. A proposal that does not beat the current version, or regresses any existing case, is marked rejected and never offered for landing."
+    },
+    {
+      "id": "AC-48.13.4",
+      "description": "An accepted proposal is landed only as a pull request to loopctl-runner (new template version, new eval cases) by a session holding an operator key; loopctl never edits a template or flips a version itself. The spec moves to the new version in the same PR's loopctl counterpart."
+    },
+    {
+      "id": "AC-48.13.5",
+      "description": "MCP tool tuning_drafts lists drafts with their scores and status, in the same change."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.13.1",
+      "verifies": ["AC-48.13.2"],
+      "name": "a human override becomes an eval case",
+      "type": "integration",
+      "steps": ["record a triage verdict a human overrode", "run spec_tuner over it"],
+      "expected_results": ["the draft holds a case whose expected answer is the human's route"]
+    },
+    {
+      "id": "TC-48.13.2",
+      "verifies": ["AC-48.13.3"],
+      "name": "a regressing proposal is rejected",
+      "type": "integration",
+      "steps": ["score a proposal that fails one existing case"],
+      "expected_results": ["status rejected, not offered"]
+    },
+    {
+      "id": "TC-48.13.3",
+      "verifies": ["AC-48.13.4"],
+      "name": "nothing in loopctl changes a template",
+      "type": "unit",
+      "steps": ["scan lib/ for writes of a spec's prompt field or a template version"],
+      "expected_results": ["none outside compiled specs"]
+    }
+  ],
+  "technical_notes": [
+    "Trace text is untrusted: fenced the same way triage fences reporter text.",
+    "The critic that scores proposals is the eval harness, not the tuner's own judgement (KB d7d84a75: a stronger external critic raises the ceiling)."
+  ],
+  "dependencies": ["US-48.9", "US-48.10", "US-48.12"]
+}

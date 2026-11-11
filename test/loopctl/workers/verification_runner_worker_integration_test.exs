@@ -147,6 +147,50 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       refute_received {:evidence, _}
     end
 
+    # US-47.6: a chg-bound story's verify read verified/master, so there is no CI to read.
+    test "a story bound to a chg change records chg_landed_on_trunk, no forge read", ctx do
+      fixture(:change_binding, %{tenant_id: ctx.tenant_id, story_id: ctx.story_id})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
+
+      run = fixture(:verification_run, ctx)
+      assert :ok = perform(ctx, run)
+
+      reloaded = reload(ctx, run)
+      assert reloaded.status == "error"
+
+      assert reloaded.ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "chg_landed_on_trunk"
+             }
+
+      refute_received {:compare, _}
+      refute_received {:evidence, _}
+    end
+
+    # An unbound story is read as before, whatever its source's mode: a pull request it was
+    # delivered by still carries the CI.
+    test "an unbound story of a chg-mode source is read as before", ctx do
+      root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+
+      [source] =
+        Loopctl.AdminRepo.all(
+          from(s in Loopctl.Intake.Source, where: s.tenant_id == ^ctx.tenant_id)
+        )
+
+      {:ok, %{mode: :chg}} =
+        Loopctl.Intake.update_source(ctx.tenant_id, source.id, %{
+          mode: "chg",
+          change_events_secret: String.duplicate("s", 32),
+          chg_root_dispatch_id: root.id
+        })
+
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
+
+      run = fixture(:verification_run, ctx)
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).status == "pass"
+    end
+
     # #931 finding g: the rescue arm records a code, never the exception.
     test "a crash records internal_error with no exception text, and cancels", ctx do
       stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->

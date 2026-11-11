@@ -18,6 +18,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.TriageTrigger
   alias Loopctl.Intake
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
@@ -167,6 +168,74 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       # carries none: the repository is no longer bound, so there is no action to take.
       assert %Record{status: :pending_triage, escalation_reasons: []} = reload(record)
       assert story_for(record.id) == nil
+    end
+
+    test "a ticket-requiring source makes no story for a ticketless record", %{tenant: tenant} do
+      {_source, ticketless} =
+        fixture(:intake_pair, %{tenant_id: tenant.id, triage_requires_ticket: true})
+
+      {_source, ticketed} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant.id,
+          repo_full_name: "mkreyman/ticketed",
+          triage_requires_ticket: true,
+          ticket_id: Ecto.UUID.generate()
+        })
+
+      # Excluded from the read, so it never holds a batch slot it can never use.
+      refute ticketless.id in candidate_ids(tenant)
+      assert ticketed.id in candidate_ids(tenant)
+
+      assert :ok = run(tenant)
+
+      assert story_for(ticketless.id) == nil
+      assert %Record{status: :pending_triage, escalation_reasons: []} = reload(ticketless)
+      assert %Story{} = story_for(ticketed.id)
+    end
+
+    test "promote/1 itself refuses a ticketless record on a ticket-requiring source", %{
+      tenant: tenant
+    } do
+      {_source, record} =
+        fixture(:intake_pair, %{tenant_id: tenant.id, triage_requires_ticket: true})
+
+      assert {:error, :ticket_required} = TriageTrigger.promote(record)
+      assert story_for(record.id) == nil
+    end
+
+    test "a record whose issue is closed makes no story", %{tenant: tenant} do
+      {_source, record} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant.id,
+          triage_requires_ticket: true,
+          ticket_id: Ecto.UUID.generate()
+        })
+
+      closed = record |> Ecto.Changeset.change(issue_state: "closed") |> AdminRepo.update!()
+
+      refute record.id in candidate_ids(tenant)
+      assert :ok = run(tenant)
+      assert story_for(record.id) == nil
+
+      # The race backstop: promote/1 refuses it on its own.
+      assert {:error, :issue_closed} = TriageTrigger.promote(closed)
+
+      # A reopen of a record with no story is applied to the same record (Loopctl.Intake), so
+      # its issue_state goes back to open and the next run promotes it.
+      closed |> Ecto.Changeset.change(issue_state: "open") |> AdminRepo.update!()
+
+      assert record.id in candidate_ids(tenant)
+      assert :ok = run(tenant)
+      assert %Story{} = story_for(record.id)
+    end
+
+    test "a source that does not require a ticket still promotes a ticketless record", %{
+      tenant: tenant
+    } do
+      {_source, record} = fixture(:intake_pair, %{tenant_id: tenant.id})
+
+      assert :ok = run(tenant)
+      assert %Story{} = story_for(record.id)
     end
 
     test "one bad record does not stop the others in the same run", %{tenant: tenant} do

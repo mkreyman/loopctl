@@ -23,7 +23,9 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:ci_red` — ci -> implementing
   - `:review_findings` — reviewing -> implementing
   - `:base_moved` — merge conflict or base moved: pr_open | ci -> implementing
-  - `:verification_failed` — post-deploy verification failing: deployed -> escalated
+  - `:verification_failed` — post-deploy verification failing: deployed | merged ->
+    escalated. From `merged` for a pr-route story, which control carries to `deployed`
+    itself (US-48.16) and so may judge before it gets there
   - `:triage_escalate` — triaged -> escalated, the triage trio's `escalate` verdict
     (design §4), including the disagreement that escalates by construction
   - `:triage_reject` — triaged -> failed, the triage trio's `reject` verdict (design §4):
@@ -85,6 +87,76 @@ defmodule Loopctl.Delivery.StageMachine do
     as it refuses the release edges, and neither is runner-reportable.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
+
+  The CHANGE-PROTOCOL edges (US-47.4, Epic 47 PRD §5). Each is taken by CONTROL from a chg
+  change event (`Loopctl.Changes.EventEffects`), never by a runner (none is in
+  `runner_reportable_edges/0`), and the event's author is never the actor: the webhook holds no
+  key, so these are written with `actor_role: :agent` and an attested-empty lineage, which keeps
+  every human-only edge out of reach.
+
+  - `:change_ready` — reviewing -> ci, when the change's review approved AND its checks passed
+    on the same revision. `ci` reads "ready to land"; `pr_open` is skipped, because a chg change
+    has no pull request
+  - `:reverted` — merged | deployed -> implementing, when chg reverted the landing. A
+    RETRACTION of a merge that HELD, so it is chained and needs a reason like `:merge_refused`,
+    and it clears exactly what `:merge_refused` clears. Its own edge rather than a reuse of
+    `:merge_refused`, because the two claims differ: a refusal says the merge never held, a
+    revert says it held and was undone. The claim is kept
+  - `:reverted_after_verify` — verified -> escalated, a revert of a story control had already
+    verified. `verified` is not closed, so a human decides what it is now
+  - `:change_resubmitted` — ci -> reviewing, when chg reports a `submitted` for a revision
+    NEWER than the one that made the story ready. Any revision re-enters review (AC-47.4.1),
+    including one pushed after the pair took `:change_ready`; the readiness was decided on a
+    head that is no longer the change's, so it clears what `ci` was keyed to that head
+    (`head_keyed/0`) and nothing merge-keyed, since nothing has merged. Not chained: `ci` is
+    not a custody fact, and neither is leaving it backwards
+  - `:change_review_findings` — ci -> implementing, when chg's review of the CURRENT revision
+    comes back with findings after the story was ready. Its own edge rather than
+    `:review_findings` from `ci`, because `:review_findings` is runner-reportable and `ci` is a
+    runner source stage: reusing it would hand a runner a `ci -> implementing` edge nothing
+    on the pull-request path takes
+  - `:change_outside_lifecycle` — any live stage but `escalated` -> escalated, when a change
+    event names an edge the machine does not allow from where the story is (a `landed` on a
+    story at `implementing`). Trunk holds a change the story did not expect, and only a human
+    can say what the story is now. It is NOT taken from `escalated`: a story already there is
+    waiting on a human, and `escalated` leaves only over `:human_resolution`
+  - `:review_missing` — merged -> escalated (US-47.5, Epic 47 PRD §6), taken in the SAME event
+    transaction as the `landed` that entered `merged`, when no chg review is recorded for the
+    landed revision (a policy auto-approval, or a review loopctl never accepted). chg lands on
+    its own authority, so the merge stands and nothing is cleared; the story is held for a
+    human and is never verified without one
+
+  The VERIFY edges (US-48.18), both taken by CONTROL from `ci`, neither runner-reportable:
+
+  - `:verify_rejected` — ci -> implementing, when the independently rooted verifier session
+    of `verify@1` answers `reject` for the story's CURRENT head
+    (`Loopctl.Agents.VerifyVerdict`). The findings are the reason. The same pass then releases
+    the claim over `:claim_released`, a counted attempt, so the story is re-placed with a
+    `rework` (`Loopctl.Delivery.Rework`) or escalated at the retry ceiling. Its own edge rather than
+    `:review_findings` or `:ci_red`, because both of those are a runner's own report and `ci`
+    is a runner source stage: reusing one would let an implementing session write the
+    verifier's verdict about itself
+  - `:no_independent_verifier_runner` — ci -> escalated, when the only runners able to take a
+    `verify` dispatch are the implementer's own agent (`Loopctl.Agents.VerifierPlacement`).
+    Nothing can verify the story without a person adding a machine
+
+  The MERGE edges (US-48.17), all three taken by CONTROL, none runner-reportable. On the pull
+  request route control decides the merge and the runner executes it
+  (`Loopctl.Delivery.MergeExecution`):
+
+  - `:runner_gone` — ci -> escalated, when the runner holding the claim has had no live socket
+    for longer than `MergeExecution.runner_gone_after_seconds/0` while the story waited at
+    `ci`. Escalated rather than re-queued: the pull request is open and green, and only the
+    machine that built it can be told to merge it. Not `:runner_lost` — that is a RELEASE edge
+    into `queued`, taken by the claim release alone
+  - `:merge_unanswered` — ci -> escalated, when the runner was instructed to merge the
+    recorded head `MergeExecution.max_sends/0` times and never reported the merge
+  - `:ungated_merge` — merged -> escalated, taken in the SAME transaction as a reported
+    `ci -> merged` on a pull-request-route story whose recorded allow
+    (`merge_gate_allowed_sha`) is not its head: a session merged without the gate. The merge
+    stands — it happened on GitHub — so nothing is cleared, and the reason names the sha. It
+    is never taken on the change protocol: chg lands through
+    `Loopctl.Delivery.Stages.advance_in_tenant_transaction/4`, which does not run the check
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
 
@@ -130,7 +202,14 @@ defmodule Loopctl.Delivery.StageMachine do
                 edge <- [:runner_lost, :claim_released],
                 do: {from, :queued, edge}
 
-  @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
+  # `detected` is RE-TRIAGE: the story goes back to the start of the line, to be triaged again
+  # by a fresh dispatch. Without it, a story whose triage produced no usable verdict could only
+  # be `queued` — handed to an implement session with no triage verdict and no Gate A input —
+  # or closed. On 2026-11-07 five HCB support-ticket stories were escalated that way at once,
+  # `triage_verdict:verdict_invalid`, by a runner defect that discarded their verdicts.
+  # `Escalations.resolve/3` admits it only for a story no implementer ever touched.
+  @human_resolution for to <- [:detected, :queued, :done, :failed],
+                        do: {:escalated, to, :human_resolution}
 
   # What a release decides AFTER it has requeued the row (US-44.4): the retry ceiling reached,
   # or an operator's release. From `queued` only, because the release has just put the row
@@ -171,6 +250,39 @@ defmodule Loopctl.Delivery.StageMachine do
   # and there the session's own `:session_escalated` is the way out. See the moduledoc entry.
   @budget_reported for from <- @in_flight, do: {from, :escalated, :budget_reported}
 
+  # The change protocol (US-47.4). The control-side escalations a change event can decide,
+  # taken through `Loopctl.Delivery.Escalations.escalate_as_control/3` and nothing else.
+  @control_escalations [:change_outside_lifecycle, :reverted_after_verify, :review_missing]
+
+  # From every stage a change event can find a story at that is not terminal: the event is
+  # recorded either way, and a story `done` or `failed` has nowhere to go. NOT from
+  # `escalated`, which a human already holds and which leaves only over `:human_resolution`.
+  #
+  # What writes the edge OUT of the stage this leaves stories in: `escalated` has
+  # `:human_resolution`, so none of these makes a stage absorbing.
+  @change_outside_lifecycle for from <- @stages,
+                                from not in @terminal,
+                                do: {from, :escalated, :change_outside_lifecycle}
+
+  # A revert takes the story back to work from either stage a landing can have reached, and
+  # keeps the claim. `implementing` is left by `:forward` (the next `submitted`) and by every
+  # in-flight edge, so this makes nothing absorbing either.
+  @reverted for from <- [:merged, :deployed], do: {from, :implementing, :reverted}
+
+  # A revision pushed after readiness goes back to review, and findings on the ready revision
+  # go back to work. `reviewing` and `implementing` both have edges out (`:change_ready`,
+  # `:review_findings`, `:forward`), so neither makes a stage absorbing.
+  @change_protocol [
+                     {:reviewing, :ci, :change_ready},
+                     {:ci, :reviewing, :change_resubmitted},
+                     {:ci, :implementing, :change_review_findings},
+                     {:verified, :escalated, :reverted_after_verify},
+                     # US-47.5: a landing with no chg review recorded for its revision.
+                     # `escalated` leaves over `:human_resolution`, so it is not absorbing.
+                     {:merged, :escalated, :review_missing}
+                   ] ++
+                     @reverted ++ @change_outside_lifecycle
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -178,16 +290,33 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:pr_open, :implementing, :base_moved},
                    {:ci, :implementing, :base_moved},
                    {:deployed, :escalated, :verification_failed},
+                   # US-48.16: control also reads a pr-route story at `merged` (its runner
+                   # reports up to the merge and stops), writing `merged -> deployed` once a
+                   # deployment carries the merge. A verdict reached BEFORE that — no deploy
+                   # inside the bounds, or one that failed — escalates from `merged`, over the
+                   # same control-only edge. `merged` is a runner SOURCE stage, so only the edge
+                   # allowlist (`@runner_reportable_edges`) keeps this off the wire.
+                   {:merged, :escalated, :verification_failed},
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
-                   {:merged, :implementing, :merge_refused}
+                   {:merged, :implementing, :merge_refused},
+                   # US-48.18: the verifier's reject, and no machine apart from the
+                   # implementer's to verify on. Both CONTROL-ONLY (see the moduledoc).
+                   {:ci, :implementing, :verify_rejected},
+                   {:ci, :escalated, :no_independent_verifier_runner},
+                   # US-48.17: the merge control decides and the runner executes. All three
+                   # CONTROL-ONLY (see the moduledoc); `escalated` leaves over
+                   # `:human_resolution`, so none of them makes a stage absorbing.
+                   {:ci, :escalated, :runner_gone},
+                   {:ci, :escalated, :merge_unanswered},
+                   {:merged, :escalated, :ungated_merge}
                  ] ++
                  @budget_exceeded ++
                  @released ++
                  @human_resolution ++
                  @session_escalated ++
-                 @budget_reported ++ @release_escalated
+                 @budget_reported ++ @release_escalated ++ @change_protocol
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -247,16 +376,24 @@ defmodule Loopctl.Delivery.StageMachine do
   #
   # So: a runner may report what its own session did and control can independently check,
   # plus its own escalation, which stops the loop rather than advancing it. A story therefore
-  # WAITS at `deployed` for control to decide verified-or-escalated, and no writer for that
-  # exists yet — an unimplemented control path, chosen deliberately over a session certifying
-  # itself.
+  # WAITS for control to decide verified-or-escalated — at `deployed`, or at `merged` when its
+  # session stopped at the merge (a pr-route session, US-48.16) — and the writer of that
+  # decision is `Loopctl.Delivery.PostDeployVerification`, which also writes
+  # `merged -> deployed` itself once a deployment carries the merge.
   #
   # One residual asymmetry, named rather than hidden: `ci -> merged` is reportable while
   # `ci -> escalated` over `:merge_gate` is not, so the merge gate's positive outcome is a
   # runner's to report and its refusal is not. That is the checkability rule above and not an
-  # oversight — a merge NAMES a sha GitHub can confirm, the gate's refusal names nothing —
-  # but WHO PERFORMS THE MERGE is undecided in the design (§9 puts auto-merge last, and build
-  # order step 1 merges nothing). Revisit this line when that is settled.
+  # oversight — a merge NAMES a sha GitHub can confirm, the gate's refusal names nothing.
+  #
+  # WHO PERFORMS THE MERGE is settled for the pull-request route (US-48.17): control decides,
+  # the runner executes. `Loopctl.Delivery.MergeExecution` runs the merge gate over the
+  # recorded head and, on an allow, instructs the runner holding the claim to merge exactly
+  # that head; the runner then reports `ci -> merged` here with the sha GitHub returned. The
+  # report stays reportable because the runner is still the one that saw the merge happen, and
+  # it is no longer the runner's word on whether it MAY: a pull-request-route merge reported
+  # for a head the gate did not allow is escalated over `:ungated_merge` in the same
+  # transaction (`Loopctl.Delivery.Stages.advance/4`).
   #
   # The SOURCE filter is also what keeps `claimed` out as a destination: `queued` is the only
   # stage anything enters `claimed` from, and `queued` is not a source. A separate
@@ -292,7 +429,9 @@ defmodule Loopctl.Delivery.StageMachine do
   # every writer in the tenant on its head row, so putting every stage change there would
   # serialise every concurrent story on that one row.
   @chained_targets [:claimed, :merged, :escalated]
-  @chained_edges [:merge_refused]
+  # `:reverted` retracts a merge as `:merge_refused` does (US-47.4): without a counter-entry the
+  # chain keeps saying the story merged, and a re-land records a second merge over a stale one.
+  @chained_edges [:merge_refused, :reverted]
 
   # Side-effect identities, and the stages allowed to write each one. A replayed stage finds
   # the identity its first run wrote; a writer from a stage that does not produce the effect
@@ -329,7 +468,14 @@ defmodule Loopctl.Delivery.StageMachine do
     # `record_effect/5`'s idempotence is exactly the semantics an allow needs: the same
     # head twice is the same allow, and a DIFFERENT head is `:effect_conflict` rather than
     # a silent re-grant.
-    merge_gate_allowed_sha: [:ci]
+    merge_gate_allowed_sha: [:ci],
+    # THE HEAD A VERIFICATION WAS MADE AT (US-48.18). Written by CONTROL at `ci`
+    # (`Loopctl.Agents.VerifyVerdict`) once report, review and verify have committed for a
+    # `pass` naming this head, and only when the row's `head_sha` is still that head. A
+    # verification is about a commit; `stories.verified_status` alone names none, so a story
+    # verified at X that came back to `ci` at Y read as verified at Y. Head-keyed below, and
+    # read by `Loopctl.Delivery.MergePrecondition`'s custody fact.
+    verified_head_sha: [:ci]
   }
 
   # Identities that stop describing the story when an edge is taken, cleared by that edge.
@@ -345,7 +491,19 @@ defmodule Loopctl.Delivery.StageMachine do
   # commit, and the count would escalate a fresh head on its predecessor's blips.
   # `head_keyed/0` is what the drift guard reads, so a new head-bound field cannot be added
   # to one clause and forgotten in the others.
-  @head_keyed [:head_sha, :merge_gate_allowed_sha, :merge_gate_unevaluated]
+  #
+  # `merge_instruction` and `runner_absence` (US-48.17) are head-keyed as well. An instruction
+  # is to merge ONE head, so one left behind would read as "already instructed" for a head
+  # nobody instructed; an absence is the clock on the runner the story waited on at `ci`, and a
+  # story that went back to work has stopped waiting.
+  @head_keyed [
+    :head_sha,
+    :merge_gate_allowed_sha,
+    :merge_gate_unevaluated,
+    :verified_head_sha,
+    :merge_instruction,
+    :runner_absence
+  ]
 
   # Everything BOUND TO THE MERGE, cleared wherever `merge_sha` is. The same rule as
   # `@head_keyed` one identity along: post-deploy verification's unresolved count is kept
@@ -353,7 +511,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # merge was retracted would escalate the next merge on its predecessor's blips.
   # `merge_keyed/0` is what the drift guard reads, so a new merge-bound field cannot be
   # added to one clause and forgotten in the others.
-  @merge_keyed [:merge_sha, :post_deploy_unresolved]
+  #
+  # `release_id` and `trunk_verified_sha` joined it with the change protocol (US-47.4), which
+  # gave a merge a way to be retracted from `deployed` (`:reverted`). The release is the deploy
+  # OF this merge, and the trunk verification is chg's verdict ON it: either left behind would
+  # describe a merge that was undone — and `release_id`, an effect, would refuse the re-land's
+  # own deploy as `:effect_conflict`.
+  @merge_keyed [:merge_sha, :post_deploy_unresolved, :release_id, :trunk_verified_sha]
 
   @released_clears [:runner_id, :worktree_path] ++ @head_keyed
 
@@ -372,11 +536,18 @@ defmodule Loopctl.Delivery.StageMachine do
   #   is the RECORD OF A VERDICT, and the same rule that keeps `:merge_gate` off the wire
   #   keeps its allow off too: a session may not report the outcome of a check it does not
   #   perform, and here it would not merely report it but GRANT it.
+  # - `verified_head_sha` — written by `Loopctl.Agents.VerifyVerdict` (US-48.18). The record of
+  #   the VERIFIER'S verdict about the head; a session reporting it would certify its own work.
   #
   # Anything the gate writes in future goes here as well. The test in
   # `runner_contract_test.exs` binds this list to the wire schema in both directions, so a new
   # effect that belongs on neither side goes red rather than reaching a runner.
-  @control_written_effects [:runner_id, :merge_gate_allowed_sha, :triage_dispatch_id]
+  @control_written_effects [
+    :runner_id,
+    :merge_gate_allowed_sha,
+    :triage_dispatch_id,
+    :verified_head_sha
+  ]
 
   @reportable_effects @effect_stages
                       |> Map.keys()
@@ -418,6 +589,17 @@ defmodule Loopctl.Delivery.StageMachine do
           | :operator_released
           | :human_resolution
           | :session_escalated
+          | :change_ready
+          | :change_resubmitted
+          | :change_review_findings
+          | :reverted
+          | :reverted_after_verify
+          | :change_outside_lifecycle
+          | :verify_rejected
+          | :no_independent_verifier_runner
+          | :runner_gone
+          | :merge_unanswered
+          | :ungated_merge
 
   @type effect ::
           :runner_id
@@ -429,6 +611,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :release_id
           | :merge_gate_allowed_sha
           | :triage_dispatch_id
+          | :verified_head_sha
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to
@@ -440,6 +623,7 @@ defmodule Loopctl.Delivery.StageMachine do
   # Identities that describe the story for its whole life rather than one attempt at it, and
   # so survive even a human re-queue. A re-queue does not re-triage — the story does not go
   # back to `detected` — so the verdict Gate A judges is still the one this dispatch gave.
+  # The one edge that clears them is the human re-triage, `escalated -> detected` (`clears/3`).
   @story_lifetime_effects [:triage_dispatch_id]
   @required_effects %{merged: [:merge_sha]}
 
@@ -553,6 +737,27 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec release_escalation_edges() :: [edge()]
   def release_escalation_edges, do: @release_escalations
 
+  @doc """
+  The control-side escalations a chg change event decides: `:change_outside_lifecycle` and
+  `:reverted_after_verify` (US-47.4), and `:review_missing` (US-47.5). Taken through
+  `Loopctl.Delivery.Escalations.escalate_as_control/3`, never by a runner.
+  """
+  @spec control_escalation_edges() :: [edge()]
+  def control_escalation_edges, do: @control_escalations
+
+  @doc """
+  The change-protocol edges (US-47.4): `:change_ready`, `:change_resubmitted`,
+  `:change_review_findings`, `:reverted`, `:reverted_after_verify` and
+  `:change_outside_lifecycle`, plus US-47.5's `:review_missing`. Control-only — none is runner-reportable, and
+  `Loopctl.Delivery.Stages.advance/4` refuses every one of them: only the change-event seam
+  (`Stages.advance_in_tenant_transaction/4`) takes them.
+  """
+  @spec change_protocol_edges() :: [edge()]
+  def change_protocol_edges,
+    do:
+      [:change_ready, :change_resubmitted, :change_review_findings, :reverted] ++
+        @control_escalations
+
   @doc "True for the edges only a human principal may take."
   @spec human_only?(edge()) :: boolean()
   def human_only?(edge), do: edge == :human_resolution
@@ -653,8 +858,8 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @doc """
   True when the transition is custody-critical and is appended to the audit chain: into
-  `claimed`, `merged` or `escalated`, out of `escalated`, or the `:merge_refused`
-  retraction of a merge.
+  `claimed`, `merged` or `escalated`, out of `escalated`, or a retraction of a merge
+  (`:merge_refused`, `:reverted`).
   """
   @spec chained?(stage(), stage(), edge()) :: boolean()
   def chained?(from, to, edge),
@@ -710,7 +915,10 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec transition_only?(atom()) :: boolean()
   def transition_only?(effect), do: effect in @transition_only
 
-  @doc "The identities no transition clears, a human re-queue included."
+  @doc """
+  The identities that survive every transition, a human re-queue included, except the human
+  re-triage (`escalated -> detected`), which clears them.
+  """
   @spec story_lifetime_effects() :: [effect()]
   def story_lifetime_effects, do: @story_lifetime_effects
 
@@ -742,9 +950,25 @@ defmodule Loopctl.Delivery.StageMachine do
         (Map.keys(@effect_stages) -- @story_lifetime_effects) ++ @head_keyed ++ @merge_keyed
       )
 
+  # Re-triage clears EVERYTHING, the story-lifetime `triage_dispatch_id` included: the next
+  # `detected -> triaged` binds the dispatch that triages it again, and Gate A must read that
+  # dispatch's lens verdicts, never the ones that came before. A human re-queue keeps it
+  # because the story keeps its triage; a re-triage is precisely the story giving it up.
+  def clears(:escalated, :detected, :human_resolution),
+    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed ++ @merge_keyed)
+
   # A refused merge never happened, so the identity recorded for it goes with the head —
   # and so does everything keyed to that merge.
   def clears(:merged, :implementing, :merge_refused), do: @merge_keyed ++ @head_keyed
+
+  # A revert retracts a merge that held (US-47.4), and clears EXACTLY what a refused one does:
+  # the merge-keyed fields and everything bound to the head.
+  def clears(from, :implementing, :reverted) when from in [:merged, :deployed],
+    do: clears(:merged, :implementing, :merge_refused)
+
+  # A revision pushed after readiness (US-47.4): the head the readiness was judged on is gone,
+  # and with it everything `ci` keyed to that head. Nothing merge-keyed exists yet.
+  def clears(:ci, :reviewing, :change_resubmitted), do: @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
 
@@ -756,5 +980,5 @@ defmodule Loopctl.Delivery.StageMachine do
   merge, whose chained counter-entry must say why the merge did not hold.
   """
   @spec reason_required?(stage(), edge()) :: boolean()
-  def reason_required?(to, edge), do: to == :escalated or edge == :merge_refused
+  def reason_required?(to, edge), do: to == :escalated or edge in @chained_edges
 end

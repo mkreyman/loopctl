@@ -315,5 +315,31 @@ defmodule Loopctl.Delivery.GateAInputTest do
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution
     end
+
+    test "a RE-TRIAGE answers nothing, and drops a Gate A answer given before it" do
+      ctx = story()
+
+      # A Gate A escalation a human re-triages instead of re-queueing: the next triage's lens
+      # verdicts are what Gate A judges, so the re-triage itself must not stand in for them.
+      events(ctx, [
+        {"triaged", "escalated", "triage_escalate", %{"reason" => "triage_verdict:escalate"}},
+        {"escalated", "detected", "human_resolution", %{}},
+        {"detected", "triaged", "forward", %{}}
+      ])
+
+      assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
+
+      other = story()
+
+      # And an answer a human DID give is about a triage the re-triage later discarded.
+      events(other, [
+        {"triaged", "escalated", "triage_escalate", %{"reason" => "triage_verdict:escalate"}},
+        {"escalated", "queued", "human_resolution", %{}},
+        {"queued", "escalated", "attempts_exhausted", %{}},
+        {"escalated", "detected", "human_resolution", %{}}
+      ])
+
+      assert GateAInput.for_story(other.story.tenant_id, other.story.id) == :missing
+    end
   end
 end

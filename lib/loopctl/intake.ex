@@ -75,6 +75,56 @@ defmodule Loopctl.Intake do
     stored content as possibly one event behind. The flag clears on the next strictly
     newer delivery, which settles the order.
 
+  An issue's deliveries are ordered against its NEWEST generation (below), and only that one.
+  A delivery older than the newest generation's content is dropped there like any other
+  older delivery. It is not applied to an earlier generation either, because an earlier
+  generation is never written again.
+
+  ## Generations
+
+  An issue has one record per generation (`Loopctl.Intake.Record`, `generation`), unique on
+  `(tenant_id, source_id, issue_number, generation)`. Every delivery applies to the NEWEST
+  generation. chg closes an issue it filed once the failure has been quiet for a while after
+  the merge, and reopens it if the failure comes back. A `reopened` delivery whose newest
+  record has reached the end of the loop therefore starts generation N+1 and applies its
+  content there. The new record sits at `pending_triage`, and the triage drain takes it like
+  any new issue. A record has reached the end of the loop (`loop_ended?/1`) when it has an
+  issue-closure row, or when its story's stage is one of `generation_end_stages/0`.
+
+  The bump has to be a delivery that WOULD be applied, newer than the record (or the same
+  second with different content). A reopen that is older than what the record already holds
+  starts nothing, so a late reopen cannot fork the issue after a newer close.
+
+  Nothing else starts a generation. A reopen of a record whose story is still in flight, or
+  that has no story yet, is applied to that record as before. The earlier generation's
+  record, story and closure are never written again.
+
+  A new generation inherits its predecessor's escalation (status, reasons, `escalated_at`).
+  An escalation is never cleared by a later delivery, and a reopen is a later delivery: a
+  reopen must not launder a flagged issue back into the triage queue. The inherited reasons
+  get their own `intake_escalated` entry on the new record, naming the generation they came
+  from.
+
+  **Which record is newest is decided under the lock, not before it.** `SELECT ... ORDER BY
+  generation DESC LIMIT 1 FOR UPDATE` picks its row from the statement's snapshot BEFORE it
+  waits. A delivery that queues behind a bump therefore gets generation N once the bump
+  commits, although N+1 now exists, because the bump never changes N's row. So after the
+  lock is taken, a FRESH statement asks whether a newer generation exists, and if one does
+  the delivery locks that one instead, until the row it holds is the newest
+  (`newest_locked/2`). It holds every row it passed on the way. A bump holds N's lock while
+  it inserts N+1, so a delivery that has the lock on N and has seen no N+1 cannot be
+  overtaken. That covers every action: an `edited` lands on N+1, and a second reopen finds
+  N+1 with no story and starts nothing. The unique index on the generation stays as a
+  backstop. A conflict there would mean a bump without the lock, and it raises rather than
+  being absorbed. A replayed delivery never gets this far: step 4's delivery index stops it
+  first.
+
+  An earlier generation's closure that is still pending when a later generation starts is
+  abandoned by `Loopctl.Delivery.IssueCloser` as `superseded_by_generation`, before any
+  forge call. Its story may have ended the loop at `merged`, before its verdict wrote the
+  closure. Closing the reopened issue with the old fix's message would answer a report
+  that is being triaged again.
+
   ## Isolation
 
   `AdminRepo` with an explicit `tenant_id` predicate on every query, as `Loopctl.Runners`
@@ -93,6 +143,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
+  alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
@@ -109,6 +160,15 @@ defmodule Loopctl.Intake do
   @max_body_bytes 1_048_576
 
   @issue_actions ~w(opened edited reopened closed labeled unlabeled)
+
+  # The stages at which a story's change has LANDED (`Loopctl.Delivery.StageMachine`). From
+  # `merged` on the fix is on trunk, so a recurrence is a new problem for a new triage, not
+  # more work on this story. Not `escalated` or `failed`. `escalated` is waiting for a human,
+  # who may send it back to `queued` (`:human_resolution`), so the issue is still that
+  # story's. A `failed` story shipped nothing. When it failed over `:triage_reject`, the
+  # verdict wrote a closure and the closure clause covers it. When it failed over
+  # `:budget_exceeded`, nothing in `lib/` writes that edge today.
+  @generation_end_stages [:merged, :deployed, :verified, :done]
 
   # Retention (see "Retention" in the moduledoc). DELIBERATELY an order of magnitude below the
   # trace pruner's, because this half runs on `AdminRepo`, whose pool is 3 connections that
@@ -143,6 +203,10 @@ defmodule Loopctl.Intake do
   @doc "The largest webhook body, in bytes, the intake route reads."
   @spec max_body_bytes() :: pos_integer()
   def max_body_bytes, do: @max_body_bytes
+
+  @doc "The story stages at which a reopen starts an issue's next generation (see Generations)."
+  @spec generation_end_stages() :: [atom()]
+  def generation_end_stages, do: @generation_end_stages
 
   @doc "The `issues` actions that update an intake record."
   @spec issue_actions() :: [String.t()]
@@ -222,6 +286,7 @@ defmodule Loopctl.Intake do
       base_branch: "base_branch",
       mode: "mode",
       required_checks: "required_checks",
+      triage_requires_ticket: "triage_requires_ticket",
       change_events_secret: "change_events_secret",
       chg_root_dispatch_id: "chg_root_dispatch_id"
     ]
@@ -344,6 +409,9 @@ defmodule Loopctl.Intake do
                  # Which route the merge gate reads, recorded for the same reason
                  # as the branch — a later `intake_source_mode_set` says what it changed TO.
                  "mode" => Atom.to_string(source.mode),
+                 # Which issues are triaged at all, so a later `intake_source_triage_requires_ticket_set`
+                 # has a starting value to be read against.
+                 "triage_requires_ticket" => source.triage_requires_ticket,
                  # The custody input a `chg` source names (PRD §6). The secret itself is never
                  # on the chain; only whether one was set.
                  "chg_root_dispatch_id" => source.chg_root_dispatch_id,
@@ -398,7 +466,8 @@ defmodule Loopctl.Intake do
 
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
   `:base_branch` (NOT nullable), `:mode` (`"pr"` or `"chg"`, NOT nullable),
-  `:required_checks`, `:change_events_secret` and `:chg_root_dispatch_id` (both nullable on a
+  `:required_checks`, `:triage_requires_ticket` (NOT nullable; `true` triages only ticket-filed issues),
+  `:change_events_secret` and `:chg_root_dispatch_id` (both nullable on a
   `pr` source and required on a `chg` one). A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
@@ -429,6 +498,7 @@ defmodule Loopctl.Intake do
     :base_branch,
     :mode,
     :required_checks,
+    :triage_requires_ticket,
     :change_events_secret,
     :chg_root_dispatch_id
   ]
@@ -489,6 +559,8 @@ defmodule Loopctl.Intake do
         do: cast_required_checks(changeset, attrs),
         else: changeset
 
+    changeset = Source.put_triage_requires_ticket(changeset, attrs)
+
     with {:ok, changeset} <- valid(changeset) do
       write_update(tenant_id, changeset, fields, opts)
     end
@@ -539,6 +611,7 @@ defmodule Loopctl.Intake do
            :ok <- append_if(fields, :base_branch, tenant_id, source, opts),
            :ok <- append_if(fields, :mode, tenant_id, source, opts),
            :ok <- append_if(fields, :required_checks, tenant_id, source, opts),
+           :ok <- append_if(fields, :triage_requires_ticket, tenant_id, source, opts),
            :ok <- append_if(fields, :chg_root_dispatch_id, tenant_id, source, opts),
            :ok <- append_if(fields, :change_events_secret, tenant_id, source, opts) do
         source
@@ -554,28 +627,7 @@ defmodule Loopctl.Intake do
   end
 
   defp append_update(field, tenant_id, source, opts) do
-    {action, payload} =
-      case field do
-        :target_epic_id ->
-          {"intake_source_repointed", %{"target_epic_id" => source.target_epic_id}}
-
-        :base_branch ->
-          {"intake_source_base_branch_set", %{"base_branch" => source.base_branch}}
-
-        :mode ->
-          {"intake_source_mode_set", %{"mode" => Atom.to_string(source.mode)}}
-
-        :required_checks ->
-          {"intake_source_required_checks_set", %{"required_checks" => source.required_checks}}
-
-        :chg_root_dispatch_id ->
-          {"intake_source_chg_root_set", %{"chg_root_dispatch_id" => source.chg_root_dispatch_id}}
-
-        # Whether a secret is set, never the secret: the chain is readable by every auditor.
-        :change_events_secret ->
-          {"intake_source_change_events_secret_set",
-           %{"change_events_secret_set" => is_binary(source.change_events_secret)}}
-      end
+    {action, payload} = update_entry(field, source)
 
     case AuditChain.append(tenant_id, %{
            action: action,
@@ -588,6 +640,32 @@ defmodule Loopctl.Intake do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp update_entry(:target_epic_id, source),
+    do: {"intake_source_repointed", %{"target_epic_id" => source.target_epic_id}}
+
+  defp update_entry(:base_branch, source),
+    do: {"intake_source_base_branch_set", %{"base_branch" => source.base_branch}}
+
+  defp update_entry(:mode, source),
+    do: {"intake_source_mode_set", %{"mode" => Atom.to_string(source.mode)}}
+
+  defp update_entry(:required_checks, source),
+    do: {"intake_source_required_checks_set", %{"required_checks" => source.required_checks}}
+
+  defp update_entry(:triage_requires_ticket, source),
+    do:
+      {"intake_source_triage_requires_ticket_set",
+       %{"triage_requires_ticket" => source.triage_requires_ticket}}
+
+  defp update_entry(:chg_root_dispatch_id, source),
+    do: {"intake_source_chg_root_set", %{"chg_root_dispatch_id" => source.chg_root_dispatch_id}}
+
+  # Whether a secret is set, never the secret: the chain is readable by every auditor.
+  defp update_entry(:change_events_secret, source),
+    do:
+      {"intake_source_change_events_secret_set",
+       %{"change_events_secret_set" => is_binary(source.change_events_secret)}}
 
   # AC-47.2.2: the root a `chg` source names is a CUSTODY INPUT (PRD §6) — later stories accept a
   # review only from a child of it and refuse it as a verifier — so it is checked against the
@@ -603,9 +681,9 @@ defmodule Loopctl.Intake do
   # across tenants.
   #
   # This guards the REGISTRATION only. Nothing here stops a source whose root is revoked between
-  # writes from staying `chg`; the change-events webhook (US-47.3, AC-47.3.6) must refuse an event
-  # for a source whose root is revoked, and every later gate that reads the root must judge it
-  # the same way.
+  # writes from staying `chg`; the change-events webhook (US-47.3, AC-47.3.7) refuses an event
+  # for a source whose root is revoked (`hold_chg_source/3`), and every later gate that reads
+  # the root must judge it the same way.
   #
   # INSIDE the write's transaction and `FOR SHARE`, so a concurrent `Dispatches.revoke/3` of the
   # root either commits first (and this read sees `revoked_at`) or waits for this write to
@@ -685,6 +763,41 @@ defmodule Loopctl.Intake do
   end
 
   @doc """
+  Whether `story_id` is a PR-ROUTE delivery story (US-48.18): it has a delivery stage row, and
+  every live intake source of its project is in mode `pr` (at least one). Read on `repo` with
+  explicit `tenant_id` predicates, so it holds on `Loopctl.AdminRepo` as well as under RLS.
+
+  The custody consequence of the answer is the caller's: `Loopctl.Progress` refuses an
+  unlineaged reject on such a story, and `Loopctl.Delivery.Stages` retires its verification on
+  every edge that clears its head.
+  """
+  @spec pr_route?(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) :: boolean()
+  # A story with no id was never persisted, so it has no stage row and no route.
+  def pr_route?(_repo, _tenant_id, nil), do: false
+
+  def pr_route?(repo, tenant_id, story_id) do
+    staged? =
+      repo.exists?(
+        from st in StoryStage, where: st.tenant_id == ^tenant_id and st.story_id == ^story_id
+      )
+
+    staged? and pr_modes?(repo, tenant_id, story_id)
+  end
+
+  defp pr_modes?(repo, tenant_id, story_id) do
+    modes =
+      repo.all(
+        from s in live_sources_query(tenant_id),
+          join: story in Story,
+          on: story.project_id == s.project_id and story.tenant_id == s.tenant_id,
+          where: story.id == ^story_id,
+          select: s.mode
+      )
+
+    modes != [] and Enum.all?(modes, &(&1 == :pr))
+  end
+
+  @doc """
   Whether a merge allow may be recorded for `story_id`: `{:error, :change_protocol_enrolled}`
   when a live intake source of the story's project is in mode `chg`, `:ok` otherwise.
 
@@ -719,9 +832,56 @@ defmodule Loopctl.Intake do
     if :chg in modes, do: {:error, :change_protocol_enrolled}, else: :ok
   end
 
-  defp judge_chg_root(tenant_id, root_id) when is_binary(root_id) do
+  @doc """
+  Re-reads a live `chg` source INSIDE the caller's transaction on `repo` and judges its root
+  by the same rule enrolment does (`check_chg_root/2`'s `judge_chg_root/3`): `{:ok, source}`,
+  `{:error, :not_chg_source}` (revoked, another tenant's, unknown, `pr`-mode or holding no
+  `change_events_secret`), `{:error, :tenant_inactive}` or `{:error, :chg_root_invalid}`.
+
+  For the change-events webhook (US-47.3, AC-47.3.7). Enrolment judges the root only when a
+  source is WRITTEN, so a root revoked between writes is caught here, on every event. Both
+  reads are `FOR SHARE`, so a concurrent revoke of the source or of its root, a mode switch or
+  a secret rotation either commits first and is seen, or waits for the event to commit. The
+  tenant's status is read here too, so a suspension committed since the caller's own
+  pre-check refuses the event. `repo` is `Loopctl.Repo` under the source's tenant there; the
+  explicit `tenant_id` predicates hold on any repo.
+
+  The held source is what the caller authenticates against: its `change_events_secret` is the
+  one that counts, not a copy read before the transaction.
+  """
+  @spec hold_chg_source(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Source.t()} | {:error, :not_chg_source | :tenant_inactive | :chg_root_invalid}
+  def hold_chg_source(repo, tenant_id, source_id)
+      when is_binary(tenant_id) and is_binary(source_id) do
+    source =
+      repo.one(
+        from s in live_sources_query(tenant_id),
+          where: s.id == ^source_id,
+          lock: "FOR SHARE"
+      )
+
+    case source do
+      %Source{mode: :chg, change_events_secret: secret} = source when is_binary(secret) ->
+        with :ok <- judge_tenant_active(repo, tenant_id),
+             :ok <- judge_chg_root(repo, tenant_id, source.chg_root_dispatch_id),
+             do: {:ok, source}
+
+      _other ->
+        {:error, :not_chg_source}
+    end
+  end
+
+  defp judge_tenant_active(repo, tenant_id) do
+    if repo.exists?(from t in Tenant, where: t.id == ^tenant_id and t.status == :active),
+      do: :ok,
+      else: {:error, :tenant_inactive}
+  end
+
+  defp judge_chg_root(repo \\ AdminRepo, tenant_id, root_id)
+
+  defp judge_chg_root(repo, tenant_id, root_id) when is_binary(root_id) do
     dispatch =
-      AdminRepo.one(
+      repo.one(
         from d in Dispatch,
           where: d.id == ^root_id and d.tenant_id == ^tenant_id,
           lock: "FOR SHARE"
@@ -731,7 +891,7 @@ defmodule Loopctl.Intake do
   end
 
   # `validate_mode/1` already required it, so a nil here is a caller bypassing the changeset.
-  defp judge_chg_root(_tenant_id, _root_id), do: {:error, :chg_root_invalid}
+  defp judge_chg_root(_repo, _tenant_id, _root_id), do: {:error, :chg_root_invalid}
 
   # `lineage_path == [id]` is what a parentless dispatch carries (`Loopctl.Dispatches`); a row
   # where the two disagree is not trusted as a root.
@@ -1195,6 +1355,36 @@ defmodule Loopctl.Intake do
     end
   end
 
+  @doc """
+  The live source a delivery to `source_id` addresses, on an active tenant, or `nil` — the one
+  cross-tenant read (by id) a webhook makes before it knows its tenant. Any `source_id` that is
+  not a UUID is `nil` too, so an unknown, a revoked, a malformed and another deployment's id are
+  one answer. Shared by the GitHub intake webhook and the change-events webhook (US-47.3).
+  """
+  @spec delivery_source(term()) :: Source.t() | nil
+  def delivery_source(source_id), do: active_source(source_id)
+
+  @doc """
+  The tenant's live `chg` source for `repo_full_name` (case-insensitively, as GitHub names
+  are), or `nil`. What a change-events gap pull signs with: the source live NOW, so a
+  re-enrolled repository's new secret is the one used (US-47.3).
+  """
+  @spec chg_source_for_repo(Ecto.UUID.t(), String.t()) :: Source.t() | nil
+  def chg_source_for_repo(tenant_id, repo_full_name)
+      when is_binary(tenant_id) and is_binary(repo_full_name) do
+    name = String.downcase(repo_full_name)
+
+    AdminRepo.one(
+      from s in live_sources_query(tenant_id),
+        join: t in Tenant,
+        on: t.id == s.tenant_id,
+        where:
+          s.mode == :chg and fragment("lower(?)", s.repo_full_name) == ^name and
+            t.status == :active,
+        limit: 1
+    )
+  end
+
   defp active_source(source_id) do
     case Ecto.UUID.cast(source_id) do
       {:ok, id} ->
@@ -1303,15 +1493,12 @@ defmodule Loopctl.Intake do
   defp apply_plan(_source, _delivery_id, {:ignored, _action}), do: :ignored
 
   defp apply_plan(source, delivery_id, {:issue, action, issue}) do
-    record = ensure_record(source, issue.number)
     extraction = TicketFacts.extract(issue.title, issue.body)
+    {record, content} = target_record(source, action, issue, extraction, delivery_id)
     new_reasons = scan(issue, extraction) -- record.escalation_reasons
     now = DateTime.utc_now()
 
-    changes =
-      record
-      |> content_changes(issue, extraction, action, delivery_id)
-      |> Map.merge(escalation_changes(record, new_reasons, now))
+    changes = Map.merge(content, escalation_changes(record, new_reasons, now))
 
     with {:ok, updated} <- AdminRepo.update(Record.apply_changeset(record, changes)),
          :ok <- escalate(updated, new_reasons, delivery_id) do
@@ -1321,8 +1508,99 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # Insert-or-nothing, then lock: two deliveries for a new issue cannot both create it,
-  # and the second waits for the first's changes before it merges its own.
+  # The record this delivery applies to and the content changes it makes there: the issue's
+  # newest generation, or a new one (see "Generations" in the moduledoc).
+  #
+  # The changes are computed against the NEWEST record before a new one is started, and they
+  # are what goes onto the new record. That keeps the same-second case honest: a reopen
+  # stamped with the same second as the close it follows is applied with `order_ambiguous`
+  # set, on the new record too, so triage re-reads the live issue.
+  defp target_record(source, action, issue, extraction, delivery_id) do
+    newest = ensure_record(source, issue.number)
+    content = content_changes(newest, issue, extraction, action, delivery_id)
+
+    if starts_generation?(newest, action, content) do
+      {insert_generation(source, newest, delivery_id), content}
+    else
+      {newest, content}
+    end
+  end
+
+  # Only a reopen, only one that would be applied (an older or restating one changes
+  # nothing, so it starts nothing), and only on a record whose story has reached the end.
+  defp starts_generation?(_record, _action, content) when content == %{}, do: false
+  defp starts_generation?(record, "reopened", _content), do: loop_ended?(record)
+  defp starts_generation?(_record, _action, _content), do: false
+
+  @doc """
+  Whether `record` has reached the end of the delivery loop: it has an issue-closure row,
+  or its story's stage is in `generation_end_stages/0`. A `reopened` delivery starts the
+  issue's next generation only then (see "Generations" in the moduledoc).
+
+  Read on `AdminRepo` with the record's tenant on every source. Committed state, unlocked:
+  a story that moves out of the set afterwards (a revert, `merged -> implementing`) leaves
+  the new generation in place. The two are separate work items for the same issue, and
+  either can be resolved without the other.
+  """
+  @spec loop_ended?(Record.t()) :: boolean()
+  def loop_ended?(%Record{tenant_id: tenant_id, id: record_id}) do
+    AdminRepo.exists?(
+      from c in IssueClosure,
+        where: c.tenant_id == ^tenant_id and c.intake_record_id == ^record_id
+    ) or
+      AdminRepo.exists?(
+        from s in Story,
+          join: st in StoryStage,
+          on: st.story_id == s.id and st.tenant_id == s.tenant_id,
+          where: s.tenant_id == ^tenant_id and s.intake_record_id == ^record_id,
+          where: st.stage in ^@generation_end_stages
+      )
+  end
+
+  # The issue's next generation, inheriting the predecessor's escalation (see the moduledoc).
+  # A plain insert: the caller holds `previous` locked and has seen no newer generation
+  # (`newest_locked/2`), so nothing else can be inserting this one. The unique index is the
+  # backstop, and a conflict there raises.
+  defp insert_generation(source, %Record{} = previous, delivery_id) do
+    now = DateTime.utc_now()
+
+    row = %{
+      id: Ecto.UUID.generate(),
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      project_id: source.project_id,
+      issue_number: previous.issue_number,
+      generation: previous.generation + 1,
+      status: previous.status,
+      escalation_reasons: previous.escalation_reasons,
+      escalated_at: previous.escalated_at,
+      inserted_at: now,
+      updated_at: now
+    }
+
+    {1, [fresh]} = AdminRepo.insert_all(Record, [row], returning: true)
+
+    Logger.info(
+      "intake: issue ##{fresh.issue_number} of source #{fresh.source_id} reopened after " <>
+        "its loop ended; generation #{fresh.generation} is record #{fresh.id} " <>
+        "(previous #{previous.id})"
+    )
+
+    inherited = %{
+      "inherited_from_generation" => previous.generation,
+      "inherited_from_record_id" => previous.id
+    }
+
+    case escalate(fresh, fresh.escalation_reasons, delivery_id, inherited) do
+      :ok -> fresh
+      {:error, reason} -> AdminRepo.rollback(reason)
+    end
+  end
+
+  # Insert-or-nothing of generation 1, then lock the NEWEST generation: two deliveries for a
+  # new issue cannot both create it, and the second waits for the first's changes before it
+  # merges its own. When a later generation exists the insert conflicts on generation 1 and
+  # the newest is still the one read.
   defp ensure_record(source, number) do
     now = DateTime.utc_now()
 
@@ -1335,20 +1613,35 @@ defmodule Loopctl.Intake do
           source_id: source.id,
           project_id: source.project_id,
           issue_number: number,
+          generation: 1,
           inserted_at: now,
           updated_at: now
         }
       ],
       on_conflict: :nothing,
-      conflict_target: [:tenant_id, :source_id, :issue_number]
+      conflict_target: [:tenant_id, :source_id, :issue_number, :generation]
     )
 
-    AdminRepo.one!(
+    newest_locked(source, number)
+  end
+
+  # Locks the newest generation, deciding "newest" AFTER the lock: see "Generations" in the
+  # moduledoc. The existence check is a new statement, so it sees a generation committed
+  # while this one waited.
+  defp newest_locked(source, number) do
+    issue =
       from r in Record,
         where: r.tenant_id == ^source.tenant_id,
-        where: r.source_id == ^source.id and r.issue_number == ^number,
-        lock: "FOR UPDATE"
-    )
+        where: r.source_id == ^source.id and r.issue_number == ^number
+
+    locked =
+      AdminRepo.one!(
+        from r in issue, order_by: [desc: r.generation], limit: 1, lock: "FOR UPDATE"
+      )
+
+    if AdminRepo.exists?(from r in issue, where: r.generation > ^locked.generation),
+      do: newest_locked(source, number),
+      else: locked
   end
 
   # Everything the detector and the fact extractor read is the UNCAPPED payload text.
@@ -1503,9 +1796,11 @@ defmodule Loopctl.Intake do
     }
   end
 
-  defp escalate(_record, [], _delivery_id), do: :ok
+  defp escalate(record, new_reasons, delivery_id, detail \\ %{})
 
-  defp escalate(record, new_reasons, delivery_id) do
+  defp escalate(_record, [], _delivery_id, _detail), do: :ok
+
+  defp escalate(record, new_reasons, delivery_id, detail) do
     Logger.warning(
       "intake: escalated issue ##{record.issue_number} of source #{record.source_id} " <>
         "(record #{record.id}): #{Enum.join(new_reasons, ", ")}"
@@ -1516,13 +1811,16 @@ defmodule Loopctl.Intake do
            actor_lineage: [],
            entity_type: "intake_record",
            entity_id: record.id,
-           payload: %{
-             "source_id" => record.source_id,
-             "issue_number" => record.issue_number,
-             "github_delivery_id" => delivery_id,
-             "signals" => new_reasons,
-             "escalation_reasons" => record.escalation_reasons
-           }
+           payload:
+             %{
+               "source_id" => record.source_id,
+               "issue_number" => record.issue_number,
+               "generation" => record.generation,
+               "github_delivery_id" => delivery_id,
+               "signals" => new_reasons,
+               "escalation_reasons" => record.escalation_reasons
+             }
+             |> Map.merge(detail)
          }) do
       {:ok, _entry} -> :ok
       {:error, reason} -> {:error, reason}

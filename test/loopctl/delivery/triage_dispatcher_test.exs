@@ -97,6 +97,91 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       write_ledger_row(ctx, story.id, kind: "implement", released_at: nil)
       assert story.id in candidate_ids(50)
     end
+
+    test "a source that requires a ticket admits only issues filed from one", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      {source_id, record_id} = source_and_record(ctx, story.id)
+      set_ticket(record_id, nil)
+
+      # False, the default: every issue is triaged, as before the field existed.
+      assert story.id in candidate_ids(50)
+
+      # Required, and the issue carries no ticket reference: not a candidate, so it holds no
+      # slot and no session is paid for. This is how HCB keeps its own sessions' issues out.
+      set_requires_ticket(source_id, true)
+      refute story.id in candidate_ids(50)
+
+      # A Ticket line with no HomeCareBilling footer confirming it, the shape one typed line
+      # leaves, is a ref without an id: still not a candidate.
+      {1, _} =
+        AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+          set: [ticket_ref: "HCB-a1b2c3d4", ticket_id: nil]
+        )
+
+      refute story.id in candidate_ids(50)
+
+      # The facts are re-extracted on every delivery, so an issue edited into the format is
+      # judged as it now stands.
+      set_ticket(record_id, "a1b2c3d4-0000-4000-8000-000000000000")
+      assert story.id in candidate_ids(50)
+
+      # And turning the requirement off admits everything again.
+      set_ticket(record_id, nil)
+      set_requires_ticket(source_id, false)
+      assert story.id in candidate_ids(50)
+    end
+
+    test "a CLOSED issue is not triaged, and reopening it makes it a candidate again", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      {_source_id, record_id} = source_and_record(ctx, story.id)
+
+      set_issue_state(record_id, "open")
+      assert story.id in candidate_ids(50)
+
+      # 2026-11-07: all five of HCB's ticket candidates had been fixed and closed days before
+      # the loop reached them, and triage was dispatched on every one.
+      set_issue_state(record_id, "closed")
+      refute story.id in candidate_ids(50)
+
+      set_issue_state(record_id, "open")
+      assert story.id in candidate_ids(50)
+    end
+
+    test "every PROJECT's oldest before any project's second: a backlog cannot fill the batch",
+         ctx do
+      backlog = for _ <- 1..3, do: fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      [head | rest] = backlog
+      Enum.each(rest, &move_to_project(&1.id, head.project_id))
+
+      ticket = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      {source_id, record_id} = source_and_record(ctx, ticket.id)
+      set_requires_ticket(source_id, true)
+      set_ticket(record_id, "a1b2c3d4-0000-4000-8000-000000000000")
+
+      backlog |> Enum.with_index() |> Enum.each(fn {s, i} -> backdate(s.id, -600 + i) end)
+      backdate(ticket.id, -60)
+
+      # 2026-11-06, production: 79 stories of projects no runner accepts were older than HCB's
+      # support tickets and held all 20 slots of every pass, so the tickets were never offered
+      # to the one runner that would take them. Ranked per project, the ticket is in the batch
+      # beside the backlog's head however long the backlog is.
+      assert candidate_ids(2) == [head.id, ticket.id]
+      assert candidate_ids(4) == [head.id, ticket.id | Enum.map(rest, & &1.id)]
+    end
+
+    test "another tenant's ticket requirement does not filter this tenant's stories", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      other_tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      other = fixture(:detected_story, %{tenant_id: other_tenant.id})
+      {other_source_id, other_record_id} = source_and_record(%{tenant: other_tenant}, other.id)
+
+      set_ticket(other_record_id, nil)
+      set_requires_ticket(other_source_id, true)
+
+      ids = candidate_ids(50)
+      assert story.id in ids
+      refute other.id in ids
+    end
   end
 
   describe "run_with/2" do
@@ -404,6 +489,60 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       )
 
     story
+  end
+
+  defp source_and_record(ctx, story_id) do
+    AdminRepo.one!(
+      from s in Loopctl.WorkBreakdown.Story,
+        join: r in Loopctl.Intake.Record,
+        on: r.id == s.intake_record_id,
+        where: s.id == ^story_id and s.tenant_id == ^ctx.tenant.id,
+        select: {r.source_id, r.id}
+    )
+  end
+
+  defp set_requires_ticket(source_id, value) do
+    {1, _} =
+      AdminRepo.update_all(from(s in Loopctl.Intake.Source, where: s.id == ^source_id),
+        set: [triage_requires_ticket: value]
+      )
+  end
+
+  defp set_issue_state(record_id, state) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+        set: [issue_state: state]
+      )
+  end
+
+  defp set_ticket(record_id, ticket_id) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+        set: [
+          ticket_ref: ticket_id && "HCB-" <> String.slice(ticket_id, 0, 8),
+          ticket_id: ticket_id
+        ]
+      )
+  end
+
+  # A second story under an existing project: the ranking partitions on the project, and the
+  # fixture gives every story its own. Its intake record stays on its own source, which the
+  # candidate read never compares with the project.
+  defp move_to_project(story_id, project_id) do
+    {1, _} =
+      AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story_id),
+        set: [project_id: project_id]
+      )
+  end
+
+  defp backdate(story_id, seconds) do
+    at = NaiveDateTime.add(NaiveDateTime.utc_now(), seconds, :second)
+
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^story_id),
+        set: [updated_at: NaiveDateTime.truncate(at, :second)]
+      )
   end
 
   defp reload_story(ctx, story_id) do

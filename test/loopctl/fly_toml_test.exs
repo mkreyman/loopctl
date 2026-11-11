@@ -13,6 +13,7 @@ defmodule Loopctl.FlyTomlTest do
   use ExUnit.Case, async: true
 
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Delivery.RetryCeiling
 
   # Defaults of the dependencies whose own shutdown follows the socket drain, used unless
   # config sets them: ThousandIsland's `shutdown_timeout` and Oban's `shutdown_grace_period`.
@@ -24,6 +25,10 @@ defmodule Loopctl.FlyTomlTest do
   # Not an invariant of the code and not a bound on anyone else's install — raise it here,
   # deliberately, when several unattended runs have landed reviewable work.
   @max_deployed_concurrency 6
+
+  # The most counted releases a story may take on loopctl.com before a person sees it, as a
+  # ceiling on the DISPATCH_MAX_ATTEMPTS it deploys. Same standing as the one above.
+  @max_deployed_attempts 3
 
   defp top_level(path) do
     path
@@ -152,7 +157,9 @@ defmodule Loopctl.FlyTomlTest do
           {"DISPATCH_WALL_CLOCK_SECONDS", :dispatch_wall_clock_seconds},
           {"DISPATCH_MAX_TURNS", :dispatch_max_turns},
           {"TRIAGE_WALL_CLOCK_SECONDS", :triage_wall_clock_seconds},
-          {"TRIAGE_MAX_TURNS", :triage_max_turns}
+          {"TRIAGE_MAX_TURNS", :triage_max_turns},
+          {"SPEC_TUNE_WALL_CLOCK_SECONDS", :spec_tune_wall_clock_seconds},
+          {"SPEC_TUNE_MAX_TURNS", :spec_tune_max_turns}
         ] do
       test "#{var} is inside the bound DispatchDriver enforces" do
         value = env_table("fly.toml")[unquote(var)]
@@ -204,6 +211,24 @@ defmodule Loopctl.FlyTomlTest do
                "deployment's spend policy allows. Raising it is a deliberate edit to " <>
                "@max_deployed_concurrency in this file, not something a config change does " <>
                "quietly"
+    end
+
+    # The retry ceiling multiplies the per-session budgets by story: each counted release
+    # below it buys another full run. RetryCeiling.parse/1 turns a malformed value into
+    # :unset, which reads as 0 with nothing logged, so the test runs the deployed value
+    # through the parser runtime.exs uses and bounds it by a named policy ceiling.
+    test "DISPATCH_MAX_ATTEMPTS is accepted by runtime.exs and inside the spend policy" do
+      value = env_table("fly.toml")["DISPATCH_MAX_ATTEMPTS"]
+      assert value, "DISPATCH_MAX_ATTEMPTS is not set in [env]"
+
+      assert {:ok, attempts} = RetryCeiling.parse(value),
+             "#{inspect(value)} is not a non-negative integer, so runtime.exs leaves the " <>
+               "ceiling unset and every story escalates on its first counted release"
+
+      assert attempts <= @max_deployed_attempts,
+             "#{attempts} is above the #{@max_deployed_attempts} runs per story this " <>
+               "deployment's spend policy allows. Raising it is a deliberate edit to " <>
+               "@max_deployed_attempts in this file"
     end
   end
 end

@@ -166,3 +166,8 @@ Mox.defmock(Loopctl.MockPullRequestSource, for: Loopctl.Delivery.PullRequestSour
 # no credential, so nothing is read — and a test that reaches it without saying so records
 # `credential_unavailable`, never a verdict.
 Mox.defmock(Loopctl.MockVerificationCredential, for: Loopctl.Verification.Credential)
+
+# US-47.3: the change protocol's one outbound call, the signed gap pull to chg-server. The
+# DataCase default stub answers `{:error, :not_stubbed}`, so a test that reaches it without
+# saying so gets a transient failure — never events it did not ask for.
+Mox.defmock(Loopctl.MockChgClient, for: Loopctl.Changes.ChgClient)

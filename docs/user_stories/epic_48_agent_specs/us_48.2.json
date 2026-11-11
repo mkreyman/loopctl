@@ -1,0 +1,103 @@
+{
+  "id": "US-48.2",
+  "title": "Agent spec struct and a registry holding triage@1 and implement@1, read by nothing",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "high",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "one compiled description of each dispatch kind",
+    "so_that": "later stories can move each kind onto it with an equivalence test, and the lists that must agree are held equal by a test"
+  },
+  "rationale": "PRD: a spec is a compiled struct in a code registry, never a tenant row, because its outcomes and effects decide which custody edges a runner message can drive.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.2.1",
+      "description": "Loopctl.Agents.Spec defines the fields: id, version, archetype (:judge | :build | :draft), kind, candidates, sweeps, payload, refs, runner, budgets, result, screens, outcomes, effects, rerun, concurrency, prompt ({template_id, version}). Every closed-set field is validated at compile time against its allowed values."
+    },
+    {
+      "id": "AC-48.2.2",
+      "description": "Loopctl.Agents.Registry returns triage@1 (:judge) and implement@1 (:build), transcribing today's behaviour; nothing in lib/ reads it yet."
+    },
+    {
+      "id": "AC-48.2.3",
+      "description": "A spec naming a stage transition outside its archetype's allowed set fails to compile: a :judge or :draft spec can name only control-only edges, and no spec can name a human_only edge."
+    },
+    {
+      "id": "AC-48.2.4",
+      "description": "A registry test binds: registry kinds == RunnerContract.Kinds.all/0 == the dispatch_records kind CHECK; triage@1 outcomes == TriageVerdict outcomes and its @routes; budget keys == DispatchPayload.budget_keys/1; every named transition is in StageMachine.transitions/0."
+    },
+    {
+      "id": "AC-48.2.5",
+      "description": "No per-tenant table and no API: specs change only through code."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.2.1",
+      "verifies": [
+        "AC-48.2.2",
+        "AC-48.2.4"
+      ],
+      "name": "registry agrees with the contract",
+      "type": "unit",
+      "steps": [
+        "list registry kinds",
+        "compare with Kinds.all and the migration CHECK"
+      ],
+      "expected_results": [
+        "equal sets"
+      ]
+    },
+    {
+      "id": "TC-48.2.2",
+      "verifies": [
+        "AC-48.2.4"
+      ],
+      "name": "triage outcomes agree",
+      "type": "unit",
+      "steps": [
+        "compare triage@1 outcomes with TriageVerdict"
+      ],
+      "expected_results": [
+        "equal, including incomplete -> escalate"
+      ]
+    },
+    {
+      "id": "TC-48.2.3",
+      "verifies": [
+        "AC-48.2.3"
+      ],
+      "name": "illegal edge refused",
+      "type": "unit",
+      "steps": [
+        "compile a :judge spec naming a runner-reportable edge"
+      ],
+      "expected_results": [
+        "CompileError naming the edge and the archetype"
+      ]
+    },
+    {
+      "id": "TC-48.2.4",
+      "verifies": [
+        "AC-48.2.3"
+      ],
+      "name": "human edge refused",
+      "type": "unit",
+      "steps": [
+        "compile any spec naming escalated -> queued human_resolution"
+      ],
+      "expected_results": [
+        "CompileError"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/chain-of-custody/SKILL.md: outcomes and effects are custody inputs.",
+    "Mutation check: drop the archetype edge check, the illegal-edge test must fail."
+  ],
+  "dependencies": []
+}

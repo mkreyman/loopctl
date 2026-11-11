@@ -31,7 +31,8 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
   @doc """
   An `exists` subquery: the story bound as `:story` depends on a story that is not verified.
   Composed by `dependency_status/2` (the claim), `unmet_story_ids/2` (bulk claim),
-  `Loopctl.Delivery.DispatchDriver.candidates/1` and `Loopctl.WorkBreakdown.Queries`' ready and
+  `Loopctl.Agents.Candidates`' `:dependencies_met` (`DispatchDriver.candidates/1`'s read) and
+  `Loopctl.WorkBreakdown.Queries`' ready and
   blocked lists, so none of them can disagree.
   """
   @spec unmet_story_dependencies() :: Ecto.Query.t()

@@ -326,6 +326,19 @@ export function requiredChecksRefusal(checks) {
   return null;
 }
 
+/**
+ * `triage_requires_ticket`: a boolean, never null (`Source.validate_triage_requires_ticket/1`
+ * answers 422 for null). True triages only issues HomeCareBilling filed from a support ticket.
+ */
+export function triageRequiresTicketRefusal(value) {
+  if (typeof value === "boolean") return null;
+
+  return refuse(
+    "`triage_requires_ticket` must be true (triage only issues filed from a support ticket) " +
+      "or false (triage every issue). It cannot be null; leave it out to keep the current value.",
+  );
+}
+
 export function sourcePath(sourceId) {
   return `${SOURCES_PATH}/${encodeURIComponent(sourceId)}`;
 }
@@ -356,6 +369,7 @@ export function publicSource(source) {
     base_branch: source.base_branch,
     mode: source.mode,
     required_checks: source.required_checks,
+    triage_requires_ticket: source.triage_requires_ticket,
     // `change_events_secret` is NEVER named here: write-only (US-47.2).
     chg_root_dispatch_id: source.chg_root_dispatch_id,
     target_epic_id: source.target_epic_id,
@@ -391,6 +405,7 @@ export async function enrollIntakeSource(
     base_branch,
     mode,
     required_checks,
+    triage_requires_ticket,
     secret_file,
     change_events_secret,
     change_events_secret_file,
@@ -447,6 +462,11 @@ export async function enrollIntakeSource(
   if (required_checks !== undefined) {
     const badChecks = requiredChecksRefusal(required_checks);
     if (badChecks) return badChecks;
+  }
+
+  if (triage_requires_ticket !== undefined) {
+    const badFlag = triageRequiresTicketRefusal(triage_requires_ticket);
+    if (badFlag) return badFlag;
   }
 
   // The `chg` credentials (US-47.2), resolved and judged before a secret file is reserved.
@@ -510,6 +530,7 @@ export async function enrollIntakeSource(
   if (base_branch !== undefined) body.base_branch = base_branch;
   if (mode !== undefined) body.mode = mode;
   if (required_checks !== undefined) body.required_checks = required_checks;
+  if (triage_requires_ticket !== undefined) body.triage_requires_ticket = triage_requires_ticket;
   Object.assign(body, chg.fields);
 
   let result;
@@ -707,6 +728,12 @@ export async function updateIntakeSource(
     body.required_checks = args.required_checks;
   }
 
+  if (args.triage_requires_ticket !== undefined) {
+    const badFlag = triageRequiresTicketRefusal(args.triage_requires_ticket);
+    if (badFlag) return badFlag;
+    body.triage_requires_ticket = args.triage_requires_ticket;
+  }
+
   // Switching to `chg` may rely on credentials an earlier `chg` stint left on the row, so their
   // absence here is the SERVER's to judge (422 naming the missing one); only their shape is
   // judged here.
@@ -717,7 +744,8 @@ export async function updateIntakeSource(
   if (Object.keys(body).length === 0) {
     return refuse(
       "Nothing to update. Name at least one of `target_epic_id` (null clears it), " +
-        "`base_branch`, `mode`, `required_checks`, `change_events_secret` (or " +
+        "`base_branch`, `mode`, `required_checks`, `triage_requires_ticket`, " +
+        "`change_events_secret` (or " +
         "`change_events_secret_file`) or `chg_root_dispatch_id`. A body carrying none of them " +
         "is refused 422 `nothing_to_update`, because a field you do not send is left exactly " +
         "as it was.",

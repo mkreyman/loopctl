@@ -11,6 +11,7 @@ defmodule LoopctlWeb.AuditController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
+  alias LoopctlWeb.CurrentTenant
   alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
@@ -50,7 +51,7 @@ defmodule LoopctlWeb.AuditController do
   project_id, from, to, page, page_size.
   """
   def index(conn, params) do
-    with {:ok, tenant_id} <- require_tenant(conn),
+    with {:ok, tenant_id} <- CurrentTenant.fetch_id(conn),
          :ok <- ProjectId.validate(params["project_id"]) do
       opts =
         []
@@ -118,13 +119,6 @@ defmodule LoopctlWeb.AuditController do
     case DateTime.from_iso8601(value) do
       {:ok, dt, _offset} -> Keyword.put(opts, key, dt)
       _ -> opts
-    end
-  end
-
-  defp require_tenant(conn) do
-    case conn.assigns[:current_tenant] do
-      %{id: id} when is_binary(id) -> {:ok, id}
-      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
     end
   end
 end

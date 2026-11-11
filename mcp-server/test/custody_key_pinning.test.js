@@ -25,8 +25,8 @@
  *
  * The five verbs below are `exact_role: :orchestrator` in loopctl:
  *
- *   - verify / reject / force_unclaim / verify-all — `story_verification_controller.ex:29-30`
- *   - bulk mark-complete                           — `bulk_operations_controller.ex:24-25`
+ *   - verify / reject / force_unclaim / verify-all — `story_verification_controller.ex:30-31`
+ *   - bulk mark-complete                           — `bulk_operations_controller.ex:25-26`
  *
  * WHAT IS DELIBERATELY NOT HERE. `report` (`exact_role: [:agent, :orchestrator]`) and
  * `review-complete` (`exact_role: [:orchestrator, :user]`) are LIST-form gates, and for them the
@@ -154,7 +154,7 @@ const EXACT_ROLE_ORCHESTRATOR = [
   ["bulk_mark_complete", "bulkMarkComplete"],
   ["verify_all_in_epic", "verifyAllInEpic"],
   // #846 round 2: force_unclaim_story is on the SAME plug line as verify and reject
-  // (`story_verification_controller.ex:29-30`) and was the one pinned custody verb missing
+  // (`story_verification_controller.ex:30-31`) and was the one pinned custody verb missing
   // from this table — and, before this round, the one sending no `keyHint`, so a missing key
   // was reported as an LLM-configuration problem.
   ["force_unclaim_story", "forceUnclaimStory"],

@@ -689,6 +689,32 @@ defmodule Loopctl.ObanConfig do
            # rather than a state an operator can be half in. Bounded per run. Keep in sync with
            # the crontab assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.TriageDispatchWorker},
+           # Epic 48 US-48.9: asks a runner to DRAFT a reply for each support ticket triage
+           # set aside (`reply_draft@1`, a `:draft`: it claims nothing and moves no stage).
+           # The triage dispatcher's cadence and reasons. OFF with the driver AND behind its
+           # own `:draft_dispatch_enabled` (default false), so scheduling it unconditionally
+           # starts nothing. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.ReplyDraftDispatchWorker},
+           # US-48.18: verify@1 — a runner apart from the implementer's verifies each pr-route
+           # story at `ci` whose head is unverified; without it the merge gate refuses every
+           # pr-route story. Behind `:dispatch_driver_enabled` like every unattended pass, so
+           # scheduling it unconditionally starts nothing. Keep in sync with the crontab
+           # assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.VerifyDispatchWorker},
+           # US-48.13: spec_tuner@1, the improvement loop. Weekly, Monday 06:00 UTC: one
+           # `spec_tune` dispatch per (project, target spec) whose run outcomes gathered the
+           # tuner's threshold since its last run. A `:draft`: OFF with the driver AND behind
+           # `:draft_dispatch_enabled`, so scheduling it unconditionally starts nothing. Keep
+           # in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"0 6 * * 1", Loopctl.Workers.SpecTunerDispatchWorker},
+           # US-48.17: the pr route's merge. Holds a verified story's claim open while its
+           # runner is live, escalates it over :runner_gone when the runner vanishes, and
+           # enqueues the per-head merge instruction job. Only the instruction is behind
+           # `:dispatch_driver_enabled`; the hold and the runner-gone escalation are not, for
+           # the reason StoryCompletionWorker's entry below gives. Local reads only, bounded
+           # per run. Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.MergeSweepWorker},
            # #803 §3: the loop's LAST transition, `verified -> done`. Nothing in `lib/` wrote
            # that edge, so a story that passed every gate stopped one stage from the end for
            # ever — `verified` had no writable edge out at all, not even for an operator. NOT
@@ -699,6 +725,18 @@ defmodule Loopctl.ObanConfig do
            # only, no forge call. Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.StoryCompletionWorker},
+           # US-47.3: finds chg changes with an event held ahead of a gap for 10 minutes, or
+           # bound to a non-terminal story and quiet for 6 hours, and enqueues ONE pull job
+           # per change (unique on the change). Every five minutes: the shorter threshold is
+           # ten, so a gap is pulled at 10-15 minutes. Local reads only; the pull is the job's.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.ChangeReconcileSweepWorker},
+           # US-47.4: drains the revert-issue outbox — opens the GitHub issue a chg revert of
+           # a `done` story owes, so the revert is triaged as a new report. Every two minutes,
+           # like the issue-closure drainer, and for its reason: up to two bounded GitHub calls
+           # a candidate (a marker read and a create), bounded per run. Keep in sync with the
+           # crontab assertion in oban_plugins_config_test.exs.
+           {"*/2 * * * *", Loopctl.Workers.ChangeRevertIssueWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.
@@ -728,6 +766,13 @@ defmodule Loopctl.ObanConfig do
            # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
            # crontab assertion in oban_plugins_config_test.exs.
            {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker},
+           # US-48.11: the daily escalation digest — one channel post per project holding
+           # budget-exhausted escalations older than an hour. DAILY and HARDCODED (no env
+           # var), like the entry above. 14:00 UTC is the start of the operator's US
+           # morning, when a parked implementation is worth reading about. Idempotent per
+           # project per UTC day. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"0 14 * * *", Loopctl.Workers.EscalationDigestWorker},
            # PARKED (see `@parked_crons`) — DECLARED here, filtered out of the live
            # crontab by `reject_parked/2` unless an operator names it in
            # `OBAN_UNPARK_CRONS`. Its action is `archive`, which is TERMINAL, and an

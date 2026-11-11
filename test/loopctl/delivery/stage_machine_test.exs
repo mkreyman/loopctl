@@ -140,6 +140,11 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # commit — a comparison the session cannot see.
     refute {:deployed, :escalated, :verification_failed} in reportable
     refute StageMachine.runner_reportable?(:deployed, :escalated, :verification_failed)
+    # US-48.16: control also reads a pr-route story at `merged`, and escalates it from there
+    # over the same verdict. `merged` IS a runner source stage, so only the edge allowlist
+    # keeps this one off the wire — which is exactly what this pins.
+    refute {:merged, :escalated, :verification_failed} in reportable
+    refute StageMachine.runner_reportable?(:merged, :escalated, :verification_failed)
 
     # And `failed` is terminal with NO way out, `:human_resolution` included, so a runner
     # able to report `:budget_exceeded` could park a story for good.
@@ -152,6 +157,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     for triple <- [
           {:ci, :escalated, :merge_gate},
           {:deployed, :escalated, :verification_failed},
+          {:merged, :escalated, :verification_failed},
           {:implementing, :failed, :budget_exceeded}
         ] do
       assert triple in StageMachine.transitions(), inspect(triple)
@@ -285,7 +291,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     end
 
     # And escalating restores the human path, which is the point.
-    for to <- [:queued, :done, :failed] do
+    for to <- [:detected, :queued, :done, :failed] do
       assert StageMachine.allowed?(:escalated, to, :human_resolution)
     end
 
@@ -354,6 +360,18 @@ defmodule Loopctl.Delivery.StageMachineTest do
     assert MapSet.disjoint?(MapSet.new(lifetime), cleared)
   end
 
+  test "a human re-triage clears everything, the triage dispatch included" do
+    assert StageMachine.allowed?(:escalated, :detected, :human_resolution)
+    cleared = MapSet.new(StageMachine.clears(:escalated, :detected, :human_resolution))
+
+    # Unlike a re-queue: the story gives up its triage, so the next `detected -> triaged` must
+    # bind the dispatch that triages it again, and Gate A must read that one's lens verdicts.
+    assert MapSet.subset?(MapSet.new(StageMachine.effects()), cleared)
+    assert :triage_dispatch_id in cleared
+    assert MapSet.subset?(MapSet.new(StageMachine.head_keyed()), cleared)
+    assert MapSet.subset?(MapSet.new(StageMachine.merge_keyed()), cleared)
+  end
+
   test "every stage is reachable from detected" do
     reachable = reach([:detected], MapSet.new([:detected]))
     assert MapSet.equal?(reachable, MapSet.new(StageMachine.stages()))
@@ -364,7 +382,8 @@ defmodule Loopctl.Delivery.StageMachineTest do
       for {f, t, e} <- StageMachine.transitions(), StageMachine.chained?(f, t, e), do: {f, t, e}
 
     assert Enum.all?(chained, fn {f, t, e} ->
-             t in [:claimed, :merged, :escalated] or f == :escalated or e == :merge_refused
+             t in [:claimed, :merged, :escalated] or f == :escalated or
+               e in [:merge_refused, :reverted]
            end)
 
     refute StageMachine.chained?(:implementing, :reviewing, :forward)
@@ -373,6 +392,170 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # A merge is a chained fact, so retracting it writes a counter-entry.
     assert StageMachine.chained?(:merged, :implementing, :merge_refused)
     assert StageMachine.reason_required?(:implementing, :merge_refused)
+  end
+
+  describe "verify@1's edges and effect (US-48.18)" do
+    test "both edges are in the table and neither is on the runner allowlist" do
+      for {_from, _to, edge} = transition <- [
+            {:ci, :implementing, :verify_rejected},
+            {:ci, :escalated, :no_independent_verifier_runner}
+          ] do
+        assert transition in StageMachine.transitions(), inspect(transition)
+        refute transition in StageMachine.runner_transitions(), inspect(transition)
+        refute edge in StageMachine.runner_reportable_edges()
+        refute edge in StageMachine.runner_edges()
+        refute StageMachine.human_only?(edge)
+      end
+    end
+
+    test "verified_head_sha is control-written, written at ci only, and head-keyed" do
+      assert :verified_head_sha in StageMachine.control_written_effects()
+      refute :verified_head_sha in StageMachine.reportable_effects()
+      assert StageMachine.effect_stages(:verified_head_sha) == [:ci]
+      assert :verified_head_sha in StageMachine.head_keyed()
+    end
+
+    test "every edge that clears the head clears the verified head with it" do
+      for {from, to, edge} <- StageMachine.transitions(),
+          cleared = StageMachine.clears(from, to, edge),
+          :head_sha in cleared do
+        assert :verified_head_sha in cleared, inspect({from, to, edge})
+      end
+
+      assert :verified_head_sha in StageMachine.clears(:ci, :implementing, :verify_rejected)
+    end
+  end
+
+  describe "the change-protocol edges (US-47.4)" do
+    test "TC-47.4.6: none of them is runner-reportable" do
+      new_edges = [
+        :change_ready,
+        :change_resubmitted,
+        :change_review_findings,
+        :reverted,
+        :reverted_after_verify,
+        :change_outside_lifecycle,
+        # US-47.5
+        :review_missing
+      ]
+
+      assert Enum.sort(StageMachine.change_protocol_edges()) == Enum.sort(new_edges)
+
+      for edge <- new_edges do
+        refute Enum.any?(StageMachine.runner_transitions(), &match?({_, _, ^edge}, &1)),
+               inspect(edge)
+
+        refute edge in StageMachine.runner_reportable_edges()
+        refute edge in StageMachine.runner_edges()
+      end
+    end
+
+    test "the main line is the one PRD §5 maps, with pr_open skipped by :change_ready" do
+      for triple <- [
+            {:implementing, :reviewing, :forward},
+            {:reviewing, :implementing, :review_findings},
+            {:reviewing, :ci, :change_ready},
+            {:ci, :reviewing, :change_resubmitted},
+            {:ci, :implementing, :change_review_findings},
+            {:ci, :merged, :forward},
+            {:merged, :deployed, :forward},
+            {:merged, :implementing, :reverted},
+            {:deployed, :implementing, :reverted},
+            {:verified, :escalated, :reverted_after_verify}
+          ] do
+        assert triple in StageMachine.transitions(), inspect(triple)
+      end
+
+      # Nothing the protocol adds enters pr_open.
+      refute Enum.any?(StageMachine.transitions(), fn {_f, t, e} ->
+               t == :pr_open and e in StageMachine.change_protocol_edges()
+             end)
+    end
+
+    test "AC-47.4.4: :reverted is chained and clears exactly what :merge_refused clears" do
+      refused = Enum.sort(StageMachine.clears(:merged, :implementing, :merge_refused))
+
+      for from <- [:merged, :deployed] do
+        assert StageMachine.chained?(from, :implementing, :reverted)
+        assert StageMachine.reason_required?(:implementing, :reverted)
+        assert Enum.sort(StageMachine.clears(from, :implementing, :reverted)) == refused
+      end
+
+      # The release and chg's trunk verification are bound to the merge: a revert from
+      # `deployed` that kept `release_id` would refuse the re-land's own deploy.
+      assert :release_id in StageMachine.merge_keyed()
+      assert :trunk_verified_sha in StageMachine.merge_keyed()
+    end
+
+    test "AC-47.4.1: leaving ci backwards clears what ci keyed to the head, nothing merge-keyed" do
+      head_keyed = Enum.sort(StageMachine.head_keyed())
+
+      assert Enum.sort(StageMachine.clears(:ci, :reviewing, :change_resubmitted)) == head_keyed
+
+      assert Enum.sort(StageMachine.clears(:ci, :implementing, :change_review_findings)) ==
+               head_keyed
+
+      for edge <- [:change_resubmitted, :change_review_findings] do
+        to = if edge == :change_resubmitted, do: :reviewing, else: :implementing
+        refute StageMachine.chained?(:ci, to, edge)
+        refute StageMachine.reason_required?(to, edge)
+        assert StageMachine.counted?(edge)
+        # Each is the protocol's own; `:review_findings` stays a reviewing-only edge, so no
+        # runner gains a `ci -> implementing` it does not already have.
+        assert [{:ci, ^to, ^edge}] = for({_f, _t, ^edge} = t <- StageMachine.transitions(), do: t)
+      end
+
+      refute {:ci, :implementing, :review_findings} in StageMachine.transitions()
+    end
+
+    test "change_outside_lifecycle leaves every live stage but escalated, for escalated" do
+      sources =
+        for {from, to, :change_outside_lifecycle} <- StageMachine.transitions() do
+          assert to == :escalated
+          from
+        end
+
+      assert Enum.sort(sources) ==
+               Enum.sort(StageMachine.stages() -- StageMachine.terminal_stages())
+
+      # A story already escalated is a human's; the protocol never re-escalates it.
+      refute :escalated in sources
+      assert StageMachine.chained?(:ci, :escalated, :change_outside_lifecycle)
+    end
+
+    test "the control escalations are exactly the three a change event decides" do
+      assert Enum.sort(StageMachine.control_escalation_edges()) ==
+               [:change_outside_lifecycle, :reverted_after_verify, :review_missing]
+
+      for edge <- StageMachine.control_escalation_edges() do
+        assert Enum.all?(StageMachine.transitions(), fn {_f, t, e} ->
+                 e != edge or t == :escalated
+               end)
+
+        refute StageMachine.human_only?(edge)
+      end
+    end
+  end
+
+  describe "the :review_missing edge (US-47.5, AC-47.5.5)" do
+    test "it is merged -> escalated and nothing else, chained, and clears nothing" do
+      assert [{:merged, :escalated, :review_missing}] ==
+               for({_f, _t, :review_missing} = t <- StageMachine.transitions(), do: t)
+
+      # Entering `escalated` is chained and needs a reason; the merge HELD, so nothing
+      # merge-keyed is cleared — trunk still has it.
+      assert StageMachine.chained?(:merged, :escalated, :review_missing)
+      assert StageMachine.reason_required?(:escalated, :review_missing)
+      assert StageMachine.clears(:merged, :escalated, :review_missing) == []
+      refute StageMachine.human_only?(:review_missing)
+    end
+
+    test "no runner can report it, and it is a control escalation" do
+      refute Enum.any?(StageMachine.runner_transitions(), &match?({_, _, :review_missing}, &1))
+      refute :review_missing in StageMachine.runner_reportable_edges()
+      assert :review_missing in StageMachine.control_escalation_edges()
+      assert :review_missing in StageMachine.change_protocol_edges()
+    end
   end
 
   test "the migration's stage CHECK allows exactly StageMachine.stages/0" do

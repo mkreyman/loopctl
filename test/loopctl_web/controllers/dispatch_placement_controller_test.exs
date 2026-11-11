@@ -12,6 +12,8 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query, only: [from: 2]
+
   alias Loopctl.AdminRepo
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Runners.Usage
@@ -173,6 +175,37 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       body = Jason.decode!(conn.resp_body)
       assert body["error"]["code"] == "dispatch_claim_ended"
       assert body["error"]["message"] =~ "NEW dispatch_id"
+    end
+
+    # US-48.7: a kind whose agent spec does not claim a story is refused by `place/4` before
+    # any claim. The fallback has no clause for the atom, so unmapped it answered 500.
+    test "not_placeable_kind is a 422 that says nothing was claimed" do
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          :not_placeable_kind
+        )
+
+      assert conn.status == 422
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "not_placeable_kind"
+      assert body["error"]["message"] =~ "Nothing was minted or claimed"
+    end
+
+    test "a TRIAGE placement is 422 not_placeable_kind, before the story is even read",
+         %{conn: conn} do
+      # The story id names no row: the guard answers before anything reads it, so the
+      # refusal is the kind's and not `story_not_found`.
+      c = ctx()
+
+      body =
+        place(conn, c, %{"kind" => "triage", "wall_clock_seconds" => 600, "max_turns" => 10})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "not_placeable_kind"
+
+      assert AdminRepo.aggregate(from(d in Dispatch, where: d.tenant_id == ^c.tenant.id), :count) ==
+               0
     end
 
     # #887 review round 1: the placement's own pre-mint dependency refusal. With no clause

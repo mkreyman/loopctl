@@ -21,7 +21,7 @@
  *   - `resolve_escalation` is the HUMAN half of the escalation pair: a `:user` key no dispatch
  *     minted. The agent key that raises an escalation is 403'd on it by design.
  *   - `force_unclaim_story` is gated `exact_role: :orchestrator`
- *     (`story_verification_controller.ex:29-30`), so it needs an ORCHESTRATOR-ROLE key and a
+ *     (`story_verification_controller.ex:30-31`), so it needs an ORCHESTRATOR-ROLE key and a
  *     higher-privileged one does NOT substitute: `RequireRole`'s exact-role clause tests
  *     `api_key.role == exact_role` (`require_role.ex:65-75`), so a `:user` or `:superadmin`
  *     key is 403'd there exactly as an agent key is. That is a chain-of-custody gate, not an
@@ -230,8 +230,15 @@ export async function storyStage({ story_id } = {}, { apiCall } = {}) {
 }
 
 /**
+ * Where `resolve_escalation` may send a story: the server's `{:escalated, to,
+ * :human_resolution}` edges. `detected` is re-triage, refused 409 `not_retriageable` for a
+ * story an implementer was assigned or worked.
+ */
+export const RESOLUTION_TARGETS = ["detected", "queued", "done", "failed"];
+
+/**
  * `POST /api/v1/stories/:id/stage/resolve`: move an escalated story off `escalated`, as a
- * human. `to` is `queued`, `done` or `failed`.
+ * human. `to` is one of `RESOLUTION_TARGETS`.
  */
 export async function resolveEscalation({ story_id, to, reason } = {}, { userKey, apiCall } = {}) {
   if (!userKey) {
@@ -245,8 +252,10 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
   const bad = uuid(story_id, "story_id");
   if (bad) return bad;
 
-  if (!["queued", "done", "failed"].includes(to)) {
-    return refuse("`to` must be one of: queued (work it again), done, failed.");
+  if (!RESOLUTION_TARGETS.includes(to)) {
+    return refuse(
+      "`to` must be one of: detected (triage it again), queued (work it again), done, failed.",
+    );
   }
 
   const body = { to };
@@ -293,7 +302,7 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * No request body — the story is named in the path.
  *
  * ORCHESTRATOR ROLE, and exactly that: the action is `exact_role: :orchestrator`
- * (`story_verification_controller.ex:29-30`), so a user or superadmin key is refused —
+ * (`story_verification_controller.ex:30-31`), so a user or superadmin key is refused —
  * `RequireRole`'s exact-role clause tests `api_key.role == exact_role`
  * (`require_role.ex:65-75`).
  *

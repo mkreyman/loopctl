@@ -128,10 +128,11 @@ It runs in two places:
   02:00 one the rest of CI uses, and not any other. So plan drift that arrives with no PR
   (a Postgres/pgvector upgrade, an ANALYZE shift) is NOT caught automatically: dispatch the
   matrix yourself after any such infrastructure change. It is a **matrix — one isolated job per scale file**, each
-  on its own database (`loopctl_test_sn_<file>`, derived in the job; beelink has one
-  long-lived Postgres, and planner stats live in the per-database `pg_statistic`) so a
+  on its own database (`loopctl_test_sn_<file>`, derived in the job; each fleet-ci host (beelink, minis, x1)
+  has one long-lived CI Postgres, and planner stats live in the per-database `pg_statistic`) so a
   committed-row corpus from one file can't pollute another's global planner stats. A
-  failed drop step leaves that database behind — reclaim it by hand.
+  failed drop step leaves that database behind on the host the job page names — reclaim it
+  there by hand.
   Each leg runs `SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly <file>`.
   The matrix covers **every `:scale_nightly`-tagged file** (the US-27.1 seed-floor check, the
   HNSW ANN / keyset / shared-assertion plan gates, and the US-27.8 per-endpoint index-usage,

@@ -155,6 +155,41 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
     end
 
+    test "binds the turn budget the dispatch was placed under (AC-48.11.2)", %{runner: runner} do
+      record = sent(runner, %{"max_turns" => 75})
+      assert record.max_turns == 75
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).max_turns == 75
+
+      # The contract bounds `max_turns` below only. A budget the column cannot hold is
+      # recorded as not known rather than refusing a dispatch the contract admits.
+      over = sent(runner, %{"max_turns" => DispatchLedger.max_storable_turns() + 1})
+      assert over.max_turns == nil
+      assert over.status == "sent"
+    end
+
+    test "a winning push refreshes the turn budget; a push that names none keeps it",
+         %{runner: runner} do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
+
+      {:ok, _record} =
+        DispatchLedger.record_sent(runner.tenant_id, runner.id, %{dispatch | max_turns: 50})
+
+      assert {:ok, :pushed} =
+               DispatchLedger.record_push(runner.tenant_id, %{dispatch | max_turns: 20})
+
+      assert DispatchLedger.get_record(runner.tenant_id, dispatch.dispatch_id).max_turns == 20
+
+      other = sent(runner, %{"max_turns" => 33})
+
+      assert {:ok, :pushed} =
+               DispatchLedger.record_push(runner.tenant_id, %{
+                 dispatch_id: other.dispatch_id,
+                 wall_clock_seconds: 600
+               })
+
+      assert DispatchLedger.get_record(runner.tenant_id, other.dispatch_id).max_turns == 33
+    end
+
     test "an implement dispatch binds its base branch; a triage dispatch records none",
          %{runner: runner} do
       {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))

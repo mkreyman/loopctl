@@ -4,8 +4,9 @@ defmodule Loopctl.Changes do
   change protocol need.
 
   A story may bind several changes over its life (a revert, a re-submit); exactly one is
-  CURRENT, the newest not superseded. The writer is the change-events webhook (US-47.3); the
-  reader tool is US-47.7. Neither exists yet, so this module has no route and no MCP tool.
+  CURRENT, the newest not superseded. The writer is the change-events webhook (US-47.3,
+  `Loopctl.Changes.Events`, through `bind_in_tenant_transaction/3` when a `submitted` event
+  applies); the reader tool is US-47.7.
 
   ## What a bind refuses, and what it never reveals
 
@@ -55,6 +56,18 @@ defmodule Loopctl.Changes do
   tenant's audit chain INSIDE the bind's transaction
   (`Loopctl.AuditChain.append_in_tenant_transaction/2`), announced after commit. An idempotent
   re-bind writes nothing, so it appends nothing.
+
+  ## Reading a story's changes
+
+  `story_changes/2` is what `GET /api/v1/stories/:id/changes` serves (US-47.7): the story's
+  bindings OLDEST FIRST with the current one last — the current binding is ordered by being
+  current, never by its `inserted_at` — each with
+  its change's APPLIED events in `event_seq` order. An event held ahead of a gap is not
+  applied, so it is not listed. Both halves are bounded, by `max_bindings/0` and
+  `max_events_per_change/0`; a truncated list keeps the NEWEST entries (the current binding
+  is always present) and says so in its counts. The event's `data` and `effect` are not
+  returned: `data` is untrusted chg-authored text, and nothing a reader of this list needs
+  is in either.
   """
 
   import Ecto.Query
@@ -64,6 +77,7 @@ defmodule Loopctl.Changes do
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Changes.Binding
+  alias Loopctl.Changes.Event
   alias Loopctl.Changes.UnboundEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Repo
@@ -84,6 +98,35 @@ defmodule Loopctl.Changes do
           Ecto.Changeset.t() | :change_bound_to_other_story | :change_superseded | :busy
 
   @input_types %{story_id: :string, repo: :string, change_id: :string}
+
+  # The bounds on `story_changes/2`, held here once and read by the endpoint's response and its
+  # operation spec alike (`LoopctlWeb.StoryChangeController`), so the documented limit and the
+  # enforced one cannot drift. A change's life is a submit, a few revisions and their checks,
+  # so 100 events holds every ordinary change whole; a story bound to more than 20 changes
+  # has been re-submitted far past what a reader needs listed.
+  @max_events_per_change 100
+  @max_bindings 20
+
+  @typedoc """
+  One binding of `story_changes/2`: the row, its newest applied events (at most
+  `max_events_per_change/0`, ascending `event_seq`), and how many applied events the change
+  has in all.
+  """
+  @type story_change :: %{
+          binding: Binding.t(),
+          events: [Event.t()],
+          applied_event_count: non_neg_integer()
+        }
+
+  @typedoc """
+  `story_changes/2`'s answer: the story's canonical (cast, lowercase) id, the listed bindings
+  oldest first with the current one last, and their total.
+  """
+  @type story_changes :: %{
+          story_id: Ecto.UUID.t(),
+          bindings: [story_change()],
+          binding_count: non_neg_integer()
+        }
 
   @doc """
   Binds `attrs.change_id` in `attrs.repo` to `attrs.story_id`.
@@ -118,6 +161,56 @@ defmodule Loopctl.Changes do
     |> after_commit(tenant_id, input)
   end
 
+  @typedoc """
+  What `bind_in_tenant_transaction/3` did, for `after_bind_commit/1` to finish once the
+  caller's transaction commits: `{outcome, tenant_id, input}`.
+  """
+  @type pending_bind ::
+          {{:bound, Binding.t(), Entry.t()}
+           | {:existing, Binding.t()}
+           | {:unbound, Entry.t() | nil}
+           | {:refused, bind_error()}, Ecto.UUID.t(), map()}
+
+  @doc """
+  `bind/4` INSIDE the caller's `Loopctl.Repo.with_tenant/2` transaction for `tenant_id` — for
+  the change-events webhook (US-47.3), whose bind must commit or roll back with the event that
+  carried it, under the lock it already holds on the change.
+
+  A refusal that wrote nothing (`:change_bound_to_other_story`, `:change_superseded`, an
+  invalid input) is RETURNED, inside `{:ok, pending}`, so the caller can record it and keep
+  its own transaction; the lock-wait bound is the caller's. A failure after a write (the
+  supersede already made) rolls the CALLER's transaction back, because nothing short of that
+  undoes it. Pass the result to `after_bind_commit/1` after the caller commits: that is where
+  the audit entry is announced and the unbound warning logged, as `bind/4` does.
+
+  Raises outside a `Loopctl.Repo` transaction.
+  """
+  @spec bind_in_tenant_transaction(Ecto.UUID.t(), map(), submitter()) :: {:ok, pending_bind()}
+  def bind_in_tenant_transaction(tenant_id, attrs, %{agent_id: agent_id} = submitter)
+      when is_binary(tenant_id) and is_map(attrs) and (is_nil(agent_id) or is_binary(agent_id)) do
+    unless Repo.in_transaction?(),
+      do: raise(ArgumentError, "bind_in_tenant_transaction/3 needs a Loopctl.Repo transaction")
+
+    lineage = Map.get(submitter, :actor_lineage, [])
+
+    case validate_input(attrs) do
+      {:ok, input} ->
+        {:ok, {bind_in_transaction(tenant_id, input, agent_id, lineage), tenant_id, input}}
+
+      {:error, changeset} ->
+        {:ok, {{:refused, changeset}, tenant_id, attrs}}
+    end
+  end
+
+  @doc """
+  Finishes a `bind_in_tenant_transaction/3` after the caller's transaction committed, and
+  answers what `bind/4` would have: `{:ok, binding}`, `{:ok, :unbound}` or `{:error, reason}`.
+  """
+  @spec after_bind_commit(pending_bind()) ::
+          {:ok, Binding.t() | :unbound} | {:error, bind_error()}
+  def after_bind_commit({outcome, tenant_id, input}),
+    do: after_commit({:ok, outcome}, tenant_id, input)
+
   @doc "The story's current binding — the newest not superseded — or `nil`."
   @spec current_binding(Ecto.UUID.t(), Ecto.UUID.t()) :: Binding.t() | nil
   def current_binding(tenant_id, story_id) when is_binary(tenant_id) and is_binary(story_id) do
@@ -144,6 +237,111 @@ defmodule Loopctl.Changes do
       end)
 
     bindings
+  end
+
+  @doc "The most applied events `story_changes/2` lists per change."
+  @spec max_events_per_change() :: pos_integer()
+  def max_events_per_change, do: @max_events_per_change
+
+  @doc "The most bindings `story_changes/2` lists per story."
+  @spec max_bindings() :: pos_integer()
+  def max_bindings, do: @max_bindings
+
+  @doc """
+  The story's bindings, oldest first, each with its change's applied events — see "Reading a
+  story's changes" above.
+
+  `{:error, :not_found}` when the story is not the tenant's: another tenant's id, an id
+  nobody issued and a malformed one answer alike. A tenant story with no binding is
+  `{:ok, %{story_id: id, bindings: [], binding_count: 0}}`. Every read runs through `Repo` under the
+  tenant's RLS context AND an explicit `tenant_id` predicate.
+  """
+  @spec story_changes(Ecto.UUID.t(), String.t()) :: {:ok, story_changes()} | {:error, :not_found}
+  def story_changes(tenant_id, story_id) when is_binary(tenant_id) and is_binary(story_id) do
+    with {:ok, id} <- Ecto.UUID.cast(story_id),
+         {:ok, {:ok, changes}} <-
+           Repo.with_tenant(tenant_id, fn -> read_story_changes(tenant_id, id) end) do
+      {:ok, changes}
+    else
+      :error -> {:error, :not_found}
+      {:ok, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  defp read_story_changes(tenant_id, story_id) do
+    story? =
+      Repo.exists?(from s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id)
+
+    if story?, do: {:ok, read_bindings(tenant_id, story_id)}, else: :not_found
+  end
+
+  # The newest `@max_bindings`, then put back oldest first. The CURRENT binding sorts ahead of
+  # every superseded one before `inserted_at` is consulted: `inserted_at` is the app's clock,
+  # and a current row stamped earlier than a superseded one must still be in the window and
+  # still be listed last. `binding_count` is the story's total, taken as a window count in the
+  # SAME statement (it is computed before LIMIT), so the list and the total see one snapshot.
+  defp read_bindings(tenant_id, story_id) do
+    rows =
+      from(b in Binding,
+        where: b.tenant_id == ^tenant_id and b.story_id == ^story_id,
+        order_by: [desc: is_nil(b.superseded_at), desc: b.inserted_at, desc: b.id],
+        limit: ^@max_bindings,
+        select: {b, over(count(b.id))}
+      )
+      |> Repo.all()
+      |> Enum.reverse()
+
+    bindings = Enum.map(rows, &elem(&1, 0))
+    events = read_applied_events(tenant_id, Enum.map(bindings, & &1.id))
+
+    %{
+      story_id: story_id,
+      binding_count: binding_total(rows),
+      bindings:
+        Enum.map(bindings, fn binding ->
+          {listed, count} = Map.get(events, {binding.repo, binding.change_id}, {[], 0})
+          %{binding: binding, events: listed, applied_event_count: count}
+        end)
+    }
+  end
+
+  defp binding_total([]), do: 0
+  defp binding_total([{_binding, total} | _]), do: total
+
+  # One query for every listed binding's events, not one per binding: each change's applied
+  # events are ranked newest first and counted in a window, and the outer query keeps the
+  # top `@max_events_per_change` of each. Answers `%{{repo, change_id} => {events, count}}`.
+  defp read_applied_events(_tenant_id, []), do: %{}
+
+  defp read_applied_events(tenant_id, binding_ids) do
+    ranked =
+      from e in Event,
+        join: b in Binding,
+        on: b.tenant_id == e.tenant_id and b.repo == e.repo and b.change_id == e.change_id,
+        where: e.tenant_id == ^tenant_id and b.tenant_id == ^tenant_id,
+        where: b.id in ^binding_ids and not is_nil(e.applied_at),
+        windows: [
+          newest: [partition_by: [e.repo, e.change_id], order_by: [desc: e.event_seq]],
+          change: [partition_by: [e.repo, e.change_id]]
+        ],
+        select: %{
+          id: e.id,
+          rank: over(row_number(), :newest),
+          applied_count: over(count(e.id), :change)
+        }
+
+    from(e in Event,
+      join: r in subquery(ranked),
+      on: r.id == e.id,
+      where: e.tenant_id == ^tenant_id and r.rank <= ^@max_events_per_change,
+      order_by: [asc: e.repo, asc: e.change_id, asc: e.event_seq],
+      select: {e, r.applied_count}
+    )
+    |> Repo.all()
+    |> Enum.group_by(fn {e, _count} -> {e.repo, e.change_id} end)
+    |> Map.new(fn {key, [{_e, count} | _] = rows} ->
+      {key, {Enum.map(rows, fn {e, _} -> e end), count}}
+    end)
   end
 
   @doc "The tenant's unbound events for one change, oldest first."
@@ -212,11 +410,13 @@ defmodule Loopctl.Changes do
       %Binding{story_id: story_id, superseded_at: nil} = binding when story_id == story.id ->
         {:existing, binding}
 
+      # Refused before anything is written, so the answer is returned rather than raised: a
+      # caller inside its own transaction (`bind_in_tenant_transaction/3`) keeps it.
       %Binding{story_id: story_id} when story_id == story.id ->
-        Repo.rollback(:change_superseded)
+        {:refused, :change_superseded}
 
       %Binding{} ->
-        Repo.rollback(:change_bound_to_other_story)
+        {:refused, :change_bound_to_other_story}
 
       nil ->
         insert_binding(tenant_id, story, input, agent_id, lineage)
@@ -338,7 +538,7 @@ defmodule Loopctl.Changes do
 
     case Ecto.Changeset.apply_action(changeset, :insert) do
       {:ok, event} -> insert_unbound(tenant_id, input, event, agent_id, lineage)
-      {:error, reason} -> Repo.rollback(reason)
+      {:error, reason} -> {:refused, reason}
     end
   end
 
@@ -384,6 +584,7 @@ defmodule Loopctl.Changes do
   end
 
   defp after_commit({:ok, {:existing, binding}}, _tenant_id, _input), do: {:ok, binding}
+  defp after_commit({:ok, {:refused, reason}}, _tenant_id, _input), do: {:error, reason}
 
   defp after_commit({:ok, {:unbound, entry}}, tenant_id, input) do
     if entry do

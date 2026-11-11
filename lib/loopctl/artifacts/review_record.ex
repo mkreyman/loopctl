@@ -23,6 +23,14 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     superseded report no longer qualifies. Set programmatically, never cast.
     Nullable: legacy pre-migration records are `NULL` and grandfathered as
     "matches".
+  - `commit_sha` -- for a story bound to a chg change ONLY (US-47.5, Epic 47 PRD §6): the
+    revision commit the chg reviewer reviewed, which `Loopctl.Progress.record_review/4` has
+    checked is the envelope `sha` of a `submitted` event of the story's CURRENT binding. A
+    landing whose revision no row names escalates over `:review_missing`. Set
+    programmatically, never cast; `NULL` on every other review.
+  - `reviewer_dispatch_id` -- the chg reviewer's own dispatch (the leaf of its server-resolved
+    lineage), written with `commit_sha` and never apart from it. Unique
+    (`review_records_reviewer_dispatch_uidx`): one reviewer dispatch records one verdict.
   """
 
   use Loopctl.Schema
@@ -42,6 +50,8 @@ defmodule Loopctl.Artifacts.ReviewRecord do
              :summary,
              :completed_at,
              :reviewed_report_at,
+             :commit_sha,
+             :reviewer_dispatch_id,
              :inserted_at,
              :updated_at
            ]}
@@ -61,6 +71,11 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     # Snapshot of story.reported_done_at at review creation (INVARIANT 2).
     # Set programmatically in Loopctl.Progress.record_review/4 — NOT in cast.
     field :reviewed_report_at, :utc_datetime_usec
+
+    # US-47.5: a chg review's revision and reviewer dispatch. Set programmatically in
+    # Loopctl.Progress.record_review/4, together or not at all — NOT in cast.
+    field :commit_sha, :string
+    field :reviewer_dispatch_id, :binary_id
 
     timestamps()
   end
@@ -102,6 +117,9 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     |> validate_number(:disproved_count, greater_than_or_equal_to: 0)
     |> validate_completed_at_not_future()
     |> validate_findings_math()
+    |> unique_constraint(:reviewer_dispatch_id, name: :review_records_reviewer_dispatch_uidx)
+    |> check_constraint(:commit_sha, name: :review_records_commit_sha)
+    |> check_constraint(:commit_sha, name: :review_records_chg_review_shape)
   end
 
   # Validates that completed_at is not more than 60 seconds in the future

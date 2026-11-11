@@ -45,6 +45,11 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   A stage row is never deleted except with its story, so an ADVANCED story keeps excluding its
   record exactly as a `detected` one does.
 
+  The read is per RECORD, and an issue has one record per generation (US-47.10, see
+  "Generations" in `Loopctl.Intake`). A reopen after the issue's story finished starts a new
+  record with no story, so that record is a candidate here and the finished one stays
+  excluded. Nothing in this read had to change for that.
+
   ## A revoked source is excluded by the predicate, not skipped in the loop
 
   `promote/1` returns `:source_revoked` for one, and the record can then never become a story:
@@ -66,6 +71,16 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
 
   `:source_revoked` therefore reaches the loop only as a race (revoked between the read and
   the promote) and is handled there as a skip for the same reason.
+
+  ## A ticketless record on a ticket-requiring source is excluded the same way
+
+  A source with `triage_requires_ticket` triages only records carrying a `ticket_id`
+  (`Loopctl.Agents.Candidates`), so a story for any other record is one nothing will take.
+  The read excludes such a record for the revoked-source reason, the batch slot, and
+  `promote/1` refuses it with `:ticket_required` as the race backstop, a skip. Unlike
+  revocation this is not permanent: an `edited` delivery re-extracts the ticket facts, and the
+  first read after `ticket_id` is set promotes the record. Not escalated: there is no question
+  for a person in an issue that was not filed from a ticket.
 
   ## Escalate what a human must clear; retry everything else
 
@@ -238,6 +253,14 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # the opposite of what happens is worse than the clause it saves.
   defp disposition(:source_revoked), do: :skip
 
+  # A ticketless record on a ticket-requiring source (see the moduledoc). Also reachable only
+  # as a race, since the read excludes it, but unlike a revoked source it DOES come back: the
+  # first read after its `ticket_id` is set promotes it.
+  defp disposition(:ticket_required), do: :skip
+
+  # Its issue is closed. Excluded from the read too; it returns once a reopen sets issue_state.
+  defp disposition(:issue_closed), do: :skip
+
   # Everything else self-heals on the next pass — see "Escalate what a human must clear" above.
   defp disposition(_reason), do: :retry
 
@@ -287,7 +310,8 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # The issue number and the source are loopctl's own facts and are what an operator greps.
   defp identity(%Record{} = record) do
     "tenant_id=#{record.tenant_id} record_id=#{record.id} " <>
-      "source_id=#{record.source_id} issue_number=#{record.issue_number}"
+      "source_id=#{record.source_id} issue_number=#{record.issue_number} " <>
+      "generation=#{record.generation}"
   end
 
   # A changeset is summarised by the keys that failed; its data is an intake record and would
@@ -304,6 +328,15 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
     resolves to no source OF THIS TENANT is kept — `promote/1` fails that closed with
     `:source_not_found` and the record escalates, which is a data inconsistency somebody has
     to look at rather than something to drop silently;
+  - the TICKET: a source with `triage_requires_ticket` promotes only a record carrying a
+    `ticket_id`. Any other record stays `pending_triage` and makes no story, because triage
+    would never take it (`Loopctl.Agents.Candidates`, `:requires_ticket_if_source_says`) and
+    a story nobody will work is clutter in the epic. Excluded from the read for the same
+    reason a revoked source is; a record that gains a ticket later is promoted then;
+  - the ISSUE STATE: a record whose issue is closed makes no story, the same rule triage
+    applies (`:issue_not_closed`). Such a record has no story and no closure row, so a reopen
+    is applied to the SAME record (`Loopctl.Intake`, a reopen of a record with no story yet):
+    its `issue_state` goes back to open and the next read promotes it;
   - the STAGE ROW: its absence is what makes a record a candidate, story or no story.
 
   Neither join can multiply a row — `stories_intake_record_uidx` permits one story per
@@ -331,6 +364,8 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
       on: st.story_id == s.id and st.tenant_id == s.tenant_id,
       where: r.status == :pending_triage,
       where: is_nil(src.id) or is_nil(src.revoked_at),
+      where: is_nil(src.id) or not src.triage_requires_ticket or not is_nil(r.ticket_id),
+      where: is_nil(r.issue_state) or r.issue_state != "closed",
       where: is_nil(st.id),
       order_by: [asc: r.inserted_at, asc: r.id],
       limit: @batch,

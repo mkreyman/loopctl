@@ -48,7 +48,14 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     # change to it is not whether it names these fields but whether it still fences all of
     # them. A future module added here on the grounds that it "only reads the title" is the
     # failure this list exists to make visible.
-    "lib/loopctl/delivery/triage_payload.ex"
+    "lib/loopctl/delivery/triage_payload.ex",
+    # US-48.13, contract 1.30.0. The builder of the `spec_tune` dispatch's traces: a failed
+    # run's story text goes to the tuner as `traces[].untrusted`, and `Tuning.story_text/1`
+    # reads the intake record's reporter title and body for it. An owner for the same reason
+    # as triage_payload.ex: every byte it reads leaves only through `Untrusted.render/2`
+    # (`fenced/2`), which `test/loopctl/agents/tuning_test.exs` asserts on the wire object,
+    # and removing that render reddens it by mutation.
+    "lib/loopctl/agents/tuning.ex"
   ]
 
   # `id` is on the list for `story_object/2` (contract 1.5.0): the dispatch carries the

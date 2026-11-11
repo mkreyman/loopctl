@@ -2,8 +2,10 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
   @moduledoc """
   Places queued stories on connected runners, once a minute (issue #803).
 
-  The cron caller of `Loopctl.Delivery.DispatchDriver.run/1`, which is where the selection and
-  every refusal live. This module is the schedule and the job's own result, and nothing else.
+  The cron caller of `Loopctl.Agents.Dispatcher.run/2` with `implement@1`
+  (`Loopctl.Agents.Specs.ImplementV1`, US-48.7) — the `:build` pass that
+  `Loopctl.Delivery.DispatchDriver` wraps, which is where the selection and every refusal live.
+  This module is the schedule and the job's own result, and nothing else.
 
   ## It does nothing until an operator turns it on
 
@@ -27,6 +29,8 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
 
   use Oban.Worker, queue: :default, max_attempts: 3
 
+  alias Loopctl.Agents.Dispatcher
+  alias Loopctl.Agents.Specs.ImplementV1
   alias Loopctl.Delivery.DispatchDriver
 
   require Logger
@@ -39,7 +43,7 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
           | {:error, {:all_candidates_errored, pos_integer()}}
           | {:cancel, {:misconfigured, atom()}}
   def perform(%Oban.Job{}) do
-    case DispatchDriver.run(@batch) do
+    case Dispatcher.run(ImplementV1.spec(), limit: @batch) do
       {:ok, results} -> report(results)
       {:error, reason} -> misconfigured(reason)
     end

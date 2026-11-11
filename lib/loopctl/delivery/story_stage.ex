@@ -11,6 +11,9 @@ defmodule Loopctl.Delivery.StoryStage do
   - `merge_gate_allowed_sha` — the head the merge precondition ALLOWED (#803). Not an
     effect the loop performs but the record that one was authorised, so an already-merged
     pull request can be told from one merged around the gate. Cleared with `head_sha`.
+  - `verified_head_sha` — the head the story was VERIFIED at (US-48.18): control writes it at
+    `ci` once a `verify@1` pass for that head has reported, reviewed and verified the story.
+    Cleared with `head_sha`, and the merge precondition requires it to equal the recorded head.
   - `merge_gate_unevaluated` — `%{"head_sha" => sha, "count" => n}`, consecutive merge-gate
     evaluations at one head that produced NO verdict because the forge was transiently
     unavailable (#803). The gate escalates once it passes its bound, so a fault that never
@@ -20,6 +23,15 @@ defmodule Loopctl.Delivery.StoryStage do
     verdict, because the forge was transiently unavailable or the deploy had not settled.
     MERGE-keyed rather than head-keyed, so it is cleared with `merge_sha`
     (`Loopctl.Delivery.StageMachine.merge_keyed/0`) and not with the head.
+  - `trunk_verified_sha` — the `verified/master` commit chg's trunk verifier passed on that
+    contains this story's merge (US-47.4, PRD §5: a `verified` change event). A record, not a
+    stage; merge-keyed, so it is cleared with `merge_sha`.
+  - `merge_instruction` — `%{"head_sha", "runner_id", "dispatch_id", "sends", "sent_at",
+    "outcome"}`, the record that control told the runner holding the claim to merge this head
+    (US-48.17, `Loopctl.Delivery.MergeExecution`). Head-keyed: a new head is a new instruction.
+  - `runner_absence` — `%{"runner_id", "since"}`, when a sweep first found the story's runner
+    with no live socket while the story waited at `ci` (US-48.17). Head-keyed; cleared when
+    the runner is seen live again.
   - `attempts` — how many times each failure edge has been taken, keyed by edge name.
   - `escalation_reason` — why the story last escalated (required while `escalated`).
   - `lock_version` — incremented by every write, so an observer can tell two reads of the
@@ -58,8 +70,12 @@ defmodule Loopctl.Delivery.StoryStage do
     field :merge_sha, :string
     field :release_id, :string
     field :merge_gate_allowed_sha, :string
+    field :verified_head_sha, :string
     field :merge_gate_unevaluated, :map
     field :post_deploy_unresolved, :map
+    field :trunk_verified_sha, :string
+    field :merge_instruction, :map
+    field :runner_absence, :map
     field :attempts, :map, default: %{}
     field :escalation_reason, :string
     field :lock_version, :integer, default: 0

@@ -17,6 +17,7 @@ defmodule LoopctlWeb.ChangeController do
   alias Loopctl.Audit
   alias Loopctl.Audit.ChangesCursor
   alias Loopctl.Knowledge
+  alias LoopctlWeb.CurrentTenant
   alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.Visibility
 
@@ -98,7 +99,7 @@ defmodule LoopctlWeb.ChangeController do
   Optional: `project_id`, `entity_type`, `action`
   """
   def index(conn, params) do
-    with {:ok, tenant_id} <- require_tenant(conn),
+    with {:ok, tenant_id} <- CurrentTenant.fetch_id(conn),
          :ok <- ProjectId.validate(params["project_id"]),
          {:ok, since, cursor_opt} <- resolve_seek(tenant_id, params) do
       limit = parse_limit(params["limit"])
@@ -259,11 +260,4 @@ defmodule LoopctlWeb.ChangeController do
 
   defp format_datetime(nil), do: nil
   defp format_datetime(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
-
-  defp require_tenant(conn) do
-    case conn.assigns[:current_tenant] do
-      %{id: id} when is_binary(id) -> {:ok, id}
-      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
-    end
-  end
 end

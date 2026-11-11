@@ -72,13 +72,30 @@ kill_timeout = 90
 
   # THE BUDGETS ARE A COST POLICY, not a timeout, and they have no defaults on purpose
   # (config/runtime.exs:177) — a default would be our guess quietly becoming Mark's
-  # spend. Calibrated against the ONE measured unattended run (2026-09-14, one story):
-  # 28.8 minutes, 108 turns, about USD 10.40. Both implement numbers are ~2x that, so a
-  # typical run finishes well inside them and a runaway is capped near an hour rather
-  # than a day. Expect roughly USD 10-20 per implement run at these figures; lower them
-  # to cap harder, raise them only with a measured run that needed it.
-  DISPATCH_WALL_CLOCK_SECONDS = "3600"
-  DISPATCH_MAX_TURNS = "200"
+  # spend. Lower them to cap harder; raise them only with a measured run that needed it.
+  # Two measured runs set them:
+  #  - 2026-09-14, one story, no PR route: 28.8 minutes, 108 turns (~3.75 a minute), about
+  #    USD 10.40. That set 3600 s / 200 turns, ~2x the run.
+  #  - 2026-11-07, the first pr-route run on home_care_billing (story ddb4fcc1, HCB #3922):
+  #    the fix was committed in 21 minutes, then the rest of the hour went to HCB's pre-push
+  #    gate and the session was killed at 3600 s mid-push, before its PR existed. A pr-route
+  #    run also carries the review, CI (~10 minutes) and the merge.
+  # So 7200 s, and turns raised with it at the measured rate (two hours at ~3.75 a minute
+  # is ~450; 400 keeps the pair bounded together). A runaway is capped near two hours and
+  # about USD 40. Mark's to lower.
+  DISPATCH_WALL_CLOCK_SECONDS = "7200"
+  DISPATCH_MAX_TURNS = "400"
+
+  # THE RETRY CEILING (US-44.4). Counted releases a story may take and still be re-placed:
+  # a lease that ran out, a runner crash, a verify@1 reject. A release retries while the
+  # count INCLUDING it is below this, so "2" is one retry: the second counted release
+  # escalates attempts_exhausted to a person. Mark said on 2026-11-08 to give one retry by
+  # default, because a verify reject now carries its findings to the next implement
+  # (#1032) and a second attempt is worth paying for. The code keeps no default (#875); this
+  # line is production's choice. Worst case per story is two runs at the budgets above.
+  # A Fly secret of the same name OUTRANKS this line: if `fly secrets list -a loopctl`
+  # shows DISPATCH_MAX_ATTEMPTS, `fly secrets unset` it or an edit here does nothing.
+  DISPATCH_MAX_ATTEMPTS = "2"
 
   # THE FLEET MULTIPLIER. The two budgets above bound ONE session; what we actually spend is
   # that times how many run at once, so the multiplier belongs next to the multiplicand or
@@ -108,22 +125,36 @@ kill_timeout = 90
   # each: declared capacity 12, spend held at 2 concurrent (roughly USD 20-40/hour) until
   # this line is deliberately raised. Raise it when several runs have landed reviewable
   # work, not before.
-  RUNNER_MAX_IN_FLIGHT_SESSIONS = "2"
+  # 3 since 2026-11-07: Mark put ryzen and x1 in the implementer pool beside minis ("minis
+  # shouldn't be the only available implementer"), each declaring one session, and a cap of 2
+  # would leave one of the three idle by policy. Roughly USD 30-60/hour at full use.
+  RUNNER_MAX_IN_FLIGHT_SESSIONS = "3"
 
   # A TRIAGE session reads a ticket and answers with a verdict — a fraction of an
   # implement run — so it gets its own far smaller pair (#803 §4). Inheriting the
-  # implement numbers would hand a reading session an hour of wall clock.
+  # implement numbers would hand a reading session two hours of wall clock.
   #
-  # UNLIKE THE IMPLEMENT PAIR, THIS ONE IS ASSERTED, NOT MEASURED. The implement budgets
-  # are 2x a real run; no triage run has ever been measured, so 600/40 is a reasoned guess.
-  # What a too-small guess looks like: the runner reports `wall_clock_exceeded` or
-  # `no_verdict_written` (runner_contract.ex:1463), and TriageVerdict.route/1
-  # (triage_verdict.ex:230) escalates EVERY incomplete reason — so every ticket escalates to
-  # a human while the workers log clean `:dispatched` tallies and the loop reads as working.
-  # There is no error to notice. CHECK THE FIRST TRIAGE RUNS against these numbers, and
-  # raise them from what those runs actually took.
-  TRIAGE_WALL_CLOCK_SECONDS = "600"
+  # ONE MEASURED RUN. 600 s / 40 turns was a reasoned guess until 2026-11-07, when the first
+  # ticket triage (HCB #3922, minis) returned its verdict 602 s after dispatch: right at the
+  # budget. Raised to 1200 s, 2x that run. What a too-small budget looks like: the runner
+  # reports `wall_clock_exceeded` or `no_verdict_written` (runner_contract.ex:1463), and
+  # TriageVerdict.route/1 (triage_verdict.ex:230) escalates EVERY incomplete reason — so
+  # every ticket escalates to a human while the workers log clean `:dispatched` tallies and
+  # the loop reads as working. There is no error to notice. Keep checking triage runs
+  # against these numbers.
+  TRIAGE_WALL_CLOCK_SECONDS = "1200"
   TRIAGE_MAX_TURNS = "40"
+
+  # spec_tuner@1's own pair (US-48.13). The runner bounds the WHOLE tuning run by this wall
+  # clock, and its critic replays every eval case of the target spec under the current and the
+  # proposed template, each with that case's own wall_clock_seconds — so the triage pair cannot
+  # hold it. Sized from loopctl-runner's eval/ sets on 2026-11-07, existing cases plus the 5 new
+  # ones a result may add (SpecTunerV1.max_new_cases/0), all run twice: implement@1 is the
+  # largest at 2 x (600+1800+1800) + 2 x 5 x 1800 = 26400 s; triage@1 is 2 x 6 x 900 + 2 x 5 x
+  # 900 = 19800 s. 28800 s leaves 2400 s for the reading session. Re-derive it when a case set
+  # grows or a case's wall clock rises. Unused while DRAFT_DISPATCH_ENABLED is off.
+  SPEC_TUNE_WALL_CLOCK_SECONDS = "28800"
+  SPEC_TUNE_MAX_TURNS = "80"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
   # started machine's 6PN address and connects to the node of the same release there; the
   # node name and IPv6 distribution come from rel/env.sh.eex. Not a secret: it names no
@@ -133,25 +164,20 @@ kill_timeout = 90
   # budget multiplies the per-node pools by it, so it must stay the true maximum (2), not
   # the number usually running. Change it when the machine count changes.
   #
-  # CLUSTER_PEERS_MAY_SUSPEND follows [http_service] below: with auto_stop_machines
-  # suspending down to min_machines_running (1), the second machine is usually suspended,
-  # so fewer peers than EXPECTED_APP_NODES - 1 is normal and Loopctl.ClusterReadiness
-  # reports it as `peers_may_be_suspended`, not the `expected_peers_missing` alarm — but only
-  # while `loopctl.internal` (which lists started machines only) lists no other machine that
-  # is not connected; a running peer that failed to join still alarms. Delete it if every
-  # machine is ever kept running, and the alarm comes back for suspension too. The count itself is
-  # always on `loopctl.cluster.peers.connected`. test/loopctl/fly_toml_test.exs holds this
-  # line to the [http_service] settings.
+  # CLUSTER_PEERS_MAY_SUSPEND is deliberately unset: min_machines_running below equals
+  # EXPECTED_APP_NODES, so a missing peer is a fault and Loopctl.ClusterReadiness alarms
+  # `expected_peers_missing`. test/loopctl/fly_toml_test.exs holds that to [http_service].
   DNS_CLUSTER_QUERY = "loopctl.internal"
   EXPECTED_APP_NODES = "2"
-  CLUSTER_PEERS_MAY_SUSPEND = "true"
 
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = "suspend"
   auto_start_machines = true
-  min_machines_running = 1
+  # 2 since 2026-11-02: every Claude session on the fleet depends on loopctl, and with 1 an
+  # OOM kill of the running machine left nothing serving until the proxy woke the other.
+  min_machines_running = 2
 
   [http_service.concurrency]
     type = "connections"
@@ -189,6 +215,9 @@ kill_timeout = 90
   port = 9568
   path = "/metrics"
 
+# 1024mb since 2026-11-02: at 512mb machine 2872420c0d2348 was OOM-killed
+# (exit 137, oom_killed=true) at 2026-11-02T00:50Z and sessions saw loopctl as
+# down. Lower it only with a peak-RSS measurement under the real load.
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1024mb"

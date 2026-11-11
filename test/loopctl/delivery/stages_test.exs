@@ -77,6 +77,19 @@ defmodule Loopctl.Delivery.StagesTest do
   end
 
   # A story in `status` at `epoch` with its stage row at `stage`.
+  # The change-event seam's own path (US-47.4): locked first, then advanced, in one tenant
+  # transaction, returning what `advance/4` would.
+  defp in_change_event_transaction(story, transition, opts) do
+    Repo.with_tenant(story.tenant_id, fn ->
+      {:ok, _locked} = Stages.lock_for_control_in_tenant_transaction(story.tenant_id, story.id)
+
+      case Stages.advance_in_tenant_transaction(story.tenant_id, story.id, transition, opts) do
+        {:ok, row, _entry} -> row
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
   defp at_stage(stage, attrs \\ %{}) do
     attrs = Map.new(attrs)
 
@@ -143,7 +156,18 @@ defmodule Loopctl.Delivery.StagesTest do
             effects: required_effects(to)
           ]
 
-        result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
+        result =
+          if edge in StageMachine.change_protocol_edges() do
+            # Only the change-event seam takes these (US-47.4); `advance/4` refuses them from
+            # every caller, before the database.
+            assert {:error, :invalid_transition} =
+                     Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts),
+                   inspect({from, to, edge})
+
+            in_change_event_transaction(story, {from, to, edge}, opts)
+          else
+            Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
+          end
 
         if edge in ([:runner_lost, :claim_released] ++ StageMachine.release_escalation_edges()) do
           # Only a releasing transaction takes these (follow_release/5): the release edges,
@@ -164,6 +188,37 @@ defmodule Loopctl.Delivery.StagesTest do
           chained = chain_actions(story.tenant_id) != []
           assert chained == StageMachine.chained?(from, to, edge), inspect({from, to, edge})
         end
+      end
+    end
+
+    test "TC-47.4.10: advance/4 and precheck/2 refuse every change-protocol edge, from any caller" do
+      triples =
+        for {_f, _t, e} = triple <- StageMachine.transitions(),
+            e in StageMachine.change_protocol_edges(),
+            do: triple
+
+      # Every one of them, the two US-47.4 round-1 added included.
+      assert triples |> Enum.map(&elem(&1, 2)) |> Enum.uniq() |> Enum.sort() ==
+               Enum.sort(StageMachine.change_protocol_edges())
+
+      for {from, to, _edge} = triple <- triples do
+        {story, row} = at_stage(from)
+
+        # The most privileged attribution there is, so nothing but the edge refuses it.
+        opts = [
+          claim_epoch: story.claim_epoch,
+          reason: "because",
+          actor_role: :user,
+          actor_lineage: [],
+          effects: required_effects(to)
+        ]
+
+        assert {:error, :invalid_transition} =
+                 Stages.advance(story.tenant_id, story.id, triple, opts),
+               inspect(triple)
+
+        assert {:error, :invalid_transition} = Stages.precheck(triple, opts), inspect(triple)
+        assert Stages.get(story.tenant_id, story.id).lock_version == row.lock_version
       end
     end
 
@@ -637,7 +692,28 @@ defmodule Loopctl.Delivery.StagesTest do
       assert row.merge_gate_unevaluated == %{"head_sha" => @sha_a, "count" => 1}
     end
 
-    test "is refused off the deployed stage — no other stage runs this gate" do
+    test "is written at merged too, and runs on across merged -> deployed (US-48.16)" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:ci, :merged},
+          claim_epoch: story.claim_epoch,
+          actor_lineage: [],
+          effects: [merge_sha: @sha_a]
+        )
+
+      assert {:ok, %{count: 1}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, %{count: 2}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:merged, :deployed}, opts)
+
+      # ONE clock from the merge: the forward edge into `deployed` clears nothing.
+      assert {:ok, %{count: 3, total: 3}} =
+               note_post_deploy(story, @sha_a, :deploy_pending, opts)
+    end
+
+    test "is refused off the merged and deployed stages — no other stage runs this gate" do
       {story, _row} = at_stage(:ci)
 
       assert {:error, :wrong_stage} =
@@ -661,7 +737,8 @@ defmodule Loopctl.Delivery.StagesTest do
       pr_number: 821,
       merge_sha: String.duplicate("d", 64),
       release_id: "v421",
-      merge_gate_allowed_sha: String.duplicate("1", 40)
+      merge_gate_allowed_sha: String.duplicate("1", 40),
+      verified_head_sha: String.duplicate("3", 40)
     }
 
     @others %{
@@ -672,7 +749,8 @@ defmodule Loopctl.Delivery.StagesTest do
       pr_number: 822,
       merge_sha: String.duplicate("f", 40),
       release_id: "v422",
-      merge_gate_allowed_sha: String.duplicate("2", 40)
+      merge_gate_allowed_sha: String.duplicate("2", 40),
+      verified_head_sha: String.duplicate("4", 40)
     }
 
     test "a replay of every outward stage finds and reuses its recorded identity" do
@@ -1977,7 +2055,16 @@ defmodule Loopctl.Delivery.StagesTest do
                "merge_gate_unevaluated" => nil,
                # Merge-keyed alongside `merge_sha` (#803 §9): post-deploy verification's
                # unresolved count is kept per MERGE, so a retracted merge takes it too.
-               "post_deploy_unresolved" => nil
+               "post_deploy_unresolved" => nil,
+               # The release and chg's trunk verification are merge-keyed too (US-47.4).
+               "release_id" => nil,
+               "trunk_verified_sha" => nil,
+               # Head-keyed (US-48.18): a verification is of one head, retracted with it.
+               "verified_head_sha" => nil,
+               # Head-keyed (US-48.17): a merge instruction names one head, and the runner's
+               # absence clock is the wait for that head's merge.
+               "merge_instruction" => nil,
+               "runner_absence" => nil
              }
 
       # And the next attempt can record its own head again.

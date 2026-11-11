@@ -397,6 +397,94 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       assert report.strata.all.escalated == 2
     end
 
+    # US-47.11: a mixed corpus — two chg-loop tickets (one escalating on an inversion phrase,
+    # one not), one intake [Feature], one intake [Bug], one engineering enhancement and one
+    # not-planned issue.
+    defp mixed_corpus do
+      [
+        replay(%{
+          "number" => 1,
+          "title" => "Failure 3f9a: claim total off by one",
+          "body" => "Fingerprint 3f9a. Root cause: unknown, investigate.",
+          labels: ["chg-loop"]
+        }),
+        replay(%{
+          "number" => 2,
+          "title" => "Failure 77c1: the export no longer includes the header",
+          labels: ["chg-loop", "bug"]
+        }),
+        replay(%{"number" => 3, "title" => "[Feature] Acme Homecare: a column"}),
+        replay(%{"number" => 4}),
+        replay(%{"number" => 5, "title" => "Refactor the parser", labels: ["enhancement"]}),
+        replay(%{"number" => 6, "title" => "Old idea", "stateReason" => "NOT_PLANNED"})
+      ]
+    end
+
+    test "chg_loop and human strata split the corpus on the chg-loop label" do
+      report = Report.gate_a(mixed_corpus(), %{corpus: "acme/repo"})
+
+      assert %{total: 2, escalated: 1, rate: 0.5, not_story: 0} = report.strata.chg_loop
+      assert report.strata.chg_loop.by_reason == %{inverts_deliberate_behaviour: 1}
+
+      assert %{total: 4, escalated: 2, rate: 0.5, not_story: 1} = report.strata.human
+      assert report.strata.human.by_reason == %{workflow_change: 2}
+    end
+
+    test "chg_loop and human PARTITION all" do
+      %{all: all, chg_loop: chg_loop, human: human} =
+        Report.gate_a(mixed_corpus(), %{}).strata
+
+      for key <- [:total, :escalated, :not_story] do
+        assert Map.fetch!(chg_loop, key) + Map.fetch!(human, key) == Map.fetch!(all, key)
+      end
+    end
+
+    test "intake and all are unchanged by the new strata" do
+      report = Report.gate_a(mixed_corpus(), %{})
+
+      assert %{total: 2, escalated: 1, rate: 0.5, not_story: 0} = report.strata.intake
+      assert report.strata.intake.by_reason == %{workflow_change: 1}
+
+      assert %{total: 6, escalated: 3, rate: 0.5, not_story: 1} = report.strata.all
+
+      assert report.strata.all.by_reason == %{
+               inverts_deliberate_behaviour: 1,
+               workflow_change: 2
+             }
+
+      # The pre-US-47.11 corpus, with no chg-loop label anywhere: `human` IS `all`.
+      plain = Report.gate_a(Enum.drop(mixed_corpus(), 2), %{}).strata
+      assert %{total: 0, escalated: 0, rate: nil, not_story: 0} = plain.chg_loop
+      assert plain.human == plain.all
+    end
+
+    test "an empty chg_loop stratum has a nil rate, never a zero one" do
+      strata = Report.gate_a([replay(%{})], %{}).strata
+
+      assert %{total: 0, escalated: 0, rate: nil} = strata.chg_loop
+    end
+
+    test "the sensitivity run carries the chg_loop and human strata too" do
+      replays = mixed_corpus()
+
+      sensitivity =
+        Enum.map(replays, &GateAReplay.replay(&1.ticket, suppress: [:request_shaped?]))
+
+      report = Report.gate_a(replays, %{}, sensitivity: sensitivity)
+
+      assert %{total: 2, escalated: 1} = report.sensitivity.chg_loop
+      assert %{total: 4, escalated: 0} = report.sensitivity.human
+      assert %{total: 2, escalated: 0} = report.sensitivity.intake
+      assert %{total: 6, escalated: 1} = report.sensitivity.all
+    end
+
+    test "an escalation row says whether chg filed it" do
+      rows = Report.gate_a(mixed_corpus(), %{}).escalations
+
+      assert Enum.find(rows, &(&1.issue == 2)).chg_loop
+      refute Enum.find(rows, &(&1.issue == 3)).chg_loop
+    end
+
     test "counts not_story apart from escalated" do
       replays = [replay(%{"stateReason" => "NOT_PLANNED"})]
 
@@ -536,6 +624,25 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       assert summary =~ "acme/repo"
       assert summary =~ "UPPER bound"
       assert summary =~ "NOT evidence that Gate B has none"
+    end
+
+    test "the Gate A summary prints the chg-loop and human strata, in the sensitivity run too" do
+      tickets = [ticket(%{"title" => "Failure 3f9a", labels: ["chg-loop"]}), ticket(%{})]
+
+      summary =
+        Report.summarize(
+          Report.gate_a(Enum.map(tickets, &GateAReplay.replay/1), %{corpus: "acme/repo"},
+            sensitivity: Enum.map(tickets, &GateAReplay.replay(&1, suppress: [:request_shaped?]))
+          )
+        )
+
+      assert summary =~ "intake tickets: n=1"
+      assert summary =~ "all tickets: n=2"
+      # Each line twice: once unindented in the main strata, once indented in the sensitivity run.
+      assert summary =~ ~r/^chg-loop tickets: n=1/m
+      assert summary =~ ~r/^human tickets: n=1/m
+      assert summary =~ ~r/^  chg-loop tickets: n=1/m
+      assert summary =~ ~r/^  human tickets: n=1/m
     end
 
     test "the Gate A summary states the lower-bound bias and the design's 54%" do

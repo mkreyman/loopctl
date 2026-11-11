@@ -41,14 +41,17 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   # the pool first: two live sockets on one credential are `:runner_ambiguous`, which would
   # refuse a dispatch for a reason that has nothing to do with the kind under test. The unlink
   # is because a channel shutting down with `:left` takes the linked test process with it.
-  defp rejoin_declaring(channel, raw, runner, kinds) do
+  defp rejoin_declaring(channel, raw, runner, kinds) when is_list(kinds),
+    do: rejoin_declaring(channel, raw, runner, %{"kinds" => kinds})
+
+  defp rejoin_declaring(channel, raw, runner, %{} = join) do
     Process.unlink(channel.channel_pid)
     ref = leave(channel)
     assert_reply ref, :ok, _, reply_timeout()
     assert eventually(fn -> not in_pool?(runner.tenant_id, runner.name) end, reply_timeout())
 
     {:ok, socket} = connect_runner_socket(raw)
-    {_reply, channel} = join_pool(socket, runner.name, %{"kinds" => kinds})
+    {_reply, channel} = join_pool(socket, runner.name, join)
     channel
   end
 
@@ -1164,6 +1167,152 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # Refused on the declaration alone: the ledger holds no refusal for this pair, so
       # nothing but the join payload can have decided it.
       refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+    end
+  end
+
+  describe "the specs a joining runner holds (contract 1.25.0, US-48.8)" do
+    setup do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+      %{runner: runner, raw: raw, channel: channel}
+    end
+
+    defp spec_refs(pairs),
+      do: for({id, version} <- pairs, do: %{"id" => id, "version" => version})
+
+    # Eligibility for a kind, judged by the same `kind_supported/4` `dispatch/3` runs, on the
+    # meta of this socket — what the triage driver and placement ask before claiming.
+    defp accepts(runner, channel, kind),
+      do:
+        Runners.accepts?(
+          runner.tenant_id,
+          runner.id,
+          socket_meta(channel),
+          kind,
+          "mkreyman/home_care_billing"
+        )
+
+    # TC-48.8.1: the join `setup` made carries no `specs` and no `kinds`, which is every runner
+    # built before 1.25.0 — and it is eligible exactly as it was.
+    test "a runner sending no specs is eligible as before, at version 1 of each kind's spec",
+         %{runner: runner, channel: channel} do
+      refute Map.has_key?(socket_meta(channel), :specs)
+      assert Runners.declared_specs(socket_meta(channel)) == [%{id: "implement", version: 1}]
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", %{dispatch_id: id}, reply_timeout()
+      assert id == payload["dispatch_id"]
+    end
+
+    test "a runner declaring kinds and no specs holds version 1 of each declared kind's spec",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["triage", "implement"])
+
+      assert Enum.sort_by(Runners.declared_specs(socket_meta(channel)), & &1.id) == [
+               %{id: "implement", version: 1},
+               %{id: "triage", version: 1}
+             ]
+
+      assert :ok = accepts(runner, channel, "triage")
+      assert :ok = accepts(runner, channel, "implement")
+    end
+
+    # TC-48.8.2: the kind is declared, and the spec loopctl runs it under is not held.
+    test "a declared kind whose spec the runner does not hold is not dispatched",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel =
+        rejoin_declaring(channel, raw, runner, %{
+          "kinds" => ["triage", "implement"],
+          "specs" => spec_refs([{"triage", 1}])
+        })
+
+      assert :ok = accepts(runner, channel, "triage")
+      assert {:error, :kind_not_supported} = accepts(runner, channel, "implement")
+
+      held = held_capacity(runner).in_flight
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :kind_not_supported} =
+               Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
+      assert held_capacity(runner).in_flight == held
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+    end
+
+    test "holding the kind's spec id at another version, or only a spec loopctl does not hold, is not holding it",
+         %{runner: runner, raw: raw, channel: channel} do
+      [[{"implement", 2}], [{"reply_draft", 1}], [{"triage", 1}, {"implement", 3}]]
+      |> Enum.reduce(channel, fn specs, channel ->
+        channel =
+          rejoin_declaring(channel, raw, runner, %{
+            "kinds" => ["implement"],
+            "specs" => spec_refs(specs)
+          })
+
+        assert {:error, :kind_not_supported} = accepts(runner, channel, "implement"),
+               inspect(specs)
+
+        payload = dispatch_payload(runner.tenant_id)
+
+        assert {:error, :kind_not_supported} =
+                 Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+        refute_push "dispatch", _
+        assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
+        channel
+      end)
+    end
+
+    test "holding the spec is what makes the declared kind eligible",
+         %{runner: runner, raw: raw, channel: channel} do
+      _channel =
+        rejoin_declaring(channel, raw, runner, %{
+          "kinds" => ["implement"],
+          "specs" => spec_refs([{"reply_draft", 1}, {"implement", 1}])
+        })
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, reply_timeout()
+    end
+
+    test "a held spec never makes an UNDECLARED kind eligible",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel =
+        rejoin_declaring(channel, raw, runner, %{
+          "kinds" => ["implement"],
+          "specs" => spec_refs([{"triage", 1}, {"implement", 1}])
+        })
+
+      assert {:error, :kind_not_supported} = accepts(runner, channel, "triage")
+      assert :ok = accepts(runner, channel, "implement")
+    end
+  end
+
+  describe "declared_specs/1" do
+    test "a declared list is returned as {id, version} maps" do
+      assert Runners.declared_specs(%{specs: [%{id: "triage", version: 2}]}) ==
+               [%{id: "triage", version: 2}]
+    end
+
+    test "absent or empty, version 1 of the spec of each declared or implied kind" do
+      assert Runners.declared_specs(%{}) == [%{id: "implement", version: 1}]
+      assert Runners.declared_specs(%{specs: []}) == [%{id: "implement", version: 1}]
+
+      assert Runners.declared_specs(%{kinds: ["triage"]}) == [%{id: "triage", version: 1}]
+
+      # A declared kind loopctl holds no spec for contributes nothing.
+      assert Runners.declared_specs(%{kinds: ["review", "triage"]}) ==
+               [%{id: "triage", version: 1}]
+    end
+
+    test "an entry not in the cast's shape is not a held spec" do
+      assert Runners.declared_specs(%{specs: [%{id: "triage", version: "1"}, %{id: :x}]}) == []
     end
   end
 

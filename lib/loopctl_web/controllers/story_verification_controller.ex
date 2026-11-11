@@ -15,6 +15,7 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   require Logger
 
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
   alias Loopctl.Dispatches
@@ -23,6 +24,7 @@ defmodule LoopctlWeb.StoryVerificationController do
   alias Loopctl.Verification.VerificationRun
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.CustodyLineage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -54,20 +56,62 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   tags(["Progress"])
 
+  # US-47.6: the 503 a chg story's trunk-evidence read answers when nothing was decided.
+  @chg_trunk_unevaluated_response {
+    "`chg_trunk_unevaluated` (" <>
+      Messages.chg_trunk_unevaluated() <>
+      ") — always with a `Retry-After` header: the forge's own delay when it named one, " <>
+      "else #{Loopctl.Changes.TrunkEvidence.default_retry_after_seconds()} seconds " <>
+      "(#{Loopctl.Verification.Credential.configuration_retry_seconds()} for " <>
+      "`credential_unavailable`). `error.reason` is one of `forge_unavailable`, " <>
+      "`trunk_ref_not_found`, `forge_unauthorized`, `forge_forbidden`, `forge_rejected`, " <>
+      "`forge_unreadable`, `credential_unavailable`, `landing_changed`.",
+    "application/json",
+    Schemas.ErrorResponse
+  }
+
   operation(:verify,
     summary: "Verify story",
     description:
       "Orchestrator verifies a reported_done story. Creates verification_result with result=pass. " <>
         "Requires a review_record to exist (call POST /stories/:id/review-complete first). " <>
-        "The review_record must have been completed AFTER the story was reported done.",
+        "The review_record must have been completed AFTER the story was reported done. " <>
+        "A key descending from an intake source's `chg_root_dispatch_id` is refused " <>
+        "409 `chg_root_cannot_verify` (US-47.5) before any story is read. A story BOUND TO A " <>
+        "chg CHANGE is verified only on a chg review of its LANDED revision — the revision " <>
+        "commit of the newest applied `landed` event of its current change — " <>
+        "(409 `chg_review_not_for_landed_revision`), and never while its delivery stage is " <>
+        "escalated over `review_missing` (409 `review_missing_escalated`). Its CI evidence " <>
+        "is chg's trunk verifier (US-47.6): the trunk commit of that landing (`data.merge_sha`) " <>
+        "must be an ancestor of, or equal to, the repository's `verified/master`, asked of " <>
+        "GitHub by sha with the tenant's own forge credential (409 " <>
+        "`chg_landing_not_trunk_verified` when it is not), and no applied `reverted` event may " <>
+        "follow the landing (409 `chg_landing_reverted`). A forge read that times out or " <>
+        "fails, a missing `verified/master` ref or commit, or no credential for the " <>
+        "repository is 503 `chg_trunk_unevaluated` with `Retry-After` — never a pass. A story " <>
+        "with no change binding takes exactly the gates it took before. A story on the " <>
+        "pull-request route (US-48.18) is verified only by the verifier dispatch loopctl " <>
+        "placed for it: any other key is refused 409 `pr_route_verifier_only`, here, on " <>
+        "verify-all and on bulk verify.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
       200 => {"Story verified", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Invalid transition, a custody refusal, `chg_root_cannot_verify` (" <>
+           Messages.chg_root_cannot_verify() <>
+           "), `review_missing_escalated` (" <>
+           Messages.review_missing_escalated() <>
+           "), `chg_review_not_for_landed_revision` (" <>
+           Messages.chg_review_not_for_landed_revision() <>
+           "), `chg_landing_not_trunk_verified` (" <>
+           Messages.chg_landing_not_trunk_verified() <>
+           ") or `chg_landing_reverted` (" <>
+           Messages.chg_landing_reverted() <> ")", "application/json", Schemas.ErrorResponse},
       422 => {"No review record found", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 => @chg_trunk_unevaluated_response
     }
   )
 
@@ -79,13 +123,22 @@ defmodule LoopctlWeb.StoryVerificationController do
         "row was in flight: a reject spent an attempt, so it is re-contracted (`contracted`) " <>
         "below the retry ceiling `DISPATCH_MAX_ATTEMPTS` and its stage row escalated over " <>
         "`attempts_exhausted` at it, leaving it `pending` for a human. The story returned is " <>
-        "the story as the reset left it.",
+        "the story as the reset left it. A key descending from an intake source's " <>
+        "`chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5): reject is " <>
+        "exempt from `caller_lineage_required` only — EXCEPT on a story whose delivery stage " <>
+        "row is on a pull-request intake source (US-48.18), where a key no dispatch minted is " <>
+        "refused 409 `caller_lineage_required`: control verifies such a story under its own " <>
+        "verifier dispatch, and a session inheriting an unlineaged legacy key could otherwise " <>
+        "reject a sibling story's work.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Rejection params", "application/json", Schemas.RejectRequest},
     responses: %{
       200 => {"Story rejected", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Invalid transition, a custody refusal (including `caller_lineage_required` for an " <>
+           "unlineaged key on a pull-request-route story), or `chg_root_cannot_verify` (" <>
+           Messages.chg_root_cannot_verify() <> ")", "application/json", Schemas.ErrorResponse},
       422 => {"Reason required", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
@@ -107,6 +160,12 @@ defmodule LoopctlWeb.StoryVerificationController do
         "Under the LCP-1 `signed` custody profile an enrolled caller must present a valid " <>
         "`claim` signature (gate `verify`), as for POST /stories/:id/verify. " <>
         "Requires a non-empty `reason`; `evidence_url` and `pr_number` are optional but strongly recommended. " <>
+        "A key descending from an intake source's `chg_root_dispatch_id` is refused 409 " <>
+        "`chg_root_cannot_verify` (US-47.5). A story bound to a chg change takes the same " <>
+        "landed-review gate verify does: 409 `review_missing_escalated` or " <>
+        "`chg_review_not_for_landed_revision` — and the same trunk-evidence gate (US-47.6): " <>
+        "409 `chg_landing_not_trunk_verified` or `chg_landing_reverted`, 503 " <>
+        "`chg_trunk_unevaluated` with `Retry-After`. " <>
         "Emits a `story.backfilled` webhook event on success.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
@@ -128,6 +187,18 @@ defmodule LoopctlWeb.StoryVerificationController do
       403 =>
         {"Insufficient role (orchestrator+ required)", "application/json", Schemas.ErrorResponse},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`chg_root_cannot_verify` (" <>
+           Messages.chg_root_cannot_verify() <>
+           "), `review_missing_escalated` (" <>
+           Messages.review_missing_escalated() <>
+           "), `chg_review_not_for_landed_revision` (" <>
+           Messages.chg_review_not_for_landed_revision() <>
+           "), `chg_landing_not_trunk_verified` (" <>
+           Messages.chg_landing_not_trunk_verified() <>
+           ") or `chg_landing_reverted` (" <>
+           Messages.chg_landing_reverted() <> ")", "application/json", Schemas.ErrorResponse},
+      503 => @chg_trunk_unevaluated_response,
       422 =>
         {"Validation error: missing reason, already verified, already rejected, has dispatch lineage, or already entered the lifecycle",
          "application/json", Schemas.ErrorResponse},
@@ -202,7 +273,19 @@ defmodule LoopctlWeb.StoryVerificationController do
       "Orchestrator convenience endpoint that verifies all stories in the epic " <>
         "that have agent_status=reported_done and verified_status=unverified. " <>
         "Requires review_type and summary in the body (same as single verify). " <>
-        "Returns count of verified stories and any errors.",
+        "Returns count of verified stories and any errors. A key descending from an intake " <>
+        "source's `chg_root_dispatch_id` is refused 409 `chg_root_cannot_verify` (US-47.5) for " <>
+        "the whole epic, and nothing is verified. A story bound to a chg change is skipped " <>
+        "into `errors` with reason `:review_missing_escalated` (" <>
+        Messages.review_missing_escalated() <>
+        "), `:chg_review_not_for_landed_revision` (" <>
+        Messages.chg_review_not_for_landed_revision() <>
+        "), `:chg_landing_not_trunk_verified` (" <>
+        Messages.chg_landing_not_trunk_verified() <>
+        "), `:chg_landing_reverted` (" <>
+        Messages.chg_landing_reverted() <>
+        ") or `{:chg_trunk_unevaluated, reason, retry_after_seconds}` (" <>
+        Messages.chg_trunk_unevaluated() <> ").",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
@@ -218,6 +301,9 @@ defmodule LoopctlWeb.StoryVerificationController do
            }
          }},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`chg_root_cannot_verify` (" <> Messages.chg_root_cannot_verify() <> ")",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -252,6 +338,7 @@ defmodule LoopctlWeb.StoryVerificationController do
           # under this exact key.
           verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
@@ -322,13 +409,25 @@ defmodule LoopctlWeb.StoryVerificationController do
         custody_claim: conn.assigns[:custody_signed_claim],
         verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
       )
+      |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
     case Progress.backfill_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
-      {:error, :not_found} ->
-        {:error, :not_found}
+      {:error, reason}
+      when reason in [
+             :not_found,
+             :chg_root_cannot_verify,
+             :review_missing_escalated,
+             :chg_review_not_for_landed_revision,
+             :chg_landing_not_trunk_verified,
+             :chg_landing_reverted
+           ] ->
+        {:error, reason}
+
+      {:error, {:chg_trunk_unevaluated, _reason, _retry_after}} = unevaluated ->
+        unevaluated
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
@@ -396,7 +495,10 @@ defmodule LoopctlWeb.StoryVerificationController do
                    :unresolvable_dispatch_lineage,
                    :missing_assigned_agent,
                    :not_found,
-                   :audit_chain_append_failed
+                   :audit_chain_append_failed,
+                   :chg_root_cannot_verify,
+                   # US-48.18 (AC-48.18.5): an unlineaged reject of a pull-request-route story.
+                   :caller_lineage_required
                  ] or is_struct(reason, Ecto.Changeset)
 
   @doc """
@@ -418,6 +520,7 @@ defmodule LoopctlWeb.StoryVerificationController do
           # takes the same server-resolved caller lineage verify does.
           verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
       case Progress.reject_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
@@ -543,9 +646,11 @@ defmodule LoopctlWeb.StoryVerificationController do
           # radius path while the single-story route enforced it.
           verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
-      {:ok, result} = Progress.verify_all_in_epic(tenant_id, epic_id, params, opts)
-      json(conn, result)
+      with {:ok, result} <- Progress.verify_all_in_epic(tenant_id, epic_id, params, opts) do
+        json(conn, result)
+      end
     end
   end
 

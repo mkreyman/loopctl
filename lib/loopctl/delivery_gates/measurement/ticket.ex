@@ -11,10 +11,20 @@ defmodule Loopctl.DeliveryGates.Measurement.Ticket do
 
   The delivery loop's Gate A judges tickets Larisa files through the in-app chat, which stamps
   a `[Bug] <agency>: ` or `[Feature] <agency>: ` prefix at FILING time. Every other issue in
-  the repository is engineering work the loop never triages. So the corpus is reported in two
-  strata and the intake one is the headline: it is the population Gate A is for, and its
+  the repository is engineering work the loop never triages. So the `intake` stratum is the
+  headline among the report's four (`Report.gate_a_strata/1`): it is the population Gate A is for, and its
   bug/feature split was decided by the intake chat rather than by a label somebody applied
   after the outcome was known.
+
+  ## `chg_loop?` — tickets a machine filed (US-47.11, issue #986)
+
+  chg files machine-written, evidence-carrying issues — a failure fingerprint, its occurrences,
+  a root cause or "unknown, investigate", acceptance criteria written as checks — and labels
+  each one `chg-loop`. They are expected to escalate far less than the human baseline, so the
+  report measures them as their own stratum and the rest as `human`. The label is the whole
+  test, matched exactly: chg applies it at FILING time, so unlike a `bug`/`enhancement` label it
+  carries no hindsight about how the ticket turned out. The gate itself reads none of this;
+  only the report splits on it.
 
   ## It refuses rather than guesses
 
@@ -32,7 +42,8 @@ defmodule Loopctl.DeliveryGates.Measurement.Ticket do
     :state_reason,
     :created_at,
     labels: [],
-    intake?: false
+    intake?: false,
+    chg_loop?: false
   ]
 
   @type t :: %__MODULE__{
@@ -43,10 +54,13 @@ defmodule Loopctl.DeliveryGates.Measurement.Ticket do
           state_reason: String.t() | nil,
           created_at: String.t() | nil,
           labels: [String.t()],
-          intake?: boolean()
+          intake?: boolean(),
+          chg_loop?: boolean()
         }
 
   @intake_prefix ~r/\A\[(Bug|Feature)\]\s+.+?:\s/
+
+  @chg_loop_label "chg-loop"
 
   @doc """
   Parses one decoded `gh issue list --json` object (string keys).
@@ -54,6 +68,8 @@ defmodule Loopctl.DeliveryGates.Measurement.Ticket do
   @spec parse(term()) :: {:ok, t()} | {:error, term()}
   def parse(%{"number" => number, "title" => title} = record)
       when is_integer(number) and number > 0 and is_binary(title) and title != "" do
+    labels = labels(Map.get(record, "labels"))
+
     {:ok,
      %__MODULE__{
        number: number,
@@ -62,8 +78,9 @@ defmodule Loopctl.DeliveryGates.Measurement.Ticket do
        state: string_or_nil(Map.get(record, "state")),
        state_reason: string_or_nil(Map.get(record, "stateReason")),
        created_at: string_or_nil(Map.get(record, "createdAt")),
-       labels: labels(Map.get(record, "labels")),
-       intake?: Regex.match?(@intake_prefix, title)
+       labels: labels,
+       intake?: Regex.match?(@intake_prefix, title),
+       chg_loop?: @chg_loop_label in labels
      }}
   end
 

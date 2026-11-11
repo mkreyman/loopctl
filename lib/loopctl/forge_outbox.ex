@@ -1,9 +1,11 @@
 defmodule Loopctl.ForgeOutbox do
   @moduledoc """
   The mechanics every forge OUTBOX shares: a table of `:pending` rows, each an outward act on
-  GitHub waiting to be performed with nothing held, drained by a cron worker. Its one user is
-  `Loopctl.Intake.IssueClosures` (closing a reporter's issue, #805), which keeps its own states
-  and its own outward calls; what is here is the mechanics an outbox must get right.
+  GitHub waiting to be performed with nothing held, drained by a cron worker. Its users are
+  `Loopctl.Intake.IssueClosures` (closing a reporter's issue, #805) and
+  `Loopctl.Changes.RevertIssues` (opening one for a chg revert, US-47.4), each keeping its own
+  states and its own outward calls; what is here is the mechanics an outbox must get right,
+  the drainer's pass over its candidates included (`drain/4`, `drain_result/2`).
 
   A row's schema must carry `tenant_id`, `id`, `status` (with `:pending`), `attempts`,
   `next_attempt_at` and `updated_at`. Every function is on `AdminRepo` with an explicit
@@ -17,6 +19,8 @@ defmodule Loopctl.ForgeOutbox do
   """
 
   import Ecto.Query
+
+  require Logger
 
   alias Loopctl.AdminRepo
 
@@ -144,5 +148,107 @@ defmodule Loopctl.ForgeOutbox do
     if length(chars) > @error_text_budget,
       do: chars |> Enum.take(@error_text_budget) |> List.to_string(),
       else: text
+  end
+
+  @doc """
+  One drainer pass over `candidates`, calling `attempt` on each and returning
+  `[{candidate, outcome}]` in order, where `attempt` returns `{outcome, retry_after}`.
+
+  Stops at `deadline` (a `System.monotonic_time(:millisecond)` value), checked BEFORE each
+  candidate so a run cannot start one just under its budget and finish past the cron interval,
+  or at the first result carrying a `retry_after`: a rate-limited forge is a reason to stop
+  asking, not to ask the rest of the batch.
+
+  ONE CANDIDATE MAY NOT KILL THE RUN (#826 review, finding 5). An exception out of `attempt`
+  would skip every remaining candidate and burn an Oban attempt — and since the candidate
+  reads are oldest-first, a row that raises reliably would sit at the head of every batch, a
+  fleet-wide stall caused by one row. So a raise OR AN EXIT (a `Finch` pool checkout timeout,
+  a `GenServer.call` timeout and a `DBConnection` ownership failure all exit rather than
+  raise; #826 round 2) costs that candidate, logged at ERROR with its identity, and is
+  `:errored`. It is safe to carry on because the drainer's `claim_attempt/3` committed before
+  anything outward ran: the attempt is counted and the row is scheduled forward, so a raising
+  row waits its backoff like a transient failure and is still bounded by `max_attempts/0`.
+
+  `opts`: `:label` (required), the drainer's name in its log lines; `:id_name`, the name the
+  candidate's id is logged under (default `"row_id"`).
+  """
+  @spec drain([map()], integer(), (map() -> {atom(), pos_integer() | nil}), keyword()) ::
+          [{map(), atom()}]
+  def drain(candidates, deadline, attempt, opts) when is_function(attempt, 1) do
+    label = Keyword.fetch!(opts, :label)
+    id_name = Keyword.get(opts, :id_name, "row_id")
+
+    candidates
+    |> Enum.reduce_while([], fn row, acc ->
+      if System.monotonic_time(:millisecond) >= deadline,
+        do: {:halt, budget_spent(acc, label)},
+        else: after_candidate(row, acc, attempt, label, id_name)
+    end)
+    |> Enum.reverse()
+  end
+
+  defp after_candidate(row, acc, attempt, label, id_name) do
+    {outcome, retry_after} = contained(row, attempt, label, id_name)
+    acc = [{row, outcome} | acc]
+    if is_integer(retry_after), do: {:halt, acc}, else: {:cont, acc}
+  end
+
+  defp budget_spent(acc, label) do
+    Logger.info(
+      "#{label}: wall-clock budget spent after #{length(acc)} " <>
+        "candidate(s); the rest are the next run's"
+    )
+
+    acc
+  end
+
+  defp contained(row, attempt, label, id_name) do
+    attempt.(row)
+  rescue
+    error -> errored(row, label, id_name, Exception.format(:error, error, __STACKTRACE__))
+  catch
+    # The `:exit` clause is for the MESSAGE only — `Exception.format_exit/1` renders a pool
+    # checkout timeout readably where the generic formatter does not. The catch-all below it
+    # already handles exits, so removing this clause changes no behaviour; the falsifiable
+    # guard is the whole `catch`, whose removal does turn the suite red.
+    :exit, reason -> errored(row, label, id_name, "exit: " <> Exception.format_exit(reason))
+    kind, value -> errored(row, label, id_name, Exception.format(kind, value, __STACKTRACE__))
+  end
+
+  defp errored(row, label, id_name, detail) do
+    Logger.error(
+      "#{label}: candidate failed, continuing with the rest of the batch: " <>
+        "tenant_id=#{row.tenant_id} story_id=#{row.story_id} " <>
+        "#{id_name}=#{row.id} detail=#{detail}",
+      tenant_id: row.tenant_id,
+      story_id: row.story_id
+    )
+
+    {:errored, nil}
+  end
+
+  @doc """
+  What a drainer's `perform/1` returns for `drain/4`'s results, after logging their tally
+  under `label`.
+
+  A SYSTEMIC failure must not report as a successful job (#826 round 2, finding 2). The
+  per-candidate containment is right for ONE bad row and wrong for a bad WORLD: on a
+  connection-pool outage every candidate raises, each is contained, and a job that returned
+  `:ok` would record a clean run — `max_attempts` never fires, nothing is discarded, nothing
+  alerts. So every candidate erroring is an ERROR for the job, which Oban retries and
+  eventually discards where it can be seen. A run with some errors and some progress stays
+  `:ok`: that is the one-bad-row case, and the row's own attempt counter bounds it.
+  """
+  @spec drain_result([{map(), atom()}], String.t()) ::
+          :ok | {:error, {:all_candidates_errored, pos_integer()}}
+  def drain_result(results, label) do
+    tally = Enum.frequencies_by(results, fn {_row, outcome} -> outcome end)
+    if map_size(tally) > 0, do: Logger.info("#{label}: #{inspect(tally)}")
+
+    errored = Map.get(tally, :errored, 0)
+
+    if results != [] and errored == length(results),
+      do: {:error, {:all_candidates_errored, errored}},
+      else: :ok
   end
 end

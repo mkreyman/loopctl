@@ -391,7 +391,16 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-47.3: the gap pull. Not stubbed means a transient failure, never events.
+    Mox.stub(Loopctl.MockChgClient, :events_after, fn _url, _secret, _change_id, _after ->
+      {:error, :not_stubbed}
+    end)
+
     Mox.stub(Loopctl.MockPullRequestSource, :label_issue, fn _repo, _number, _label ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :remove_label, fn _repo, _number, _label ->
       {:error, :not_stubbed}
     end)
 
@@ -400,6 +409,16 @@ defmodule Loopctl.DataCase do
     end)
 
     Mox.stub(Loopctl.MockPullRequestSource, :close_issue, fn _repo, _number, _state_reason ->
+      {:error, :not_stubbed}
+    end)
+
+    # US-47.4: a revert after `done` opens an issue. Fail-closed for the same reason as the
+    # three writes above — an unstubbed test must never open a real issue.
+    Mox.stub(Loopctl.MockPullRequestSource, :create_issue, fn _repo, _title, _body ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :find_issue, fn _repo, _marker ->
       {:error, :not_stubbed}
     end)
 

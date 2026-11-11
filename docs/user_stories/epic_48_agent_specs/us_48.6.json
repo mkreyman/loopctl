@@ -1,0 +1,66 @@
+{
+  "id": "US-48.6",
+  "title": "Kind predicates derived from the archetype",
+  "epic": {
+    "id": "epic_48",
+    "name": "Agent specs"
+  },
+  "priority": "medium",
+  "phase": "agent_specs",
+  "story": {
+    "as_a": "loopctl developer",
+    "i_want_to": "every 'is this implement' check to ask the spec's archetype",
+    "so_that": "a new :build spec is treated as claim-holding everywhere without a code search"
+  },
+  "rationale": "DispatchLedger.implement_kind? (dispatch_ledger.ex:869-874, nil counts as implement), budget_keys (dispatch_payload.ex:443-444), fill/3's kind default (:117-131) and the runner-side prefix exemption all special-case the kind string.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-48.6.1",
+      "description": "Spec.holds_claim?(kind) replaces implement_kind?; budget_keys, fill/3's default and accepted_session's default kind come from the spec."
+    },
+    {
+      "id": "AC-48.6.2",
+      "description": "A property test over every registry kind plus nil and an unknown kind shows the old and new predicates agree."
+    },
+    {
+      "id": "AC-48.6.3",
+      "description": "An unknown kind fails closed: it holds no claim and gets no budget."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-48.6.1",
+      "verifies": [
+        "AC-48.6.2"
+      ],
+      "name": "predicate agreement",
+      "type": "property",
+      "steps": [
+        "generate kinds from registry ++ [nil, unknown]"
+      ],
+      "expected_results": [
+        "old == new for every predicate"
+      ]
+    },
+    {
+      "id": "TC-48.6.2",
+      "verifies": [
+        "AC-48.6.3"
+      ],
+      "name": "unknown kind",
+      "type": "unit",
+      "steps": [
+        "ask holds_claim? and budget_keys for an unknown kind"
+      ],
+      "expected_results": [
+        "false, and an error"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "The runner-side prefix exemption moves in US-48.8 with the contract change."
+  ],
+  "dependencies": [
+    "US-48.2"
+  ]
+}

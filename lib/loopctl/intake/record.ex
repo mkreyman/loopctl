@@ -34,6 +34,14 @@ defmodule Loopctl.Intake.Record do
   issue from GitHub whenever `order_ambiguous` is set** (a runner has `gh` access; loopctl
   does not). A strictly newer delivery clears it. See "Delivery order" in `Loopctl.Intake`.
 
+  ## Generation
+
+  One issue can have several records, one per `generation`, starting at 1. A `reopened`
+  delivery for an issue whose newest record has reached the end of the loop starts the next
+  generation (see "Generations" in `Loopctl.Intake`). Every delivery applies to the newest
+  generation, and an earlier generation's row is never written again. It is the provenance
+  of the fix that did not hold.
+
   ## Escalation
 
   `status: :escalated` with `escalation_reasons` (`"<signal>:<field>"` strings) is set
@@ -53,6 +61,7 @@ defmodule Loopctl.Intake.Record do
     belongs_to :project, Loopctl.Projects.Project
 
     field :issue_number, :integer
+    field :generation, :integer, default: 1
     field :github_issue_id, :integer
     field :html_url, :string
     field :issue_state, :string
@@ -96,5 +105,6 @@ defmodule Loopctl.Intake.Record do
     |> check_constraint(:ticket_ref, name: :intake_records_ticket_shape)
     |> check_constraint(:status, name: :intake_records_escalation_shape)
     |> check_constraint(:order_ambiguous, name: :intake_records_order_ambiguity_shape)
+    |> check_constraint(:generation, name: :intake_records_generation_positive)
   end
 end

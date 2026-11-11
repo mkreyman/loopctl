@@ -128,8 +128,11 @@ defmodule Loopctl.Tenants.TierCapabilities do
        "(knowledge_base), which stays agent-native. Listing/reading embedding status and " <>
        "ingestion anomalies stays open."},
     {:skills, :human_anchored,
-     "Skill definitions and versions (create/update/archive/new version/import) and " <>
-       "recorded skill results. Reading skills and cost-performance stays open."},
+     "Skill definitions and versions (create/update/archive/new version/import), " <>
+       "recorded skill results, and recording that an agent spec's tuning proposal " <>
+       "landed (US-48.13), the operator's word that a person merged a prompt change. " <>
+       "Reading skills, cost-performance and tuning drafts stays open to the roles " <>
+       "that may read them."},
     {:coordination_quarantine, :human_anchored,
      "Secret-leak quarantine triage on the coordination bus (US-39.1): reading the FULL " <>
        "body of a post quarantined for a credential shape, and releasing a false positive. " <>
@@ -190,7 +193,11 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.KnowledgeEmbeddingController",
       "LoopctlWeb.IngestionAnomalyController"
     ],
-    skills: ["LoopctlWeb.SkillController", "LoopctlWeb.SkillResultController"],
+    skills: [
+      "LoopctlWeb.SkillController",
+      "LoopctlWeb.SkillResultController",
+      "LoopctlWeb.TuningDraftController"
+    ],
     coordination_quarantine: ["LoopctlWeb.ChannelPostController"]
   }
 
@@ -210,8 +217,22 @@ defmodule Loopctl.Tenants.TierCapabilities do
   # Placement is filed under `chain_of_custody` rather than `dispatch` because the claim is
   # what it is for — the mint is how it gets a lineage to claim under. Modules are STRINGS for
   # symmetry with the controller map, though these carry no cross-layer dependency.
+  #
+  # US-48.18 adds three of the same shape, each reached with no controller in front of it:
+  # `Loopctl.Agents.VerifierPlacement` mints the root verifier dispatch and binds
+  # `verifier_dispatch_id`, `Loopctl.Agents.VerifyVerdict` reports, reviews and verifies, and
+  # `Loopctl.Delivery.ImplementerStart` starts the claimed story.
+  #
+  # US-48.17 adds `Loopctl.Delivery.MergeExecution`: an Oban job that runs the merge gate and
+  # instructs the runner holding the claim to merge, with no controller in front of it.
   @gated_contexts %{
-    chain_of_custody: ["Loopctl.Delivery.Placement"]
+    chain_of_custody: [
+      "Loopctl.Delivery.Placement",
+      "Loopctl.Agents.VerifierPlacement",
+      "Loopctl.Agents.VerifyVerdict",
+      "Loopctl.Delivery.ImplementerStart",
+      "Loopctl.Delivery.MergeExecution"
+    ]
   }
 
   @learn_more "https://loopctl.com/wiki/chain-of-custody"

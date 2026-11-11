@@ -998,6 +998,14 @@ config :loopctl, :delivery_pull_request_source, Loopctl.MockPullRequestSource
 # `Req.Test` bytes, so its response mapping is covered rather than only its interface.
 config :loopctl, :delivery_github_req_plug, {Req.Test, Loopctl.Delivery.GitHubPullRequestSource}
 
+# US-47.3: the change-events gap pull. A Mox mock, so no test reaches a chg-server; the
+# DataCase default stub answers `{:error, :not_stubbed}`. The Req client's own tests exercise
+# the real module against `Req.Test`. The base URL is a constant every test sees; a test of the
+# unconfigured case passes `base_url: nil` to the function rather than changing it.
+config :loopctl, :chg_client, Loopctl.MockChgClient
+config :loopctl, :chg_req_plug, {Req.Test, Loopctl.Changes.ReqChgClient}
+config :loopctl, :chg_server_url, "https://chg.test"
+
 # #803 §9: the deployment environment post-deploy verification reads. Pinned here rather
 # than left to the runtime default so the suite never depends on a developer's shell, and
 # so a test can assert the name that reached the forge call.

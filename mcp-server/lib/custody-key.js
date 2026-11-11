@@ -2,9 +2,9 @@
  * Key selection for the `exact_role: :orchestrator` custody verbs (loopctl #846 review round 2).
  *
  * WHICH VERBS. `verify`, `reject` and `force_unclaim` plus the aggregate `verify_all`
- * (`lib/loopctl_web/controllers/story_verification_controller.ex:29-30`), and bulk
+ * (`lib/loopctl_web/controllers/story_verification_controller.ex:30-31`), and bulk
  * `verify`/`reject`/`mark_complete`
- * (`lib/loopctl_web/controllers/bulk_operations_controller.ex:24-25`). All are mounted
+ * (`lib/loopctl_web/controllers/bulk_operations_controller.ex:25-26`). All are mounted
  * `exact_role: :orchestrator`, where the role hierarchy does NOT apply: `RequireRole`'s
  * exact-role clause tests `api_key.role == exact_role` (`require_role.ex:65-75`), so a `:user`
  * or `:superadmin` key is refused there exactly as an `:agent` key is.

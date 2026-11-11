@@ -27,7 +27,7 @@ defmodule Loopctl.DeliveryGates.Measurement.GateAReplay do
   The prefix is stamped by the in-app chat at FILING time, before anyone knows what the fix
   turned out to be. A `bug`/`enhancement` LABEL is often applied afterwards, sometimes after
   the work landed, so a corpus classified by label carries hindsight the triage trio would not
-  have had. Both strata are reported; the intake one is the headline for exactly this reason.
+  have had. The report carries four strata (`Report.gate_a_strata/1`); the intake one is the headline for exactly this reason.
 
   ## `confidence` is a placeholder, not a measurement
 

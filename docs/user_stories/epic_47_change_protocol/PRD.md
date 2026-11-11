@@ -132,7 +132,8 @@ by searching every tenant for a repo named in an unauthenticated body.
 **The wire contract, as chg emits it** (confirmed by the chg session on 2026-10-19; record:
 mkreyman/chg#33, comments 6257372489 and 6257451658, the later one winning):
 
-- Headers `X-Chg-Timestamp` and `X-Chg-Signature`; the HMAC is over `"<timestamp>.<raw body>"`
+- Headers `X-Chg-Timestamp: <unix seconds>` and `X-Chg-Signature: sha256=<hex HMAC-SHA256>`
+  (mkreyman/chg#33, the first comment); the HMAC is over `"<timestamp>.<raw body>"`
   keyed by `change_events_secret`. chg signs at send time, so a retry carries a fresh
   timestamp and stays inside the 5-minute window.
 - Envelope: `{v, repo, change_id, event_seq, kind, revision, sha, occurred_at, data}`.
@@ -174,7 +175,11 @@ mkreyman/chg#33, comments 6257372489 and 6257451658, the later one winning):
   with the same secret over `"<timestamp>.GET.<path>?<query>"` exactly as sent (the query
   carries only `after`), inside the same 5-minute window. `change_id` is GLOBALLY unique (a
   client ULID with a unique index across every repo in chg-server), so the URL needs no repo;
-  loopctl's `(repo, change_id)` keys stay as a redundant guard.
+  loopctl's `(repo, change_id)` keys stay as a redundant guard. The pull carries the same two
+  headers. A 200 is `{"events": [...], "next_after": N | null}`: events with seq > `after`, in
+  seq order, at most 500 per response, `next_after` null once caught up. 400 is a bad `after`,
+  401 a bad or stale signature, 404 an unknown change (checked after the signature, so ids
+  cannot be probed), 5xx retryable (mkreyman/chg#33 item 6).
 - chg-server is chg's Phase 2 and is not running yet (mkreyman/chg#35). Until then, 47.3 is
   built and tested against this contract but receives no real events.
 - GitHub App 5101362 is ADOPTED by chg as chg-server's lander (renamed chg-lander, given a new
@@ -187,7 +192,9 @@ new are control-only (never runner-reportable). `pr_open` is skipped: a chg chan
 | chg event | edge | notes |
 |---|---|---|
 | `submitted` (any revision, n ≥ 1) | `implementing → reviewing`, `:forward` (exists) | each revision after `review_findings` re-enters review this way |
-| `review_findings` | `reviewing → implementing`, `:review_findings` (exists) | |
+| `submitted`, story at `ci`, for a revision newer than any earlier `submitted` | `ci → reviewing`, **`:change_resubmitted`** (new) | a revision pushed after the story was ready re-enters review; not chained, clears the head-keyed fields the readiness set and nothing merge-keyed. One that is not newer moves nothing |
+| `review_findings` | `reviewing → implementing`, `:review_findings` (exists) | findings for a revision a later `submitted` superseded move nothing |
+| `review_findings`, story at `ci` | `ci → implementing`, **`:change_review_findings`** (new) | its own edge, because `:review_findings` is runner-reportable and `ci` is a runner source stage |
 | `review_approved` (`by: model` or `by: policy`) and `check_passed` on the same revision | `reviewing → ci`, **`:change_ready`** (new) | `ci` reads "ready to land". A policy auto-approval takes the same edge; §6 decides what it means for custody |
 | `landed` | `ci → merged`, `:forward` (exists), `merge_sha` = the landing commit | chained, like every entry into `merged` |
 | `verified` (the trunk verifier went green on a sha containing it) | none | recorded on the stage row as `trunk_verified_sha` |
@@ -201,7 +208,7 @@ example is a second `submitted` while review is still running on the first.
 
 **`:reverted` is a retraction of a merge, and it is chained like `:merge_refused`.** It goes in
 `@chained_edges`, and its `clears/3` clause clears `merge_sha` and the head- and release-keyed
-fields exactly as `merge_refused` does (`stage_machine.ex:810`). Otherwise the chain keeps saying
+fields exactly as `merge_refused` does (`stage_machine.ex:845`). Otherwise the chain keeps saying
 the story merged, and a re-land records a second merge over a stale `merge_sha`. The edge is new
 rather than a reuse of `:merge_refused` because the two claims differ: `merge_refused` says the
 merge never held, and a revert says it held and was undone.
@@ -267,7 +274,9 @@ PR-shaped. For a `mode: :chg` source it reads instead:
 - the bound change's `landed` sha must be an ancestor of the repo's `verified/master` (compare
   API, by sha);
 - no `reverted` event may follow it;
-- a `review_records` row must exist whose `commit_sha` is the landed revision (§6).
+- a `review_records` row must exist whose `commit_sha` is the landed revision (§6) — enforced
+  on every verify path by 47.5 (`chg_review_not_for_landed_revision`), so 47.6 adds only the
+  two trunk checks above.
 
 The verifier is whoever verifies stories in the delivery loop today. `verify_story` keeps every
 existing gate (exact `:orchestrator`, lineage, recorded separation) and adds §6's
@@ -296,7 +305,11 @@ chg must change is filed on mkreyman/chg.
 | default | where to overrule | effect of overruling |
 |---|---|---|
 | The change protocol lives in chg-server, not loopctl (chg design §5, §10) | here, or chg `docs/design.md` §10 | loopctl absorbs chg phase 2: this epic grows to ledger + lander + review dispatch, and landing inherits loopctl's outages |
-| An auto-approved story-bound change escalates `review_missing` rather than verifying | 47.5 | a story could reach `verified` with no reviewer, which is a custody gap |
+| An auto-approved story-bound change escalates `review_missing` rather than verifying, and every verify path (verify, verify-all, bulk verify, backfill, bulk mark-complete) refuses a chg story while it is escalated over `review_missing` (409 `review_missing_escalated`) and unless a chg review names its landed revision — the sha of the newest applied `landed` event of its current binding (409 `chg_review_not_for_landed_revision`) | 47.5 | a story could reach `verified` with no reviewer, which is a custody gap |
+| A root counts as chg's for `chg_root_cannot_verify` while ANY intake source of the tenant names it, live or revoked, `chg` or `pr` mode, judged on the caller's MINTING lineage (`Loopctl.Changes.ReviewCustody`) | 47.5 | narrowing to live `chg` sources lets a revoked or switched source's reviewer tree verify; judging the live lineage lets an expired chg key reject |
+| chg-rooted keys are also refused `claim`, bulk claim and `report` (`chg_root_review_only`) | 47.5 | an agent-role child of chg's root could claim a story and a sibling review it — siblings pass the lineage gate |
+| `review_complete` keeps requiring `reported_done`, so chg's reviewer must record after the implementer reports | 47.5 | a review recorded before the report is refused 422 `story_not_reported_done`, and a landing with none escalates `review_missing` |
+| The landing judges the review that exists WHEN `landed` applies; one recorded after escalates anyway | 47.5 | a human resolves it from `escalated`; the alternative is a re-check that un-escalates, which no control edge allows |
 | `reverted` returns the story to `implementing`, keeping its claim; after `done` it opens a new story through intake | 47.4 | alternative: release to `queued` for a fresh dispatch |
 
 ## 10. Keep / delete verdict on every piece #984 lists

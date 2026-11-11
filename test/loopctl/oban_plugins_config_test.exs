@@ -279,6 +279,66 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-47.3: ChangeReconcileSweepWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ChangeReconcileSweepWorker} -> true
+          {_schedule, Loopctl.Workers.ChangeReconcileSweepWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the ChangeReconcileSweepWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a ChangeReconcileSweepWorker crontab entry — without it nothing pulls " <>
+               "a chg change whose events have a gap, or a quiet bound change, and a lost " <>
+               "event holds the change behind the gap for ever (AC-47.3.3)"
+    end
+
+    test "it runs every five minutes, fleet-wide in one job", %{entry: entry} do
+      # The gap threshold is ten minutes, so a five-minute cadence pulls a gap at 10-15.
+      assert elem(entry, 0) == "*/5 * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
+  describe "US-47.4: ChangeRevertIssueWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ChangeRevertIssueWorker} -> true
+          {_schedule, Loopctl.Workers.ChangeRevertIssueWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the ChangeRevertIssueWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a ChangeRevertIssueWorker crontab entry — without it a chg revert of a " <>
+               "done story records the issue it owes and nothing ever opens it (AC-47.4.5)"
+    end
+
+    test "it runs every two minutes, fleet-wide in one job", %{entry: entry} do
+      assert elem(entry, 0) == "*/2 * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "DispatchDriverWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
@@ -348,6 +408,118 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
 
     test "it runs every minute, like the drainer and the driver it sits between", %{entry: entry} do
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
+  describe "US-48.9: ReplyDraftDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ReplyDraftDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.ReplyDraftDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs every minute, at triage's cadence", %{entry: entry} do
+      assert entry,
+             "expected a ReplyDraftDispatchWorker crontab entry — without one no ticket triage " <>
+               "set aside is ever drafted. Safe to schedule unconditionally: it is off unless " <>
+               "both DISPATCH_DRIVER_ENABLED and DRAFT_DISPATCH_ENABLED are set."
+
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
+  describe "US-48.18: VerifyDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.VerifyDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.VerifyDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs every minute", %{entry: entry} do
+      assert entry,
+             "expected a VerifyDispatchWorker crontab entry — without one no pr-route story " <>
+               "is ever verified and the merge gate refuses every one. Safe to schedule " <>
+               "unconditionally: it is off unless DISPATCH_DRIVER_ENABLED is set."
+
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
+  describe "US-48.13: SpecTunerDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.SpecTunerDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.SpecTunerDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs weekly", %{entry: entry} do
+      assert entry,
+             "expected a SpecTunerDispatchWorker crontab entry — without one the improvement " <>
+               "loop never runs. Safe to schedule unconditionally: it is off unless both " <>
+               "DISPATCH_DRIVER_ENABLED and DRAFT_DISPATCH_ENABLED are set."
+
+      assert elem(entry, 0) == "0 6 * * 1"
+      assert tuple_size(entry) == 2
+    end
+  end
+
+  describe "US-48.17: MergeSweepWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.MergeSweepWorker} -> true
+          {_schedule, Loopctl.Workers.MergeSweepWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the entry exists and runs every minute", %{entry: entry} do
+      assert entry,
+             "expected a MergeSweepWorker crontab entry — without one a verified pr-route " <>
+               "story is never instructed to merge, its claim lapses at ci, and a vanished " <>
+               "runner is never noticed."
+
       assert elem(entry, 0) == "* * * * *"
       assert tuple_size(entry) == 2
     end
@@ -730,6 +902,33 @@ defmodule Loopctl.ObanPluginsConfigTest do
     test "its schedule is the daily off-peak observation", %{entry: entry} do
       schedule = elem(entry, 0)
       assert schedule == "40 3 * * *"
+    end
+  end
+
+  describe "US-48.11: EscalationDigestWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.EscalationDigestWorker} -> true
+          {_schedule, Loopctl.Workers.EscalationDigestWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the EscalationDigestWorker entry exists, daily, and is not parked", %{entry: entry} do
+      assert entry,
+             "expected an EscalationDigestWorker crontab entry — without one a budget-killed " <>
+               "implementation is surfaced only to whoever already holds its story id"
+
+      assert elem(entry, 0) == "0 14 * * *"
+      refute Loopctl.Workers.EscalationDigestWorker in Loopctl.ObanConfig.parked_crons()
     end
   end
 

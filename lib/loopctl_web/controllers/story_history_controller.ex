@@ -14,6 +14,7 @@ defmodule LoopctlWeb.StoryHistoryController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
+  alias LoopctlWeb.CurrentTenant
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -52,7 +53,7 @@ defmodule LoopctlWeb.StoryHistoryController do
     # For now, we validate the UUID format and query the audit log directly.
     # If no audit entries exist, the story is treated as not found since
     # we cannot verify its existence without the Story schema.
-    with {:ok, tenant_id} <- require_tenant(conn),
+    with {:ok, tenant_id} <- CurrentTenant.fetch_id(conn),
          {:ok, _uuid} <- validate_uuid(story_id),
          {:ok, result} <- query_history(tenant_id, story_id, params) do
       json(conn, %{
@@ -134,12 +135,5 @@ defmodule LoopctlWeb.StoryHistoryController do
 
   defp maybe_put_integer(opts, key, value) when is_integer(value) do
     Keyword.put(opts, key, value)
-  end
-
-  defp require_tenant(conn) do
-    case conn.assigns[:current_tenant] do
-      %{id: id} when is_binary(id) -> {:ok, id}
-      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
-    end
   end
 end

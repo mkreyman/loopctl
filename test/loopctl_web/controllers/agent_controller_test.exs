@@ -83,6 +83,24 @@ defmodule LoopctlWeb.AgentControllerTest do
       assert json_response(conn, 422)
     end
 
+    test "refuses a name under the reserved system: prefix (US-48.11)", %{conn: conn} do
+      # The escalation digest posts as `system:escalation-digest`; a key that could register
+      # that name would author posts indistinguishable from loopctl's own.
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/agents/register", %{
+          "name" => "System:Escalation-Digest",
+          "agent_type" => "implementer"
+        })
+
+      # Refused for the PREFIX, not for some other field.
+      assert conn |> json_response(422) |> inspect() =~ "reserved"
+    end
+
     test "rejects non-agent roles (user)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

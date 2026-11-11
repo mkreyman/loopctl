@@ -23,12 +23,17 @@ defmodule LoopctlWeb.AgentController do
 
   operation(:register,
     summary: "Register agent",
-    description: "Self-registers a new agent. Requires an API key with agent role.",
+    description:
+      "Self-registers a new agent. Requires an API key with agent role. A `name` starting " <>
+        "#{inspect(Loopctl.Agents.Agent.reserved_name_prefix())} (any case) is refused 422: " <>
+        "the prefix is reserved for agents loopctl itself posts as.",
     request_body: {"Agent params", "application/json", Schemas.AgentRegisterRequest},
     responses: %{
       201 => {"Agent created", "application/json", Schemas.AgentResponse},
       409 => {"Agent already registered", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error, including a reserved name prefix", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

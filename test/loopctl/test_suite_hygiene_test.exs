@@ -38,6 +38,8 @@ defmodule Loopctl.TestSuiteHygieneTest do
       "an AdminRepo write committing apart from a failed Repo transaction is the subject: " <>
         "two connections over committed rows",
     "test/loopctl/changes_lock_test.exs" => @race,
+    "test/loopctl/changes/events_lock_test.exs" => @race,
+    "test/loopctl/changes/review_custody_lock_test.exs" => @race,
     "test/loopctl/config_test_exs_partition_wiring_test.exs" =>
       "the subject is config/test.exs's own read of the OS environment at load time",
     "test/loopctl/context_retriever/entity_definitions_rollback_test.exs" => @migration,
@@ -56,6 +58,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
       "poisons and VACUUMs the shared HNSW graph: every concurrent insert enters the same " <>
         "graph, so neither state would be this test's alone",
     "test/loopctl/intake_escalation_concurrency_test.exs" => @race,
+    "test/loopctl/intake_generation_concurrency_test.exs" => @race,
     "test/loopctl/knowledge/by_source_change_feed_plan_scale_test.exs" => @scale,
     "test/loopctl/knowledge/cosine_lint_vs_scale_gate_scale_test.exs" => @scale,
     "test/loopctl/knowledge/distant_pairs_novelty_scale_test.exs" => @scale,

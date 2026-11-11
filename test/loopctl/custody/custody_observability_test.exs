@@ -54,17 +54,31 @@ defmodule Loopctl.Custody.CustodyObservabilityTest do
     end
   end
 
-  describe "both post-commit appends in Progress route through the guard" do
-    # These two appends run AFTER their state change has committed, so nothing can
-    # roll them back — the only available response to a failure is to say so. A
-    # source scan keeps a future edit from quietly reverting to a discarded result.
-    test "verifier_selected and verifier_not_assigned pipe into log_append_failure" do
+  describe "the verifier appends in Progress are never discarded" do
+    # `verifier_not_assigned` runs AFTER its state change has committed, so nothing can roll
+    # it back — the only available response to a failure is to say so. A source scan keeps a
+    # future edit from quietly reverting to a discarded result.
+    test "verifier_not_assigned pipes into log_append_failure" do
       source = File.read!("lib/loopctl/progress.ex")
 
-      for action <- ["verifier_selected", "verifier_not_assigned"] do
-        assert source =~ ~s|log_append_failure("#{action}"|,
-               "#{action}'s audit-chain append must pipe into AuditChain.log_append_failure/4"
-      end
+      assert source =~ ~s|log_append_failure("verifier_not_assigned"|,
+             "verifier_not_assigned's audit-chain append must pipe into " <>
+               "AuditChain.log_append_failure/4"
+    end
+
+    # US-48.18: `verifier_selected` is no longer a post-commit append. It is written in the SAME
+    # AdminRepo transaction as `verifier_dispatch_id` (`write_verifier_selection/4`, shared by
+    # `assign_rotating_verifier/3` and `bind_verifier_dispatch/4`), so a failed append rolls the
+    # selection back instead of leaving a column the chain never names.
+    test "verifier_selected is appended inside the selection's own transaction" do
+      source = File.read!("lib/loopctl/progress.ex")
+
+      [_, body] = String.split(source, "defp write_verifier_selection(", parts: 2)
+      [body | _] = String.split(body, "\n  defp ", parts: 2)
+
+      assert body =~ "AuditChain.append_in_admin_transaction("
+      assert body =~ ~s|action: "verifier_selected"|
+      assert body =~ "verifier_dispatch_id"
     end
   end
 

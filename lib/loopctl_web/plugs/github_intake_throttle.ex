@@ -38,10 +38,15 @@ defmodule LoopctlWeb.Plugs.GithubIntakeThrottle do
   @impl true
   def init(opts), do: opts
 
+  # The change-events webhook (US-47.3) mounts this same gate with `bucket: "change_events_ip"`,
+  # so chg-server's deliveries and GitHub's draw on separate per-IP buckets, each held to the
+  # same ceiling.
   @impl true
-  def call(conn, _opts) do
+  def call(conn, opts) do
+    prefix = Keyword.get(opts, :bucket, "github_intake_ip")
+
     case RemoteIp.bucket_key_tagged(conn.remote_ip) do
-      {:client, ip} -> throttle(conn, "github_intake_ip:#{ip}")
+      {:client, ip} -> throttle(conn, "#{prefix}:#{ip}")
       {:unresolved, _reason} -> conn
     end
   end
@@ -56,7 +61,7 @@ defmodule LoopctlWeb.Plugs.GithubIntakeThrottle do
       |> put_resp_header("retry-after", to_string(div(window_ms, 1000)))
       |> put_status(:too_many_requests)
       |> Phoenix.Controller.json(%{
-        error: %{status: 429, message: "Too many intake deliveries from this IP."}
+        error: %{status: 429, message: "Too many webhook deliveries from this IP."}
       })
       |> halt()
     end

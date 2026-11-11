@@ -4,6 +4,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   import Bitwise
   import Loopctl.Fixtures
 
+  alias Loopctl.Agents.Registry, as: SpecRegistry
+  alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
   alias Loopctl.ApiSpec.RunnerContract.Kinds
@@ -39,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "a01a152b854be3f549bca095d5f783e9645928951e6e6f61d5a378013d25cca8"
+  @digest "2da5115b9b9eedf83074fe5716834656e51292427b76d2e4b28817cae8703709"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -73,8 +75,110 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.23.0"
-      assert schema["x-contract-version"] == "1.23.0"
+      assert RunnerContract.version() == "1.31.0"
+      assert schema["x-contract-version"] == "1.31.0"
+
+      # 1.30.0 (US-48.13): `spec_tune` is a kind a runner may be sent and the one kind that
+      # names no story, so `story_id` left the schema's `required` (settled in code); its
+      # object and its result schema are published, and its traces are capped.
+      assert "spec_tune" in connection["dispatchable_kinds"]
+      refute "spec_tune" in RunnerContract.Kinds.implied_by_silence()
+      refute "story_id" in schema["$defs"]["RunnerDispatch"]["required"]
+      assert schema["$defs"]["RunnerDispatch"]["properties"]["spec_tune"]
+
+      assert %{"max_bytes" => 48_000, "fields" => %{"traces" => %{"max_items" => 8}}} =
+               connection["limits"]["spec_tune"]
+
+      assert connection["limits"]["spec_tune"]["fields"]["traces"]["item_fields"]["untrusted"] ==
+               %{"max_length" => 1500}
+
+      assert %{
+               "type" => "object",
+               "required" => ["new_cases", "proposed_template", "scores"],
+               "additionalProperties" => false
+             } = connection["agent_result_schemas"]["spec_tuner@1"]
+
+      # 1.28.0 (US-48.18): the verifier is a kind a runner may be sent, it is never implied by
+      # silence, and its verdict schema is published with the other agent_result specs.
+      assert "verify" in connection["dispatchable_kinds"]
+      refute "verify" in RunnerContract.Kinds.implied_by_silence()
+
+      assert %{
+               "type" => "object",
+               "required" => ["verdict", "head_sha", "findings"],
+               "additionalProperties" => false,
+               "properties" => %{
+                 "verdict" => %{"enum" => ["pass", "reject"]},
+                 "findings" => %{"maxItems" => 10}
+               }
+             } = connection["agent_result_schemas"]["verify@1"]
+
+      # ...and neither control-only edge is a transition a runner may report.
+      refute Enum.any?(connection["stage_transitions"], fn t ->
+               t["edge"] in ["verify_rejected", "no_independent_verifier_runner"]
+             end)
+
+      # 1.29.0 (US-48.17): control decides the merge and pushes `merge`; the runner executes
+      # it. Outbound only (no reply, never inbound), squash only, every identity required.
+      assert connection["events"]["merge"] == "RunnerMergeInstruction"
+      refute "merge" in RunnerContract.inbound_events()
+      refute Map.has_key?(connection["replies"], "merge")
+
+      assert %{
+               "type" => "object",
+               "additionalProperties" => false,
+               "properties" => %{"merge_method" => %{"enum" => ["squash"]}}
+             } = merge = schema["$defs"]["RunnerMergeInstruction"]
+
+      assert Enum.sort(merge["required"]) ==
+               ~w(claim_epoch dispatch_id head_sha merge_method pr_number repo story_id)
+
+      # ...and none of its three control-only edges is a transition a runner may report.
+      refute Enum.any?(connection["stage_transitions"], fn t ->
+               t["edge"] in ["runner_gone", "merge_unanswered", "ungated_merge"]
+             end)
+
+      # 1.26.0 (US-48.9): the reply drafter is a kind a runner may be sent.
+      assert "reply_draft" in connection["dispatchable_kinds"]
+
+      # 1.26.0: every agent_result spec's result schema is published, keyed <id>@<version>, so a
+      # runner validates against loopctl's schema and not a copy of it.
+      reporting =
+        for spec <- SpecRegistry.all(),
+            Spec.reports_agent_result?(spec),
+            do: "#{spec.id}@#{spec.version}"
+
+      assert reporting != []
+      assert Enum.sort(Map.keys(connection["agent_result_schemas"])) == Enum.sort(reporting)
+
+      assert %{
+               "type" => "object",
+               "required" => ["body"],
+               "additionalProperties" => false,
+               "properties" => %{
+                 "body" => %{"type" => "string", "minLength" => 1, "maxLength" => 3000}
+               }
+             } = connection["agent_result_schemas"]["reply_draft@1"]
+
+      # 1.25.0 (US-48.8): the generic result message, its cap and burst, and the spec id bound.
+      assert connection["events"]["agent_result"] == "RunnerAgentResultMessage"
+
+      assert connection["limits"]["agent_result"] == %{
+               "max_bytes" => RunnerContract.RunnerAgentResultMessage.max_result_bytes()
+             }
+
+      assert connection["limits"]["agent_result_burst"] == RunnerContract.agent_result_burst()
+
+      assert connection["limits"]["spec_id_max_length"] ==
+               RunnerContract.RunnerSpecRef.max_id_length()
+
+      assert schema["$defs"]["RunnerJoin"]["properties"]["specs"]["items"] ==
+               schema["$defs"]["RunnerAgentResultMessage"]["properties"]["spec"]
+
+      # 1.24.0: the cap on a message's three lens verdicts is published, from its declaration.
+      assert connection["limits"]["lens_verdicts"] == %{
+               "max_bytes" => RunnerContract.RunnerLensVerdict.max_bytes()
+             }
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -92,7 +196,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck",
                "triage_verdict" => "RunnerTriageVerdictAck",
-               "session_ended" => "RunnerSessionEndedAck"
+               "session_ended" => "RunnerSessionEndedAck",
+               "agent_result" => "RunnerAgentResultAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -1113,6 +1218,136 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     end
   end
 
+  describe "cast_dispatch/1 spec_tune (contract 1.30.0, US-48.13)" do
+    defp spec_tune_dispatch(overrides) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "kind" => "spec_tune",
+          "repo" => "mkreyman/home_care_billing",
+          "base_branch" => "master",
+          "branch" => "master",
+          "claim_epoch" => 0,
+          "wall_clock_seconds" => 1200,
+          "max_turns" => 40,
+          "spec_tune" => spec_tune_object()
+        },
+        overrides
+      )
+    end
+
+    defp spec_tune_object(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "target" => %{"id" => "triage", "version" => 1},
+          "template" => %{"id" => "triage", "version" => 1},
+          "eval_set" => "triage@1",
+          "window" => %{"since" => nil, "until" => "2026-11-07T06:00:00Z"},
+          "outcome_rows" => 20,
+          "traces" => [spec_tune_trace()]
+        },
+        overrides
+      )
+    end
+
+    defp spec_tune_trace(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "trace_id" => Ecto.UUID.generate(),
+          "failures" => ["human_override"],
+          "agent_decision" => %{"outcome" => "escalate"},
+          "human_decision" => %{"route" => "queued", "outcomes" => ["story"]},
+          "untrusted" => "fenced block"
+        },
+        overrides
+      )
+    end
+
+    test "a story-less spec_tune dispatch with epoch 0 casts" do
+      assert {:ok, cast} = RunnerContract.cast_dispatch(spec_tune_dispatch(%{}))
+      refute Map.has_key?(cast, :story_id)
+      assert [%{failures: ["human_override"]}] = cast.spec_tune.traces
+    end
+
+    test "a spec_tune dispatch naming a story is refused" do
+      dispatch = spec_tune_dispatch(%{"story_id" => Ecto.UUID.generate()})
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "names no story"))
+    end
+
+    test "a spec_tune dispatch with a non-zero epoch is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_dispatch(spec_tune_dispatch(%{"claim_epoch" => 3}))
+
+      assert Enum.any?(errors, &(&1 =~ "claim_epoch must be 0"))
+    end
+
+    test "a spec_tune dispatch without its object is refused" do
+      dispatch = Map.delete(spec_tune_dispatch(%{}), "spec_tune")
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "must carry the spec_tune object"))
+    end
+
+    test "a spec_tune object on a story-anchored kind is refused" do
+      dispatch =
+        spec_tune_dispatch(%{"kind" => "reply_draft", "story_id" => Ecto.UUID.generate()})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "spec_tune is only allowed when kind is spec_tune"))
+    end
+
+    test "every story-anchored kind still needs a story_id" do
+      story_kinds = Kinds.all() -- Kinds.storyless_kinds()
+      assert Kinds.storyless_kinds() == ["spec_tune"]
+      assert "implement" in story_kinds and "triage" in story_kinds
+
+      for kind <- story_kinds do
+        dispatch =
+          spec_tune_dispatch(%{"kind" => kind})
+          |> Map.delete("spec_tune")
+
+        assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+        assert Enum.any?(errors, &(&1 =~ "must carry story_id")), kind
+      end
+    end
+
+    test "no traces, or a trace with no failure, is refused in code" do
+      empty = spec_tune_dispatch(%{"spec_tune" => spec_tune_object(%{"traces" => []})})
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(empty)
+      assert Enum.any?(errors, &(&1 =~ "at least one trace"))
+
+      blank =
+        spec_tune_dispatch(%{
+          "spec_tune" => spec_tune_object(%{"traces" => [spec_tune_trace(%{"failures" => []})]})
+        })
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(blank)
+      assert Enum.any?(errors, &(&1 =~ "at least one failure"))
+    end
+
+    test "an unknown failure code, an oversized untrusted block or too many traces is refused" do
+      for object <- [
+            spec_tune_object(%{"traces" => [spec_tune_trace(%{"failures" => ["felt_bad"]})]}),
+            spec_tune_object(%{
+              "traces" => [spec_tune_trace(%{"untrusted" => String.duplicate("x", 1_501)})]
+            }),
+            spec_tune_object(%{"traces" => for(_ <- 1..9, do: spec_tune_trace())})
+          ] do
+        assert {:error, {:invalid, _}} =
+                 RunnerContract.cast_dispatch(spec_tune_dispatch(%{"spec_tune" => object}))
+      end
+    end
+
+    test "the object cap binds under the byte rule" do
+      # Eight traces at the per-field cap, each `untrusted` charged six bytes per character.
+      traces = for _ <- 1..8, do: spec_tune_trace(%{"untrusted" => String.duplicate("<", 1_500)})
+      dispatch = spec_tune_dispatch(%{"spec_tune" => spec_tune_object(%{"traces" => traces})})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "bytes under the byte rule"))
+    end
+  end
+
   describe "cast_join/1 kinds (contract 1.6.0)" do
     # #834 round 3, finding 3. This value goes verbatim into the Presence meta, which
     # Phoenix.Tracker replicates to EVERY node for the life of the socket and the pool read
@@ -1800,6 +2035,279 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # takes the edge. Published nowhere a runner could send it from.
       refute Enum.any?(connection["stage_transitions"], &(&1["edge"] == "budget_reported"))
       assert {:implementing, :escalated, :budget_reported} in StageMachine.transitions()
+    end
+  end
+
+  describe "cast_session_ended/1 turns and work left behind (contract 1.27.0, AC-48.11.2)" do
+    defp ended(attrs) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "claim_epoch" => 3,
+          "reason" => "wall_clock_exceeded"
+        },
+        attrs
+      )
+    end
+
+    test "both optional fields are carried when sent, in either boolean value" do
+      for left <- [true, false] do
+        payload = ended(%{"turns_used" => 41, "work_left_behind" => left})
+
+        assert {:ok, message} = RunnerContract.cast_session_ended(payload)
+
+        assert message == %{
+                 dispatch_id: payload["dispatch_id"],
+                 claim_epoch: 3,
+                 reason: "wall_clock_exceeded",
+                 turns_used: 41,
+                 work_left_behind: left
+               }
+      end
+
+      assert {:ok, %{turns_used: 0}} =
+               RunnerContract.cast_session_ended(ended(%{"turns_used" => 0}))
+    end
+
+    test "absent stays absent: a 1.26.0 runner's message casts exactly as before" do
+      assert {:ok, message} = RunnerContract.cast_session_ended(ended(%{}))
+      refute Map.has_key?(message, :turns_used)
+      refute Map.has_key?(message, :work_left_behind)
+
+      # Either one alone is fine: a runner that cannot tell what it left behind omits that.
+      assert {:ok, only_turns} = RunnerContract.cast_session_ended(ended(%{"turns_used" => 7}))
+      refute Map.has_key?(only_turns, :work_left_behind)
+    end
+
+    test "a value of the wrong type or range is invalid_payload" do
+      # "41" and "true" are not here: the contract's cast (OpenApiSpex) reads a digit string
+      # as an integer and "true"/"false" as booleans on every field, `claim_epoch` included,
+      # and these two follow the same rule. Anything else of the wrong type is refused.
+      for bad <- [
+            %{"turns_used" => "forty"},
+            %{"turns_used" => -1},
+            %{"turns_used" => %{"n" => 1}},
+            %{"turns_used" => 1.5},
+            %{"turns_used" => nil},
+            %{"turns_used" => RunnerSessionEnded.max_turns_used() + 1},
+            %{"work_left_behind" => "unknown"},
+            %{"work_left_behind" => "yes"},
+            %{"work_left_behind" => [true]},
+            %{"work_left_behind" => nil},
+            %{"work_left_behind" => 1}
+          ] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_session_ended(ended(bad)),
+               inspect(bad)
+      end
+
+      assert {:ok, %{turns_used: max}} =
+               RunnerContract.cast_session_ended(
+                 ended(%{"turns_used" => RunnerSessionEnded.max_turns_used()})
+               )
+
+      assert max == RunnerSessionEnded.max_turns_used()
+    end
+
+    test "the published shape names both as optional properties" do
+      ended = RunnerContract.json_schema()["$defs"]["RunnerSessionEnded"]
+
+      assert Enum.sort(ended["required"]) == ~w(claim_epoch dispatch_id reason)
+
+      assert %{"type" => "integer", "minimum" => 0, "maximum" => max} =
+               ended["properties"]["turns_used"]
+
+      assert max == RunnerSessionEnded.max_turns_used()
+      assert %{"type" => "boolean"} = ended["properties"]["work_left_behind"]
+    end
+  end
+
+  describe "cast_join/1 specs (contract 1.25.0, AC-48.8.1)" do
+    test "absent, the join is the pre-1.25.0 one and carries no specs" do
+      assert {:ok, meta} = RunnerContract.cast_join(@join)
+      refute Map.has_key?(meta, :specs)
+    end
+
+    test "a list of {id, version} is carried with atom keys" do
+      specs = [%{"id" => "triage", "version" => 1}, %{"id" => "reply_draft", "version" => 2}]
+
+      assert {:ok, %{specs: [%{id: "triage", version: 1}, %{id: "reply_draft", version: 2}]}} =
+               RunnerContract.cast_join(Map.put(@join, "specs", specs))
+    end
+
+    test "every item is exactly {id, version}, both required" do
+      for bad <- [
+            %{"id" => "triage"},
+            %{"version" => 1},
+            %{"id" => "triage", "version" => 1, "extra" => true},
+            %{"id" => "Triage", "version" => 1},
+            %{"id" => "1triage", "version" => 1},
+            %{"id" => "tri-age", "version" => 1},
+            %{"id" => String.duplicate("a", 65), "version" => 1},
+            %{"id" => "triage", "version" => 0},
+            %{"id" => "triage", "version" => 1.5},
+            "triage@1"
+          ] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_join(Map.put(@join, "specs", [bad])),
+               inspect(bad)
+      end
+
+      assert {:ok, %{specs: [%{id: id}]}} =
+               RunnerContract.cast_join(
+                 Map.put(@join, "specs", [%{"id" => String.duplicate("a", 64), "version" => 1}])
+               )
+
+      assert byte_size(id) == RunnerContract.RunnerSpecRef.max_id_length()
+    end
+
+    test "at most 32 specs" do
+      specs = for n <- 1..33, do: %{"id" => "s#{n}", "version" => 1}
+
+      assert {:error, {:invalid, [_ | _]}} =
+               RunnerContract.cast_join(Map.put(@join, "specs", specs))
+
+      assert {:ok, %{specs: kept}} =
+               RunnerContract.cast_join(Map.put(@join, "specs", Enum.take(specs, 32)))
+
+      assert length(kept) == 32
+    end
+
+    test "the published shape is the one cast applies" do
+      join = RunnerContract.json_schema()["$defs"]["RunnerJoin"]
+      refute "specs" in join["required"]
+
+      assert %{
+               "type" => "array",
+               "maxItems" => 32,
+               "items" => %{
+                 "type" => "object",
+                 "required" => ["id", "version"],
+                 "additionalProperties" => false,
+                 "properties" => %{
+                   "id" => %{
+                     "type" => "string",
+                     "pattern" => "^[a-z][a-z0-9_]*$",
+                     "maxLength" => 64
+                   },
+                   "version" => %{"type" => "integer", "minimum" => 1}
+                 }
+               }
+             } = join["properties"]["specs"]
+    end
+  end
+
+  describe "cast_agent_result_message/1 (contract 1.25.0, AC-48.8.2)" do
+    defp agent_result_msg(attrs) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "claim_epoch" => 3,
+          "spec" => %{"id" => "reply_draft", "version" => 1},
+          "result" => %{"reply" => "thanks", "nested" => %{"k" => [1, 2]}}
+        },
+        attrs
+      )
+    end
+
+    test "admits the envelope and carries the result VERBATIM for the spec's own schema" do
+      payload = agent_result_msg(%{"undeclared" => "dropped"})
+
+      assert {:ok, message} = RunnerContract.cast_agent_result_message(payload)
+
+      assert message == %{
+               dispatch_id: payload["dispatch_id"],
+               claim_epoch: 3,
+               spec: %{id: "reply_draft", version: 1},
+               result: %{"reply" => "thanks", "nested" => %{"k" => [1, 2]}}
+             }
+    end
+
+    test "every field is required, and result must be an object" do
+      for key <- ~w(dispatch_id claim_epoch spec result) do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_agent_result_message(Map.delete(agent_result_msg(%{}), key)),
+               key
+      end
+
+      for bad <- ["text", [1], 3, nil] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => bad})),
+               inspect(bad)
+      end
+    end
+
+    test "the spec reference has the join's shape" do
+      for bad <- [%{"id" => "Reply", "version" => 1}, %{"id" => "reply", "version" => 0}] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_agent_result_message(agent_result_msg(%{"spec" => bad}))
+      end
+    end
+
+    test "a result over the byte cap is refused, one at the cap is not" do
+      cap = RunnerContract.RunnerAgentResultMessage.max_result_bytes()
+      overhead = ByteRule.bytes(%{"reply" => ""})
+      per_char = ByteRule.constants()["per_string_char"]
+      fits = div(cap - overhead, per_char)
+
+      at_cap = %{"reply" => String.duplicate("a", fits)}
+      assert ByteRule.bytes(at_cap) <= cap
+
+      assert {:ok, _} =
+               RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => at_cap}))
+
+      over = %{"reply" => String.duplicate("a", fits + 1)}
+      assert ByteRule.bytes(over) > cap
+
+      assert {:error, {:invalid, [message]}} =
+               RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => over}))
+
+      assert message =~ "#{cap} bytes"
+    end
+
+    test "a NUL or an over-wide number anywhere in the result is refused" do
+      for bad <- [
+            %{"reply" => "a\u0000b"},
+            %{"a\u0000" => "b"},
+            %{"deep" => [%{"n" => Integer.pow(10, ByteRule.max_number_digits())}]}
+          ] do
+        assert {:error, {:invalid, [_]}} =
+                 RunnerContract.cast_agent_result_message(agent_result_msg(%{"result" => bad}))
+      end
+    end
+
+    test "cast_agent_result/2 applies a spec's schema and keeps only what it declares" do
+      schema = %OpenApiSpex.Schema{
+        type: :object,
+        required: [:reply],
+        properties: %{reply: %OpenApiSpex.Schema{type: :string, maxLength: 5}}
+      }
+
+      assert {:ok, %{reply: "hi"}} =
+               RunnerContract.cast_agent_result(%{"reply" => "hi", "x" => 1}, schema)
+
+      assert {:error, {:invalid, [_ | _]}} =
+               RunnerContract.cast_agent_result(%{"reply" => "toolong"}, schema)
+
+      assert {:error, {:invalid, [_ | _]}} = RunnerContract.cast_agent_result(%{}, schema)
+
+      assert {:error, {:invalid, [_]}} =
+               RunnerContract.cast_agent_result(%{"reply" => "a\u0000"}, schema)
+    end
+
+    test "is published as an event with a declared reply, refusals and a bucket" do
+      connection = RunnerContract.json_schema()["x-connection"]
+
+      assert "agent_result" in RunnerContract.inbound_events()
+
+      for code <- ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted
+                     already_recorded claim_epoch_mismatch wrong_dispatch_kind internal_error) do
+        assert code in connection["errors"]["agent_result"], code
+      end
+
+      assert RunnerContract.permanent_error?("agent_result", "already_recorded")
+      assert RunnerContract.permanent_error?("agent_result", "invalid_payload")
+      refute RunnerContract.permanent_error?("agent_result", "rate_limited")
     end
   end
 
@@ -2593,7 +3101,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "dispatch_reply" => live_or_gone,
                "trace" => live_or_gone,
                "stage" => live_or_gone,
-               "triage_verdict" => ~w(unknown_dispatch)
+               "triage_verdict" => ~w(unknown_dispatch),
+               "agent_result" => ~w(unknown_dispatch)
              }
     end
 

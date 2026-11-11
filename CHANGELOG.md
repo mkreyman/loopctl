@@ -4,6 +4,123 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Changed
+
+- **A ticket-requiring intake source no longer makes stories for ticketless issues
+  (2026-11-08).** With `triage_requires_ticket` set, an issue that carries no support ticket
+  stays an intake record and gets no "Triage pending" story; it is promoted if a ticket
+  appears later. Triage already skipped them, so they only cluttered the target epic.
+- **Production retries a story once before escalating (2026-11-08).** `fly.toml [env]` sets
+  `DISPATCH_MAX_ATTEMPTS = "2"`: the first counted release (a lost lease, a crash, a `verify@1`
+  reject) re-places the story, the second escalates `attempts_exhausted`. The code still has
+  no default, so a self-hosted deploy that leaves it unset keeps escalating on the first.
+- **A `verify@1` reject sends the story back to work at once, with the findings (2026-11-08).**
+  The reject used to leave the story at `implementing` with its claim held until the lease ran
+  out, and nothing re-dispatched it; the session that was finally placed was told nothing about
+  the open pull request or what was wrong. The reject now releases the claim as a counted
+  attempt, so `DISPATCH_MAX_ATTEMPTS` decides on the spot: below it the story is re-placed, at
+  the ceiling it is escalated `attempts_exhausted` for a person, and `resolve_escalation` to
+  `queued` re-places it.
+  - **Runner contract 1.31.0** (minor, additive): an `implement` dispatch may carry `rework`
+    (`pr_number`, `rejected_head_sha`, `findings`), and only an `implement` dispatch. The
+    session continues the open pull request on the same branch and opens no second one.
+    Re-vendor `priv/runner_contract/v1.json` to act on it; an older runner ignores the field.
+- **`spec_tuner@1` has its own budget pair: `SPEC_TUNE_WALL_CLOCK_SECONDS` and
+  `SPEC_TUNE_MAX_TURNS` (2026-11-07).** It spent the triage pair until now, but the runner
+  bounds a whole tuning run by that wall clock and the run replays every eval case twice, so a
+  1200 s budget could never finish one. `fly.toml` sets 28800 s (the largest eval set, implement@1 with 5 new cases, run twice) and 80 turns. Neither has a
+  default: with `DRAFT_DISPATCH_ENABLED` on and either unset, the weekly tuning job cancels
+  naming the key. Self-hosters who enabled tuning must set both before deploying. Triage,
+  verify and reply_draft budgets are unchanged.
+- **The improvement loop: `spec_tuner@1` proposes prompt-template changes, and loopctl never
+  applies them (US-48.13, 2026-11-07).** A weekly pass (`SpecTunerDispatchWorker`, Mondays
+  06:00 UTC, behind `DISPATCH_DRIVER_ENABLED` and `DRAFT_DISPATCH_ENABLED`) takes each
+  (project, target spec) whose run-outcome ledger has 20 rows since its last answered tuning
+  run, and sends one `spec_tune` dispatch carrying that spec's failed runs as fenced traces. The
+  answer is stored in `spec_tuning_drafts` under the status loopctl decides from the per-case
+  results: `proposed` only when strictly better with no existing case regressing. A person turns
+  a proposed draft into a pull request and marks it landed (`POST /api/v1/tuning_drafts/:id/landed`,
+  user role); `GET /api/v1/tuning_drafts` lists them (user role). MCP tools `tuning_drafts` and
+  `tuning_draft_mark_landed` (loopctl-mcp-server 3.10.0).
+  - **Runner contract 1.30.0** (minor): `spec_tune` is a dispatchable kind and the first that
+    names NO story. `story_id` is no longer schema-required on `dispatch` (every other kind
+    still carries it, enforced in code), and a `spec_tune` dispatch carries `claim_epoch` 0 and
+    a `spec_tune` object. Its result is an `agent_result` under `spec_tuner@1`. Re-vendor
+    `priv/runner_contract/v1.json`. A runner that does not declare `spec_tune` is never sent
+    one.
+  - **Migration `20261107210000_create_spec_tuning_drafts`** widens the `runner_dispatches`
+    kind CHECK, makes `runner_dispatches.story_id` and `agent_run_outcomes.story_id` nullable
+    for `spec_tune` rows only (a shape CHECK holds both directions), and creates
+    `spec_tuning_drafts` (RLS enabled). No backfill and no manual step. Its rollback deletes any
+    `spec_tune` ledger and outcome rows before restoring NOT NULL.
+- **Control decides the pull-request merge, and the runner executes it (US-48.17,
+  2026-11-07).** A new pass (`MergeSweepWorker`, every minute) runs the merge gate, as control,
+  over each pull-request story at `ci` that is verified at its head. On `allow` it sends the
+  runner holding the claim a `merge` instruction, and the runner merges exactly that head and
+  reports `ci -> merged`. Only sending the instruction is behind `DISPATCH_DRIVER_ENABLED`.
+  - **Runner contract 1.29.0** (minor): a new control -> runner event, `merge`
+    (`RunnerMergeInstruction`: `dispatch_id`, `claim_epoch`, `story_id`, `repo`, `pr_number`,
+    `head_sha`, `merge_method` = `squash`). Re-vendor `priv/runner_contract/v1.json` and
+    declare 1.29.0 on join. A runner that joins on an older version is never sent a merge, and
+    its pull-request stories escalate `merge_unanswered`.
+  - **A pull-request merge with no gate allow for its head escalates `ungated_merge`.** The
+    merge is recorded and then escalated in the same transaction, and the reason names the
+    merge commit and the head. A runner that still merges on its own (before contract 1.29.0)
+    therefore escalates every pull-request merge it reports. chg stories are not affected.
+  - **A pull-request story's claim no longer lapses at `ci`.** loopctl holds it open while the
+    runner is connected, never past the implement dispatch's credential expiry. A story whose
+    runner has been gone for ten minutes escalates `runner_gone` instead of going back to the
+    queue. `renew_story_claim` is unchanged.
+  - **Migration `20261107200000_add_merge_instruction_and_runner_absence`** adds
+    `story_stages.merge_instruction` and `story_stages.runner_absence`, and two stage-event
+    names. No backfill and no manual step. Its rollback refuses while any row carries either
+    new event.
+- **Control verifies pull-request stories at `ci` under an independent verifier (US-48.18,
+  2026-11-07).** A new `verify@1` pass (`VerifyDispatchWorker`, every minute, behind
+  `DISPATCH_DRIVER_ENABLED`) mints a verifier dispatch as a new root under the tenant's
+  operator key for a runner whose agent is not the implementer's, and sends that runner a
+  `verify` dispatch. On `pass` control reports, reviews and verifies the story and records the
+  head it judged. On `reject` the story goes back to `implementing` with the findings. A
+  verdict for a head the story no longer has is dropped. When the implementer's own agent is
+  the only one the tenant has, the story escalates `no_independent_verifier_runner`.
+  - **Runner contract 1.28.0** (minor): `verify` is a dispatchable kind, and its dispatch
+    carries `verify: {pr_number, head_sha}`. Re-vendor `priv/runner_contract/v1.json`. A
+    runner gets `verify` dispatches only if it declares the kind when it joins, and until one
+    does, every pull-request story waits at `ci`.
+  - **The merge gate is bound to the head.** A story verified at another head, or at no
+    recorded head, is refused `verified_for_other_head`. A story verified before this release
+    has no recorded head, so it is verified again before it can merge. Any move that clears a
+    pull-request story's head (`base_moved`, `ci_red`, a reject) also clears its verification.
+  - **`POST /api/v1/stories/:id/reject` and bulk reject refuse a key no dispatch minted on a
+    pull-request story** with 409 `caller_lineage_required`. Such keys can still reject any
+    other story.
+  - **The tenant operator key a pass acts as can no longer be a dispatch-minted `:user` key.**
+    A tenant whose only `:user` key was minted by a dispatch is reported `no_operator_key`.
+  - **Migration `20261107190000_add_verified_head_sha_and_verify_kind`** adds
+    `story_stages.verified_head_sha` and `verify` to the dispatch-kind CHECK. No backfill and
+    no manual step.
+- **Pull-request stories now close their GitHub issue after the deploy (US-48.16,
+  2026-11-07).** Post-deploy verification also reads stories at `merged`: once a successful
+  deployment carries the merge commit it writes `deployed` (the deployment id as
+  `release_id`), verifies, and the issue is closed `shipped`. A merged story with no such
+  deployment escalates `verification_failed` at the existing bounds. A pr-mode repository
+  needs its `(tenant, repository)` pair in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, or a tenant
+  token, for these reads; without one its merged stories wait and then escalate.
+- **`POST /api/v1/stories/:id/stage/resolve` accepts `to: detected` (2026-11-07).** A human can
+  now send a story that triage escalated back to be triaged again; its old triage dispatch is
+  unbound. A story an implementer was assigned or worked is refused 409 `not_retriageable`,
+  with what it holds in `held`. loopctl-mcp-server 3.6.0 exposes it on `resolve_escalation`.
+- **ecto 3.14.3 for CVE-2026-118391 (2026-11-06)**, with ecto_sql 3.14.0, decimal 3.2.0 and
+  cowboy 2.20.0. Two more HIGH advisories are acknowledged in `mix.exs` because no fixed
+  release exists on hex: cowboy CVE-2026-115701 and cowlib CVE-2026-113431. Both are memory
+  exhaustion by a client of a Cowboy listener, and loopctl's only one is the `:9568` metrics
+  reporter on Fly's private network. A self-hoster who publishes that port is exposed.
+- **Production keeps both machines running at 1024mb (2026-11-02).** `fly.toml` now sets
+  `memory = "1024mb"` and `min_machines_running = 2`, and drops `CLUSTER_PEERS_MAY_SUSPEND`,
+  so a missing peer alarms `expected_peers_missing` again. A machine was OOM-killed at 512mb
+  while it was the only one running. A self-hoster who copies `fly.toml` pays for two
+  always-on 1 GB machines.
+
 ### Removed
 
 - **Epic 45's change threads are deleted (#984).** BREAKING for anything still calling them:
@@ -40,6 +157,198 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A session end reports its turns and the work it left behind (2026-11-07, US-48.11,
+  runner contract 1.27.0).** `session_ended` gains two optional fields: `turns_used` (an
+  integer, 0 up to the int4 ceiling) and `work_left_behind` (a boolean: `true` when the
+  session's branch had commits not on the remote at exit, `false` when it had none, omitted
+  when the runner could not tell). A wrong type or range is `invalid_payload`. The report is
+  still recorded once per dispatch and its identity is still `dispatch_id`, `claim_epoch` and
+  `reason`: a resend that differs only in the new fields is answered `ok` (`replayed: true`)
+  and the first copy's values stand. A 1.26.0 runner that sends neither behaves exactly as
+  before; re-vendor the contract to send them. Migration `20261107180000` adds three nullable
+  columns to `runner_dispatches`: `max_turns` (the turn budget the dispatch was placed under,
+  written where `wall_clock_seconds` is and refreshed by the push that wins delivery; a budget
+  past the int4 ceiling is stored NULL rather than refusing the dispatch), `session_turns_used`
+  and `work_left_behind` (written once, with the session end). CHECKs keep the counts
+  non-negative, the budget positive, and both session-end figures NULL on a row with no
+  recorded session end. No backfill: existing rows read as not reported.
+- **Run-outcome ledger per agent spec version (2026-11-07, US-48.12).** Migration
+  `20261107170000` adds the RLS table `agent_run_outcomes`: one row per runner dispatch, keyed
+  by the spec `{id, version}` it ran under, with the session's end and the signals later
+  events prove (merge-gate decision, CI result, merge, review counts, a human's override of
+  a triage verdict, a re-queue after a budget kill, the draft screen). New
+  `GET /api/v1/agent_specs/:spec_id/outcomes?window_days=` (any key, agent role up, default
+  30 days, at most 365; 400 outside that) returns per-version counts, rates and medians;
+  loopctl-mcp-server 3.8.0 exposes it as `agent_outcomes`. `turns` comes from the runner's
+  session-end report (contract 1.27.0), so `median_turns` is null for runs on an older runner;
+  cost stays null, because no runner message reports it.
+- **The escalation inbox (2026-11-07, US-48.11).** `GET /api/v1/escalations` lists the
+  tenant's stories parked at `escalated`, newest first, keyset-paginated, any authenticated
+  key (`agent` role and above), read-only. Each row's `reason_class` (`budget_exhausted`,
+  `session_failed`, `triage_escalated`, `gate_refused`, `operator_released`, `other`) is
+  derived from the stage-machine edge, never from `escalation_reason`. That field is untrusted
+  session text, returned raw and fenced. A `budget_exhausted` row carries the run's elapsed
+  time, budget and branch from the dispatch ledger, and the turns it used against the turn
+  budget it was placed under. `work_left_behind` is `true` or `false` as the runner's 1.27.0
+  session-end report says, and `unknown` (with `turns_used` null) when an older runner's
+  report carries neither. Filters are `reason_class`,
+  `project_id` and `since`. New 400s: an unknown `reason_class`, a bad `since`, `limit` or
+  cursor. A malformed `project_id` is a 422. loopctl-mcp-server 3.9.0 adds
+  `escalation_list`. A new daily Oban cron, `EscalationDigestWorker` at 14:00 UTC with no env
+  var, posts one digest per project that has `budget_exhausted` rows older than an hour. It
+  goes to that project's coordination channel under the key
+  `escalation-digest:<project_id>:<YYYY-MM-DD>`, at most once per project per UTC day, and its
+  author is a per-tenant agent named `system:escalation-digest`. **New API constraint:** agent
+  names starting `system:` (any case) are now reserved, and register and update refuse them
+  with 422. Only a name being set is judged, so an existing agent with such a name keeps it.
+- **Reply drafts for tickets triage set aside (2026-11-07, US-48.9).** For a story whose
+  intake record carries a support `ticket_id` and which triage rejected or escalated, a runner
+  session drafts a reply (agent spec `reply_draft@1`, dispatch kind `reply_draft`, runner
+  contract **1.26.0**: the kind is dispatchable and carries the fenced report in the `triage`
+  object). loopctl stores the draft and NEVER sends it. A body the injection screen flags is
+  stored `refused` with the screen's codes and without the body. Read them with
+  `GET /api/v1/projects/:project_id/reply_drafts` (`user` role: the bodies are drafted from
+  customer ticket text; cursor-paginated), MCP `reply_draft_list` in loopctl-mcp-server 3.7.0.
+  New env var **`DRAFT_DISPATCH_ENABLED`**, default off, which also needs
+  `DISPATCH_DRIVER_ENABLED`; sessions spend the `TRIAGE_*` budgets. Migration
+  `20261107140000_create_reply_drafts` adds the `reply_drafts` table (RLS) and `reply_draft`
+  to the `runner_dispatches_kind` CHECK; its `down` deletes the `reply_draft` ledger rows
+  before restoring the CHECK. A recorded `agent_result` now also releases its dispatch's slot.
+- **Intake sources can triage only support-ticket issues (2026-11-06).**
+  `intake_sources.triage_requires_ticket` (migration
+  `20261106230000_add_triage_requires_ticket_to_intake_sources`, boolean, NOT NULL, default
+  false, so every existing source triages every issue as before). True makes the triage
+  dispatcher pick only stories whose intake record carries a `ticket_id`, which intake keeps
+  when an issue's single `#HCB-xxxxxxxx` Ticket line and HomeCareBilling footer agree; the
+  rest stay `detected` and use no runner. A format filter, not authentication: anyone who can
+  open an issue can type the format. Set it with `POST`/`PATCH /api/v1/intake/sources` or the
+  `intake_source_enroll` / `intake_source_update` tools; anything but a JSON boolean is a 422.
+- **Runner contract 1.25.0: runners declare the agent specs they hold, and `:draft` results
+  come back through one `agent_result` message (US-48.8).** `RunnerJoin.specs` is an optional
+  list of `{id, version}` (at most 32). A kind is dispatched only to a runner holding the spec
+  loopctl runs it under; a runner sending no `specs` is read as holding version 1 of each
+  declared kind's spec, so every runner already deployed is eligible exactly as before.
+  `GET /api/v1/runners/pool` returns the declaration as `specs` (null when none), and
+  loopctl-mcp-server 3.6.1's `runner_pool` describes it. Migration
+  `20261107120000_add_runner_dispatches_agent_result` adds four nullable columns to
+  `runner_dispatches` (no backfill, no manual step) where a validated result is recorded once
+  per dispatch. No production spec reports through `agent_result` yet, so every one is refused
+  `invalid_payload` today. Minor: re-vendor to declare `specs`.
+- **Runner contract 1.24.0** publishes `x-connection.limits.lens_verdicts.max_bytes`, the cap
+  on a triage verdict's three lens verdicts together. Minor: a runner should re-vendor to read
+  the cap rather than hard-code it.
+- **A reopened issue whose loop has ended comes back to triage (US-47.10, #986).** Migration
+  `20261019180000_add_generation_to_intake_records` adds `intake_records.generation`
+  (default 1, so every existing row becomes generation 1) and replaces the unique index
+  `intake_records_issue_uidx` with `intake_records_issue_generation_uidx` on
+  `(tenant_id, source_id, issue_number, generation)`. A `reopened` delivery for an issue whose
+  newest record has a closure, or whose story is `merged`, `deployed`, `verified` or `done`,
+  starts a new record at `pending_triage`. The earlier record, its story and its closure stay
+  as they were. **Deploy ordering:** once the migration runs, a machine still on the previous
+  release answers every `issues` webhook delivery with a 500 until it is replaced, because
+  its insert names the dropped index. GitHub does not retry these. After the rollout, for
+  each enrolled repository, list the webhook's deliveries
+  (`GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries`) and, for every `issues` delivery
+  in the deploy window whose status code is not 2xx, call
+  `POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts`. A
+  redelivery reuses its `X-GitHub-Delivery` id, so one that had in fact succeeded is not
+  applied twice. No manual data step. `down` refuses while any issue has a second
+  generation.
+  The issue closer now removes any OTHER loopctl resolution label from the open issue
+  before adding its own, so a reopened issue's later close never carries two
+  (`PullRequestSource.remove_label/3`, `DELETE /repos/{owner}/{repo}/issues/{n}/labels/{name}`,
+  which needs the same `issues: write` the closer already uses). A closed issue found
+  carrying only this closure's label now counts as loopctl's own close only when the
+  closure recorded `labelled_at`; otherwise it is `abandoned` with `closed_by_other`,
+  because the label may be an earlier generation's. A pending closure whose record is no
+  longer the issue's newest generation is `abandoned` with the new reason
+  `superseded_by_generation`, before any GitHub call; it is not re-drivable by
+  `requeue_abandoned`.
+- **chg-server's change-events webhook (US-47.3): `POST /api/v1/change_events/:source_id`.**
+  For a `chg` intake source. No API key: authenticated by `X-Chg-Signature: sha256=<hex>`, an
+  HMAC-SHA256 over `"<X-Chg-Timestamp>.<raw body>"` with the source's `change_events_secret`,
+  the timestamp in unix seconds within 300 s of loopctl's clock. An unknown, revoked or `pr`
+  source, a wrong signature, a stale timestamp, an envelope for another repository and a source
+  whose `chg_root_dispatch_id` has since been revoked (or is no longer a parentless
+  orchestrator root) all answer the same 401 `invalid_signature` and write nothing; each is
+  counted in `loopctl.changes.event_refused.count` by source and reason. Body cap 262144 bytes
+  (413). Idempotent on `(repo, change_id, event_seq)`: a redelivery is 200 `duplicate: true`;
+  the same key with different content is 409 `event_conflict`. Events apply in `event_seq`
+  order per change (an event ahead of a gap answers `held`); every applied event is appended
+  to the tenant's audit chain as `change_event_applied`. A `submitted` event naming a story of
+  the tenant binds the change to it (US-47.1). No stage moves yet: the stage mapping is US-47.4.
+  Lock contention is 503 `busy` with `retry-after`. Throttled per IP like the GitHub intake
+  webhook.
+- **Gap and staleness reconciliation (US-47.3).** `ChangeReconcileSweepWorker` (every 5 min)
+  pulls `GET <CHG_SERVER_URL>/api/v1/changes/:change_id/events?after=N` from chg-server, signed
+  over `"<timestamp>.GET.<path>?<query>"` with the same secret, for a change whose events have
+  had a gap for 10 min or that is bound to a non-terminal story and has been quiet for 6 h —
+  one job per change. **New env var `CHG_SERVER_URL`** (unset: nothing is pulled; see
+  `deploy/FLY_SECRETS.md`). A pull chg-server refuses 401 raises the
+  `changes.pull_unauthorized` operator alert (the scale-alert webhook) and counts
+  `loopctl.changes.pull_refused.count`.
+- **Migration `20261019150000_create_change_events`**: two new tables, `change_events` and
+  `change_cursors`, RLS-enabled. Additive; no deploy ordering.
+- **chg change events move the story's stage (US-47.4).** A story bound to a chg change now
+  moves on that change's events: `submitted` to `reviewing`, `review_findings` back to
+  `implementing`, `review_approved` plus `check_passed` on one revision to `ci` (new edge
+  `change_ready`; `pr_open` is never entered for a bound story, by any writer), `landed` to
+  `merged`, and `reverted` back to `implementing` (new chained edge `reverted`). A revision
+  submitted after the story reached `ci` returns it to `reviewing` (new edge
+  `change_resubmitted`), and findings on the ready revision return it to `implementing` (new
+  edge `change_review_findings`). A revert of a `verified` story escalates
+  (`reverted_after_verify`); an event the stage cannot take escalates
+  (`change_outside_lifecycle`). None of the new edges is reachable through any other writer.
+  A revert of a `done` story OPENS A GITHUB ISSUE on the repository for triage, so the
+  tenant's forge credential for a chg repository needs `issues: write` — the same scope issue
+  closing already needs. New cron worker `ChangeRevertIssueWorker` (every two minutes).
+  Migration `20261019160000_add_change_stage_mapping` adds `story_stages.trunk_verified_sha`
+  and the `change_revert_issues` table; additive, no deploy ordering. Each chained stage
+  retraction now also names `release_id` and `trunk_verified_sha` under `retracted`.
+- **Review custody for chg-dispatched reviews (US-47.5).** On a story bound to a chg change,
+  `POST /api/v1/stories/:id/review-complete` accepts the review only from a key whose dispatch
+  is a strict descendant of the intake source's `chg_root_dispatch_id` (409
+  `chg_reviewer_required`, chg-server's root key included), requires a new body field
+  `commit_sha` naming a submitted revision of the story's current change (422
+  `commit_sha_not_bound`), and records one verdict per reviewer dispatch (409
+  `chg_review_already_recorded`, held by a unique index). These run after the existing custody
+  gates, whose codes are unchanged; on any other story `commit_sha` is ignored and not stored.
+  Review records now serialise `commit_sha` and `reviewer_dispatch_id`. A chg story that
+  reaches `merged` with no such review for its landed revision is escalated in the same
+  transaction over a new control-only edge `review_missing` (`merged -> escalated`; the merge
+  stands) and waits for a human; if that escalation cannot be written the whole `landed` event
+  rolls back (503 `busy` on contention, else 500 `change_event_failed`, logged and counted as
+  `[:loopctl, :changes, :review_hold_refused]`) and chg redelivers it, so a merge never commits
+  without its hold. Such a story is never verified: `POST /stories/:id/verify`,
+  `/epics/:id/verify-all`, `/stories/bulk/verify`, `/stories/:id/backfill` and
+  `/stories/bulk/mark-complete` refuse a story bound to a chg change with 409
+  `review_missing_escalated` while it is escalated over `review_missing` (a human resolves it
+  first), and with 409 `chg_review_not_for_landed_revision` unless a chg review names its
+  LANDED revision — the revision commit of the newest applied `landed` event of its current
+  change (verify-all and the bulk paths report either per story). Stories with no change
+  binding are answered exactly as before. Migration `20261019170000_add_chg_review_custody_to_review_records`
+  adds the two nullable columns, a CHECK that they are set together, and the unique index;
+  additive, no deploy ordering. MCP: loopctl-mcp-server 3.3.0.
+- **A chg story's CI evidence is `verified/master` (US-47.6).** On a story bound to a chg
+  change, every path that reaches `verified` (`POST /stories/:id/verify`,
+  `/epics/:id/verify-all`, `/stories/bulk/verify`, `/stories/:id/backfill`,
+  `/stories/bulk/mark-complete`) now also asks GitHub whether the trunk commit of the newest
+  applied `landed` event (`data.merge_sha`) is an ancestor of, or equal to, the repository's
+  `refs/heads/verified/master` (`GET /repos/:repo/compare/<merge_sha>...verified/master`),
+  read before the verify transaction with the same bounded timeouts as the other forge reads.
+  409 `chg_landing_not_trunk_verified` when it is not (or the landing named no valid trunk
+  commit); 409 `chg_landing_reverted` when an applied `reverted` event follows the landing;
+  503 `chg_trunk_unevaluated` with `Retry-After` and an `error.reason` when nothing could be
+  decided — a timeout, an unreachable forge, a 5xx or rate limit (the forge's own delay), a
+  401/403/422, a missing `verified/master` ref or commit (404, `trunk_ref_not_found`), no
+  credential for the repository (`credential_unavailable`, Retry-After 3600), or a new landing
+  in between (`landing_changed`). verify-all and the bulk paths report each per story. Stories
+  with no change binding are answered exactly as before and never reach the forge.
+  **Operator action:** the tenant's forge token (or the operator `GITHUB_TOKEN` lent through
+  `VERIFICATION_OPERATOR_TOKEN_TENANTS`) must be able to read the chg repository's commits —
+  a classic token's `repo` scope for a private repository, or a fine-grained token's
+  `Contents: read`; without it every chg verify answers 503 `forge_forbidden`/`trunk_ref_not_found`.
+  No migration. MCP: loopctl-mcp-server 3.4.0.
 - **Intake-source mode `chg` (US-47.2).** `POST /api/v1/intake/sources` and `PATCH
   /api/v1/intake/sources/:id` accept `mode: "chg"` beside `pr`, plus two fields a `chg`
   source must carry: `change_events_secret` (the HMAC key chg-server will sign its event
@@ -377,6 +686,31 @@ All notable changes to loopctl are documented here.
     MCP server 2.109.0 adds `thread_stage_report`.
 
 ### Changed
+
+- **Dependency security bumps: plug_crypto 2.2.1, mint 1.10.2, cowlib 2.21.0.** CI's
+  Security job failed on 2026-10-24 on EEF-CVE-2026-105963 (plug_crypto: the secret key
+  base lands in stack-trace arguments on a wrong-typed argument, reachable through
+  `Phoenix.Token.verify/4`; fixed in 2.2.1). mint 1.10.2 backports the fixes for all
+  three advisories 1.11.0 carried (EEF-CVE-2026-91043 HIGH, -92103, -94194), so the pin
+  below 1.11.0 — the Finch 0.23.0 receive-timeout crash, pinned by
+  `test/loopctl/net/finch_timeout_reuse_test.exs` — costs no security, and the three
+  mint `ignore_advisories` entries are gone. cowlib 2.21.0 fixes EEF-CVE-2026-43969 and
+  that entry goes too. The remaining ignores — cowlib CVE-2026-43966 and cloak
+  CVE-2026-95105 / CVE-2026-94206 — have no upstream release to fix them and are
+  unreachable from loopctl's code, each pinned by
+  `test/loopctl/vault/cloak_advisory_reachability_test.exs` or the mix.exs comment.
+
+- **chg-server's keys never certify or implement (US-47.5).** A key whose MINTING lineage
+  (revoked or not) is rooted at a dispatch any intake source of the tenant registers as
+  `chg_root_dispatch_id` — live or revoked source, either mode — is refused 409
+  `chg_root_cannot_verify` by `POST /stories/:id/verify`, `/reject` (exempt from
+  `caller_lineage_required` only), `/backfill`, `POST /epics/:id/verify-all` and
+  `POST /stories/bulk/verify`, `/bulk/reject` and `/bulk/mark-complete` (the bulk paths and
+  verify-all refuse the whole call), and 409 `chg_root_review_only` by `POST /stories/:id/claim`,
+  `/report` and `/bulk/claim`. No other caller's answer changes.
+- **`POST /api/v1/stories/:id/review-complete` answers `caller_lineage_required` as the
+  documented 409.** The controller had no clause for it, so a key no dispatch minted reviewing
+  dispatch-minted work got a 500.
 
 - **The app's HTTP listener no longer serves HTTP/2.** Bandit now closes a connection that
   opens with the HTTP/2 preface, which keeps CVE-2026-105659 (HIGH, Bandit's HTTP/2 stack,

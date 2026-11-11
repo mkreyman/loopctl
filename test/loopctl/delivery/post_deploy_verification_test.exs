@@ -22,13 +22,16 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Intake.IssueClosure
   alias Loopctl.MockPullRequestSource
   alias Loopctl.Repo
+  alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.PostDeployVerificationWorker
 
   @repo "acme/widgets"
   @merge String.duplicate("a", 40)
   @deployed String.duplicate("b", 40)
+  @allowed_head String.duplicate("e", 40)
 
   setup :verify_on_exit!
 
@@ -152,11 +155,11 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
                PostDeployVerification.evaluate(ctx.tenant_id, Ecto.UUID.generate())
     end
 
-    test "a story that is not at the deployed stage is UNTOUCHED", ctx do
-      set_stage(ctx, :merged)
+    test "a story at neither merged nor deployed is UNTOUCHED", ctx do
+      set_stage(ctx, :ci)
 
       assert {:error, :wrong_stage} = evaluate(ctx)
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
     end
 
     test "a story with no stage row at all is :no_stage", ctx do
@@ -593,13 +596,14 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   describe "the sweep" do
     test "verifies a story at deployed, and touches one at any other stage NOT AT ALL", ctx do
       other = build_story(%{id: ctx.tenant_id}, "acme/other")
-      set_stage(other, :merged)
+      set_stage(other, :ci)
       stub_deployment(sha: @merge)
+      before = Stages.get(other.tenant_id, other.story_id)
 
       assert :ok = perform_job(PostDeployVerificationWorker, %{})
 
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :verified
-      assert Stages.get(other.tenant_id, other.story_id).stage == :merged
+      assert Stages.get(other.tenant_id, other.story_id).lock_version == before.lock_version
     end
 
     test "is idempotent: a second run writes nothing", ctx do
@@ -713,7 +717,384 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
     end
   end
 
+  describe "a pr-route story at merged (US-48.16)" do
+    setup ctx do
+      at_merged(ctx)
+      :ok
+    end
+
+    test "a successful deployment of the merge takes it merged -> deployed -> verified", ctx do
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :verified, reasons: []} = result} = enforce(ctx)
+      # Read at `merged`, and it reports where the deploy write left it.
+      assert result.stage == :deployed
+      assert result.resolution == Resolution.for_verdict(:shipped)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :verified
+      # The deployment that carried the merge IS the release, written on the edge into
+      # `deployed` — the only stage `release_id` may be written at.
+      assert row.release_id == "91"
+
+      transitions =
+        for %StageEvent{event: "transitioned"} = e <-
+              Stages.list_events(ctx.tenant_id, ctx.story_id),
+            do: {e.from_stage, e.to_stage, e.edge, e.actor_label}
+
+      assert {"merged", "deployed", "forward", "test"} in transitions
+      assert {"deployed", "verified", "forward", "test"} in transitions
+    end
+
+    test "a merge of a head the gate never allowed escalates over ungated_merge, never deploys",
+         ctx do
+      # The session pushed past the allow and merged that head itself; the report carried
+      # only the merge sha, so the recorded head still equalled the allow.
+      stub_merged_head(@deployed)
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:ungated_merge, @allowed_head, @deployed} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+
+      assert [%StageEvent{edge: "ungated_merge"}] =
+               for(
+                 %StageEvent{event: "transitioned", to_stage: "escalated"} = e <-
+                   Stages.list_events(ctx.tenant_id, ctx.story_id),
+                 do: e
+               )
+    end
+
+    test "an unreadable pull request waits rather than judging the merge", ctx do
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, 77 ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :unresolved, unresolved_kind: :forge_fault}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+    end
+
+    test "no deployment carries the merge yet: the pull request is never read", ctx do
+      # The merged head only matters once a deploy carries the merge; reading it on every
+      # sweep before then spent one forge call per waiting story per run.
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _number ->
+        flunk("the merged head is read only once a deployment carries the merge")
+      end)
+
+      stub_deployment(contains: false)
+
+      assert {:ok, %Result{decision: decision}} = enforce(ctx)
+      refute decision in [:verified, :failed]
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+    end
+
+    test "the deploy write names the deployment, and verification follows in ONE pass", ctx do
+      # A merge BEHIND the deployed commit: containment, not equality, exactly as at deployed.
+      stub_deployment()
+
+      assert {:ok, %Result{decision: :verified, deployment_id: 91}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :verified
+    end
+
+    test "AC-48.16.4: verifying a story from an intake record records a SHIPPED closure", ctx do
+      record = link_intake_record(ctx, 512)
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :verified}} = enforce(ctx)
+
+      assert [%IssueClosure{} = closure] = closures(ctx)
+      assert closure.verdict == :shipped
+      assert closure.status == :pending
+      assert closure.issue_number == 512
+      assert closure.intake_record_id == record.id
+    end
+
+    test "NO deployment yet WAITS at merged and is counted", ctx do
+      stub_deployments([])
+
+      assert {:ok, %Result{decision: :unresolved, unresolved_kind: :deploy_pending} = result} =
+               enforce(ctx)
+
+      assert {:deploy_not_started, @merge, "production"} in result.reasons
+      assert result.stage == :merged
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :merged
+      assert is_nil(row.release_id)
+
+      assert row.post_deploy_unresolved ==
+               %{"merge_sha" => @merge, "kind" => "deploy_pending", "count" => 1, "total" => 1}
+
+      assert closures(ctx) == []
+    end
+
+    test "NO deployment past the bound escalates FROM merged, as a deployed story does", ctx do
+      stub_deployments([])
+      limit = PostDeployVerification.max_consecutive_unresolved(:deploy_pending)
+
+      for _attempt <- 1..limit do
+        assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      end
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:unresolved_limit_exceeded, :deploy_pending, limit + 1, limit} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.attempts["verification_failed"] == 1
+      assert row.escalation_reason =~ "deploy_not_started"
+      assert row.escalation_reason =~ @merge
+    end
+
+    test "the count started at merged CARRIES OVER into deployed — one clock, from the merge",
+         ctx do
+      stub_deployments([])
+      assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+
+      # A carrying deployment still running: the story is not deployed yet either.
+      stub_deployment(state: :pending)
+      assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :merged
+      assert row.post_deploy_unresolved["total"] == 3
+
+      stub_deployment(sha: @merge)
+      assert {:ok, %Result{decision: :verified}} = enforce(ctx)
+      assert is_nil(Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved)
+    end
+
+    test "a FAILED carrying deploy escalates from merged, and never writes deployed", ctx do
+      stub_deployment(state: :failure)
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:deploy_not_successful, :failure, @deployed, @merge} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert is_nil(row.release_id)
+
+      refute Enum.any?(
+               Stages.list_events(ctx.tenant_id, ctx.story_id),
+               &(&1.event == "transitioned" and &1.to_stage == "deployed")
+             )
+    end
+
+    test "a runner that reported the deploy first wins the race; nothing is written twice",
+         ctx do
+      # The row moves to `deployed` between the stage read and the compare-and-set.
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        set_stage(ctx, :deployed)
+
+        {:ok,
+         %{
+           deployments: [
+             %{
+               id: 91,
+               sha: @merge,
+               state: :success,
+               succeeded?: true,
+               created_at: DateTime.utc_now()
+             }
+           ],
+           incomplete: nil
+         }}
+      end)
+
+      assert {:ok, %Result{decision: :verified, reasons: reasons}} = enforce(ctx)
+      assert {:transition_failed, :deployed, :forward, :stale_stage} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
+    end
+
+    test "a stale claim epoch cannot deploy it, and the failure is reported", ctx do
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :verified, reasons: reasons}} =
+               PostDeployVerification.enforce(
+                 ctx.tenant_id,
+                 ctx.story_id,
+                 Keyword.put(opts(), :claim_epoch, 99)
+               )
+
+      assert {:transition_failed, :deployed, :forward, :stale_claim_epoch} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+    end
+
+    test "a merged story with NO merge sha fails closed from merged", ctx do
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in StoryStage, where: s.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [merge_sha: nil])
+        end)
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("the forge must not be asked about a merge nothing recorded")
+      end)
+
+      assert {:ok, %Result{decision: :failed, reasons: [:merge_sha_not_recorded]}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a CHANGE-BOUND story at merged is chg's to deploy, and is not read", ctx do
+      # A chg landing reaches `merged` too, and chg's own `deployed` event moves it on.
+      fixture(:change_binding, %{tenant_id: ctx.tenant_id, story_id: ctx.story_id})
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("a chg story's deploy is chg's to report")
+      end)
+
+      assert {:error, :change_protocol} = evaluate(ctx)
+      assert {:error, :change_protocol} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :merged
+    end
+
+    test "a change-bound story at DEPLOYED is still verified (unchanged)", ctx do
+      fixture(:change_binding, %{tenant_id: ctx.tenant_id, story_id: ctx.story_id})
+      set_stage(ctx, :deployed)
+      stub_deployment(sha: @merge)
+
+      assert {:ok, %Result{decision: :verified, stage: :deployed}} = enforce(ctx)
+    end
+
+    test "tenant isolation: another tenant cannot read or advance this story", ctx do
+      other = build_story(fixture(:tenant, %{trust_tier: :agent_rooted}), "acme/other")
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("no forge read for a story outside the caller's tenant")
+      end)
+
+      before = Stages.get(ctx.tenant_id, ctx.story_id)
+
+      assert {:error, :not_found} =
+               PostDeployVerification.enforce(other.tenant_id, ctx.story_id, opts())
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).lock_version == before.lock_version
+    end
+  end
+
+  describe "the sweep, over merged stories (US-48.16)" do
+    test "TC-48.16.3: a deployed merge reaches verified; the other tenant's is its own", ctx do
+      at_merged(ctx)
+      link_intake_record(ctx, 77)
+      other = build_story(fixture(:tenant, %{trust_tier: :agent_rooted}), "acme/other")
+      at_merged(other)
+
+      # Only THIS repository's environment has a deployment of the merge. The other tenant's
+      # story is asked about under its own tenant and its own repository, and waits.
+      Mox.stub(MockPullRequestSource, :deployments_since, fn
+        %ForgeRepo{full_name: @repo}, "production", _since ->
+          {:ok,
+           %{
+             deployments: [
+               %{
+                 id: 91,
+                 sha: @merge,
+                 state: :success,
+                 succeeded?: true,
+                 created_at: DateTime.utc_now()
+               }
+             ],
+             incomplete: nil
+           }}
+
+        %ForgeRepo{full_name: "acme/other"}, "production", _since ->
+          {:ok, %{deployments: [], incomplete: nil}}
+      end)
+
+      assert :ok = perform_job(PostDeployVerificationWorker, %{})
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :verified
+      assert row.release_id == "91"
+      assert [%IssueClosure{verdict: :shipped, issue_number: 77}] = closures(ctx)
+
+      theirs = Stages.get(other.tenant_id, other.story_id)
+      assert theirs.stage == :merged
+      assert is_nil(theirs.release_id)
+      assert closures(other) == []
+    end
+
+    test "a change-bound merged story is not a candidate, so it cannot starve the batch", ctx do
+      at_merged(ctx)
+      fixture(:change_binding, %{tenant_id: ctx.tenant_id, story_id: ctx.story_id})
+      before = Stages.get(ctx.tenant_id, ctx.story_id)
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("a chg story at merged is not the sweep's")
+      end)
+
+      assert :ok = perform_job(PostDeployVerificationWorker, %{})
+      assert Stages.get(ctx.tenant_id, ctx.story_id).lock_version == before.lock_version
+
+      # The verifier would refuse it anyway, so the outcome above cannot see the FILTER.
+      # The candidate list can: a refused candidate is never touched, stays the oldest row,
+      # and holds a batch slot on every run.
+      unbound = build_story(%{id: ctx.tenant_id}, "acme/other")
+      at_merged(unbound)
+      ids = Enum.map(PostDeployVerificationWorker.candidates(), & &1.story_id)
+
+      assert unbound.story_id in ids
+      refute ctx.story_id in ids
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------------------
+
+  # A pr-route story as the runner leaves it (US-48.16 AC-1): `ci -> merged` reported with
+  # the merge sha, no release yet.
+  # The merge gate allowed @allowed_head and GitHub merged that head, so the ungated-merge
+  # read passes; `stub_merged_head/1` overrides it.
+  defp at_merged(ctx) do
+    {:ok, {1, _}} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(s in StoryStage, where: s.story_id == ^ctx.story_id)
+        |> Repo.update_all(
+          set: [
+            stage: :merged,
+            release_id: nil,
+            pr_number: 77,
+            merge_gate_allowed_sha: @allowed_head
+          ]
+        )
+      end)
+
+    stub_merged_head(@allowed_head)
+    :ok
+  end
+
+  defp stub_merged_head(head) do
+    Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{}, 77 ->
+      {:ok, %{merged?: true, head_sha: head, merge_sha: @merge}}
+    end)
+  end
+
+  defp link_intake_record(ctx, issue_number) do
+    record = fixture(:intake_record, %{tenant_id: ctx.tenant_id, issue_number: issue_number})
+
+    {:ok, {1, _}} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(s in Story, where: s.id == ^ctx.story_id)
+        |> Repo.update_all(set: [intake_record_id: record.id])
+      end)
+
+    record
+  end
+
+  defp closures(ctx) do
+    {:ok, rows} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.all(from c in IssueClosure, where: c.story_id == ^ctx.story_id)
+      end)
+
+    rows
+  end
 
   defp evaluate(ctx), do: PostDeployVerification.evaluate(ctx.tenant_id, ctx.story_id)
   defp enforce(ctx), do: PostDeployVerification.enforce(ctx.tenant_id, ctx.story_id, opts())

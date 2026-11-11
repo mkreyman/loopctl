@@ -22,10 +22,10 @@ gated, so escalating to a bigger key never clears a 403 there:
 
 | Endpoint | Gate |
 |----------|------|
-| `verify` / `reject` / `force_unclaim` / `verify_all` | `exact_role: :orchestrator` (`story_verification_controller.ex:28-29`) — a superadmin key CANNOT verify |
-| `contract` / `report` | `exact_role: [:agent, :orchestrator]` (`story_status_controller.ex:26-30`) — a human user key CANNOT report |
+| `verify` / `reject` / `force_unclaim` / `verify_all` | `exact_role: :orchestrator` (`story_verification_controller.ex:30-31`) — a superadmin key CANNOT verify |
+| `contract` / `report` | `exact_role: [:agent, :orchestrator]` (`story_status_controller.ex:48-52`) — a human user key CANNOT report |
 | `claim` / `start` / `request-review` / `unclaim` / `renew-claim` | `exact_role: :agent` (`story_status_controller.ex`) |
-| `review-complete` | `exact_role: [:orchestrator, :user]` (`review_record_controller.ex:22-23`) — an agent key never reaches the controller |
+| `review-complete` | `exact_role: [:orchestrator, :user]` (`review_record_controller.ex:24-25`) — an agent key never reaches the controller |
 
 **Anti-pattern: never "normalize" an `exact_role` custody gate to `role:`.** That is exactly what
 would let one high-privilege key both implement and report/verify.
@@ -42,7 +42,7 @@ Human-rooted operations additionally pass `RequireHumanAnchor`
 
 It is not a per-request WebAuthn check — WebAuthn is how a tenant EARNS `:human_anchored`. Keying on
 tier rather than role is what closes the self-minted-key bypass. **The plug is in NO router pipeline —
-it is opt-in per controller** (e.g. `story_verification_controller.ex:35`, `dispatch_controller.ex:16`,
+it is opt-in per controller** (e.g. `story_verification_controller.ex:37`, `dispatch_controller.ex:16`,
 `artifact_report_controller.ex:30`), so a new human-rooted endpoint gets NO trust-tier gate unless you
 add the plug line yourself.
 
@@ -89,15 +89,20 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   `self_verify_blocked`: the latter is an L6 byzantine signal that escalates to a tenant-wide halt,
   and an unmigrated legacy key would have armed it on every call. REJECT is exempt from that one
   refusal (`unlineaged_caller/3`) — sending work back is the remediation path, and refusing it
-  strands the story at reported_done. THEN the RECORDED verifier
+  strands the story at reported_done. On a PR-ROUTE story (`Intake.pr_route?/3`, US-48.18)
+  report, review-complete (before the nil-reviewer permit) and verify also refuse
+  `409 pr_route_verifier_only` unless the caller's lineage leaf is the bound
+  `verifier_dispatch_id` (`pr_route_verifier?/2`); it records no custody violation, and REJECT
+  is exempt from it too. A rebind (`bind_verifier_dispatch/4`) clears `verified_head_sha` with
+  the earlier verification. THEN the RECORDED verifier
   (`verify_recorded_separation/2`) when BOTH `implementer_dispatch_id` and
   `verifier_dispatch_id` are set, decided by `verify_lineage_separated/4`.
   An EMPTY lineage on either side (what an unloadable dispatch yields,
   `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:732-779`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:784`) instead of
+  `progress.ex:755-802`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:1093`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -115,12 +120,45 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   user-role key also has no `agent_id` and permitting on nil alone let an ANCESTOR of the
   implementer review its own subtree; then the reviewer's lineage; then plain equality. That nil
   permit has THREE parts, all of which must change
-  together: (a) the `exact_role: [:orchestrator, :user]` plug (`review_record_controller.ex:22-23`),
+  together: (a) the `exact_role: [:orchestrator, :user]` plug (`review_record_controller.ex:24-25`),
   which 403s an agent key before the controller runs — so the `:agent` branch of the controller cond
   is unreachable today; (b) `LoopctlWeb.ReviewRecordController.create/2`
-  (`lib/loopctl_web/controllers/review_record_controller.ex:92-116`), which rejects an orchestrator
+  (`lib/loopctl_web/controllers/review_record_controller.ex:125-151`), which rejects an orchestrator
   key with no `agent_id` and passes a literal `nil` (there is NO sentinel) for a user key; (c) the
   `Progress` permit itself.
+
+**chg-dispatched reviews (US-47.5) — `Loopctl.Changes.ReviewCustody`.** On a story with a change
+binding, review-complete additionally demands (after the three gates above, never instead) a
+reviewer whose LIVE lineage is a STRICT descendant of the chg root of the source that delivered
+the change (`chg_reviewer_required`; the root key too), a `commit_sha` that is an applied
+`submitted` revision of the CURRENT binding (`commit_sha_not_bound`), and one verdict per reviewer
+dispatch — a unique index, not a read (`chg_review_already_recorded`). Its mirror: a caller whose
+MINTING lineage is rooted at any registered `chg_root_dispatch_id` (live or revoked source, either
+mode) is refused `chg_root_cannot_verify` on verify / reject / verify-all / bulk verify+reject /
+backfill / bulk mark-complete and `chg_root_review_only` on claim / bulk claim / report, before
+any story is read. MINTING, because an expired chg key's live lineage is `[]` and reject admits
+`[]`. Neither refusal records a custody violation. The lineage gate always passes a chg
+reviewer, so it proves only that chg-server MINTED the key — separation of the job from the
+implementer is chg-server's to construct (PRD §6). A landing whose revision (`event.sha`) no chg
+review names is escalated over the control-only `:review_missing` in the landed event's own
+transaction (`EventEffects.after_move/5`), FAIL CLOSED: a refused hold rolls the landing back
+so chg redelivers it. The verify half is ONE function every path to `verified` calls —
+verify, verify-all, bulk verify, backfill, bulk mark-complete —
+`ReviewCustody.ensure_landed_review/3`: on a chg story it refuses `review_missing_escalated`
+while the stage is escalated over `:review_missing`, and `chg_review_not_for_landed_revision`
+unless a chg review names the LANDED revision (the `sha` of the newest applied `landed` event
+of the current binding). Escalation in general does NOT block verify; only this edge does.
+Neither refusal records a custody violation.
+
+**A chg story's CI evidence (US-47.6) — `Loopctl.Changes.TrunkEvidence`.** Right after that gate,
+on the same five paths, the landing's TRUNK commit (`data.merge_sha`, never `event.sha`) must be in
+`verified/master` (`PullRequestSource.contains?/3`; `chg_landing_not_trunk_verified`) and no applied
+`reverted` may follow the landing (`chg_landing_reverted`). The forge is read BEFORE the
+transaction (`assess/3`, `assess_many/3`) and applied under the lock only to the landing it was
+made for (`ensure_trunk_verified/4`); any forge failure, a 404 included, is
+`{:chg_trunk_unevaluated, reason, retry_after}` — a 503 with `Retry-After`, never a pass. Do not
+move the read into the Multi (a lock held across a network call), and do not short-circuit on the
+local `trunk_verified_sha`: the ref is the evidence.
 
 **Custody-orphan predicates are the ONLY guard for the never-dispatched case.** The DB CHECK
 `stories_reported_done_requires_agent` is satisfied whenever `implementer_dispatch_id IS NULL`, which
@@ -128,7 +166,7 @@ is exactly the orphaned shape — do not delete `custody_orphaned?/1` or `custod
 redundant with the constraint.
 
 **Backfill is the fourth way to reach `verified`, and its guard is `stories.lifecycle_entered_at`.**
-`backfill_story/4` / `ensure_mark_complete_allowed/2` certify with no report, no review record and no
+`backfill_story/4` / `ensure_mark_complete_allowed/3` certify with no report, no review record and no
 verifier, so they are confined to work that never entered the lifecycle. State alone cannot answer
 that: `force_unclaim_story/3` CLEARS `assigned_agent_id`, and a legacy bearer claim never writes
 `implementer_dispatch_id`, so claim -> force-unclaim leaves a worked story indistinguishable from
@@ -248,9 +286,9 @@ correct behavior; do not add a workaround.
   a read-then-write.
 
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
-(`progress.ex:540-563`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
+(`progress.ex:563-586`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:812-817`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:1121-1126`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
@@ -297,7 +335,7 @@ exist, but every one descends from the implementer's root — the single-root te
 not a shortage; its remedy is the operator minting an independently-rooted verifier tree.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:732-736`), and with `[]` the rejection is
+`select_rotating_verifier/3` passes `[]` (`progress.ex:770-774`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.
@@ -343,6 +381,24 @@ secret), and a `PATCH /api/v1/intake/sources/:id` that names `change_events_secr
 `chg_root_dispatch_id` OR sets `mode` to `chg` — a bare switch re-activates the secret and
 custody root the source kept — under its own code, `403 chg_registration_forbidden`, whose
 remedy is the operator key: a dispatch minted beneath the caller would be refused again.
+
+The registered `chg_root_dispatch_id` is judged again on EVERY change event, not only when the
+source is written: `POST /api/v1/change_events/:source_id` (US-47.3) re-reads the source and its
+root `FOR SHARE` inside the event's own transaction (`Loopctl.Intake.hold_chg_source/3`, the
+same rule as enrolment) and answers a revoked or reshaped root with the same 401 as a bad
+signature. That webhook holds no API key, so it carries no lineage and can perform no custody
+act; a `submitted` event's binding is always `submitter_not_claimant` and never writes
+`assigned_agent_id` or `implementer_dispatch_id`.
+
+The same holds for the stage moves an event makes (US-47.4, `Loopctl.Changes.EventEffects`):
+each is a CONTROL write inside the event's transaction, attributed `actor_role: :agent` with an
+attested-empty lineage, so no human-only edge (`:human_resolution`) is reachable from a change
+event. The change-protocol edges (`StageMachine.change_protocol_edges/0`) are held out of
+`runner_reportable_edges/0` and refused by `Stages.advance/4` to every caller — only the
+change-event path, `Stages.advance_in_tenant_transaction/4`, takes them; `:reverted` is a
+chained retraction like `:merge_refused`; and a
+story an operator escalated is never re-escalated or moved by an event — `escalated` still
+leaves only over `:human_resolution`.
 
 All three refusals are logged (`lineage_ceiling_refused`) and emit
 `[:loopctl, :custody, :lineage_ceiling_refused]`. A 403 body carries the caller's own

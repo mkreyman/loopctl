@@ -21,11 +21,22 @@ defmodule Loopctl.Delivery.TriageVerdict do
   hand the principal that read the reporter's text the ability to name its own gate outcome,
   which is the separation the whole machine is built on.
 
+  ## The routes, screens and effects are `triage@1`'s (Epic 48, US-48.5)
+
+  This module no longer holds a route table. The outcome routes, the route each screen takes
+  when it refuses and the effects a result drives are read from the spec
+  (`Loopctl.Agents.Specs.TriageV1`), and each screen and effect the spec names is a function
+  clause here keyed by that name — `screens/0` and `effects/0` — drawn from the closed sets
+  `Loopctl.Agents.Spec` checks a spec against when it compiles. `runnable/1` states what else
+  a spec must hold for this pass to apply it. What stays code whatever the spec says: the
+  triage step and its binding, the order of the screens, the draft screens running on every
+  draft, and the escalation reasons, which are built from enums.
+
   ## Every verdict passes through `triaged` first
 
-  `triage_for/1` returns the transitions IN ORDER, and every outcome begins with
+  `transitions_for/2` returns the transitions IN ORDER, and every outcome begins with
   `{:detected, :triaged, :forward}` — triage HAPPENED, whatever it concluded. Only then does
-  the outcome route:
+  the outcome route (`triage@1`):
 
   | `outcome` | transitions | what the reporter is told |
   |---|---|---|
@@ -98,24 +109,33 @@ defmodule Loopctl.Delivery.TriageVerdict do
   never re-screens. Past `triaged` the route has landed and there is nothing to do. Then the
   draft, then the one transition out of `triaged`.
 
-  ## An incomplete triage is not re-triaged, deliberately (US-44.2 round 3, finding 4)
+  ## An incomplete triage is re-triaged by a human, never re-queued
 
-  An `incomplete` run escalates. A human who re-queues it sends it on to an implementation the
-  merge gate will refuse: Gate A reads the bound dispatch's lens verdicts, an incomplete run
-  recorded none, and `Loopctl.Delivery.GateAInput` does not count the human resolution of an
-  incomplete run as a Gate A answer — so the merge gate refuses `:missing` and escalates
-  again. That refusal is the documented safe state, and it is kept rather than adding an
-  `escalated -> detected` re-triage edge, because `triage_dispatch_id` is a STORY-LIFETIME
-  identity (`StageMachine`) that no transition clears. A re-triage edge would have to clear it,
-  which gives a story two deciders over its life and reopens the question the binding exists
-  to close: whose lens verdicts Gate A reads. So the escalation is a person's to resolve, and
-  re-queueing it is the one resolution the merge gate will refuse — visibly, not silently.
+  An `incomplete` run escalates. A human who re-queues it (`to: queued`) sends it on to an
+  implementation the merge gate will refuse: Gate A reads the bound dispatch's lens verdicts,
+  an incomplete run recorded none, and `Loopctl.Delivery.GateAInput` does not count the human
+  resolution of an incomplete run as a Gate A answer — so the merge gate refuses `:missing`
+  and escalates again.
+
+  The resolution that works is the human-only re-triage, `escalated -> detected` (`to:
+  detected`). It is still ONE decider at a time, which is what the binding exists to hold:
+  - the edge clears `triage_dispatch_id`, so the next `detected -> triaged` binds the new
+    dispatch, and Gate A reads that one;
+  - `Loopctl.Delivery.Escalations.resolve/3` supersedes the old triage dispatches first
+    (`DispatchLedger.supersede_triage_dispatches/2`), so a resend of the discarded verdict is
+    refused `:dispatch_not_accepted` and cannot bind the story again (the claim epoch cannot
+    fence it, because nothing moves it on an unclaimed story);
+  - `GateAInput` forgets any Gate A answer a human gave before the re-triage;
+  - a story an implementer touched is refused `not_retriageable`.
   """
 
   import Ecto.Query
 
   require Logger
 
+  alias Loopctl.Agents.Outcomes
+  alias Loopctl.Agents.Spec
+  alias Loopctl.Agents.Specs.TriageV1
   alias Loopctl.Audit
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.ImplementerInput
@@ -137,12 +157,37 @@ defmodule Loopctl.Delivery.TriageVerdict do
   @type outcome :: String.t()
   @type transition :: {StageMachine.stage(), StageMachine.stage(), StageMachine.edge()}
 
-  # THE TRIAGE STEP ITSELF, taken by every outcome. See the moduledoc for why the
-  # intermediate `triaged` is load-bearing rather than bookkeeping.
-  @triaged {:detected, :triaged, :forward}
+  @type option :: {:spec, Spec.t()}
 
-  # The escalation that replaces a `story` route: the screen's, or a draft loopctl cannot use.
-  @escalate {:triaged, :escalated, :triage_escalate}
+  # THE TRIAGE STEP ITSELF, taken by every outcome. See the moduledoc for why the
+  # intermediate `triaged` is load-bearing rather than bookkeeping. ARCHETYPE SEMANTICS, not a
+  # spec field: `detected -> triaged` is the transition that carries the `triage_dispatch_id`
+  # binding, and `Stages.advance/4` refuses `:triage_not_bound` for every transition out of
+  # `triaged`, so a spec may only NAME it as the head of each route (`runnable/1` holds it to
+  # exactly this), never move it.
+  @triage_step {:detected, :triaged, :forward}
+
+  # The spec outcome a message's `incomplete` branch routes through. Not a verdict outcome: the
+  # contract's `outcome` enum never carries it, so `outcomes/0` leaves it out.
+  @incomplete "incomplete"
+
+  # THE SCREENS THIS MODULE RUNS, in the order it runs them, each a function clause below named
+  # by the spec's `screens` key and drawn from `Spec.screen_names/0`, the closed set a spec is
+  # checked against when it compiles.
+  #
+  # The VERDICT screens run iff the spec names them: Gate A's codes first, then Gate B's.
+  @verdict_screens [:gate_a, :gate_b]
+
+  # The DRAFT screens run on every draft, whatever the spec says: the injection screen on
+  # anything that becomes a row is untrusted-input handling, which stays code (Epic 48 PRD,
+  # "What stays code"). The spec names the route each takes when it refuses, and `runnable/1`
+  # refuses a spec that writes a draft without naming both.
+  @draft_screens [:draft_injection, :draft_dispatchable]
+
+  # THE EFFECTS THIS MODULE APPLIES, each named by the spec's `effects` and drawn from
+  # `Spec.effect_names/0`: the triage binding on the triage step, and the drafted story before
+  # the transition out of `triaged`.
+  @effects [:triage_dispatch_id, :story_draft]
 
   # The gate screen's recorded codes: a count bound, and the sentinel `screen_codes/1` ends a
   # partial list with. See there.
@@ -153,43 +198,147 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # judgement, and writing it into the row is control's act, exactly as the transition is.
   @draft_actor "control:triage_draft"
 
-  @routes %{
-    "story" => [{:triaged, :queued, :forward}],
-    "escalate" => [{:triaged, :escalated, :triage_escalate}],
-    "reject" => [{:triaged, :failed, :triage_reject}]
-  }
-
   @doc """
-  The transitions a verdict implies, in order, or `{:error, {:unknown_outcome, outcome}}`.
+  The transitions a verdict implies, in order, or `{:error, {:unknown_outcome, outcome}}`:
+  the spec's route for `outcome` (`triage@1` by default, `Loopctl.Agents.Specs.TriageV1`).
 
   PURE. Takes the outcome string a cast verdict carries — never the verdict map — because
   everything else in that map is reporter-shaped and has no part in this decision.
 
   An unknown outcome is an ERROR rather than an empty list. `cast_triage_verdict/1` already
-  constrains the enum, so reaching this clause means the contract and this table disagree,
+  constrains the enum, so reaching this clause means the contract and the spec disagree,
   and the safe reading of a verdict loopctl cannot interpret is not "do nothing" — a story
   silently left at `detected` is retried by the trigger worker for ever against a condition
-  nothing reports.
+  nothing reports. `"#{@incomplete}"` is unknown here too: it is the route of a message's
+  `incomplete` branch (`incomplete_transitions/1`), never a verdict's outcome.
   """
-  @spec transitions_for(outcome()) :: {:ok, [transition()]} | {:error, {:unknown_outcome, term()}}
-  def transitions_for(outcome) when is_binary(outcome) do
-    case Map.fetch(@routes, outcome) do
-      {:ok, rest} -> {:ok, [@triaged | rest]}
+  @spec transitions_for(outcome(), Spec.t()) ::
+          {:ok, [transition()]} | {:error, {:unknown_outcome, term()}}
+  def transitions_for(outcome, spec \\ TriageV1.spec())
+
+  def transitions_for(outcome, %Spec{outcomes: outcomes})
+      when is_binary(outcome) and outcome != @incomplete do
+    case Map.fetch(outcomes, outcome) do
+      {:ok, route} -> {:ok, route}
       :error -> {:error, {:unknown_outcome, outcome}}
     end
   end
 
-  def transitions_for(outcome), do: {:error, {:unknown_outcome, outcome}}
+  def transitions_for(outcome, %Spec{}), do: {:error, {:unknown_outcome, outcome}}
 
   @doc """
-  Every outcome this module routes, which must be exactly the contract's enum.
+  Every verdict outcome the spec routes, which must be exactly the contract's enum.
 
   Public so the drift between the two is a TEST rather than a comment: an outcome added to
-  `RunnerTriageVerdict` and forgotten here would cast successfully and then fail to route,
-  which is the shape where the wire says yes and the machine says nothing.
+  `RunnerTriageVerdict` and forgotten in the spec would cast successfully and then fail to
+  route, which is the shape where the wire says yes and the machine says nothing.
   """
-  @spec outcomes() :: [String.t()]
-  def outcomes, do: @routes |> Map.keys() |> Enum.sort()
+  @spec outcomes(Spec.t()) :: [String.t()]
+  def outcomes(%Spec{outcomes: outcomes} \\ TriageV1.spec()),
+    do: outcomes |> Map.keys() |> List.delete(@incomplete) |> Enum.sort()
+
+  @doc """
+  Each verdict outcome and the transitions it takes OUT of `triaged`: the spec's routes without
+  the shared triage step every one begins with.
+  """
+  @spec routes(Spec.t()) :: %{String.t() => [transition()]}
+  def routes(%Spec{} = spec \\ TriageV1.spec()),
+    do: Map.new(outcomes(spec), &{&1, tl(Map.fetch!(spec.outcomes, &1))})
+
+  @doc """
+  The transitions an `incomplete` triage message implies, in order: the spec's
+  `"#{@incomplete}"` route. In `triage@1` that is the triage step, then the same escalation an
+  `escalate` verdict takes, for every incomplete reason.
+  """
+  @spec incomplete_transitions(Spec.t()) :: [transition(), ...]
+  def incomplete_transitions(%Spec{outcomes: outcomes} \\ TriageV1.spec()),
+    do: Map.fetch!(outcomes, @incomplete)
+
+  @doc """
+  The screens this module runs, in order: the verdict screens a spec may switch on by naming
+  them, then the draft screens every draft runs. Each is a name in `Spec.screen_names/0`.
+
+  `:payload_too_large` is not here: it is the DISPATCH pass's screen
+  (`Loopctl.Agents.Dispatcher`), refused before a verdict can exist.
+  """
+  @spec screens() :: [atom()]
+  def screens, do: @verdict_screens ++ @draft_screens
+
+  @doc "The effects this module applies, each a name in `Spec.effect_names/0`."
+  @spec effects() :: [atom()]
+  def effects, do: @effects
+
+  @doc """
+  `:ok` when `spec` is one this module can apply a result of, else `{:error, problems}`.
+
+  A spec is code, so a refusal here is a programming error and `apply/4` raises on it; it is
+  public so the registry's spec is held to it by a test rather than by the first verdict.
+  What it holds, each because the pass is built on it:
+
+  - the archetype is `:judge`, and the outcomes include `"#{@incomplete}"`;
+  - every outcome route is the triage step `#{inspect(@triage_step)}` and then ONE transition
+    out of `triaged`, and so is every screen route this module takes;
+  - the effects are a subset of `effects/0` and include `:triage_dispatch_id`: the binding is
+    the custody the `:triage_not_bound` refusal reads, so a `:judge` result never applies
+    without it;
+  - an outcome that QUEUES the story requires `:story_draft` (a queued stub is work dispatched
+    against nothing), and a spec naming `:story_draft` names a route for both draft screens.
+  """
+  @spec runnable(Spec.t()) :: :ok | {:error, [String.t()]}
+  def runnable(%Spec{} = spec) do
+    drafts? = :story_draft in spec.effects
+    queues? = Enum.any?(Map.values(spec.outcomes), &(&1 |> List.last() |> queues?()))
+    unapplied = spec.effects -- @effects
+    unrouted = if drafts?, do: @draft_screens -- Map.keys(spec.screens), else: []
+
+    checks = [
+      {spec.archetype == :judge, "archetype #{inspect(spec.archetype)} is not :judge"},
+      {Map.has_key?(spec.outcomes, @incomplete), "no #{inspect(@incomplete)} outcome"},
+      {unapplied == [], "effects #{inspect(unapplied)} are not applied here"},
+      {:triage_dispatch_id in spec.effects, "no :triage_dispatch_id effect"},
+      {drafts? or not queues?, "an outcome queues the story with no :story_draft effect"},
+      {unrouted == [], "a :story_draft spec names no route for #{inspect(unrouted)}"}
+    ]
+
+    problems =
+      for({false, problem} <- checks, do: problem) ++
+        bad_routes(spec.outcomes, "outcome", &match?([@triage_step, {:triaged, _, _}], &1)) ++
+        bad_routes(Map.take(spec.screens, taken_screens(spec)), "screen", &leaves_triaged?/1)
+
+    if problems == [], do: :ok, else: {:error, problems}
+  end
+
+  defp leaves_triaged?([{:triaged, _to, _edge}]), do: true
+  defp leaves_triaged?(_route), do: false
+
+  # The screens of `spec` this module takes the route of.
+  defp taken_screens(spec) do
+    Enum.filter(@verdict_screens, &Map.has_key?(spec.screens, &1)) ++
+      if(:story_draft in spec.effects, do: @draft_screens, else: [])
+  end
+
+  defp bad_routes(routes, what, ok?) do
+    for {name, route} <- Enum.sort(routes), not ok?.(route) do
+      "#{what} #{inspect(name)} route #{inspect(route)} is not the shape this pass takes"
+    end
+  end
+
+  defp runnable!(spec) do
+    case runnable(spec) do
+      :ok ->
+        :ok
+
+      {:error, problems} ->
+        raise ArgumentError,
+              "#{spec.id}@#{spec.version}: Loopctl.Delivery.TriageVerdict cannot apply its " <>
+                "result: " <> Enum.join(problems, "; ")
+    end
+  end
+
+  # The one route that CONTINUES the loop: it hands the story on to be built, so it is the one
+  # the verdict screens can turn into an escalation and the one that needs a draft.
+  defp queues?({:triaged, :queued, _edge}), do: true
+  defp queues?(_transition), do: false
 
   @doc """
   True when the verdict's outcome ends the story rather than passing it on.
@@ -257,27 +406,94 @@ defmodule Loopctl.Delivery.TriageVerdict do
   built from the ENUMS (`triage_verdict:escalate`, `triage_verdict:<incomplete_reason>`), both
   of which the cast already constrained, and the session's own prose stays in the verdict
   record where an operator reads it as data.
+
+  ## Routed by the spec (US-48.5)
+
+  The outcome routes, the screens' routes and the effects are `triage@1`'s
+  (`Loopctl.Agents.Specs.TriageV1`); `:spec` replaces it, and is only ever set by code — a
+  spec is a compiled module, never request data. A spec this module cannot apply
+  (`runnable/1`) raises `ArgumentError`, a programming error rather than a refusal.
   """
-  @spec apply(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+  @spec apply(Ecto.UUID.t(), Ecto.UUID.t(), map(), [option()]) ::
           {:ok, %{record: TriageVerdictRecord.t(), replayed?: boolean()}} | {:error, error()}
-  def apply(tenant_id, runner_id, %{} = message) do
+  def apply(tenant_id, runner_id, %{} = message, opts \\ []) do
+    spec = Keyword.get_lazy(opts, :spec, &TriageV1.spec/0)
+    :ok = runnable!(spec)
+
     with {:ok, session} <-
            DispatchLedger.accepted_session(tenant_id, runner_id, message.dispatch_id,
-             kind: "triage"
+             kind: spec.kind
            ),
          :ok <- epoch_matches(session, message),
-         {:ok, leave} <- route(message),
+         {:ok, leave} <- route(message, spec),
          {:ok, row} <- bound(tenant_id, session.story_id, message.dispatch_id),
-         {:ok, record, replayed?} <- record(tenant_id, session, message) do
+         {:ok, record, replayed?} <- record(tenant_id, session, message, leave) do
       ctx = %{
         tenant_id: tenant_id,
         runner_id: runner_id,
         session: session,
         message: message,
-        leave: leave
+        leave: leave,
+        spec: spec
       }
 
       with :ok <- drive(ctx, row, :first), do: {:ok, %{record: record, replayed?: replayed?}}
+    end
+  end
+
+  @typedoc "A screen `screen_message/2` names as refusing, and the codes it refused with."
+  @type refusal :: {atom(), [String.t()]}
+
+  @type screen_option ::
+          {:spec, Spec.t()}
+          | {:resolve_repo, (-> {:ok, String.t()} | {:error, term()})}
+          | {:story, Story.t()}
+
+  @doc """
+  Every screen `apply/4` would run over a cast `triage_verdict` message, with NOTHING read or
+  written: the refusing screens, in the order they run, each with its codes (US-48.10).
+
+  It is how a recorded eval result is replayed (`Loopctl.DeliveryGates.Measurement.EvalReplay`),
+  so it is built from the same functions the live pass calls, not a copy of them: the route
+  (`route/2`), the verdict screens and their codes (`screen_verdict/4`, whose decision is what
+  the triage step records under `gate_screen`), and the draft as it would be written and
+  screened (`screen_draft/2`). What it supplies in place of a read:
+
+  - `:resolve_repo` (required) — what `repo_for_story/2` answers live: the story's one live
+    intake source's repository, `{:ok, repo}` or `{:error, reason}`. Called only when Gate B
+    is named and the route queues, exactly as live.
+  - `:story` — the stub row the draft replaces (`%Story{}` by default); the draft screens read
+    its `metadata` and judge the draft as `ImplementerInput.story_object/2` would.
+  - `:spec` — `triage@1` by default.
+
+  A draft screen refusal is listed AFTER the verdict screens', as live: the triage step records
+  the verdict screens' codes first, and the draft's refusal decides the route out of `triaged`.
+  Only the first refusing draft screen is listed, because live stops at it. A write-time
+  refusal of the draft row (a changeset the database refuses) is not a screen and is not here.
+
+  `{:error, reason}` is a message no route applies to — the refusal `apply/4` would answer.
+  """
+  @spec screen_message(map(), [screen_option()]) :: {:ok, [refusal()]} | {:error, error()}
+  def screen_message(%{} = message, opts) do
+    spec = Keyword.get_lazy(opts, :spec, &TriageV1.spec/0)
+    resolve_repo = Keyword.fetch!(opts, :resolve_repo)
+    story = Keyword.get(opts, :story, %Story{})
+    :ok = runnable!(spec)
+
+    with {:ok, leave} <- route(message, spec),
+         {:ok, draft} <- drafted_story(leave, message) do
+      {_decision, refused} = screen_verdict(spec, leave, message, resolve_repo)
+      {:ok, refused ++ draft_refusal(story, draft)}
+    end
+  end
+
+  defp draft_refusal(_story, nil), do: []
+
+  defp draft_refusal(story, draft) do
+    case screen_draft(story, draft) do
+      {:ok, _attrs} -> []
+      {:error, {:draft_flagged, signals}} -> [{:draft_injection, signals}]
+      {:error, {:draft_not_dispatchable, violations}} -> [{:draft_dispatchable, violations}]
     end
   end
 
@@ -299,24 +515,27 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
   defp epoch_matches(_session, _message), do: {:error, :claim_epoch_mismatch}
 
-  defp route(%{incomplete: reason}) when is_binary(reason) do
-    # EVERY incomplete reason escalates. A triage run that produced nothing usable needs a
-    # human, which is what `escalate` means; the enum exists so an operator can tell a crash
-    # from a refused verdict, not so they route differently.
-    {:ok, @escalate}
+  defp route(%{incomplete: reason}, spec) when is_binary(reason) do
+    # EVERY incomplete reason takes the one `"incomplete"` route. In `triage@1` it escalates: a
+    # triage run that produced nothing usable needs a human, which is what `escalate` means;
+    # the enum exists so an operator can tell a crash from a refused verdict, not so they
+    # route differently.
+    [@triage_step, leave] = incomplete_transitions(spec)
+    {:ok, leave}
   end
 
   # Every route is the triage step and then ONE transition out of `triaged`, and the pass is
-  # built on that; a route of any other shape is a CaseClauseError here, never a success that
-  # applied nothing.
-  defp route(%{verdict: %{outcome: outcome}}) do
-    case transitions_for(outcome) do
-      {:ok, [@triaged, leave]} -> {:ok, leave}
+  # built on that (`runnable/1` holds the spec to it); a route of any other shape is a
+  # CaseClauseError here, never a success that applied nothing.
+  defp route(%{verdict: %{outcome: outcome}}, spec) do
+    case transitions_for(outcome, spec) do
+      {:ok, [@triage_step, leave]} -> {:ok, leave}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp route(_message), do: {:error, {:invalid, ["exactly_one_of_verdict_or_incomplete"]}}
+  defp route(_message, _spec),
+    do: {:error, {:invalid, ["exactly_one_of_verdict_or_incomplete"]}}
 
   # WHO MAY APPLY A VERDICT TO THIS STORY, decided off the stage row before anything is recorded,
   # screened or read: anyone while it is still at `detected` (the triage step's compare-and-set
@@ -337,11 +556,11 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # `{:ok, record, replayed?}`. The lens entries are keyed by lens once stored, so their arrival
   # order is not part of what was said: sorted before hashing, a resend that rebuilt the list in
   # another order is still the same verdict rather than a permanent `already_recorded`.
-  defp record(tenant_id, session, message) do
+  defp record(tenant_id, session, message, leave) do
     digest = message |> sort_lens_verdicts() |> TriageVerdictRecord.digest()
 
     with :none <- recorded(tenant_id, message.dispatch_id, digest),
-         do: insert_record(tenant_id, session, message, digest)
+         do: insert_record(tenant_id, session, message, digest, leave)
   end
 
   # INSIDE `with_tenant/2`, because `triage_verdicts` is RLS-scoped and a read with no tenant
@@ -374,7 +593,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
-  defp insert_record(tenant_id, session, message, digest) do
+  defp insert_record(tenant_id, session, message, digest, {_from, destination, _edge}) do
     verdict = Map.get(message, :verdict)
 
     attrs = %{
@@ -394,7 +613,9 @@ defmodule Loopctl.Delivery.TriageVerdict do
       payload_digest: digest
     }
     |> TriageVerdictRecord.create_changeset(attrs)
-    |> then(fn changeset -> in_tenant(tenant_id, fn -> Repo.insert(changeset) end) end)
+    |> then(fn changeset ->
+      in_tenant(tenant_id, fn -> insert_with_outcome(changeset, message, attrs, destination) end)
+    end)
     |> case do
       {:ok, record} ->
         {:ok, record, false}
@@ -410,12 +631,41 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
+  # The verdict row and its run outcome (US-48.12) in the one tenant transaction: the outcome
+  # is recorded only by the delivery that inserted the verdict, so a resend records nothing.
+  defp insert_with_outcome(changeset, message, attrs, destination) do
+    with {:ok, record} <- Repo.insert(changeset) do
+      :ok = record_outcome(record.tenant_id, message, attrs, destination)
+      {:ok, record}
+    end
+  end
+
   # The unique index racing another delivery of the SAME verdict — a rejoin whose old channel is
   # still draining, two sockets, two nodes. Re-read and compare rather than refusing:
   # `already_recorded` is published as PERMANENT, so a conforming runner would never resend and
   # the documented close of this race could not happen.
   defp raced(tenant_id, dispatch_id, digest) do
     with :none <- recorded(tenant_id, dispatch_id, digest), do: {:error, :already_recorded}
+  end
+
+  # The triage run's outcome row (US-48.12), in the verdict record's own transaction: the
+  # verdict is the session's end. The `verdict` signal is the outcome's enum and the stage
+  # the spec routes it to — the destination a human's later resolution is judged against
+  # (`Loopctl.Agents.Outcomes`). Enums only, never the session's prose.
+  defp record_outcome(tenant_id, message, attrs, destination) do
+    {end_reason, value} =
+      case attrs.outcome do
+        nil ->
+          {"triage_incomplete",
+           %{"incomplete" => attrs.incomplete_reason, "destination" => to_string(destination)}}
+
+        outcome ->
+          {"triage_verdict", %{"outcome" => outcome, "destination" => to_string(destination)}}
+      end
+
+    Outcomes.record_result_in(Repo, tenant_id, message.dispatch_id, end_reason, [
+      {"verdict", value, "triage_verdict"}
+    ])
   end
 
   defp unique_violation?(%Ecto.Changeset{errors: errors}) do
@@ -459,7 +709,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp drive(ctx, %StoryStage{stage: :detected}, :first) do
     decision = screen(ctx)
 
-    case advance(ctx, @triaged, ctx.message.claim_epoch, screen_event(decision)) do
+    case advance(ctx, @triage_step, ctx.message.claim_epoch, screen_event(decision)) do
       {:ok, _row} ->
         finish(ctx, decision)
 
@@ -488,10 +738,11 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # that reaches `queued` carrying the stub row is work dispatched against a repository name and
   # an issue number, while a draft with no advance is simply queued by the next resend.
   #
-  # A draft loopctl cannot dispatch, or one that scans as injection, escalates INSTEAD of the
-  # route and keeps the stub row; otherwise the route is taken, or the screen's escalation.
+  # A draft loopctl cannot dispatch, or one that scans as injection, takes its screen's route
+  # INSTEAD of the outcome's and keeps the stub row; otherwise the outcome's route is taken, or
+  # the refusing verdict screen's.
   defp finish(ctx, decision) do
-    case draft(ctx) do
+    case effect(:story_draft, ctx) do
       :ok ->
         ctx |> out_of_triaged(decision) |> then(&leave(ctx, &1))
 
@@ -505,7 +756,11 @@ defmodule Loopctl.Delivery.TriageVerdict do
       # blanking the stub would have destroyed the only usable thing on the row.
       {:error, {:draft_not_dispatchable, violations}} ->
         warn(ctx, "triage draft not dispatchable", violations)
-        leave(ctx, {@escalate, "triage_verdict:draft_not_dispatchable"})
+
+        leave(
+          ctx,
+          {screen_route(ctx, :draft_dispatchable), "triage_verdict:draft_not_dispatchable"}
+        )
 
       # A DRAFT THAT SCANS AS INJECTION IS ESCALATED, NOT QUEUED — same disposition as one
       # loopctl cannot dispatch, for a stronger reason. See `unflagged/1`: the drafted text is
@@ -515,7 +770,8 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
         leave(
           ctx,
-          {@escalate, {"triage_verdict:draft_flagged", flagged_event_data(signals)}}
+          {screen_route(ctx, :draft_injection),
+           {"triage_verdict:draft_flagged", flagged_event_data(signals)}}
         )
 
       {:error, reason} ->
@@ -528,7 +784,31 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp out_of_triaged(ctx, {:escalate, codes}) do
     warn(ctx, "triage verdict refused by the gate screen", codes)
-    {@escalate, screen_event({:escalate, codes})}
+    {screen_route(ctx, refusing_screen(ctx.spec, codes)), screen_event({:escalate, codes})}
+  end
+
+  # THE ROUTE A REFUSING SCREEN TAKES, from the spec. `runnable/1` holds every route this module
+  # takes to one transition out of `triaged`.
+  defp screen_route(%{spec: spec}, screen) do
+    [leave] = Map.fetch!(spec.screens, screen)
+    leave
+  end
+
+  # Which verdict screen refused, read off the recorded CODES, because a resend reads the
+  # decision back from the triage step's event and the codes are all it recorded. Gate A's codes
+  # come first and are the only ones carrying `gate_a:` or `trio_verdict:`; anything else is
+  # Gate B's. A list holding only the overflow sentinel lost every code, and Gate A's are never
+  # the ones dropped (they carry no pattern), so it is Gate B's.
+  #
+  # A decision recorded under a spec that named a screen this one does not is read as the
+  # verdict screen this spec DOES name: it is still a refusal, and a refusal is never a queue.
+  defp refusing_screen(spec, [code | _rest]) do
+    named = Enum.filter(@verdict_screens, &Map.has_key?(spec.screens, &1))
+
+    screen =
+      if String.starts_with?(code, ["gate_a:", "trio_verdict:"]), do: :gate_a, else: :gate_b
+
+    if screen in named, do: screen, else: List.first(named, screen)
   end
 
   defp warn(ctx, what, codes) do
@@ -611,14 +891,33 @@ defmodule Loopctl.Delivery.TriageVerdict do
         actor_role: :agent,
         actor_lineage: [],
         session_dispatch: {ctx.message.dispatch_id, ctx.session.slot_generation}
-      ] ++ event_data ++ binding(transition, ctx.message)
+      ] ++ event_data ++ binding(transition, ctx)
 
     Stages.advance(ctx.tenant_id, ctx.session.story_id, transition, opts)
   end
 
-  # The triage step names the dispatch that took it, in its own transaction.
-  defp binding(@triaged, message), do: [effects: [triage_dispatch_id: message.dispatch_id]]
-  defp binding(_transition, _message), do: []
+  # The triage step names the dispatch that took it, in its own transaction: the spec's
+  # `:triage_dispatch_id` effect, which `runnable/1` requires of every spec this module applies.
+  defp binding(@triage_step, ctx), do: effect(:triage_dispatch_id, ctx)
+  defp binding(_transition, _ctx), do: []
+
+  # ── the effects, by the name the spec gives them ──────────────────────────────────────────
+
+  # Each returns what its write needs, and applies only when the spec names it:
+  #
+  # - `:triage_dispatch_id` — the `Stages.advance/4` effect the triage step carries;
+  # - `:story_draft` — the drafted story, written before the transition out of `triaged`.
+  defp effect(name, %{spec: spec} = ctx) when name in @effects do
+    if name in spec.effects, do: apply_effect(name, ctx), else: unnamed_effect(name)
+  end
+
+  defp apply_effect(:triage_dispatch_id, ctx),
+    do: [effects: [triage_dispatch_id: ctx.message.dispatch_id]]
+
+  defp apply_effect(:story_draft, ctx), do: draft(ctx)
+
+  defp unnamed_effect(:triage_dispatch_id), do: []
+  defp unnamed_effect(:story_draft), do: :ok
 
   # ENUM VALUES ONLY. See the `apply/3` doc: the verdict's own escalation prose was written
   # by a session that had just read reporter text, and this string lands in an append-only
@@ -644,7 +943,31 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # `Audit.create_log_entry/2` writes on `AdminRepo` — a different pool, three connections wide —
   # and a checkout timeout there RAISES, so inside the transaction it would roll the drafted row
   # back and escape as an exception. The audit row is a record OF a committed write.
-  defp draft(%{message: %{verdict: %{outcome: "story", story: %{} = draft}}} = ctx) do
+  #
+  # "An accepted verdict" is the outcome whose route QUEUES the story (`story` in `triage@1`),
+  # read off the route the spec gave it rather than off the outcome's name.
+  defp draft(%{leave: leave, message: message} = ctx) do
+    case drafted_story(leave, message) do
+      {:ok, nil} -> :ok
+      {:ok, draft} -> write_drafted(ctx, draft)
+      {:error, _reason} = missing -> missing
+    end
+  end
+
+  # The draft a message carries for THIS route: `nil` when the route does not queue (or the
+  # message is an `incomplete`), the verdict's `story` when it does. Shared by the live write
+  # and `screen_message/2`, so both decide "is there a draft to screen" the same way.
+  defp drafted_story(leave, %{verdict: %{} = verdict}) do
+    cond do
+      not queues?(leave) -> {:ok, nil}
+      is_map(Map.get(verdict, :story)) -> {:ok, verdict.story}
+      true -> missing_draft(verdict)
+    end
+  end
+
+  defp drafted_story(_leave, _message), do: {:ok, nil}
+
+  defp write_drafted(ctx, draft) do
     %{tenant_id: tenant_id, session: %{story_id: story_id}} = ctx
 
     in_tenant(tenant_id, fn ->
@@ -661,13 +984,11 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   # `cast_triage_verdict/1` requires `story` when the outcome is `story` (its `story_pairing`
   # rule), so this clause is unreachable through the channel. It is here because the
-  # alternative — falling through to the no-op below — would QUEUE the stub row: a runner
-  # would be sent a story whose title is a repository name and an issue number, with no
-  # acceptance criteria, which is work dispatched against nothing.
-  defp draft(%{message: %{verdict: %{outcome: "story"}}}),
-    do: {:error, {:invalid, ["story is required when outcome is story"]}}
-
-  defp draft(_ctx), do: :ok
+  # alternative — a no-op — would QUEUE the stub row: a runner would be sent a story whose
+  # title is a repository name and an issue number, with no acceptance criteria, which is work
+  # dispatched against nothing.
+  defp missing_draft(%{outcome: outcome}),
+    do: {:error, {:invalid, ["story is required when outcome is #{outcome}"]}}
 
   # THE ROW'S OWN STAGE AND BINDING, read in the draft's transaction, decide whether this draft
   # is written. `drive/3` reaches here only with the row at `triaged` and bound to this dispatch;
@@ -703,6 +1024,12 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp drafted(other), do: other
 
   defp write_draft(story, draft) do
+    with {:ok, attrs} <- screen_draft(story, draft), do: write(story, attrs)
+  end
+
+  # THE DRAFT AS IT WOULD BE WRITTEN, and every draft screen over it: `{:ok, attrs}` or the
+  # first screen's refusal. Reads and writes nothing, so `screen_message/2` runs exactly this.
+  defp screen_draft(story, draft) do
     attrs = %{
       title: Untrusted.sanitise(Map.get(draft, :title)),
       description: Untrusted.sanitise(Map.get(draft, :description)),
@@ -710,11 +1037,22 @@ defmodule Loopctl.Delivery.TriageVerdict do
       metadata: draft_metadata(story, draft)
     }
 
-    with :ok <- unflagged(attrs),
-         :ok <- dispatchable(story, attrs) do
-      write(story, attrs)
-    end
+    with :ok <- draft_screens(story, attrs), do: {:ok, attrs}
   end
+
+  # EVERY DRAFT SCREEN, IN ORDER, on every draft: the first refusal stands. Not filtered by the
+  # spec (see `@draft_screens`); the spec names only the route each refusal takes.
+  defp draft_screens(story, attrs) do
+    Enum.reduce_while(@draft_screens, :ok, fn screen, :ok ->
+      case draft_screen(screen, story, attrs) do
+        :ok -> {:cont, :ok}
+        refused -> {:halt, refused}
+      end
+    end)
+  end
+
+  defp draft_screen(:draft_injection, _story, attrs), do: unflagged(attrs)
+  defp draft_screen(:draft_dispatchable, story, attrs), do: dispatchable(story, attrs)
 
   # THE DRAFT IS SCANNED, BECAUSE SANITISING IS NOT SCREENING (#804 hop 2).
   #
@@ -779,10 +1117,25 @@ defmodule Loopctl.Delivery.TriageVerdict do
   def draft_signals, do: @draft_signals
 
   defp unflagged(attrs) do
-    case attrs |> scannable() |> InjectionDetector.scan() |> Enum.filter(&acted_on?/1) do
+    case attrs |> scannable() |> draft_flags() do
       [] -> :ok
       signals -> {:error, {:draft_flagged, signals}}
     end
+  end
+
+  @doc """
+  The DRAFT screen over session-authored `fields` (`{field, text}` pairs, as
+  `InjectionDetector.scan/1` takes them): the detector's `"<signal>:<field>"` codes whose
+  signal is one of `draft_signals/0`, sorted. `[]` is clean.
+
+  The one implementation of "is this session-written text instruction-shaped", shared by the
+  drafted story here and by `reply_draft@1`'s `:injection_detector_draft` screen
+  (`Loopctl.ReplyDrafts.screen/1`), so the calibration `draft_false_positive_test.exs` pins
+  binds both.
+  """
+  @spec draft_flags([{String.t(), String.t() | nil}]) :: [String.t()]
+  def draft_flags(fields) when is_list(fields) do
+    fields |> InjectionDetector.scan() |> Enum.filter(&acted_on?/1)
   end
 
   # A signal is `"<name>:<field>"`, and the field half is ours — it cannot contain a colon.
@@ -960,24 +1313,65 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # is recorded as codes on that step's own event (`screen_event/1`). Every later attempt reads
   # it back (`recorded_decision/1`): the screen reads live facts — the intake source, the
   # trigger configuration — and a re-screen after either changed could reverse a refusal the
-  # first attempt had already reached. Only a `story` outcome is about to be queued; the other
-  # routes already stop for a person or close the report.
-  defp screen(%{message: %{verdict: %{outcome: "story"} = verdict} = message} = ctx) do
-    reasons =
-      gate_a_screen(Map.get(message, :lens_verdicts)) ++
-        gate_b_screen(ctx.tenant_id, ctx.session.story_id, verdict)
-
-    if reasons == [], do: :queue, else: {:escalate, screen_codes(reasons)}
+  # first attempt had already reached. Only the outcome whose route QUEUES the story is about to
+  # be built (`story` in `triage@1`); the other routes already stop for a person or close the
+  # report.
+  #
+  # THE SPEC SAYS WHICH VERDICT SCREENS RUN: each of `@verdict_screens` it names, in that order,
+  # so Gate A's codes come before Gate B's.
+  defp screen(ctx) do
+    resolve_repo = fn -> repo_for_story(ctx.tenant_id, ctx.session.story_id) end
+    {decision, _refused} = screen_verdict(ctx.spec, ctx.leave, ctx.message, resolve_repo)
+    decision
   end
 
-  defp screen(_ctx), do: :queue
+  # The verdict screens' decision, and which named screen refused with which codes. The
+  # repository Gate B reads is a FUNCTION, called only when Gate B is named and the route
+  # queues, so the live path reads the intake source exactly when it did before.
+  defp screen_verdict(spec, leave, %{verdict: %{} = verdict} = message, resolve_repo) do
+    refused =
+      if queues?(leave),
+        do:
+          for(
+            screen <- named_verdict_screens(spec),
+            reasons <- [verdict_screen(screen, message, verdict, resolve_repo)],
+            reasons != [],
+            do: {screen, reasons}
+          ),
+        else: []
+
+    decision =
+      case Enum.flat_map(refused, &elem(&1, 1)) do
+        [] -> :queue
+        reasons -> {:escalate, screen_codes(reasons)}
+      end
+
+    {decision, Enum.map(refused, fn {screen, reasons} -> {screen, screen_codes(reasons)} end)}
+  end
+
+  defp screen_verdict(_spec, _leave, _message, _resolve_repo), do: {:queue, []}
+
+  defp named_verdict_screens(spec),
+    do: Enum.filter(@verdict_screens, &Map.has_key?(spec.screens, &1))
+
+  defp verdict_screen(:gate_a, message, _verdict, _resolve_repo),
+    do: gate_a_screen(Map.get(message, :lens_verdicts))
+
+  defp verdict_screen(:gate_b, _message, verdict, resolve_repo),
+    do: gate_b_screen(resolve_repo.(), verdict)
 
   # The first attempt's decision, off the triage event it wrote. The `gate_screen` KEY is the
   # refusal — it is written only when the screen refused — so its presence decides, never its
   # length: an empty list read as "queue" would turn a refusal into a queue. A triage event
   # from before the screen existed carries no key and is read as "queue", which is what that
-  # attempt did. Read only for a `story` outcome, the one route the screen can change.
-  defp recorded_decision(%{message: %{verdict: %{outcome: "story"}}} = ctx) do
+  # attempt did. Read only for the outcome that queues, the one route the screen can change.
+  defp recorded_decision(%{leave: leave, message: %{verdict: %{}}} = ctx) do
+    if queues?(leave), do: recorded_screen(ctx), else: :queue
+  end
+
+  defp recorded_decision(_ctx), do: :queue
+
+  defp recorded_screen(ctx) do
     ctx.tenant_id
     |> Stages.list_transitions(ctx.session.story_id)
     |> Enum.find(&(&1.from == "detected" and &1.to == "triaged"))
@@ -987,8 +1381,6 @@ defmodule Loopctl.Delivery.TriageVerdict do
       _queued_or_unscreened -> :queue
     end
   end
-
-  defp recorded_decision(_ctx), do: :queue
 
   defp screen_event(:queue), do: nil
   defp screen_event({:escalate, codes}), do: {screen_reason(codes), %{"gate_screen" => codes}}
@@ -1005,10 +1397,10 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
-  defp gate_b_screen(tenant_id, story_id, verdict) do
+  defp gate_b_screen(repo, verdict) do
     touches = get_in(verdict, [:story, :touches]) || []
 
-    case repo_for_story(tenant_id, story_id) do
+    case repo do
       {:ok, repo} -> GateB.triage_screen(DeliveryGates.load_triggers(), repo, touches)
       {:error, reason} -> [{:repository_unresolved, reason}]
     end

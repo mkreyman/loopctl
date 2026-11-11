@@ -659,20 +659,35 @@ defmodule Loopctl.MemoryRecallContextTest do
 
       for i <- 1..4, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 23))
 
-      off = Memory.recall_context(ctx.scope, query: marker, limit: 3, diversity_enabled: false)
+      # A near-duplicate of a1 (cosine ~1.0): the default threshold would drop it, so it
+      # surviving proves `diversity_near_dup_threshold: 2.0` reached the selector.
+      twin = embedded_article(ctx.tenant.id, "#{marker} a1 twin", spiked(23))
+
+      off = Memory.recall_context(ctx.scope, query: marker, limit: 5, diversity_enabled: false)
 
       pure =
         Memory.recall_context(ctx.scope,
           query: marker,
-          limit: 3,
+          limit: 5,
           diversity_lambda: 1.0,
           diversity_near_dup_threshold: 2.0
         )
 
       assert knowledge_result_ids(pure) == knowledge_result_ids(off)
       assert Enum.map(pure.results, & &1.score) == Enum.map(off.results, & &1.score)
+      assert twin.id in knowledge_result_ids(pure)
+      assert pure.meta.diversity.dropped_near_duplicates == 0
       assert pure.meta.diversity.lambda == 1.0
       assert off.meta.diversity.enabled == false
+    end
+
+    test "a score tie at the cut is broken by id, whatever order the search returned (#1002)" do
+      pool = for id <- ~w(c a d b), do: %{score: 0.5, article: %{id: id}}
+      top = %{score: 0.9, article: %{id: "z"}}
+
+      ordered = Memory.diversity_pool_order(Enum.reverse([top | pool]))
+
+      assert Enum.map(ordered, & &1.article.id) == ~w(z a b c d)
     end
 
     test "selection does not decide render order — the merged list is still score DESC", ctx do

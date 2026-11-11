@@ -27,6 +27,13 @@ import {
   stagePath,
   storyStage,
 } from "../lib/delivery-loop.js";
+import { replyDraftList, replyDraftsPath } from "../lib/reply-drafts.js";
+import {
+  TUNING_DRAFTS_PATH,
+  landedPath,
+  tuningDraftMarkLanded,
+  tuningDrafts,
+} from "../lib/tuning-drafts.js";
 import { stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -227,6 +234,13 @@ describe("resolve_escalation", () => {
       deps({ apiCall }),
     );
     assert.deepEqual(calls[1].body, { to: "failed", reason: "the reporter withdrew it" });
+  });
+
+  test("sends a story back to triage with to: detected", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await resolveEscalation({ story_id: STORY_ID, to: "detected" }, deps({ apiCall }));
+    assert.deepEqual(calls[0].body, { to: "detected" });
   });
 
   test("refuses a target the stage machine does not have", async () => {
@@ -485,6 +499,177 @@ describe("id validation — shared by every verb here", () => {
   });
 });
 
+describe("reply_draft_list (US-48.9)", () => {
+  const PROJECT_ID = "5b0b6a5e-6d43-4f3e-9d1f-2f6c1c1e0a11";
+
+  test("GETs the project's drafts with the user key, and nothing else", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await replyDraftList({ project_id: PROJECT_ID }, { userKey: "user-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "GET");
+    assert.equal(calls[0].path, `/api/v1/projects/${PROJECT_ID}/reply_drafts`);
+    assert.equal(calls[0].body, null);
+  });
+
+  test("carries cursor and limit as query parameters, encoded", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await replyDraftList(
+      { project_id: PROJECT_ID, cursor: "a+b/c=", limit: 10 },
+      { userKey: "user-key", apiCall },
+    );
+
+    assert.equal(calls[0].path, `${replyDraftsPath(PROJECT_ID)}?cursor=a%2Bb%2Fc%3D&limit=10`);
+  });
+
+  test("path-encodes a project slug rather than refusing it", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await replyDraftList({ project_id: "home care/billing" }, { userKey: "user-key", apiCall });
+
+    assert.equal(calls[0].path, "/api/v1/projects/home%20care%2Fbilling/reply_drafts");
+  });
+
+  test("refuses locally, sending nothing, with no user key or no project", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    const noKey = await replyDraftList({ project_id: PROJECT_ID }, { apiCall });
+    assert.equal(noKey.error, true);
+    assert.match(noKey.body, /LOOPCTL_USER_KEY/);
+
+    const noProject = await replyDraftList({}, { userKey: "user-key", apiCall });
+    assert.equal(noProject.error, true);
+    assert.match(noProject.body, /project_id/);
+
+    const badLimit = await replyDraftList(
+      { project_id: PROJECT_ID, limit: 0 },
+      { userKey: "user-key", apiCall },
+    );
+    assert.equal(badLimit.error, true);
+
+    const badCursor = await replyDraftList(
+      { project_id: PROJECT_ID, cursor: 7 },
+      { userKey: "user-key", apiCall },
+    );
+    assert.equal(badCursor.error, true);
+
+    assert.equal(calls.length, 0);
+  });
+
+  test("its description says loopctl never sends a draft and names the key", () => {
+    const start = INDEX_SRC.indexOf('name: "reply_draft_list"');
+    assert.ok(start > -1, "reply_draft_list is not declared");
+    const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+    assert.match(declaration, /NEVER SENDS/);
+    assert.match(declaration, /LOOPCTL_USER_KEY/);
+    assert.match(declaration, /403/);
+  });
+
+  test("its handler takes the exact user key, as the runner tools do", () => {
+    const start = INDEX_SRC.indexOf("async function replyDraftListRead(");
+    assert.ok(start > -1, "the reply_draft_list handler was not found");
+    const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
+    const handler = stripComments(INDEX_SRC.slice(start, end));
+
+    assert.match(handler, /replyDraftList\(args, runnerDeps\(\)\)/);
+  });
+});
+
+describe("tuning_drafts and tuning_draft_mark_landed (US-48.13)", () => {
+  const DRAFT_ID = "6c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e";
+  const PR = "https://github.com/mkreyman/loopctl/pull/1042";
+
+  test("GETs the drafts with the user key, filters encoded as query parameters", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await tuningDrafts({}, { userKey: "user-key", apiCall });
+    await tuningDrafts(
+      { project_id: DRAFT_ID, spec_id: "triage", status: "proposed", cursor: "a+b", limit: 10 },
+      { userKey: "user-key", apiCall },
+    );
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].method, "GET");
+    assert.equal(calls[0].path, TUNING_DRAFTS_PATH);
+    assert.equal(calls[0].body, null);
+    assert.equal(
+      calls[1].path,
+      `${TUNING_DRAFTS_PATH}?project_id=${DRAFT_ID}&spec_id=triage&status=proposed&cursor=a%2Bb&limit=10`,
+    );
+  });
+
+  test("POSTs the PR to the draft's landed path, and nothing else", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: PR }, { userKey: "user-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.equal(calls[0].path, landedPath(DRAFT_ID));
+    assert.equal(calls[0].path, `/api/v1/tuning_drafts/${DRAFT_ID}/landed`);
+    assert.deepEqual(calls[0].body, { pr_url: PR });
+  });
+
+  test("refuses locally, sending nothing, with no user key or a malformed argument", async () => {
+    const { calls, apiCall } = fakeApi();
+    const deps = { userKey: "user-key", apiCall };
+
+    const refusals = [
+      await tuningDrafts({}, { apiCall }),
+      await tuningDrafts({ project_id: "nope" }, deps),
+      await tuningDrafts({ spec_id: "Bad Spec" }, deps),
+      await tuningDrafts({ status: "applied" }, deps),
+      await tuningDrafts({ cursor: 7 }, deps),
+      await tuningDrafts({ limit: 0 }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: PR }, { apiCall }),
+      await tuningDraftMarkLanded({ pr_url: PR }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: "https://evil.example/a/b/pull/1" }, deps),
+      await tuningDraftMarkLanded({ draft_id: DRAFT_ID, pr_url: `${PR}\nX` }, deps),
+    ];
+
+    for (const result of refusals) {
+      assert.equal(result.error, true);
+      assert.equal(result.status, 0, "a local refusal must not claim a server answered");
+    }
+
+    assert.match(refusals[0].body, /LOOPCTL_USER_KEY/);
+    assert.equal(calls.length, 0);
+  });
+
+  test("the descriptions say loopctl never applies a draft, what is refused and which key", () => {
+    for (const name of ["tuning_drafts", "tuning_draft_mark_landed"]) {
+      const start = INDEX_SRC.indexOf(`name: "${name}"`);
+      assert.ok(start > -1, `${name} is not declared`);
+      const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+      assert.match(declaration, /NEVER|changes no template/);
+      assert.match(declaration, /LOOPCTL_USER_KEY/);
+      assert.match(declaration, /403/);
+    }
+
+    const landed = INDEX_SRC.indexOf('name: "tuning_draft_mark_landed"');
+    const declaration = INDEX_SRC.slice(landed, INDEX_SRC.indexOf("inputSchema:", landed));
+    assert.match(declaration, /409 not_proposed/);
+    assert.match(declaration, /422/);
+  });
+
+  test("both handlers take the exact user key, as the runner tools do", () => {
+    for (const [fn, call] of [
+      ["tuningDraftsRead", /tuningDrafts\(args, runnerDeps\(\)\)/],
+      ["tuningDraftLand", /tuningDraftMarkLanded\(args, runnerDeps\(\)\)/],
+    ]) {
+      const start = INDEX_SRC.indexOf(`async function ${fn}(`);
+      assert.ok(start > -1, `the ${fn} handler was not found`);
+      const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
+      assert.match(stripComments(INDEX_SRC.slice(start, end)), call);
+    }
+  });
+});
+
 describe("the wiring in index.js", () => {
   test("every delivery-loop tool is declared, dispatched TO ITS OWN HANDLER, and documented", () => {
     // The defect these tools exist for is a verb that exists and nothing calls. A tool
@@ -503,9 +688,13 @@ describe("the wiring in index.js", () => {
     const wiring = {
       place_dispatch: "placeDispatch",
       story_stage: "storyStage",
+      change_binding_get: "changeBindingGet",
       resolve_escalation: "resolveEscalation",
       force_unclaim_story: "forceUnclaimStory",
       merge_precondition: "mergePreconditionTool",
+      reply_draft_list: "replyDraftListRead",
+      tuning_drafts: "tuningDraftsRead",
+      tuning_draft_mark_landed: "tuningDraftLand",
     };
 
     for (const [name, handler] of Object.entries(wiring)) {
@@ -523,7 +712,7 @@ describe("the wiring in index.js", () => {
   });
 
   test("force_unclaim_story selects its key the way every exact_role verb does", () => {
-    // The endpoint is `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`),
+    // The endpoint is `exact_role: :orchestrator` (`story_verification_controller.ex:30-31`),
     // so it needs an orchestrator-ROLE key; which env var holds one is a separate question
     // and `lib/custody-key.js` answers it — LOOPCTL_ORCH_KEY sent exactly when set, a global
     // LOOPCTL_API_KEY otherwise. What this pins is that the handler does not answer it itself.
@@ -584,6 +773,13 @@ describe("the wiring in index.js", () => {
       assert.match(pool, /1\.14\.0/);
     });
 
+    test("runner_pool's row and description name specs (contract 1.25.0)", () => {
+      const pool = row("runner_pool");
+
+      assert.match(pool, /`specs` \(runner contract 1\.25\.0\)/);
+      assert.match(stripComments(INDEX_SRC), /"specs \(runner contract 1\.25\.0\) is the agent specs/);
+    });
+
     test("place_dispatch's row says to omit branch, and names all three refusals", () => {
       const place = row("place_dispatch");
 
@@ -625,6 +821,18 @@ describe("the wiring in index.js", () => {
       assert.match(row("place_dispatch"), /runner_exhausted/);
       assert.match(declaration("place_dispatch"), /runner_exhausted/);
       assert.match(declaration("place_dispatch"), /usage_exhausted_until/);
+    });
+
+    // US-48.7. `Placement.place/4` refuses a kind whose agent spec is not a `:build` before any
+    // claim is written; the tool description is what a session reads instead of the
+    // controller, so both declarations name the refusal and say nothing was claimed.
+    test("place_dispatch names 422 not_placeable_kind in its description and its row", () => {
+      const start = INDEX_SRC.indexOf('name: "place_dispatch"');
+      const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+      assert.match(declaration, /422 `not_placeable_kind`/);
+      assert.match(declaration, /BEFORE anything is minted or claimed/);
+      assert.match(row("place_dispatch"), /422 `not_placeable_kind`/);
     });
   });
 

@@ -85,9 +85,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
   can be an ancestor of what is deployed rather than equal to it, and that IS shipped.
   The forge answers whether `sha` is reachable from `ref`.
 
-  ## `issue/2`, `label_issue/3`, `comment_issue/3` and `close_issue/3` — the reporter's side (#805)
+  ## `issue/2`, `label_issue/3`, `remove_label/3`, `comment_issue/3` and `close_issue/3` — the reporter's side (#805)
 
-  The four calls `Loopctl.Delivery.IssueCloser` makes to tell the person who filed a GitHub
+  The five calls `Loopctl.Delivery.IssueCloser` makes to tell the person who filed a GitHub
   issue what happened to it. They live on THIS behaviour for the same reason the deployment
   pair does: one config-resolved forge client for the whole delivery loop, with one set of
   bounded timeouts and one rate-limit classification, rather than a second client with its
@@ -96,6 +96,18 @@ defmodule Loopctl.Delivery.PullRequestSource do
   They are the only WRITE callbacks here. Everything above reads. That asymmetry is why the
   closer, and not this behaviour, carries the at-most-once machinery: a read may be repeated
   freely and a close may not.
+
+  ## `create_issue/3` and `find_issue/2` — a revert after `done` (US-47.4)
+
+  A chg revert that reaches a story loopctl already closed opens a NEW issue on the repository,
+  which intake then triages like any other report (Epic 47 PRD §5).
+  `Loopctl.Changes.RevertIssueOpener` is the caller. Creating is not idempotent at the forge —
+  a second call is a second issue — so the caller writes a MARKER into the body and, on any
+  attempt after its first, asks `find_issue/2` whether an earlier attempt already opened it
+  before creating again: a crash between the create and the record of it costs a read, never a
+  duplicate issue. The search reads only the credential's own issues since the row was
+  written, ALL of them up to a page bound, and an exhausted bound is an error rather than
+  "none" — so a burst of other issues cannot push the earlier one out of sight.
   """
 
   alias Loopctl.Delivery.ForgeRepo
@@ -272,6 +284,16 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback label_issue(repo(), pos_integer(), String.t()) :: :ok | {:error, term()}
 
   @doc """
+  REMOVES one label from an issue, leaving every other label alone.
+
+  The closer uses it for one thing: taking an EARLIER generation's resolution label off a
+  reopened issue before it applies its own (US-47.10), so a close never carries two
+  resolution labels. Idempotent: removing a label the issue does not carry is `:ok`, because
+  the state the caller asked for already holds.
+  """
+  @callback remove_label(repo(), pos_integer(), String.t()) :: :ok | {:error, term()}
+
+  @doc """
   Posts one comment on an issue.
 
   The ONLY callback here that is not naturally idempotent — a second call is a second comment
@@ -290,6 +312,32 @@ defmodule Loopctl.Delivery.PullRequestSource do
   """
   @callback close_issue(repo(), pos_integer(), :completed | :not_planned) ::
               :ok | {:error, term()}
+
+  @doc """
+  OPENS an issue with `title` and `body`, returning its number. Not idempotent: see the
+  moduledoc for how the caller makes it so.
+  """
+  @callback create_issue(repo(), String.t(), String.t()) ::
+              {:ok, pos_integer()} | {:error, term()}
+
+  @typedoc """
+  What `find_issue/2` looks for: an issue whose body contains `marker` or whose title contains
+  `title_token`, opened no earlier than `since`.
+  """
+  @type issue_search :: %{
+          marker: String.t(),
+          title_token: String.t(),
+          since: DateTime.t()
+        }
+
+  @doc """
+  The number of an issue the CREDENTIAL ITSELF opened since `search.since` whose body contains
+  the marker or whose title contains the token, or `nil` once every such issue has been read
+  and none does. `{:error, reason}` when the forge could not say — a failed read, and also a
+  search that reached its page bound without reading them all — never read as "none", because
+  the caller would then create a duplicate.
+  """
+  @callback find_issue(repo(), issue_search()) :: {:ok, pos_integer() | nil} | {:error, term()}
 
   # -- the checked entry points (#936) -------------------------------------------------------
   #
@@ -329,8 +377,17 @@ defmodule Loopctl.Delivery.PullRequestSource do
   def label_issue(%ForgeRepo{} = repo, a, b), do: impl().label_issue(repo, a, b)
 
   @doc false
+  def remove_label(%ForgeRepo{} = repo, a, b), do: impl().remove_label(repo, a, b)
+
+  @doc false
   def comment_issue(%ForgeRepo{} = repo, a, b), do: impl().comment_issue(repo, a, b)
 
   @doc false
   def close_issue(%ForgeRepo{} = repo, a, b), do: impl().close_issue(repo, a, b)
+
+  @doc false
+  def create_issue(%ForgeRepo{} = repo, a, b), do: impl().create_issue(repo, a, b)
+
+  @doc false
+  def find_issue(%ForgeRepo{} = repo, a), do: impl().find_issue(repo, a)
 end

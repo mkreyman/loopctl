@@ -221,7 +221,10 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
     test "an issue already closed carrying our label is recorded closed, not closed again",
          ctx do
-      closure = closure(ctx, :shipped)
+      # `labelled_at` set, because that is the only state the crash window can be in: this
+      # closure reached its close, so step 2 stamped the marker first. Until US-47.10 the
+      # fixture left it nil, and step 1 did not read it.
+      closure = closure(ctx, :shipped, labelled_at: DateTime.utc_now())
 
       # The crash window: the close landed, the record of it did not. The only evidence is
       # GitHub's own state, so that is what is read.
@@ -603,6 +606,123 @@ defmodule Loopctl.Delivery.IssueCloserTest do
     end
   end
 
+  describe "a reopened issue's later generation (US-47.10)" do
+    test "a different verdict ends with exactly one resolution label, ours", ctx do
+      closure = closure(ctx, :not_actionable)
+
+      # The earlier generation shipped and its close left `resolution-shipped` on the issue.
+      forge = fake_issue(["bug", @shipped_label])
+
+      assert {:closed, nil} = IssueCloser.close(closure)
+
+      labels = Agent.get(forge, & &1.labels)
+      assert Enum.filter(labels, &(&1 in Resolution.labels())) == [@not_actionable_label]
+      assert "bug" in labels
+      assert Agent.get(forge, & &1.state) == "closed"
+
+      # The removal came before the add, so no moment carried two resolution labels.
+      assert Agent.get(forge, &Enum.reverse(&1.calls)) == [
+               {:remove, @shipped_label},
+               {:label, @not_actionable_label},
+               :comment,
+               :close
+             ]
+
+      assert %IssueClosure{status: :closed} = reload(ctx)
+    end
+
+    test "the same verdict removes nothing and re-adds nothing", ctx do
+      closure = closure(ctx, :shipped)
+      forge = fake_issue(["bug", @shipped_label])
+
+      expect(MockPullRequestSource, :remove_label, 0, fn _r, _n, _l -> :ok end)
+
+      assert {:closed, nil} = IssueCloser.close(closure)
+      assert Agent.get(forge, &Enum.reverse(&1.calls)) == [:comment, :close]
+      assert Agent.get(forge, & &1.labels) == ["bug", @shipped_label]
+    end
+
+    test "a transient removal failure backs off without labelling, and the retry recovers",
+         ctx do
+      closure = closure(ctx, :not_actionable)
+      forge = fake_issue(["bug", @shipped_label], remove_fails: 1)
+
+      assert {:deferred, nil} = IssueCloser.close(closure)
+
+      # NOT a silent pass: nothing was added on top of the stale label, and the row waits.
+      assert Agent.get(forge, &Enum.reverse(&1.calls)) == [{:remove_failed, @shipped_label}]
+      row = reload(ctx)
+      assert row.status == :pending
+      assert row.attempts == 1
+      assert row.last_error =~ "github_unreachable"
+
+      assert {:closed, nil} = IssueCloser.close(due(ctx))
+
+      labels = Agent.get(forge, & &1.labels)
+      assert Enum.filter(labels, &(&1 in Resolution.labels())) == [@not_actionable_label]
+    end
+
+    test "a same-verdict label left by the earlier generation, closed by somebody else, is NOT ours",
+         ctx do
+      # Generation 1 shipped and left `resolution-shipped` on the issue. Generation 2 also
+      # shipped, and another actor (chg, a maintainer) closed the issue before this closure
+      # ever ran. One resolution label, and it is the right one, but this closure never put
+      # it there.
+      closure = closure(ctx, :shipped)
+
+      expect(MockPullRequestSource, :issue, fn _repo, _number ->
+        {:ok, %{state: "closed", labels: ["bug", @shipped_label]}}
+      end)
+
+      expect(MockPullRequestSource, :close_issue, 0, fn _r, _n, _s -> :ok end)
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "closed_by_other"
+      assert row.closed_at == nil
+    end
+
+    test "a same-verdict label already present is ADOPTED, so our crash window still reads as ours",
+         ctx do
+      closure = closure(ctx, :shipped)
+      forge = fake_issue(["bug", @shipped_label])
+
+      # Attempt 1 finds our label there, comments, and the close fails.
+      stub(MockPullRequestSource, :close_issue, fn _r, _n, _s ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      assert {:deferred, nil} = IssueCloser.close(closure)
+      assert %DateTime{} = reload(ctx).labelled_at
+
+      # The close then lands (ours, its response lost), and the retry reads it back.
+      Agent.update(forge, &%{&1 | state: "closed"})
+
+      assert {:closed, nil} = IssueCloser.close(due(ctx))
+      assert %IssueClosure{status: :closed} = reload(ctx)
+    end
+
+    test "a crash between the removal and the add leaves a state the retry finishes", ctx do
+      closure = closure(ctx, :not_actionable)
+      forge = fake_issue(["bug", @shipped_label], label_fails: 1)
+
+      # The removal landed, the add did not: the issue is open with no resolution label.
+      assert {:deferred, nil} = IssueCloser.close(closure)
+      assert Agent.get(forge, & &1.labels) == ["bug"]
+
+      assert {:closed, nil} = IssueCloser.close(due(ctx))
+
+      assert Agent.get(forge, &Enum.filter(&1.labels, fn l -> l in Resolution.labels() end)) ==
+               [@not_actionable_label]
+
+      # Nothing was removed twice: the retry read the issue and found nothing stale.
+      assert Agent.get(forge, &Enum.count(&1.calls, fn c -> c == {:remove, @shipped_label} end)) ==
+               1
+    end
+  end
+
   describe "tenant isolation" do
     test "a closure is only ever acted on with its own tenant's scope", ctx do
       other = fixture(:tenant)
@@ -615,13 +735,19 @@ defmodule Loopctl.Delivery.IssueCloserTest do
     end
   end
 
-  defp closure(ctx, verdict) do
-    fixture(:issue_closure, %{
-      tenant_id: ctx.tenant.id,
-      story_id: ctx.story.id,
-      intake_record: ctx.record,
-      verdict: verdict
-    })
+  defp closure(ctx, verdict, attrs \\ []) do
+    fixture(
+      :issue_closure,
+      Map.merge(
+        %{
+          tenant_id: ctx.tenant.id,
+          story_id: ctx.story.id,
+          intake_record: ctx.record,
+          verdict: verdict
+        },
+        Map.new(attrs)
+      )
+    )
   end
 
   # The closer reads the issue TWICE on any path that reaches the close: once for the replay
@@ -637,6 +763,57 @@ defmodule Loopctl.Delivery.IssueCloserTest do
   end
 
   defp reload(ctx), do: IssueClosures.get(ctx.tenant.id, ctx.story.id)
+
+  # An issue held in an Agent, so a test asserts the labels the issue ENDS with rather than
+  # only the calls made. The mocks run in the test process (the closer is called from it).
+  # `:remove_fails` / `:label_fails` make that many calls fail transiently first.
+  defp fake_issue(labels, opts \\ []) do
+    {:ok, forge} =
+      Agent.start_link(fn ->
+        %{
+          state: "open",
+          labels: labels,
+          calls: [],
+          remove_fails: Keyword.get(opts, :remove_fails, 0),
+          label_fails: Keyword.get(opts, :label_fails, 0)
+        }
+      end)
+
+    stub(MockPullRequestSource, :issue, fn _repo, _number ->
+      {:ok, Agent.get(forge, &Map.take(&1, [:state, :labels]))}
+    end)
+
+    stub(MockPullRequestSource, :remove_label, fn _repo, _number, label ->
+      Agent.get_and_update(forge, fn
+        %{remove_fails: n} = s when n > 0 ->
+          {{:error, {:github_unreachable, :timeout}},
+           %{s | remove_fails: n - 1, calls: [{:remove_failed, label} | s.calls]}}
+
+        s ->
+          {:ok, %{s | labels: List.delete(s.labels, label), calls: [{:remove, label} | s.calls]}}
+      end)
+    end)
+
+    stub(MockPullRequestSource, :label_issue, fn _repo, _number, label ->
+      Agent.get_and_update(forge, fn
+        %{label_fails: n} = s when n > 0 ->
+          {{:error, {:github_unreachable, :timeout}}, %{s | label_fails: n - 1}}
+
+        s ->
+          {:ok, %{s | labels: s.labels ++ [label], calls: [{:label, label} | s.calls]}}
+      end)
+    end)
+
+    stub(MockPullRequestSource, :comment_issue, fn _repo, _number, _body ->
+      Agent.update(forge, &%{&1 | calls: [:comment | &1.calls]})
+    end)
+
+    stub(MockPullRequestSource, :close_issue, fn _repo, _number, _reason ->
+      Agent.update(forge, &%{&1 | state: "closed", calls: [:close | &1.calls]})
+    end)
+
+    forge
+  end
 
   defp due(ctx) do
     row = reload(ctx)

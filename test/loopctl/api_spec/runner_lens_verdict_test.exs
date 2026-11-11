@@ -96,6 +96,30 @@ defmodule Loopctl.ApiSpec.RunnerLensVerdictTest do
     assert bytes == 8_402
   end
 
+  test "the cap is published, because field maxima in astral characters exceed it" do
+    # 1.24.0: a runner reads the cap from `x-connection.limits` instead of re-typing it. It has to
+    # check it at all because a schema-valid set can be refused: 🦀 is one character to every
+    # maxLength and twelve bytes to the byte rule.
+    assert RunnerContract.json_schema()["x-connection"]["limits"]["lens_verdicts"] ==
+             %{"max_bytes" => RunnerLensVerdict.max_bytes()}
+
+    crab = String.duplicate("🦀", 60)
+
+    astral =
+      Enum.map(RunnerLensVerdict.lenses(), fn name ->
+        lens(name, %{
+          "outcome" => "escalate",
+          "escalation_reasons" => [crab, crab, crab],
+          "contradicts" => [%{"kind" => "story", "ref" => crab, "why" => crab}]
+        })
+      end)
+
+    assert {:error, {:invalid, errors}} =
+             RunnerContract.cast_triage_verdict_message(message(astral))
+
+    assert Enum.any?(errors, &String.starts_with?(&1, "lens_verdicts exceed"))
+  end
+
   test "a verdict and its lens verdicts, both at their caps, fit one socket frame" do
     # `max_frame_size: 64_000` on the runner socket (lib/loopctl_web/endpoint.ex:73). The lens
     # cap was sized from what the verdict's cap and the envelope leave of it.

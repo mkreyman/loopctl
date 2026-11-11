@@ -88,6 +88,8 @@ defmodule Loopctl.Delivery.TriageTrigger do
           | :intake_record_not_found
           | :story_number_exhausted
           | :source_not_found
+          | :ticket_required
+          | :issue_closed
           | {:stage_not_opened, :not_found | :busy}
           | {:intake_record_already_linked, Ecto.UUID.t() | nil}
           | :epic_not_found
@@ -97,11 +99,15 @@ defmodule Loopctl.Delivery.TriageTrigger do
   Creates the story for `record` and opens its delivery stage at `detected`.
 
   Returns `{:ok, story}` — including when the story already existed, see the moduledoc — or
-  `{:error, reason}`. The caller retries the record on `:no_target_epic`.
+  `{:error, reason}`. The caller retries the record on `:no_target_epic` and skips it on
+  `:ticket_required` (a ticketless record on a source with `triage_requires_ticket`) and
+  `:issue_closed` (its issue is closed; a reopen makes it promotable again).
   """
   @spec promote(Record.t()) :: {:ok, map()} | {:error, error()}
   def promote(%Record{} = record) do
     with {:ok, source} <- live_source(record),
+         :ok <- ticket_admitted(source, record),
+         :ok <- issue_open(record),
          {:ok, epic_id} <- target_epic(source),
          {:ok, story} <- create(record, source, epic_id),
          {:ok, _row} <- opened(record.tenant_id, story.id) do
@@ -141,6 +147,19 @@ defmodule Loopctl.Delivery.TriageTrigger do
       nil -> {:error, :source_not_found}
     end
   end
+
+  # A source with `triage_requires_ticket` gets a story only for an issue filed from a support
+  # ticket, the same rule triage applies (`Loopctl.Agents.Candidates`). Without this, every
+  # other issue became a "Triage pending" story nothing would ever take.
+  defp ticket_admitted(%Source{triage_requires_ticket: true}, %Record{ticket_id: nil}),
+    do: {:error, :ticket_required}
+
+  defp ticket_admitted(%Source{}, %Record{}), do: :ok
+
+  # Only an open issue gets a story: triage never takes a closed one (`:issue_not_closed`).
+  # A reopen writes `issue_state` back onto the same record, which then promotes.
+  defp issue_open(%Record{issue_state: "closed"}), do: {:error, :issue_closed}
+  defp issue_open(%Record{}), do: :ok
 
   defp target_epic(%Source{target_epic_id: nil}), do: {:error, :no_target_epic}
   defp target_epic(%Source{target_epic_id: id}), do: {:ok, id}
@@ -192,9 +211,16 @@ defmodule Loopctl.Delivery.TriageTrigger do
   # LOOPCTL'S OWN FACTS ONLY — the repository and the issue number. Not the reporter's title,
   # which is what a stub would naturally borrow and is exactly what design §10 forbids
   # reaching an implementer. Triage replaces this with the drafted title.
-  defp stub_title(%Record{issue_number: number}, %Source{repo_full_name: repo}) do
-    "Triage pending: #{repo}##{number}"
-  end
+  #
+  # A later generation (US-47.10) says so, from loopctl's own counter, so the reopened issue's
+  # second story is not a twin of the first in the epic's list.
+  defp stub_title(%Record{issue_number: number, generation: 1}, %Source{repo_full_name: repo}),
+    do: "Triage pending: #{repo}##{number}"
+
+  defp stub_title(%Record{issue_number: number, generation: generation}, %Source{
+         repo_full_name: repo
+       }),
+       do: "Triage pending: #{repo}##{number} (reopened, generation #{generation})"
 
   # `EPIC.SEQUENCE`, which is the convention every other story in this codebase follows —
   # story `43.1` is the first story of epic 43 — and NOT a scheme of this module's own.

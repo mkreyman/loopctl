@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 3.2.0 — 2026-11-11 (update_project)
+## 3.12.0 — 2026-11-11 (update_project)
 
 ### Added
 
@@ -19,6 +19,181 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **`handoff` 422 remediation on a work project** now names the fix: a membership story in
   that project (`create_story`, `contract_story`, `claim_story`, `start_story`,
   `request_review`, then leave it), never a second channel.
+## 3.11.2 — 2026-11-08
+
+### Fixed
+
+- `intake_source_enroll` and `intake_source_update` described `triage_requires_ticket` as
+  leaving every ticketless issue at `detected`. With loopctl's intake change such an issue
+  stays an intake record and gets no story until it gains a ticket; the descriptions now say so.
+
+## 3.11.1 — 2026-11-07
+
+### Fixed
+
+- The stuck-story playbook named the runner's worktree as `.claude/worktrees/loop-<story_id>`;
+  the runner creates `.claude/worktrees/loop-story-<story_id>`. The take-over steps and each
+  row's `salvage` line now name the real path.
+
+## 3.11.0 — 2026-11-07 (the stuck-story playbook)
+
+### Added
+
+- **`stuck_story` prompt**, the server's first MCP prompt: in Claude Code it is
+  `/mcp__loopctl__stuck_story [story_id]`. It has the session diagnose an escalated story and
+  recommend retry, re-triage, take-over or close, with the whole runbook attached.
+- **`escalation_playbook`** returns the same runbook as a tool (whole, or one `reason_class`).
+  Local: sends nothing.
+- **`escalation_list` carries remedies**: the page's `remedies` holds, once per class present,
+  what the class means and which `resolve_escalation` target fits; each row's `remedy` adds a
+  warning when the change already merged and where to find the runner's unpushed commits when
+  it left some.
+
+## 3.10.1 — 2026-11-07
+
+### Fixed
+
+- README: `tuning_drafts` lists the `nothing_to_learn` status, and `agent_outcomes` names
+  `verify` and `spec_tuner` among its spec ids with what counts as success for each. No tool
+  changed; `agent_outcomes` already accepted both ids.
+
+## 3.10.0 — 2026-11-07 (the improvement loop)
+
+### Added
+
+- **`tuning_drafts`** lists the improvement loop's tuning drafts (loopctl US-48.13,
+  `GET /api/v1/tuning_drafts`): what a `spec_tuner@1` session proposed for a target spec from
+  its failed runs — a prompt-template diff, new eval cases and both templates' scores — under
+  the status loopctl decided itself (`proposed` only when strictly better with no existing case
+  regressing, `rejected` with its reasons otherwise). Filters `project_id`, `spec_id`, `status`;
+  keyset pagination through `next_cursor`. Requires `LOOPCTL_USER_KEY`.
+- **`tuning_draft_mark_landed`** records that a person merged a proposed draft's template
+  change (`POST /api/v1/tuning_drafts/:id/landed`, `pr_url` required). It changes no template
+  and no spec version. 409 `not_proposed`, 422 for a malformed `pr_url`. Requires
+  `LOOPCTL_USER_KEY`. A draft may also be `nothing_to_learn`: the window held no failure, so
+  nothing was dispatched and the window closed.
+
+### Changed
+
+- **`report_story`**, **`review_complete`** and **`verify_story`** name their new refusal:
+  409 `pr_route_verifier_only` on a pull-request-route story for any key but the one minted for
+  the story's bound `verify@1` dispatch (loopctl US-48.18). `reject_story` is not gated by it.
+- **`agent_outcomes`** counts verify and spec_tuner successes, and `reply_draft_list` names its
+  422 for a project reference it cannot resolve.
+
+## 3.9.1 — 2026-11-07 (verify@1)
+
+### Changed
+
+- **`reject_story`**'s description names its new refusal: 409 `caller_lineage_required` for a
+  key no dispatch minted on a pull-request-route story (loopctl US-48.18), which control now
+  verifies and rejects through its own verifier dispatch.
+
+## 3.9.0 — 2026-11-07 (the escalation inbox)
+
+### Added
+
+- **`escalation_list`** reads the escalation inbox (loopctl US-48.11, `GET /api/v1/escalations`):
+  every story of the tenant parked at `escalated`, newest first, with `reason_class` derived from
+  the stage-machine edge (budget_exhausted, session_failed, triage_escalated, gate_refused,
+  operator_released, other) and, for a budget kill, the run's elapsed time, budget and branch
+  from the dispatch ledger, its turns used against its turn budget, and `work_left_behind`
+  (`"true"`/`"false"` from the runner's session-end report, `"unknown"` for a runner older
+  than contract 1.27.0). Filters `reason_class`, `project_id`, `since`; keyset pagination
+  through `next_cursor`. It reads only: `resolve_escalation` with `to: "queued"` works a row
+  again. Any key of the tenant reads it; `LOOPCTL_AGENT_KEY` is passed as an override.
+
+### Changed
+
+- **`agent_outcomes`**' description no longer says no runner reports turns: `median_turns` is
+  filled from the runner's session-end report since loopctl runner contract 1.27.0.
+
+## 3.8.0 — 2026-11-07 (agent outcomes)
+
+### Added
+
+- **`agent_outcomes`** reads an agent spec's track record from the run-outcome ledger (loopctl
+  US-48.12, `GET /api/v1/agent_specs/:spec_id/outcomes`): per spec version, newest first, the
+  runs recorded in the last `window_days` (default 30, at most 365) and how many succeeded,
+  were overridden by a human or exhausted their budget, each also as a rate, with the median
+  elapsed seconds and turns. Any tenant key reads it (`role: :agent`); `LOOPCTL_AGENT_KEY` is
+  the tool's own key, after `LOOPCTL_API_KEY`.
+
+## 3.7.0 — 2026-11-07 (reply drafts)
+
+### Added
+
+- **`reply_draft_list`** reads a project's reply drafts (loopctl US-48.9,
+  `GET /api/v1/projects/:project_id/reply_drafts`): what a runner session drafted for a support
+  ticket triage rejected or escalated, `drafted` with its body or `refused` with the screen
+  code and no body. loopctl never sends a draft; a person reads it and sends it or not. Keyset
+  pagination through `next_cursor`. Requires `LOOPCTL_USER_KEY`: the endpoint is user-role
+  because the bodies are drafted from customer ticket text.
+
+## 3.6.0 — 2026-11-07 (re-triage an escalated story)
+
+### Added
+
+- **`resolve_escalation` takes `to: detected`**, which sends an escalated story back to be
+  TRIAGED again over the human-only edge `escalated -> detected`. It is for a story triage
+  escalated, such as `triage_verdict:verdict_invalid`, and it unbinds the story's old triage
+  dispatch so Gate A reads the new one's lens verdicts. loopctl refuses it 409
+  `not_retriageable`, listing what the story holds in `held`, for a story an implementer was
+  assigned or worked. Before this, `queued` was the only way back to work, and on a triage
+  escalation it skipped triage.
+
+## 3.4.0 — 2026-10-19 (chg trunk evidence)
+
+### Changed
+
+- **`verify_story`, `verify_all_in_epic`, `bulk_mark_complete` and `backfill_story` document the
+  chg trunk-evidence gate** (loopctl US-47.6): a story bound to a chg change is verified only
+  when the trunk commit of its newest landing (`data.merge_sha`) is an ancestor of the repo's
+  `verified/master` (409 `chg_landing_not_trunk_verified` otherwise) and no `reverted` event
+  follows the landing (409 `chg_landing_reverted`). A forge read that cannot answer is 503
+  `chg_trunk_unevaluated` with `Retry-After`, never a pass; the bulk paths report each as a
+  per-story error.
+
+## 3.3.0 — 2026-10-19 (chg review custody)
+
+### Added
+
+- **`review_complete` takes `commit_sha`** (loopctl US-47.5, AC-47.5.2): the reviewed chg
+  revision, forwarded as given. REQUIRED on a story bound to a chg change, where it must be
+  the sha of a submitted revision of the story's current change (422 `commit_sha_not_bound`
+  otherwise); ignored and not stored on any other story.
+
+### Changed
+
+- **`review_complete` documents the chg review gates** (AC-47.5.1): on a story bound to a chg
+  change only a key chg-server minted for the review — a strict descendant of the intake
+  source's `chg_root_dispatch_id` — may record it (409 `chg_reviewer_required`, the root key
+  included), and one reviewer dispatch records one verdict (409
+  `chg_review_already_recorded`). They run after the existing custody gates, never instead.
+- **`verify_story`, `reject_story`, `verify_all_in_epic` and `bulk_mark_complete` document 409
+  `chg_root_cannot_verify`** (AC-47.5.4): a key descending from a registered
+  `chg_root_dispatch_id` never certifies; the bulk paths refuse the whole call.
+- **`claim_story` and `report_story` document 409 `chg_root_review_only`**: chg-server's keys
+  may only review.
+- **`verify_story`, `verify_all_in_epic` and `bulk_mark_complete` document the chg
+  landed-review gate** (AC-47.5.5): a story bound to a chg change is verified only on a chg
+  review of its LANDED revision (409 `chg_review_not_for_landed_revision`) and never while its
+  stage is escalated over `review_missing` (409 `review_missing_escalated`); the epic and bulk
+  paths report either as a per-story error.
+
+## 3.2.0 — 2026-10-19 (change_binding_get)
+
+### Added
+
+- **`change_binding_get`** (loopctl US-47.7, AC-47.7.1) — `GET /api/v1/stories/:id/changes`:
+  the chg changes bound to a story, oldest first so the current one is last, each with its
+  applied events (`event_seq`, `kind`, `revision`, `sha`, `occurred_at`, `applied_at`; never
+  the event `data` payload). Both lists are bounded by the server and the bounds are in the
+  response's `meta`; a truncated list keeps the newest entries. Any tenant key reads it
+  (`role: :agent` with the hierarchy), so nothing is pinned: `LOOPCTL_API_KEY` when set, else
+  `LOOPCTL_AGENT_KEY`, else `LOOPCTL_ORCH_KEY`. 404 for a story
+  that is not the caller's tenant's, exactly as for an unknown id. A malformed `story_id` is
+  refused locally.
 
 ## 3.1.0 — 2026-10-19 (intake mode chg)
 

@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Spec
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.DispatchDriver
   alias Loopctl.Delivery.Placement
@@ -95,6 +96,36 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
           set: [agent_status: :pending]
         )
 
+      assert story.id in candidate_ids(50)
+    end
+
+    test "a story whose issue has CLOSED is not implemented; reopened, it is again", ctx do
+      repo = "mkreyman/repo-#{System.unique_integer([:positive])}"
+      story = bind_repo(ctx, queued_story(ctx), repo)
+
+      # An authored story carries no intake record and is not touched by the filter.
+      assert story.id in candidate_ids(50)
+
+      record =
+        fixture(:intake_record, %{
+          tenant_id: ctx.tenant.id,
+          project_id: story.project_id,
+          repo_full_name: repo
+        })
+
+      {1, _} =
+        AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+          set: [intake_record_id: record.id]
+        )
+
+      set_issue_state(record.id, "open")
+      assert story.id in candidate_ids(50)
+
+      # Closed after triage queued it: somebody fixed or withdrew it, so no session is paid for.
+      set_issue_state(record.id, "closed")
+      refute story.id in candidate_ids(50)
+
+      set_issue_state(record.id, "open")
       assert story.id in candidate_ids(50)
     end
 
@@ -194,6 +225,24 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       # And WITHIN a tenant it is still oldest-first, which is the half that cannot starve a
       # story: the second story arrives once every tenant's first has been taken.
       assert candidate_ids(3) == [first.id, other_story.id, second.id]
+    end
+
+    test "every PROJECT's oldest before any project's second, within one tenant", ctx do
+      backlog_head = bind_repo(ctx, queued_story(ctx))
+      backlog_next = queued_story(ctx)
+      move_to_project(backlog_next.id, backlog_head.project_id)
+      newcomer = bind_repo(ctx, queued_story(ctx))
+
+      backdate(backlog_head.id, -600)
+      backdate(backlog_next.id, -590)
+      backdate(newcomer.id, -60)
+
+      # Whether a runner takes a story's repository is decided per story, after this read, so a
+      # project no runner accepts kept its rows at the head of an oldest-first ranking and the
+      # same batch came back every pass. Ranked per project, the newer project's only story is
+      # reached in the same pass as the backlog's head.
+      assert candidate_ids(2) == [backlog_head.id, newcomer.id]
+      assert candidate_ids(3) == [backlog_head.id, newcomer.id, backlog_next.id]
     end
   end
 
@@ -319,6 +368,24 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
         assert DispatchDriver.normalise_budget(value, :dispatch_max_turns) ==
                  {:error, {:unset, :dispatch_max_turns}}
       end
+    end
+
+    test "every budget key a spec may name has a ceiling" do
+      # A key with no `budget_maximum/1` clause raises FunctionClauseError inside the pass, so
+      # a spec naming it would crash its worker every run instead of refusing by key.
+      for {wall_clock, turns} <- Spec.budget_pairs() do
+        assert DispatchDriver.normalise_budget(60, wall_clock) == {:ok, 60}
+        assert DispatchDriver.normalise_budget(10, turns) == {:ok, 10}
+      end
+    end
+
+    test "the spec_tune wall clock is held to the contract's ceiling" do
+      max = RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+
+      assert DispatchDriver.normalise_budget(max, :spec_tune_wall_clock_seconds) == {:ok, max}
+
+      assert DispatchDriver.normalise_budget(max + 1, :spec_tune_wall_clock_seconds) ==
+               {:error, {:over_contract_maximum, :spec_tune_wall_clock_seconds}}
     end
   end
 
@@ -750,6 +817,13 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   # A story contracted and standing at `queued` — what a placement takes.
   defp queued_story(ctx), do: ctx |> triaged_story() |> queue()
 
+  defp set_issue_state(record_id, state) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Intake.Record, where: r.id == ^record_id),
+        set: [issue_state: state]
+      )
+  end
+
   defp triaged_story(ctx) do
     story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
 
@@ -852,6 +926,15 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   defp candidate_ids(limit) do
     Enum.map(DispatchDriver.candidates(limit), & &1.story_id)
+  end
+
+  # A second story under an already-bound project: the project is what the ranking partitions
+  # on, and the fixture gives every story its own.
+  defp move_to_project(story_id, project_id) do
+    {1, _} =
+      AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story_id),
+        set: [project_id: project_id]
+      )
   end
 
   defp backdate(story_id, seconds) do

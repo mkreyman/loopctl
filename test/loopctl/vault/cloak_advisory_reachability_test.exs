@@ -28,22 +28,27 @@ defmodule Loopctl.Vault.CloakAdvisoryReachabilityTest do
   # The beam FILE in the app's ebin, not `:code.which/1`: other tests recompile some lib
   # modules in memory (a credo check's registry, for one), and `:code.which/1` then answers ""
   # for a module that has no file behind its loaded copy. The file is what was compiled.
-  defp atoms(module) do
-    beam = Application.app_dir(:loopctl, ["ebin", "#{module}.beam"])
+  # `ebin` is resolved once by the caller: `Application.app_dir/2` is a code-server call, and
+  # one per module stalled this test behind a loaded code server (chg S10 shadow, 2026-10-19).
+  defp atoms(ebin, module) do
+    beam = Path.join(ebin, "#{module}.beam")
     {:ok, {^module, [atoms: atoms]}} = :beam_lib.chunks(String.to_charlist(beam), [:atoms])
-    Enum.map(atoms, fn {_index, atom} -> atom end)
+    MapSet.new(atoms, fn {_index, atom} -> atom end)
   end
 
   defp cipher_modules(ciphers), do: Enum.map(ciphers, fn {_label, {module, _opts}} -> module end)
 
   test "no compiled loopctl module references an advisory-affected cloak module" do
     modules = Application.spec(:loopctl, :modules)
+    ebin = Application.app_dir(:loopctl, "ebin")
+    affected = MapSet.new(@affected)
 
     # The scan reads atom tables at all: the module that builds the vault cipher names GCM.
-    assert Cloak.Ciphers.AES.GCM in atoms(Loopctl.Config)
+    assert Cloak.Ciphers.AES.GCM in atoms(ebin, Loopctl.Config)
 
+    # One read of each module's atom table, intersected with the affected set.
     offenders =
-      Enum.filter(modules, fn module -> Enum.any?(@affected, &(&1 in atoms(module))) end)
+      Enum.reject(modules, fn module -> MapSet.disjoint?(atoms(ebin, module), affected) end)
 
     assert offenders == [],
            "an affected cloak module makes an ignored advisory in mix.exs reachable"

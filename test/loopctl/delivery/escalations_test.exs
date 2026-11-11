@@ -160,6 +160,93 @@ defmodule Loopctl.Delivery.EscalationsTest do
     end
   end
 
+  defp control_opts(edge, overrides \\ []) do
+    Keyword.merge(
+      [
+        edge: edge,
+        claim_epoch: @epoch,
+        reason: "change_outside_lifecycle: landed moves implementing nowhere",
+        actor_label: "chg:change_events",
+        actor_lineage: []
+      ],
+      overrides
+    )
+  end
+
+  describe "escalate_as_control/3 (US-47.4)" do
+    test "escalates over the edge it is given, with no claimant check" do
+      {story, _row, _agent_id} = claimed(:implementing, :unclaimed)
+
+      assert {:ok, row} =
+               Escalations.escalate_as_control(
+                 story.tenant_id,
+                 story.id,
+                 control_opts(:change_outside_lifecycle)
+               )
+
+      assert row.stage == :escalated
+      assert row.attempts == %{"change_outside_lifecycle" => 1}
+
+      assert [%{edge: "change_outside_lifecycle", from: "implementing"}] =
+               Stages.list_transitions(story.tenant_id, story.id)
+
+      assert chain_actions(story.tenant_id) == ["story_stage_escalated"]
+    end
+
+    test "a replay under the same epoch writes no second transition or chain entry" do
+      {story, _row, _agent_id} = claimed(:verified)
+      opts = control_opts(:reverted_after_verify)
+
+      assert {:ok, first} = Escalations.escalate_as_control(story.tenant_id, story.id, opts)
+      assert {:ok, again} = Escalations.escalate_as_control(story.tenant_id, story.id, opts)
+
+      assert again.lock_version == first.lock_version
+      assert chain_actions(story.tenant_id) == ["story_stage_escalated"]
+    end
+
+    test "inside the caller's transaction it returns the entry for the caller to announce" do
+      {story, _row, _agent_id} = claimed(:ci)
+
+      {:ok, {row, entry}} =
+        Repo.with_tenant(story.tenant_id, fn ->
+          {:ok, row, entry} =
+            Escalations.escalate_as_control(
+              story.tenant_id,
+              story.id,
+              control_opts(:change_outside_lifecycle, in_tenant_transaction: true)
+            )
+
+          {row, entry}
+        end)
+
+      assert row.stage == :escalated
+      assert %Entry{action: "story_stage_escalated"} = entry
+    end
+
+    test "refuses an edge that is not a control escalation, before touching anything" do
+      {story, row, _agent_id} = claimed(:implementing)
+
+      for edge <- [:session_escalated, :merge_gate, :human_resolution, :forward] do
+        assert_raise ArgumentError, fn ->
+          Escalations.escalate_as_control(story.tenant_id, story.id, control_opts(edge))
+        end
+      end
+
+      assert Stages.get(story.tenant_id, story.id).lock_version == row.lock_version
+    end
+
+    test "the fence still holds: a stale epoch is refused" do
+      {story, _row, _agent_id} = claimed(:implementing)
+
+      assert {:error, :stale_claim_epoch} =
+               Escalations.escalate_as_control(
+                 story.tenant_id,
+                 story.id,
+                 control_opts(:change_outside_lifecycle, claim_epoch: @epoch - 1)
+               )
+    end
+  end
+
   describe "refusals" do
     test "refuses a caller that is not the story's assigned agent" do
       {story, _row, _agent} = claimed()

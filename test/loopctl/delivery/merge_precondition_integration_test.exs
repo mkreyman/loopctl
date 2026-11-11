@@ -73,6 +73,24 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:custody, :not_verified} in reasons
     end
 
+    # US-48.18 (AC-48.18.4): a verification is of ONE head. A story verified at another head —
+    # or before the head was recorded at all — is not verified at this one.
+    for {label, verified_head} <- [
+          {"another head", String.duplicate("c", 40)},
+          {"no head", nil}
+        ] do
+      test "a story verified at #{label} is refused :verified_for_other_head", ctx do
+        {1, _} =
+          from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^ctx.story_id)
+          |> AdminRepo.update_all(set: [verified_head_sha: unquote(verified_head)])
+
+        stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+
+        assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+        assert {:custody, :verified_for_other_head} in reasons
+      end
+    end
+
     test "a forge failure that is NOT transient escalates rather than passing", ctx do
       Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
         {:error, {:github_api_error, 404}}

@@ -1919,6 +1919,22 @@ defmodule Loopctl.ApiSpec.Schemas do
         fixes_count: %Schema{type: :integer},
         summary: %Schema{type: :string, nullable: true},
         completed_at: %Schema{type: :string, format: :"date-time"},
+        commit_sha: %Schema{
+          type: :string,
+          nullable: true,
+          pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          description:
+            "US-47.5: the chg revision this review covers. Set only on a story bound to a " <>
+              "chg change; null on every other review."
+        },
+        reviewer_dispatch_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "US-47.5: the chg reviewer's own dispatch, set with `commit_sha`. One reviewer " <>
+              "dispatch records one verdict."
+        },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
       },
@@ -3644,7 +3660,7 @@ defmodule Loopctl.ApiSpec.Schemas do
               "repository, and `fail` adds `failed_check` and `conclusion`. With no verdict " <>
               "(`error`), `ci_unavailable_reason` is a short code with no URL and no " <>
               "repository name (e.g. `credential_unavailable`, `no_intake_source`, " <>
-              "`no_required_checks`, `no_story_branch`, `empty_change`, " <>
+              "`no_required_checks`, `no_story_branch`, `chg_landed_on_trunk`, `empty_change`, " <>
               "`ci_definition_changed`, `ci_wait_exhausted`, `forge_unavailable`, " <>
               "`database_busy`, " <>
               "and for an abbreviated `commit_sha` `unresolved_sha` or " <>

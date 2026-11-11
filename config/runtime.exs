@@ -182,12 +182,28 @@ case System.get_env("RUNNER_MAX_IN_FLIGHT_SESSIONS") &&
   _ -> :ok
 end
 
+# US-47.3: chg-server's base URL, for the signed gap pull (Loopctl.Changes.ReqChgClient). One
+# chg-server serves every enrolled repository, so this is deployment config, not a per-source
+# field. Unset: change events are still received, applied and audited; no gap or staleness pull
+# is attempted, and the reconcile sweep logs what it could not enqueue.
+case System.get_env("CHG_SERVER_URL") do
+  url when is_binary(url) and url != "" -> config :loopctl, :chg_server_url, String.trim(url)
+  _ -> :ok
+end
+
 # #803: the unattended dispatch driver (Loopctl.Delivery.DispatchDriver). OPT-IN — anything
 # but "true"/"1" leaves it off, including a typo, because this is the component that spends
 # money and runs code on someone's machines with nobody watching.
 config :loopctl,
        :dispatch_driver_enabled,
        System.get_env("DISPATCH_DRIVER_ENABLED") in ~w(true 1)
+
+# Epic 48 US-48.9: the reply drafter (`reply_draft@1`, Loopctl.Workers.ReplyDraftDispatchWorker).
+# OPT-IN on top of the driver, same exact spelling: a draft pass runs only while BOTH are on,
+# because drafting is new work on a runner no ticket needed before.
+config :loopctl,
+       :draft_dispatch_enabled,
+       System.get_env("DRAFT_DISPATCH_ENABLED") in ~w(true 1)
 
 # Its per-session budgets. NO DEFAULT on purpose: enabled with either unset, the driver
 # places nothing and the cron job FAILS naming the key, rather than dispatching on a figure
@@ -232,6 +248,23 @@ case System.get_env("TRIAGE_MAX_TURNS") && Integer.parse(System.get_env("TRIAGE_
   _ -> :ok
 end
 
+# US-48.13: the spec_tuner@1 run's own budgets. A tuning run is one proposing session plus the
+# runner's eval critic, which runs every case of the target's set under the current and the
+# proposed template, each with its whole case wall clock (the runner bounds the run by
+# `wall_clock_seconds`). That is hours, not the minutes a triage read takes, so it cannot ride
+# the triage pair. No default, same policy.
+case System.get_env("SPEC_TUNE_WALL_CLOCK_SECONDS") &&
+       Integer.parse(System.get_env("SPEC_TUNE_WALL_CLOCK_SECONDS")) do
+  {seconds, ""} when seconds > 0 -> config :loopctl, :spec_tune_wall_clock_seconds, seconds
+  _ -> :ok
+end
+
+case System.get_env("SPEC_TUNE_MAX_TURNS") &&
+       Integer.parse(System.get_env("SPEC_TUNE_MAX_TURNS")) do
+  {turns, ""} when turns > 0 -> config :loopctl, :spec_tune_max_turns, turns
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects
@@ -243,7 +276,7 @@ endpoint_http = [
   # HTTP/2 is off: Bandit then closes a connection that opens with the HTTP/2 preface
   # instead of serving it. Nothing needs it — Fly's proxy speaks HTTP/1.1 to the app
   # (fly.toml `h2_backend = false`). Off since #981, when it also kept the then-unpatched
-  # CVE-2026-105659 unreachable; bandit 1.13.1 patches that CVE, and the option stays
+  # CVE-2026-105659 unreachable; bandit 1.14.1 (OSV-clean) patches it, and the option stays
   # because nothing serves h2. test/loopctl_web/endpoint_http2_test.exs fails if it goes.
   http_2_options: [enabled: false]
 ]
