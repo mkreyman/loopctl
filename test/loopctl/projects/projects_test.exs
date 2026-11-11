@@ -120,6 +120,42 @@ defmodule Loopctl.ProjectsTest do
                Projects.create_project(tenant.id, %{name: "Test", slug: "-bad"})
 
       assert errors_on(changeset).slug != []
+
+      # Ends with underscore
+      assert {:error, changeset} =
+               Projects.create_project(tenant.id, %{name: "Test", slug: "bad_"})
+
+      assert errors_on(changeset).slug != []
+    end
+
+    test "accepts an underscore slug, so a slug can be the repo basename (#1038)" do
+      tenant = fixture(:tenant)
+
+      assert {:ok, %{slug: "home_care_billing"}} =
+               Projects.create_project(
+                 tenant.id,
+                 %{name: "home_care_billing", slug: "home_care_billing"},
+                 kind: :kb
+               )
+    end
+
+    test "a kb scope's name must equal its slug; a work project's need not" do
+      tenant = fixture(:tenant)
+
+      assert {:error, changeset} =
+               Projects.create_project(tenant.id, %{name: "Forge", slug: "diagram_forge"},
+                 kind: :kb
+               )
+
+      assert errors_on(changeset).name == ["must equal the slug (diagram_forge) for a kb scope"]
+
+      assert {:ok, %{name: "diagram_forge"}} =
+               Projects.create_project(tenant.id, %{name: "Diagram Forge", slug: "diagram_forge"},
+                 kind: :kb
+               )
+
+      assert {:ok, %{name: "Forge"}} =
+               Projects.create_project(tenant.id, %{name: "Forge", slug: "forge-work"})
     end
 
     test "defaults metadata to empty map" do
@@ -235,6 +271,16 @@ defmodule Loopctl.ProjectsTest do
       assert found.id == project.id
     end
 
+    test "resolves the hyphenated spelling against an underscored slug (#1038)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "home_care_billing"})
+
+      assert {:ok, found, :normalized_slug} =
+               Projects.resolve_project_ref(tenant.id, "home-care-billing")
+
+      assert found.id == project.id
+    end
+
     test "resolves by repo basename when the slug drifted from the repo" do
       tenant = fixture(:tenant)
 
@@ -344,6 +390,68 @@ defmodule Loopctl.ProjectsTest do
   end
 
   describe "resolve_project/2" do
+    test "a slug reaches a channel stored under the other separator, both ways (#1038)" do
+      tenant = fixture(:tenant)
+      hyphen = fixture(:project, %{tenant_id: tenant.id, slug: "fleet-dash"})
+      under = fixture(:project, %{tenant_id: tenant.id, slug: "open_brain"})
+
+      assert {:ok, %{id: id1}, :normalized_slug} =
+               Projects.resolve_project(tenant.id, slug: "fleet_dash")
+
+      assert id1 == hyphen.id
+
+      assert {:ok, %{id: id2}, :normalized_slug} =
+               Projects.resolve_project(tenant.id, slug: "open-brain")
+
+      assert id2 == under.id
+    end
+
+    test "an exact slug wins over its folded twin" do
+      tenant = fixture(:tenant)
+      _hyphen = fixture(:project, %{tenant_id: tenant.id, slug: "twin-slug"})
+      under = fixture(:project, %{tenant_id: tenant.id, slug: "twin_slug"})
+
+      assert {:ok, %{id: id}, :slug} = Projects.resolve_project(tenant.id, slug: "twin_slug")
+      assert id == under.id
+    end
+
+    test "a fold matching two active projects falls through instead of guessing" do
+      tenant = fixture(:tenant)
+      _a = fixture(:project, %{tenant_id: tenant.id, slug: "two-ways"})
+      _b = fixture(:project, %{tenant_id: tenant.id, slug: "two_ways"})
+
+      assert {:error, :not_found} = Projects.resolve_project(tenant.id, slug: "two__ways")
+    end
+
+    test "a fold prefers the single active project over an archived twin" do
+      tenant = fixture(:tenant)
+      old = fixture(:project, %{tenant_id: tenant.id, slug: "renamed-repo"})
+      {:ok, _} = Projects.archive_project(tenant.id, old)
+      live = fixture(:project, %{tenant_id: tenant.id, slug: "renamed_repo"})
+
+      assert {:ok, %{id: id}, :normalized_slug} =
+               Projects.resolve_project(tenant.id, slug: "renamed.repo")
+
+      assert id == live.id
+    end
+
+    test "a fold never resolves a lone archived project" do
+      tenant = fixture(:tenant)
+      old = fixture(:project, %{tenant_id: tenant.id, slug: "ads-for-care"})
+      {:ok, _} = Projects.archive_project(tenant.id, old)
+
+      assert {:error, :not_found} = Projects.resolve_project(tenant.id, slug: "ads_for_care")
+      assert {:ok, _, :slug} = Projects.resolve_project(tenant.id, slug: "ads-for-care")
+    end
+
+    test "a folded slug never resolves another tenant's project" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      _theirs = fixture(:project, %{tenant_id: tenant_b.id, slug: "cross_tenant"})
+
+      assert {:error, :not_found} = Projects.resolve_project(tenant_a.id, slug: "cross-tenant")
+    end
+
     test "resolves by exact slug" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id, slug: "loopctl"})

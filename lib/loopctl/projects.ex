@@ -155,8 +155,9 @@ defmodule Loopctl.Projects do
   Three passes, most-specific first:
 
     1. the exact `slug`;
-    2. the slug NORMALIZED — downcased, `_`/whitespace/`.` folded to `-` — which is
-       precisely the transform between a repo directory and this app's slug format;
+    2. the slug FOLDED — downcased, every run of non-alphanumerics read as one `-` on
+       BOTH the reference and the stored slug — so `home_care_billing` and
+       `home-care-billing` reach the same project whichever one is stored (#1038);
     3. the repo BASENAME of an active project's `repo_url`, compared on the same
        normalized form. This is what resolves a project whose slug drifted from its
        repo (`freight-pilot` -> slug `freight-pilot-2`).
@@ -191,28 +192,14 @@ defmodule Loopctl.Projects do
       trimmed ->
         normalized = normalize_project_ref(trimmed)
 
-        with :error <- resolve_ref_by_slug(tenant_id, trimmed, :slug),
-             :error <- resolve_ref_by_normalized_slug(tenant_id, trimmed, normalized) do
+        # resolve_by_slug/2 is the exact slug, then the folded slug.
+        with :error <- resolve_by_slug(tenant_id, trimmed) do
           resolve_ref_by_repo_name(tenant_id, normalized)
         end
     end
   end
 
   def resolve_project_ref(_tenant_id, _ref), do: {:error, :not_found}
-
-  defp resolve_ref_by_slug(tenant_id, slug, matched_by) do
-    case AdminRepo.get_by(Project, slug: slug, tenant_id: tenant_id) do
-      nil -> :error
-      project -> {:ok, project, matched_by}
-    end
-  end
-
-  # Skipped when normalization is a no-op, so the identical lookup is not run twice.
-  defp resolve_ref_by_normalized_slug(_tenant_id, same, same), do: :error
-  defp resolve_ref_by_normalized_slug(_tenant_id, _trimmed, ""), do: :error
-
-  defp resolve_ref_by_normalized_slug(tenant_id, _trimmed, normalized),
-    do: resolve_ref_by_slug(tenant_id, normalized, :normalized_slug)
 
   defp resolve_ref_by_repo_name(_tenant_id, ""), do: {:error, :not_found}
 
@@ -236,17 +223,10 @@ defmodule Loopctl.Projects do
     end
   end
 
-  # The transform between a repo DIRECTORY name and this app's slug format
-  # (lowercase alphanumeric + hyphens, per `Project.create_changeset/2`).
+  # `Project.fold/1`; the same fold is applied to stored slugs in SQL
+  # (`resolve_by_folded_slug/2`), so `_` and `-` spellings compare equal.
   defp normalize_project_ref(nil), do: ""
-
-  defp normalize_project_ref(value) when is_binary(value) do
-    value
-    |> String.trim()
-    |> String.downcase()
-    |> String.replace(~r/[^a-z0-9]+/u, "-")
-    |> String.trim("-")
-  end
+  defp normalize_project_ref(value) when is_binary(value), do: Project.fold(value)
 
   # Trailing path segment of a repo URL / ssh spec / bare owner/repo, ".git" stripped.
   defp repo_basename(nil), do: nil
@@ -265,7 +245,9 @@ defmodule Loopctl.Projects do
   repo X" into a loopctl project. Tries identifiers in precedence order and
   returns the first hit:
 
-  1. exact `:slug`
+  1. `:slug`, exact first, then FOLDED (`home_care_billing` and `home-care-billing`
+     reach the same project; the fold resolves only a single ACTIVE match and
+     otherwise falls through)
   2. normalized `:repo_url` (see `normalize_repo_url/1` — matches across
      `git@github.com:owner/repo.git`, `https://github.com/owner/repo`, and the
      bare `owner/repo`)
@@ -294,7 +276,7 @@ defmodule Loopctl.Projects do
   ## Returns
 
   - `{:ok, %Project{}, matched_by}` on the first matching identifier, where
-    `matched_by` is `:slug`, `:repo_url`, or `:name` -- the identifier that
+    `matched_by` is `:slug`, `:normalized_slug`, `:repo_url`, or `:name` -- the identifier that
     produced the hit, so callers can validate the match against their intent
     (a stale slug that misses and silently falls through to `repo_url`/`name`
     is now detectable).
@@ -315,7 +297,7 @@ defmodule Loopctl.Projects do
   # a malformed container degrades to :no_identifier via fetch_opt/2's catch-all
   # rather than raising -- upholding the "never raises on malformed input" doc.
   @spec resolve_project(Ecto.UUID.t(), keyword() | map() | term()) ::
-          {:ok, Project.t(), :slug | :repo_url | :name}
+          {:ok, Project.t(), :slug | :normalized_slug | :repo_url | :name}
           | {:error, :not_found | :no_identifier | :ambiguous}
   def resolve_project(tenant_id, opts) do
     slug = opts |> fetch_opt(:slug) |> presence()
@@ -336,7 +318,8 @@ defmodule Loopctl.Projects do
   @doc """
   Updates a project within a tenant.
 
-  Slug cannot be changed after creation.
+  A work project's slug cannot be changed; a `kind: :kb` scope's can, and its name
+  follows (see `Project.update_changeset/2`). The audit entry records both.
 
   ## Parameters
 
@@ -375,10 +358,12 @@ defmodule Loopctl.Projects do
           metadata: metadata,
           old_state: %{
             "name" => project.name,
+            "slug" => project.slug,
             "status" => to_string(project.status)
           },
           new_state: %{
             "name" => updated.name,
+            "slug" => updated.slug,
             "status" => to_string(updated.status)
           }
         }
@@ -689,8 +674,34 @@ defmodule Loopctl.Projects do
 
   defp resolve_by_slug(tenant_id, slug) do
     case AdminRepo.get_by(Project, slug: slug, tenant_id: tenant_id) do
-      nil -> :error
+      nil -> resolve_by_folded_slug(tenant_id, slug)
       project -> {:ok, project, :slug}
+    end
+  end
+
+  # Slugs gained `_` in #1038, and the fleet's channels are being renamed from the
+  # hyphenated form (`home-care-billing`) to the repo basename (`home_care_billing`).
+  # A session computing either spelling must reach the same channel instead of 404ing
+  # and creating a duplicate, so an exact miss retries on the FOLDED form: every run of
+  # non-alphanumerics read as one `-`, on both sides. The fold is a FUZZY identifier, so
+  # like `repo_url` and `name` it resolves only an ACTIVE project, and only when exactly
+  # one matches; anything else falls through to `repo_url` / `name` rather than guessing.
+  # An exact slug still resolves an archived project.
+  defp resolve_by_folded_slug(tenant_id, value) do
+    case Project.fold(value) do
+      "" ->
+        :error
+
+      folded ->
+        Project
+        |> where([p], p.tenant_id == ^tenant_id and p.status == :active)
+        |> where([p], fragment("regexp_replace(?, '[^a-z0-9]+', '-', 'g')", p.slug) == ^folded)
+        |> limit(2)
+        |> AdminRepo.all()
+        |> case do
+          [project] -> {:ok, project, :normalized_slug}
+          _ -> :error
+        end
     end
   end
 

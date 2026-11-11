@@ -41,7 +41,7 @@ export const HANDOFF_KEY_PREFIX = "handoff:";
 export const KEY_MAX_BYTES = 200;
 
 // Mirrors Loopctl.Projects.Project's slug rules (lib/loopctl/projects/project.ex:31,137):
-// /^[a-z0-9][a-z0-9-]*[a-z0-9]$/, 2..63 chars. A derived slug that cannot satisfy these
+// /^[a-z0-9][a-z0-9_-]*[a-z0-9]$/, 2..63 chars. A derived slug that cannot satisfy these
 // is reported as underivable rather than sent on to fail server-side.
 export const SLUG_MIN_LENGTH = 2;
 export const SLUG_MAX_LENGTH = 63;
@@ -124,7 +124,7 @@ export function handoffKey(anchor) {
 
 /**
  * The repo basename from a git remote URL or a bare owner/repo, with original casing
- * preserved (so it can seed a human-readable scope NAME).
+ * preserved; `deriveSlug` lowercases it.
  *
  * Handles: git@github.com:owner/repo.git, https://github.com/owner/repo(/),
  * ssh://git@host/owner/repo.git, bare owner/repo, and trailing query/fragment.
@@ -150,8 +150,10 @@ export function repoBasename(repoUrl) {
  *
  * DETERMINISM IS THE POINT (#528 AC4): the created scope must be re-resolvable by the
  * same derivation on a retry, or a repeated handoff would create a second scope and burn
- * the tenant's max_projects budget. Underscores become hyphens, matching the existing
- * convention in this tenant (repo home_care_billing -> slug home-care-billing).
+ * the tenant's max_projects budget. The slug is the repo basename lowercased with `_` KEPT
+ * (#1038: repo home_care_billing -> slug home_care_billing); only other non-alphanumeric
+ * runs become `-`. The server resolves a slug on its folded form too, so a channel still
+ * stored under the old hyphenated slug is found rather than duplicated.
  *
  * Returns null when nothing valid can be derived — the caller then asks for an explicit
  * slug instead of sending a doomed create.
@@ -162,13 +164,13 @@ export function deriveSlug(repoUrl) {
 
   const slug = basename
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/[^a-z0-9_]+/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
+    .replace(/^[-_]+|[-_]+$/g, "")
     .slice(0, SLUG_MAX_LENGTH)
-    // A mid-string hyphen can land last after truncation; the server's format regex
+    // A mid-string separator can land last after truncation; the server's format regex
     // requires an alphanumeric final character.
-    .replace(/-+$/, "");
+    .replace(/[-_]+$/, "");
 
   return slug.length >= SLUG_MIN_LENGTH ? slug : null;
 }
@@ -248,7 +250,7 @@ function createRemediation(status) {
  * Returns a channel summary, or an `apiCall`-shaped failure.
  */
 async function ensureChannel(
-  { project_id, repo_url, slug, name, description, tech_stack, create_channel },
+  { project_id, repo_url, slug, description, tech_stack, create_channel },
   { resolveProject, createKbScope },
 ) {
   // An explicit project_id is taken at face value — the caller already resolved it, and
@@ -305,12 +307,14 @@ async function ensureChannel(
       0,
       `Could not derive a valid project slug from repo_url ${JSON.stringify(repo_url)} ` +
         `(needs ${SLUG_MIN_LENGTH}-${SLUG_MAX_LENGTH} chars of lowercase alphanumerics and ` +
-        `hyphens). Pass an explicit slug.`,
+        `hyphens or underscores). Pass an explicit slug.`,
     );
   }
 
   const created = await createKbScope({
-    name: name || repoBasename(repo_url) || createSlug,
+    // A channel's name IS its slug (#1038): the server refuses a kb scope whose name
+    // differs, so the tool takes no `name` at all.
+    name: createSlug,
     slug: createSlug,
     repo_url,
     description,
@@ -360,7 +364,6 @@ export async function createHandoff(args = {}, deps = {}) {
     project_id,
     repo_url,
     slug,
-    name,
     description,
     tech_stack,
     to_host,
@@ -383,7 +386,7 @@ export async function createHandoff(args = {}, deps = {}) {
   }
 
   const channel = await ensureChannel(
-    { project_id, repo_url, slug, name, description, tech_stack, create_channel },
+    { project_id, repo_url, slug, description, tech_stack, create_channel },
     deps,
   );
   if (channel?.error === true) return channel;
