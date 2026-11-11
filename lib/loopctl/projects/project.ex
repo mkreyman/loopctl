@@ -128,15 +128,22 @@ defmodule Loopctl.Projects.Project do
   # stored one casts as no change, and must still be judged rather than overwritten.
   defp name_supplied?(attrs), do: Map.has_key?(attrs, :name) or Map.has_key?(attrs, "name")
 
-  # A project whose name IS its slug (every kb scope, and a work project named that way)
-  # keeps name == slug when renamed by slug alone, without the caller restating it.
-  defp name_follows_slug(%{data: %{name: same, slug: same}} = changeset, false = _supplied) do
+  # On a slug-only rename the name follows for a kb scope (always: its name is its slug, and a
+  # legacy kb row whose name drifted is realigned rather than refused) and for a work project
+  # whose name IS its slug. A work project with a display name keeps it.
+  defp name_follows_slug(%{data: %{kind: :kb}} = changeset, false = _supplied),
+    do: follow_slug(changeset)
+
+  defp name_follows_slug(%{data: %{name: same, slug: same}} = changeset, false = _supplied),
+    do: follow_slug(changeset)
+
+  defp name_follows_slug(changeset, _name_supplied), do: changeset
+
+  defp follow_slug(changeset) do
     if changed?(changeset, :slug),
       do: put_change(changeset, :name, get_field(changeset, :slug)),
       else: changeset
   end
-
-  defp name_follows_slug(changeset, _name_supplied), do: changeset
 
   # A kb scope's name is its slug. A name that is the same string up to case and separators
   # (`home_care_billing` for slug `home-care-billing`, what MCP clients before 3.13 send) is

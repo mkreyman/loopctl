@@ -11,7 +11,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **`update_project` renames a work project's slug too** (#1038): the server no longer
   refuses it, so a repo's work channel can take the repo basename. A name equal to the old
-  slug follows; a display name is kept. Descriptions updated.
+  slug follows; a display name is kept. The `update_project` and `delete_project` descriptions say so.
 
 ## 3.13.0 — 2026-11-11 (a channel's name is its slug)
 

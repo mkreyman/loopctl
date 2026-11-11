@@ -41,7 +41,7 @@
     },
     {
       "id": "AC-5.1.6",
-      "description": "PATCH /api/v1/projects/:id (role: user) updates project fields; slug cannot be changed after creation",
+      "description": "PATCH /api/v1/projects/:id (role: user) updates project fields, slug included (#1038: a slug another project holds is refused 422)",
       "status": "pending"
     },
     {
