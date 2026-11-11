@@ -178,9 +178,10 @@ defmodule LoopctlWeb.ProjectController do
     summary: "Update project",
     description:
       "Updates a project's name, slug, repo_url, description, tech_stack, mission or " <>
-        "metadata. Orchestrator+ role on a human-anchored tenant. Only a kind: kb scope's " <>
-        "slug can change (a work project's is refused 422); its name follows the slug, a " <>
-        "kb name that differs from its slug is refused 422, and a slug another project " <>
+        "metadata. Orchestrator+ role on a human-anchored tenant. A slug change renames " <>
+        "the project's channel; when the body carries no name and the name equaled the " <>
+        "old slug, the name follows. A kb name that differs from its slug is refused " <>
+        "422, and a slug another project " <>
         "(archived included) holds is refused 422. Both are audited. A body " <>
         "carrying status is refused 422 whatever its value: archive with DELETE " <>
         "/api/v1/projects/:id (user+) and restore with POST /api/v1/projects/:id/restore. " <>
@@ -455,8 +456,8 @@ defmodule LoopctlWeb.ProjectController do
   @doc """
   PATCH /api/v1/projects/:id
 
-  Updates a project. Requires orchestrator+ role on a human-anchored tenant. Only a
-  `kind: :kb` scope's slug can change (#1038), and status cannot: a body carrying `status` is refused 422 before the project
+  Updates a project. Requires orchestrator+ role on a human-anchored tenant. The slug can
+  change (#1038), and status cannot: a body carrying `status` is refused 422 before the project
   is read, because archiving is DELETE (user+) and restoring is POST /restore, each with its
   own gate, cap check and audit action that a PATCH would skip.
   """

@@ -5,8 +5,8 @@
  *
  * WHAT THE ENDPOINT ACCEPTS: `name`, `slug`, `repo_url`, `description`, `tech_stack`,
  * `mission`, `metadata`. It drops every nil, so a request naming none is a 200 that changes
- * nothing: refused here. Only a kind: kb scope's `slug` can change, and its name follows it
- * (#1038); a work project's slug change is a 422. A body carrying `status` is a 422 (archive
+ * nothing: refused here. Any project's `slug` can change, and a name that equaled the old
+ * slug follows it (#1038). A body carrying `status` is a 422 (archive
  * and restore have their own routes), so it is never sent. An empty `mission` clears it.
  *
  * KEY: orchestrator role on a human-anchored tenant; index.js injects the orchestrator-pinned

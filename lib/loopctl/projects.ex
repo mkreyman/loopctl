@@ -318,8 +318,8 @@ defmodule Loopctl.Projects do
   @doc """
   Updates a project within a tenant.
 
-  A work project's slug cannot be changed; a `kind: :kb` scope's can, and its name
-  follows (see `Project.update_changeset/2`). The audit entry records both.
+  The slug can be changed, and a name that equaled the old slug follows it (see
+  `Project.update_changeset/2`). The audit entry records both.
 
   ## Parameters
 

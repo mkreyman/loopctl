@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.13.1 — 2026-11-11
+
+### Changed
+
+- **`update_project` renames a work project's slug too** (#1038): the server no longer
+  refuses it, so a repo's work channel can take the repo basename. A name equal to the old
+  slug follows; a display name is kept. Descriptions updated.
+
 ## 3.13.0 — 2026-11-11 (a channel's name is its slug)
 
 ### Changed

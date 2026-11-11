@@ -11,8 +11,8 @@ defmodule Loopctl.Projects.Project do
 
   - `name` -- display name
   - `slug` -- unique within tenant, archived projects included (lowercase alphanumeric,
-    hyphens and underscores, 2-63 chars). A `kind: :kb` scope's slug can be changed;
-    a work project's cannot.
+    hyphens and underscores, 2-63 chars). It can be changed, so a repo's channel can
+    be aligned to the repo name.
 
   A `kind: :kb` scope is a repo's coordination channel, and its `name` must equal its
   `slug` (#1038): two strings made by two rules drifted apart on 17 of 29 projects.
@@ -94,10 +94,11 @@ defmodule Loopctl.Projects.Project do
   @doc """
   Changeset for updating an existing project.
 
-  A work project's slug cannot be changed (a `slug` that differs is refused). A `kind: :kb`
-  scope's slug can, so a repo channel can be aligned to its repo name (#1038); when the
-  request carries no name, the name follows the slug. A kb name is otherwise held to the
-  rule `create_changeset/2` applies (see `fold/1`).
+  Any project's slug can be changed, so a repo channel (a kb scope or a work project) can be
+  aligned to its repo name (#1038). When the request carries no name and the stored name
+  equals the stored slug, the name follows the new slug; a name that was never the slug is
+  left alone. A kb name is otherwise held to the rule `create_changeset/2` applies (see
+  `fold/1`).
   Status cannot be changed here: archiving and restoring are `archive_changeset/1` and
   `activate_changeset/1`, reached only through `Projects.archive_project/3` and
   `Projects.unarchive_project/3`, which carry the role gate, the `max_projects` cap and the
@@ -108,7 +109,6 @@ defmodule Loopctl.Projects.Project do
     project
     |> cast(attrs, [:name, :slug, :repo_url, :description, :tech_stack, :mission, :metadata])
     |> validate_required([:name, :slug])
-    |> validate_slug_change()
     |> validate_slug()
     |> name_follows_slug(name_supplied?(attrs))
     |> validate_kb_name_equals_slug()
@@ -124,20 +124,13 @@ defmodule Loopctl.Projects.Project do
     )
   end
 
-  defp validate_slug_change(%{data: %{kind: :kb}} = changeset), do: changeset
-
-  defp validate_slug_change(changeset) do
-    if changed?(changeset, :slug),
-      do: add_error(changeset, :slug, "cannot be changed on a work project"),
-      else: changeset
-  end
-
   # Whether the CALLER sent a name, not whether cast saw a change: a name equal to the
   # stored one casts as no change, and must still be judged rather than overwritten.
   defp name_supplied?(attrs), do: Map.has_key?(attrs, :name) or Map.has_key?(attrs, "name")
 
-  # A kb scope renamed by slug alone keeps name == slug without the caller restating it.
-  defp name_follows_slug(%{data: %{kind: :kb}} = changeset, false = _name_supplied) do
+  # A project whose name IS its slug (every kb scope, and a work project named that way)
+  # keeps name == slug when renamed by slug alone, without the caller restating it.
+  defp name_follows_slug(%{data: %{name: same, slug: same}} = changeset, false = _supplied) do
     if changed?(changeset, :slug),
       do: put_change(changeset, :name, get_field(changeset, :slug)),
       else: changeset
