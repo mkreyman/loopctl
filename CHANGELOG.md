@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A project slug may contain `_`, and a kb scope's name must equal its slug (2026-11-11,
+  #1038).** A repo channel is named and slugged by the repo basename verbatim
+  (`home_care_billing`). `POST /api/v1/kb-scopes` refuses a `name` that differs from `slug`
+  (422). `PATCH /api/v1/projects/:id` now takes `slug` for a kb scope (its name follows, both
+  audited) and refuses it with 422 for a work project, where it used to be silently ignored.
+  `resolve_project` and the `project_id` reference resolver match a slug on its folded form
+  too (`home-care-billing` reaches `home_care_billing` and back), so channels renamed to
+  their repo basename keep resolving for sessions that still compute the old spelling.
 - **A ticket-requiring intake source no longer makes stories for ticketless issues
   (2026-11-08).** With `triage_requires_ticket` set, an issue that carries no support ticket
   stays an intake record and gets no "Triage pending" story; it is promoted if a ticket

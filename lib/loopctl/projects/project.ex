@@ -10,7 +10,12 @@ defmodule Loopctl.Projects.Project do
   ## Fields
 
   - `name` -- display name
-  - `slug` -- unique within tenant (lowercase alphanumeric + hyphens, 2-63 chars)
+  - `slug` -- unique within tenant, archived projects included (lowercase alphanumeric,
+    hyphens and underscores, 2-63 chars). A `kind: :kb` scope's slug can be changed;
+    a work project's cannot.
+
+  A `kind: :kb` scope is a repo's coordination channel, and its `name` must equal its
+  `slug` (#1038): two strings made by two rules drifted apart on 17 of 29 projects.
   - `repo_url` -- GitHub/GitLab repository URL
   - `description` -- freeform text description
   - `tech_stack` -- e.g., "elixir/phoenix", "typescript/fastify"
@@ -28,7 +33,9 @@ defmodule Loopctl.Projects.Project do
 
   @statuses [:active, :archived]
   @kinds [:work, :kb]
-  @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
+  # `_` is allowed so a repo channel's slug can be the repo basename verbatim
+  # (`home_care_billing`), the same string its name carries (#1038).
+  @slug_format ~r/^[a-z0-9][a-z0-9_-]*[a-z0-9]$/
   @mission_max_length 2_000
 
   @derive {Jason.Encoder,
@@ -78,30 +85,71 @@ defmodule Loopctl.Projects.Project do
     |> cast(attrs, [:name, :slug, :repo_url, :description, :tech_stack, :mission, :metadata])
     |> validate_required([:name, :slug])
     |> validate_slug()
+    |> validate_kb_name_equals_slug()
     |> validate_mission()
     |> validate_metadata()
-    |> unique_constraint([:tenant_id, :slug],
-      message: "has already been taken for this tenant",
-      error_key: :slug
-    )
+    |> slug_unique_constraint()
   end
 
   @doc """
   Changeset for updating an existing project.
 
-  Slug cannot be changed after creation, and neither can status: archiving and restoring
-  are `archive_changeset/1` and `activate_changeset/1`, reached only through
-  `Projects.archive_project/3` and `Projects.unarchive_project/3`, which carry the role gate,
-  the `max_projects` cap and the audit action an ordinary edit does not.
+  A work project's slug cannot be changed (a `slug` that differs is refused). A `kind: :kb`
+  scope's slug can, so a repo channel can be aligned to its repo name (#1038); when only
+  the slug changes, the name follows it, and a name that differs from the slug is refused.
+  Status cannot be changed here: archiving and restoring are `archive_changeset/1` and
+  `activate_changeset/1`, reached only through `Projects.archive_project/3` and
+  `Projects.unarchive_project/3`, which carry the role gate, the `max_projects` cap and the
+  audit action an ordinary edit does not.
   """
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(project, attrs) do
     project
-    |> cast(attrs, [:name, :repo_url, :description, :tech_stack, :mission, :metadata])
-    |> validate_required([:name])
+    |> cast(attrs, [:name, :slug, :repo_url, :description, :tech_stack, :mission, :metadata])
+    |> validate_required([:name, :slug])
+    |> validate_slug_change()
+    |> validate_slug()
+    |> name_follows_slug()
+    |> validate_kb_name_equals_slug()
     |> validate_mission()
     |> validate_metadata()
+    |> slug_unique_constraint()
   end
+
+  defp slug_unique_constraint(changeset) do
+    unique_constraint(changeset, [:tenant_id, :slug],
+      message: "has already been taken for this tenant",
+      error_key: :slug
+    )
+  end
+
+  defp validate_slug_change(%{data: %{kind: :kb}} = changeset), do: changeset
+
+  defp validate_slug_change(changeset) do
+    if changed?(changeset, :slug),
+      do: add_error(changeset, :slug, "cannot be changed on a work project"),
+      else: changeset
+  end
+
+  # A kb scope renamed by slug alone keeps name == slug without the caller restating it.
+  defp name_follows_slug(%{data: %{kind: :kb}} = changeset) do
+    if changed?(changeset, :slug) and not changed?(changeset, :name),
+      do: put_change(changeset, :name, get_field(changeset, :slug)),
+      else: changeset
+  end
+
+  defp name_follows_slug(changeset), do: changeset
+
+  defp validate_kb_name_equals_slug(%{data: %{kind: :kb}} = changeset) do
+    name = get_field(changeset, :name)
+    slug = get_field(changeset, :slug)
+
+    if is_binary(name) and is_binary(slug) and name != slug,
+      do: add_error(changeset, :name, "must equal the slug (#{slug}) for a kb scope"),
+      else: changeset
+  end
+
+  defp validate_kb_name_equals_slug(changeset), do: changeset
 
   @doc """
   Changeset for archiving a project (setting status to :archived).
@@ -135,7 +183,8 @@ defmodule Loopctl.Projects.Project do
     changeset
     |> validate_format(:slug, @slug_format,
       message:
-        "must be lowercase alphanumeric with hyphens, starting and ending with alphanumeric"
+        "must be lowercase alphanumeric with hyphens or underscores, starting and " <>
+          "ending with alphanumeric"
     )
     |> validate_length(:slug, min: 2, max: 63)
   end

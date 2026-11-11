@@ -1105,8 +1105,18 @@ defmodule Loopctl.ApiSpec.Schemas do
       type: :object,
       required: [:name, :slug],
       properties: %{
-        name: %Schema{type: :string, example: "My Project"},
-        slug: %Schema{type: :string, example: "my-project"},
+        name: %Schema{
+          type: :string,
+          example: "my-project",
+          description: "For a kind: kb scope, must equal slug (422 otherwise)."
+        },
+        slug: %Schema{
+          type: :string,
+          example: "my-project",
+          description:
+            "Lowercase alphanumerics, hyphens and underscores, 2-63 chars, unique in the " <>
+              "tenant across archived projects too. For a repo channel, the repo basename."
+        },
         repo_url: %Schema{
           type: :string,
           nullable: true,

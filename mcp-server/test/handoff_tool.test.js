@@ -132,13 +132,14 @@ describe("repoBasename / deriveSlug", () => {
     assert.equal(deriveSlug("https://github.com/o/repo.git?ref=main#frag"), "repo");
   });
 
-  test("normalizes underscores and case to the existing slug convention", () => {
-    // The tenant's repo home_care_billing already maps to slug home-care-billing.
-    assert.equal(deriveSlug("https://github.com/mkreyman/home_care_billing"), "home-care-billing");
-    assert.equal(deriveSlug("git@github.com:o/AVA_Home_Care.git"), "ava-home-care");
+  test("keeps underscores and lowercases, so the slug is the repo basename (#1038)", () => {
+    assert.equal(deriveSlug("https://github.com/mkreyman/home_care_billing"), "home_care_billing");
+    assert.equal(deriveSlug("git@github.com:o/AVA_Home_Care.git"), "ava_home_care");
+    assert.equal(deriveSlug("o/my.dotted repo"), "my-dotted-repo");
+    assert.equal(deriveSlug("o/_edge_"), "edge");
   });
 
-  test("preserves original casing for the display NAME", () => {
+  test("repoBasename keeps the remote's casing", () => {
     assert.equal(repoBasename("git@github.com:o/AVA_Home_Care.git"), "AVA_Home_Care");
   });
 
@@ -154,7 +155,7 @@ describe("repoBasename / deriveSlug", () => {
   });
 
   test("produces a slug the server's format regex accepts, including at the length cap", () => {
-    const serverFormat = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
+    const serverFormat = /^[a-z0-9][a-z0-9_-]*[a-z0-9]$/;
     const inputs = [
       REPO_URL,
       "o/repo_with_a_very_long_name_that_exceeds_sixty_three_characters_for_sure_yes",
@@ -171,7 +172,7 @@ describe("repoBasename / deriveSlug", () => {
   });
 
   test("returns null when nothing valid can be derived", () => {
-    for (const input of ["o/x", "o/---", "", "   ", null, undefined, "/"]) {
+    for (const input of ["o/x", "o/---", "o/_-_", "", "   ", null, undefined, "/"]) {
       assert.equal(deriveSlug(input), null, `expected null for ${JSON.stringify(input)}`);
     }
   });
@@ -267,7 +268,17 @@ describe("createHandoff — no project yet (AC3, the #517 case)", () => {
     assert.equal(calls.create[0].slug, "custom-scope");
   });
 
-  test("passes name/description/tech_stack through to the create only", async () => {
+  test("an underscore repo creates a channel whose name equals its slug (#1038)", async () => {
+    const { deps, calls } = fakes({ resolve: [notFound] });
+    await createHandoff(
+      { anchor: "a#1", body: "tldr", repo_url: "git@github.com:mkreyman/ads_for_care.git" },
+      deps,
+    );
+    assert.equal(calls.create[0].slug, "ads_for_care");
+    assert.equal(calls.create[0].name, "ads_for_care");
+  });
+
+  test("passes description/tech_stack through to the create only, and never a separate name", async () => {
     const { deps, calls } = fakes({ resolve: [notFound] });
     await createHandoff(
       {
@@ -280,7 +291,7 @@ describe("createHandoff — no project yet (AC3, the #517 case)", () => {
       },
       deps,
     );
-    assert.equal(calls.create[0].name, "Harness Kit");
+    assert.equal(calls.create[0].name, calls.create[0].slug);
     assert.equal(calls.create[0].description, "d");
     assert.equal(calls.create[0].tech_stack, "t");
     assert.equal(calls.post[0].name, undefined);

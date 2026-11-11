@@ -3841,8 +3841,12 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "Project name." },
-        slug: { type: "string", description: "URL-safe slug." },
+        name: { type: "string", description: "Project name: the same string as slug." },
+        slug: {
+          type: "string",
+          description:
+            "The repo basename, lowercased, underscores kept (lowercase alphanumerics, hyphens, underscores; 2-63 chars).",
+        },
         repo_url: { type: "string", description: "GitHub repo URL." },
         description: { type: "string", description: "Project description." },
         tech_stack: { type: "string", description: "Tech stack summary." },
@@ -3862,8 +3866,15 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "Scope name (often the repo name)." },
-        slug: { type: "string", description: "URL-safe slug (often the repo basename)." },
+        name: {
+          type: "string",
+          description: "Scope name: the same string as slug (a different one is refused 422).",
+        },
+        slug: {
+          type: "string",
+          description:
+            "The repo basename, lowercased, underscores kept (lowercase alphanumerics, hyphens, underscores; 2-63 chars).",
+        },
         repo_url: {
           type: "string",
           description: "Repo URL, so resolve_project can map a repo to this scope.",
@@ -3918,12 +3929,12 @@ const TOOLS = [
         repo_url: {
           type: "string",
           description:
-            "The repo's git remote (git@github.com:owner/repo.git, https://github.com/owner/repo, or bare owner/repo). The usual way to name the channel; also used to derive the kb-scope slug/name if one must be created.",
+            "The repo's git remote (git@github.com:owner/repo.git, https://github.com/owner/repo, or bare owner/repo). The usual way to name the channel; also used to derive the kb-scope slug if one must be created: the repo basename lowercased, underscores kept, and the name is the same string.",
         },
         slug: {
           type: "string",
           description:
-            "Explicit project slug, if you know it or want to override the slug derived from repo_url (lowercase alphanumerics and hyphens, 2-63 chars).",
+            "Explicit project slug, if you know it or want to override the slug derived from repo_url (lowercase alphanumerics, hyphens and underscores, 2-63 chars).",
         },
         project_id: {
           type: "string",
@@ -3958,11 +3969,6 @@ const TOOLS = [
           type: "boolean",
           description:
             "Default true: create a kind: kb scope when the repo has no project yet (this is what makes a handoff possible on a fresh repo; it consumes one max_projects slot, and the response reports channel.created). Pass false to fail with an actionable error instead of creating anything.",
-        },
-        name: {
-          type: "string",
-          description:
-            "Scope name, used ONLY if a channel must be created. Defaults to the repo basename.",
         },
         description: {
           type: "string",
@@ -4297,7 +4303,7 @@ const TOOLS = [
   {
     name: "delete_project",
     description:
-      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and no API call changes or releases a slug, so a new project needs a different one. The way back: restore_project for a work project, restore_kb_scope for a kb scope. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
+      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and nothing releases a slug, so a new project needs a different one (update_project can change a kb scope's slug, never a work project's). The way back: restore_project for a work project, restore_kb_scope for a kb scope. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4327,12 +4333,17 @@ const TOOLS = [
   {
     name: "update_project",
     description:
-      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. The slug never changes, and status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field.",
+      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. Only a kind: kb scope's slug can change: its name follows the slug, a kb name different from its slug is 422, and a slug another project holds (archived included) is 422; a work project's slug change is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field.",
     inputSchema: {
       type: "object",
       properties: {
         project_id: { type: "string", description: "The project's UUID." },
-        name: { type: "string", description: "New name." },
+        name: { type: "string", description: "New name. For a kb scope it must equal the slug." },
+        slug: {
+          type: "string",
+          description:
+            "New slug, kb scopes only (lowercase alphanumerics, hyphens, underscores; 2-63 chars). For a repo channel, the repo basename verbatim, e.g. home_care_billing.",
+        },
         repo_url: { type: "string", description: "Git remote URL, e.g. https://github.com/owner/repo." },
         description: { type: "string", description: "New description." },
         tech_stack: { type: "string", description: "New tech stack summary." },

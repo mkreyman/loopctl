@@ -185,6 +185,34 @@ defmodule LoopctlWeb.ProjectControllerTest do
       assert project.kind == :kb
     end
 
+    test "refuses a name that differs from the slug (#1038)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "Ads For Care", "slug" => "ads_for_care"})
+
+      assert json_response(conn, 422)["error"]["details"]["name"] == [
+               "must equal the slug (ads_for_care) for a kb scope"
+             ]
+    end
+
+    test "accepts an underscore slug, the repo basename verbatim (#1038)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "ads_for_care", "slug" => "ads_for_care"})
+
+      project = json_response(conn, 201)["project"]
+      assert project["slug"] == "ads_for_care"
+      assert project["name"] == "ads_for_care"
+    end
+
     test "kind cannot be forced to :work via the request body", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -251,7 +279,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/projects", %{
-          "name" => "eCommerce Friendly",
+          "name" => "ecommerce-friendly",
           "slug" => "ecommerce-friendly",
           "repo_url" => "https://github.com/mkreyman/ecommerce-friendly"
         })
@@ -283,7 +311,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/projects", %{
-          "name" => "eCommerce Friendly",
+          "name" => "ecommerce-friendly",
           "slug" => "ecommerce-friendly"
         })
 
@@ -322,7 +350,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/kb-scopes", %{
-          "name" => "eCommerce Friendly",
+          "name" => "ecommerce-friendly",
           "slug" => "ecommerce-friendly",
           "repo_url" => "https://github.com/mkreyman/ecommerce-friendly"
         })
@@ -432,10 +460,10 @@ defmodule LoopctlWeb.ProjectControllerTest do
     test "restore is rejected 422 when the tenant is at its project cap", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted, settings: %{"max_projects" => 1}})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
-      {:ok, kb} = Projects.create_project(tenant.id, %{name: "a", slug: "aa"}, kind: :kb)
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "aa", slug: "aa"}, kind: :kb)
       {:ok, _} = Projects.archive_project(tenant.id, kb)
       # Fill the single active slot with another scope.
-      {:ok, _} = Projects.create_project(tenant.id, %{name: "b", slug: "bb"}, kind: :kb)
+      {:ok, _} = Projects.create_project(tenant.id, %{name: "bb", slug: "bb"}, kind: :kb)
 
       conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/kb-scopes/#{kb.id}/restore")
 
@@ -740,7 +768,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
       assert json_response(conn, 200)["project"]["mission"] == nil
     end
 
-    test "does not change slug (slug not in update cast)", %{conn: conn} do
+    test "refuses a slug change on a work project", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       project = fixture(:project, %{tenant_id: tenant.id, slug: "original-slug"})
@@ -753,9 +781,64 @@ defmodule LoopctlWeb.ProjectControllerTest do
           "name" => "Updated"
         })
 
-      body = json_response(conn, 200)
-      # Slug should remain unchanged since it's not in update_changeset cast
-      assert body["project"]["slug"] == "original-slug"
+      assert json_response(conn, 422)["error"]["details"]["slug"] == [
+               "cannot be changed on a work project"
+             ]
+
+      assert {:ok, %{slug: "original-slug"}} = Projects.get_project(tenant.id, project.id)
+    end
+
+    test "renames a kb scope to its repo basename; the name follows (#1038)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb, slug: "ads-for-care"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{kb.id}", %{"slug" => "ads_for_care"})
+
+      project = json_response(conn, 200)["project"]
+      assert project["slug"] == "ads_for_care"
+      assert project["name"] == "ads_for_care"
+
+      {:ok, %{data: [entry | _]}} =
+        Loopctl.Audit.list_entries(tenant.id, entity_type: "project", action: "updated")
+
+      assert entry.old_state["slug"] == "ads-for-care"
+      assert entry.new_state["slug"] == "ads_for_care"
+    end
+
+    test "refuses a kb name that differs from its slug", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb, slug: "fleet_dash"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{kb.id}", %{"name" => "Fleet Dash"})
+
+      assert json_response(conn, 422)["error"]["details"]["name"] == [
+               "must equal the slug (fleet_dash) for a kb scope"
+             ]
+    end
+
+    test "refuses a kb slug another project holds, archived included", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      taken = fixture(:project, %{tenant_id: tenant.id, slug: "open_brain"})
+      {:ok, _} = Projects.archive_project(tenant.id, taken)
+      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb, slug: "open-brain"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{kb.id}", %{"slug" => "open_brain"})
+
+      assert json_response(conn, 422)["error"]["details"]["slug"] == [
+               "has already been taken for this tenant"
+             ]
     end
 
     test "creates audit log entry on update", %{conn: conn} do
@@ -884,7 +967,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       {:ok, scope} =
-        Projects.create_project(tenant.id, %{name: "kb", slug: "kb-restore"}, kind: :kb)
+        Projects.create_project(tenant.id, %{name: "kb-restore", slug: "kb-restore"}, kind: :kb)
 
       {:ok, _} = Projects.archive_project(tenant.id, scope)
 

@@ -1540,6 +1540,13 @@ defmodule Loopctl.Fixtures do
     # so a `kind: :kb` attr produces a real KB scope for coordination/tier tests.
     {kind, data} = Map.pop(build(:project, attrs), :kind, :work)
 
+    # A kb scope's name must equal its slug (#1038); default it so a test that only
+    # asks for `kind: :kb` gets a valid scope.
+    data =
+      if kind == :kb and not Map.has_key?(attrs, :name),
+        do: Map.put(data, :name, data.slug),
+        else: data
+
     changeset =
       %Project{tenant_id: tenant_id, kind: kind}
       |> Project.create_changeset(data)

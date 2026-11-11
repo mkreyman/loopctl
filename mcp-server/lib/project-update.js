@@ -3,10 +3,11 @@
  * loopctl #1036). Without it no session could set a work project's `repo_url`, so SessionStart,
  * which resolves channels by `repo_url`, found no channel for that repo.
  *
- * WHAT THE ENDPOINT ACCEPTS: `name`, `repo_url`, `description`, `tech_stack`, `mission`,
- * `metadata`. It drops every nil, so a request naming none is a 200 that changes nothing:
- * refused here. `slug` never changes, and a body carrying `status` is a 422 (archive and
- * restore have their own routes), so neither is ever sent. An empty `mission` clears it.
+ * WHAT THE ENDPOINT ACCEPTS: `name`, `slug`, `repo_url`, `description`, `tech_stack`,
+ * `mission`, `metadata`. It drops every nil, so a request naming none is a 200 that changes
+ * nothing: refused here. Only a kind: kb scope's `slug` can change, and its name follows it
+ * (#1038); a work project's slug change is a 422. A body carrying `status` is a 422 (archive
+ * and restore have their own routes), so it is never sent. An empty `mission` clears it.
  *
  * KEY: orchestrator role on a human-anchored tenant; index.js injects the orchestrator-pinned
  * `apiCall`, as it does for the epic writes.
@@ -14,7 +15,15 @@
 
 import { uuid as uuidRefusal } from "./delivery-loop.js";
 
-export const PROJECT_UPDATABLE = ["name", "repo_url", "description", "tech_stack", "mission", "metadata"];
+export const PROJECT_UPDATABLE = [
+  "name",
+  "slug",
+  "repo_url",
+  "description",
+  "tech_stack",
+  "mission",
+  "metadata",
+];
 
 export function projectPath(projectId) {
   return `/api/v1/projects/${encodeURIComponent(projectId)}`;

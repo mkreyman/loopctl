@@ -23,14 +23,20 @@ function recorder() {
 }
 
 describe("update_project request", () => {
-  test("PATCHes only the named fields, never slug or status", async () => {
+  test("PATCHes only the named fields, never status", async () => {
     const { calls, apiCall } = recorder();
     await updateProject(
-      { project_id: ID, repo_url: "https://github.com/mkreyman/second_brain", slug: "x", status: "archived", name: null },
+      { project_id: ID, repo_url: "https://github.com/mkreyman/second_brain", status: "archived", name: null },
       { apiCall },
     );
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0], ["PATCH", `/api/v1/projects/${ID}`, { repo_url: "https://github.com/mkreyman/second_brain" }]);
+  });
+
+  test("sends a slug, so a kb scope can be renamed to its repo basename (#1038)", async () => {
+    const { calls, apiCall } = recorder();
+    await updateProject({ project_id: ID, slug: "home_care_billing" }, { apiCall });
+    assert.deepEqual(calls[0][2], { slug: "home_care_billing" });
   });
 
   test("an empty mission is sent, so it can be cleared", async () => {
@@ -41,7 +47,7 @@ describe("update_project request", () => {
 
   test("refuses an update naming no field, and sends nothing", async () => {
     const { calls, apiCall } = recorder();
-    const result = await updateProject({ project_id: ID, slug: "x" }, { apiCall });
+    const result = await updateProject({ project_id: ID, status: "archived" }, { apiCall });
     assert.equal(result.error, true);
     assert.match(result.body, /needs at least one of/);
     assert.equal(calls.length, 0);

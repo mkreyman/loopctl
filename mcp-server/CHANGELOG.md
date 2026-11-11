@@ -5,6 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.13.0 — 2026-11-11 (a channel's name is its slug)
+
+### Changed
+
+- **`handoff` derives the slug from the repo basename with `_` kept** (#1038):
+  `home_care_billing` stays `home_care_billing` instead of becoming `home-care-billing`, and a
+  created channel's name is always that same string. The tool no longer takes a `name`: the
+  server refuses a kb scope whose name differs from its slug. A channel still stored under the
+  hyphenated slug is found, because the server resolves a slug on its folded form too.
+- **`update_project` sends `slug`**: a kb scope can be renamed to its repo basename (its name
+  follows). A work project's slug change is a 422.
+- `create_kb_scope` and `create_project` describe `name` as the same string as `slug`.
+
 ## 3.12.0 — 2026-11-11 (update_project)
 
 ### Added
