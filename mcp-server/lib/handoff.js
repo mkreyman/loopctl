@@ -207,7 +207,10 @@ function postRemediation(status, channel) {
         "member of it: channel writes on a work project require an agent assigned to a " +
         "story there. The server's 'does not exist or does not belong to your tenant' " +
         "wording is deliberately non-specific (it must not leak an existence oracle), so " +
-        "do NOT read it as the project being missing. "
+        "do NOT read it as the project being missing. Fix it with a membership story in " +
+        "THIS project, never a second channel: create_story, then contract_story, " +
+        "claim_story, start_story and request_review, and leave it there (verify, unclaim " +
+        "or release clears the assignee). Then call handoff again. "
       : "";
 
   return (
