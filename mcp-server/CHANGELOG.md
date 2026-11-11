@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.2.0 — 2026-11-11 (update_project)
+
+### Added
+
+- **`update_project`** (#1036): PATCH a project's `name`, `repo_url`, `description`,
+  `tech_stack`, `mission` or `metadata`, sent with the orchestrator-pinned key. Slug and status
+  are never sent, and a call naming no field is refused locally. Before this, no session could
+  set a work project's `repo_url`, so SessionStart resolved no channel for that repo.
+
+### Changed
+
+- **`handoff` 422 remediation on a work project** now names the fix: a membership story in
+  that project (`create_story`, `contract_story`, `claim_story`, `start_story`,
+  `request_review`, then leave it), never a second channel.
+
 ## 3.1.0 — 2026-10-19 (intake mode chg)
 
 ### Added

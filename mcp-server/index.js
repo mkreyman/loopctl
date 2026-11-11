@@ -957,6 +957,31 @@ async function restoreProject({ project_id }) {
   return toContent(result);
 }
 
+const PROJECT_UPDATABLE = ["name", "repo_url", "description", "tech_stack", "mission", "metadata"];
+
+// PATCH /api/v1/projects/:id. The controller drops every nil, so a request naming no field is
+// a 200 that changes nothing: refused here instead. `slug` and `status` are not accepted
+// (slug never changes; status has its own DELETE and restore routes, and PATCH 422s it).
+async function updateProject(args) {
+  const { project_id } = args;
+  if (typeof project_id !== "string" || !/^[0-9a-f-]{36}$/i.test(project_id)) {
+    return toContent({ error: true, status: 0, body: "project_id must be a project UUID; nothing was sent." });
+  }
+  const body = {};
+  for (const key of PROJECT_UPDATABLE) {
+    if (args[key] !== undefined && args[key] !== null) body[key] = args[key];
+  }
+  if (Object.keys(body).length === 0) {
+    return toContent({
+      error: true,
+      status: 0,
+      body: `update_project needs at least one of ${PROJECT_UPDATABLE.join(", ")}; nothing was sent.`,
+    });
+  }
+  const result = await orchestratorPinnedApiCall("PATCH", `/api/v1/projects/${project_id}`, body);
+  return toContent(result);
+}
+
 async function getProgress({ project_id, include_cost }) {
   const params = new URLSearchParams();
   if (include_cost) params.set("include_cost", "true");
@@ -4229,6 +4254,24 @@ const TOOLS = [
           type: "string",
           description: "The UUID of the archived work project to restore.",
         },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "update_project",
+    description:
+      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. The slug never changes, and status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "The project's UUID." },
+        name: { type: "string", description: "New name." },
+        repo_url: { type: "string", description: "Git remote URL, e.g. https://github.com/owner/repo." },
+        description: { type: "string", description: "New description." },
+        tech_stack: { type: "string", description: "New tech stack summary." },
+        mission: { type: "string", description: "New mission; an empty string clears it." },
+        metadata: { type: "object", description: "Replaces the metadata map whole." },
       },
       required: ["project_id"],
     },
@@ -9788,6 +9831,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "delete_project":
       return await deleteProject(args);
 
+    case "update_project":
+      return await updateProject(args);
     case "restore_project":
       return await restoreProject(args);
 
