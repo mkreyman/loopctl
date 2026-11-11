@@ -143,14 +143,19 @@ defmodule Loopctl.ProjectsTest do
       tenant = fixture(:tenant)
 
       assert {:error, changeset} =
-               Projects.create_project(tenant.id, %{name: "Diagram Forge", slug: "diagram_forge"},
+               Projects.create_project(tenant.id, %{name: "Forge", slug: "diagram_forge"},
                  kind: :kb
                )
 
       assert errors_on(changeset).name == ["must equal the slug (diagram_forge) for a kb scope"]
 
-      assert {:ok, _} =
-               Projects.create_project(tenant.id, %{name: "Diagram Forge", slug: "diagram_forge"})
+      assert {:ok, %{name: "diagram_forge"}} =
+               Projects.create_project(tenant.id, %{name: "Diagram Forge", slug: "diagram_forge"},
+                 kind: :kb
+               )
+
+      assert {:ok, %{name: "Forge"}} =
+               Projects.create_project(tenant.id, %{name: "Forge", slug: "forge-work"})
     end
 
     test "defaults metadata to empty map" do
@@ -428,6 +433,15 @@ defmodule Loopctl.ProjectsTest do
                Projects.resolve_project(tenant.id, slug: "renamed.repo")
 
       assert id == live.id
+    end
+
+    test "a fold never resolves a lone archived project" do
+      tenant = fixture(:tenant)
+      old = fixture(:project, %{tenant_id: tenant.id, slug: "ads-for-care"})
+      {:ok, _} = Projects.archive_project(tenant.id, old)
+
+      assert {:error, :not_found} = Projects.resolve_project(tenant.id, slug: "ads_for_care")
+      assert {:ok, _, :slug} = Projects.resolve_project(tenant.id, slug: "ads-for-care")
     end
 
     test "a folded slug never resolves another tenant's project" do

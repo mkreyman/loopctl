@@ -95,8 +95,9 @@ defmodule Loopctl.Projects.Project do
   Changeset for updating an existing project.
 
   A work project's slug cannot be changed (a `slug` that differs is refused). A `kind: :kb`
-  scope's slug can, so a repo channel can be aligned to its repo name (#1038); when only
-  the slug changes, the name follows it, and a name that differs from the slug is refused.
+  scope's slug can, so a repo channel can be aligned to its repo name (#1038); when the
+  request carries no name, the name follows the slug. A kb name is otherwise held to the
+  rule `create_changeset/2` applies (see `fold/1`).
   Status cannot be changed here: archiving and restoring are `archive_changeset/1` and
   `activate_changeset/1`, reached only through `Projects.archive_project/3` and
   `Projects.unarchive_project/3`, which carry the role gate, the `max_projects` cap and the
@@ -109,7 +110,7 @@ defmodule Loopctl.Projects.Project do
     |> validate_required([:name, :slug])
     |> validate_slug_change()
     |> validate_slug()
-    |> name_follows_slug()
+    |> name_follows_slug(name_supplied?(attrs))
     |> validate_kb_name_equals_slug()
     |> validate_mission()
     |> validate_metadata()
@@ -131,25 +132,54 @@ defmodule Loopctl.Projects.Project do
       else: changeset
   end
 
+  # Whether the CALLER sent a name, not whether cast saw a change: a name equal to the
+  # stored one casts as no change, and must still be judged rather than overwritten.
+  defp name_supplied?(attrs), do: Map.has_key?(attrs, :name) or Map.has_key?(attrs, "name")
+
   # A kb scope renamed by slug alone keeps name == slug without the caller restating it.
-  defp name_follows_slug(%{data: %{kind: :kb}} = changeset) do
-    if changed?(changeset, :slug) and not changed?(changeset, :name),
+  defp name_follows_slug(%{data: %{kind: :kb}} = changeset, false = _name_supplied) do
+    if changed?(changeset, :slug),
       do: put_change(changeset, :name, get_field(changeset, :slug)),
       else: changeset
   end
 
-  defp name_follows_slug(changeset), do: changeset
+  defp name_follows_slug(changeset, _name_supplied), do: changeset
 
+  # A kb scope's name is its slug. A name that is the same string up to case and separators
+  # (`home_care_billing` for slug `home-care-billing`, what MCP clients before 3.13 send) is
+  # STORED as the slug rather than refused, so an older client still gets a channel; a name
+  # that is a different string is refused.
   defp validate_kb_name_equals_slug(%{data: %{kind: :kb}} = changeset) do
     name = get_field(changeset, :name)
     slug = get_field(changeset, :slug)
 
-    if is_binary(name) and is_binary(slug) and name != slug,
-      do: add_error(changeset, :name, "must equal the slug (#{slug}) for a kb scope"),
-      else: changeset
+    cond do
+      not (is_binary(name) and is_binary(slug)) or name == slug ->
+        changeset
+
+      fold(name) == fold(slug) ->
+        put_change(changeset, :name, slug)
+
+      true ->
+        add_error(changeset, :name, "must equal the slug (#{slug}) for a kb scope")
+    end
   end
 
   defp validate_kb_name_equals_slug(changeset), do: changeset
+
+  @doc """
+  The FOLDED form of a slug, name or repo directory: trimmed, lowercased, every run of
+  non-alphanumerics one `-`. `home_care_billing`, `Home-Care-Billing` and
+  `home-care-billing` fold to the same string.
+  """
+  @spec fold(String.t()) :: String.t()
+  def fold(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/u, "-")
+    |> String.trim("-")
+  end
 
   @doc """
   Changeset for archiving a project (setting status to :archived).

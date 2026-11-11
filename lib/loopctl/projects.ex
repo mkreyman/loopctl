@@ -223,18 +223,10 @@ defmodule Loopctl.Projects do
     end
   end
 
-  # The FOLDED form of a slug or a repo directory name: lowercase, every run of
-  # non-alphanumerics one `-`. The same fold is applied to stored slugs in SQL
+  # `Project.fold/1`; the same fold is applied to stored slugs in SQL
   # (`resolve_by_folded_slug/2`), so `_` and `-` spellings compare equal.
   defp normalize_project_ref(nil), do: ""
-
-  defp normalize_project_ref(value) when is_binary(value) do
-    value
-    |> String.trim()
-    |> String.downcase()
-    |> String.replace(~r/[^a-z0-9]+/u, "-")
-    |> String.trim("-")
-  end
+  defp normalize_project_ref(value) when is_binary(value), do: Project.fold(value)
 
   # Trailing path segment of a repo URL / ssh spec / bare owner/repo, ".git" stripped.
   defp repo_basename(nil), do: nil
@@ -254,7 +246,8 @@ defmodule Loopctl.Projects do
   returns the first hit:
 
   1. `:slug`, exact first, then FOLDED (`home_care_billing` and `home-care-billing`
-     reach the same project; a fold matching several projects falls through)
+     reach the same project; the fold resolves only a single ACTIVE match and
+     otherwise falls through)
   2. normalized `:repo_url` (see `normalize_repo_url/1` — matches across
      `git@github.com:owner/repo.git`, `https://github.com/owner/repo`, and the
      bare `owner/repo`)
@@ -690,37 +683,27 @@ defmodule Loopctl.Projects do
   # hyphenated form (`home-care-billing`) to the repo basename (`home_care_billing`).
   # A session computing either spelling must reach the same channel instead of 404ing
   # and creating a duplicate, so an exact miss retries on the FOLDED form: every run of
-  # non-alphanumerics read as one `-`, on both sides. A fold that matches more than one
-  # project prefers the single active one, and otherwise falls through to `repo_url` /
-  # `name` rather than guessing.
+  # non-alphanumerics read as one `-`, on both sides. The fold is a FUZZY identifier, so
+  # like `repo_url` and `name` it resolves only an ACTIVE project, and only when exactly
+  # one matches; anything else falls through to `repo_url` / `name` rather than guessing.
+  # An exact slug still resolves an archived project.
   defp resolve_by_folded_slug(tenant_id, value) do
-    case fold_slug(value) do
+    case Project.fold(value) do
       "" ->
         :error
 
       folded ->
         Project
-        |> where([p], p.tenant_id == ^tenant_id)
+        |> where([p], p.tenant_id == ^tenant_id and p.status == :active)
         |> where([p], fragment("regexp_replace(?, '[^a-z0-9]+', '-', 'g')", p.slug) == ^folded)
-        |> order_by([p], asc: p.inserted_at)
-        |> limit(@project_ref_candidate_limit)
+        |> limit(2)
         |> AdminRepo.all()
-        |> pick_folded_match()
+        |> case do
+          [project] -> {:ok, project, :normalized_slug}
+          _ -> :error
+        end
     end
   end
-
-  defp pick_folded_match([project]), do: {:ok, project, :normalized_slug}
-
-  defp pick_folded_match([_ | _] = projects) do
-    case Enum.filter(projects, &(&1.status == :active)) do
-      [project] -> {:ok, project, :normalized_slug}
-      _ -> :error
-    end
-  end
-
-  defp pick_folded_match([]), do: :error
-
-  defp fold_slug(value), do: normalize_project_ref(value)
 
   defp resolve_by_name(_tenant_id, nil), do: :error
 

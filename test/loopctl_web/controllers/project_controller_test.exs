@@ -192,11 +192,29 @@ defmodule LoopctlWeb.ProjectControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/kb-scopes", %{"name" => "Ads For Care", "slug" => "ads_for_care"})
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "Marketing Site", "slug" => "ads_for_care"})
 
       assert json_response(conn, 422)["error"]["details"]["name"] == [
                "must equal the slug (ads_for_care) for a kb scope"
              ]
+    end
+
+    test "an MCP client before 3.13 still gets a channel, named by its slug", %{conn: conn} do
+      # Clients before 3.13 send the raw repo basename as name and the hyphenated slug.
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{
+          "name" => "home_care_billing",
+          "slug" => "home-care-billing"
+        })
+
+      project = json_response(conn, 201)["project"]
+      assert project["slug"] == "home-care-billing"
+      assert project["name"] == "home-care-billing"
     end
 
     test "accepts an underscore slug, the repo basename verbatim (#1038)", %{conn: conn} do
@@ -817,10 +835,29 @@ defmodule LoopctlWeb.ProjectControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> patch(~p"/api/v1/projects/#{kb.id}", %{"name" => "Fleet Dash"})
+        |> patch(~p"/api/v1/projects/#{kb.id}", %{"name" => "dashboard"})
 
       assert json_response(conn, 422)["error"]["details"]["name"] == [
                "must equal the slug (fleet_dash) for a kb scope"
+             ]
+    end
+
+    test "an explicit name is judged, never overwritten by the new slug", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb, slug: "fleet-dash"})
+
+      # The name equals the stored one, so cast sees no change; it must still be refused.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{kb.id}", %{
+          "slug" => "dashboard_v2",
+          "name" => "fleet-dash"
+        })
+
+      assert json_response(conn, 422)["error"]["details"]["name"] == [
+               "must equal the slug (dashboard_v2) for a kb scope"
              ]
     end
 
