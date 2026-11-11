@@ -202,7 +202,7 @@ const DECLARED = {
   // five: the intake-source PUT rejoined the `duplicate` block above when
   // `intake_source_update` made its PATCH twin real, which is the ratchet working in the
   // direction it is meant to move.
-  "PUT /api/v1/projects/:param": "gap", // ProjectController.update
+  "PUT /api/v1/projects/:param": "duplicate", // ProjectController.update — update_project PATCHes it
   "PUT /api/v1/webhooks/:param": "gap", // WebhookController.update
   "PUT /api/v1/skills/:param": "gap", // SkillController.update
   "PUT /api/v1/token-budgets/:param": "gap", // TokenBudgetController.update
@@ -234,7 +234,6 @@ const DECLARED = {
   "GET /api/v1/agents": "gap", // AgentController.index
   "GET /api/v1/agents/:param": "gap", // AgentController.show
   "GET /api/v1/projects/:param": "gap", // ProjectController.show
-  "PATCH /api/v1/projects/:param": "gap", // ProjectController.update
   "GET /api/v1/projects/:param/export": "gap", // ImportExportController.export_project
   "POST /api/v1/projects/:param/ui-tests": "gap", // UiTestController.create
   "GET /api/v1/projects/:param/ui-tests": "gap", // UiTestController.index

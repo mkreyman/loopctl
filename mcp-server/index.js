@@ -75,6 +75,7 @@ import {
   githubCredential as githubCredentialRequest,
   setGithubCredential as setGithubCredentialRequest,
 } from "./lib/github-credential.js";
+import { updateProject as updateProjectRequest } from "./lib/project-update.js";
 import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
@@ -957,29 +958,8 @@ async function restoreProject({ project_id }) {
   return toContent(result);
 }
 
-const PROJECT_UPDATABLE = ["name", "repo_url", "description", "tech_stack", "mission", "metadata"];
-
-// PATCH /api/v1/projects/:id. The controller drops every nil, so a request naming no field is
-// a 200 that changes nothing: refused here instead. `slug` and `status` are not accepted
-// (slug never changes; status has its own DELETE and restore routes, and PATCH 422s it).
 async function updateProject(args) {
-  const { project_id } = args;
-  if (typeof project_id !== "string" || !/^[0-9a-f-]{36}$/i.test(project_id)) {
-    return toContent({ error: true, status: 0, body: "project_id must be a project UUID; nothing was sent." });
-  }
-  const body = {};
-  for (const key of PROJECT_UPDATABLE) {
-    if (args[key] !== undefined && args[key] !== null) body[key] = args[key];
-  }
-  if (Object.keys(body).length === 0) {
-    return toContent({
-      error: true,
-      status: 0,
-      body: `update_project needs at least one of ${PROJECT_UPDATABLE.join(", ")}; nothing was sent.`,
-    });
-  }
-  const result = await orchestratorPinnedApiCall("PATCH", `/api/v1/projects/${project_id}`, body);
-  return toContent(result);
+  return toContent(await updateProjectRequest(args, { apiCall: orchestratorPinnedApiCall }));
 }
 
 async function getProgress({ project_id, include_cost }) {
