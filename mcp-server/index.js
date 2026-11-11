@@ -4303,7 +4303,7 @@ const TOOLS = [
   {
     name: "delete_project",
     description:
-      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and archiving never releases it, so a new project needs a different one. The one way a slug is freed: update_project renaming a kb scope (never a work project) releases the kb scope's old slug. The way back: restore_project for a work project, restore_kb_scope for a kb scope. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
+      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and archiving never releases it, so a new project needs a different one. The one way a slug is freed: update_project renaming the project's slug releases the old one. The way back: restore_project for a work project, restore_kb_scope for a kb scope. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4333,7 +4333,7 @@ const TOOLS = [
   {
     name: "update_project",
     description:
-      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. Only a kind: kb scope's slug can change: its name follows the slug, a kb name different from its slug is 422, and a slug another project holds (archived included) is 422; a work project's slug change is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field.",
+      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. A slug change renames the project's channel (kb scope or work project); when no name is sent and the name equaled the old slug, the name follows. A kb name different from its slug is 422, and a slug another project holds (archived included) is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4342,7 +4342,7 @@ const TOOLS = [
         slug: {
           type: "string",
           description:
-            "New slug, kb scopes only (lowercase alphanumerics, hyphens, underscores; 2-63 chars). For a repo channel, the repo basename verbatim, e.g. home_care_billing.",
+            "New slug (lowercase alphanumerics, hyphens, underscores; 2-63 chars). For a repo channel, the repo basename verbatim, e.g. home_care_billing.",
         },
         repo_url: { type: "string", description: "Git remote URL, e.g. https://github.com/owner/repo." },
         description: { type: "string", description: "New description." },

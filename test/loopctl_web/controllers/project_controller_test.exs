@@ -786,7 +786,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
       assert json_response(conn, 200)["project"]["mission"] == nil
     end
 
-    test "refuses a slug change on a work project", %{conn: conn} do
+    test "changes a work project's slug; a name sent with it is kept", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       project = fixture(:project, %{tenant_id: tenant.id, slug: "original-slug"})
@@ -795,15 +795,81 @@ defmodule LoopctlWeb.ProjectControllerTest do
         conn
         |> auth_conn(raw_key)
         |> patch(~p"/api/v1/projects/#{project.id}", %{
-          "slug" => "new-slug",
+          "slug" => "new_slug",
           "name" => "Updated"
         })
 
-      assert json_response(conn, 422)["error"]["details"]["slug"] == [
-               "cannot be changed on a work project"
-             ]
+      body = json_response(conn, 200)["project"]
+      assert body["slug"] == "new_slug"
+      assert body["name"] == "Updated"
+    end
 
-      assert {:ok, %{slug: "original-slug"}} = Projects.get_project(tenant.id, project.id)
+    test "a work project named as its slug follows a slug-only rename", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project =
+        fixture(:project, %{tenant_id: tenant.id, slug: "cron-books", name: "cron-books"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"slug" => "cron_books"})
+
+      body = json_response(conn, 200)["project"]
+      assert body["slug"] == "cron_books"
+      assert body["name"] == "cron_books"
+    end
+
+    test "a work project whose name is not its slug keeps the name on a slug-only rename",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project =
+        fixture(:project, %{tenant_id: tenant.id, slug: "fleet-dash", name: "Fleet Dashboard"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"slug" => "fleet_dash"})
+
+      body = json_response(conn, 200)["project"]
+      assert body["slug"] == "fleet_dash"
+      assert body["name"] == "Fleet Dashboard"
+    end
+
+    test "refuses a work project slug another project holds", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      fixture(:project, %{tenant_id: tenant.id, slug: "taken"})
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "mine"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"slug" => "taken"})
+
+      assert json_response(conn, 422)
+      assert {:ok, %{slug: "mine"}} = Projects.get_project(tenant.id, project.id)
+    end
+
+    test "a legacy kb scope whose name drifted is realigned by a slug-only rename",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb, slug: "ads-for-care"})
+      # A row written before #1038, when a kb name could differ from its slug.
+      Loopctl.AdminRepo.update!(Ecto.Changeset.change(kb, name: "Ads For Care Platform"))
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{kb.id}", %{"slug" => "ads_for_care"})
+
+      project = json_response(conn, 200)["project"]
+      assert project["slug"] == "ads_for_care"
+      assert project["name"] == "ads_for_care"
     end
 
     test "renames a kb scope to its repo basename; the name follows (#1038)", %{conn: conn} do

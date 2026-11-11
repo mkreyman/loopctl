@@ -10,8 +10,10 @@ All notable changes to loopctl are documented here.
   #1038).** A repo channel is named and slugged by the repo basename verbatim
   (`home_care_billing`). `POST /api/v1/kb-scopes` refuses a `name` that is a different
   string from `slug` (422); one that differs only by case or separators is stored as the
-  slug, so MCP clients before 3.13 still get a channel. `PATCH /api/v1/projects/:id` now takes `slug` for a kb scope (its name follows, both
-  audited) and refuses it with 422 for a work project, where it used to be silently ignored.
+  slug, so MCP clients before 3.13 still get a channel. `PATCH /api/v1/projects/:id` now takes `slug` for any project, kb scope or
+  work project (audited; a slug another project holds is 422). The name follows the slug
+  when the request carries no name and the name equalled the old slug; a work project with a
+  display name keeps it. Before this a work project's `slug` was silently ignored.
   `resolve_project` and the `project_id` reference resolver match a slug on its folded form
   too (`home-care-billing` reaches `home_care_billing` and back), so channels renamed to
   their repo basename keep resolving for sessions that still compute the old spelling.
