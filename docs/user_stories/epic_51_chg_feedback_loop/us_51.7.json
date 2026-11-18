@@ -58,8 +58,11 @@
       ]
     }
   ],
-  "technical_notes": [],
+  "technical_notes": [
+    "Re-scoped after_release on 2026-11-18: AC-51.7.3 requires the loopctl-runner session's agreement before the contract change merges, and none answered the contract post (contract:loopctl:us-51.7-triage-loop-finding) while the epic was built. The loopctl half alone would publish a field no template renders. Built after epic/chg-feedback-loop merges, once the runner side agrees."
+  ],
   "dependencies": [
     "US-51.3"
-  ]
+  ],
+  "after_release": "epic/chg-feedback-loop"
 }
