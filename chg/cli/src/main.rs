@@ -110,6 +110,30 @@ enum Top {
         #[command(subcommand)]
         command: ShadowCmd,
     },
+    /// This machine's outbox to loopctl's ledger (design §5).
+    Outbox {
+        #[command(subcommand)]
+        command: OutboxCmd,
+    },
+    /// Change events: the per-change log loopctl applies in `event_seq` order.
+    Event {
+        #[command(subcommand)]
+        command: EventCmd,
+    },
+    /// Ask loopctl for the review key of one (change, revision) under the source's chg
+    /// root (loopctl US-50.3). Prints loopctl's answer: `{dispatch_id, api_key,
+    /// expires_at}`. The key is shown once; hand it to the review job only. A repeat
+    /// before a verdict revokes the earlier key and mints afresh. Exit 0 minted, 1 refused
+    /// (409 `review_already_recorded`, 422 `revision_not_submitted`; loopctl's error on
+    /// stderr), 2 could not ask.
+    ReviewDispatch {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        change: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        revision: u64,
+    },
     /// Run the whole suite (static checks included, unless --no-static) on a trunk commit
     /// in this tree, and on green fast-forward `verified/<branch>` on the remote to it;
     /// never backwards, and never forced (story S8). Prints a JSON report. Exit 0 green (or nothing to do: the
@@ -212,6 +236,69 @@ enum Top {
         label: String,
         #[arg(long, default_value = "reland")]
         fix_label: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutboxCmd {
+    /// Deliver this machine's unsent ledger rows (shadow log, review rounds, flaky tests)
+    /// and change events to loopctl, for every repo in ~/.chg/loopctl.toml. Each file is
+    /// sent from the offset loopctl last answered for; the first send is the backfill.
+    /// Never on a push: writers start it detached, and a cron line repeats it. A failure
+    /// backs the repo off (30 s doubling to 1 h). Exit 0 sent or nothing to do (also when
+    /// unconfigured or another send is running), 1 when a repo failed.
+    Send {
+        /// Ignore the backoff.
+        #[arg(long)]
+        force: bool,
+        /// Print nothing unless something failed.
+        #[arg(long)]
+        quiet: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Per configured repo: unsent rows, the oldest one's age, changes with undelivered
+    /// events, and the backoff. Exit 0 healthy, 1 when a row has waited over 24 h.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventCmd {
+    /// Append one event to a change's chain (`refs/chg/<change>/events` on the remote).
+    /// Its `event_seq` is the next after the remote's tip: the push is a fast-forward, so
+    /// two machines racing never share or skip a seq. Delivery to loopctl follows in the
+    /// background. Prints `{change_id, event_seq, commit, repo}`. Exit 0 or 2.
+    Emit {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        change: String,
+        /// The event kind, e.g. `submitted`, `landed` (loopctl US-47.4 maps them).
+        #[arg(long)]
+        kind: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        revision: u64,
+        /// The revision's full commit sha.
+        #[arg(long)]
+        sha: String,
+        /// A JSON object (default `{}`).
+        #[arg(long, default_value = "{}")]
+        data: String,
+    },
+    /// Deliver a change's events from this clone: loopctl's cursor says what it lacks, and
+    /// the chain on the remote supplies it. The answer to a gap alert. Exit 0 or 2.
+    Sync {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        change: String,
     },
 }
 
@@ -432,6 +519,65 @@ fn main() -> ExitCode {
             }
         }
         Top::Doctor { repo } => doctor(&repo_root(repo)),
+        Top::Outbox { command } => match command {
+            OutboxCmd::Send { force, quiet, json } => outbox_send(force, quiet, json),
+            OutboxCmd::Status { json } => outbox_status(json),
+        },
+        Top::Event { command } => match command {
+            EventCmd::Emit {
+                repo,
+                remote,
+                change,
+                kind,
+                revision,
+                sha,
+                data,
+            } => with_worktree(repo, |r| {
+                let data = match serde_json::from_str(&data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("chg: event emit: --data is not JSON: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let ev = chg::events::NewEvent {
+                    change_id: &change,
+                    kind: &kind,
+                    revision,
+                    sha: &sha,
+                    data,
+                };
+                match chg::events::emit(r, &remote, &ev) {
+                    Ok(e) => {
+                        println!("{}", serde_json::to_string(&e).expect("serializes"));
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("chg: event emit: {e}");
+                        ExitCode::from(2)
+                    }
+                }
+            }),
+            EventCmd::Sync {
+                repo,
+                remote,
+                change,
+            } => with_worktree(repo, |r| match chg::events::sync(r, &remote, &change) {
+                Ok(slug) => {
+                    eprintln!("chg: {change} of {slug} is queued; `chg outbox status` shows it");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("chg: event sync: {e}");
+                    ExitCode::from(2)
+                }
+            }),
+        },
+        Top::ReviewDispatch {
+            repo,
+            change,
+            revision,
+        } => with_worktree(repo, |r| review_dispatch_cmd(r, &change, revision)),
         Top::Gate { repo } => {
             let r = gate::resolve(&repo_root(repo));
             println!("{}", r.mode);
@@ -529,8 +675,11 @@ fn main() -> ExitCode {
             remote,
             label,
         } => {
+            let root = repo_root(repo);
             let result = read_ids(&tests).and_then(|ids| {
-                revert::file_flaky(&repo_root(repo), &remote, &ids, &run_id, &label)
+                let urls = revert::file_flaky(&root, &remote, &ids, &run_id, &label)?;
+                ledger_flaky(&root, &ids, &run_id);
+                Ok(urls)
             });
             match result {
                 Ok(urls) => {
@@ -681,7 +830,158 @@ fn doctor(repo: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    match chg::outbox::doctor(repo) {
+        (true, text) => println!("ok: {text}"),
+        (false, text) => {
+            println!("FAIL: {text}");
+            return ExitCode::from(1);
+        }
+    }
     ExitCode::SUCCESS
+}
+
+/// One `flaky` ledger row per test, for loopctl (design §5). A failure to write is reported
+/// and never fails the filing.
+fn ledger_flaky(repo: &Path, ids: &[String], run_id: &str) {
+    let Some(slug) = git::origin_slug(repo) else {
+        return;
+    };
+    let host = shadow::hostname();
+    let at = chg::outbox::now_ms();
+    let rows: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "v": 1, "kind": "flaky", "repo": slug, "host": host, "at_ms": at,
+                "test": t, "run_id": run_id,
+            })
+        })
+        .collect();
+    let path = chg::outbox::derived_path(&git::repo_key(repo), "flaky");
+    match chg::outbox::append_rows(&path, &rows) {
+        Ok(()) => chg::outbox::kick(),
+        Err(e) => eprintln!("chg: flaky: the ledger row was not written: {e}"),
+    }
+}
+
+fn outbox_send(force: bool, quiet: bool, json: bool) -> ExitCode {
+    let s = match chg::outbox::send(force) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("chg: outbox send: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let failed = s.repos.iter().any(|r| r.problem.is_some());
+    if json {
+        println!("{}", serde_json::to_string(&s).expect("serializes"));
+    } else if !quiet || failed || !s.warnings.is_empty() {
+        let at = chg::outbox::rfc3339(chg::outbox::now_ms());
+        if !s.configured {
+            println!(
+                "{at} nothing to send: {} is absent",
+                chg::outbox::config_path().display()
+            );
+        } else if s.busy {
+            println!("{at} another send is running");
+        }
+        for r in &s.repos {
+            let mut line = format!(
+                "{at} {}: {} inserted, {} duplicate(s), {} rejected; events: {} posted, {} change(s) complete",
+                r.repo,
+                r.sent.inserted,
+                r.sent.duplicates,
+                r.sent.rejected,
+                r.events.posted,
+                r.events.completed
+            );
+            for p in &r.events.problems {
+                line.push_str(&format!("; {p}"));
+            }
+            if let Some(p) = &r.problem {
+                line.push_str(&format!("; STOPPED: {p}"));
+            }
+            println!("{line}");
+        }
+        for w in &s.warnings {
+            println!("{at} warning: {w}");
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn outbox_status(json: bool) -> ExitCode {
+    let cfg = match chg::outbox::load() {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            println!(
+                "not configured: {} is absent",
+                chg::outbox::config_path().display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("chg: outbox status: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let now = chg::outbox::now_ms();
+    let st = chg::outbox::status(&cfg);
+    if json {
+        println!("{}", serde_json::to_string(&st).expect("serializes"));
+    } else {
+        for r in &st {
+            println!("{}", r.line(now));
+        }
+    }
+    if st.iter().all(|r| r.healthy(now)) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn review_dispatch_cmd(repo: &Path, change: &str, revision: u64) -> ExitCode {
+    let cfg = match chg::outbox::load() {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            eprintln!(
+                "chg: review-dispatch: {} is absent",
+                chg::outbox::config_path().display()
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("chg: review-dispatch: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(slug) = git::origin_slug(repo) else {
+        eprintln!("chg: review-dispatch: the repo has no origin to name it");
+        return ExitCode::from(2);
+    };
+    match chg::events::review_dispatch(&cfg, &slug, change, revision) {
+        Ok(r) if r.status == 201 || r.status == 200 => {
+            println!("{}", r.body.trim());
+            ExitCode::SUCCESS
+        }
+        Ok(r) if matches!(r.status, 409 | 422) => {
+            eprintln!("chg: review-dispatch: HTTP {} {}", r.status, r.code());
+            ExitCode::from(1)
+        }
+        Ok(r) => {
+            eprintln!("chg: review-dispatch: HTTP {} {}", r.status, r.code());
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("chg: review-dispatch: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn validate(repo: &Path) -> ExitCode {

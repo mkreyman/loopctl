@@ -108,7 +108,21 @@ fn stop_group(child: &mut std::process::Child) {
 /// `run`, stopped after `timeout`: for git calls that reach a remote, which a slow network
 /// or an ssh prompt nobody answers would otherwise hold forever. git and the ssh it starts
 /// run in their own process group, so stopping it takes both.
-pub fn run_bounded(mut c: Command, timeout: Duration) -> Result<Output, String> {
+pub fn run_bounded(c: Command, timeout: Duration) -> Result<Output, String> {
+    let shown = format!("{c:?}");
+    let output = run_bounded_output(c, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "{shown} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output)
+}
+
+/// `run_bounded` that returns the output of a command that ran and failed, for a caller
+/// that reads why (a rejected push). `Err` only when it could not run or was stopped.
+pub fn run_bounded_output(mut c: Command, timeout: Duration) -> Result<Output, String> {
     let shown = format!("{c:?}");
     // Files, not pipes: nothing has to drain them while we wait.
     let (out, err) = match (tempfile::tempfile(), tempfile::tempfile()) {
@@ -151,18 +165,11 @@ pub fn run_bounded(mut c: Command, timeout: Duration) -> Result<Output, String> 
             Err(e) => return Err(format!("waiting on {shown}: {e}")),
         }
     };
-    let output = Output {
+    Ok(Output {
         status,
         stdout: read(out),
         stderr: read(err),
-    };
-    if !status.success() {
-        return Err(format!(
-            "{shown} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(output)
+    })
 }
 
 /// Trimmed stdout of a git command that must succeed.
@@ -371,6 +378,12 @@ pub fn repo_key(dir: &Path) -> String {
         .and_then(|s| s.rsplit('/').next().map(String::from))
         .or_else(|| common_dir(dir).ok().map(|c| common_dir_name(&c)))
         .unwrap_or_else(|| "repo".into());
+    key_of(&raw)
+}
+
+/// `raw` made filesystem-safe the way `repo_key` names a repo: the key of `owner/name` is
+/// `key_of(name)`.
+pub fn key_of(raw: &str) -> String {
     raw.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "._-".contains(c) {

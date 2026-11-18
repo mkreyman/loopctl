@@ -111,7 +111,9 @@ jobs:
             apt="-q -o Acquire::http::Timeout=20 -o Acquire::Retries=3"
             timeout 300 apt-get $apt update >/dev/null
             timeout 300 apt-get $apt install -y xfsprogs git sudo shellcheck >/dev/null
-            shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh scripts/ci-rust-toolchain.sh
+            shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh scripts/ci-rust-toolchain.sh \
+              bin/chg-outbox-cron.sh tests/outbox-cron-test.sh
+            bash tests/outbox-cron-test.sh
             useradd -m ci && echo "ci ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/ci
             sudo -u ci sudo bash tests/volume-setup-test.sh'
       - name: remove the container if the job was cancelled

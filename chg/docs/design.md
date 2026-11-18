@@ -1,6 +1,6 @@
-# chg: a change server for an agent fleet
+# chg: a change system for an agent fleet
 
-Design, 2026-10-16. Read-only research; nothing here is built. Sources are in `notes.md` next to this file.
+Design, 2026-10-16; revised 2026-11-18. Phase 1 and the outbox to loopctl are built; sections 3-6 describe phases 2-3 as designed. Sources are in `notes.md` next to this file.
 
 ## 0. The answer
 
@@ -15,10 +15,10 @@ Anthropic replaced git because of data volume: almost 100 GB of history, 25 mill
 | Claude fixes conflicts | A conflict-resolver job on the runner pool | — |
 | Antique: semantic approval rules, humans review intent | Server-dispatched review with a lean payload, plus policy classes (comment/doc/test-only auto-approve; sensitive paths always reviewed) | A new review UI; GitHub's UI stays the place to browse |
 | scion-daemon per node, snapshot start, >99% cache hit | `chgd` per machine: a warm snapshot per verified trunk revision, cloned copy-on-write into a workspace in seconds | Virtualized FS (EdenFS-style); our repos are too small to need it |
-| Source control as an API (bisect/revert pipelines) | Every operation is a CLI verb and an MCP tool; bisect and revert are server jobs | — |
-| Superfan agents per component | One watcher agent per server component, from phase 3 | — |
+| Source control as an API (bisect/revert pipelines) | Every operation is a CLI verb; bisect and revert are pool jobs | — |
+| Superfan agents per component | One watcher agent per component (lander, verifier, pool), from phase 3 | — |
 
-The stack: an Elixir/Phoenix control plane (`chg-server` on Fly, Postgres), a Rust client (`chg` CLI plus the `chgd` node daemon) on every fleet machine, and per-language adapters behind one contract (Elixir and TypeScript ship together). GitHub stays the durable store for refs and objects, and the place to browse. It stops being the workflow: no PRs and no Actions in the gate path from phase 2.
+The stack: a Rust client (`chg` CLI plus the `chgd` node daemon) on every fleet machine, per-language adapters behind one contract (Elixir and TypeScript ship together), and **loopctl** as the place the record lives: the ledger, each change's event log, review custody and the dashboard (loopctl Epic 50). There is no chg control-plane app. Coordination that must not wait on a web service (landing, job leases) is a compare-and-swap on a git ref on GitHub, which every machine can reach and which already is the authority for trunk. GitHub stays the durable store for refs and objects, and the place to browse. It stops being the workflow: no PRs and no Actions in the gate path from phase 2.
 
 ## 1. What the Scion article says, and what it leaves out
 
@@ -52,9 +52,9 @@ Baseline (HCB 2026-10-02..16, numbers as given, not re-measured):
 |---|---|---|
 | 72% of PR lifetime is before the PR opens | Implementation plus a 9-minute full local gate (`.githooks/pre-push` runs `mix precommit`), repeated per push | Affected-only gate on a warm workspace (phase 1) |
 | Local gate duplicated by CI; 64% full re-runs | `attest` in HCB `ci.yml` refuses any head with `behind_by > 0`. Once the base moves (always, at 30-120/day), the attestation is void and CI runs everything | The verdict is keyed to *change vs its merge base*, and full-suite truth moves to post-merge (phase 1) |
-| 51% of PRs did catch-up base merges; only 6 of 449 were real conflicts | The same rule tells agents to "merge the base locally" to stay attested | Never require a current base; merge server-side, and only conflicts need work (phase 1 policy, phase 2 mechanism) |
+| 51% of PRs did catch-up base merges; only 6 of 449 were real conflicts | The same rule tells agents to "merge the base locally" to stay attested | Never require a current base; the lander merges in memory, and only conflicts need work (phase 1 policy, phase 2 mechanism) |
 | CI wait 6.9 agent-hours/day; job queue median 20s | Every PR runs GitHub Actions on one host (beelink) after the gate already ran | No suite runs in PR CI (phase 1); a pull-based pool across every machine (phase 3) |
-| `/code-review` round median 226s, 88% model time, 94k-token start, one tool call per turn | The review runs inside the harness context, after CI, sequentially | A server-dispatched reviewer with a ~15k payload, running concurrently with checks (phase 2) |
+| `/code-review` round median 226s, 88% model time, 94k-token start, one tool call per turn | The review runs inside the harness context, after CI, sequentially | A pool-dispatched reviewer with a ~15k payload, running concurrently with checks (phase 2) |
 | Every new worktree pays full `deps.get` + compile | Worktrees start empty | A warm snapshot per verified revision, cloned copy-on-write (phase 1) |
 
 What 10-100x means: fleet-holding goes from 120 to 1,200-12,000 landings/day and HCB from 30 to 300-3,000, with a default of 20-50 concurrent agents. 12,000/day averages 0.14 landings/s, with peaks near 1/s. One ref CAS of about 1 s against GitHub, batched, handles that with about 10x headroom (section 3.6).
@@ -64,19 +64,22 @@ What 10-100x means: fleet-holding goes from 120 to 1,200-12,000 landings/day and
 ### 3.1 Components
 
 ```
- agent session (any machine)             chg-server (Elixir/Phoenix on Fly, 2 machines, Postgres)
- ┌──────────────────────────┐   HTTPS    ┌──────────────────────────────────────────────────┐
- │ chg CLI (Rust)  / MCP    │──────────▶ │ Ledger: changes, revisions, events (op log)      │
- │ workspace = CoW clone    │            │ Lander (per trunk): merge-tree, commit, CAS push │
- └──────────▲───────────────┘            │ Verifier: batch, shard, bisect, revert, flakes   │
-            │ unix socket                │ Job queue with leases (Postgres SKIP LOCKED)     │
- ┌──────────┴───────────────┐  long-poll │ Review + conflict dispatch, policy engine        │
- │ chgd (Rust), one per box │◀─────────▶ │ MCP endpoint, LiveView dashboard, GitHub App     │
- │ bare mirror, snapshots,  │            └───────────────┬──────────────────────────────────┘
- │ job executor, verdicts   │                            │ git push (ff-only = CAS), refs/chg/*
- └──────────────────────────┘                            ▼
-                                              GitHub: durable refs + objects, browsing, deploy trigger
+ agent session (any machine)
+ ┌──────────────────────────┐  git push (ff-only = CAS): revisions, event chains, trunk, leases
+ │ chg CLI (Rust)           │──────────────────────────────────────────────┐
+ │ workspace = CoW clone    │                                              ▼
+ └──────────▲───────────────┘                         GitHub: durable refs + objects, browsing,
+            │ unix socket                                     refs/chg/<id>/{<n>,events}, deploy trigger
+ ┌──────────┴───────────────┐  git fetch / push (CAS)          ▲
+ │ chgd (Rust), one per box │──────────────────────────────────┘
+ │ bare mirror, snapshots,  │
+ │ lander, verifier, job    │  outbox: signed HTTPS, off the push path
+ │ executor, verdicts,      │─────────────────────────────▶ loopctl (Epic 47 + 50): ledger rows, change
+ │ outbox                   │  review_dispatch (US-50.3)    events applied in seq order, story binding,
+ └──────────────────────────┘◀───────────────────────────── review custody, dashboard, MCP read tool
 ```
+
+loopctl receives and never calls: an outage there costs freshness of the record and new review keys, never a push, a landing or a check.
 
 ### 3.2 Unit of change
 
@@ -84,38 +87,42 @@ A **change** is a stable identity: a client-generated ULID, written as a `Change
 
 - Change: `id, repo, trunk, author_session, story_id (optional), intent (text: what and why), depends_on[] (stacks), state, policy_class`.
 - Revision: `change_id, n, base_sha, commit_sha, tree_sha, input_fingerprint`. Unique on `(change_id, n)` and on `(change_id, tree_sha)`, so re-submitting identical content is a no-op.
-- Events: an append-only per-change log (`submitted, check_passed, review_findings, conflict, landed, verified, reverted, …`). This is jj's operation log at change granularity. It is the agent's inbox and the audit trail.
+- Events: an append-only per-change log (`submitted, check_passed, review_findings, conflict, landed, verified, reverted, …`). This is jj's operation log at change granularity. It is the agent's inbox and the audit trail. It lives as a commit chain at `refs/chg/<change-id>/events`, one commit per event holding the exact JSON loopctl receives, so `event_seq` is allocated by a fast-forward push and is gap-free across machines (`chg event emit`, docs/outbox.md). loopctl applies the same events in seq order and holds any that arrive ahead of a gap.
 - Landing writes **one** first-parent commit on trunk per change (a squash of the change's latest revision onto the current tip). Trunk history stays linear; the revision history lives in `refs/chg/*` and the event log.
-- Stacks: a change with `depends_on` lands only after its parents. Its revisions are replayed server-side with `git replay` when a parent changes, which never touches a workspace.
+- Stacks: a change with `depends_on` lands only after its parents. Its revisions are replayed by the lander with `git replay` on its bare mirror when a parent changes, which never touches a workspace.
 
 ### 3.3 Where state lives
 
 | State | Home | Authority | Rebuildable from |
 |---|---|---|---|
 | Trunk tip (`refs/heads/master`) | GitHub | **GitHub** (the ff-only push is the CAS) | — |
-| Verified pointer (`refs/heads/verified/master`) | GitHub | GitHub (written by the verifier, ff-only) | Verification rows |
-| Revision objects | GitHub `refs/chg/*`, server bare mirror, node mirrors | GitHub | — |
-| Changes, revisions, events, jobs, leases, verdicts, verifications, deploys | Postgres (Fly; `ecf-postgres` or its own mpg cluster) | Postgres | Landing state can be re-derived from trunk ancestry via `Change-Id` trailers |
-| Server bare mirror | Fly volume | Cache | `git fetch` from GitHub |
-| Node bare mirror, snapshots, verdict cache | Each machine (`chgd`) | Cache | Snapshot rebuild, or the server verdict table |
+| Verified pointer (`refs/heads/verified/master`) | GitHub | GitHub (written by the verifier, ff-only) | Verification events |
+| Revision objects | GitHub `refs/chg/<id>/<n>`, node mirrors | GitHub | — |
+| Change events (submitted, review, landed, …) | GitHub `refs/chg/<id>/events` (one commit per event) | GitHub (the ff-only push allocates `event_seq`) | — |
+| Job leases (phase 3) | GitHub `refs/chg/jobs/<job>` (a commit naming owner, epoch, expiry) | GitHub (the ff-only push is the lease CAS) | Expire and are re-leased |
+| Ledger: shadow and gate verdicts, review rounds, flaky tests, runner samples; applied change events; story bindings; review custody | loopctl (Epic 47, Epic 50) | loopctl, as a record | Every row and event is resent from the fleet's files and chains (idempotent) |
+| Unsent ledger rows and events | Each machine's outbox (`~/.chg/outbox`, the shadow log) | The machine's | — |
+| Node bare mirror, snapshots, verdict cache | Each machine (`chgd`) | Cache | Snapshot rebuild |
 | Workspaces | Each machine | The agent's | Any change's latest revision ref |
 
-Two rules follow. **Landed means reachable from GitHub trunk**, and the database only remembers it. **Nothing on a dev machine is needed for correctness**: lose a machine and you lose only its unsubmitted edits.
+Two rules follow. **Landed means reachable from GitHub trunk**, and loopctl only remembers it. **Nothing on a dev machine is needed for correctness**: lose a machine and you lose only its unsubmitted edits and the ledger rows it had not sent.
 
 ### 3.4 Agent interface
 
-The CLI is the primary surface, because hooks, Bash-native sessions and the runner all use it. MCP tools (served by Phoenix over streamable HTTP) map one-to-one onto it.
+The CLI is the only surface, because hooks, Bash-native sessions and the runner all use it. loopctl's MCP tools read the record (`chg_ledger_summary`, `change_binding_get`); they do not drive changes.
 
 | Verb | Replaces | Exit codes / result |
 |---|---|---|
 | `chg ws new <name> [--repo R]` (phase 1 runs it from the `post-checkout` hook of `git worktree add`) | `git worktree add` + `deps.get` + compile/install + PLT build | 0 ready (prints path); 3 no snapshot (falls back to cold build and says so) |
 | `chg check` (phase 1 runs it from `pre-push`) | `mix precommit` / `pnpm verify` before push; CI's suite on the PR | 0 pass (verdict recorded); 1 fail (failures inline) |
-| `chg submit [--intent F] [--story ID] [--depends-on C] [--wait]` (phase 2) | push, `gh pr create`, `wait-for-checks.sh`, `/code-review` dispatch, `gh pr merge`, `delete-merged-branch.sh`, `worktree-remove.sh` | Returns a change id at once. With `--wait` (backgrounded): 0 landed; 1 checks failed; 2 review findings; 3 conflict the resolver could not fix; 4 landed then reverted; 5 budget elapsed; 6 server unreachable, submission queued in the outbox |
+| `chg submit [--intent F] [--story ID] [--depends-on C] [--wait]` (phase 2) | push, `gh pr create`, `wait-for-checks.sh`, `/code-review` dispatch, `gh pr merge`, `delete-merged-branch.sh`, `worktree-remove.sh` | Returns a change id at once. With `--wait` (backgrounded): 0 landed; 1 checks failed; 2 review findings; 3 conflict the resolver could not fix; 4 landed then reverted; 5 budget elapsed; 6 GitHub unreachable, submission queued in the outbox |
 | `chg revise` | Pushing a fix and re-requesting review | New revision of the workspace's change; re-review covers only the interdiff |
 | `chg status [C]` / `chg wait C` | ci-status plugin polling | Event-log tail; a long-poll that ends on a terminal event |
 | `chg log C` | Reading PR timelines | Full event log |
 
-MCP: `change_submit`, `change_revise`, `change_status`, `change_wait` (long-poll up to 55 s), `ws_new`, `trunk_verified`. The ci-status plugin's push-a-prompt-on-settle behaviour is re-pointed at change events, so a session learns that its change landed, failed or was reverted without polling.
+`chg wait` watches the change's event chain (`git ls-remote` on `refs/chg/<id>/events`, re-armed every 55 s). The ci-status plugin's push-a-prompt-on-settle behaviour is re-pointed at the same chain, so a session learns that its change landed, failed or was reverted without polling.
+
+Built so far for phase 2's record: `chg event emit|sync` (the chain and its delivery), `chg review-dispatch` (a loopctl review key for one revision) and `chg outbox send|status` (docs/outbox.md).
 
 ### 3.5 Workspaces in seconds
 
@@ -141,19 +148,19 @@ Targets: a workspace is ready to run tests in under 15 s at p50 on both repos, a
 
 The only serialization point is a millisecond-scale ref CAS. No lock is ever held across a test.
 
-Per trunk, one lander process runs in the Phoenix cluster (`:global` name, plus a Postgres advisory lock as a second guard). It is a throughput optimisation; correctness comes from the CAS:
+Per trunk, one `chgd` runs the lander at a time: it holds the lease `refs/chg/jobs/lander-<trunk>` (3.11), renewed every 15 s. One lander is a throughput optimisation; correctness comes from the CAS, so two landers after a lease race cost a rejected push, never a wrong trunk:
 
-1. Take ready changes in FIFO order: required checks passed on the latest revision, review approved or auto-approved by policy, dependencies landed.
-2. `T` = trunk tip in the server's mirror, fetched if older than 2 s.
+1. Take ready changes in FIFO order, read from the event chains: required checks passed on the latest revision, review approved or auto-approved by policy, dependencies landed.
+2. `T` = trunk tip in the lander's mirror, fetched if older than 2 s.
 3. For each change `c`: run `git merge-tree --write-tree --merge-base=<c.base> T <c.commit>` (merge-ort in memory, no worktree).
    - Conflict: emit a `conflict` event and send `c` to the resolver (3.9).
    - **Overlap re-check** (SubmitQueue's conflict-graph idea, in miniature): if the files `c` touches, or its affected-test set, intersect anything landed on trunk since `c.base`, run `c`'s affected checks on the merged tree before landing it. Disjoint changes land without that re-check. Most changes are disjoint: only 6 of 449 were even textual conflicts.
    - Otherwise: `git commit-tree <tree> -p T` with the subject, intent body and `Change-Id`/`Revision` trailers, and set `T` to the new commit.
-4. Batch up to 20 changes or 2 s. Write a `landing` row `(old_sha, new_sha, change_ids[])`, then `git push origin <new>:refs/heads/master` without force. Fast-forward-only makes GitHub's ref update the CAS.
+4. Batch up to 20 changes or 2 s, then `git push origin <new>:refs/heads/master` without force. Fast-forward-only makes GitHub's ref update the CAS. No intent row is needed: step 5 derives the outcome from trunk itself.
 5. If the push is rejected or its result is unknown, fetch and check which `Change-Id`s are now reachable from trunk. Mark those landed and restart from step 2 with the rest. A change is never committed twice, because reachability is checked before every push.
 6. Emit `landed` events; the verifier sees the new tip.
 
-Branch protection on `master` allows pushes only from the chg GitHub App, plus Mark's break-glass.
+Branch protection on `master` allows fast-forward pushes only from the fleet's GitHub identity, the one landers push as, plus Mark's break-glass. Enrollment's hook refuses a session's own `git push` to master ("use chg submit"), so the identity's bypass is used by landers alone. There is no chg GitHub App (section 10; chg#33).
 
 Capacity: merge-tree plus commit-tree on these repos takes milliseconds; the push takes about 1 s. With batching, sustained throughput is well above 10 landings/s, against a 100x need of about 0.14/s average and about 1/s peak.
 
@@ -172,7 +179,7 @@ Affected selection is the adapter's job (3.13). It always has a fail-closed esca
 - **Verifier loop, per trunk.** Whenever `tip != verified` and no verification is running, verify the tip: the full suite sharded across the pool, and e2e. Everything that lands during a run joins the next batch, so batch size adapts to load with no tuning. TAP does the same: presubmit is a subset, postsubmit is batched.
 - **Green:** fast-forward `verified/master` to that sha (CAS). Snapshots rebuild from it, deploy takes it, and new workspaces base on it. **Agents never start from an unverified tip**, so a red window on trunk blocks nobody's work, only the deploy.
 - **Red:** collect the failing test ids, then rerun them twice on the same sha.
-  - Passes on rerun: it is **flaky**. Write a quarantine row (the test leaves the gating set for that trunk), file an issue labelled `flaky` (`deferred-finding` style) naming the test, and re-verify.
+  - Passes on rerun: it is **flaky**. Quarantine it (the test leaves the gating set for that trunk, recorded as a `flaky` ledger row and the open issue), file an issue labelled `flaky` (`deferred-finding` style) naming the test, and re-verify.
   - Still failing: **bisect over the batch, running only the failing tests**. Up to `k` prefixes run in parallel (`k` = free shard slots), so 80 changes take 2 rounds at k=8. The first red prefix is the culprit.
 - **Revert:** create a revert change (a 3-way merge with base = culprit, ours = tip, theirs = culprit^, via merge-tree) with policy class `revert`. It lands through the same lander, gated by the failing tests going green on the reverted tree. The culprit's change reopens with a `reverted` event carrying the failures. Its author session is notified (ci-status prompt / channel post) and fixes it with `chg revise`, which re-lands like any revision. Idempotency key: `(culprit_change_id, verification_id)`.
 - **Deploy:** a deploy job takes the newest verified sha, coalescing bursts (one Fly deploy per app at a time; image label = sha, so a repeat is a no-op), then runs a post-deploy smoke. A failed smoke rolls back to the previous release image and marks that sha `deploy_failed`, which the verifier treats like red.
@@ -183,17 +190,17 @@ When a textual conflict appears at landing, a `resolve` job goes to the pool. It
 
 ### 3.10 Review integration (intent review)
 
-- Review is a server job dispatched **at submit, concurrently with checks**, not after CI. The payload is built by the server: the change's intent and the story's acceptance criteria, the diff, the full text of the touched files and their immediate callers, and the top KB hits for the touched modules, fetched up front. The target starting context is 15-20k tokens, against 94k today. The reviewer runs with parallel tool calls on and writes findings as structured JSON: `file:line`, failure scenario, CONFIRMED or PLAUSIBLE.
-- **Policy classes** in `.chg/policy.toml`, computed by the server from the diff:
+- Review is a pool job dispatched **at submit, concurrently with checks**, not after CI. The `chgd` that leases it first asks loopctl for the review key of that `(change, revision)` (`chg review-dispatch`, loopctl US-50.3), which the reviewer records its verdict with, and hands the key to the job alone. The payload is built by the job: the change's intent and the story's acceptance criteria, the diff, the full text of the touched files and their immediate callers, and the top KB hits for the touched modules, fetched up front. The target starting context is 15-20k tokens, against 94k today. The reviewer runs with parallel tool calls on and writes findings as structured JSON: `file:line`, failure scenario, CONFIRMED or PLAUSIBLE.
+- **Policy classes** in `.chg/policy.toml`, computed by `chg submit` from the diff and re-checked by the lander:
   - `docs` (only `*.md` outside the always-all list), `comment-only` (AST-equal after stripping comments: `Code.string_to_quoted` for Elixir, the TS compiler API for TS) and `test-only` auto-approve with no model review.
   - `sensitive` globs (auth, credentials, billing/money, PHI schemas, migrations, `.github/`, `.chg/`) always get the full review lens set and never auto-approve. Mark's rule stands: they merge on review plus green, never on his say-so.
   - `revert` (3.8) skips review: it is the exact inverse of a reviewed change, and its gate is the failing tests going green. This is a default Mark may overrule (section 10).
-- **One round.** Findings come back as a `review_findings` event (exit 2). The agent fixes every confirmed finding (rule 0) and runs `chg revise`. The server re-reviews **only the interdiff**, once, and the review-round counter moves server-side. The cap and the `REVIEW CAP` escalation stay as today.
+- **One round.** Findings come back as a `review_findings` event (exit 2). The agent fixes every confirmed finding (rule 0) and runs `chg revise`. The pool re-reviews **only the interdiff**, once, and the review-round counter reads the change's `review_*` events (each round is also a `review_round` ledger row in loopctl). The cap and the `REVIEW CAP` escalation stay as today.
 
 ### 3.11 Runner pool
 
-- `chgd` on every machine declares capacity: slots and CPU/memory per slot, with beelink given most (24 threads), then minis (16), mac-mini and blockit, then nuc (4). It **pulls** from the server: a long-poll `lease` call that returns one job matching its labels (repo, OS, capabilities such as `postgres`, `browsers`, `claude`).
-- Jobs are `snapshot_build`, `check`, `verify_shard`, `bisect`, `review`, `resolve` and `deploy`. They live in Postgres (`jobs` with `FOR UPDATE SKIP LOCKED`), each with `idempotency_key UNIQUE`, `lease_owner`, `lease_epoch` (a fencing token), `lease_expires_at` (60 s, renewed every 15 s), `attempts` and `max_attempts`.
+- `chgd` on every machine declares capacity: slots and CPU/memory per slot, with beelink given most (24 threads), then minis (16), mac-mini and blockit, then nuc (4). It **pulls**: it lists open jobs matching its labels (repo, OS, capabilities such as `postgres`, `browsers`, `claude`) and leases one.
+- Jobs are `snapshot_build`, `check`, `verify_shard`, `bisect`, `review`, `resolve` and `deploy`. A job is a ref, `refs/chg/jobs/<idempotency_key>`, whose commit chain records its spec, then each lease (`owner`, `epoch`, `expires_at`: 60 s, renewed every 15 s) and its result. Leasing is a fast-forward push of the next lease commit, so two runners racing for one job cannot both win, and the epoch is the fencing token: a result whose epoch is not the chain's newest is refused by the same CAS. At the projected 0.14 landings/s plus their jobs, ref pushes stay near 1/s, inside the 3.12 trigger. If they do not, the job chains move to a bare repo of the fleet's own (the 3.12 flip), not to a service.
 - Every job runs in a CoW workspace named after the job id, under a cgroup slice on Linux. The existing CI-host memory slicing in `infra` carries over.
 - A dev machine's agents and its runner share the box. `chgd` admits pool jobs only below a load threshold, and beelink, being dedicated, admits up to its slots.
 
@@ -201,7 +208,7 @@ When a textual conflict appears at landing, a `resolve` job goes to the pool. It
 
 GitHub keeps `master`, `verified/master` and `refs/chg/*`, so every object and ref is durable off-fleet and browsable. Deploy secrets stay where they are. From phase 2 there are no PRs or Actions in the gate path for enrolled repos. In phase 3, Actions shrinks to nothing, or to the deploy step if Mark prefers it there.
 
-**Do not flip GitHub to a mirror** unless a measured trigger fires: GitHub push p95 over 3 s, sustained landings over 5/s, or a rate-limit response. At 100x the projection is about 0.14/s. If the trigger fires, the flip is local: the server's bare repo becomes the authority (Fly volume plus continuous `git push --mirror` to GitHub), and only the CAS target changes.
+**Do not flip GitHub to a mirror** unless a measured trigger fires: GitHub push p95 over 3 s, sustained landings over 5/s, or a rate-limit response. At 100x the projection is about 0.14/s. If the trigger fires, the flip is local: a bare repo the fleet hosts (beelink, with continuous `git push --mirror` to GitHub) becomes the authority, and only the CAS target changes.
 
 ### 3.13 The adapter contract (language-neutral)
 
@@ -239,24 +246,20 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
 ## 4. Failure design
 
 **Partitions.**
-- *Agent ↔ server:* `chg submit` writes the revision to a local outbox (`~/.local/state/chg/outbox`) and pushes `refs/chg/<id>/<n>` to GitHub independently. Submission is idempotent on `(change_id, n, tree_sha)`, so a retry after a lost response is a no-op, and `--wait` exits 6 with the outbox entry named. `chg check` keeps working offline: it records verdicts locally and uploads them later.
-- *Runner ↔ server:* the lease expires (60 s) and the job is re-leased elsewhere. A late result from the partitioned runner carries a stale `lease_epoch` and is rejected (fencing).
-- *Server ↔ GitHub:* landing pauses. Ready changes stay ready and nothing is lost. On recovery the lander reconciles first (3.6 step 5).
-- *Fly ↔ fleet LAN* (the internet is down): agents keep editing and checking locally, and landing waits. Today's GitHub dependency behaves the same; no new failure domain is added.
-- The server also does not depend on loopctl. During this research the KB timed out twice and then returned 503 `db_unavailable`; a KB outage must never stop merges, which is why chg is its own app.
+- *Agent ↔ GitHub:* `chg submit` pushes `refs/chg/<id>/<n>` and emits `submitted`; while GitHub is unreachable it queues both in the outbox and `--wait` exits 6 with the entry named. Submission is idempotent on `(change_id, n, tree_sha)`, so a retry after a lost response is a no-op. `chg check` keeps working offline: it records verdicts locally.
+- *Runner ↔ GitHub:* the lease expires (60 s) and the job is re-leased elsewhere. A late result from the partitioned runner carries a stale epoch, so its fast-forward push is refused (fencing).
+- *Lander ↔ GitHub:* landing pauses. Ready changes stay ready and nothing is lost. On recovery the lander reconciles first (3.6 step 5).
+- *Fleet ↔ loopctl:* nothing on the push, check or landing path waits. Ledger rows and events stay in the outbox and are resent with backoff (30 s doubling to 1 h); loopctl holds events that arrive ahead of a gap, and a gap no sender fills alerts the operator, who runs `chg event sync`. New review keys wait, so a change already reviewed lands and one awaiting review waits. During this research the KB timed out twice and then returned 503 `db_unavailable`; that is why loopctl only receives.
+- *Fleet ↔ internet* (the LAN is up, the internet is down): agents keep editing and checking locally, and landing waits. Today's GitHub dependency behaves the same; no new failure domain is added.
 
 **State on crash, deploy and failover.**
-- All coordination state is in Postgres, and every multi-step operation writes its intent first:
-  - a `landing` row before the push;
-  - a `verification` row before the shards;
-  - a `revert` row before the revert lands;
-  - a `deploy` row before `fly deploy`.
-- On boot, a reconciler finishes or rolls back each open intent against the truth:
-  - landing: check trunk reachability;
-  - verified: read the `verified/master` ref;
-  - deploy: read `fly releases` for the image label.
-- The lander and verifier are restartable processes holding no state beyond Postgres. A Fly deploy that kills one mid-step leaves an intent row the reconciler resolves. The Fly app runs 2 machines; a `:global` lander re-registers on the survivor, and the advisory lock prevents a split-brain double lander. Even a double lander is safe, because the ff-only push rejects the loser.
-- `chgd` keeps its node state on disk (mirror, snapshots, verdict cache, outbox) and rebuilds any of it on corruption.
+- Every coordination fact is a ref on GitHub, and every multi-step operation is resumable from refs alone:
+  - landing: which `Change-Id`s trunk reaches (3.6 step 5);
+  - verification: the `verified/master` ref and the verifier job's chain;
+  - revert: the revert change's own events, keyed `(culprit_change_id, verification_id)`;
+  - deploy: `fly releases` for the image label.
+- The lander and verifier are `chgd` duties held by a lease, holding no state beyond refs. A machine that dies mid-step loses the lease in 60 s, and the next holder starts by reconciling. Even a double lander is safe, because the ff-only push rejects the loser.
+- `chgd` keeps its node state on disk (mirror, snapshots, verdict cache, outbox) and rebuilds any of it on corruption, except unsent outbox rows, which a lost disk loses. Events never are: they are on GitHub before they are queued.
 
 **Retry idempotency.**
 
@@ -264,23 +267,27 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
 |---|---|---|
 | Submit | `(change_id, tree_sha)` | Returns the existing revision |
 | Check | `(check_id, fingerprint)` | Returns the cached verdict |
-| Job | `idempotency_key` + `lease_epoch` | Late result rejected |
+| Job | `idempotency_key` (its ref) + lease epoch | Late result rejected |
+| Change event | `event_seq` allocated by the chain's ff push; loopctl keys `(repo, change_id, event_seq)` | Redelivery is a duplicate; a conflicting body is 409 |
+| Ledger row | `(source, host, sha256 of the row)` in loopctl | Counted as a duplicate |
+| Review key | `(source, change_id, revision)` in loopctl | Re-mint revokes the earlier key until a verdict, then 409 |
 | Land | `Change-Id` reachability check before every push | Never double-lands |
 | Revert | `(culprit_change_id, verification_id)` | One revert |
 | Deploy | Image label = sha | Fly no-op |
-| Flaky quarantine | `(trunk, test_id)` | One row, one issue |
+| Flaky quarantine | `(trunk, test_id)` | One issue, commented per run |
 | Notifications | `(change_id, event_seq)` | ci-status dedups |
 
 **Slow, not down.**
-- Every call has a timeout: client RPC 10 s; `change_wait` long-poll 55 s, re-armed; git push 60 s with the reconcile path on timeout. A timeout is an unknown result, never a failure, and is resolved by reconciliation.
+- Every call has a timeout: a loopctl request 30 s (10 s to connect); `chg wait` 55 s, re-armed; git push 60 s with the reconcile path on timeout. A timeout is an unknown result, never a failure, and is resolved by reconciliation.
 - Leases are judged by heartbeat. A slow runner that keeps heartbeating keeps its job; one that stalls loses it. Per-kind wall-clock caps (check 15 min, shard 20 min, review 10 min, resolve 15 min) bound a slow job.
 - Snapshots are built locally from git deltas and are never downloaded, so a slow WAN costs only the small fetch.
 - A per-machine admission threshold stops pool jobs from starving the agents working on that box.
 
 **Where units of work run, and how they are reached after a restart.**
-- Agent sessions run on their own machine. The server reaches a session only through its change's event log: ci-status prompts while it lives, and `chg status` for whichever session picks the change up next (a handoff names the change id).
+- Agent sessions run on their own machine. The fleet reaches a session only through its change's event chain: ci-status prompts while it lives, and `chg status` for whichever session picks the change up next (a handoff names the change id).
 - Jobs run on whichever runner leased them. After a runner restart the lease lapses and the job runs elsewhere, so nothing addresses a runner directly.
-- The lander and verifier run on whichever Fly machine holds the `:global` registration and are found through it. Postgres is their memory.
+- The lander and verifier run on whichever `chgd` holds their lease and are found through the lease ref. Refs are their memory.
+- Outbox sends run on the machine that wrote the rows, started by the writer and by a 10-minute cron line; a restart loses nothing but the run in flight, which the saved offset resumes.
 - Deploys run as `deploy` jobs on a runner labelled `fly` (or in GitHub Actions if Mark keeps it there), keyed by sha.
 
 ## 5. Build vs buy
@@ -288,15 +295,17 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
 | Component | Verdict | Why |
 |---|---|---|
 | VCS / object store | **Buy: git + GitHub** | Our volume is far below where git breaks. Sapling/Mononoke: the OSS server is "still in development", lacks Thrift APIs and config docs, and has almost no outside adoption. Scion is not public. |
-| Merge engine | **Buy: git merge-ort** via `git merge-tree --write-tree` (git ≥2.38) and `git replay` (built for server-side rebase on bare repos) | gitoxide lists merge, cherry-pick, revert, rebase and push as "still need plumbing across crates". Revisit only if fork/exec cost shows up in profiles, which it will not at about 1/s. |
+| Merge engine | **Buy: git merge-ort** via `git merge-tree --write-tree` (git ≥2.38) and `git replay` (built for rebase on bare repos, with no worktree) | gitoxide lists merge, cherry-pick, revert, rebase and push as "still need plumbing across crates". Revisit only if fork/exec cost shows up in profiles, which it will not at about 1/s. |
 | Change ids, op log, first-class conflicts | **Borrow from jj** (`Change-Id`, per-change event log, conflicts as a state rather than an error) | Agents are fluent in git. Switching the client to jj adds a learning cost and reliability risk for little gain, since our conflicts are rare and the resolver handles them. |
 | Merge queue | **Build (small)**. Reject GitHub merge queue, Aviator, Mergify and Graphite | They are all PR-shaped and keep pre-merge testing of the predicted tip on GitHub Actions: the serialization and CI wait we are removing (GitHub caps concurrency at 1-100 builds; Aviator's per-target queues need us to compute affected targets anyway). Uber SubmitQueue (Go, no releases) keeps master green by speculative pre-merge builds, which is compute we choose to spend post-merge instead; we take its conflict-graph idea as the overlap re-check. |
 | Presubmit/postsubmit split, culprit finding, auto-revert | **Borrow from Google TAP** (and SafeRevert's caution) | Batched postsubmit with bisect is the proven answer to "what does CI mean at agent scale". |
 | Workspace provisioning | **Build on OS primitives**: APFS `clonefile`, XFS reflink on a loop image, pnpm's same-filesystem store, Elixir `check_cwd: false` | No product does per-revision warm snapshots for mix and pnpm. Scalar and partial clone solve volume we do not have. |
 | Test result caching | **Build a verdict cache keyed by input fingerprint** (Bazel remote-cache model) | Adopting Bazel means rewriting both builds. Turborepo's cache covers TS tasks only and fleet-holding does not use turbo. |
 | Runner | **Build `chgd`**; retire GitHub Actions from the gate path in phase 3 | Actions on one host is the 20 s queue and the 6.9 agent-hours. loopctl-runner supervises Claude sessions, a different job, but its enrollment and lease ideas carry over. |
-| Review | **Reuse the existing review lenses and prompts**; build only the server-side payload builder and dispatch | The 226 s is mostly harness context and serial position, not the reviewer prompts. |
-| Control plane home | **New Phoenix app `chg-server`, not loopctl** | Separate failure domain (see the KB outage above), separate deploy cadence. loopctl change threads lived inside loopctl's story lifecycle and died there. |
+| Review | **Reuse the existing review lenses and prompts**; build only the payload builder and the pool dispatch. Custody is **loopctl's** (US-47.5, US-50.3): the review key is minted per revision under the source's chg root | The 226 s is mostly harness context and serial position, not the reviewer prompts. |
+| Ledger, change record, dashboard | **Extend loopctl** (Epic 47 change events and bindings, Epic 50 ledger rows, cursor, review dispatch, dashboard, `chg_ledger_summary`). Mark, 2026-10-28: *"I insist on extending loopctl for that and NOT building a separate app."* | loopctl already holds stories, custody and the KB, so a change's record sits beside the story it delivers. Its failure domain is kept off the gate by direction: the fleet sends through a local outbox and loopctl never calls back (4, Partitions). loopctl change threads died because they were opt-in and removed no wait (section 8), not because of where they lived. |
+| Coordination (landing, leases, event order) | **Build on git ref CAS on GitHub**, no service | The ff-only push is already the authority for trunk (3.6). The same primitive orders events (3.2), leases jobs and elects the lander (3.11), so there is no database to keep in step with the refs and nothing to host. |
+| Outbox and sender | **Build (small), in `chg`** | Append-only JSON-lines files with a saved offset, a signed batch POST, backoff, and the shadow log reused as its own queue (docs/outbox.md). A message broker would be a second service to run for one producer per machine. |
 
 **Rust or Elixir.**
 - **Rust:** the `chg` CLI and the `chgd` daemon.
@@ -305,14 +314,15 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
   - It computes BLAKE3 fingerprints over input trees on every check.
   - The job executor needs cgroups, process-group kill and log streaming.
   - It ships as one artifact for macOS arm64 and Linux x86_64, with no runtime to keep in sync across 5 machines.
-- **Elixir:** everything with state, concurrency and coordination: the ledger, lander, verifier, bisect, job leasing, review and resolver dispatch, the MCP endpoint, the LiveView dashboard and the GitHub App webhooks. That is Mark's stack, OTP supervision fits long-running orchestrators, and Postgres is the only state.
-- **Git** is called by shelling out to `git` from both sides. It is the battle-tested merge engine, and wrapping it is cheaper than re-implementing it.
+  - The lander, verifier and job leasing live in `chgd` too: their state is refs, so a supervised daemon per machine with a lease is all they need.
+- **Elixir:** what loopctl holds (Epic 47, Epic 50): applying events in seq order, story bindings, the ledger tables, review custody, the LiveView dashboard and the MCP read tool. That is Mark's stack, and loopctl's Postgres is the record.
+- **Git** is called by shelling out to `git`. It is the battle-tested merge engine, and wrapping it is cheaper than re-implementing it.
 
 ## 6. Phases
 
 Each phase removes a measured wait on its own, ships in days with the fleet building it, and is judged against the 2026-10-02..16 baseline. A phase that does not move its number is reverted, not kept as more machinery.
 
-**Phase 1: Verify once, start warm (about 5-7 days). No server yet, still on GitHub PRs.**
+**Phase 1: Verify once, start warm (about 5-7 days). Still on GitHub PRs.**
 - Removes the duplicated gate and full CI re-runs (64%), catch-up merges (51% of PRs), most of the 6.9 agent-hours/day of CI wait, most of the 9-minute gate, and cold worktree setup.
 - How:
   - **Adapter contract + Rust `chg`** with the `ws new`, `check`, `snapshot` and `verify-culprit` verbs.
@@ -327,9 +337,9 @@ Each phase removes a measured wait on its own, ships in days with the fleet buil
 **Phase 2: Land without PRs (about 5-7 days).**
 - Removes the PR ceremony (create, wait, merge, branch delete, worktree remove), the serial ordering of review after CI, and most of review latency.
 - How:
-  - **`chg-server`**: ledger, lander with overlap re-check, events, and an MCP endpoint.
-  - **`chg submit` / `revise` / `wait`.**
-  - **Server-dispatched lean review**, concurrent with checks.
+  - **The lander** (`chg land`, a lease-holding loop under a systemd/launchd unit on two machines) with the overlap re-check, reading the event chains.
+  - **`chg submit` / `revise` / `wait`**, emitting events through the outbox to loopctl (already built: `chg event`, `chg review-dispatch`, `chg outbox`).
+  - **Lean review dispatched at submit**, concurrent with checks, under a loopctl review key.
   - **The conflict resolver.**
   - **Enrollment per repo**: `gh pr create` and branch pushes to `master` are refused by hook with "use chg submit". The delivery-loop text in CLAUDE.md and the ci-status, wait-for-checks and review-counter mechanisms are rewritten in the same PR (no tombstones).
 - Checks still run in the agent's workspace (phase 1 `chg check`). The verifier is still master's Actions run.
@@ -420,7 +430,7 @@ S1 blocks S2, S3, S4 and S6. S5 is independent. S7 needs S6. S8 is independent o
 
 ## 8. Why this does not end like change threads
 
-loopctl change threads (server ledger, squash merge through the GitHub API, review dispatch) were never used, for these reasons:
+loopctl change threads (a ledger in loopctl, squash merge through the GitHub API, review dispatch) were never used, for these reasons:
 1. They were **opt-in and additive**: a `.loopctl/mode` marker, a `loop/` branch prefix, and the PR path still open and still the default the delivery loop described.
 2. They **removed no wait**: GitHub Actions still judged every checkpoint, so a thread was the same pipeline under a new name.
 3. They needed a **different way to start work**: runner-dispatched `claude -p` sessions, with the accept path off by default. Mark's actual sessions never passed through it.
@@ -446,5 +456,9 @@ This design inverts each of those:
 - **Auto-reverts land without a `/code-review` round.** The revert is the exact inverse of a reviewed change, and its gate is the failing tests going green. Overrule in `.chg/policy.toml` (`[class.revert] review = true`).
 - **Docs-only, comment-only and test-only changes auto-approve** with no model review. Overrule per class in the same file.
 - **New worktrees base on `verified/master`, not the master tip.** Overrule with `chg ws new --from tip`.
-- **chg-server is a new Fly app on Postgres, separate from loopctl.**
 - **GitHub remains the durable ref and object store** until the trigger in 3.12.
+- **Coordination is git ref CAS on GitHub, not a service**: event order (`refs/chg/<id>/events`), job leases and the lander's lease (`refs/chg/jobs/*`). Overrule by naming a host for a coordination service; the cost is a component on the landing path that the fleet must keep up.
+- **The loopctl-merge GitHub App (5101362) is retired, not adopted** (chg#33). Landers push trunk as the fleet's existing GitHub identity under a ruleset that allows it fast-forward pushes, so no App private key is copied to every machine. Overrule by adopting the App: a new private key into each machine's secrets, the old one revoked, and the ruleset's bypass actor kept.
+- **Every enrolled machine holds its repos' `change_events_secret`** (`~/.chg/loopctl.toml`, mode 0600), so any of them can send rows and mint a review key (loopctl US-50.3). Overrule by sending from one reviewer host only, which makes it a single point of failure for review.
+- **The outbox sends every 10 minutes by cron and after every write**, backing off 30 s doubling to 1 h; `chg doctor` fails when a row has waited over 24 h. Overrule in `cli/src/outbox.rs` (`BACKOFF_*`, `STALE_MS`) and `bin/chg-outbox-cron.sh`.
+- **A review round is sent only once its branch links to a PR**, and a voided round is sent as a second row of kind `review_round_void`, never deleted. A branch reused for several PRs credits the newest (the row lists all in `prs`). Overrule in `outbox::review_rows`.

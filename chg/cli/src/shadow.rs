@@ -273,7 +273,11 @@ pub fn append(path: &Path, row: &Row) -> Result<(), String> {
     line.push('\n');
     f.write_all(line.as_bytes())
         .and_then(|_| f.sync_data())
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    drop(f);
+    // Deliver it to loopctl's ledger in the background (design §5); never on this path.
+    crate::outbox::kick();
+    Ok(())
 }
 
 /// Parses a log; a line that does not parse (a torn write, a newer row version's
@@ -340,7 +344,7 @@ pub fn spawn(repo: &Path, key: &str, sha: &str, base: &str) -> Result<PathBuf, S
 /// renames a new binary over the old one, and Linux then names this process's executable
 /// `<path> (deleted)`: start the binary that now lives at `<path>` instead. Every
 /// detached copy starts from this command.
-fn chg_command() -> Result<Command, String> {
+pub fn chg_command() -> Result<Command, String> {
     let exe = std::env::current_exe().map_err(|e| format!("locating chg: {e}"))?;
     Ok(Command::new(live_path(exe)))
 }
