@@ -239,6 +239,42 @@ defmodule Loopctl.Agents.CandidatesTest do
 
   # Every predicate, both ways where it has two, for both kinds, in two tenants. Each row is
   # backdated to its own second, so the order is a fact of the data and not of insertion time.
+  describe "US-51.3: a loop issue on a ticket-requiring source" do
+    test "is a triage candidate by loopctl's own finding, not by its text", ctx do
+      t = ctx.tenant.id
+      loop = detected(t, -100)
+      copy = detected(t, -90)
+
+      for story <- [loop, copy], do: set_requires_ticket(source_id(story), true)
+
+      loop_record = AdminRepo.get!(Loopctl.Intake.Record, record_id(loop))
+      repo = AdminRepo.get!(Source, source_id(loop)).repo_full_name
+      now = DateTime.utc_now()
+
+      AdminRepo.insert!(%Loopctl.Changes.Finding{
+        tenant_id: t,
+        kind: "flaky_test",
+        fingerprint: "fp-loop",
+        repo_full_name: repo,
+        state: :filed,
+        first_seen_at: now,
+        last_seen_at: now,
+        issue_number: loop_record.issue_number
+      })
+
+      # The copy carries the loop's marker and label on an issue number no finding holds.
+      {1, _} =
+        AdminRepo.update_all(
+          from(r in Loopctl.Intake.Record, where: r.id == ^record_id(copy)),
+          set: [untrusted_body: "<!-- loopctl:chg-finding x -->", untrusted_labels: ["chg-loop"]]
+        )
+
+      built = ids(run(TriageV1.spec(), 500))
+      assert loop.id in built
+      refute copy.id in built
+    end
+  end
+
   defp seed_corpus(ctx) do
     t = ctx.tenant.id
 

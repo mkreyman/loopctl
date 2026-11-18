@@ -71,6 +71,7 @@ tests makes a miss disappear by hiding it. Mark overruled the human step for chg
 | 51.4 | Silence detector: a quiet source is a finding | 51.1 |
 | 51.5 | chg's selection fixes merge on a measured widening proof | 51.1 |
 | 51.6 | Read surface: findings in the summary, an MCP tool, the dashboard | 51.1, 51.2 |
+| 51.7 | Triage dispatch carries a loop issue's finding as loopctl-authored fields (runner contract) | 51.3 |
 
 The chg side of 51.5 (a replay command that writes verifier-bound ledger rows) and chg#22's
 adoption of the finding rules are handed off on the chg channel.

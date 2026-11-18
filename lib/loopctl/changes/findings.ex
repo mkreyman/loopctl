@@ -1107,6 +1107,45 @@ defmodule Loopctl.Changes.Findings do
     )
   end
 
+  # -- the intake admission (US-51.3) ----------------------------------------------------
+
+  @doc """
+  A subquery for `exists/1`: whether the record bound as `:record` in the enclosing query is
+  the issue of one of its tenant's findings, on the repository its source names. THE
+  admission a `triage_requires_ticket` source grants a loop issue, used by every place that
+  enforces the ticket rule so they cannot disagree. It reads loopctl's own table and nothing
+  in the issue: a copied body, a `chg-loop` label or a typed marker on any other issue number
+  matches nothing.
+
+  The repository is compared case-insensitively, as intake compares it (`Events.repo_key/1`).
+  """
+  @spec loop_issue_query() :: Ecto.Query.t()
+  def loop_issue_query do
+    from f in Finding,
+      join: s in Source,
+      on: s.id == parent_as(:record).source_id and s.tenant_id == f.tenant_id,
+      where:
+        f.tenant_id == parent_as(:record).tenant_id and
+          f.issue_number == parent_as(:record).issue_number and
+          fragment("lower(?) = lower(?)", f.repo_full_name, s.repo_full_name),
+      select: 1
+  end
+
+  @doc "The id of the finding whose loop issue `record` is (`loop_issue_query/0`), or nil."
+  @spec loop_finding_for(Loopctl.Intake.Record.t()) :: Ecto.UUID.t() | nil
+  def loop_finding_for(%Record{} = record) do
+    AdminRepo.one(
+      from f in Finding,
+        join: s in Source,
+        on: s.id == ^record.source_id and s.tenant_id == f.tenant_id,
+        where:
+          f.tenant_id == ^record.tenant_id and f.issue_number == ^record.issue_number and
+            fragment("lower(?) = lower(?)", f.repo_full_name, s.repo_full_name),
+        limit: 1,
+        select: f.id
+    )
+  end
+
   @doc "One tenant's findings, newest sighting first."
   @spec list(Ecto.UUID.t()) :: [Finding.t()]
   def list(tenant_id) do

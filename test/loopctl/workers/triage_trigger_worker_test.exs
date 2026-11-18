@@ -203,6 +203,71 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       assert story_for(record.id) == nil
     end
 
+    # US-51.3: a loop issue is admitted by loopctl's own record of it, never by its text.
+    defp loop_finding!(tenant_id, repo_full_name, issue_number) do
+      now = DateTime.utc_now()
+
+      AdminRepo.insert!(%Loopctl.Changes.Finding{
+        tenant_id: tenant_id,
+        kind: "flaky_test",
+        fingerprint: "fp-#{System.unique_integer([:positive])}",
+        repo_full_name: repo_full_name,
+        state: :filed,
+        first_seen_at: now,
+        last_seen_at: now,
+        filed_at: now,
+        issue_number: issue_number
+      })
+    end
+
+    test "a ticket-requiring source promotes the issue of a chg finding, and marks it", %{
+      tenant: tenant
+    } do
+      {_source, record} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant.id,
+          repo_full_name: "mkreyman/Loop_Repo",
+          issue_number: 900,
+          triage_requires_ticket: true
+        })
+
+      # The case differs on purpose: intake compares repository names case-insensitively.
+      finding = loop_finding!(tenant.id, "mkreyman/loop_repo", 900)
+
+      assert record.id in candidate_ids(tenant)
+      assert :ok = run(tenant)
+
+      assert %Story{} = story_for(record.id)
+      assert %Record{loop_finding_id: finding_id} = reload(record)
+      assert finding_id == finding.id
+    end
+
+    test "a copied loop issue on a number no finding holds stays pending", %{tenant: tenant} do
+      {_source, copy} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant.id,
+          repo_full_name: "mkreyman/loop_repo",
+          issue_number: 901,
+          triage_requires_ticket: true
+        })
+
+      copy
+      |> Ecto.Changeset.change(
+        untrusted_body: "<!-- loopctl:chg-finding #{Ecto.UUID.generate()} -->",
+        untrusted_labels: ["chg-loop"]
+      )
+      |> AdminRepo.update!()
+
+      # A finding on the same number in ANOTHER repository, and one of another tenant on
+      # this repository and number: neither admits it.
+      loop_finding!(tenant.id, "mkreyman/elsewhere", 901)
+      loop_finding!(fixture(:tenant).id, "mkreyman/loop_repo", 901)
+
+      refute copy.id in candidate_ids(tenant)
+      assert {:error, :ticket_required} = TriageTrigger.promote(reload(copy))
+      assert story_for(copy.id) == nil
+    end
+
     test "a record whose issue is closed makes no story", %{tenant: tenant} do
       {_source, record} =
         fixture(:intake_pair, %{

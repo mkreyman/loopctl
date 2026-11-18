@@ -20,7 +20,7 @@
     },
     {
       "id": "AC-51.3.2",
-      "description": "Such a record is marked loop_finding with the finding id, and triage receives the finding's kind and evidence as loopctl-authored fields beside the untrusted issue text."
+      "description": "Such a record is marked with the finding id (intake_records.loop_finding_id), set when it is promoted. Delivering the finding to triage as loopctl-authored fields is US-51.7, because it changes the runner contract."
     },
     {
       "id": "AC-51.3.3",

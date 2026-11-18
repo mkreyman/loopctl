@@ -56,6 +56,7 @@ defmodule Loopctl.Delivery.TriageTrigger do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Changes.Findings
   alias Loopctl.Delivery.Stages
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
@@ -151,10 +152,29 @@ defmodule Loopctl.Delivery.TriageTrigger do
   # A source with `triage_requires_ticket` gets a story only for an issue filed from a support
   # ticket, the same rule triage applies (`Loopctl.Agents.Candidates`). Without this, every
   # other issue became a "Triage pending" story nothing would ever take.
-  defp ticket_admitted(%Source{triage_requires_ticket: true}, %Record{ticket_id: nil}),
-    do: {:error, :ticket_required}
+  #
+  # US-51.3: or for an issue the chg feedback loop filed, which loopctl knows by looking it up
+  # in its own `chg_findings` (`Findings.loop_finding_for/1`), never by anything in the issue.
+  # The record is marked with that finding when it is admitted.
+  defp ticket_admitted(%Source{triage_requires_ticket: true}, %Record{ticket_id: nil} = record) do
+    case Findings.loop_finding_for(record) do
+      nil -> {:error, :ticket_required}
+      finding_id -> mark_loop_finding(record, finding_id)
+    end
+  end
 
   defp ticket_admitted(%Source{}, %Record{}), do: :ok
+
+  defp mark_loop_finding(%Record{loop_finding_id: finding_id}, finding_id), do: :ok
+
+  defp mark_loop_finding(%Record{} = record, finding_id) do
+    AdminRepo.update_all(
+      from(r in Record, where: r.tenant_id == ^record.tenant_id and r.id == ^record.id),
+      set: [loop_finding_id: finding_id]
+    )
+
+    :ok
+  end
 
   # Only an open issue gets a story: triage never takes a closed one (`:issue_not_closed`).
   # A reopen writes `issue_state` back onto the same record, which then promotes.

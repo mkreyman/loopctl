@@ -78,6 +78,10 @@ defmodule Loopctl.Intake.Record do
     field :ticket_priority, :string
     field :ticket_kind, :string
 
+    # US-51.3: set by `Loopctl.Delivery.TriageTrigger` from loopctl's own `chg_findings`
+    # lookup, never from the issue. Never cast.
+    field :loop_finding_id, Ecto.UUID
+
     field :status, Ecto.Enum, values: @statuses, default: :pending_triage
     field :escalation_reasons, {:array, :string}, default: []
     field :escalated_at, :utc_datetime_usec

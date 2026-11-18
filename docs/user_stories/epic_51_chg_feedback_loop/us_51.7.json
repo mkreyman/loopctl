@@ -1,0 +1,65 @@
+{
+  "id": "US-51.7",
+  "title": "Triage dispatch carries a loop issue's finding as loopctl-authored fields",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "medium",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "triage session working a chg loop issue",
+    "i_want_to": "receive the finding's kind and evidence as trusted fields beside the untrusted issue text",
+    "so_that": "my verdict rests on loopctl's own record of the problem, not on an issue body anyone could edit"
+  },
+  "rationale": "Split from AC-51.3.2 when US-51.3 was built. The record now carries loop_finding_id, but the triage object is a wire contract the loopctl-runner reads (Loopctl.ApiSpec.RunnerContract.RunnerTriage, a 48_000-byte object budget, its template pastes fields by name). Adding fields is a contract version bump and a runner template change in another repository, so it cannot ship inside one loopctl story. Until it ships, triage sees the evidence only inside the issue body, as untrusted text.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.7.1",
+      "description": "RunnerTriage gains an optional loop_finding object (finding id, kind, fingerprint, occurrences, fix_attempts, and a bounded evidence map of scalars) under the existing object byte cap, with the contract version bumped and the measured worst-case figures asserted by name in runner_contract_test.exs."
+    },
+    {
+      "id": "AC-51.7.2",
+      "description": "TriagePayload.build/1 fills loop_finding from the record's loop_finding_id by a lookup in chg_findings of the same tenant, never from the issue text; a record with no loop_finding_id carries none."
+    },
+    {
+      "id": "AC-51.7.3",
+      "description": "The loopctl-runner triage template renders loop_finding as loopctl-authored context beside the untrusted block; agreed with the runner's maintaining session over the loopctl-runner coordination channel before the contract change merges."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.7.1",
+      "name": "a loop record carries its finding",
+      "type": "unit",
+      "preconditions": [
+        "a record with loop_finding_id set"
+      ],
+      "steps": [
+        "TriagePayload.build/1"
+      ],
+      "expected_results": [
+        "loop_finding has the finding's kind and evidence",
+        "the object fits the byte cap"
+      ]
+    },
+    {
+      "id": "TC-51.7.2",
+      "name": "another tenant's finding id carries nothing",
+      "type": "unit",
+      "preconditions": [
+        "a record whose loop_finding_id names another tenant's finding"
+      ],
+      "steps": [
+        "TriagePayload.build/1"
+      ],
+      "expected_results": [
+        "no loop_finding"
+      ]
+    }
+  ],
+  "technical_notes": [],
+  "dependencies": [
+    "US-51.3"
+  ]
+}
