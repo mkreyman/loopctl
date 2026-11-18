@@ -19,7 +19,8 @@ defmodule Loopctl.Changes.Dashboard do
   `filters` is `%{repo: String.t() | nil, host: String.t() | nil, since: DateTime.t()}`. `repo`
   is matched case-insensitively (`Loopctl.Changes.Events.repo_key/1`). `host` narrows the panels
   whose rows carry a host (the ledger rows); review outcomes and change cursors have none, and
-  ignore it. `since` bounds every panel by its own time column.
+  ignore it. `since`, and `until` (exclusive) when given, bound every panel by its own time
+  column.
 
   ## What the fields mean
 
@@ -86,8 +87,36 @@ defmodule Loopctl.Changes.Dashboard do
   @type filters :: %{
           optional(:repo) => String.t() | nil,
           optional(:host) => String.t() | nil,
-          required(:since) => DateTime.t()
+          required(:since) => DateTime.t(),
+          optional(:until) => DateTime.t() | nil
         }
+
+  @max_period_days 90
+
+  @doc """
+  The longest period one summary may cover, in days (US-50.6): `until - since` beyond this is
+  refused, so one call never aggregates an unbounded slice of the ledger.
+  """
+  @spec max_period_days() :: pos_integer()
+  def max_period_days, do: @max_period_days
+
+  @doc """
+  The whole dashboard as one map, every panel computed by the function `LoopctlWeb.ChgLive`
+  calls: what `GET /api/v1/chg_ledger/summary` answers (US-50.6).
+  """
+  @spec summary(Ecto.UUID.t(), filters()) :: map()
+  def summary(tenant_id, filters) do
+    %{
+      gate_outcomes: gate_outcomes(tenant_id, filters),
+      fallbacks: fallbacks(tenant_id, filters),
+      selection: selection(tenant_id, filters),
+      phase_times: phase_times(tenant_id, filters),
+      flaky: flaky(tenant_id, filters),
+      runner_samples: runner_samples(tenant_id, filters),
+      review_outcomes: review_outcomes(tenant_id, filters),
+      attention: attention(tenant_id, filters)
+    }
+  end
 
   @typedoc "A panel's data, or `:unavailable` when its read was shed."
   @type panel(data) :: data | :unavailable
@@ -336,7 +365,9 @@ defmodule Loopctl.Changes.Dashboard do
   """
   @spec review_outcomes(Ecto.UUID.t(), filters()) :: panel(map())
   def review_outcomes(tenant_id, filters) do
-    opts = [since: filters.since, limit: @list_limit] ++ repo_opt(filters)
+    opts =
+      [since: filters.since, until: Map.get(filters, :until), limit: @list_limit] ++
+        repo_opt(filters)
 
     case PrReviewOutcomes.list(tenant_id, opts) do
       {:error, :heavy_read_overloaded} ->
@@ -380,36 +411,36 @@ defmodule Loopctl.Changes.Dashboard do
           last_event_at: c.last_event_at
         }
 
-    query =
-      case filters do
-        %{repo: repo} when is_binary(repo) and repo != "" ->
-          where(query, [c], c.repo == ^Events.repo_key(repo))
-
-        _ ->
-          query
-      end
-
-    read(tenant_id, query)
+    query
+    |> by_repo(filters)
+    |> before_until(filters, :attention_at)
+    |> then(&read(tenant_id, &1))
   end
 
   # The ledger rows the filters select. Every panel over ledger rows starts here.
   defp ledger(tenant_id, filters) do
-    query = from(r in LedgerRow, where: r.tenant_id == ^tenant_id and r.at >= ^filters.since)
-
-    query =
-      case filters do
-        %{repo: repo} when is_binary(repo) and repo != "" ->
-          where(query, [r], r.repo == ^Events.repo_key(repo))
-
-        _ ->
-          query
-      end
-
-    case filters do
-      %{host: host} when is_binary(host) and host != "" -> where(query, [r], r.host == ^host)
-      _ -> query
-    end
+    from(r in LedgerRow, where: r.tenant_id == ^tenant_id and r.at >= ^filters.since)
+    |> by_repo(filters)
+    |> by_host(filters)
+    |> before_until(filters, :at)
   end
+
+  # Binding-agnostic filters, shared by the ledger and cursor queries: `repo`, `host` (ledger
+  # rows only) and the exclusive `until` on the panel's own time column.
+  defp by_repo(query, %{repo: repo}) when is_binary(repo) and repo != "",
+    do: where(query, [x], x.repo == ^Events.repo_key(repo))
+
+  defp by_repo(query, _filters), do: query
+
+  defp by_host(query, %{host: host}) when is_binary(host) and host != "",
+    do: where(query, [x], x.host == ^host)
+
+  defp by_host(query, _filters), do: query
+
+  defp before_until(query, %{until: %DateTime{} = until}, column),
+    do: where(query, [x], field(x, ^column) < ^until)
+
+  defp before_until(query, _filters, _column), do: query
 
   defp read(tenant_id, query) do
     case HeavyRead.all(tenant_id, query, read_opts()) do

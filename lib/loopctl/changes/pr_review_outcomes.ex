@@ -91,8 +91,8 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
 
   @doc """
   `tenant_id`'s outcomes, newest merge first, each with its counted `rounds` and
-  `merged_without_counted_round`. `opts`: `:repo` (an `owner/name`, any case), `:since` (a
-  `DateTime`, on `merged_at`), `:limit` (1..500, default 100).
+  `merged_without_counted_round`. `opts`: `:repo` (an `owner/name`, any case), `:since` and
+  `:until` (exclusive; `DateTime`s on `merged_at`), `:limit` (1..500, default 100).
   """
   @spec list(Ecto.UUID.t(), keyword()) :: [outcome()] | {:error, :heavy_read_overloaded}
   def list(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -113,6 +113,12 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
     query =
       case Keyword.get(opts, :since) do
         %DateTime{} = since -> where(query, [o], o.merged_at >= ^since)
+        _ -> query
+      end
+
+    query =
+      case Keyword.get(opts, :until) do
+        %DateTime{} = until -> where(query, [o], o.merged_at < ^until)
         _ -> query
       end
 
