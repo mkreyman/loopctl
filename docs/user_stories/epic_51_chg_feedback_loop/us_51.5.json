@@ -1,0 +1,73 @@
+{
+  "id": "US-51.5",
+  "title": "chg's selection fixes merge on a measured widening proof",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "high",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "fleet operator",
+    "i_want_to": "have the delivery loop merge a fix to chg's test selection without me",
+    "so_that": "chg improves its own selection from its own misses"
+  },
+  "rationale": "Mark, 2026-11-18, on chg's fixes reaching him by design: 'I would argue that should be the first place the automatic feedback loop should be implemented.' The human step guarded against a fix that hides a miss by selecting fewer tests; a server-side measurement that selection only widened guards against the same thing.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.5.1",
+      "description": "DELIVERY_GATES_CONFIG gains a mkreyman/chg entry: chg's selection code (cli/src/cover.rs, adapters/*/lib/**, and the affected-test modules the KB 4a86157b floor names for selection) is effect_paths; the rest of that floor (gate, check, adapter contract, output, verify, main, culprit, revert, CI workflows) stays human_paths. Every glob is matched against the chg repository's file list before it ships (mix loopctl.gates.check_drift)."
+    },
+    {
+      "id": "AC-51.5.2",
+      "description": "A selection proof is loopctl's measurement: for the story's head sha, chg_ledger_rows of kind chg and source replay whose raw names the verifier dispatch id bound to the story (verifier_dispatch_id), never the implementer's. It passes when (a) the replay of the finding's miss sha selects every test the gate failed there, and (b) for every commit in the replay corpus the head selects a superset of what the base selected."
+    },
+    {
+      "id": "AC-51.5.3",
+      "description": "MergePrecondition clears a :prove_effect Gate B outcome on the chg repository with that measured proof; a caller-supplied effect_proof still cannot clear it. A missing, partial or narrowing proof refuses with reasons naming the missing replay or each narrowed commit."
+    },
+    {
+      "id": "AC-51.5.4",
+      "description": "A chg change touching any human_paths file still escalates, proof or not."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.5.1",
+      "name": "widening proof merges",
+      "type": "integration",
+      "preconditions": ["a chg story touching cover.rs", "verifier replay rows that select the missed test and a superset everywhere"],
+      "steps": ["merge precondition"],
+      "expected_results": ["allow"]
+    },
+    {
+      "id": "TC-51.5.2",
+      "name": "narrowing refuses",
+      "type": "integration",
+      "preconditions": ["one corpus commit selects fewer tests on the head"],
+      "steps": ["merge precondition"],
+      "expected_results": ["refuse naming that commit"]
+    },
+    {
+      "id": "TC-51.5.3",
+      "name": "implementer rows do not count",
+      "type": "integration",
+      "preconditions": ["replay rows naming the implementer dispatch"],
+      "steps": ["merge precondition"],
+      "expected_results": ["refuse: no verifier replay"]
+    },
+    {
+      "id": "TC-51.5.4",
+      "name": "human path still escalates",
+      "type": "integration",
+      "preconditions": ["a change to cli/src/revert.rs with a passing proof"],
+      "steps": ["merge precondition"],
+      "expected_results": ["refuse, human"]
+    }
+  ],
+  "technical_notes": [
+    "chg side: a replay command that writes kind chg, source replay rows carrying the dispatch id of the run that made them, sent through the outbox. Handed off on the chg channel.",
+    "Mark said on 2026-11-18 to let chg's own fixes merge without him, because chg should keep improving its own practices. This narrows the KB 4a86157b floor for selection code only; update that article when this ships."
+  ],
+  "dependencies": ["US-51.1"]
+}

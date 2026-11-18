@@ -1,0 +1,54 @@
+{
+  "id": "US-51.6",
+  "title": "Read surface: findings in the summary, an MCP tool and the dashboard",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "medium",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "fleet operator or session",
+    "i_want_to": "see every finding with its state, issue and attempts",
+    "so_that": "I can tell what the loop is doing without reading GitHub"
+  },
+  "rationale": "CLAUDE.md: an operator-facing endpoint is not done until an MCP tool calls it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.6.1",
+      "description": "GET /api/v1/chg_findings (role :agent, tenant from the key) lists findings filtered by state, kind and repo, newest first, capped; each row carries kind, fingerprint, repo, state, occurrences, fix_attempts, loop_depth, the issue URL and timestamps."
+    },
+    {
+      "id": "AC-51.6.2",
+      "description": "MCP tool chg_findings calls it, declared, dispatched, documented in mcp-server/README.md, with a wiring test; mcp-server version bumped."
+    },
+    {
+      "id": "AC-51.6.3",
+      "description": "Dashboard.summary/2 gains a findings panel (counts per state and kind, the escalated list), shown on /chg and returned by chg_ledger_summary."
+    },
+    {
+      "id": "AC-51.6.4",
+      "description": "POST /api/v1/chg_findings/:id/clear (role :user, human-anchored) clears an escalated finding back to queued; an MCP tool calls it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.6.1",
+      "name": "list and isolation",
+      "type": "integration",
+      "preconditions": ["findings in tenants A and B"],
+      "steps": ["GET as A"],
+      "expected_results": ["only A's findings"]
+    },
+    {
+      "id": "TC-51.6.2",
+      "name": "clear needs a user key",
+      "type": "integration",
+      "preconditions": ["an escalated finding"],
+      "steps": ["POST clear with an agent key", "with a user key"],
+      "expected_results": ["403", "queued"]
+    }
+  ],
+  "technical_notes": [],
+  "dependencies": ["US-51.1", "US-51.2"]
+}
