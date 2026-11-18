@@ -67,7 +67,10 @@ defmodule Loopctl.Changes.Findings do
   @row_limit 5_000
   @default_daily_cap 5
   @max_loop_depth 2
+  @max_fix_attempts 2
+  @quiet_days 7
   @label "chg-loop"
+  @escalated_label "chg-loop-escalated"
   @default_chg_repo "mkreyman/chg"
 
   # Bounds on what a ledger row may contribute to a finding's evidence: the row's scalar
@@ -96,6 +99,18 @@ defmodule Loopctl.Changes.Findings do
   @doc "The label every loop issue carries."
   @spec label() :: String.t()
   def label, do: @label
+
+  @doc "The label an escalated loop issue gains."
+  @spec escalated_label() :: String.t()
+  def escalated_label, do: @escalated_label
+
+  @doc "Failed fixes before a finding escalates instead of reopening."
+  @spec max_fix_attempts() :: pos_integer()
+  def max_fix_attempts, do: @max_fix_attempts
+
+  @doc "Days a fixed finding must stay unseen before its issue is closed."
+  @spec quiet_days() :: pos_integer()
+  def quiet_days, do: @quiet_days
 
   @doc "The depth at which a finding escalates instead of filing."
   @spec max_loop_depth() :: pos_integer()
@@ -159,10 +174,13 @@ defmodule Loopctl.Changes.Findings do
   @doc "`sweep/2` for one tenant."
   @spec sweep_tenant(Ecto.UUID.t(), DateTime.t(), keyword()) :: map()
   def sweep_tenant(tenant_id, now \\ DateTime.utc_now(), opts \\ []) do
+    # Fixed first, so a sighting tonight on a fix merged today is judged against that fix.
+    fixed = mark_fixed(tenant_id, now)
     sightings = derive(tenant_id, now, opts)
     record_sightings(tenant_id, sightings, now)
+    closed = plan_closures(tenant_id, now)
     filed = plan_filing(tenant_id, now, opts)
-    %{sighted: length(sightings), filed: filed}
+    %{sighted: length(sightings), fixed: fixed, closed: closed, filed: filed}
   end
 
   @doc """
@@ -448,8 +466,18 @@ defmodule Loopctl.Changes.Findings do
     if fresh != [] do
       newest = Enum.max_by(fresh, & &1.at, DateTime)
 
-      # Conditional on the `last_seen_at` read above, so two sweeps cannot both add the same
-      # rows: the loser's update matches nothing.
+      # The count and the recurrence it may show commit together, so a crash between them
+      # cannot leave a counted sighting whose recurrence nobody acted on.
+      {:ok, _} = AdminRepo.transaction(fn -> count_sightings(finding, fresh, newest, now) end)
+    end
+
+    :ok
+  end
+
+  defp count_sightings(%Finding{} = finding, fresh, newest, now) do
+    # Conditional on the `last_seen_at` read by the caller, so two sweeps cannot both add the
+    # same rows: the loser's update matches nothing, and so acts on nothing.
+    {counted, _} =
       AdminRepo.update_all(
         from(f in Finding,
           where:
@@ -459,9 +487,267 @@ defmodule Loopctl.Changes.Findings do
         inc: [occurrences: length(fresh)],
         set: [last_seen_at: newest.at, evidence: newest.evidence, updated_at: now]
       )
-    end
 
-    :ok
+    if counted == 1 and recurred?(finding, fresh), do: recur(finding, fresh, now)
+  end
+
+  # A fixed or closed finding seen again AFTER its fix merged: the fix did not hold.
+  defp recurred?(%Finding{state: state, fixed_at: %DateTime{} = fixed_at}, fresh)
+       when state in [:fixed, :closed],
+       do: Enum.any?(fresh, &(DateTime.compare(&1.at, fixed_at) == :gt))
+
+  defp recurred?(_finding, _fresh), do: false
+
+  # US-51.2: `fix_attempts + 1`, then reopen (back to `:filed`) or, at `@max_fix_attempts`,
+  # escalate. A compare-and-set on the state and count read, so two sweeps recur once; the
+  # action's generation is the NEW count, so the act is decided once per failed fix.
+  defp recur(%Finding{} = finding, fresh, now) do
+    attempts = finding.fix_attempts + 1
+    escalate? = attempts >= @max_fix_attempts
+    reason = "fix_attempts_#{attempts}"
+
+    set =
+      if escalate?,
+        do: [state: :escalated, escalated_at: now, escalated_reason: reason],
+        else: [state: :filed]
+
+    {n, _} =
+      AdminRepo.update_all(
+        from(f in Finding,
+          where:
+            f.tenant_id == ^finding.tenant_id and f.id == ^finding.id and
+              f.state == ^finding.state and f.fix_attempts == ^finding.fix_attempts
+        ),
+        set: [fix_attempts: attempts, updated_at: now] ++ set
+      )
+
+    if n == 1 do
+      action = if escalate?, do: :escalate, else: :reopen
+      text = recurrence_comment(finding, fresh, attempts, escalate?)
+      enqueue(finding, action, attempts, text, now)
+    end
+  end
+
+  defp recurrence_comment(%Finding{} = finding, fresh, attempts, escalate?) do
+    newest = Enum.max_by(fresh, & &1.at, DateTime)
+
+    head =
+      if escalate?,
+        do:
+          "The fix did not hold again (attempt #{attempts}). The loop stops here: this needs a " <>
+            "person. loopctl files nothing more for this finding until it is cleared.",
+        else:
+          "The fix did not hold: the signal came back after the fix merged " <>
+            "(#{finding.fix_merge_sha || "merge sha unknown"}). Reopening for another attempt."
+
+    """
+    #{head}
+
+    - new sightings: #{length(fresh)}
+    - latest: #{DateTime.to_iso8601(newest.at)}
+    - fix attempts so far: #{attempts}
+    """
+  end
+
+  # An outbox row for a non-`open` act on the finding's issue, on the tenant's live source for
+  # its repository. With no live source, or no issue to act on, there is nothing to act
+  # through; the state change above stands and is visible on the finding.
+  defp enqueue(%Finding{issue_number: nil} = finding, action, _generation, _text, _now) do
+    log_unactionable(finding, action, "no_issue")
+  end
+
+  defp enqueue(%Finding{} = finding, action, generation, text, now) do
+    case source_for(finding.tenant_id, finding.repo_full_name) do
+      nil ->
+        log_unactionable(finding, action, "no_live_source")
+
+      %Source{} = source ->
+        AdminRepo.insert_all(
+          FindingAction,
+          [
+            %{
+              id: Ecto.UUID.generate(),
+              tenant_id: finding.tenant_id,
+              finding_id: finding.id,
+              source_id: source.id,
+              action: action,
+              generation: generation,
+              repo_full_name: source.repo_full_name,
+              body: text,
+              issue_number: finding.issue_number,
+              status: :pending,
+              attempts: 0,
+              inserted_at: now,
+              updated_at: now
+            }
+          ],
+          on_conflict: :nothing,
+          conflict_target: [:finding_id, :action, :generation]
+        )
+    end
+  end
+
+  defp log_unactionable(%Finding{} = finding, action, why) do
+    Logger.warning(
+      "Findings: #{action} decided for #{finding.kind} #{finding.fingerprint} but not " <>
+        "enqueued (#{why}): tenant_id=#{finding.tenant_id}",
+      tenant_id: finding.tenant_id
+    )
+  end
+
+  # -- fixed and closed (US-51.2) ---------------------------------------------------------
+
+  @doc """
+  Moves each `:filed` finding whose issue the delivery loop made a story from, and whose story
+  merged, to `:fixed`, recording the merge sha. `fixed_at` is the sweep's `now`: the stage
+  keeps no merge time, so the quiet period runs from the night the merge was seen, never
+  from before it. Returns how many moved.
+  """
+  @spec mark_fixed(Ecto.UUID.t(), DateTime.t()) :: non_neg_integer()
+  def mark_fixed(tenant_id, now \\ DateTime.utc_now()) do
+    tenant_id
+    |> merged_fixes()
+    |> AdminRepo.all()
+    |> Enum.count(fn {id, merge_sha} -> fix(tenant_id, id, merge_sha, now) end)
+  end
+
+  defp fix(tenant_id, id, merge_sha, now) do
+    {n, _} =
+      AdminRepo.update_all(
+        from(f in Finding,
+          where: f.tenant_id == ^tenant_id and f.id == ^id and f.state == :filed
+        ),
+        set: [state: :fixed, fix_merge_sha: merge_sha, fixed_at: now, updated_at: now]
+      )
+
+    n == 1
+  end
+
+  # `{finding_id, merge_sha}` for each filed finding whose issue became a story that merged.
+  defp merged_fixes(tenant_id) do
+    from(f in Finding,
+      join: src in Source,
+      on: src.tenant_id == f.tenant_id and src.repo_full_name == f.repo_full_name,
+      join: r in Record,
+      on:
+        r.tenant_id == f.tenant_id and r.source_id == src.id and
+          r.issue_number == f.issue_number,
+      join: s in Story,
+      on: s.tenant_id == r.tenant_id and s.intake_record_id == r.id,
+      join: st in StoryStage,
+      on: st.tenant_id == s.tenant_id and st.story_id == s.id,
+      where:
+        f.tenant_id == ^tenant_id and f.state == :filed and not is_nil(f.issue_number) and
+          not is_nil(st.merge_sha),
+      distinct: f.id,
+      order_by: [asc: f.id, desc: st.updated_at],
+      select: {f.id, st.merge_sha}
+    )
+  end
+
+  @doc """
+  Closes the issue of each `:fixed` finding not seen since its fix for `quiet_days/0`: the
+  `:fixed -> :closed` compare-and-set and the `close` action, in one transaction. Returns how
+  many closed.
+  """
+  @spec plan_closures(Ecto.UUID.t(), DateTime.t()) :: non_neg_integer()
+  def plan_closures(tenant_id, now \\ DateTime.utc_now()) do
+    cutoff = DateTime.add(now, -@quiet_days * 86_400, :second)
+
+    from(f in Finding,
+      where:
+        f.tenant_id == ^tenant_id and f.state == :fixed and f.fixed_at <= ^cutoff and
+          f.last_seen_at <= f.fixed_at
+    )
+    |> AdminRepo.all()
+    |> Enum.count(&(close(&1, now) == :closed))
+  end
+
+  defp close(%Finding{} = finding, now) do
+    text = """
+    No sighting in the #{@quiet_days} days since the fix was seen merged \
+    (#{finding.fix_merge_sha}). Closing.
+
+    - last sighting: #{DateTime.to_iso8601(finding.last_seen_at)}
+    - occurrences in all: #{finding.occurrences}
+    """
+
+    AdminRepo.transaction(fn ->
+      {n, _} =
+        AdminRepo.update_all(
+          from(f in Finding,
+            where:
+              f.tenant_id == ^finding.tenant_id and f.id == ^finding.id and f.state == :fixed and
+                f.last_seen_at == ^finding.last_seen_at
+          ),
+          set: [state: :closed, closed_at: now, updated_at: now]
+        )
+
+      if n == 1 do
+        enqueue(finding, :close, finding.fix_attempts, text, now)
+        :closed
+      else
+        :skipped
+      end
+    end)
+    |> case do
+      {:ok, outcome} -> outcome
+    end
+  end
+
+  @doc """
+  The finding behind an action whose `reopen` the forge refused for good (the issue was
+  deleted or transferred): files it again as a new issue, the reopen abandoned and the new
+  `open` decided in one transaction. The finding forgets its old issue number.
+  """
+  @spec refile(FindingAction.t(), term()) :: {:ok, FindingAction.t()} | {:error, :not_pending}
+  def refile(%FindingAction{action: :reopen} = action, reason) do
+    now = DateTime.utc_now()
+
+    AdminRepo.transaction(fn ->
+      with {:ok, abandoned} <-
+             mark_abandoned(action.tenant_id, action.id, "reopen_refused_refiled", reason),
+           %Finding{} = finding <-
+             AdminRepo.one(
+               from f in Finding,
+                 where: f.tenant_id == ^action.tenant_id and f.id == ^action.finding_id
+             ) do
+        AdminRepo.update_all(
+          from(f in Finding, where: f.tenant_id == ^finding.tenant_id and f.id == ^finding.id),
+          set: [issue_number: nil, updated_at: now]
+        )
+
+        action_id = Ecto.UUID.generate()
+
+        AdminRepo.insert_all(
+          FindingAction,
+          [
+            %{
+              id: action_id,
+              tenant_id: finding.tenant_id,
+              finding_id: finding.id,
+              source_id: action.source_id,
+              action: :open,
+              generation: action.generation,
+              repo_full_name: action.repo_full_name,
+              title: title(finding, action_id),
+              body: body(finding, action_id),
+              status: :pending,
+              attempts: 0,
+              inserted_at: now,
+              updated_at: now
+            }
+          ],
+          on_conflict: :nothing,
+          conflict_target: [:finding_id, :action, :generation]
+        )
+
+        abandoned
+      else
+        {:error, :not_pending} -> AdminRepo.rollback(:not_pending)
+        nil -> AdminRepo.rollback(:not_pending)
+      end
+    end)
   end
 
   # The depth of the change a sighting points at: when one of its shas is the merge of a story

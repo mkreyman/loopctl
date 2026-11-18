@@ -1229,6 +1229,26 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
+  describe "reopen_issue/2 (US-51.2)" do
+    test "PATCHes state open" do
+      parent = self()
+
+      stub(fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:request, conn.method, conn.request_path, Jason.decode!(body)})
+        json(conn, %{})
+      end)
+
+      assert :ok = Source.reopen_issue(@repo, 7)
+
+      assert_received {:request, "PATCH", "/repos/acme/widgets/issues/7", %{"state" => "open"}}
+    end
+
+    test "an issue number that is not positive never reaches the network" do
+      assert {:error, {:invalid_issue_number, 0}} = Source.reopen_issue(@repo, 0)
+    end
+  end
+
   describe "create_issue/3 (US-47.4)" do
     test "POSTs title and body to the issues collection and returns the new number" do
       parent = self()

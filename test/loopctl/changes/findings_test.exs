@@ -339,6 +339,157 @@ defmodule Loopctl.Changes.FindingsTest do
     end
   end
 
+  # US-51.2: a filed flaky_test finding with issue `issue`, whose loop story merged as `sha`.
+  defp fixed_flaky!(ctx, issue, sha) do
+    flaky!(ctx.hcb, "t1", %{at: DateTime.add(@now, -2 * 86_400, :second)})
+    Findings.sweep_tenant(ctx.tenant_id, DateTime.add(@now, -2 * 86_400, :second), opts())
+
+    [finding] = findings(ctx.tenant_id)
+
+    AdminRepo.update_all(from(f in Finding, where: f.id == ^finding.id),
+      set: [issue_number: issue]
+    )
+
+    AdminRepo.update_all(from(a in FindingAction, where: a.finding_id == ^finding.id),
+      set: [status: :done, done_at: @now, issue_number: issue]
+    )
+
+    record =
+      fixture(:intake_record, %{
+        tenant_id: ctx.tenant_id,
+        repo: AdminRepo,
+        repo_full_name: "mkreyman/home_care_billing",
+        issue_number: issue
+      })
+
+    story = fixture(:story, %{tenant_id: ctx.tenant_id})
+
+    AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+      set: [intake_record_id: record.id]
+    )
+
+    fixture(:story_stage, %{
+      tenant_id: ctx.tenant_id,
+      story_id: story.id,
+      repo: AdminRepo,
+      merge_sha: sha
+    })
+
+    finding.id
+  end
+
+  defp action_of(tenant_id, kind) do
+    Enum.find(actions(tenant_id), &(&1.action == kind))
+  end
+
+  describe "the fix lifecycle (US-51.2)" do
+    test "a merged loop story moves its finding to fixed", ctx do
+      id = fixed_flaky!(ctx, 51, @sha)
+
+      assert %{fixed: 1} = Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      assert %Finding{state: :fixed, fix_merge_sha: @sha, fixed_at: @now} =
+               AdminRepo.get(Finding, id)
+    end
+
+    test "a fixed finding quiet for the period closes, with a comment", ctx do
+      id = fixed_flaky!(ctx, 52, @sha)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      early = DateTime.add(@now, (Findings.quiet_days() - 1) * 86_400, :second)
+      assert %{closed: 0} = Findings.sweep_tenant(ctx.tenant_id, early, opts())
+
+      later = DateTime.add(@now, Findings.quiet_days() * 86_400, :second)
+      assert %{closed: 1} = Findings.sweep_tenant(ctx.tenant_id, later, opts())
+      assert %Finding{state: :closed} = AdminRepo.get(Finding, id)
+
+      close = action_of(ctx.tenant_id, :close)
+      assert close.issue_number == 52
+      assert close.body =~ "#{Findings.quiet_days()} days"
+
+      expect(Loopctl.MockPullRequestSource, :comment_issue, fn _r, 52, _b -> :ok end)
+      expect(Loopctl.MockPullRequestSource, :close_issue, fn _r, 52, :completed -> :ok end)
+      assert {:done, nil} = FindingFiler.perform(close)
+    end
+
+    test "a sighting after the fix reopens; a second escalates", ctx do
+      id = fixed_flaky!(ctx, 53, @sha)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      day2 = DateTime.add(@now, 86_400, :second)
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(day2, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, day2, opts())
+
+      assert %Finding{state: :filed, fix_attempts: 1} = AdminRepo.get(Finding, id)
+      reopen = action_of(ctx.tenant_id, :reopen)
+      assert %FindingAction{issue_number: 53, generation: 1} = reopen
+      assert reopen.body =~ "did not hold"
+
+      expect(Loopctl.MockPullRequestSource, :reopen_issue, fn _r, 53 -> :ok end)
+      expect(Loopctl.MockPullRequestSource, :comment_issue, fn _r, 53, _b -> :ok end)
+      assert {:done, nil} = FindingFiler.perform(reopen)
+
+      # The second fix merges and is seen; the signal comes back again.
+      AdminRepo.update_all(from(f in Finding, where: f.id == ^id),
+        set: [state: :fixed, fixed_at: day2]
+      )
+
+      day3 = DateTime.add(day2, 86_400, :second)
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(day3, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, day3, opts())
+
+      assert %Finding{state: :escalated, fix_attempts: 2, escalated_reason: "fix_attempts_2"} =
+               AdminRepo.get(Finding, id)
+
+      escalate = action_of(ctx.tenant_id, :escalate)
+
+      expect(Loopctl.MockPullRequestSource, :comment_issue, fn _r, 53, _b -> :ok end)
+
+      expect(Loopctl.MockPullRequestSource, :label_issue, fn _r, 53, "chg-loop-escalated" ->
+        :ok
+      end)
+
+      assert {:done, nil} = FindingFiler.perform(escalate)
+    end
+
+    test "a sighting before the fix merged does not count against the fix", ctx do
+      id = fixed_flaky!(ctx, 54, @sha)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      # A row stamped before fixed_at, arriving late.
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(@now, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, DateTime.add(@now, 3600, :second), opts())
+
+      assert %Finding{state: :fixed, fix_attempts: 0} = AdminRepo.get(Finding, id)
+      refute action_of(ctx.tenant_id, :reopen)
+    end
+
+    test "a reopen the forge refuses for good files the finding again", ctx do
+      id = fixed_flaky!(ctx, 55, @sha)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      day2 = DateTime.add(@now, 86_400, :second)
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(day2, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, day2, opts())
+
+      reopen = action_of(ctx.tenant_id, :reopen)
+
+      expect(Loopctl.MockPullRequestSource, :reopen_issue, fn _r, 55 ->
+        {:error, {:github_api_error, 410}}
+      end)
+
+      assert {:abandoned, nil} = FindingFiler.perform(reopen)
+      assert %Finding{issue_number: nil, state: :filed} = AdminRepo.get(Finding, id)
+
+      assert [%FindingAction{generation: 1, status: :pending, title: title}] =
+               Enum.filter(
+                 actions(ctx.tenant_id),
+                 &(&1.action == :open and &1.status == :pending)
+               )
+
+      assert title =~ "[chg-loop]"
+    end
+  end
+
   describe "tenant isolation" do
     test "one tenant's ledger never becomes another tenant's finding", ctx do
       %{source: other} = fixture(:chg_source, %{repo_full_name: "mkreyman/home_care_billing"})

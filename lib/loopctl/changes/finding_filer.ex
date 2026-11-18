@@ -19,6 +19,13 @@ defmodule Loopctl.Changes.FindingFiler do
   4. **Labels it** `chg-loop` (additive and idempotent at the forge) and marks the row done,
      which also gives the finding its issue number.
 
+  ## `:close`, `:reopen`, `:escalate` (US-51.2)
+
+  Each is a comment on the finding's issue plus one forge state change: close it
+  (`:completed`), reopen it, or add the `chg-loop-escalated` label. A retry after a partial
+  attempt may post the comment twice; it never acts on a second issue. A reopen the forge
+  refuses for good files the finding again (`Findings.refile/2`).
+
   ## Transient versus permanent
 
   `Loopctl.Delivery.MergePrecondition.transient?/1`, the classification every forge drainer
@@ -75,8 +82,62 @@ defmodule Loopctl.Changes.FindingFiler do
     end
   end
 
-  defp act(%FindingAction{action: other} = action, _repo),
-    do: abandon(action, "unsupported_action", other)
+  # US-51.2. Each act is a comment plus one forge state change, and each half is idempotent
+  # at the forge except the comment, which a retry may post twice: a duplicate comment is the
+  # accepted cost, never a duplicate issue.
+  defp act(%FindingAction{action: :close} = action, repo) do
+    with :ok <- PullRequestSource.comment_issue(repo, action.issue_number, action.body),
+         :ok <- PullRequestSource.close_issue(repo, action.issue_number, :completed) do
+      finish(action)
+    else
+      {:error, reason} -> fault(action, reason)
+    end
+  end
+
+  defp act(%FindingAction{action: :reopen} = action, repo) do
+    case PullRequestSource.reopen_issue(repo, action.issue_number) do
+      :ok ->
+        case PullRequestSource.comment_issue(repo, action.issue_number, action.body) do
+          :ok -> finish(action)
+          {:error, reason} -> fault(action, reason)
+        end
+
+      {:error, reason} ->
+        reopen_fault(action, reason)
+    end
+  end
+
+  defp act(%FindingAction{action: :escalate} = action, repo) do
+    with :ok <- PullRequestSource.comment_issue(repo, action.issue_number, action.body),
+         :ok <-
+           PullRequestSource.label_issue(repo, action.issue_number, Findings.escalated_label()) do
+      finish(action)
+    else
+      {:error, reason} -> fault(action, reason)
+    end
+  end
+
+  # A reopen the forge refused for good (the issue was deleted or transferred) files the
+  # finding again rather than abandoning the problem.
+  defp reopen_fault(%FindingAction{} = action, reason) do
+    if permanent?(reason) do
+      case Findings.refile(action, reason) do
+        {:ok, _abandoned} ->
+          log_abandoned(action, "reopen_refused_refiled", reason)
+          {:abandoned, nil}
+
+        {:error, :not_pending} ->
+          {:skipped, nil}
+      end
+    else
+      fault(action, reason)
+    end
+  end
+
+  defp permanent?(reason),
+    do:
+      not MergePrecondition.transient?(reason) and not Credential.configuration?(reason) and
+        not match?({:issue_search_inconclusive, _}, reason)
 
   defp create(%FindingAction{} = action, repo) do
     case PullRequestSource.create_issue(repo, action.title, action.body) do
