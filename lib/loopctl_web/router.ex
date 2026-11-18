@@ -187,6 +187,7 @@ defmodule LoopctlWeb.Router do
     post "/change_events/:source_id", ChangeEventController, :create
     get "/change_events/:source_id/cursor", ChangeEventController, :cursor
     post "/chg_ledger/:source_id", ChgLedgerController, :create
+    post "/change_events/:source_id/review_dispatch", ChangeEventController, :review_dispatch
   end
 
   scope "/swaggerui" do

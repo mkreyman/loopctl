@@ -227,14 +227,20 @@ defmodule Loopctl.Changes.Events do
   `FOR SHARE` in a tenant transaction, its tenant and chg root judged, and the signature
   verified again against the held row; `fun` runs inside that transaction. Every refusal is
   `{:error, :unauthorized}`, counted by `event_refused/3`. `fun` may `Repo.rollback/1` with
-  `{:bad_request, code}`, which comes back as `{:error, {:bad_request, code}}`; any other
-  rollback is `{:error, :busy}` or `{:error, :apply_failed}` as for a push.
+  `{:bad_request, code}` or `{:rejected, http_status, code}`, which come back as
+  `{:error, ...}` unchanged, or with `{:refused, reason}`, which is the 401; any other rollback
+  is `{:error, :busy}` or `{:error, :apply_failed}` as for a push.
 
   `opts`: `:now` and `:lock_timeout_ms`, as for `receive_push/3`.
   """
   @spec signed(term(), push_input(), keyword(), (Source.t() -> result)) ::
           {:ok, result}
-          | {:error, :unauthorized | {:bad_request, String.t()} | :busy | :apply_failed}
+          | {:error,
+             :unauthorized
+             | {:bad_request, String.t()}
+             | {:rejected, pos_integer(), String.t()}
+             | :busy
+             | :apply_failed}
         when result: term()
   def signed(source_id, %{raw_body: raw_body} = input, opts, fun)
       when is_binary(raw_body) and is_function(fun, 1) do
@@ -258,6 +264,9 @@ defmodule Loopctl.Changes.Events do
 
         {:error, {:bad_request, code}} when is_binary(code) ->
           {:error, {:bad_request, code}}
+
+        {:error, {:rejected, status, code}} when is_integer(status) and is_binary(code) ->
+          {:error, {:rejected, status, code}}
 
         {:error, reason} ->
           failed(source, reason)

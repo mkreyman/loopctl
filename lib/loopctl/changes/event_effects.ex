@@ -529,7 +529,7 @@ defmodule Loopctl.Changes.EventEffects do
   defp review_missing_reason(%Event{} = event) do
     "review_missing: chg landed change #{RevertIssues.safe_id(event.change_id)} revision " <>
       "#{event.revision} (#{RevertIssues.safe_sha(event.sha)}) with no review recorded for " <>
-      "that revision by a reviewer chg-server minted — a policy auto-approval, or a review " <>
+      "that revision by a reviewer its intake source minted — a policy auto-approval, or a review " <>
       "loopctl never accepted. The merge stands; a human decides what the story is now, " <>
       "and it is not verified without one."
   end

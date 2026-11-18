@@ -56,6 +56,7 @@
     ["GET","/api/v1/audit/sth/:tenant_id/inclusion/:position","LoopctlWeb.AuditSthController",":inclusion"],
     ["POST","/api/v1/change_events/:source_id","LoopctlWeb.ChangeEventController",":create"],
     ["GET","/api/v1/change_events/:source_id/cursor","LoopctlWeb.ChangeEventController",":cursor"],
+    ["POST","/api/v1/change_events/:source_id/review_dispatch","LoopctlWeb.ChangeEventController",":review_dispatch"],
     ["GET","/api/v1/changes","LoopctlWeb.ChangeController",":index"],
     ["GET","/api/v1/channel/claims","LoopctlWeb.ChannelClaimController",":index"],
     ["POST","/api/v1/channel/claims","LoopctlWeb.ChannelClaimController",":create"],

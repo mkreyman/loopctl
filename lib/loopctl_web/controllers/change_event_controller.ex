@@ -22,7 +22,9 @@ defmodule LoopctlWeb.ChangeEventController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Changes.Events
+  alias Loopctl.Changes.ReviewDispatches
   alias Loopctl.Changes.Signature
+  alias Loopctl.Dispatches
   alias LoopctlWeb.Plugs.IntakeRawBody
   alias OpenApiSpex.Schema
 
@@ -270,6 +272,118 @@ defmodule LoopctlWeb.ChangeEventController do
         error(conn, 500, "change_cursor_failed", "The cursor could not be read. Retry.")
     end
   end
+
+  operation(:review_dispatch,
+    summary: "Mint a chg review dispatch under the source's root (fleet chgd only)",
+    description:
+      "US-50.3. A fleet machine's chgd asks for the key a review of one `(change_id, " <>
+        "revision)` records its verdict with. A machine endpoint with no MCP tool, signed " <>
+        "exactly like the event POST. loopctl mints an `:orchestrator` child of the source's " <>
+        "`chg_root_dispatch_id`, attributed to the per-source system agent, living " <>
+        "#{Dispatches.max_expires_seconds()} seconds. It records a review on that revision " <>
+        "(`commit_sha` = the revision's sha) and is refused claim, report, verify and reject. " <>
+        "Whoever holds the source's `change_events_secret` can mint these; the root key's " <>
+        "expiry does not matter, its revocation does. Every authentication refusal, a revoked " <>
+        "root included, is the event POST's 401 `invalid_signature`. The revision must have " <>
+        "an applied `submitted` event from this source (422 `revision_not_submitted`). One " <>
+        "live dispatch per revision: a repeat request revokes the earlier dispatch and mints " <>
+        "afresh, so a lost answer is safe to retry, until any of them has recorded a review, " <>
+        "after which it is 409 `review_already_recorded`. A tenant under a custody halt is " <>
+        "503 `tenant_halted`. Lock contention is 503 `busy`.",
+    security: [],
+    parameters: [
+      source_id: [in: :path, type: :string, description: "Intake source UUID"],
+      "X-Chg-Timestamp": [
+        in: :header,
+        type: :string,
+        required: true,
+        description: "Unix seconds at signing"
+      ],
+      "X-Chg-Signature": [
+        in: :header,
+        type: :string,
+        required: true,
+        description: "sha256=<hex HMAC-SHA256 of \"<timestamp>.<raw body>\">"
+      ]
+    ],
+    request_body:
+      {"The review to mint for", "application/json",
+       %Schema{
+         type: :object,
+         required: [:change_id, :revision],
+         properties: %{
+           change_id: %Schema{type: :string},
+           revision: %Schema{type: :integer, minimum: 1}
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Minted", "application/json",
+         %Schema{
+           type: :object,
+           required: [:dispatch_id, :api_key, :expires_at],
+           properties: %{
+             dispatch_id: %Schema{type: :string, format: :uuid},
+             api_key: %Schema{type: :string, description: "Shown once"},
+             expires_at: %Schema{type: :string, format: :"date-time"}
+           }
+         }},
+      400 => {"`invalid_request`", "application/json", Schemas.ErrorResponse},
+      401 => {"`invalid_signature`", "application/json", Schemas.ErrorResponse},
+      409 => {"`review_already_recorded`", "application/json", Schemas.ErrorResponse},
+      422 => {"`revision_not_submitted`", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"`busy`: retry after `retry-after`; or `tenant_halted`", "application/json",
+         Schemas.ErrorResponse}
+    }
+  )
+
+  @rejection_messages %{
+    "revision_not_submitted" =>
+      "No submitted event from this source has been applied for that change and revision.",
+    "review_already_recorded" =>
+      "A review dispatch for this revision has already recorded its verdict; it is not re-minted.",
+    "tenant_halted" =>
+      "The tenant's custody operations are halted; no review dispatch is minted until it clears."
+  }
+
+  @doc "POST /api/v1/change_events/:source_id/review_dispatch"
+  def review_dispatch(conn, %{"source_id" => source_id}) do
+    case conn.private[IntakeRawBody.private_key()] do
+      raw_body when is_binary(raw_body) ->
+        input = %{
+          raw_body: raw_body,
+          timestamp: header(conn, "x-chg-timestamp"),
+          signature: header(conn, "x-chg-signature")
+        }
+
+        answer_review_dispatch(conn, ReviewDispatches.request(source_id, input))
+
+      nil ->
+        Logger.error(
+          "review dispatch: no raw body captured; IntakeRawBody is not mounted ahead of parsers"
+        )
+
+        unauthorized(conn)
+    end
+  end
+
+  defp answer_review_dispatch(conn, {:ok, minted}),
+    do: conn |> put_status(201) |> json(minted)
+
+  defp answer_review_dispatch(conn, {:error, :unauthorized}), do: unauthorized(conn)
+
+  defp answer_review_dispatch(conn, {:error, {:bad_request, code}}),
+    do: error(conn, 400, code, "The signed body must be {\"change_id\": ..., \"revision\": n}.")
+
+  defp answer_review_dispatch(conn, {:error, {:rejected, status, code}}),
+    do: error(conn, status, code, Map.fetch!(@rejection_messages, code))
+
+  defp answer_review_dispatch(_conn, {:error, :busy}), do: {:error, :busy}
+
+  defp answer_review_dispatch(conn, {:error, _reason}),
+    do: error(conn, 500, "review_dispatch_failed", "The review dispatch could not be minted.")
 
   defp header(conn, name) do
     case get_req_header(conn, name) do

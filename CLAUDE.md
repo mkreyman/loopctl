@@ -169,7 +169,7 @@ in order:
    when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set, decided by
    `verify_lineage_separated/4`: an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:837-841`) blocks, and the
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:897-901`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
 5. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories and for every
@@ -267,8 +267,16 @@ verify/reject, backfill and bulk mark-complete (`refuse_chg_root_verifier/2`,
 controllers resolve it through ONE helper, `LoopctlWeb.CustodyLineage.chg_root_opts/1`. The refusal is judged before any story is read, so no other caller's
 answer changes, and it records no custody violation. What the chg gate does NOT prove: every
 chg reviewer key sits under chg's root and outside every implementer's chain, so lineage
-always passes it — loopctl proves chg-server minted the key, and chg-server is trusted to run
-the job apart from the implementer (PRD §6). A landing with no chg review for its landed
+always passes it — loopctl proves the intake SOURCE minted the key, and the fleet's chgd is
+trusted to run the job apart from the implementer (PRD §6). There is no chg-server: a review key
+is minted server-side by `POST /api/v1/change_events/:source_id/review_dispatch`
+(`Loopctl.Changes.ReviewDispatches`, US-50.3), HMAC-authenticated like a change event, as an
+`:orchestrator` child of the source's root through `Dispatches.mint_chg_reviewer/4` — the one
+path that mints under a parent without a caller lineage, so it must never be reachable from a
+key-authenticated route. **Whoever holds a source's `change_events_secret` can therefore mint
+reviewers for that source.** One live reviewer dispatch per `(source, change, revision)`; a
+re-mint revokes the earlier one only while none has recorded a verdict (`409
+review_already_recorded` after), and a custody halt refuses it (`503 tenant_halted`). A landing with no chg review for its landed
 revision (`event.sha`, the revision commit — never `data.merge_sha`) is escalated in the
 landed event's own transaction over the control-only edge `:review_missing`
 (`EventEffects.after_move/5`, `lib/loopctl/changes/event_effects.ex:493`), and that hold
@@ -621,7 +629,7 @@ no schema here sets `additionalProperties: false`. **846.6**, `PATCH /api/v1/sto
 (`router.ex:477`) had been served for months with no tool, so a session could file a story and
 not correct it. **846.7**, a tool that merged, went green and deployed and was still uncallable,
 because it ships as an npm package and MCP binds its tool list at session start. And **PR #862**,
-`Dispatches.revoke/3` (`dispatches.ex:502`) — then a context function with no route at all, so
+`Dispatches.revoke/3` (`dispatches.ex:562`) — then a context function with no route at all, so
 the one call that unsticks a parked dispatch key was reachable only from `iex`. #862 gave it
 both, which is why this entry reads in the past tense while the four above it do not.
 

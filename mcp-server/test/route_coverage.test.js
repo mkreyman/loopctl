@@ -159,6 +159,7 @@ const DECLARED = {
   "POST /api/v1/intake/github/:param": "machine", // GithubIntakeController.deliver
   "POST /api/v1/change_events/:param": "machine", // ChangeEventController.create — the fleet chg senders' event webhook (US-47.3)
   "GET /api/v1/change_events/:param/cursor": "machine", // ChangeEventController.cursor — the senders' signed cursor read (US-50.2)
+  "POST /api/v1/change_events/:param/review_dispatch": "machine", // ChangeEventController.review_dispatch — a fleet chgd's signed review-key request (US-50.3)
   "POST /api/v1/chg_ledger/:param": "machine", // ChgLedgerController.create — the senders' signed ledger batch (US-50.1)
   "GET /api/v1/openapi": "machine", // OpenApiSpex.Plug.RenderSpec — a 607 KB spec for API tooling
 

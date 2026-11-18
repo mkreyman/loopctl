@@ -23,8 +23,10 @@ defmodule Loopctl.Changes.ReviewCustody do
 
   What this does NOT prove, so nobody reads more into it: every chg reviewer key sits under
   chg's root and outside every implementer's chain, so the lineage gate always passes a chg
-  review whoever ran the job. loopctl proves chg-server minted the reviewer's key; that the job
-  ran apart from the implementer's session is chg-server's to construct (PRD §6).
+  review whoever ran the job. loopctl proves the intake source minted the reviewer's key
+  (`Loopctl.Changes.ReviewDispatches`, US-50.3), so whoever holds the source's
+  `change_events_secret` can mint reviewers for it; that the job ran apart from the
+  implementer's session is the fleet's chgd to construct (PRD §6).
 
   ## Which revision (AC-47.5.2)
 
@@ -279,7 +281,7 @@ defmodule Loopctl.Changes.ReviewCustody do
       when refusal in [:chg_root_cannot_verify, :chg_root_review_only] do
     if chg_rooted?(tenant_id, lineage) do
       Logger.warning(
-        "#{refusal}: a chg-server key attempted a custody act it may never perform " <>
+        "#{refusal}: a chg-rooted key attempted a custody act it may never perform " <>
           "tenant_id=#{tenant_id} lineage_root=#{hd(lineage)}"
       )
 
