@@ -30,7 +30,7 @@ An **intake source** binds one GitHub repository to one work project. It also re
 - Enroll it with `intake_source_enroll`, which calls `POST /api/v1/intake/sources` with a user key on a human-anchored tenant. The webhook secret is returned once, and the MCP tool writes it to a file rather than into the transcript.
 - Point the repository's webhook at the returned `webhook_url`:
   - content type `application/json`
-  - the **Issues** event only
+  - the **Issues** and **Pull requests** events (a merged pull request queues a read of its `## Review findings` section; every other pull-request action is recorded as ignored)
   - the secret from that file
 - **Name `target_epic_id`.** A source without one creates no stories: its reports wait as intake records at `pending_triage`, and they become stories on the next run after `intake_source_update` names an epic. Nothing is lost, and nothing shows up in `story_stage` meanwhile.
 - **Name `base_branch`.** Set it to `main` for a repository that uses it; the default is `master`.

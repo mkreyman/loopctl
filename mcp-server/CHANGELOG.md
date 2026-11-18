@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.14.1 — 2026-11-18
+
+### Changed
+
+- **`intake_source_enroll`** README row: the GitHub webhook takes the Issues AND Pull requests
+  events, and the one-line `gh api` command adds `-f 'events[]=pull_request'` (loopctl US-50.4
+  reads review outcomes from merged pull requests).
+
 ## 3.14.0 — 2026-11-18
 
 ### Added

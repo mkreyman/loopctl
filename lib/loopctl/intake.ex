@@ -24,8 +24,9 @@ defmodule Loopctl.Intake do
   4. **Record the delivery**, keyed by `X-GitHub-Delivery` under a unique index. A replay
      inserts nothing and changes nothing.
   5. **Apply the event.** `ping` is logged. `issues` with `opened`, `edited`, `reopened`,
-     `closed`, `labeled` or `unlabeled` updates the issue's intake record. Everything else is
-     logged as `ignored`.
+     `closed`, `labeled` or `unlabeled` updates the issue's intake record. A `pull_request`
+     `closed` with `merged: true` queues `PrReviewOutcomeWorker` (US-50.4) and is recorded as
+     `recorded`. Everything else is logged as `ignored`.
 
   Steps 4 and 5 share one transaction, so a delivery is never marked seen without its
   effect.
