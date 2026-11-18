@@ -50,6 +50,26 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert verdict.custody == :ok
     end
 
+    test "US-51.5: an effect path on a selection-proof repo is judged by the measured proof",
+         ctx do
+      stub_source(files: ["priv/rates/2026.csv"], diffstat: %{files: 1, changed_lines: 2})
+
+      # Not a selection-proof repository: the caller-proof path, as before.
+      assert {:ok, %Verdict{decision: :refuse, reasons: plain}} = evaluate(ctx)
+      assert :effect_proof_required in plain
+
+      # A selection-proof repository (case-insensitive): the story has no recorded replay.
+      assert {:ok, %Verdict{decision: :refuse, reasons: measured}} =
+               MergePrecondition.evaluate(
+                 ctx.tenant_id,
+                 ctx.story_id,
+                 opts() ++ [selection_proof_repos: [String.upcase(@repo)]]
+               )
+
+      assert {:selection_proof, :selection_replay_missing} in measured
+      refute :effect_proof_required in measured
+    end
+
     test "resolves the repository from the story's intake source, never from the caller", ctx do
       # No intake source for this project: nothing else can name the repository, so the
       # gate refuses rather than judging the change against another repository's triggers.

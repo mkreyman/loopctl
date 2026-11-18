@@ -106,11 +106,21 @@ defmodule Loopctl.Changes.FindingsTest do
       ledger!(ctx.hcb, "gate", %{
         sha: sha,
         verdict: "fail",
-        raw: %{"failures" => ["test/b_test.exs:2", "test/a_test.exs:1"]}
+        raw: %{
+          "failures" => [
+            "test/b_test.exs:2",
+            %{"id" => "test/a_test.exs:1"},
+            7,
+            "test/b_test.exs:2"
+          ]
+        }
       })
 
       assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
       assert s.fingerprint =~ ~r/\Ahome_care_billing@#{sha}:[0-9a-f]{12}\z/
+
+      # US-51.5: the failed tests by name, what a fix's replay must cover.
+      assert s.evidence["failures"] == ["test/a_test.exs:1", "test/b_test.exs:2"]
     end
 
     test "a full run, a passing gate, or a row outside the window is not a miss", ctx do

@@ -99,6 +99,48 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert {:effect_proof_caller_asserted, :pass} in verdict.reasons
     end
 
+    test "US-51.5: a MEASURED selection proof clears an effect path" do
+      verdict =
+        judge(
+          files: ["priv/rates/2026.csv"],
+          diffstat: %{files: 1, changed_lines: 2},
+          selection_proof: :pass
+        )
+
+      assert verdict.gate_b.outcome == :prove_effect
+      assert verdict.decision == :allow
+    end
+
+    test "US-51.5: a failed selection proof refuses naming each reason, caller proof or not" do
+      verdict =
+        judge(
+          files: ["priv/rates/2026.csv"],
+          diffstat: %{files: 1, changed_lines: 2},
+          selection_proof: {:fail, [{:selection_narrowed, "abc", ["t1"]}]},
+          effect_proof: %{
+            intent: {:changes, ["fixture-a"]},
+            fixture_set: ["fixture-a"],
+            fixture_results: %{"fixture-a" => :changed},
+            coverage: %{required: [], covered: []}
+          }
+        )
+
+      assert verdict.decision == :refuse
+      assert verdict.reasons == [{:selection_proof, {:selection_narrowed, "abc", ["t1"]}}]
+    end
+
+    test "US-51.5: a selection proof never clears a human path" do
+      verdict =
+        judge(
+          files: ["lib/widgets_web/router.ex"],
+          diffstat: %{files: 1, changed_lines: 3},
+          selection_proof: :pass
+        )
+
+      assert verdict.decision == :refuse
+      assert verdict.gate_b.outcome == :human
+    end
+
     test "an effect path with a FAILING proof refuses and routes to Gate A" do
       verdict =
         judge(
@@ -1007,7 +1049,8 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       recorded_allow_sha: Keyword.get(opts, :recorded_allow_sha),
       gate_a_input:
         Keyword.get(opts, :gate_a_input, {:persisted_triage, List.duplicate(trio("story"), 3)}),
-      effect_proof: Keyword.get(opts, :effect_proof)
+      effect_proof: Keyword.get(opts, :effect_proof),
+      selection_proof: Keyword.get(opts, :selection_proof, :not_applicable)
     }
   end
 

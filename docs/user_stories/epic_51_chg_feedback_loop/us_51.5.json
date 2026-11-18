@@ -20,7 +20,7 @@
     },
     {
       "id": "AC-51.5.2",
-      "description": "A selection proof is loopctl's measurement: for the story's head sha, chg_ledger_rows of kind chg and source replay whose raw names the verifier dispatch id bound to the story (verifier_dispatch_id), never the implementer's. It passes when (a) the replay of the finding's miss sha selects every test the gate failed there, and (b) for every commit in the replay corpus the head selects a superset of what the base selected."
+      "description": "A selection proof is the selection_replay the story's verifier recorded with its verify@1 pass verdict, on the dispatch ledger row of the story's verifier_dispatch_id, for the stage row's current head (Loopctl.Changes.SelectionProof). Not chg ledger rows: those are signed with a source secret every fleet machine holds, so an implementer could write one naming any dispatch id; the verifier's key never leaves loopctl. It passes when (a) for a story from a selection_miss finding, the replay at the finding's commit covers every test the gate failed there, as loopctl recorded them on the finding, and (b) a corpus of at least SelectionProof.min_corpus/0 commits drops no test its base selected."
     },
     {
       "id": "AC-51.5.3",
@@ -36,38 +36,65 @@
       "id": "TC-51.5.1",
       "name": "widening proof merges",
       "type": "integration",
-      "preconditions": ["a chg story touching cover.rs", "verifier replay rows that select the missed test and a superset everywhere"],
-      "steps": ["merge precondition"],
-      "expected_results": ["allow"]
+      "preconditions": [
+        "a chg story touching cover.rs",
+        "verifier replay rows that select the missed test and a superset everywhere"
+      ],
+      "steps": [
+        "merge precondition"
+      ],
+      "expected_results": [
+        "allow"
+      ]
     },
     {
       "id": "TC-51.5.2",
       "name": "narrowing refuses",
       "type": "integration",
-      "preconditions": ["one corpus commit selects fewer tests on the head"],
-      "steps": ["merge precondition"],
-      "expected_results": ["refuse naming that commit"]
+      "preconditions": [
+        "one corpus commit selects fewer tests on the head"
+      ],
+      "steps": [
+        "merge precondition"
+      ],
+      "expected_results": [
+        "refuse naming that commit"
+      ]
     },
     {
       "id": "TC-51.5.3",
       "name": "implementer rows do not count",
       "type": "integration",
-      "preconditions": ["replay rows naming the implementer dispatch"],
-      "steps": ["merge precondition"],
-      "expected_results": ["refuse: no verifier replay"]
+      "preconditions": [
+        "replay rows naming the implementer dispatch"
+      ],
+      "steps": [
+        "merge precondition"
+      ],
+      "expected_results": [
+        "refuse: no verifier replay"
+      ]
     },
     {
       "id": "TC-51.5.4",
       "name": "human path still escalates",
       "type": "integration",
-      "preconditions": ["a change to cli/src/revert.rs with a passing proof"],
-      "steps": ["merge precondition"],
-      "expected_results": ["refuse, human"]
+      "preconditions": [
+        "a change to cli/src/revert.rs with a passing proof"
+      ],
+      "steps": [
+        "merge precondition"
+      ],
+      "expected_results": [
+        "refuse, human"
+      ]
     }
   ],
   "technical_notes": [
-    "chg side: a replay command that writes kind chg, source replay rows carrying the dispatch id of the run that made them, sent through the outbox. Handed off on the chg channel.",
+    "Runner and chg side: the verify@1 template runs chg's replay of the head against the base over a commit corpus (and the finding's miss commit) and reports it as the optional selection_replay field of its agent_result. Handed off on the loopctl-runner and chg channels.",
     "Mark said on 2026-11-18 to let chg's own fixes merge without him, because chg should keep improving its own practices. This narrows the KB 4a86157b floor for selection code only; update that article when this ships."
   ],
-  "dependencies": ["US-51.1"]
+  "dependencies": [
+    "US-51.1"
+  ]
 }

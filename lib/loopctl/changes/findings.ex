@@ -315,7 +315,10 @@ defmodule Loopctl.Changes.Findings do
           "sha" => r.sha,
           "host" => r.host,
           "chg_row" => scalars(r.raw),
-          "gate_row" => scalars(gate_raw)
+          "gate_row" => scalars(gate_raw),
+          # The tests the gate failed, by name: what a fix's replay must select at this sha
+          # (US-51.5, `Loopctl.Changes.SelectionProof`).
+          "failures" => failure_names(gate_raw)
         }
       }
     end)
@@ -448,6 +451,29 @@ defmodule Loopctl.Changes.Findings do
   end
 
   defp failures_digest(_raw), do: ""
+
+  @max_failure_names 50
+
+  @doc "The most failed-test names a selection_miss finding keeps in its evidence."
+  @spec max_failure_names() :: pos_integer()
+  def max_failure_names, do: @max_failure_names
+
+  # A failure is a name ("test/a_test.exs:12") or an object with an `id`; anything else names
+  # no test. Sorted and unique, so a finding's list does not depend on the gate's order.
+  defp failure_names(%{"failures" => failures}) when is_list(failures) do
+    failures
+    |> Enum.flat_map(fn
+      name when is_binary(name) and name != "" -> [name]
+      %{"id" => id} when is_binary(id) and id != "" -> [id]
+      _other -> []
+    end)
+    |> Enum.map(&bounded(&1, @evidence_value_chars))
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.take(@max_failure_names)
+  end
+
+  defp failure_names(_raw), do: []
 
   # A ledger row's scalar fields, bounded: what a row may say in an issue.
   defp scalars(raw) when is_map(raw) do

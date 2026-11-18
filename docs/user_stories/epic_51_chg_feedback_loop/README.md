@@ -52,10 +52,11 @@ tests makes a miss disappear by hiding it. Mark overruled the human step for chg
 
 - chg's SELECTION code becomes an `effect_paths` trigger, so a change to it is `:prove_effect`,
   not `:human`.
-- The proof is loopctl's own ledger, written by the independent verifier (verify@1, its own
-  custody root), never by the implementing session: replayed on the fix's head, the miss commit
-  must now select the missed test, and every commit in the replay corpus must select a superset
-  of what the base selected. Selection may only WIDEN.
+- The proof is the replay the independent verifier (verify@1, its own custody root) records
+  with its verdict, on the verifier dispatch's own ledger row, never anything the implementing
+  session can write: not chg ledger rows, which every fleet machine can sign. Replayed on the
+  fix's head, the miss commit must now select the missed tests, and every commit in the replay
+  corpus must select a superset of what the base selected. Selection may only WIDEN.
 - The merge precondition accepts that proof because loopctl measured it, the case its
   `:effect_proof_caller_asserted` clause was left open for.
 - The rest of the floor (verify, revert, landing, CI workflows) stays `human_paths`. No sweep
