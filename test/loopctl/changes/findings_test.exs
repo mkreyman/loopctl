@@ -1,0 +1,355 @@
+defmodule Loopctl.Changes.FindingsTest do
+  @moduledoc """
+  US-51.1: the chg feedback loop's nightly sweep (`Loopctl.Changes.Findings`), its filer
+  (`Loopctl.Changes.FindingFiler`) and its drainer (`Loopctl.Workers.ChgFindingActionWorker`),
+  against the mocked forge.
+  """
+
+  use Loopctl.DataCase, async: true
+
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Changes.Cursor
+  alias Loopctl.Changes.Finding
+  alias Loopctl.Changes.FindingAction
+  alias Loopctl.Changes.FindingFiler
+  alias Loopctl.Changes.Findings
+  alias Loopctl.Changes.LedgerRow
+  alias Loopctl.Delivery.ForgeRepo
+  alias Loopctl.Intake.Source
+  alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.ChgFindingActionWorker
+
+  setup :verify_on_exit!
+
+  @now ~U[2026-11-19 04:10:00.000000Z]
+  @chg_repo "mkreyman/chg"
+  @sha String.duplicate("a", 40)
+
+  setup do
+    %{source: hcb} = fixture(:chg_source, %{repo_full_name: "mkreyman/home_care_billing"})
+    tenant_id = hcb.tenant_id
+    %{source: chg} = fixture(:chg_source, %{tenant_id: tenant_id, repo_full_name: @chg_repo})
+    %{tenant_id: tenant_id, hcb: hcb, chg: chg}
+  end
+
+  defp opts(extra \\ []), do: Keyword.merge([chg_repo: @chg_repo, daily_cap: 5], extra)
+
+  defp ledger!(source, kind, attrs) do
+    raw = Map.merge(%{"v" => 1, "kind" => kind}, Map.get(attrs, :raw, %{}))
+
+    AdminRepo.insert!(%LedgerRow{
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      repo: Map.get(attrs, :repo, "home_care_billing"),
+      host: "minis",
+      kind: kind,
+      sha: Map.get(attrs, :sha),
+      verdict: Map.get(attrs, :verdict),
+      at: Map.get(attrs, :at, DateTime.add(@now, -3600, :second)),
+      raw: raw,
+      row_hash: Ecto.UUID.generate()
+    })
+  end
+
+  defp selection_miss!(source, attrs \\ %{}) do
+    sha = Map.get(attrs, :sha, @sha)
+    at = Map.get(attrs, :at, DateTime.add(@now, -3600, :second))
+    mode = Map.get(attrs, :mode, "affected")
+
+    ledger!(source, "chg", %{sha: sha, verdict: "pass", at: at, raw: %{"mode" => mode}})
+    ledger!(source, "gate", %{sha: sha, verdict: Map.get(attrs, :gate, "fail"), at: at})
+  end
+
+  defp flaky!(source, test, attrs \\ %{}) do
+    ledger!(source, "flaky", %{
+      at: Map.get(attrs, :at, DateTime.add(@now, -3600, :second)),
+      raw: Map.merge(%{"test" => test}, Map.get(attrs, :raw, %{}))
+    })
+  end
+
+  defp cursor!(source, attention_at) do
+    AdminRepo.insert!(%Cursor{
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      repo: "home_care_billing",
+      change_id: "01J" <> Integer.to_string(System.unique_integer([:positive])),
+      applied_seq: 3,
+      last_event_at: attention_at,
+      attention: "gap",
+      attention_at: attention_at
+    })
+  end
+
+  defp findings(tenant_id), do: Findings.list(tenant_id)
+
+  defp actions(tenant_id) do
+    AdminRepo.all(from a in FindingAction, where: a.tenant_id == ^tenant_id)
+  end
+
+  describe "derive/3" do
+    test "a selecting chg pass whose gate failed is a selection miss filed on chg", ctx do
+      selection_miss!(ctx.hcb)
+
+      assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
+      assert s.kind == "selection_miss"
+      assert s.repo_full_name == @chg_repo
+      assert s.fingerprint == "home_care_billing@#{@sha}"
+      assert s.evidence["gate_row"]["kind"] == "gate"
+    end
+
+    test "the gate's failures are part of a miss's fingerprint", ctx do
+      sha = String.duplicate("d", 40)
+      ledger!(ctx.hcb, "chg", %{sha: sha, verdict: "pass", raw: %{"mode" => "affected"}})
+
+      ledger!(ctx.hcb, "gate", %{
+        sha: sha,
+        verdict: "fail",
+        raw: %{"failures" => ["test/b_test.exs:2", "test/a_test.exs:1"]}
+      })
+
+      assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
+      assert s.fingerprint =~ ~r/\Ahome_care_billing@#{sha}:[0-9a-f]{12}\z/
+    end
+
+    test "a full run, a passing gate, or a row outside the window is not a miss", ctx do
+      selection_miss!(ctx.hcb, %{mode: "all"})
+      selection_miss!(ctx.hcb, %{sha: String.duplicate("b", 40), gate: "pass"})
+
+      selection_miss!(ctx.hcb, %{
+        sha: String.duplicate("c", 40),
+        at: DateTime.add(@now, -Findings.window_hours() * 3600 - 60, :second)
+      })
+
+      assert Findings.derive(ctx.tenant_id, @now, opts()) == []
+    end
+
+    test "an unquarantined flaky test is a finding on its source's repository", ctx do
+      flaky!(ctx.hcb, "test/a_test.exs:12")
+      flaky!(ctx.hcb, "test/b_test.exs:3", %{raw: %{"quarantine" => "#99"}})
+
+      assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
+      assert s.kind == "flaky_test"
+      assert s.repo_full_name == "mkreyman/home_care_billing"
+      assert s.fingerprint == "home_care_billing:test/a_test.exs:12"
+    end
+
+    test "a cursor flagged for longer than the threshold is a stuck change", ctx do
+      old = DateTime.add(@now, -(Findings.stuck_after_hours() + 1) * 3600, :second)
+      cursor!(ctx.hcb, old)
+      cursor!(ctx.hcb, DateTime.add(@now, -600, :second))
+
+      assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
+      assert s.kind == "stuck_change"
+      assert s.evidence["attention"] == "gap"
+    end
+
+    test "a row of a revoked source is skipped: nowhere to file", ctx do
+      flaky!(ctx.hcb, "test/a_test.exs:12")
+      AdminRepo.update_all(from(s in Source, where: s.id == ^ctx.hcb.id), set: [revoked_at: @now])
+
+      assert Findings.derive(ctx.tenant_id, @now, opts()) == []
+    end
+
+    test "evidence carries only bounded scalar fields of the row", ctx do
+      ledger!(ctx.hcb, "flaky", %{
+        raw: %{"test" => "t", "nested" => %{"x" => 1}, "long" => String.duplicate("z", 500)}
+      })
+
+      assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
+      refute Map.has_key?(s.evidence["row"], "nested")
+      assert String.length(s.evidence["row"]["long"]) == 200
+    end
+  end
+
+  describe "record_sightings/3" do
+    test "a rerun over the same rows counts nothing twice; a newer row adds", ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts(daily_cap: 0))
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts(daily_cap: 0))
+
+      assert [%Finding{occurrences: 1}] = findings(ctx.tenant_id)
+
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(@now, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts(daily_cap: 0))
+
+      assert [%Finding{occurrences: 2, state: :queued}] = findings(ctx.tenant_id)
+    end
+  end
+
+  describe "plan_filing/3" do
+    test "files one open action per finding, once", ctx do
+      flaky!(ctx.hcb, "t1")
+      assert %{filed: 1} = Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      assert %{filed: 0} = Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      assert [%Finding{state: :filed, filed_at: %DateTime{}} = f] = findings(ctx.tenant_id)
+      assert [%FindingAction{action: :open, status: :pending} = a] = actions(ctx.tenant_id)
+      assert a.finding_id == f.id
+      assert a.repo_full_name == "mkreyman/home_care_billing"
+      assert a.title =~ Findings.title_token(a.id)
+      assert a.body =~ Findings.marker(a.id)
+      assert a.body =~ "UNTRUSTED DATA field=chg_finding_evidence"
+    end
+
+    test "caps new issues per repository per day, most-seen first", ctx do
+      flaky!(ctx.hcb, "t1")
+      flaky!(ctx.hcb, "t2")
+      flaky!(ctx.hcb, "t2", %{at: DateTime.add(@now, -120, :second)})
+      flaky!(ctx.hcb, "t3")
+
+      assert %{filed: 1} = Findings.sweep_tenant(ctx.tenant_id, @now, opts(daily_cap: 1))
+
+      filed = Enum.filter(findings(ctx.tenant_id), &(&1.state == :filed))
+      assert [%Finding{fingerprint: "home_care_billing:t2"}] = filed
+
+      # The same day: the cap is spent. The next day: one more.
+      assert %{filed: 0} = Findings.sweep_tenant(ctx.tenant_id, @now, opts(daily_cap: 1))
+      tomorrow = DateTime.add(@now, 86_400, :second)
+
+      assert Findings.plan_filing(ctx.tenant_id, tomorrow, opts(daily_cap: 1)) == 1
+    end
+
+    test "a finding whose repository has no live source stays queued", ctx do
+      selection_miss!(ctx.hcb)
+      AdminRepo.update_all(from(s in Source, where: s.id == ^ctx.chg.id), set: [revoked_at: @now])
+
+      assert %{filed: 0} = Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      assert [%Finding{state: :queued, kind: "selection_miss"}] = findings(ctx.tenant_id)
+      assert actions(ctx.tenant_id) == []
+    end
+  end
+
+  describe "loop depth" do
+    test "a sighting on the merge of a loop-made story escalates at the max depth", ctx do
+      # An earlier finding at depth 1 whose issue the loop made a story from, merged as @sha.
+      record =
+        fixture(:intake_record, %{
+          tenant_id: ctx.tenant_id,
+          repo: AdminRepo,
+          repo_full_name: @chg_repo,
+          issue_number: 41
+        })
+
+      story = fixture(:story, %{tenant_id: ctx.tenant_id})
+
+      AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+        set: [intake_record_id: record.id]
+      )
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: story.id,
+        repo: AdminRepo,
+        merge_sha: @sha
+      })
+
+      AdminRepo.insert!(%Finding{
+        tenant_id: ctx.tenant_id,
+        kind: "selection_miss",
+        fingerprint: "earlier",
+        repo_full_name: @chg_repo,
+        state: :fixed,
+        first_seen_at: @now,
+        last_seen_at: @now,
+        loop_depth: Findings.max_loop_depth() - 1,
+        issue_number: 41
+      })
+
+      selection_miss!(ctx.hcb)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      new =
+        Findings.get_by_fingerprint(ctx.tenant_id, "selection_miss", "home_care_billing@#{@sha}")
+
+      assert %Finding{state: :escalated, loop_depth: depth} = new
+      assert depth == Findings.max_loop_depth()
+      assert new.escalated_reason == "loop_depth_#{depth}"
+      assert actions(ctx.tenant_id) == []
+    end
+  end
+
+  describe "FindingFiler.perform/1" do
+    setup ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      [action] = actions(ctx.tenant_id)
+      stub(Loopctl.MockPullRequestSource, :label_issue, fn _r, _n, "chg-loop" -> :ok end)
+      %{action: action}
+    end
+
+    test "the first attempt creates, labels and records the issue", ctx do
+      expect(Loopctl.MockPullRequestSource, :find_issue, 0, fn _r, _s -> {:ok, nil} end)
+
+      expect(Loopctl.MockPullRequestSource, :create_issue, fn %ForgeRepo{}, title, _body ->
+        assert title == ctx.action.title
+        {:ok, 314}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :label_issue, fn _r, 314, "chg-loop" -> :ok end)
+
+      assert {:done, nil} = FindingFiler.perform(ctx.action)
+      assert [%FindingAction{status: :done, issue_number: 314}] = actions(ctx.tenant_id)
+      assert [%Finding{issue_number: 314, state: :filed}] = findings(ctx.tenant_id)
+    end
+
+    test "a retry finds the issue an earlier attempt opened instead of opening another", ctx do
+      expect(Loopctl.MockPullRequestSource, :create_issue, fn _r, _t, _b ->
+        {:error, {:github_api_error, 502}}
+      end)
+
+      assert {:deferred, _} = FindingFiler.perform(ctx.action)
+
+      AdminRepo.update_all(from(a in FindingAction, where: a.id == ^ctx.action.id),
+        set: [next_attempt_at: nil]
+      )
+
+      search = Findings.issue_search(ctx.action)
+      expect(Loopctl.MockPullRequestSource, :find_issue, fn _r, ^search -> {:ok, 77} end)
+      expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
+
+      [pending] = actions(ctx.tenant_id)
+      assert {:done, nil} = FindingFiler.perform(pending)
+      assert [%Finding{issue_number: 77}] = findings(ctx.tenant_id)
+    end
+
+    test "a revoked source abandons without a forge call", ctx do
+      AdminRepo.update_all(from(s in Source, where: s.id == ^ctx.hcb.id), set: [revoked_at: @now])
+      expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
+
+      assert {:abandoned, _} = FindingFiler.perform(ctx.action)
+
+      assert [%FindingAction{status: :abandoned, abandoned_reason: "source_revoked"}] =
+               actions(ctx.tenant_id)
+    end
+
+    test "two drainers act once: the second finds the row claimed", ctx do
+      expect(Loopctl.MockPullRequestSource, :create_issue, 1, fn _r, _t, _b -> {:ok, 5} end)
+
+      assert {:done, nil} = FindingFiler.perform(ctx.action)
+      assert {:skipped, nil} = FindingFiler.perform(ctx.action)
+    end
+
+    test "the drainer performs a due action", ctx do
+      expect(Loopctl.MockPullRequestSource, :create_issue, fn _r, _t, _b -> {:ok, 9} end)
+
+      deadline = System.monotonic_time(:millisecond) + 60_000
+      assert [{_row, :done}] = ChgFindingActionWorker.sweep([ctx.action], deadline)
+    end
+  end
+
+  describe "tenant isolation" do
+    test "one tenant's ledger never becomes another tenant's finding", ctx do
+      %{source: other} = fixture(:chg_source, %{repo_full_name: "mkreyman/home_care_billing"})
+      flaky!(other, "t-other")
+
+      assert Findings.derive(ctx.tenant_id, @now, opts()) == []
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      assert findings(ctx.tenant_id) == []
+
+      assert [%Finding{}] =
+               Findings.sweep_tenant(other.tenant_id, @now, opts()) && findings(other.tenant_id)
+    end
+  end
+end

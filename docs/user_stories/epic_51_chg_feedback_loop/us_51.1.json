@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-51.1.1",
-      "description": "A nightly Oban cron (FindingSweepWorker) reads each tenant's ledger and review outcomes since its last run and derives findings of four kinds: selection_miss (a chg row that passed on a sha whose gate row failed; fingerprint repo + sha + the gate's failures), flaky_test (a flaky row with no quarantine; fingerprint repo + test), missing_review (a merged PR with no counted review round; fingerprint repo + PR number), stuck_change (a cursor flagged gap or stale for more than 24 hours; fingerprint source + change_id)."
+      "description": "A nightly Oban cron (ChgFindingSweepWorker) reads each tenant's ledger and review outcomes over a trailing 48-hour window (a rerun counts no row twice) and derives findings of four kinds: selection_miss (a chg row that passed on a sha whose gate row failed; fingerprint repo + sha + the gate's failures), flaky_test (a flaky row with no quarantine; fingerprint repo + test), missing_review (a merged PR with no counted review round; fingerprint repo + PR number), stuck_change (a cursor flagged gap or stale for more than 24 hours; fingerprint source + change_id)."
     },
     {
       "id": "AC-51.1.2",
@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-51.1.6",
-      "description": "Filing is idempotent across a crash: the finding row is written state filing before the GitHub call with an idempotency marker in the issue body; a run that finds a filing row searches the repository for that marker before filing again."
+      "description": "Filing is idempotent across a crash: deciding to file moves the finding queued -> filed and inserts one open action in a chg_finding_actions outbox row in ONE transaction (unique on finding, action and generation); the drainer (ChgFindingActionWorker) writes an idempotency marker into the issue body and, on any attempt after the first, searches the repository for that marker before creating again."
     }
   ],
   "test_cases": [
