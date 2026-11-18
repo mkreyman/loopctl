@@ -36,31 +36,8 @@ defmodule Loopctl.MixProject do
       # declined fix from arriving silently.
       hex: [
         ignore_advisories: [
-          # cowlib 2.21.0 (2026-10-08) fixed CVE-2026-43969 (cow_cookie:cookie/1
-          # client-side encoder; nothing in the release calls it — no gun, no
-          # cowlib-based HTTP client), so that ignore is gone with the bump.
-          # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting in
-          # cow_http_struct_hd:escape_string/2 — still no patched release: OSV shows
-          # it introduced at 2.9.0 with no `fixed` event, and 2.21.0 is the newest
-          # cowlib on hex. cowlib is compiled in as a hard transitive of
-          # telemetry_metrics_prometheus (via plug_cowboy and cowboy), but the ONLY
-          # Cowboy listener is that reporter on the internal :9568 metrics port
-          # (prod-only, Fly private 6PN); the public API serves on Bandit
-          # (config/config.exs, Bandit.PhoenixAdapter). The metrics endpoint emits no
-          # structured headers built from untrusted input. Recheck when cowlib > 2.21.0.
-          "CVE-2026-43966",
-          # Two more against the same metrics-only Cowboy stack (2026-11-06), neither with
-          # a patched release on hex: OSV records each fix only as a git commit.
-          # CVE-2026-115701 (HIGH): cowboy HTTP/1.1 buffers pipelined data without bound,
-          # introduced 2.18.0, still flagged at 2.20.0, the newest on hex.
-          # CVE-2026-113431 (HIGH): cowlib's cow_http2_machine does not bound a decoded
-          # header list (HPACK amplification), introduced 2.7.0; 2.21.0 is the newest.
-          # Both are memory exhaustion by a client of a Cowboy listener, and the only one is
-          # the :9568 metrics reporter, reachable only by Fly's scraper on private 6PN
-          # (fly.toml [metrics]; it is not in http_service). The public API is Bandit.
-          # Recheck when cowboy > 2.20.0 or cowlib > 2.21.0.
-          "CVE-2026-115701",
-          "CVE-2026-113431",
+          # No cowboy or cowlib ignores remain: cowboy 2.21.0 and cowlib 2.22.0
+          # (2026-11-09) fix CVE-2026-115701, CVE-2026-113431 and CVE-2026-43966.
           # No mint ignores remain: 1.10.2 (2026-09-29) backported the fixes for all
           # three advisories 1.11.0 carried (CVE-2026-91043 HIGH, CVE-2026-92103,
           # CVE-2026-94194), so the pin below 1.11.0 in deps/0 costs no security.
