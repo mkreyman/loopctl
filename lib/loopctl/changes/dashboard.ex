@@ -43,6 +43,7 @@ defmodule Loopctl.Changes.Dashboard do
 
   alias Loopctl.Changes.Cursor
   alias Loopctl.Changes.Events
+  alias Loopctl.Changes.Finding
   alias Loopctl.Changes.LedgerRow
   alias Loopctl.Changes.PrReviewOutcomes
   alias Loopctl.HeavyRead
@@ -114,8 +115,73 @@ defmodule Loopctl.Changes.Dashboard do
       flaky: flaky(tenant_id, filters),
       runner_samples: runner_samples(tenant_id, filters),
       review_outcomes: review_outcomes(tenant_id, filters),
-      attention: attention(tenant_id, filters)
+      attention: attention(tenant_id, filters),
+      findings: findings(tenant_id, filters)
     }
+  end
+
+  @doc """
+  The chg feedback loop's findings (US-51.6): counts per state and per kind, and the escalated
+  ones, newest first, at most `list_limit/0`. Current state, so `since`/`until` and `host` do
+  not apply; `repo` does, on the repository a finding is filed on.
+  """
+  @spec findings(Ecto.UUID.t(), map()) :: panel(map())
+  def findings(tenant_id, filters) do
+    base =
+      case Map.get(filters, :repo) do
+        nil ->
+          from(f in Finding, where: f.tenant_id == ^tenant_id)
+
+        repo ->
+          from(f in Finding,
+            where:
+              f.tenant_id == ^tenant_id and
+                fragment("lower(?)", f.repo_full_name) == ^String.downcase(repo)
+          )
+      end
+
+    counts =
+      read(
+        tenant_id,
+        from(f in base, group_by: [f.state, f.kind], select: {f.state, f.kind, count(f.id)})
+      )
+
+    escalated =
+      read(
+        tenant_id,
+        from(f in base,
+          where: f.state == :escalated,
+          order_by: [desc: f.escalated_at, asc: f.id],
+          limit: @list_limit,
+          select: %{
+            id: f.id,
+            kind: f.kind,
+            repo: f.repo_full_name,
+            issue_number: f.issue_number,
+            reason: f.escalated_reason,
+            escalated_at: f.escalated_at,
+            occurrences: f.occurrences,
+            fix_attempts: f.fix_attempts
+          }
+        )
+      )
+
+    if :unavailable in [counts, escalated] do
+      :unavailable
+    else
+      %{
+        by_state: tally(counts, fn {state, _kind, n} -> {to_string(state), n} end),
+        by_kind: tally(counts, fn {_state, kind, n} -> {kind, n} end),
+        escalated: escalated
+      }
+    end
+  end
+
+  defp tally(rows, key_count) do
+    Enum.reduce(rows, %{}, fn row, acc ->
+      {key, n} = key_count.(row)
+      Map.update(acc, key, n, &(&1 + n))
+    end)
   end
 
   @typedoc "A panel's data, or `:unavailable` when its read was shed."

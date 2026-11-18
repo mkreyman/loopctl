@@ -551,6 +551,100 @@ defmodule Loopctl.Changes.FindingsTest do
     end
   end
 
+  describe "list/2 and clear/3 (US-51.6)" do
+    defp escalate!(id, issue) do
+      AdminRepo.update_all(from(f in Finding, where: f.id == ^id),
+        set: [
+          state: :escalated,
+          escalated_at: @now,
+          escalated_reason: "fix_attempts_2",
+          fix_attempts: 2,
+          issue_number: issue
+        ]
+      )
+    end
+
+    test "filters by state, kind and repo, newest first, capped", ctx do
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(@now, -7200, :second)})
+      flaky!(ctx.hcb, "t2")
+      selection_miss!(ctx.hcb)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      assert [first, _, _] = Findings.list(ctx.tenant_id)
+      assert first.last_seen_at == DateTime.add(@now, -3600, :second)
+
+      assert [%Finding{kind: "selection_miss"}] =
+               Findings.list(ctx.tenant_id, kind: "selection_miss")
+
+      assert [_, _] = Findings.list(ctx.tenant_id, repo: "MKREYMAN/Home_Care_Billing")
+      assert [] = Findings.list(ctx.tenant_id, state: :escalated)
+      assert [_] = Findings.list(ctx.tenant_id, limit: 1)
+      assert [_, _, _] = Findings.list(ctx.tenant_id, limit: Findings.list_cap() + 50)
+    end
+
+    test "clear sends an escalated finding back to queued, audited", ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      [finding] = findings(ctx.tenant_id)
+      escalate!(finding.id, 60)
+
+      actor = %{api_key_id: nil, label: "user:test"}
+      assert {:ok, cleared} = Findings.clear(ctx.tenant_id, finding.id, actor)
+
+      assert %Finding{
+               state: :queued,
+               fix_attempts: 0,
+               cycle: 1,
+               issue_number: nil,
+               escalated_reason: nil,
+               escalated_at: nil
+             } = cleared
+
+      assert AdminRepo.exists?(
+               from l in Loopctl.Audit.AuditLog,
+                 where:
+                   l.tenant_id == ^ctx.tenant_id and l.entity_id == ^finding.id and
+                     l.action == "chg_finding_cleared"
+             )
+    end
+
+    test "a cleared finding is filed afresh: its new open is not the old one", ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      [finding] = findings(ctx.tenant_id)
+      escalate!(finding.id, 61)
+
+      {:ok, _} = Findings.clear(ctx.tenant_id, finding.id, %{})
+      Findings.sweep_tenant(ctx.tenant_id, DateTime.add(@now, 60, :second), opts())
+
+      opens =
+        ctx.tenant_id
+        |> actions()
+        |> Enum.filter(&(&1.action == :open))
+        |> Enum.sort_by(& &1.cycle)
+
+      assert [%FindingAction{cycle: 0, generation: 0}, %FindingAction{cycle: 1, generation: 0}] =
+               opens
+
+      assert %Finding{state: :filed, cycle: 1} = AdminRepo.get(Finding, finding.id)
+    end
+
+    test "clear refuses a finding that is not escalated, or not the tenant's", ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      [finding] = findings(ctx.tenant_id)
+
+      assert {:error, :not_escalated} = Findings.clear(ctx.tenant_id, finding.id, %{})
+      assert {:error, :not_found} = Findings.clear(ctx.tenant_id, Ecto.UUID.generate(), %{})
+      assert {:error, :not_found} = Findings.clear(ctx.tenant_id, "nope", %{})
+
+      escalate!(finding.id, 62)
+      %{source: other} = fixture(:chg_source, %{repo_full_name: @chg_repo})
+      assert {:error, :not_found} = Findings.clear(other.tenant_id, finding.id, %{})
+      assert Findings.list(other.tenant_id) == []
+    end
+  end
+
   describe "tenant isolation" do
     test "one tenant's ledger never becomes another tenant's finding", ctx do
       %{source: other} = fixture(:chg_source, %{repo_full_name: "mkreyman/home_care_billing"})

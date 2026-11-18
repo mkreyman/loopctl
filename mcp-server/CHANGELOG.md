@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.15.0 — 2026-11-18
+
+### Added
+
+- **`chg_findings`** (loopctl US-51.6): the chg feedback loop's findings, filtered by
+  `state`, `kind`, `repo`, `limit`. Any tenant key.
+- **`chg_finding_clear`** (loopctl US-51.6): sends an escalated finding back to `queued` so
+  the loop files a fresh issue. Needs `LOOPCTL_USER_KEY` on a human-anchored tenant.
+
+### Changed
+
+- **`chg_ledger_summary`** returns a `findings` panel: counts per state and kind, and the
+  escalated findings.
+
 ## 3.14.1 — 2026-11-18
 
 ### Changed

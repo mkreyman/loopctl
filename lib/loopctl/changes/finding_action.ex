@@ -30,6 +30,7 @@ defmodule Loopctl.Changes.FindingAction do
 
     field :action, Ecto.Enum, values: @actions
     field :generation, :integer
+    field :cycle, :integer, default: 0
 
     field :repo_full_name, :string
     field :title, :string

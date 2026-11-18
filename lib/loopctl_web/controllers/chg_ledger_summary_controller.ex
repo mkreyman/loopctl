@@ -130,6 +130,13 @@ defmodule LoopctlWeb.ChgLedgerSummaryController do
                    description:
                      "Changes flagged gap or stale and still flagged. Current state: `since` " <>
                        "and `until` do not apply. " <> @panel_description
+                 },
+                 findings: %OpenApiSpex.Schema{
+                   description:
+                     "The feedback loop's findings (US-51.6): `by_state` and `by_kind` " <>
+                       "counts and the `escalated` ones, newest first. Current state: " <>
+                       "`since`, `until` and `host` do not apply; `repo` does. " <>
+                       @panel_description
                  }
                }
              }

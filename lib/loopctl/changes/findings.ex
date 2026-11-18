@@ -52,6 +52,7 @@ defmodule Loopctl.Changes.Findings do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.Changes.Cursor
   alias Loopctl.Changes.Events
   alias Loopctl.Changes.Finding
@@ -674,6 +675,7 @@ defmodule Loopctl.Changes.Findings do
               source_id: source.id,
               action: action,
               generation: generation,
+              cycle: finding.cycle,
               repo_full_name: source.repo_full_name,
               body: text,
               issue_number: finding.issue_number,
@@ -684,7 +686,7 @@ defmodule Loopctl.Changes.Findings do
             }
           ],
           on_conflict: :nothing,
-          conflict_target: [:finding_id, :action, :generation]
+          conflict_target: [:finding_id, :cycle, :action, :generation]
         )
     end
   end
@@ -833,6 +835,7 @@ defmodule Loopctl.Changes.Findings do
               source_id: action.source_id,
               action: :open,
               generation: action.generation,
+              cycle: action.cycle,
               repo_full_name: action.repo_full_name,
               title: title(finding, action_id),
               body: body(finding, action_id),
@@ -843,7 +846,7 @@ defmodule Loopctl.Changes.Findings do
             }
           ],
           on_conflict: :nothing,
-          conflict_target: [:finding_id, :action, :generation]
+          conflict_target: [:finding_id, :cycle, :action, :generation]
         )
 
         abandoned
@@ -962,6 +965,7 @@ defmodule Loopctl.Changes.Findings do
       source_id: source.id,
       action: :open,
       generation: finding.fix_attempts,
+      cycle: finding.cycle,
       repo_full_name: source.repo_full_name,
       title: title(finding, action_id),
       body: body(finding, action_id),
@@ -984,7 +988,7 @@ defmodule Loopctl.Changes.Findings do
     end)
     |> Multi.insert_all(:action, FindingAction, [action],
       on_conflict: :nothing,
-      conflict_target: [:finding_id, :action, :generation]
+      conflict_target: [:finding_id, :cycle, :action, :generation]
     )
     |> AdminRepo.transaction()
     |> case do
@@ -1250,13 +1254,108 @@ defmodule Loopctl.Changes.Findings do
     )
   end
 
-  @doc "One tenant's findings, newest sighting first."
-  @spec list(Ecto.UUID.t()) :: [Finding.t()]
-  def list(tenant_id) do
-    AdminRepo.all(
-      from f in Finding,
-        where: f.tenant_id == ^tenant_id,
-        order_by: [desc: f.last_seen_at, asc: f.id]
+  @list_cap 200
+  @list_default 50
+
+  @doc "The most findings `list/2` returns in one call."
+  @spec list_cap() :: pos_integer()
+  def list_cap, do: @list_cap
+
+  @doc """
+  One tenant's findings, newest sighting first (US-51.6). Options, each optional: `:state`
+  (a `Finding` state atom), `:kind`, `:repo` (any case) and `:limit` (default
+  #{@list_default}, at most `list_cap/0`).
+  """
+  @spec list(Ecto.UUID.t(), keyword()) :: [Finding.t()]
+  def list(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, @list_default) |> max(1) |> min(@list_cap)
+
+    from(f in Finding,
+      where: f.tenant_id == ^tenant_id,
+      order_by: [desc: f.last_seen_at, asc: f.id],
+      limit: ^limit
     )
+    |> filter(:state, Keyword.get(opts, :state))
+    |> filter(:kind, Keyword.get(opts, :kind))
+    |> filter(:repo, Keyword.get(opts, :repo))
+    |> AdminRepo.all()
+  end
+
+  defp filter(query, _key, nil), do: query
+  defp filter(query, :state, state), do: where(query, [f], f.state == ^state)
+  defp filter(query, :kind, kind), do: where(query, [f], f.kind == ^kind)
+
+  defp filter(query, :repo, repo),
+    do: where(query, [f], fragment("lower(?)", f.repo_full_name) == ^String.downcase(repo))
+
+  @doc """
+  A person clears an escalated finding (US-51.6): it goes back to `:queued` with its fix
+  attempts reset and its issue number dropped, so the next sweep files a fresh issue and the
+  loop tries again. The escalated issue is left as it is, for the person to close. Audited.
+
+  `{:error, :not_found}` for no such finding in the tenant, `{:error, :not_escalated}` for a
+  finding in any other state. The caller is a `:user` key on a human-anchored tenant; that
+  gate is the controller's.
+  """
+  @spec clear(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok, Finding.t()} | {:error, :not_found | :not_escalated}
+  def clear(tenant_id, finding_id, %{} = actor) do
+    with {:ok, id} <- cast_id(finding_id),
+         {:ok, {:ok, finding}} <- AdminRepo.transaction(fn -> clear_locked(tenant_id, id) end) do
+      audit_clear(tenant_id, finding, actor)
+      {:ok, finding}
+    else
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cast_id(id) do
+    case Ecto.UUID.cast(id) do
+      {:ok, id} -> {:ok, id}
+      :error -> {:error, :not_found}
+    end
+  end
+
+  defp clear_locked(tenant_id, id) do
+    case AdminRepo.one(
+           from f in Finding,
+             where: f.tenant_id == ^tenant_id and f.id == ^id,
+             lock: "FOR UPDATE"
+         ) do
+      %Finding{state: :escalated} = finding ->
+        finding
+        |> Ecto.Changeset.change(
+          state: :queued,
+          escalated_at: nil,
+          escalated_reason: nil,
+          fix_attempts: 0,
+          cycle: finding.cycle + 1,
+          issue_number: nil,
+          filed_at: nil,
+          fix_merge_sha: nil,
+          fixed_at: nil,
+          closed_at: nil
+        )
+        |> AdminRepo.update()
+
+      %Finding{} ->
+        {:error, :not_escalated}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  defp audit_clear(tenant_id, finding, actor) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "chg_finding",
+      entity_id: finding.id,
+      action: "chg_finding_cleared",
+      actor_type: "api_key",
+      actor_id: Map.get(actor, :api_key_id),
+      actor_label: Map.get(actor, :label),
+      metadata: %{"kind" => finding.kind, "repo" => finding.repo_full_name}
+    })
   end
 end

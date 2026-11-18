@@ -38,6 +38,8 @@ defmodule Loopctl.Changes.Finding do
 
     field :loop_depth, :integer, default: 0
     field :fix_attempts, :integer, default: 0
+    # How many times a person cleared it from escalated (US-51.6); part of every action key.
+    field :cycle, :integer, default: 0
 
     field :issue_number, :integer
     field :filed_at, :utc_datetime_usec

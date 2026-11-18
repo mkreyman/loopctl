@@ -43,7 +43,8 @@ defmodule LoopctlWeb.ChgLive do
      |> stream(:flaky, [])
      |> stream(:runner, [])
      |> stream(:outcomes, [])
-     |> stream(:attention, [])}
+     |> stream(:attention, [])
+     |> stream(:escalated, [])}
   end
 
   @impl true
@@ -135,8 +136,14 @@ defmodule LoopctlWeb.ChgLive do
     runner = Dashboard.runner_samples(tenant_id, filters)
     reviews = Dashboard.review_outcomes(tenant_id, filters)
     attention = Dashboard.attention(tenant_id, filters)
+    findings = Dashboard.findings(tenant_id, filters)
 
     socket
+    |> assign(
+      :findings,
+      if(findings == :unavailable, do: :unavailable, else: Map.delete(findings, :escalated))
+    )
+    |> stream(:escalated, list_rows(findings, :escalated), reset: true)
     |> assign(:outcomes_by_day, Dashboard.gate_outcomes(tenant_id, filters))
     |> assign(:fallbacks, Dashboard.fallbacks(tenant_id, filters))
     |> assign(:selection, selection)
@@ -478,6 +485,45 @@ defmodule LoopctlWeb.ChgLive do
               <span class="font-mono text-slate-500">last event {timestamp(c.last_event_at)}</span>
             </li>
           </ul>
+        </.panel>
+
+        <.panel id="panel-findings" title="Feedback loop findings" class="lg:col-span-2">
+          <.unavailable :if={@findings == :unavailable} />
+          <div :if={@findings != :unavailable} class="space-y-3">
+            <dl id="findings-by-state" class="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+              <div :for={state <- ~w(queued filed fixed closed escalated)} class="flex gap-1">
+                <dt class="font-mono text-slate-500">{state}</dt>
+                <dd class="font-mono text-slate-200">{Map.get(@findings.by_state, state, 0)}</dd>
+              </div>
+            </dl>
+            <dl id="findings-by-kind" class="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+              <div :for={{kind, n} <- Enum.sort(@findings.by_kind)} class="flex gap-1">
+                <dt class="font-mono text-slate-500">{kind}</dt>
+                <dd class="font-mono text-slate-200">{n}</dd>
+              </div>
+            </dl>
+            <ul id="escalated-list" phx-update="stream" class="divide-y divide-slate-800/60">
+              <li id="escalated-empty" class="hidden py-2 text-sm text-slate-500 only:block">
+                No finding is escalated.
+              </li>
+              <li
+                :for={{dom_id, f} <- @streams.escalated}
+                id={dom_id}
+                class="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-xs"
+              >
+                <span class="inline-flex items-center rounded-sm bg-amber-950 px-2 py-0.5 font-mono font-medium text-amber-300">
+                  {f.kind}
+                </span>
+                <span class="font-mono text-slate-200">{f.repo}</span>
+                <span :if={f.issue_number} class="font-mono text-slate-400">#{f.issue_number}</span>
+                <span class="font-mono text-slate-500">
+                  seen {f.occurrences}, fixes {f.fix_attempts}
+                </span>
+                <span class="font-mono text-slate-500">escalated {timestamp(f.escalated_at)}</span>
+                <span class="w-full text-slate-400">{f.reason}</span>
+              </li>
+            </ul>
+          </div>
         </.panel>
       </div>
     </section>

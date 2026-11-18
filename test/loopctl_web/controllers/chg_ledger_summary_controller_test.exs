@@ -111,7 +111,7 @@ defmodule LoopctlWeb.ChgLedgerSummaryControllerTest do
       expected = expected |> Jason.encode!() |> Jason.decode!()
 
       for panel <- ~w(gate_outcomes fallbacks selection phase_times flaky runner_samples
-                      review_outcomes attention) do
+                      review_outcomes attention findings) do
         assert data[panel] == expected[panel], "#{panel} differs from Dashboard's"
       end
 
@@ -172,6 +172,40 @@ defmodule LoopctlWeb.ChgLedgerSummaryControllerTest do
       assert data["gate_outcomes"] == []
       assert data["runner_samples"] == []
       assert data["attention"] == []
+      assert data["findings"] == %{"by_state" => %{}, "by_kind" => %{}, "escalated" => []}
+    end
+
+    test "US-51.6: the findings panel counts per state and kind and lists the escalated", ctx do
+      at = DateTime.add(DateTime.utc_now(), -60)
+
+      for {state, reason} <- [{:filed, nil}, {:escalated, "loop_depth_2"}] do
+        AdminRepo.insert!(%Loopctl.Changes.Finding{
+          tenant_id: ctx.source.tenant_id,
+          kind: "flaky_test",
+          fingerprint: Ecto.UUID.generate(),
+          repo_full_name: ctx.source.repo_full_name,
+          state: state,
+          first_seen_at: at,
+          last_seen_at: at,
+          escalated_at: reason && at,
+          escalated_reason: reason
+        })
+      end
+
+      findings =
+        ctx.agent_key |> summary(%{}) |> json_response(200) |> get_in(["data", "findings"])
+
+      assert findings["by_state"] == %{"filed" => 1, "escalated" => 1}
+      assert findings["by_kind"] == %{"flaky_test" => 2}
+      assert [%{"reason" => "loop_depth_2"}] = findings["escalated"]
+
+      other =
+        ctx.agent_key
+        |> summary(%{repo: "someone/else"})
+        |> json_response(200)
+        |> get_in(["data", "findings"])
+
+      assert other["by_state"] == %{}
     end
 
     test "no key is a 401", _ctx do

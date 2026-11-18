@@ -36,19 +36,39 @@
       "id": "TC-51.6.1",
       "name": "list and isolation",
       "type": "integration",
-      "preconditions": ["findings in tenants A and B"],
-      "steps": ["GET as A"],
-      "expected_results": ["only A's findings"]
+      "preconditions": [
+        "findings in tenants A and B"
+      ],
+      "steps": [
+        "GET as A"
+      ],
+      "expected_results": [
+        "only A's findings"
+      ]
     },
     {
       "id": "TC-51.6.2",
       "name": "clear needs a user key",
       "type": "integration",
-      "preconditions": ["an escalated finding"],
-      "steps": ["POST clear with an agent key", "with a user key"],
-      "expected_results": ["403", "queued"]
+      "preconditions": [
+        "an escalated finding"
+      ],
+      "steps": [
+        "POST clear with an agent key",
+        "with a user key"
+      ],
+      "expected_results": [
+        "403",
+        "queued"
+      ]
     }
   ],
-  "technical_notes": [],
-  "dependencies": ["US-51.1", "US-51.2"]
+  "technical_notes": [
+    "A clear resets fix_attempts, and an action's generation is the fix-attempt count, so the next open after a clear would repeat an (action, generation) already used and ON CONFLICT DO NOTHING would drop it silently. chg_findings.cycle counts the clears and is part of the once-per-act key (finding_id, cycle, action, generation), so each cycle acts afresh.",
+    "ChgFindingController is claimed by TierCapabilities' issue_intake surface: clearing re-files an issue through the tenant's intake source, the same surface as enrolling it."
+  ],
+  "dependencies": [
+    "US-51.1",
+    "US-51.2"
+  ]
 }
