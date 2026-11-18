@@ -153,6 +153,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.PrReviewOutcomeWorker
 
   # The largest webhook body the intake route reads. An `issues` payload with a maximal
   # 65,536-character body, escaped, plus its repository and user objects, stays well under
@@ -1422,6 +1423,19 @@ defmodule Loopctl.Intake do
     end
   end
 
+  # US-50.4: a merged pull request queues one read of its review outcome. Only the number is
+  # taken from the payload; the job reads the body itself, through the tenant's credential.
+  defp plan(
+         "pull_request",
+         %{
+           "action" => "closed",
+           "pull_request" => %{"merged" => true, "number" => number}
+         },
+         _source
+       )
+       when is_integer(number) and number > 0 and number <= 2_147_483_647,
+       do: {:ok, {:pr_merged, "closed", number}}
+
   defp plan(_event, payload, _source), do: {:ok, {:ignored, GithubPayload.action(payload)}}
 
   defp apply_delivery(source, event, delivery_id, raw_body, plan) do
@@ -1442,6 +1456,7 @@ defmodule Loopctl.Intake do
       case plan do
         {:ping, _} -> {"ping", nil, nil}
         {:issue, action, issue} -> {"recorded", action, issue.number}
+        {:pr_merged, action, _number} -> {"recorded", action, nil}
         {:ignored, action} -> {"ignored", action, nil}
       end
 
@@ -1470,6 +1485,24 @@ defmodule Loopctl.Intake do
 
   defp apply_plan(_source, _delivery_id, {:ping, _}), do: :ping
   defp apply_plan(_source, _delivery_id, {:ignored, _action}), do: :ignored
+
+  # The enqueue never fails the delivery: a lost review-outcome read costs an audit row, while
+  # failing here would make GitHub redeliver, and a redelivery is a duplicate the unique index
+  # answers without queueing anything.
+  defp apply_plan(source, _delivery_id, {:pr_merged, _action, number}) do
+    case Oban.insert(PrReviewOutcomeWorker.new_for(source, number)) do
+      {:ok, _job} ->
+        :recorded
+
+      {:error, reason} ->
+        Logger.error(
+          "intake: review-outcome job not queued source_id=#{source.id} pr=#{number} " <>
+            "reason=#{inspect(reason)}"
+        )
+
+        :recorded
+    end
+  end
 
   defp apply_plan(source, delivery_id, {:issue, action, issue}) do
     extraction = TicketFacts.extract(issue.title, issue.body)

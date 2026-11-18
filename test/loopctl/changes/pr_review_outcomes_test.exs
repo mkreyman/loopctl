@@ -1,0 +1,245 @@
+defmodule Loopctl.Changes.PrReviewOutcomesTest do
+  @moduledoc """
+  US-50.4: a merged pull request's review outcome, from the intake webhook through the job to
+  the stored row and its counted rounds.
+  """
+
+  use LoopctlWeb.ConnCase, async: true
+
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Changes.LedgerRow
+  alias Loopctl.Changes.PrReviewOutcome
+  alias Loopctl.Changes.PrReviewOutcomes
+  alias Loopctl.Intake.Signature
+  alias Loopctl.Workers.PrReviewOutcomeWorker
+
+  use Oban.Testing, repo: Loopctl.Repo
+
+  setup :verify_on_exit!
+
+  @body """
+  ## Testing
+
+  Ran the suite.
+
+  ## Review findings
+
+  1. fixed high lib/a.ex:10 — a leak
+  2. wrong low lib/b.ex:2 — a race — wrong because the lock at b.ex:1 serialises it
+  3. medium, fixed: prose a person wrote
+  """
+
+  @merged_at ~U[2026-11-18 12:00:00Z]
+
+  defp merged_pr(number, repo, merged \\ true) do
+    %{
+      "action" => "closed",
+      "number" => number,
+      "pull_request" => %{"number" => number, "merged" => merged, "body" => "webhook copy"},
+      "repository" => %{"full_name" => repo}
+    }
+  end
+
+  defp deliver(conn, secret, source, payload, delivery_id \\ Ecto.UUID.generate()) do
+    raw = Jason.encode!(payload)
+
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("x-github-event", "pull_request")
+    |> put_req_header("x-github-delivery", delivery_id)
+    |> put_req_header("x-hub-signature-256", Signature.header(secret, raw))
+    |> post("/api/v1/intake/github/#{source.id}", raw)
+  end
+
+  defp stub_forge(body, merged \\ true) do
+    stub(Loopctl.MockPullRequestSource, :pull_request_body, fn _repo, _number ->
+      {:ok,
+       %{
+         body: body,
+         merged?: merged,
+         merged_at: if(merged, do: @merged_at),
+         merge_sha: if(merged, do: String.duplicate("c", 40))
+       }}
+    end)
+  end
+
+  defp round_row!(source, repo, pr) do
+    now = DateTime.utc_now()
+
+    AdminRepo.insert!(%LedgerRow{
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      repo: repo,
+      host: "minis",
+      kind: "review_round",
+      at: now,
+      raw: %{"v" => 1, "kind" => "review_round", "repo" => repo, "pr" => pr},
+      row_hash: Ecto.UUID.generate()
+    })
+  end
+
+  defp outcomes(tenant_id),
+    do: AdminRepo.all(from o in PrReviewOutcome, where: o.tenant_id == ^tenant_id)
+
+  describe "TC-50.4.2: a merge enqueues once and records one row" do
+    test "two deliveries of the merge store one parsed row", %{conn: conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      stub_forge(@body)
+      payload = merged_pr(7, source.repo_full_name)
+
+      assert %{"outcome" => "recorded"} =
+               conn |> deliver(secret, source, payload) |> json_response(200)
+
+      assert %{"outcome" => "recorded"} =
+               build_conn() |> deliver(secret, source, payload) |> json_response(200)
+
+      assert [row] = outcomes(source.tenant_id)
+      assert row.pr_number == 7
+      assert row.has_review_section
+      assert DateTime.compare(row.merged_at, @merged_at) == :eq
+      assert row.merge_sha == String.duplicate("c", 40)
+
+      assert [
+               %{
+                 "disposition" => "fixed",
+                 "severity" => "high",
+                 "file" => "lib/a.ex",
+                 "line" => 10
+               },
+               %{
+                 "disposition" => "wrong",
+                 "reason" => "wrong because the lock at b.ex:1 serialises it"
+               }
+             ] = row.findings
+
+      assert [unparsed] = row.unparsed
+      assert unparsed =~ "medium, fixed"
+    end
+
+    test "the job reads the body from the forge, never the webhook copy", %{conn: conn} do
+      {secret, source} = fixture(:intake_source, %{})
+
+      expect(Loopctl.MockPullRequestSource, :pull_request_body, fn repo, 9 ->
+        assert repo.full_name == source.repo_full_name
+        {:ok, %{body: nil, merged?: true, merged_at: @merged_at, merge_sha: nil}}
+      end)
+
+      conn |> deliver(secret, source, merged_pr(9, source.repo_full_name)) |> json_response(200)
+
+      assert [%{has_review_section: false, findings: []}] = outcomes(source.tenant_id)
+    end
+
+    test "a closed but unmerged PR and other actions queue nothing", %{conn: conn} do
+      {secret, source} = fixture(:intake_source, %{})
+
+      expect(Loopctl.MockPullRequestSource, :pull_request_body, 0, fn _repo, _number ->
+        flunk("no read")
+      end)
+
+      assert %{"outcome" => "ignored"} =
+               conn
+               |> deliver(secret, source, merged_pr(3, source.repo_full_name, false))
+               |> json_response(200)
+
+      opened = %{merged_pr(4, source.repo_full_name) | "action" => "opened"}
+
+      assert %{"outcome" => "ignored"} =
+               build_conn() |> deliver(secret, source, opened) |> json_response(200)
+
+      assert outcomes(source.tenant_id) == []
+    end
+  end
+
+  describe "the job" do
+    test "a forge error retries; a re-run replaces the row" do
+      {_secret, source} = fixture(:intake_source, %{})
+      args = %{"tenant_id" => source.tenant_id, "source_id" => source.id, "pr_number" => 5}
+
+      stub(Loopctl.MockPullRequestSource, :pull_request_body, fn _repo, _n ->
+        {:error, {:http, 502}}
+      end)
+
+      assert {:error, {:http, 502}} = perform_job(PrReviewOutcomeWorker, args)
+
+      stub_forge("no section here")
+      assert :ok = perform_job(PrReviewOutcomeWorker, args)
+      stub_forge(@body)
+      assert :ok = perform_job(PrReviewOutcomeWorker, args)
+
+      assert [%{has_review_section: true, findings: [_, _]}] = outcomes(source.tenant_id)
+    end
+
+    test "an unmerged PR, a revoked source and no credential are cancelled" do
+      {_secret, source} = fixture(:intake_source, %{})
+      args = %{"tenant_id" => source.tenant_id, "source_id" => source.id, "pr_number" => 5}
+
+      stub_forge(@body, false)
+      assert {:cancel, :not_merged} = perform_job(PrReviewOutcomeWorker, args)
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _t, _r ->
+        {:error, :credential_unavailable}
+      end)
+
+      assert {:cancel, :credential_unavailable} = perform_job(PrReviewOutcomeWorker, args)
+
+      AdminRepo.update!(Ecto.Changeset.change(source, revoked_at: DateTime.utc_now()))
+      assert {:cancel, :source_unavailable} = perform_job(PrReviewOutcomeWorker, args)
+
+      assert outcomes(source.tenant_id) == []
+    end
+  end
+
+  describe "TC-50.4.3: rounds" do
+    test "no section and no round is merged_without_counted_round", %{conn: conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      repo = String.downcase(source.repo_full_name)
+      stub_forge("## Risk\n\nnone")
+
+      conn |> deliver(secret, source, merged_pr(11, source.repo_full_name)) |> json_response(200)
+      stub_forge(@body)
+
+      build_conn()
+      |> deliver(secret, source, merged_pr(12, source.repo_full_name))
+      |> json_response(200)
+
+      round_row!(source, repo, 12)
+      round_row!(source, repo, 12)
+      round_row!(source, repo, 11 * 1000)
+      round_row!(source, repo, "not-a-number")
+
+      by_pr = source.tenant_id |> PrReviewOutcomes.list() |> Map.new(&{&1.pr_number, &1})
+
+      assert %{has_review_section: false, rounds: 0, merged_without_counted_round: true} =
+               by_pr[11]
+
+      assert %{has_review_section: true, rounds: 2, merged_without_counted_round: false} =
+               by_pr[12]
+
+      assert [%{pr_number: 12}] =
+               PrReviewOutcomes.list(source.tenant_id,
+                 repo: source.repo_full_name,
+                 since: @merged_at
+               )
+               |> Enum.filter(&(&1.pr_number == 12))
+    end
+  end
+
+  describe "TC-50.4.4: tenant isolation" do
+    test "tenant B reads none of tenant A's outcomes or rounds", %{conn: conn} do
+      {secret, source_a} = fixture(:intake_source, %{})
+      {_secret_b, source_b} = fixture(:intake_source, %{})
+      stub_forge(@body)
+
+      conn
+      |> deliver(secret, source_a, merged_pr(21, source_a.repo_full_name))
+      |> json_response(200)
+
+      round_row!(source_a, String.downcase(source_a.repo_full_name), 21)
+
+      assert [%{rounds: 1}] = PrReviewOutcomes.list(source_a.tenant_id)
+      assert PrReviewOutcomes.list(source_b.tenant_id) == []
+    end
+  end
+end

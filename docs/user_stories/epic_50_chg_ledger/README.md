@@ -62,5 +62,6 @@ sender delivers real events.
 | default | where | effect of overruling |
 |---|---|---|
 | The fleet sender holds `change_events_secret`, so any fleet machine can mint a review child (50.3) | US-50.3 | the alternative is a standing reviewer host with its own secret; it narrows who can mint reviewers to one machine and makes that machine a single point of failure for review |
+| A `review_round` ledger row names its pull request in `"pr"` (a positive integer); rounds are counted on `raw->>'pr'` (50.4) | US-50.4 | the stories named no key; the alternative is matching on the merge sha, which a review of an earlier head does not carry |
 | A gap no sender fills alerts the operator; loopctl never pulls | US-50.2 | a pull needs a reachable chg endpoint, which is the chg-server Mark ruled out |
 | Ledger rows are kept 180 days, then deleted by a nightly prune | US-50.1 | longer retention grows the table without bound; the audit questions look back weeks |

@@ -9234,11 +9234,14 @@ const TOOLS = [
       "THEN CONFIGURE GITHUB — the tool stops at the loopctl end and this is the other half. " +
       "On the repository: Settings > Webhooks > Add webhook, Payload URL = the `webhook_url` " +
       "returned, Content type = application/json, Secret = the contents of `secret_file`, and " +
-      "under 'Let me select individual events' tick ISSUES ONLY. The secret is the HMAC key " +
+      "under 'Let me select individual events' tick ISSUES and PULL REQUESTS (a merged pull " +
+      "request queues a read of its `## Review findings` section; every other pull-request " +
+      "action is recorded as ignored). The secret is the HMAC key " +
       "GitHub signs the RAW body with as `X-Hub-Signature-256`; loopctl verifies it before " +
       "trusting a byte. In one command, without the secret ever passing through this " +
       "transcript: gh api repos/OWNER/REPO/hooks -f name=web -f config[url]=<webhook_url> -f " +
-      "config[content_type]=json -f config[secret]=\"$(cat <secret_file>)\" -f 'events[]=issues'\n\n" +
+      "config[content_type]=json -f config[secret]=\"$(cat <secret_file>)\" -f 'events[]=issues' " +
+      "-f 'events[]=pull_request'\n\n" +
       "EVERY delivery failure afterwards is the SAME 401 `invalid_signature` — an unknown or " +
       "revoked source, a suspended tenant, a missing or wrong signature, and a payload whose " +
       "`repository.full_name` does not match this source's repository. That is deliberate (a " +

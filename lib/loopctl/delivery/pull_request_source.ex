@@ -173,6 +173,25 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback pull_request(repo(), pos_integer()) :: {:ok, pull_request()} | {:error, term()}
 
   @typedoc """
+  A pull request's description and merge facts (US-50.4). `body` is UNTRUSTED forge text and
+  `nil` when the description is empty; `merged_at`/`merge_sha` are `nil` on an unmerged one.
+  """
+  @type pull_request_body :: %{
+          body: String.t() | nil,
+          merged?: boolean(),
+          merged_at: DateTime.t() | nil,
+          merge_sha: String.t() | nil
+        }
+
+  @doc """
+  The current description of one pull request, read when it merges so the review outcome of
+  the merged PR (`Loopctl.Changes.PrReviewOutcomes`) is taken from what the PR finally said,
+  never from the webhook's copy.
+  """
+  @callback pull_request_body(repo(), pos_integer()) ::
+              {:ok, pull_request_body()} | {:error, term()}
+
+  @typedoc """
   One commit, as much of it as story verification judges: its tree.
   """
   @type commit :: %{tree_sha: String.t()}
@@ -348,6 +367,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @doc false
   def pull_request(%ForgeRepo{} = repo, a), do: impl().pull_request(repo, a)
+
+  @doc false
+  def pull_request_body(%ForgeRepo{} = repo, a), do: impl().pull_request_body(repo, a)
 
   @doc false
   def commit(%ForgeRepo{} = repo, a), do: impl().commit(repo, a)
