@@ -42,6 +42,20 @@ defmodule Loopctl.Repo.Migrations.LedgerModeAndUnroutedChangeEvents do
   end
 
   def down do
+    # `routed` is the only marker of an event a non-`chg` source delivered, and the code before
+    # this migration reads every APPLIED event as evidence: dropping the column with such rows
+    # in place would let a pr-stint `landed` or `submitted` stand in as the landed revision or
+    # a bound sha. Deleting them is an operator's decision, not a rollback's, so refuse.
+    execute("""
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM change_events WHERE NOT routed) THEN
+        RAISE EXCEPTION 'change_events holds unrouted rows; delete them (DELETE FROM change_events WHERE NOT routed) before rolling back';
+      END IF;
+    END
+    $$
+    """)
+
     alter table(:change_events) do
       remove :routed
     end

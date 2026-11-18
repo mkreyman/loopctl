@@ -12,7 +12,9 @@ All notable changes to loopctl are documented here.
   `change_events_secret` and a live `chg_root_dispatch_id`, whatever its mode. Only a `chg`
   source's events bind stories or move stages; any other source's events are stored,
   cursored and audited with effect `recorded` and `routed: false`, and no custody gate reads
-  them (a `reverted` event still counts against verification in every mode). A `pr` source's
+  them (a `reverted` event still counts against verification in every mode). An event for a
+  change the `chg` route already acted on is still 401 while its source is not `chg`, so a
+  source switched chg -> pr keeps its sender's backlog for the switch back. A `pr` source's
   merge precondition still reads the PR. Reviewer minting
   (`POST /api/v1/change_events/:source_id/review_dispatch`) stays `chg`-only, with the same
   401. The new mode `ledger` enrolls a repository with no work project on an active KB scope,

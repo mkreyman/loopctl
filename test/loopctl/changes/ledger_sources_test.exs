@@ -168,6 +168,27 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
 
       assert [%Event{routed: false}, %Event{routed: false}] = events(ctx, "C1")
     end
+
+    test "a change the chg route acted on is refused off it, writes nothing, and applies routed once chg again" do
+      ctx = fixture(:chg_source, %{})
+      assert {:ok, %{outcome: :applied}} = push(ctx, %{change_id: "C1", event_seq: 1})
+
+      {:ok, _} = Intake.update_source(ctx.source.tenant_id, ctx.source.id, %{mode: "pr"})
+
+      assert {:error, :unauthorized} = push(ctx, %{change_id: "C1", event_seq: 2})
+      assert [%Event{event_seq: 1, routed: true}] = events(ctx, "C1")
+
+      # A change that began off the route is still recorded.
+      assert {:ok, %{outcome: :applied}} = push(ctx, %{change_id: "C2", event_seq: 1})
+      assert [%Event{routed: false}] = events(ctx, "C2")
+
+      {:ok, _} = Intake.update_source(ctx.source.tenant_id, ctx.source.id, %{mode: "chg"})
+
+      assert {:ok, %{outcome: :applied, applied_seq: 2}} =
+               push(ctx, %{change_id: "C1", event_seq: 2})
+
+      assert [%Event{routed: true}, %Event{event_seq: 2, routed: true}] = events(ctx, "C1")
+    end
   end
 
   describe "a chg source is unchanged" do
@@ -185,25 +206,22 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
   describe "an unrouted event is evidence for nothing" do
     test "a landed event a pr source delivered is not the change's landed revision" do
       ctx = fixture(:chg_source, %{})
-      routed_sha = String.duplicate("1", 40)
-
-      assert {:ok, _} =
-               push(ctx, %{change_id: "C1", event_seq: 1, kind: "landed", sha: routed_sha})
-
       {:ok, _} = Intake.update_source(ctx.source.tenant_id, ctx.source.id, %{mode: "pr"})
 
-      assert {:ok, _} =
+      assert {:ok, %{outcome: :applied}} =
                push(ctx, %{
                  change_id: "C1",
-                 event_seq: 2,
+                 event_seq: 1,
                  kind: "landed",
                  sha: String.duplicate("2", 40)
                })
 
+      {:ok, _} = Intake.update_source(ctx.source.tenant_id, ctx.source.id, %{mode: "chg"})
+
       repo = Events.repo_key(ctx.source.repo_full_name)
       binding = %Binding{repo: repo, change_id: "C1"}
 
-      assert %{{^repo, "C1"} => %{sha: ^routed_sha, event_seq: 1}} =
+      assert %{} ==
                Landings.newest_applied_landings(AdminRepo, ctx.source.tenant_id, [binding])
     end
   end

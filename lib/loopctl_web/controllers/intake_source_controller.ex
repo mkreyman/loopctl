@@ -89,7 +89,11 @@ defmodule LoopctlWeb.IntakeSourceController do
               "with 409 `change_protocol_enrolled`. A `chg` source needs BOTH " <>
               "`change_events_secret` and `chg_root_dispatch_id`, from the same request or " <>
               "kept from an earlier `chg` stint; without them the write is a 422. Switching " <>
-              "back to `pr` KEEPS both and ignores them, and every write that leaves the " <>
+              "back to `pr` KEEPS both, and they stay LIVE: the sender's ledger and its new " <>
+              "changes' events are still accepted (recorded, routing nothing), while an event " <>
+              "for a change the `chg` route already acted on is 401 until the source is `chg` " <>
+              "again. Clear them with an explicit null if the sender must be refused. Every " <>
+              "write that leaves the " <>
               "source `chg` re-checks the root. A switch to `chg` is 409 " <>
               "`pr_route_in_flight` while a story of the project holds a merge allow it has " <>
               "not merged on. `ledger` (issue #1047): a kb scope's ledger-only credential — " <>
@@ -258,12 +262,15 @@ defmodule LoopctlWeb.IntakeSourceController do
            change_events_secret: %Schema{
              type: :string,
              writeOnly: true,
-             description: "Optional; required with `mode: chg`. " <> @change_events_secret_doc
+             description:
+               "Optional; required with `mode: chg` or `mode: ledger`. " <>
+                 @change_events_secret_doc
            },
            chg_root_dispatch_id: %Schema{
              type: :string,
              format: :uuid,
-             description: "Optional; required with `mode: chg`. " <> @chg_root_doc
+             description:
+               "Optional; required with `mode: chg` or `mode: ledger`. " <> @chg_root_doc
            },
            target_epic_id: %Schema{
              type: :string,

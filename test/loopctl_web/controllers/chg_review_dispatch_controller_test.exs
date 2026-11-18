@@ -323,16 +323,17 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
              |> json_response(401) == @unauthorized
     end
 
-    # Issue #1047: a revision submitted during a `pr` stint was applied unrouted, so once the
-    # source is `chg` again it is still not a revision a reviewer can be minted for.
+    # Issue #1047: a change that BEGAN during a `pr` stint was applied unrouted, so once the
+    # source is `chg` again its revision is still not one a reviewer can be minted for. (A
+    # change the chg route already acted on is refused off it instead, see LedgerSourcesTest.)
     test "a revision submitted while the source was pr is 422 revision_not_submitted",
          %{conn: conn} = ctx do
       {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "pr"})
-      submit!(ctx, "C1", 2, 2, sha("b"))
+      submit!(ctx, "C9", 1, 1, sha("b"))
       {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "chg"})
 
       assert %{"error" => %{"code" => "revision_not_submitted"}} =
-               conn |> request(ctx, %{change_id: "C1", revision: 2}) |> json_response(422)
+               conn |> request(ctx, %{change_id: "C9", revision: 1}) |> json_response(422)
     end
 
     # Issue #1047: a `pr` source holding the chg credentials sends its ledger and events, but a

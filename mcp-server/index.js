@@ -9512,8 +9512,10 @@ const TOOLS = [
       "— and whenever one is named (422 `chg_root_invalid` unless it is a parentless, " +
       "unrevoked, orchestrator-role dispatch of this tenant; a revoked root blocks every such " +
       "write until a live one is named, while switching to `pr` is never blocked). Switching " +
-      "to `pr` KEEPS both and ignores " +
-      "them; on a `pr` source an explicit null clears either, and on a `chg` source a null is " +
+      "to `pr` KEEPS both and they stay LIVE: the sender's ledger and its new changes' events " +
+      "are still accepted (recorded, routing nothing), while an event for a change the `chg` " +
+      "route already acted on is 401 until the source is `chg` again. Send an explicit null " +
+      "to refuse the sender. On a `pr` source a null clears either, and on a `chg` source a null is " +
       "a 422. Naming either credential, or setting `mode` to `chg` or `ledger` (which " +
       "re-activates the kept ones), needs the tenant's operator key — a user-role key NO " +
       "DISPATCH MINTED — " +

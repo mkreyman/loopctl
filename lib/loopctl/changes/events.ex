@@ -67,8 +67,10 @@ defmodule Loopctl.Changes.Events do
 
   The mode is read at APPLICATION, not at receipt: an event held behind a gap is applied under
   whatever mode the source has when the gap fills. A switch to `chg` is the deliberate act that
-  opens the route, so an event applied after it is routed; one applied after a switch away is
-  not.
+  opens the route, so an event applied after it is routed. A switch away does not move a change
+  the route has already acted on: while the source is not `chg`, an event for a change with any
+  applied routed event is refused with the same 401, writing nothing, so the sender keeps it
+  until the source is `chg` again. Only a change that began off the route is recorded unrouted.
 
   ## Idempotency
 
@@ -529,7 +531,9 @@ defmodule Loopctl.Changes.Events do
     cursor = lock_cursor(source, key, now)
     # The HELD source's mode, read FOR SHARE in this transaction: a switch commits first and is
     # seen, or waits for this event.
-    effects_opts = Keyword.put(effects_opts, :routed, routed?(source))
+    routed = routed?(source)
+    unless routed, do: refuse_routed_change!(key)
+    effects_opts = Keyword.put(effects_opts, :routed, routed)
 
     case insert_event(source, key, envelope, via, now) do
       :inserted ->
@@ -674,6 +678,23 @@ defmodule Loopctl.Changes.Events do
 
   defp routed?(%Source{mode: :chg}), do: true
   defp routed?(%Source{}), do: false
+
+  # A change the `chg` route has already acted on stays on that route. While its source is not
+  # `chg` (a temporary switch to `pr`, or one made before this deploy that kept the
+  # credentials), its next event is refused with the 401 it got before a `pr` source could send
+  # at all, writing nothing, so the sender keeps it and redelivers it once the source is `chg`
+  # again. Applying it unrouted instead would move the cursor past it, and no later reader
+  # counts an unrouted event: a `landed` would never land the story. Judged under the change's
+  # cursor lock, so it cannot race the change's own events.
+  defp refuse_routed_change!(key) do
+    if Repo.exists?(
+         from e in Event,
+           where:
+             e.tenant_id == ^key.tenant_id and e.repo == ^key.repo and
+               e.change_id == ^key.change_id and not is_nil(e.applied_at) and e.routed
+       ),
+       do: Repo.rollback({:refused, :change_on_chg_route})
+  end
 
   # What of a caller's `opts` reaches `EventEffects.apply_event/3`.
   defp effects_opts(opts), do: Keyword.take(opts, [:escalate])

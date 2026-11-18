@@ -3810,7 +3810,8 @@ defmodule Loopctl.Fixtures do
       occurred_at: Map.get(attrs, :occurred_at, now),
       data: Map.get(attrs, :data, %{}),
       received_via: "push",
-      applied_at: if(Map.get(attrs, :applied, true), do: now)
+      applied_at: if(Map.get(attrs, :applied, true), do: now),
+      routed: Map.get(attrs, :routed, true)
     })
   end
 
