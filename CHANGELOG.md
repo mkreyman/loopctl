@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Operator browser login and the `/chg` dashboard (2026-11-18, US-50.5).** `/login` signs
+  a tenant's human in with the passkey enrolled at signup (usernameless, user verification
+  required; a security key enrolled without a resident credential cannot sign in, so enroll a
+  passkey). The session is server-side (`browser_sessions`), lasts 8 hours, and is ended by
+  logout, an authenticator revoke or a tenant leaving `:active`. `/chg` shows gate outcomes,
+  the fallback rate, selection quality, phase times, flaky tests, runner samples, merged-PR
+  review outcomes and changes flagged gap or stale, filterable by repo, host and period. The
+  migration `20261118220000` adds `browser_sessions` and `webauthn_login_challenges`; new
+  tables only, so the rolling deploy needs no ordering.
 - **`CHG_SERVER_URL` is removed; loopctl no longer pulls chg change events (2026-11-18,
   US-50.2).** There is no chg-server: the fleet's chg outboxes send events, and loopctl
   cannot reach them. Every 200 from `POST /api/v1/change_events/:source_id` now carries

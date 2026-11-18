@@ -24,6 +24,7 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
   alias Loopctl.Changes.PrReviewOutcome
   alias Loopctl.Changes.ReviewFindings
   alias Loopctl.Delivery.PullRequestSource
+  alias Loopctl.HeavyRead
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
 
@@ -93,7 +94,7 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
   `merged_without_counted_round`. `opts`: `:repo` (an `owner/name`, any case), `:since` (a
   `DateTime`, on `merged_at`), `:limit` (1..500, default 100).
   """
-  @spec list(Ecto.UUID.t(), keyword()) :: [outcome()]
+  @spec list(Ecto.UUID.t(), keyword()) :: [outcome()] | {:error, :heavy_read_overloaded}
   def list(tenant_id, opts \\ []) when is_binary(tenant_id) do
     limit = opts |> Keyword.get(:limit, 100) |> max(1) |> min(500)
 
@@ -115,13 +116,17 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
         _ -> query
       end
 
-    {:ok, {rows, counts}} =
-      Repo.with_tenant(tenant_id, fn ->
-        rows = Repo.all(query)
-        {rows, rounds(tenant_id, rows)}
-      end)
+    with rows when is_list(rows) <- heavy_all(tenant_id, query),
+         counts when is_map(counts) <- rounds(tenant_id, rows) do
+      Enum.map(rows, &with_rounds(&1, counts))
+    end
+  end
 
-    Enum.map(rows, &with_rounds(&1, counts))
+  # An analytical read an operator page re-runs at will, so it runs on `HeavyReadRepo`
+  # (`Loopctl.HeavyRead`, whose guard pins every base table to `tenant_id`). Shed load comes
+  # back as `{:error, :heavy_read_overloaded}` rather than raising, for the caller to show.
+  defp heavy_all(tenant_id, query) do
+    HeavyRead.all(tenant_id, query, Keyword.put(HeavyRead.opts(:enumeration), :on_overload, :tag))
   end
 
   # One grouped read of every listed PR's review_round rows, keyed {repo, pr_number}. A `pr`
@@ -140,8 +145,11 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
       group_by: [r.repo, fragment("(?->>'pr')", r.raw)],
       select: {r.repo, fragment("(?->>'pr')", r.raw), count(r.id)}
     )
-    |> Repo.all()
-    |> Map.new(fn {repo, pr, count} -> {{repo, pr}, count} end)
+    |> then(&heavy_all(tenant_id, &1))
+    |> case do
+      rows when is_list(rows) -> Map.new(rows, fn {repo, pr, count} -> {{repo, pr}, count} end)
+      {:error, _reason} = error -> error
+    end
   end
 
   defp with_rounds(%PrReviewOutcome{} = o, counts) do

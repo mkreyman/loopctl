@@ -333,6 +333,13 @@ const NON_API = {
   "GET /signup": "browser", // SignupLive — the WebAuthn ceremony's own page
   "GET /tenants/:param/onboarding": "browser", // OnboardingLive
   "GET /enroll": "browser", // EnrollLive
+  // US-50.5 — the operator's WebAuthn browser login and the chg dashboard it opens. A human
+  // with a passkey is the caller; a session reaches the same data through the ledger summary
+  // tool, not this page.
+  "GET /login": "browser", // LoginLive
+  "POST /login": "browser", // BrowserSessionController.create, the assertion's form POST
+  "DELETE /logout": "browser", // BrowserSessionController.delete
+  "GET /chg": "browser", // ChgLive
   "GET /wiki": "browser", // WikiLive.index
   "GET /wiki/:param": "browser", // WikiLive.show
   "GET /swaggerui": "browser", // OpenApiSpex.Plug.SwaggerUI over GET /api/v1/openapi

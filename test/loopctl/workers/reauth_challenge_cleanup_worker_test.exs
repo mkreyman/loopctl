@@ -11,6 +11,7 @@ defmodule Loopctl.Workers.ReauthChallengeCleanupWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.WebAuthn.EnrollmentChallenge
+  alias Loopctl.WebAuthn.LoginChallenge
   alias Loopctl.WebAuthn.ReauthChallenge
   alias Loopctl.Workers.ReauthChallengeCleanupWorker
 
@@ -71,6 +72,28 @@ defmodule Loopctl.Workers.ReauthChallengeCleanupWorkerTest do
     refute AdminRepo.get(EnrollmentChallenge, expired_enrollment.id)
     refute AdminRepo.get(EnrollmentChallenge, used_enrollment.id)
     assert AdminRepo.get(EnrollmentChallenge, live_enrollment.id)
+  end
+
+  test "US-50.5: sweeps stale operator-login challenges, keeps a live unused one" do
+    now = DateTime.utc_now()
+
+    insert = fn expires_at, used_at ->
+      AdminRepo.insert!(%LoginChallenge{
+        challenge: :erlang.term_to_binary(%{bytes: :crypto.strong_rand_bytes(16)}),
+        expires_at: expires_at,
+        used_at: used_at
+      })
+    end
+
+    expired = insert.(DateTime.add(now, -60, :second), nil)
+    used = insert.(DateTime.add(now, 300, :second), now)
+    live = insert.(DateTime.add(now, 300, :second), nil)
+
+    assert :ok = ReauthChallengeCleanupWorker.perform(%Oban.Job{args: %{}})
+
+    refute AdminRepo.get(LoginChallenge, expired.id)
+    refute AdminRepo.get(LoginChallenge, used.id)
+    assert AdminRepo.get(LoginChallenge, live.id)
   end
 
   test "is a no-op when both tables are empty of stale rows" do
