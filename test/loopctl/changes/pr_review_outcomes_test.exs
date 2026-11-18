@@ -65,20 +65,31 @@ defmodule Loopctl.Changes.PrReviewOutcomesTest do
     end)
   end
 
-  defp round_row!(source, repo, pr) do
-    now = DateTime.utc_now()
+  # `opts`: `:kind` ("review_round" or "review_round_void") and `:round_id` (omitted from
+  # `raw` when nil, as a sender predating round ids would).
+  defp round_row!(source, repo, pr, opts \\ []) do
+    kind = Keyword.get(opts, :kind, "review_round")
+
+    raw =
+      case Keyword.get(opts, :round_id) do
+        nil -> %{"v" => 1, "kind" => kind, "repo" => repo, "pr" => pr}
+        id -> %{"v" => 1, "kind" => kind, "repo" => repo, "pr" => pr, "round_id" => id}
+      end
 
     AdminRepo.insert!(%LedgerRow{
       tenant_id: source.tenant_id,
       source_id: source.id,
       repo: repo,
       host: "minis",
-      kind: "review_round",
-      at: now,
-      raw: %{"v" => 1, "kind" => "review_round", "repo" => repo, "pr" => pr},
+      kind: kind,
+      at: DateTime.utc_now(),
+      raw: raw,
       row_hash: Ecto.UUID.generate()
     })
   end
+
+  defp void_row!(source, repo, pr, round_id),
+    do: round_row!(source, repo, pr, kind: "review_round_void", round_id: round_id)
 
   defp outcomes(tenant_id),
     do: AdminRepo.all(from o in PrReviewOutcome, where: o.tenant_id == ^tenant_id)
@@ -248,6 +259,65 @@ defmodule Loopctl.Changes.PrReviewOutcomesTest do
                  since: @merged_at
                )
                |> Enum.filter(&(&1.pr_number == 12))
+    end
+  end
+
+  describe "voided rounds (#1044)" do
+    setup do
+      {_secret, source} = fixture(:intake_source, %{})
+      repo = String.downcase(source.repo_full_name)
+      facts = %{body: @body, merged?: true, merged_at: @merged_at, merge_sha: nil}
+      for n <- 1..4, do: {:ok, _} = PrReviewOutcomes.record(source, n, facts)
+      %{source: source, repo: repo}
+    end
+
+    defp rounds_by_pr(tenant_id),
+      do: tenant_id |> PrReviewOutcomes.list() |> Map.new(&{&1.pr_number, &1})
+
+    test "a round and its void count zero; a void for another round_id changes nothing",
+         %{source: source, repo: repo} do
+      round_row!(source, repo, 1, round_id: "r1")
+      void_row!(source, repo, 1, "r1")
+
+      round_row!(source, repo, 2, round_id: "r2a")
+      round_row!(source, repo, 2, round_id: "r2b")
+      void_row!(source, repo, 2, "r2a")
+
+      round_row!(source, repo, 3, round_id: "r3")
+      void_row!(source, repo, 3, "someone-else")
+
+      by_pr = rounds_by_pr(source.tenant_id)
+      assert %{rounds: 0, merged_without_counted_round: true} = by_pr[1]
+      assert %{rounds: 1, merged_without_counted_round: false} = by_pr[2]
+      assert %{rounds: 1} = by_pr[3]
+
+      # PRs 1 and 4 have no counted round.
+      assert %{merged: 4, without_round: 2} = PrReviewOutcomes.totals(source.tenant_id)
+    end
+
+    test "a void that arrives before its round still cancels it", %{source: source, repo: repo} do
+      void_row!(source, repo, 1, "early")
+      round_row!(source, repo, 1, round_id: "early")
+
+      assert %{rounds: 0} = rounds_by_pr(source.tenant_id)[1]
+      assert %{without_round: 4} = PrReviewOutcomes.totals(source.tenant_id)
+    end
+
+    test "a round with no round_id is never cancelled", %{source: source, repo: repo} do
+      round_row!(source, repo, 1)
+      void_row!(source, repo, 1, nil)
+
+      assert %{rounds: 1} = rounds_by_pr(source.tenant_id)[1]
+      assert %{without_round: 3} = PrReviewOutcomes.totals(source.tenant_id)
+    end
+
+    test "another tenant's void cancels nothing", %{source: source, repo: repo} do
+      {_secret_b, source_b} = fixture(:intake_source, %{})
+      round_row!(source, repo, 1, round_id: "shared")
+      void_row!(source_b, repo, 1, "shared")
+
+      assert %{rounds: 1} = rounds_by_pr(source.tenant_id)[1]
+      assert %{without_round: 3} = PrReviewOutcomes.totals(source.tenant_id)
     end
   end
 
