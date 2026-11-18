@@ -1364,27 +1364,6 @@ defmodule Loopctl.Intake do
   @spec delivery_source(term()) :: Source.t() | nil
   def delivery_source(source_id), do: active_source(source_id)
 
-  @doc """
-  The tenant's live `chg` source for `repo_full_name` (case-insensitively, as GitHub names
-  are), or `nil`. What a change-events gap pull signs with: the source live NOW, so a
-  re-enrolled repository's new secret is the one used (US-47.3).
-  """
-  @spec chg_source_for_repo(Ecto.UUID.t(), String.t()) :: Source.t() | nil
-  def chg_source_for_repo(tenant_id, repo_full_name)
-      when is_binary(tenant_id) and is_binary(repo_full_name) do
-    name = String.downcase(repo_full_name)
-
-    AdminRepo.one(
-      from s in live_sources_query(tenant_id),
-        join: t in Tenant,
-        on: t.id == s.tenant_id,
-        where:
-          s.mode == :chg and fragment("lower(?)", s.repo_full_name) == ^name and
-            t.status == :active,
-        limit: 1
-    )
-  end
-
   defp active_source(source_id) do
     case Ecto.UUID.cast(source_id) do
       {:ok, id} ->

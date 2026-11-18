@@ -151,12 +151,12 @@ defmodule LoopctlWeb.Telemetry do
         event_name: [:loopctl, :changes, :review_hold_refused],
         description: "chg landed events rolled back because the review_missing hold was refused."
       ),
-      # A gap pull chg-server refused for its signature: under a one-sided secret rotation,
-      # the only signal loopctl gets. Alert on any.
-      counter("loopctl.changes.pull_refused.count",
-        event_name: [:loopctl, :changes, :pull_refused],
-        tags: [:source],
-        description: "Signed gap pulls chg-server refused 401, by source."
+      # A change no fleet sender is filling (US-50.2): held behind a gap for 10 minutes, or
+      # bound and quiet for 6 hours. Each is also an operator alert; alert on any.
+      counter("loopctl.changes.attention.count",
+        event_name: [:loopctl, :changes, :attention],
+        tags: [:condition],
+        description: "chg changes flagged gap or stale, by condition."
       ),
 
       # Contract 1.6.0. A runner that DECLARED a kind on join and then answered

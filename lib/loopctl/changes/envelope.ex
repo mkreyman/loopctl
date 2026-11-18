@@ -44,7 +44,7 @@ defmodule Loopctl.Changes.Envelope do
     data: :map
   }
 
-  # A change id is a client ULID on chg's side; it is also a path segment of the gap pull, so
+  # A change id is a client ULID on chg's side; it is also the cursor read's query value, so
   # it is held to URL-safe characters here rather than escaped later.
   @change_id_format ~r/\A[A-Za-z0-9._:-]+\z/
   @kind_format ~r/\A[a-z][a-z0-9_]{0,63}\z/

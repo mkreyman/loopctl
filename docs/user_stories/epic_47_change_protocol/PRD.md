@@ -171,17 +171,13 @@ mkreyman/chg#33, comments 6257372489 and 6257451658, the later one winning):
   any kind the stage mapping does not map, answers `2xx`, and moves no stage. Recording it is
   what keeps ordering whole: the event's `event_seq` is now present, so the next event is not
   held behind a gap that would never fill. chg can add kinds without a loopctl release.
-- The gap pull is `GET /api/v1/changes/:change_id/events?after=N` on chg-server, HMAC-signed
-  with the same secret over `"<timestamp>.GET.<path>?<query>"` exactly as sent (the query
-  carries only `after`), inside the same 5-minute window. `change_id` is GLOBALLY unique (a
-  client ULID with a unique index across every repo in chg-server), so the URL needs no repo;
-  loopctl's `(repo, change_id)` keys stay as a redundant guard. The pull carries the same two
-  headers. A 200 is `{"events": [...], "next_after": N | null}`: events with seq > `after`, in
-  seq order, at most 500 per response, `next_after` null once caught up. 400 is a bad `after`,
-  401 a bad or stale signature, 404 an unknown change (checked after the signature, so ids
-  cannot be probed), 5xx retryable (mkreyman/chg#33 item 6).
-- chg-server is chg's Phase 2 and is not running yet (mkreyman/chg#35). Until then, 47.3 is
-  built and tested against this contract but receives no real events.
+- **There is no gap pull.** Mark ruled on 2026-10-28 that there is no chg-server: the fleet's
+  per-machine chg outboxes send the events, and loopctl cannot reach them. Epic 50 (US-50.2)
+  replaced the pull with a sender-driven fill: every answer to an event post carries the
+  change's cursor (`applied_through`, `held`), a signed
+  `GET /api/v1/change_events/:source_id/cursor?change_id=` answers it alone, and a gap or a
+  stale change that no sender fills raises one operator alert. See
+  `docs/user_stories/epic_50_chg_ledger/README.md`.
 - GitHub App 5101362 is ADOPTED by chg as chg-server's lander (renamed chg-lander, given a new
   key). loopctl holds none of its credentials: `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`
   were unset from loopctl's Fly app on 2026-10-19 (release v736).

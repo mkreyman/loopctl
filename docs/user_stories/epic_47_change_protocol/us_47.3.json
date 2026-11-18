@@ -157,12 +157,10 @@
     }
   ],
   "technical_notes": [
-    "The chg client is a behaviour resolved from config (Loopctl.Changes.ChgClient), mocked in test/support/mocks.ex.",
+    "AC-47.3.3's pull is retired by US-50.2: there is no chg-server to pull from, so a gap or stale change is flagged and alerted, and the fleet sender resends from the cursor every answer carries.",
     "Build against PRD \u00a75's wire contract, confirmed on mkreyman/chg#33 (headers, signed strings for POST and the gap-pull GET, envelope, per-kind data).",
     "Event application goes through ONE seam, Loopctl.Changes.EventEffects.apply_event/2, called in event_seq order inside the transaction that holds the change's cursor lock, marks the event applied and appends it to the audit chain. In this story it binds a submitted event's story (PRD \u00a74, Loopctl.Changes.bind_in_tenant_transaction/3) and records every other kind; US-47.4 fills it with the stage mapping.",
-    "AC-47.3.7's root check is Loopctl.Intake.hold_chg_source/3: the source and its root read FOR SHARE inside the event's own transaction, by the same rule enrolment uses.",
-    "chg-server's base URL is the deployment env var CHG_SERVER_URL (one chg-server serves every enrolled repo); unset, events are still received and applied but nothing is pulled."
-  ],
+    "AC-47.3.7's root check is Loopctl.Intake.hold_chg_source/3: the source and its root read FOR SHARE inside the event's own transaction, by the same rule enrolment uses."  ],
   "dependencies": [
     "US-47.1",
     "US-47.2"

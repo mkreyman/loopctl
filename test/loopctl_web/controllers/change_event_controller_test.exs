@@ -199,10 +199,11 @@ defmodule LoopctlWeb.ChangeEventControllerTest do
 
   describe "AC-47.3.5: the request makes no outbound call" do
     test "not even for an event held ahead of a gap", %{conn: conn} = ctx do
-      # Zero calls allowed: verify_on_exit! fails the test if the request reached chg-server.
-      Mox.expect(Loopctl.MockChgClient, :events_after, 0, fn _, _, _, _ -> {:ok, []} end)
+      # loopctl has no outbound client for the change protocol at all (US-50.2); an event held
+      # ahead of a gap is answered from the transaction with the cursor the sender resends from.
+      refute Code.ensure_loaded?(Loopctl.Changes.ChgClient)
 
-      assert %{"outcome" => "held"} =
+      assert %{"outcome" => "held", "cursor" => %{"applied_through" => 0, "held" => [5]}} =
                conn |> post_event(ctx, encode(event("C1", 5))) |> json_response(200)
     end
   end
@@ -256,6 +257,85 @@ defmodule LoopctlWeb.ChangeEventControllerTest do
 
       assert event_rows(other.tenant_id) == 0
       assert event_rows(ctx.tenant_id) == 0
+    end
+  end
+
+  defp get_cursor(conn, ctx, change_id, opts \\ []) do
+    ts = Keyword.get(opts, :timestamp, Integer.to_string(System.os_time(:second)))
+    source_id = Keyword.get(opts, :source_id, ctx.source.id)
+    path = "/api/v1/change_events/#{source_id}/cursor"
+    query = if change_id, do: "change_id=#{change_id}", else: ""
+
+    signature =
+      Signature.header(ctx.secret, Signature.delivery_string(ts, Signature.get_body(path, query)))
+
+    conn
+    |> put_req_header("x-chg-timestamp", ts)
+    |> put_req_header("x-chg-signature", Keyword.get(opts, :signature, signature))
+    |> get(path <> "?" <> query)
+  end
+
+  describe "US-50.2 TC-50.2.1: every answer carries the cursor" do
+    test "applied, held and duplicate", %{conn: conn} = ctx do
+      assert %{"cursor" => %{"change_id" => "C1", "applied_through" => 1, "held" => []}} =
+               conn |> post_event(ctx, encode(event("C1", 1))) |> json_response(200)
+
+      e3 = encode(event("C1", 3))
+
+      assert %{"outcome" => "held", "cursor" => %{"applied_through" => 1, "held" => [3]}} =
+               build_conn() |> post_event(ctx, e3) |> json_response(200)
+
+      assert %{"duplicate" => true, "cursor" => %{"applied_through" => 1, "held" => [3]}} =
+               build_conn() |> post_event(ctx, e3) |> json_response(200)
+    end
+  end
+
+  describe "US-50.2 TC-50.2.2: the cursor read" do
+    setup %{conn: conn} = ctx do
+      assert %{} = conn |> post_event(ctx, encode(event("C1", 1))) |> json_response(200)
+      assert %{} = build_conn() |> post_event(ctx, encode(event("C1", 3))) |> json_response(200)
+      :ok
+    end
+
+    test "answers the held seqs", ctx do
+      assert build_conn() |> get_cursor(ctx, "C1") |> json_response(200) ==
+               %{"change_id" => "C1", "applied_through" => 1, "held" => [3]}
+    end
+
+    test "an unknown change reads as empty, never a 404", ctx do
+      assert build_conn() |> get_cursor(ctx, "NOPE") |> json_response(200) ==
+               %{"change_id" => "NOPE", "applied_through" => 0, "held" => []}
+    end
+
+    test "every refusal is the change-events 401", ctx do
+      bad = "sha256=" <> String.duplicate("0", 64)
+      stale = Integer.to_string(System.os_time(:second) - 360)
+
+      for opts <- [[signature: bad], [timestamp: stale], [source_id: Ecto.UUID.generate()]] do
+        assert build_conn() |> get_cursor(ctx, "C1", opts) |> json_response(401) == @unauthorized
+      end
+    end
+
+    test "a revoked root is refused", ctx do
+      {1, _} =
+        AdminRepo.update_all(from(d in Dispatch, where: d.id == ^ctx.root.id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert build_conn() |> get_cursor(ctx, "C1") |> json_response(401) == @unauthorized
+    end
+
+    test "a missing change_id is a 400 after the signature", ctx do
+      assert %{"error" => %{"code" => "change_id_required"}} =
+               build_conn() |> get_cursor(ctx, nil) |> json_response(400)
+    end
+
+    test "tenant isolation: another tenant's source reads nothing of this change", ctx do
+      %{secret: secret, source: source} = fixture(:chg_source, %{})
+      other = %{ctx | secret: secret, source: source}
+
+      assert build_conn() |> get_cursor(other, "C1") |> json_response(200) ==
+               %{"change_id" => "C1", "applied_through" => 0, "held" => []}
     end
   end
 end

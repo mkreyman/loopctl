@@ -1,18 +1,18 @@
 defmodule LoopctlWeb.ChangeEventController do
   @moduledoc """
-  chg-server's event webhook (US-47.3, Epic 47 PRD §5):
-  `POST /api/v1/change_events/:source_id`.
+  The chg change-events webhook (US-47.3, Epic 47 PRD §5) and its cursor read (US-50.2):
+  `POST /api/v1/change_events/:source_id` and `GET /api/v1/change_events/:source_id/cursor`.
 
-  A machine endpoint: chg-server calls it, never a session, so it has no MCP tool (the same
-  exemption as the GitHub intake webhook and the runner socket). Not authenticated by API
-  key, so it carries no lineage and can perform no custody act. It is authenticated by
-  `X-Chg-Signature`, an HMAC over `"<X-Chg-Timestamp>.<raw body>"` under the source's
-  `change_events_secret`, checked before the JSON is parsed
-  (`Loopctl.Changes.Events.receive_push/3`). The raw body is captured ahead of `Plug.Parsers`
-  by `LoopctlWeb.Plugs.IntakeRawBody`; if it is absent the event is refused like any other
-  unauthenticated one.
+  Machine endpoints: a fleet machine's chg outbox sender calls them, never a session, so they
+  have no MCP tool (the same exemption as the GitHub intake webhook and the runner socket).
+  Not authenticated by API key, so they carry no lineage and can perform no custody act. They
+  are authenticated by `X-Chg-Signature`, an HMAC over `"<X-Chg-Timestamp>.<raw body>"` (a
+  POST) or `"<X-Chg-Timestamp>.GET.<path>?<query>"` (a GET) under the source's
+  `change_events_secret`, checked before anything is parsed (`Loopctl.Changes.Events`). The
+  raw body is captured ahead of `Plug.Parsers` by `LoopctlWeb.Plugs.IntakeRawBody`; if it is
+  absent the event is refused like any other unauthenticated one.
 
-  The request makes no outbound call (AC-47.3.5): it answers from its own transaction.
+  Neither request makes an outbound call (AC-47.3.5): each answers from its own transaction.
   """
 
   use LoopctlWeb, :controller
@@ -36,10 +36,30 @@ defmodule LoopctlWeb.ChangeEventController do
   # The 500's message, held here for the response and the operation spec alike.
   @apply_failed_message "The event could not be recorded. Redeliver it."
 
+  @cursor_schema %Schema{
+    type: :object,
+    required: [:change_id, :applied_through, :held],
+    properties: %{
+      change_id: %Schema{type: :string},
+      applied_through: %Schema{
+        type: :integer,
+        description: "Every event_seq at or below this is applied; resend from the next"
+      },
+      held: %Schema{
+        type: :array,
+        items: %Schema{type: :integer},
+        description:
+          "Stored event_seqs waiting behind a gap, lowest first, at most 500. Non-empty " <>
+            "means the sender should resend from applied_through + 1."
+      }
+    }
+  }
+
   operation(:create,
-    summary: "Receive a chg change event (chg-server only)",
+    summary: "Receive a chg change event (fleet chg sender only)",
     description:
-      "chg-server delivers each change's event log here, one event per request. A machine " <>
+      "A fleet machine's chg outbox delivers each change's event log here, one event per " <>
+        "request. A machine " <>
         "endpoint with no MCP tool. No API key: the request is authenticated by " <>
         "`X-Chg-Signature: sha256=<hex HMAC-SHA256>` over `\"<X-Chg-Timestamp>.<raw body>\"` " <>
         "keyed by the intake source's `change_events_secret`, with `X-Chg-Timestamp` in unix " <>
@@ -55,8 +75,9 @@ defmodule LoopctlWeb.ChangeEventController do
         "key with different content is 409 `event_conflict`. Events apply in `event_seq` " <>
         "order per change: one arriving ahead of a gap answers 200 with outcome `held` and " <>
         "applies when the gap fills. A kind loopctl does not map is recorded and applied as " <>
-        "a no-op, so it never leaves a gap. Lock contention is 503 `busy` with " <>
-        "`retry-after`: redeliver. Throttled per client IP (429).",
+        "a no-op, so it never leaves a gap. Every 200 carries the change's `cursor`: when " <>
+        "its `held` list is non-empty, resend from `applied_through + 1`. Lock contention " <>
+        "is 503 `busy` with `retry-after`: redeliver. Throttled per client IP (429).",
     security: [],
     parameters: [
       source_id: [in: :path, type: :string, description: "Intake source UUID"],
@@ -105,7 +126,7 @@ defmodule LoopctlWeb.ChangeEventController do
         {"Accepted", "application/json",
          %Schema{
            type: :object,
-           required: [:status, :outcome, :duplicate, :applied_seq],
+           required: [:status, :outcome, :duplicate, :applied_seq, :cursor],
            properties: %{
              status: %Schema{type: :string, enum: ["ok"]},
              outcome: %Schema{type: :string, enum: ["applied", "held", "duplicate"]},
@@ -113,7 +134,8 @@ defmodule LoopctlWeb.ChangeEventController do
              applied_seq: %Schema{
                type: :integer,
                description: "The highest event_seq of this change now applied"
-             }
+             },
+             cursor: @cursor_schema
            }
          }},
       400 => {"Signed but malformed: `invalid_event`", "application/json", Schemas.ErrorResponse},
@@ -153,12 +175,13 @@ defmodule LoopctlWeb.ChangeEventController do
     }
 
     case Events.receive_push(source_id, input) do
-      {:ok, %{outcome: outcome, applied_seq: applied_seq}} ->
+      {:ok, %{outcome: outcome, applied_seq: applied_seq, cursor: cursor}} ->
         json(conn, %{
           status: "ok",
           outcome: outcome,
           duplicate: outcome == :duplicate,
-          applied_seq: applied_seq
+          applied_seq: applied_seq,
+          cursor: cursor
         })
 
       {:error, :unauthorized} ->
@@ -180,6 +203,71 @@ defmodule LoopctlWeb.ChangeEventController do
 
       {:error, _reason} ->
         error(conn, 500, "change_event_failed", @apply_failed_message)
+    end
+  end
+
+  operation(:cursor,
+    summary: "Read a chg change's cursor (fleet chg sender only)",
+    description:
+      "What loopctl holds of one change, for a sender deciding what to resend (US-50.2). " <>
+        "loopctl never pulls events: a sender that sees `held` non-empty resends from " <>
+        "`applied_through + 1`. A machine endpoint with no MCP tool. Signed like the event " <>
+        "POST, but over `\"<X-Chg-Timestamp>.GET.<path>?<query>\"` with the path and query " <>
+        "exactly as sent. Every refusal is the same 401 `invalid_signature` the POST gives. " <>
+        "A change loopctl has never seen answers `applied_through: 0, held: []`, never a " <>
+        "404, so a change id cannot be probed. A missing `change_id` is 400 " <>
+        "`change_id_required`. Throttled per client IP (429).",
+    security: [],
+    parameters: [
+      source_id: [in: :path, type: :string, description: "Intake source UUID"],
+      change_id: [in: :query, type: :string, required: true, description: "The change id"],
+      "X-Chg-Timestamp": [
+        in: :header,
+        type: :string,
+        required: true,
+        description: "Unix seconds at signing"
+      ],
+      "X-Chg-Signature": [
+        in: :header,
+        type: :string,
+        required: true,
+        description: "sha256=<hex HMAC-SHA256 of \"<timestamp>.GET.<path>?<query>\">"
+      ]
+    ],
+    responses: %{
+      200 => {"The change's cursor", "application/json", @cursor_schema},
+      400 => {"`change_id_required`", "application/json", Schemas.ErrorResponse},
+      401 => {"`invalid_signature`", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 => {"`busy`: retry after `retry-after`", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc "GET /api/v1/change_events/:source_id/cursor"
+  def cursor(conn, %{"source_id" => source_id} = params) do
+    input = %{
+      path: conn.request_path,
+      query: conn.query_string,
+      change_id: params["change_id"],
+      timestamp: header(conn, "x-chg-timestamp"),
+      signature: header(conn, "x-chg-signature")
+    }
+
+    case Events.read_cursor(source_id, input) do
+      {:ok, view} ->
+        json(conn, view)
+
+      {:error, :unauthorized} ->
+        unauthorized(conn)
+
+      {:error, {:bad_request, code}} ->
+        error(conn, 400, code, "The change_id query parameter is required.")
+
+      {:error, :busy} ->
+        {:error, :busy}
+
+      {:error, _reason} ->
+        error(conn, 500, "change_cursor_failed", "The cursor could not be read. Retry.")
     end
   end
 
