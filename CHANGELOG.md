@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The chg feedback loop (2026-11-19, Epic 51).**
+  - **The nightly sweep:** `ChgFindingSweepWorker` (04:10 UTC) derives findings from the chg ledger: selection misses, unquarantined flaky tests, merges with no review, stuck changes, and silent senders. It files each finding as a GitHub issue on the owning repository's live intake source, through an outbox drained by `ChgFindingActionWorker`. It closes a finding that stayed quiet for 7 days after its fix, reopens one that recurs, and escalates the second recurrence or a loop depth of 2.
+  - **Env vars:** `CHG_FINDINGS_DAILY_CAP` (default 5 new issues per repository per day) and `CHG_FINDINGS_REPO` (default `mkreyman/chg`, where chg's own selection misses are filed).
+  - **Intake:** a loop-filed issue is admitted on a ticket-gated source without a ticket.
+  - **Merge gate:** on the chg repository, a `:prove_effect` change now clears Gate B when the verifier's `verify@1` verdict carries a passing `selection_replay` (runner contract 1.32.0, optional field).
+  - **New API:** `GET /api/v1/chg_findings` (any key) and `POST /api/v1/chg_findings/:id/clear` (user key, human-anchored).
+  - **Migrations:** `20261119010000`, `20261119020000` and `20261119030000` add tables and columns only, so the rolling deploy needs no ordering.
 - **Operator browser login and the `/chg` dashboard (2026-11-18, US-50.5).** `/login` signs
   a tenant's human in with the passkey enrolled at signup (usernameless, user verification
   required; a security key enrolled without a resident credential cannot sign in, so enroll a
