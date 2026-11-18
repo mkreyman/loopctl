@@ -311,6 +311,18 @@ defmodule Loopctl.Changes.PrReviewOutcomesTest do
       assert %{without_round: 3} = PrReviewOutcomes.totals(source.tenant_id)
     end
 
+    test "an empty round_id is treated as none: a void carrying \"\" cancels nothing",
+         %{source: source, repo: repo} do
+      round_row!(source, repo, 1, round_id: "")
+      round_row!(source, repo, 2, round_id: "")
+      void_row!(source, repo, 1, "")
+
+      by_pr = rounds_by_pr(source.tenant_id)
+      assert %{rounds: 1} = by_pr[1]
+      assert %{rounds: 1} = by_pr[2]
+      assert %{without_round: 2} = PrReviewOutcomes.totals(source.tenant_id)
+    end
+
     test "another tenant's void cancels nothing", %{source: source, repo: repo} do
       {_secret_b, source_b} = fixture(:intake_source, %{})
       round_row!(source, repo, 1, round_id: "shared")

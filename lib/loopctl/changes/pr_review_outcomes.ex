@@ -201,16 +201,19 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
 
   # The `review_round_void` rows that cancel the enclosing query's `:round` row: same tenant,
   # same repository, same `round_id`. Order of arrival does not matter, since a void that
-  # landed before its round still matches it. A round with no `round_id` is never cancelled
-  # (NULL never equals NULL). The tenant is pinned here because `HeavyRead`'s guard walks
-  # only `from` and joins, never a WHERE subquery.
+  # landed before its round still matches it. A round whose `round_id` is missing OR empty is
+  # never cancelled: `nullif` turns "" into NULL, and NULL never equals NULL, so one void
+  # carrying "" cannot cancel every round that also carries "". The expression matches the
+  # partial index `chg_ledger_rows_void_round_id_idx`, so each probe is one index lookup.
+  # The tenant is pinned here because `HeavyRead`'s guard walks only `from` and joins, never
+  # a WHERE subquery.
   defp voided(tenant_id) do
     from v in LedgerRow,
       where:
         v.tenant_id == ^tenant_id and v.kind == @void_kind and
           v.repo == parent_as(:round).repo and
-          fragment("(?->>'round_id')", v.raw) ==
-            fragment("(?->>'round_id')", parent_as(:round).raw),
+          fragment("nullif(?->>'round_id', '')", v.raw) ==
+            fragment("nullif(?->>'round_id', '')", parent_as(:round).raw),
       select: 1
   end
 
