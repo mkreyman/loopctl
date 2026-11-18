@@ -7,6 +7,10 @@ defmodule Loopctl.Workers.ChgLedgerPruneWorker do
   A row is a measurement, not custody evidence: nothing in the audit chain or any gate reads
   it, so the window is a disk bound only. One tenant's failure is logged and the run moves to
   the next tenant, so a fault in one tenant never starves the rest.
+
+  The same nightly run retires source-minted chg reviewer agents that hold no live dispatch
+  (`Loopctl.Changes.ReviewDispatches.retire_idle_reviewers/2`, US-50.3): one agent exists per
+  reviewed revision, and without this they would accumulate looking live.
   """
 
   use Oban.Worker, queue: :default, max_attempts: 3, unique: [period: 3_600]
@@ -14,6 +18,7 @@ defmodule Loopctl.Workers.ChgLedgerPruneWorker do
   require Logger
 
   alias Loopctl.Changes.Ledger
+  alias Loopctl.Changes.ReviewDispatches
   alias Loopctl.Tenants
 
   @impl Oban.Worker
@@ -45,7 +50,13 @@ defmodule Loopctl.Workers.ChgLedgerPruneWorker do
         end
       end)
 
-    Logger.info("chg ledger prune: deleted=#{result.deleted} failed=#{length(result.failed)}")
+    retired = ReviewDispatches.retire_idle_reviewers(now)
+
+    Logger.info(
+      "chg ledger prune: deleted=#{result.deleted} failed=#{length(result.failed)} " <>
+        "reviewers_retired=#{retired}"
+    )
+
     result
   end
 end

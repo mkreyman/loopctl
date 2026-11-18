@@ -204,7 +204,7 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
                ReviewCustody.hold_minted_dispatch(
                  AdminRepo,
                  ctx.tenant_id,
-                 minted["dispatch_id"],
+                 [ctx.root.id, minted["dispatch_id"]],
                  sha("a")
                )
 
@@ -212,9 +212,48 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
                ReviewCustody.hold_minted_dispatch(
                  AdminRepo,
                  ctx.tenant_id,
-                 Ecto.UUID.generate(),
+                 [ctx.root.id, Ecto.UUID.generate()],
                  sha("a")
                )
+    end
+
+    test "a key delegated under a minted key cannot review, even its revision's sha", ctx do
+      minted = mint!(ctx)
+      delegate = fixture(:agent, %{tenant_id: ctx.tenant_id, agent_type: :orchestrator})
+
+      {:ok, %{dispatch: child, raw_key: child_key}} =
+        Dispatches.create_dispatch(ctx.tenant_id, %{
+          parent_dispatch_id: minted["dispatch_id"],
+          role: :orchestrator,
+          agent_id: delegate.id
+        })
+
+      assert child.lineage_path == [ctx.root.id, minted["dispatch_id"], child.id]
+
+      assert %{"error" => %{"code" => "chg_review_dispatch_mismatch"}} =
+               child_key |> review_complete(ctx.story, sha("a")) |> json_response(409)
+
+      # The minted key itself still records its revision.
+      assert minted["api_key"] |> review_complete(ctx.story, sha("a")) |> json_response(201)
+    end
+  end
+
+  describe "retire_idle_reviewers/2" do
+    test "deactivates a reviewer agent with no live dispatch; a re-mint re-activates it", ctx do
+      first = mint!(ctx)
+      agent_id = dispatch(first["dispatch_id"]).agent_id
+      later = DateTime.add(DateTime.utc_now(), 5 * 3_600, :second)
+
+      # Live now: nothing retired.
+      assert ReviewDispatches.retire_idle_reviewers(DateTime.utc_now()) |> is_integer()
+      assert %{status: :active} = AdminRepo.get!(Loopctl.Agents.Agent, agent_id)
+
+      # Past the dispatch's expiry it is idle.
+      assert ReviewDispatches.retire_idle_reviewers(later) >= 1
+      assert %{status: :deactivated} = AdminRepo.get!(Loopctl.Agents.Agent, agent_id)
+
+      mint!(ctx)
+      assert %{status: :active} = AdminRepo.get!(Loopctl.Agents.Agent, agent_id)
     end
   end
 

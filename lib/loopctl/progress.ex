@@ -2807,12 +2807,14 @@ defmodule Loopctl.Progress do
         Multi.new()
         # US-50.3: a key minted by an intake source reviews only ITS revision, and only while
         # its dispatch is live. Read under the review dispatch's row lock, the one a re-mint
-        # takes, so a review and a re-mint for one revision serialise (AC-50.3.3).
+        # takes, so a review and a re-mint for one revision serialise (AC-50.3.3). The whole
+        # lineage, not the leaf: a key delegated under a minted key is refused too, and a
+        # minted key reviewing a story that is not chg-bound has no revision sha to match.
         |> Multi.run(:chg_dispatch, fn repo, _ ->
           ReviewCustody.hold_minted_dispatch(
             repo,
             tenant_id,
-            chg_review.reviewer_dispatch_id,
+            reviewer_lineage,
             chg_review.commit_sha
           )
         end)

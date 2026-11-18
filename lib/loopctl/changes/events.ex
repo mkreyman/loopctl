@@ -228,8 +228,10 @@ defmodule Loopctl.Changes.Events do
   verified again against the held row; `fun` runs inside that transaction. Every refusal is
   `{:error, :unauthorized}`, counted by `event_refused/3`. `fun` may `Repo.rollback/1` with
   `{:bad_request, code}` or `{:rejected, http_status, code}`, which come back as
-  `{:error, ...}` unchanged, or with `{:refused, reason}`, which is the 401; any other rollback
-  is `{:error, :busy}` or `{:error, :apply_failed}` as for a push.
+  `{:error, ...}` unchanged, or with `{:refused, reason}`, which is the 401;
+  `{:unrecorded_dispatch, tenant_id, dispatch_id, reason}` also comes back unchanged, so the
+  caller can revoke a dispatch committed apart from the rolled-back transaction. Any other
+  rollback is `{:error, :busy}` or `{:error, :apply_failed}` as for a push.
 
   `opts`: `:now` and `:lock_timeout_ms`, as for `receive_push/3`.
   """
@@ -239,6 +241,7 @@ defmodule Loopctl.Changes.Events do
              :unauthorized
              | {:bad_request, String.t()}
              | {:rejected, pos_integer(), String.t()}
+             | {:unrecorded_dispatch, Ecto.UUID.t(), Ecto.UUID.t(), term()}
              | :busy
              | :apply_failed}
         when result: term()
@@ -267,6 +270,9 @@ defmodule Loopctl.Changes.Events do
 
         {:error, {:rejected, status, code}} when is_integer(status) and is_binary(code) ->
           {:error, {:rejected, status, code}}
+
+        {:error, {:unrecorded_dispatch, _tenant_id, _dispatch_id, _reason} = unrecorded} ->
+          {:error, unrecorded}
 
         {:error, reason} ->
           failed(source, reason)

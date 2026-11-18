@@ -48,6 +48,8 @@ defmodule Loopctl.Changes.ReviewDispatches do
 
   import Ecto.Query
 
+  require Logger
+
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Artifacts.ReviewRecord
@@ -96,9 +98,65 @@ defmodule Loopctl.Changes.ReviewDispatches do
         AuditChain.announce_entry(entry)
         {:ok, minted}
 
+      {:error, {:unrecorded_dispatch, tenant_id, dispatch_id, reason}} ->
+        revoke_unrecorded(tenant_id, dispatch_id, reason)
+        {:error, :apply_failed}
+
       error ->
         error
     end
+  end
+
+  # Outside every transaction now, so the revoke's own audit append takes the chain lock freely.
+  defp revoke_unrecorded(tenant_id, dispatch_id, reason) do
+    Logger.error(
+      "chg review dispatch not recorded, revoking it: dispatch_id=#{dispatch_id} " <>
+        "reason=#{inspect(reason)}"
+    )
+
+    case Dispatches.revoke(tenant_id, dispatch_id) do
+      {:ok, _} ->
+        :ok
+
+      {:error, revoke_reason} ->
+        Logger.error(
+          "chg review dispatch revoke failed: dispatch_id=#{dispatch_id} " <>
+            "reason=#{inspect(revoke_reason)}; the next mint for its revision revokes it"
+        )
+    end
+  end
+
+  @doc """
+  Retires source-minted reviewer agents (`agent_name/3`) that hold no live dispatch: status
+  `:deactivated`, so the agent list does not fill with one-shot identities that look live.
+  Fleet-wide on `AdminRepo`, at most `limit` per call. A later mint for the same revision
+  re-activates its agent. Returns the number retired.
+  """
+  @spec retire_idle_reviewers(DateTime.t(), pos_integer()) :: non_neg_integer()
+  def retire_idle_reviewers(%DateTime{} = now, limit \\ 1_000)
+      when is_integer(limit) and limit > 0 do
+    live =
+      from d in Dispatch,
+        where:
+          d.tenant_id == parent_as(:agent).tenant_id and d.agent_id == parent_as(:agent).id and
+            is_nil(d.revoked_at) and d.expires_at > ^now,
+        select: 1
+
+    idle =
+      from a in Agent,
+        as: :agent,
+        where: like(a.name, "system:chg-reviewer:%") and a.status != :deactivated,
+        where: not exists(subquery(live)),
+        limit: ^limit,
+        select: a.id
+
+    {count, _} =
+      AdminRepo.update_all(
+        from(a in Agent, where: a.id in subquery(idle)),
+        set: [status: :deactivated, updated_at: now]
+      )
+
+    count
   end
 
   @doc """
@@ -243,13 +301,18 @@ defmodule Loopctl.Changes.ReviewDispatches do
     end)
   end
 
-  # The revision's reviewer identity. `ON CONFLICT DO NOTHING` then a read, so two first mints
-  # for one revision do not fail each other.
+  # The revision's reviewer identity, upserted ON `AdminRepo` so it COMMITS before the mint: the
+  # mint writes the dispatch and its key on `AdminRepo` too, in its own transaction, and both
+  # rows carry a foreign key to this agent. Written inside this Repo transaction instead, the
+  # mint's FK check waits on the uncommitted agent row while this transaction waits on the
+  # mint, a cross-connection wait Postgres cannot see as a deadlock. A re-mint re-activates an
+  # agent `retire_idle_reviewers/2` retired. An agent left by a rolled-back request is inert:
+  # it holds no key, and the next mint for its revision reuses it.
   defp reviewer_agent(tenant_id, source_id, change_id, revision) do
     name = agent_name(source_id, change_id, revision)
     now = DateTime.utc_now()
 
-    Repo.insert_all(
+    AdminRepo.insert_all(
       Agent,
       [
         %{
@@ -264,11 +327,11 @@ defmodule Loopctl.Changes.ReviewDispatches do
           updated_at: now
         }
       ],
-      on_conflict: :nothing,
+      on_conflict: [set: [status: :active, updated_at: now]],
       conflict_target: [:tenant_id, :name]
     )
 
-    case Repo.one(
+    case AdminRepo.one(
            from a in Agent,
              where: a.tenant_id == ^tenant_id and a.name == ^name,
              select: a.id
@@ -278,10 +341,11 @@ defmodule Loopctl.Changes.ReviewDispatches do
     end
   end
 
-  # The mint committed on AdminRepo already, apart from this Repo transaction. So a failure
-  # here revokes the new dispatch before rolling back: a rolled-back mint leaves no live key no
-  # row records. (A crash between the two is covered by the next mint for the revision, which
-  # revokes every live dispatch of the revision's agent.)
+  # The mint committed on AdminRepo already, apart from this Repo transaction. A failure here
+  # rolls back carrying the dispatch id, and `request/3` revokes it AFTER the transaction ends:
+  # revoking from in here would append to the audit chain on AdminRepo while this transaction
+  # holds the tenant's chain lock, and wait on itself. (A crash between the two is covered by
+  # the next mint for the revision, which revokes every live dispatch of the revision's agent.)
   defp record!(source, repo, change_id, revision, dispatch) do
     row = %ReviewDispatch{
       tenant_id: source.tenant_id,
@@ -297,8 +361,7 @@ defmodule Loopctl.Changes.ReviewDispatches do
       entry
     else
       {:error, reason} ->
-        _ = Dispatches.revoke(source.tenant_id, dispatch.id)
-        Repo.rollback({:audit_failed, reason})
+        Repo.rollback({:unrecorded_dispatch, source.tenant_id, dispatch.id, reason})
     end
   end
 

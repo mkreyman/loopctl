@@ -255,7 +255,9 @@ descendant of the root (`chg_reviewer_required`, the root's own key included), t
 (`commit_sha_not_bound`); one reviewer dispatch records one verdict, held by the unique index
 `review_records_reviewer_dispatch_uidx` (`chg_review_already_recorded`); and a key an intake
 source minted (a `chg_review_dispatches` row) records only ITS revision's sha while its dispatch
-is live (`chg_review_dispatch_mismatch`, `ReviewCustody.hold_minted_dispatch/4`), read under
+is live, and a key delegated UNDER a minted key records nothing
+(`chg_review_dispatch_mismatch`, `ReviewCustody.hold_minted_dispatch/4`, which reads the
+reviewer's whole lineage, not its leaf), read under
 that row's lock inside the review's own transaction — the lock a re-mint takes, so a verdict
 and a re-mint for one revision serialise. On any other story
 `commit_sha` is not stored, so a review recorded before binding never counts as a chg review.
@@ -290,7 +292,7 @@ without its hold. Such a story is never verified: every path that reaches `verif
 verify and verify-all through `chg_landed_review/2` (`progress.ex:3128`), bulk verify
 through `process_verify/3` (`bulk_operations.ex:433`), backfill and bulk mark-complete
 through `guard_backfill/3` (`progress.ex:3240`) — calls one function,
-`ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:261`). It refuses a chg story with
+`ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:272`). It refuses a chg story with
 `review_missing_escalated` while its stage is escalated over `:review_missing` (a human
 resolves it) and with `chg_review_not_for_landed_revision` unless a chg review names its
 LANDED revision: the `sha` of the newest APPLIED `landed` event of its current binding. A

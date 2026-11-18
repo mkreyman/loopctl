@@ -177,30 +177,41 @@ defmodule Loopctl.Changes.ReviewCustody do
   defp bound_revision(_tenant_id, _chg, _commit_sha), do: {:error, :commit_sha_not_bound}
 
   @doc """
-  Inside the review's own transaction on `repo` (US-50.3): when `dispatch_id` was minted by an
-  intake source (`Loopctl.Changes.ReviewDispatches`), takes that review dispatch's row lock,
-  then refuses `{:error, :chg_review_dispatch_mismatch}` when the dispatch is revoked or
-  `commit_sha` is not the sha of the revision it was minted for. `:ok` for a `nil` dispatch and
-  for a dispatch no intake source minted.
+  Inside the review's own transaction on `repo` (US-50.3), given the reviewer's dispatch
+  `lineage` (root first, the reviewing dispatch last). When the LEAF was minted by an intake
+  source (`Loopctl.Changes.ReviewDispatches`), takes that review dispatch's row lock, then
+  refuses `{:error, :chg_review_dispatch_mismatch}` when the dispatch is revoked or
+  `commit_sha` is not the sha of the revision it was minted for. When a NON-leaf entry was
+  source-minted, the reviewer is a key delegated under a minted key, and it is refused the
+  same way: its verdict would escape both the revision binding and the re-mint's verdict
+  check, which read the minted dispatch. `:ok` when no dispatch on the lineage was minted.
 
   The lock is the one `ReviewDispatches` takes before it decides a re-mint, so a verdict and a
   re-mint for one revision serialise: whichever commits first, the other sees it.
   """
-  @spec hold_minted_dispatch(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil, term()) ::
+  @spec hold_minted_dispatch(Ecto.Repo.t(), Ecto.UUID.t(), [Ecto.UUID.t()], term()) ::
           {:ok, :not_minted | :held} | {:error, :chg_review_dispatch_mismatch}
-  def hold_minted_dispatch(_repo, _tenant_id, nil, _commit_sha), do: {:ok, :not_minted}
+  def hold_minted_dispatch(_repo, _tenant_id, [], _commit_sha), do: {:ok, :not_minted}
 
-  def hold_minted_dispatch(repo, tenant_id, dispatch_id, commit_sha) do
+  def hold_minted_dispatch(repo, tenant_id, lineage, commit_sha) when is_list(lineage) do
+    leaf = List.last(lineage)
+
     minted =
-      repo.one(
+      repo.all(
         from r in ReviewDispatch,
-          where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id,
+          where: r.tenant_id == ^tenant_id and r.dispatch_id in ^lineage,
           lock: "FOR UPDATE"
       )
 
     case minted do
-      nil -> {:ok, :not_minted}
-      %ReviewDispatch{} = row -> judge_minted(repo, tenant_id, row, commit_sha)
+      [] ->
+        {:ok, :not_minted}
+
+      [%ReviewDispatch{dispatch_id: ^leaf} = row] ->
+        judge_minted(repo, tenant_id, row, commit_sha)
+
+      _delegated ->
+        {:error, :chg_review_dispatch_mismatch}
     end
   end
 
