@@ -60,7 +60,66 @@ defmodule Loopctl.Dispatches do
           {:ok, %{dispatch: Dispatch.t(), raw_key: String.t()}} | {:error, term()}
   def create_dispatch(tenant_id, attrs, opts \\ []) do
     parsed = parse_dispatch_attrs(attrs)
-    do_create_dispatch(tenant_id, parsed, opts)
+    # The parent rule is this function's own and never an input: only
+    # `mint_chg_reviewer/4` resolves a parent any other way.
+    do_create_dispatch(tenant_id, parsed, Keyword.delete(opts, :resolve_parent))
+  end
+
+  @doc "The longest a dispatch (and its key) may live, in seconds."
+  @spec max_expires_seconds() :: pos_integer()
+  def max_expires_seconds, do: @max_expires_seconds
+
+  @doc """
+  Mints one chg review dispatch (US-50.3): an `:orchestrator` child of the source's chg root
+  `root_id`, for `agent_id`, living `#{@max_expires_seconds}` seconds, with its ephemeral key.
+
+  The ONE server-side path that mints under a parent without consulting a caller's lineage,
+  because its caller is a chg intake source authenticated by its HMAC
+  (`Loopctl.Changes.ReviewDispatches`), not a key. It differs from `create_dispatch/3` in one
+  rule only: the parent must be an UNREVOKED chg root (parentless, `:orchestrator`,
+  `lineage_path == [id]`, the rule `Loopctl.Intake` enrols a source under), and its own key's
+  EXPIRY does not matter. A root's key lives at most #{@max_expires_seconds} seconds and nothing
+  holds it after that, so requiring a live one would make every source unable to mint once its
+  enrolment was a few hours old. Revocation still ends it. Never reach this from a
+  key-authenticated route.
+
+  `opts`: `:actor_lineage` for the audit entry.
+  """
+  @spec mint_chg_reviewer(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, %{dispatch: Dispatch.t(), raw_key: String.t()}} | {:error, term()}
+  def mint_chg_reviewer(tenant_id, root_id, agent_id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(root_id) and is_binary(agent_id) do
+    parsed =
+      parse_dispatch_attrs(%{
+        parent_dispatch_id: root_id,
+        role: :orchestrator,
+        agent_id: agent_id,
+        expires_in_seconds: @max_expires_seconds
+      })
+
+    do_create_dispatch(
+      tenant_id,
+      parsed,
+      Keyword.put(opts, :resolve_parent, &unrevoked_chg_root/2)
+    )
+  end
+
+  defp unrevoked_chg_root(tenant_id, root_id) do
+    root =
+      from(d in Dispatch,
+        where:
+          d.id == ^root_id and d.tenant_id == ^tenant_id and is_nil(d.revoked_at) and
+            is_nil(d.parent_dispatch_id) and d.role == :orchestrator
+      )
+      |> AdminRepo.one()
+
+    case root do
+      %Dispatch{lineage_path: [id]} = root when id == root.id ->
+        {:ok, %{lineage: root.lineage_path, parent: root}}
+
+      _ ->
+        {:error, :chg_root_invalid}
+    end
   end
 
   defp parse_dispatch_attrs(attrs) do
@@ -185,7 +244,8 @@ defmodule Loopctl.Dispatches do
     multi =
       Multi.new()
       |> Multi.run(:resolve_lineage, fn _repo, _changes ->
-        resolve_lineage(tenant_id, parent_id)
+        resolve = Keyword.get(opts, :resolve_parent, &resolve_lineage/2)
+        resolve.(tenant_id, parent_id)
       end)
       |> Multi.run(:verify_attestation, fn _repo,
                                            %{

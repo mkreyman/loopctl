@@ -1,0 +1,77 @@
+{
+  "id": "US-50.4",
+  "title": "Review outcomes from merged PR bodies",
+  "epic": {
+    "id": "epic_50",
+    "name": "chg change ledger and dashboard"
+  },
+  "priority": "medium",
+  "phase": "chg_ledger",
+  "story": {
+    "as_a": "operator",
+    "i_want_to": "see each merged PR's review findings by severity and disposition, and its counted rounds",
+    "so_that": "a PR merged with no counted review round, or with unfixed findings, is visible without reading PR bodies by hand"
+  },
+  "rationale": "loopctl#1014 audit question: review rounds per PR. On 2026-10-29 HCB#3260 merged with no counted round.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-50.4.1",
+      "description": "A merged pull request on a repo with an intake source enqueues one Oban job (unique on tenant, repo, PR number) that reads the PR body through the tenant's GitHub token and parses its ## Review findings section in the format bin/review-dispositions.py --render prints: one row per finding with disposition, file, line and severity."
+    },
+    {
+      "id": "AC-50.4.2",
+      "description": "A new tenant-scoped table pr_review_outcomes stores (source_id, repo, pr_number, merged_at, merge_sha, findings JSON, has_review_section), unique on (tenant_id, repo, pr_number); a re-run replaces the row."
+    },
+    {
+      "id": "AC-50.4.3",
+      "description": "Round counts come from ledger rows of kind review_round (US-50.1) keyed by repo and PR; a merged PR with no review_round row is reported as merged_without_counted_round."
+    },
+    {
+      "id": "AC-50.4.4",
+      "description": "A body with no section, or a line the parser cannot read, is stored with has_review_section false or the line under unparsed; the job never fails on body content. A GitHub error retries with backoff and never blocks the intake webhook."
+    },
+    {
+      "id": "AC-50.4.5",
+      "description": "Tenant isolation: tenant B never reads tenant A's outcomes."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-50.4.1",
+      "name": "parse a rendered section",
+      "type": "unit",
+      "preconditions": ["a body rendered by review-dispositions.py with three findings"],
+      "steps": ["parse it"],
+      "expected_results": ["three findings with disposition, file, line, severity"]
+    },
+    {
+      "id": "TC-50.4.2",
+      "name": "merge enqueues once",
+      "type": "integration",
+      "preconditions": ["an intake source", "mocked GitHub client"],
+      "steps": ["deliver the closed+merged webhook twice"],
+      "expected_results": ["one job", "one pr_review_outcomes row"]
+    },
+    {
+      "id": "TC-50.4.3",
+      "name": "no section and no round",
+      "type": "integration",
+      "preconditions": ["a merged PR body without the section", "no review_round row"],
+      "steps": ["run the job", "read the summary"],
+      "expected_results": ["has_review_section false", "the PR is listed merged_without_counted_round"]
+    },
+    {
+      "id": "TC-50.4.4",
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": ["outcomes in tenant A"],
+      "steps": ["read as tenant B"],
+      "expected_results": ["none visible"]
+    }
+  ],
+  "technical_notes": [
+    "The render format is claude-config bin/review-dispositions.py; copy its vocabulary into a module attribute and pin it with a fixture taken from a real merged PR body.",
+    "GitHub calls go through the existing forge behaviour on the tenant's own token (#936)."
+  ],
+  "dependencies": ["US-50.1"]
+}

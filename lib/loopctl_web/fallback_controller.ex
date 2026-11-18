@@ -624,6 +624,7 @@ defmodule LoopctlWeb.FallbackController do
       when code in [
              :chg_reviewer_required,
              :chg_review_already_recorded,
+             :chg_review_dispatch_mismatch,
              :chg_root_cannot_verify,
              :chg_root_review_only,
              :review_missing_escalated,
@@ -1411,6 +1412,9 @@ defmodule LoopctlWeb.FallbackController do
 
   defp chg_custody_message(:chg_review_already_recorded),
     do: Messages.chg_review_already_recorded()
+
+  defp chg_custody_message(:chg_review_dispatch_mismatch),
+    do: Messages.chg_review_dispatch_mismatch()
 
   defp chg_custody_message(:chg_root_cannot_verify), do: Messages.chg_root_cannot_verify()
   defp chg_custody_message(:chg_root_review_only), do: Messages.chg_root_review_only()

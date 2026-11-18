@@ -298,15 +298,31 @@ defmodule Loopctl.ObanPluginsConfigTest do
 
     test "the ChangeReconcileSweepWorker entry exists in the crontab", %{entry: entry} do
       assert entry,
-             "expected a ChangeReconcileSweepWorker crontab entry — without it nothing pulls " <>
+             "expected a ChangeReconcileSweepWorker crontab entry — without it nothing flags " <>
                "a chg change whose events have a gap, or a quiet bound change, and a lost " <>
-               "event holds the change behind the gap for ever (AC-47.3.3)"
+               "event holds the change behind the gap with nobody told (US-50.2)"
     end
 
     test "it runs every five minutes, fleet-wide in one job", %{entry: entry} do
-      # The gap threshold is ten minutes, so a five-minute cadence pulls a gap at 10-15.
+      # The gap threshold is ten minutes, so a five-minute cadence flags a gap at 10-15.
       assert elem(entry, 0) == "*/5 * * * *"
       assert tuple_size(entry) == 2
+    end
+  end
+
+  describe "US-50.1: ChgLedgerPruneWorker crontab entry" do
+    test "it runs nightly and is not parked" do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+      {Oban.Plugins.Cron, cron_opts} = Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], &(elem(&1, 1) == Loopctl.Workers.ChgLedgerPruneWorker))
+
+      assert entry,
+             "expected a ChgLedgerPruneWorker crontab entry — nothing else prunes the ledger"
+
+      assert elem(entry, 0) == "40 3 * * *"
+      refute Loopctl.Workers.ChgLedgerPruneWorker in Loopctl.ObanConfig.parked_crons()
     end
   end
 

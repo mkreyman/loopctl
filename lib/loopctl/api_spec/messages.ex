@@ -40,9 +40,20 @@ defmodule Loopctl.ApiSpec.Messages do
   @spec chg_reviewer_required() :: String.t()
   def chg_reviewer_required do
     "This story is bound to a chg change, so its review is accepted only from a key whose " <>
-      "dispatch chg-server minted for the review: a strict descendant of the intake " <>
-      "source's chg_root_dispatch_id. Neither chg-server's root key nor any key outside " <>
-      "that subtree can record it."
+      "dispatch was minted for the review under the intake source " <>
+      "(POST /api/v1/change_events/:source_id/review_dispatch): a strict descendant of the " <>
+      "source's chg_root_dispatch_id. Neither the root's own key nor any key outside that " <>
+      "subtree can record it."
+  end
+
+  @doc "The 409 `chg_review_dispatch_mismatch` message (a source-minted key off its revision)."
+  @spec chg_review_dispatch_mismatch() :: String.t()
+  def chg_review_dispatch_mismatch do
+    "This key was minted by the intake source for ONE revision of one change " <>
+      "(POST /api/v1/change_events/:source_id/review_dispatch), and it records a review only " <>
+      "of that revision's commit, only while its dispatch is live. The `commit_sha` sent is " <>
+      "another revision's, or the dispatch was revoked by a later mint for the same revision. " <>
+      "Ask for a key for the revision you reviewed."
   end
 
   @doc "The 422 `commit_sha_not_bound` message (review-complete on a chg story)."
@@ -57,9 +68,8 @@ defmodule Loopctl.ApiSpec.Messages do
   @doc "The 409 `chg_review_already_recorded` message (one verdict per reviewer dispatch)."
   @spec chg_review_already_recorded() :: String.t()
   def chg_review_already_recorded do
-    "This reviewer dispatch has already recorded its verdict. chg-server mints one reviewer " <>
-      "dispatch per (change, revision) review, and each records exactly one; a further " <>
-      "review needs a new dispatch."
+    "This reviewer dispatch has already recorded its verdict. The intake source mints one " <>
+      "live reviewer dispatch per (change, revision), and each records exactly one verdict."
   end
 
   @doc "The 409 `chg_root_cannot_verify` message (verify, reject, verify-all, bulk, backfill)."

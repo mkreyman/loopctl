@@ -459,6 +459,12 @@ end
 
 Two lineages share a prefix if they descend from the same ancestor dispatch — which means a common orchestrator dispatched both. The verifier must come from a lineage with no common ancestor with the implementer.
 
+### 6.2.1 Source-minted chg reviewers (US-50.3)
+
+A story bound to a chg change takes its review only from a strict descendant of its intake source's `chg_root_dispatch_id` (US-47.5). No process holds that root's key: a dispatch key lives at most four hours, and the operator key cannot mint under a root outside its own lineage. So the source itself mints the reviewer. `POST /api/v1/change_events/:source_id/review_dispatch` `{change_id, revision}`, signed with the source's `change_events_secret` exactly like a change event, mints an `:orchestrator` child of the root for one applied `submitted` revision (`Loopctl.Changes.ReviewDispatches`, `Loopctl.Dispatches.mint_chg_reviewer/4`). The root's expiry does not matter; its revocation ends minting.
+
+The trust this moves, stated so nobody reads more into it: **whoever holds a source's `change_events_secret` can mint reviewers for that source's changes**, as chg-server could have before it was dropped. loopctl proves the source minted the key, not that the review ran apart from the implementer's session; that separation is the fleet's chgd to construct. No custody gate is loosened: the key is refused claim and report (`chg_root_review_only`) and verify and reject (`chg_root_cannot_verify`), one live dispatch exists per `(source, change, revision)`, and a revision whose review is recorded is never re-minted (`409 review_already_recorded`). The mint path takes no caller lineage, so it is reachable only from that HMAC-authenticated route.
+
 ### 6.3 Rotating verifier selection
 
 At `request_review` time, loopctl selects a verifier lineage. The selection algorithm:

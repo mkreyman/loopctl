@@ -153,6 +153,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.PrReviewOutcomeWorker
 
   # The largest webhook body the intake route reads. An `issues` payload with a maximal
   # 65,536-character body, escaped, plus its repository and user objects, stays well under
@@ -1364,27 +1365,6 @@ defmodule Loopctl.Intake do
   @spec delivery_source(term()) :: Source.t() | nil
   def delivery_source(source_id), do: active_source(source_id)
 
-  @doc """
-  The tenant's live `chg` source for `repo_full_name` (case-insensitively, as GitHub names
-  are), or `nil`. What a change-events gap pull signs with: the source live NOW, so a
-  re-enrolled repository's new secret is the one used (US-47.3).
-  """
-  @spec chg_source_for_repo(Ecto.UUID.t(), String.t()) :: Source.t() | nil
-  def chg_source_for_repo(tenant_id, repo_full_name)
-      when is_binary(tenant_id) and is_binary(repo_full_name) do
-    name = String.downcase(repo_full_name)
-
-    AdminRepo.one(
-      from s in live_sources_query(tenant_id),
-        join: t in Tenant,
-        on: t.id == s.tenant_id,
-        where:
-          s.mode == :chg and fragment("lower(?)", s.repo_full_name) == ^name and
-            t.status == :active,
-        limit: 1
-    )
-  end
-
   defp active_source(source_id) do
     case Ecto.UUID.cast(source_id) do
       {:ok, id} ->
@@ -1443,6 +1423,19 @@ defmodule Loopctl.Intake do
     end
   end
 
+  # US-50.4: a merged pull request queues one read of its review outcome. Only the number is
+  # taken from the payload; the job reads the body itself, through the tenant's credential.
+  defp plan(
+         "pull_request",
+         %{
+           "action" => "closed",
+           "pull_request" => %{"merged" => true, "number" => number}
+         },
+         _source
+       )
+       when is_integer(number) and number > 0 and number <= 2_147_483_647,
+       do: {:ok, {:pr_merged, "closed", number}}
+
   defp plan(_event, payload, _source), do: {:ok, {:ignored, GithubPayload.action(payload)}}
 
   defp apply_delivery(source, event, delivery_id, raw_body, plan) do
@@ -1463,6 +1456,7 @@ defmodule Loopctl.Intake do
       case plan do
         {:ping, _} -> {"ping", nil, nil}
         {:issue, action, issue} -> {"recorded", action, issue.number}
+        {:pr_merged, action, _number} -> {"recorded", action, nil}
         {:ignored, action} -> {"ignored", action, nil}
       end
 
@@ -1491,6 +1485,24 @@ defmodule Loopctl.Intake do
 
   defp apply_plan(_source, _delivery_id, {:ping, _}), do: :ping
   defp apply_plan(_source, _delivery_id, {:ignored, _action}), do: :ignored
+
+  # The enqueue never fails the delivery: a lost review-outcome read costs an audit row, while
+  # failing here would make GitHub redeliver, and a redelivery is a duplicate the unique index
+  # answers without queueing anything.
+  defp apply_plan(source, _delivery_id, {:pr_merged, _action, number}) do
+    case Oban.insert(PrReviewOutcomeWorker.new_for(source, number)) do
+      {:ok, _job} ->
+        :recorded
+
+      {:error, reason} ->
+        Logger.error(
+          "intake: review-outcome job not queued source_id=#{source.id} pr=#{number} " <>
+            "reason=#{inspect(reason)}"
+        )
+
+        :recorded
+    end
+  end
 
   defp apply_plan(source, delivery_id, {:issue, action, issue}) do
     extraction = TicketFacts.extract(issue.title, issue.body)

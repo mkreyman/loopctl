@@ -90,6 +90,7 @@ import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-versi
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 import { changeBindingGet as changeBindingGetRequest } from "./lib/change-bindings.js";
 import { agentOutcomes } from "./lib/agent-outcomes.js";
+import { chgLedgerSummary } from "./lib/chg-ledger-summary.js";
 import {
   clearGithubCredential as clearGithubCredentialRequest,
   githubCredential as githubCredentialRequest,
@@ -3504,6 +3505,18 @@ async function agentOutcomesRead(args) {
   );
 }
 
+// US-50.6: a READ of the chg ledger summary, `role: :agent` with the hierarchy — keyed as
+// agentOutcomesRead is, LOOPCTL_AGENT_KEY as an OVERRIDE so `resolveKey`'s order holds.
+async function chgLedgerSummaryRead(args) {
+  const key = process.env.LOOPCTL_AGENT_KEY;
+
+  return toContent(
+    await chgLedgerSummary(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, key),
+    }),
+  );
+}
+
 async function resolveEscalation(args) {
   return toContent(await resolveEscalationRequest(args, deliveryDeps()));
 }
@@ -5026,7 +5039,10 @@ const TOOLS = [
       "chg_root_dispatch_id — else 409 chg_reviewer_required (chg-server's root key is " +
       "refused too); commit_sha is REQUIRED and must be the sha of a submitted revision of " +
       "the story's current change, else 422 commit_sha_not_bound; and one reviewer dispatch " +
-      "records one verdict, a second is 409 chg_review_already_recorded. On any other story " +
+      "records one verdict, a second is 409 chg_review_already_recorded. A key the intake " +
+      "source minted (review_dispatch, loopctl US-50.3) reviews only the revision it was " +
+      "minted for, and only while its dispatch is live, else 409 " +
+      "chg_review_dispatch_mismatch. On any other story " +
       "commit_sha is ignored and not stored. On a PULL-REQUEST-ROUTE story (loopctl " +
       "US-48.18) only the key of the story's bound verify@1 dispatch may record the review, " +
       "else 409 pr_route_verifier_only — a user key included.",
@@ -8950,6 +8966,45 @@ const TOOLS = [
     },
   },
   {
+    name: "chg_ledger_summary",
+    description:
+      "THE CHG AUDIT QUESTIONS, ANSWERED (GET /api/v1/chg_ledger/summary, loopctl US-50.6): " +
+      "what the /chg dashboard shows, computed server-side by the same functions, from the " +
+      "ledger rows the fleet's chg outboxes sent. Panels: `gate_outcomes` (per day and kind " +
+      "`chg`/`gate`, counts per verdict), `fallbacks` (checks that ran mode all, the rate, " +
+      "the top reasons), `selection` (stats, plus misses: a chg check that passed on a " +
+      "commit whose gate failed), `phase_times` (hydrate, static, affected, tests, " +
+      "lock_wait: rows, mean and max ms), `flaky`, `runner_samples`, `review_outcomes` " +
+      "(merged PRs' findings by severity and disposition, and how many merged without a " +
+      "counted review round), `attention` (changes flagged gap or stale). Lists are capped " +
+      "at 50 rows. A panel whose read was shed under load is the string `unavailable`; " +
+      "retry later, the others are unaffected.\n\n" +
+      "Filters, all optional: `repo` (owner/name), `host` (a fleet host; review outcomes " +
+      "and flagged changes carry none and ignore it), `since` (ISO 8601, inclusive; default " +
+      "7 days before `until`), `until` (ISO 8601, exclusive; default now). Any key of the " +
+      "tenant may read it (`role: :agent` with the hierarchy), so the key is the usual " +
+      "order with LOOPCTL_AGENT_KEY as this tool's own: LOOPCTL_API_KEY when set, else " +
+      "LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY. REFUSES: 422 for a timestamp that is not " +
+      "ISO 8601, a `since` not before `until`, or a period over 90 days; 401 for no key or " +
+      "one that does not authenticate; 429 when rate limited. No 403: every key role " +
+      "clears the gate. Those 422 cases are refused locally too (status 0, nothing sent).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Only this repository, owner/name." },
+        host: { type: "string", description: "Only rows from this fleet host." },
+        since: {
+          type: "string",
+          description: "ISO 8601 start, inclusive. Default 7 days before `until`.",
+        },
+        until: {
+          type: "string",
+          description: "ISO 8601 end, exclusive. Default now. At most 90 days after `since`.",
+        },
+      },
+    },
+  },
+  {
     name: "change_binding_get",
     description:
       "THE CHG CHANGES BOUND TO A STORY (GET /api/v1/stories/:id/changes, loopctl US-47.7): " +
@@ -9234,11 +9289,14 @@ const TOOLS = [
       "THEN CONFIGURE GITHUB — the tool stops at the loopctl end and this is the other half. " +
       "On the repository: Settings > Webhooks > Add webhook, Payload URL = the `webhook_url` " +
       "returned, Content type = application/json, Secret = the contents of `secret_file`, and " +
-      "under 'Let me select individual events' tick ISSUES ONLY. The secret is the HMAC key " +
+      "under 'Let me select individual events' tick ISSUES and PULL REQUESTS (a merged pull " +
+      "request queues a read of its `## Review findings` section; every other pull-request " +
+      "action is recorded as ignored). The secret is the HMAC key " +
       "GitHub signs the RAW body with as `X-Hub-Signature-256`; loopctl verifies it before " +
       "trusting a byte. In one command, without the secret ever passing through this " +
       "transcript: gh api repos/OWNER/REPO/hooks -f name=web -f config[url]=<webhook_url> -f " +
-      "config[content_type]=json -f config[secret]=\"$(cat <secret_file>)\" -f 'events[]=issues'\n\n" +
+      "config[content_type]=json -f config[secret]=\"$(cat <secret_file>)\" -f 'events[]=issues' " +
+      "-f 'events[]=pull_request'\n\n" +
       "EVERY delivery failure afterwards is the SAME 401 `invalid_signature` — an unknown or " +
       "revoked source, a suspended tenant, a missing or wrong signature, and a payload whose " +
       "`repository.full_name` does not match this source's repository. That is deliberate (a " +
@@ -10665,6 +10723,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "agent_outcomes":
       return await agentOutcomesRead(args);
+    case "chg_ledger_summary":
+      return await chgLedgerSummaryRead(args);
 
     case "resolve_escalation":
       return await resolveEscalation(args);

@@ -6,6 +6,23 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Operator browser login and the `/chg` dashboard (2026-11-18, US-50.5).** `/login` signs
+  a tenant's human in with the passkey enrolled at signup (usernameless, user verification
+  required; a security key enrolled without a resident credential cannot sign in, so enroll a
+  passkey). The session is server-side (`browser_sessions`), lasts 8 hours, and is ended by
+  logout, an authenticator revoke or a tenant leaving `:active`. `/chg` shows gate outcomes,
+  the fallback rate, selection quality, phase times, flaky tests, runner samples, merged-PR
+  review outcomes and changes flagged gap or stale, filterable by repo, host and period. The
+  migration `20261118220000` adds `browser_sessions` and `webauthn_login_challenges`; new
+  tables only, so the rolling deploy needs no ordering.
+- **`CHG_SERVER_URL` is removed; loopctl no longer pulls chg change events (2026-11-18,
+  US-50.2).** There is no chg-server: the fleet's chg outboxes send events, and loopctl
+  cannot reach them. Every 200 from `POST /api/v1/change_events/:source_id` now carries
+  `cursor: {change_id, applied_through, held}`, and the new signed
+  `GET /api/v1/change_events/:source_id/cursor?change_id=` answers it alone; a sender resends
+  from `applied_through + 1`. A change held behind a gap for 10 minutes, or a bound change
+  quiet for 6 hours, raises one `changes.gap` / `changes.stale` operator alert instead of a
+  pull. Unset `CHG_SERVER_URL` if a deployment set it; it is now ignored.
 - **A project slug may contain `_`, and a kb scope's name must equal its slug (2026-11-11,
   #1038).** A repo channel is named and slugged by the repo basename verbatim
   (`home_care_billing`). `POST /api/v1/kb-scopes` refuses a `name` that is a different

@@ -9,7 +9,8 @@ defmodule Loopctl.Changes.Event do
     it have applied. `effect` is what applying it did (`Loopctl.Changes.EventEffects`).
   - `data` is chg's per-kind payload, stored as received. It is UNTRUSTED text: nothing reads
     it as an instruction, and nothing but the effects module reads it at all.
-  - `received_via` is `"push"` (the webhook) or `"pull"` (gap or staleness reconciliation).
+  - `received_via` is `"push"` (the webhook). Rows written before US-50.2 may read `"pull"`,
+    from the retired chg-server gap pull.
 
   Written only by `Loopctl.Changes.Events` from a validated `Loopctl.Changes.Envelope`; there
   is no changeset because no field of this row is ever cast from a request. `tenant_id` and

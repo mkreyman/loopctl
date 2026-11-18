@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # epic/** too: an epic's stories are commits pushed straight to its branch with no PR
+    # until the last one, so a push is the only event that can gate them. Deploy stays
+    # master-only (its job conditions name refs/heads/master).
+    branches: [master, "epic/**"]
   pull_request:
     branches: [master]
   schedule:

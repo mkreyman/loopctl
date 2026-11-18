@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.14.0 — 2026-11-18
+
+### Added
+
+- **`chg_ledger_summary`** (loopctl US-50.6): the chg audit questions the `/chg` dashboard
+  answers — gate outcomes, fallback rate, selection quality and misses, phase times, flaky
+  tests, runner samples, merged-PR review outcomes, changes flagged gap or stale — filtered
+  by `repo`, `host`, `since`, `until` (at most 90 days). Any tenant key.
+
 ## 3.13.1 — 2026-11-11
 
 ### Changed

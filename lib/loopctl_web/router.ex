@@ -26,6 +26,12 @@ defmodule LoopctlWeb.Router do
     }
   end
 
+  # US-50.5 — the operator's browser session, on top of `:browser`. Asks
+  # `BrowserLogin.validate/2` on every request; the LiveView half is `BrowserAuth.on_mount/4`.
+  pipeline :browser_session do
+    plug LoopctlWeb.Plugs.RequireBrowserSession
+  end
+
   pipeline :api do
     plug :accepts, ["json"]
     plug OpenApiSpex.Plug.PutApiSpec, module: Loopctl.ApiSpec
@@ -95,6 +101,38 @@ defmodule LoopctlWeb.Router do
     live_session :public_wiki, root_layout: {LoopctlWeb.Layouts, :root} do
       live "/wiki", WikiIndexLive, :index
       live "/wiki/:slug", WikiShowLive, :show
+    end
+  end
+
+  # US-50.5 — the operator's browser login: a WebAuthn assertion with the credential enrolled
+  # at signup (`Loopctl.WebAuthn.BrowserLogin`, which is `Reauth`'s usernameless ceremony).
+  # `/login` is public, since it is how a session starts, in its own live_session so its
+  # `session:` MFA can hand it the HTTP-resolved client IP for its rate limit. The assertion is
+  # POSTed to `BrowserSessionController` because a LiveView cannot write the session cookie;
+  # that POST and the logout DELETE go through `:browser`'s CSRF protection.
+  scope "/", LoopctlWeb do
+    pipe_through :browser
+
+    live_session :browser_login,
+      session: {LoopctlWeb.BrowserAuth, :login_session, []},
+      root_layout: {LoopctlWeb.Layouts, :root} do
+      live "/login", LoginLive, :index
+    end
+
+    post "/login", BrowserSessionController, :create
+    delete "/logout", BrowserSessionController, :delete
+  end
+
+  # US-50.5 — the chg dashboard. BOTH layers guard it: `:browser_session` on the HTTP request,
+  # and the `:operator` live_session's `on_mount` on every mount, including a live navigation
+  # that never reaches the router's plugs.
+  scope "/", LoopctlWeb do
+    pipe_through [:browser, :browser_session]
+
+    live_session :operator,
+      on_mount: {LoopctlWeb.BrowserAuth, :require_browser_session},
+      root_layout: {LoopctlWeb.Layouts, :root} do
+      live "/chg", ChgLive, :index
     end
   end
 
@@ -172,9 +210,11 @@ defmodule LoopctlWeb.Router do
     post "/intake/github/:source_id", GithubIntakeController, :deliver
   end
 
-  # US-47.3 — chg-server's change-events webhook. Authenticated like the GitHub intake one, by
-  # an HMAC over the raw body (captured by the same LoopctlWeb.Plugs.IntakeRawBody), so it
-  # sits outside `:authenticated` too, behind the same per-IP throttle on a bucket of its own.
+  # US-47.3 / US-50.2 / US-50.1 — the fleet chg senders' change-events webhook, cursor read
+  # and ledger batch. Authenticated like the GitHub intake one, by an HMAC over the raw body
+  # (captured by the same LoopctlWeb.Plugs.IntakeRawBody) or, for the GET, over its path and
+  # query, so they sit outside `:authenticated` too, behind the same per-IP throttle on a
+  # bucket of their own.
   pipeline :change_events do
     plug LoopctlWeb.Plugs.GithubIntakeThrottle, bucket: "change_events_ip"
   end
@@ -183,6 +223,9 @@ defmodule LoopctlWeb.Router do
     pipe_through [:api, :change_events]
 
     post "/change_events/:source_id", ChangeEventController, :create
+    get "/change_events/:source_id/cursor", ChangeEventController, :cursor
+    post "/chg_ledger/:source_id", ChgLedgerController, :create
+    post "/change_events/:source_id/review_dispatch", ChangeEventController, :review_dispatch
   end
 
   scope "/swaggerui" do
@@ -500,6 +543,10 @@ defmodule LoopctlWeb.Router do
     # US-48.12: an agent spec's track record, per version, from the run-outcome ledger. A
     # read of counts and enums, agent-role.
     get "/agent_specs/:spec_id/outcomes", AgentOutcomeController, :summary
+
+    # US-50.6: the /chg dashboard's aggregates for a session without a browser. A read of
+    # the fleet's own ledger rows, agent-role.
+    get "/chg_ledger/summary", ChgLedgerSummaryController, :show
 
     # US-48.13: the improvement loop's drafts, and the operator's record that one landed in a
     # pull request. User-role both: traces carry ticket text, and `landed` certifies a person

@@ -1,16 +1,17 @@
 defmodule Loopctl.Changes.Signature do
   @moduledoc """
-  The HMAC both directions of the chg change protocol are signed with (US-47.3, Epic 47
-  PRD §5; wire contract confirmed on mkreyman/chg#33).
+  The HMAC every request of the chg change protocol is signed with (US-47.3, US-50.2; Epic 47
+  PRD §5, Epic 50 README). The fleet's senders call loopctl; loopctl calls nothing.
 
-  - **Delivery** (chg-server → loopctl): `X-Chg-Timestamp: <unix seconds>` and
+  - **A POST** (an event, a ledger batch): `X-Chg-Timestamp: <unix seconds>` and
     `X-Chg-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>">`, keyed by the
     intake source's `change_events_secret`.
-  - **Gap pull** (loopctl → chg-server): the same two headers, over
-    `"<timestamp>.GET.<path>?<query>"` exactly as sent.
+  - **A GET** (the cursor read): the same two headers, over
+    `"<timestamp>.GET.<path>?<query>"` exactly as sent. `verify/5` judges it with
+    `get_body/2` in place of the raw body.
 
-  Both are judged inside a 300-second window either side of now. chg signs at send time,
-  so a redelivery carries a fresh timestamp and stays inside it.
+  Both are judged inside a 300-second window either side of now. The sender signs at send
+  time, so a redelivery carries a fresh timestamp and stays inside it.
 
   `verify/5` does the same HMAC work whether the signature header is well-formed or not, and
   whether the timestamp is in the window or not, so a caller cannot tell those apart by
@@ -37,11 +38,11 @@ defmodule Loopctl.Changes.Signature do
   def delivery_string(timestamp, raw_body), do: timestamp <> "." <> raw_body
 
   @doc """
-  The string a gap pull's signature covers: `\"<timestamp>.GET.<path>?<query>\"`, with the
-  path and query exactly as the request sends them.
+  What a GET signs in place of a body: `"GET.<path>?<query>"`, with the path and query exactly
+  as the request sends them, so its signed string is `"<timestamp>.GET.<path>?<query>"`.
   """
-  @spec pull_string(String.t(), String.t(), String.t()) :: String.t()
-  def pull_string(timestamp, path, query), do: "#{timestamp}.GET.#{path}?#{query}"
+  @spec get_body(String.t(), String.t()) :: String.t()
+  def get_body(path, query), do: "GET.#{path}?#{query}"
 
   @doc "The `X-Chg-Signature` value for `signed` under `secret`."
   @spec header(binary(), binary()) :: String.t()

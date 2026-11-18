@@ -5,10 +5,12 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import WebAuthn from "./hooks/webauthn"
 import AuthenticatorEnroll from "./hooks/authenticator_enroll"
+import WebAuthnLogin from "./hooks/webauthn_login"
 
 const Hooks = {
   WebAuthn,
   AuthenticatorEnroll,
+  WebAuthnLogin,
 }
 
 let csrfToken = document.querySelector("meta[name='csrf-token']")?.getAttribute("content")

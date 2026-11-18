@@ -1,19 +1,23 @@
 defmodule LoopctlWeb.Plugs.IntakeRawBody do
   @moduledoc """
-  Captures the RAW request body of a GitHub intake delivery (issue #803) or a chg change
-  event (US-47.3) before `Plug.Parsers` runs.
+  Captures the RAW request body of a GitHub intake delivery (issue #803), a chg change event
+  (US-47.3) or a chg ledger batch (US-50.1) before `Plug.Parsers` runs.
 
   GitHub's `X-Hub-Signature-256` is an HMAC over the exact bytes of the body, and
   `Plug.Conn.read_body/2` is destructive: once `Plug.Parsers` has read and decoded the
   JSON, the bytes are gone and a re-encoding of the params does not reproduce them. So
   this plug is mounted in `LoopctlWeb.Endpoint` AHEAD of `Plug.Parsers` and, for
-  `POST /api/v1/intake/github/:source_id` and `POST /api/v1/change_events/:source_id` only:
+  `POST /api/v1/intake/github/:source_id`, `POST /api/v1/change_events/:source_id`,
+  `POST /api/v1/change_events/:source_id/review_dispatch` and
+  `POST /api/v1/chg_ledger/:source_id` only:
 
-  - refuses a body over the route's cap — `Loopctl.Intake.max_body_bytes/0` or
-    `Loopctl.Changes.Events.max_body_bytes/0` — with `413 payload_too_large`, by its declared
-    `content-length` before reading and by counting while reading;
+  - refuses a body over the route's cap — `Loopctl.Intake.max_body_bytes/0`,
+    `Loopctl.Changes.Events.max_body_bytes/0` or `Loopctl.Changes.Ledger.max_body_bytes/0` —
+    with `413 payload_too_large`, by its declared `content-length` before reading and by
+    counting while reading;
   - stores the bytes in `conn.private[:intake_raw_body]`, where
-    `LoopctlWeb.GithubIntakeController` and `LoopctlWeb.ChangeEventController` read them.
+    `LoopctlWeb.GithubIntakeController`, `LoopctlWeb.ChangeEventController` and
+    `LoopctlWeb.ChgLedgerController` read them.
 
   Because the body is consumed here, `Plug.Parsers` then reads an empty body and decodes
   nothing, so the untrusted JSON is never parsed before its signature is checked. Every
@@ -25,6 +29,7 @@ defmodule LoopctlWeb.Plugs.IntakeRawBody do
   import Plug.Conn
 
   alias Loopctl.Changes.Events
+  alias Loopctl.Changes.Ledger
   alias Loopctl.Intake
 
   @private_key :intake_raw_body
@@ -41,6 +46,20 @@ defmodule LoopctlWeb.Plugs.IntakeRawBody do
   # need the same bytes, under their own cap.
   def call(%Plug.Conn{method: "POST", path_info: ["api", "v1", "change_events", _]} = conn, _),
     do: capture(conn, {Events.max_body_bytes(), "A change event"})
+
+  # US-50.3: a review-dispatch request is a tiny signed body; the change-event cap bounds it.
+  def call(
+        %Plug.Conn{
+          method: "POST",
+          path_info: ["api", "v1", "change_events", _, "review_dispatch"]
+        } = conn,
+        _
+      ),
+      do: capture(conn, {Events.max_body_bytes(), "A review-dispatch request"})
+
+  # US-50.1: a ledger batch is signed the same way, under its own cap.
+  def call(%Plug.Conn{method: "POST", path_info: ["api", "v1", "chg_ledger", _]} = conn, _),
+    do: capture(conn, {Ledger.max_body_bytes(), "A ledger batch"})
 
   def call(conn, _opts), do: conn
 

@@ -339,6 +339,10 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    Mox.stub(Loopctl.MockPullRequestSource, :pull_request_body, fn _repo, _number ->
+      {:error, :not_stubbed}
+    end)
+
     Mox.stub(Loopctl.MockPullRequestSource, :repo_files, fn _repo, _ref ->
       {:error, :not_stubbed}
     end)
@@ -388,11 +392,6 @@ defmodule Loopctl.DataCase do
     # reach a real GitHub issue, and `{:error, :not_stubbed}` is not transient, so it abandons
     # the closure loudly instead of retrying it round the sweep.
     Mox.stub(Loopctl.MockPullRequestSource, :issue, fn _repo, _number ->
-      {:error, :not_stubbed}
-    end)
-
-    # US-47.3: the gap pull. Not stubbed means a transient failure, never events.
-    Mox.stub(Loopctl.MockChgClient, :events_after, fn _url, _secret, _change_id, _after ->
       {:error, :not_stubbed}
     end)
 

@@ -1,0 +1,82 @@
+{
+  "id": "US-50.3",
+  "title": "Source-minted review dispatches under the chg root",
+  "epic": {
+    "id": "epic_50",
+    "name": "chg change ledger and dashboard"
+  },
+  "priority": "high",
+  "phase": "chg_ledger",
+  "story": {
+    "as_a": "fleet machine's chgd dispatching a review",
+    "i_want_to": "obtain a review key under the source's chg root for one (change_id, revision)",
+    "so_that": "the reviewer's verdict satisfies US-47.5's chg review custody with no process holding a standing root key"
+  },
+  "rationale": "A dispatch key lives at most 14400 s and the operator key cannot mint under a root outside its lineage, so Epic 47 §6's chg-server-holds-the-root design has no holder. loopctl#1014 comment 3, question 2.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-50.3.1",
+      "description": "POST /api/v1/change_events/:source_id/review_dispatch with {change_id, revision}, authenticated as the change-events webhook, mints a child dispatch of the source's chg_root_dispatch_id (role :orchestrator, so review_complete's exact_role gate admits it) and answers 201 {dispatch_id, api_key, expires_at}."
+    },
+    {
+      "id": "AC-50.3.2",
+      "description": "The change must have an applied submitted event for that revision under the source; otherwise 422 revision_not_submitted. A source with no chg_root_dispatch_id, or whose root is revoked, gets the change-events 401."
+    },
+    {
+      "id": "AC-50.3.3",
+      "description": "One live review dispatch per (source, change_id, revision): a second request revokes the earlier dispatch and mints a fresh one ONLY while the earlier one has recorded no review; after a verdict it answers 409 review_already_recorded. A lost response is therefore retryable and a recorded verdict is never re-mintable."
+    },
+    {
+      "id": "AC-50.3.4",
+      "description": "The minted key passes US-47.5 unchanged: it is a strict descendant of the root (chg_reviewer_required passes), is refused claim and report (chg_root_review_only) and verify/reject (chg_root_cannot_verify). No custody gate is loosened."
+    },
+    {
+      "id": "AC-50.3.5",
+      "description": "The mint is appended to the tenant audit chain with source_id, change_id, revision and dispatch_id. The root dispatch's own key expiry does not matter; only its revocation does."
+    },
+    {
+      "id": "AC-50.3.6",
+      "description": "docs/chain-of-custody-v2.md and CLAUDE.md's chg-dispatched reviews paragraph state the trust this moves: whoever holds change_events_secret can mint reviewers for that source, as chg-server could before; loopctl proves the source minted the key, not that the job ran apart from the implementer."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-50.3.1",
+      "name": "mint and record",
+      "type": "integration",
+      "preconditions": ["a :chg source with a root", "a story bound to a change with submitted revision 1, reported done"],
+      "steps": ["signed POST review_dispatch for revision 1", "review_complete with the returned key and commit_sha of revision 1"],
+      "expected_results": ["201 with a key", "the review records"]
+    },
+    {
+      "id": "TC-50.3.2",
+      "name": "re-mint before and after a verdict",
+      "type": "integration",
+      "preconditions": ["a minted review dispatch"],
+      "steps": ["request again", "record a review with the second key", "request a third time"],
+      "expected_results": ["the first dispatch is revoked", "the review records", "409 review_already_recorded"]
+    },
+    {
+      "id": "TC-50.3.3",
+      "name": "the key cannot verify or claim",
+      "type": "integration",
+      "preconditions": ["a minted review key"],
+      "steps": ["verify_story with it", "claim with it"],
+      "expected_results": ["409 chg_root_cannot_verify", "403 or 409 chg_root_review_only"]
+    },
+    {
+      "id": "TC-50.3.4",
+      "name": "refusals",
+      "type": "integration",
+      "preconditions": ["a :chg source"],
+      "steps": ["request for an unsubmitted revision", "revoke the root and request", "request with a bad signature"],
+      "expected_results": ["422 revision_not_submitted", "the change-events 401", "the change-events 401"]
+    }
+  ],
+  "technical_notes": [
+    "Load .claude/skills/chain-of-custody/SKILL.md before implementing.",
+    "Mint through Dispatches with the root as parent on a server-side path that does not consult caller lineage, because the caller is the source's HMAC, not a key. That path is reachable only from this controller; never expose it to a key-authenticated route.",
+    "Hold the source and root FOR SHARE in the mint's transaction, as Intake.hold_chg_source/3 does for events."
+  ],
+  "dependencies": []
+}

@@ -1,8 +1,20 @@
 defmodule Loopctl.Changes.Events do
   @moduledoc """
-  The change-events webhook's context (US-47.3, Epic 47 PRD §5): receipt, verification,
-  idempotency, per-change ordering and audit of the events chg-server delivers, and the
-  ingest half of gap and staleness reconciliation (`Loopctl.Changes.Reconcile` pulls).
+  The change-events webhook's context (US-47.3, Epic 47 PRD §5; US-50.2): receipt,
+  verification, idempotency, per-change ordering and audit of the events the fleet's chg
+  outboxes deliver, and the change's cursor that tells a sender what to resend.
+
+  ## The cursor: how a gap fills
+
+  loopctl cannot reach the senders, so it never pulls. Every answer to a push carries the
+  change's cursor, `%{applied_through: n, held: [seq...]}`, read in the transaction that
+  applied the event, and `read_cursor/3` answers it alone for a signed GET. A sender that
+  sees `held` non-empty resends from `applied_through + 1`. `held` lists at most
+  `@max_held` seqs, lowest first; past that the gap is not the sender's only problem.
+
+  An applied event also clears the change's `attention` flag
+  (`Loopctl.Changes.Reconcile`): a `stale` change has heard from its sender, and a `gap`
+  change whose held events have all applied is whole again.
 
   ## Authentication: one refusal for everything
 
@@ -37,12 +49,10 @@ defmodule Loopctl.Changes.Events do
 
   `repo` is the CANONICAL repository key (`repo_key/1`: the source's `repo_full_name`,
   downcased), never the envelope's spelling or the source's as stored. GitHub names are
-  case-insensitive and the pull resolves the source that way
-  (`Loopctl.Intake.chg_source_for_repo/2`), so a case-variant envelope, or the repository
-  re-enrolled under another spelling, keys the SAME events and the SAME cursor. Every place a
-  change is keyed derives it with `repo_key/1` — the events, the cursor, the binding a
-  `submitted` event makes (`Loopctl.Changes.EventEffects`), and the pull
-  (`Loopctl.Changes.Reconcile`) — and both tables CHECK `repo = lower(repo)`.
+  case-insensitive, so a case-variant envelope, or the repository re-enrolled under another
+  spelling, keys the SAME events and the SAME cursor. Every place a change is keyed derives it
+  with `repo_key/1` — the events, the cursor and the binding a `submitted` event makes
+  (`Loopctl.Changes.EventEffects`) — and both tables CHECK `repo = lower(repo)`.
 
   ## Ordering
 
@@ -52,8 +62,8 @@ defmodule Loopctl.Changes.Events do
   come is stored with `applied_at` NULL (`:held`) and applies when the gap before it fills —
   in the same transaction as the event that fills it. Lock waits are bounded
   (`Loopctl.Runners.Capacity.set_lock_timeout!/2`) and contention answers `{:error, :busy}`
-  (`Loopctl.Delivery.Stages.answering_busy/4`), a retryable 503: chg redelivers, and every
-  write here is safe to resend.
+  (`Loopctl.Delivery.Stages.answering_busy/4`), a retryable 503: the sender redelivers, and
+  every write here is safe to resend.
 
   Applying is `Loopctl.Changes.EventEffects.apply_event/2`, the one seam the stage mapping
   (US-47.4) fills. Whatever it does, the event is marked applied and the cursor advances, so
@@ -68,8 +78,7 @@ defmodule Loopctl.Changes.Events do
 
   ## No outbound call
 
-  Nothing here reaches the network (AC-47.3.5). The pull is `Loopctl.Changes.Reconcile`'s,
-  run from an Oban job.
+  Nothing here reaches the network (AC-47.3.5).
   """
 
   import Ecto.Query
@@ -97,8 +106,23 @@ defmodule Loopctl.Changes.Events do
   # The same work for an unknown source as for a known one, so timing does not say which.
   @timing_key :crypto.hash(:sha256, "loopctl-change-events-unknown-source")
 
+  # The most held seqs a cursor lists.
+  @max_held 500
+
   @type outcome :: :applied | :held | :duplicate
-  @type result :: %{outcome: outcome(), applied_seq: non_neg_integer()}
+  @type cursor_view :: %{
+          change_id: String.t(),
+          applied_through: non_neg_integer(),
+          held: [pos_integer()]
+        }
+  @type result :: %{outcome: outcome(), applied_seq: non_neg_integer(), cursor: cursor_view()}
+  @type cursor_input :: %{
+          required(:path) => String.t(),
+          required(:query) => String.t(),
+          required(:change_id) => String.t() | nil,
+          optional(:timestamp) => String.t() | nil,
+          optional(:signature) => String.t() | nil
+        }
   @type push_input :: %{
           required(:raw_body) => binary(),
           optional(:timestamp) => String.t() | nil,
@@ -160,47 +184,133 @@ defmodule Loopctl.Changes.Events do
   end
 
   @doc """
-  Ingests envelopes `Loopctl.Changes.Reconcile` pulled for one change of `source`, in one
-  transaction under the same source hold, cursor lock and ordering as a push. A pulled event
-  that conflicts with a stored one is skipped and logged rather than failing the page.
+  Answers one change's cursor to a signed GET for `source_id` (US-50.2):
+  `{:ok, %{change_id:, applied_through:, held:}}`.
 
-  Answers `{:ok, %{applied_seq: n}}` — the change's cursor after the page, `nil` when every
-  envelope was skipped — or the refusal `{:error, :unauthorized}` when the source or its root
-  is no longer valid.
+  The signature covers `Signature.get_body(path, query)` exactly as the request sent them, and
+  every refusal is the same `{:error, :unauthorized}` a push gets, judged the same way: the
+  pre-check, then the source held `FOR SHARE` with its tenant and root re-judged and the
+  signature verified again against the held row. A change loopctl has never seen answers
+  `applied_through: 0, held: []` rather than a not-found, so a change id cannot be probed.
+  A missing `change_id` is `{:error, {:bad_request, "change_id_required"}}`, judged after the
+  signature.
   """
-  @spec ingest_pulled(Source.t(), [Envelope.t()], keyword()) ::
-          {:ok, %{applied_seq: non_neg_integer() | nil}}
-          | {:error, :unauthorized | :busy | :apply_failed}
-  def ingest_pulled(%Source{} = source, envelopes, opts \\ []) when is_list(envelopes) do
-    now = DateTime.utc_now()
+  @spec read_cursor(term(), cursor_input(), keyword()) ::
+          {:ok, cursor_view()}
+          | {:error, :unauthorized | {:bad_request, String.t()} | :busy | :apply_failed}
+  def read_cursor(source_id, %{path: path, query: query} = input, opts \\ [])
+      when is_binary(path) and is_binary(query) do
+    now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:second) end)
 
-    source.tenant_id
-    |> in_held_source(source, opts, fn held ->
-      Enum.reduce(envelopes, {nil, []}, &ingest_pulled_one(held, &1, now, &2, opts))
+    signed = %{
+      raw_body: Signature.get_body(path, query),
+      timestamp: input[:timestamp],
+      signature: input[:signature]
+    }
+
+    signed(source_id, signed, Keyword.put(opts, :now, now), fn held ->
+      case required_change_id(input[:change_id]) do
+        {:ok, change_id} -> cursor_view(held.tenant_id, repo_key(held.repo_full_name), change_id)
+        {:error, bad_request} -> Repo.rollback(bad_request)
+      end
     end)
-    |> case do
-      {:ok, {applied_seq, pending}} ->
-        after_commit(pending)
-        {:ok, %{applied_seq: applied_seq}}
+  end
 
-      {:error, {:refused, reason}} ->
-        event_refused(source.id, source, reason)
-        {:error, :unauthorized}
+  @doc """
+  Runs `fun.(held_source)` for one signed request to `source_id`, and is the ONE way a chg
+  sender's request is authenticated: the change-event push, the cursor read (US-50.2) and the
+  ledger batch (US-50.1) all come through here or through `receive_push/3`, which judges the
+  same way.
 
-      {:error, reason} ->
-        failed(source, reason)
+  `input` carries `:raw_body` (the bytes the signature covers), `:timestamp` and
+  `:signature`. The signature is checked against the source's secret, then the source is held
+  `FOR SHARE` in a tenant transaction, its tenant and chg root judged, and the signature
+  verified again against the held row; `fun` runs inside that transaction. Every refusal is
+  `{:error, :unauthorized}`, counted by `event_refused/3`. `fun` may `Repo.rollback/1` with
+  `{:bad_request, code}` or `{:rejected, http_status, code}`, which come back as
+  `{:error, ...}` unchanged, or with `{:refused, reason}`, which is the 401;
+  `{:unrecorded_dispatch, tenant_id, dispatch_id, reason}` also comes back unchanged, so the
+  caller can revoke a dispatch committed apart from the rolled-back transaction. Any other
+  rollback is `{:error, :busy}` or `{:error, :apply_failed}` as for a push.
+
+  `opts`: `:now` and `:lock_timeout_ms`, as for `receive_push/3`.
+  """
+  @spec signed(term(), push_input(), keyword(), (Source.t() -> result)) ::
+          {:ok, result}
+          | {:error,
+             :unauthorized
+             | {:bad_request, String.t()}
+             | {:rejected, pos_integer(), String.t()}
+             | {:unrecorded_dispatch, Ecto.UUID.t(), Ecto.UUID.t(), term()}
+             | :busy
+             | :apply_failed}
+        when result: term()
+  def signed(source_id, %{raw_body: raw_body} = input, opts, fun)
+      when is_binary(raw_body) and is_function(fun, 1) do
+    now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:second) end)
+
+    with {:ok, source} <- authenticate(source_id, input, now) do
+      Logger.metadata(tenant_id: source.tenant_id)
+
+      source.tenant_id
+      |> in_held_source(source, opts, fn held ->
+        reauthenticate!(held, input, now)
+        fun.(held)
+      end)
+      |> case do
+        {:ok, value} ->
+          {:ok, value}
+
+        {:error, {:refused, reason}} ->
+          event_refused(source.id, source, reason)
+          {:error, :unauthorized}
+
+        {:error, {:bad_request, code}} when is_binary(code) ->
+          {:error, {:bad_request, code}}
+
+        {:error, {:rejected, status, code}} when is_integer(status) and is_binary(code) ->
+          {:error, {:rejected, status, code}}
+
+        {:error, {:unrecorded_dispatch, _tenant_id, _dispatch_id, _reason} = unrecorded} ->
+          {:error, unrecorded}
+
+        {:error, reason} ->
+          failed(source, reason)
+      end
     end
   end
 
-  defp ingest_pulled_one(source, envelope, now, {applied_seq, pending}, opts) do
-    case ingest_one(source, envelope, "pull", now, effects_opts(opts)) do
-      {:conflict, _existing} ->
-        log_conflict(source, envelope, "pull")
-        {applied_seq, pending}
+  defp required_change_id(change_id) when is_binary(change_id) and change_id != "",
+    do: {:ok, change_id}
 
-      {_outcome, applied_seq, more} ->
-        {applied_seq, pending ++ more}
-    end
+  defp required_change_id(_change_id), do: {:error, {:bad_request, "change_id_required"}}
+
+  # Inside a tenant transaction: the change's applied seq and its stored, unapplied seqs.
+  defp cursor_view(tenant_id, repo, change_id) do
+    applied =
+      Repo.one(
+        from c in Cursor,
+          where: c.tenant_id == ^tenant_id and c.repo == ^repo and c.change_id == ^change_id,
+          select: c.applied_seq
+      ) || 0
+
+    %{
+      change_id: change_id,
+      applied_through: applied,
+      held: held_seqs(%{tenant_id: tenant_id, repo: repo, change_id: change_id})
+    }
+  end
+
+  defp held_seqs(key) do
+    Repo.all(
+      from e in Event,
+        where:
+          e.tenant_id == ^key.tenant_id and e.repo == ^key.repo and
+            e.change_id == ^key.change_id and is_nil(e.applied_at),
+        order_by: [asc: e.event_seq],
+        limit: @max_held,
+        select: e.event_seq
+    )
   end
 
   @doc """
@@ -332,9 +442,9 @@ defmodule Loopctl.Changes.Events do
     {:error, :event_conflict}
   end
 
-  defp finish_push({:ok, {outcome, applied_seq, pending}}, _source, _envelope) do
+  defp finish_push({:ok, {outcome, view, pending}}, _source, _envelope) do
     after_commit(pending)
-    {:ok, %{outcome: outcome, applied_seq: applied_seq}}
+    {:ok, %{outcome: outcome, applied_seq: view.applied_through, cursor: view}}
   end
 
   defp finish_push({:error, {:refused, reason}}, source, _envelope) do
@@ -375,7 +485,7 @@ defmodule Loopctl.Changes.Events do
 
   # ── ingest: lock, insert, apply ─────────────────────────────────────────────
 
-  # Inside the tenant transaction. Answers `{outcome, applied_seq, pending}` or
+  # Inside the tenant transaction. Answers `{outcome, cursor_view, pending}` or
   # `{:conflict, existing}`.
   defp ingest_one(%Source{} = source, envelope, via, now, effects_opts) do
     key = %{
@@ -389,16 +499,20 @@ defmodule Loopctl.Changes.Events do
     case insert_event(source, key, envelope, via, now) do
       :inserted ->
         {cursor, pending} = apply_ready(cursor, [], effects_opts)
-        touch_cursor(cursor, source, now)
+        held = held_seqs(key)
+        touch_cursor(cursor, held, source, now)
         outcome = if cursor.applied_seq >= envelope.event_seq, do: :applied, else: :held
-        {outcome, cursor.applied_seq, pending}
+        {outcome, view(key, cursor.applied_seq, held), pending}
 
       {:existing, existing} ->
         if same_event?(existing, envelope),
-          do: {:duplicate, cursor.applied_seq, []},
+          do: {:duplicate, view(key, cursor.applied_seq, held_seqs(key)), []},
           else: {:conflict, existing}
     end
   end
+
+  defp view(key, applied_seq, held),
+    do: %{change_id: key.change_id, applied_through: applied_seq, held: held}
 
   # The row is created by the change's first event and locked by every one after. Two first
   # events race on the unique index: the loser waits for the winner's commit (bounded by the
@@ -517,7 +631,10 @@ defmodule Loopctl.Changes.Events do
   # What of a caller's `opts` reaches `EventEffects.apply_event/3`.
   defp effects_opts(opts), do: Keyword.take(opts, [:escalate])
 
-  defp touch_cursor(%Cursor{} = cursor, source, now) do
+  # An arrival clears a `stale` flag; a `gap` flag stays until nothing is held.
+  defp touch_cursor(%Cursor{} = cursor, held, source, now) do
+    attention = if cursor.attention == "gap" and held != [], do: "gap"
+
     {1, _} =
       Repo.update_all(
         from(c in Cursor, where: c.id == ^cursor.id and c.tenant_id == ^cursor.tenant_id),
@@ -525,6 +642,8 @@ defmodule Loopctl.Changes.Events do
           applied_seq: cursor.applied_seq,
           last_event_at: now,
           source_id: source.id,
+          attention: attention,
+          attention_at: if(attention, do: cursor.attention_at),
           updated_at: now
         ]
       )

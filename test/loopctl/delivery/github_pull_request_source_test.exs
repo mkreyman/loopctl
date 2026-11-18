@@ -1056,6 +1056,46 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   # -- the reporter's side (#805) ----------------------------------------------------------
 
+  describe "pull_request_body/2 (US-50.4)" do
+    test "reads the body and the merge facts of a merged PR" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/pulls/12"
+
+        json(conn, %{
+          "merged" => true,
+          "body" => "## Review findings\n\n0 findings.",
+          "merged_at" => "2026-11-18T12:00:00Z",
+          "merge_commit_sha" => String.duplicate("a", 40)
+        })
+      end)
+
+      assert {:ok,
+              %{
+                body: "## Review findings\n\n0 findings.",
+                merged?: true,
+                merged_at: ~U[2026-11-18 12:00:00Z],
+                merge_sha: merge_sha
+              }} = Source.pull_request_body(@repo, 12)
+
+      assert merge_sha == String.duplicate("a", 40)
+    end
+
+    test "an empty body is nil and an unmerged PR carries no merge facts" do
+      stub(fn conn ->
+        json(conn, %{"merged" => false, "body" => "", "merge_commit_sha" => "abc"})
+      end)
+
+      assert {:ok, %{body: nil, merged?: false, merged_at: nil, merge_sha: nil}} =
+               Source.pull_request_body(@repo, 12)
+    end
+
+    test "an unreadable PR is refused and a bad number never reaches the network" do
+      stub(fn conn -> json(conn, %{"body" => "x"}) end)
+      assert {:error, {:unreadable_pull_request, _}} = Source.pull_request_body(@repo, 12)
+      assert {:error, {:invalid_pr_number, 0}} = Source.pull_request_body(@repo, 0)
+    end
+  end
+
   describe "issue/2" do
     test "reads state and label NAMES, dropping anything that is not one" do
       stub(fn conn ->

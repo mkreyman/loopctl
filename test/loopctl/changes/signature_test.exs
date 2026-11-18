@@ -19,9 +19,15 @@ defmodule Loopctl.Changes.SignatureTest do
     assert header("1792370000", ~s({"a":1})) == "sha256=" <> expected
   end
 
-  test "a gap pull signs \"<timestamp>.GET.<path>?<query>\"" do
-    assert Signature.pull_string("1792370000", "/api/v1/changes/01JA/events", "after=7") ==
-             "1792370000.GET./api/v1/changes/01JA/events?after=7"
+  test "a GET signs \"<timestamp>.GET.<path>?<query>\"" do
+    path = "/api/v1/change_events/S1/cursor"
+    body = Signature.get_body(path, "change_id=01JA")
+
+    assert Signature.delivery_string("1792370000", body) ==
+             "1792370000.GET./api/v1/change_events/S1/cursor?change_id=01JA"
+
+    ts = Integer.to_string(@now)
+    assert Signature.verify(@secret, ts, body, header(ts, body), @now) == :ok
   end
 
   test "verify/5 accepts a correct signature inside the window, upper-case hex included" do

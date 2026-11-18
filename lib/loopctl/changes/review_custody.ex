@@ -23,8 +23,10 @@ defmodule Loopctl.Changes.ReviewCustody do
 
   What this does NOT prove, so nobody reads more into it: every chg reviewer key sits under
   chg's root and outside every implementer's chain, so the lineage gate always passes a chg
-  review whoever ran the job. loopctl proves chg-server minted the reviewer's key; that the job
-  ran apart from the implementer's session is chg-server's to construct (PRD §6).
+  review whoever ran the job. loopctl proves the intake source minted the reviewer's key
+  (`Loopctl.Changes.ReviewDispatches`, US-50.3), so whoever holds the source's
+  `change_events_secret` can mint reviewers for it; that the job ran apart from the
+  implementer's session is the fleet's chgd to construct (PRD §6).
 
   ## Which revision (AC-47.5.2)
 
@@ -73,8 +75,10 @@ defmodule Loopctl.Changes.ReviewCustody do
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
   alias Loopctl.Changes.Landings
+  alias Loopctl.Changes.ReviewDispatch
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.GitSha
   alias Loopctl.Intake.Source
 
@@ -171,6 +175,66 @@ defmodule Loopctl.Changes.ReviewCustody do
   end
 
   defp bound_revision(_tenant_id, _chg, _commit_sha), do: {:error, :commit_sha_not_bound}
+
+  @doc """
+  Inside the review's own transaction on `repo` (US-50.3), given the reviewer's dispatch
+  `lineage` (root first, the reviewing dispatch last). When the LEAF was minted by an intake
+  source (`Loopctl.Changes.ReviewDispatches`), takes that review dispatch's row lock, then
+  refuses `{:error, :chg_review_dispatch_mismatch}` when the dispatch is revoked or
+  `commit_sha` is not the sha of the revision it was minted for. When a NON-leaf entry was
+  source-minted, the reviewer is a key delegated under a minted key, and it is refused the
+  same way: its verdict would escape both the revision binding and the re-mint's verdict
+  check, which read the minted dispatch. `:ok` when no dispatch on the lineage was minted.
+
+  The lock is the one `ReviewDispatches` takes before it decides a re-mint, so a verdict and a
+  re-mint for one revision serialise: whichever commits first, the other sees it.
+  """
+  @spec hold_minted_dispatch(Ecto.Repo.t(), Ecto.UUID.t(), [Ecto.UUID.t()], term()) ::
+          {:ok, :not_minted | :held} | {:error, :chg_review_dispatch_mismatch}
+  def hold_minted_dispatch(_repo, _tenant_id, [], _commit_sha), do: {:ok, :not_minted}
+
+  def hold_minted_dispatch(repo, tenant_id, lineage, commit_sha) when is_list(lineage) do
+    leaf = List.last(lineage)
+
+    minted =
+      repo.all(
+        from r in ReviewDispatch,
+          where: r.tenant_id == ^tenant_id and r.dispatch_id in ^lineage,
+          lock: "FOR UPDATE"
+      )
+
+    case minted do
+      [] ->
+        {:ok, :not_minted}
+
+      [%ReviewDispatch{dispatch_id: ^leaf} = row] ->
+        judge_minted(repo, tenant_id, row, commit_sha)
+
+      _delegated ->
+        {:error, :chg_review_dispatch_mismatch}
+    end
+  end
+
+  defp judge_minted(repo, tenant_id, row, commit_sha) do
+    if repo.exists?(live_dispatch(tenant_id, row)) and
+         repo.exists?(revision_submitted(tenant_id, row, commit_sha)),
+       do: {:ok, :held},
+       else: {:error, :chg_review_dispatch_mismatch}
+  end
+
+  defp live_dispatch(tenant_id, row) do
+    from d in Dispatch,
+      where: d.tenant_id == ^tenant_id and d.id == ^row.dispatch_id and is_nil(d.revoked_at)
+  end
+
+  # The minted row's own revision, submitted by its own source with exactly this sha.
+  defp revision_submitted(tenant_id, row, commit_sha) do
+    from e in Event,
+      where: e.tenant_id == ^tenant_id and e.source_id == ^row.source_id,
+      where: e.repo == ^row.repo and e.change_id == ^row.change_id,
+      where: e.kind == "submitted" and e.revision == ^row.revision and e.sha == ^commit_sha,
+      where: not is_nil(e.applied_at)
+  end
 
   @doc """
   Whether `story_id` has a chg review recorded for the revision commit `sha` — what a
@@ -279,7 +343,7 @@ defmodule Loopctl.Changes.ReviewCustody do
       when refusal in [:chg_root_cannot_verify, :chg_root_review_only] do
     if chg_rooted?(tenant_id, lineage) do
       Logger.warning(
-        "#{refusal}: a chg-server key attempted a custody act it may never perform " <>
+        "#{refusal}: a chg-rooted key attempted a custody act it may never perform " <>
           "tenant_id=#{tenant_id} lineage_root=#{hd(lineage)}"
       )
 

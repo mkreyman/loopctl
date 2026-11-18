@@ -108,8 +108,10 @@ defmodule LoopctlWeb.ReviewRecordController do
            "`missing_assigned_agent`, `unresolvable_dispatch_lineage`; and on a story bound " <>
            "to a chg change `chg_reviewer_required` (" <>
            Messages.chg_reviewer_required() <>
-           ") or `chg_review_already_recorded` (" <>
-           Messages.chg_review_already_recorded() <> ")", "application/json",
+           "), `chg_review_already_recorded` (" <>
+           Messages.chg_review_already_recorded() <>
+           ") or `chg_review_dispatch_mismatch` (" <>
+           Messages.chg_review_dispatch_mismatch() <> ")", "application/json",
          Schemas.ErrorResponse},
       422 =>
         {"Story not in reported_done status, a validation error, or `commit_sha_not_bound` (" <>

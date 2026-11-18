@@ -2805,6 +2805,19 @@ defmodule Loopctl.Progress do
 
       multi =
         Multi.new()
+        # US-50.3: a key minted by an intake source reviews only ITS revision, and only while
+        # its dispatch is live. Read under the review dispatch's row lock, the one a re-mint
+        # takes, so a review and a re-mint for one revision serialise (AC-50.3.3). The whole
+        # lineage, not the leaf: a key delegated under a minted key is refused too, and a
+        # minted key reviewing a story that is not chg-bound has no revision sha to match.
+        |> Multi.run(:chg_dispatch, fn repo, _ ->
+          ReviewCustody.hold_minted_dispatch(
+            repo,
+            tenant_id,
+            reviewer_lineage,
+            chg_review.commit_sha
+          )
+        end)
         |> Multi.insert(:review_record, changeset)
         # The review's counts on the story's build run's outcome row (US-48.12), in this
         # transaction. Always `{:ok, :ok}`: it adds no refusal this function can return.
@@ -2909,6 +2922,9 @@ defmodule Loopctl.Progress do
       do: {:error, :chg_review_already_recorded},
       else: {:error, changeset}
   end
+
+  defp handle_review_transaction({:error, :chg_dispatch, reason, _}, _, _, _, _),
+    do: {:error, reason}
 
   defp handle_review_transaction({:error, :enqueue_knowledge_worker, reason, _}, _, _, _, _) do
     {:error, reason}

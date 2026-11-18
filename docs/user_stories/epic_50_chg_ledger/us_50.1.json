@@ -1,0 +1,98 @@
+{
+  "id": "US-50.1",
+  "title": "Ledger rows: table and batch ingest",
+  "epic": {
+    "id": "epic_50",
+    "name": "chg change ledger and dashboard"
+  },
+  "priority": "high",
+  "phase": "chg_ledger",
+  "story": {
+    "as_a": "fleet machine's chg outbox sender",
+    "i_want_to": "deliver my shadow-ledger rows to loopctl in batches",
+    "so_that": "gate outcomes, selection quality and phase timings from every machine are answerable from one place"
+  },
+  "rationale": "loopctl#1014: the 2026-10-28 audit answered these questions by ssh'ing into four machines. Machine-called endpoint, exempt from the MCP-tool rule like the change-events webhook.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-50.1.1",
+      "description": "A new tenant-scoped table chg_ledger_rows (RLS enabled, tenant_id never cast) stores one row per delivered ledger row: source_id, repo, host, kind, sha, at (from at_ms), verdict, ms, the row's raw JSON, and row_hash (sha256 of the raw row as delivered). A unique index on (tenant_id, source_id, host, row_hash) makes delivery idempotent."
+    },
+    {
+      "id": "AC-50.1.2",
+      "description": "POST /api/v1/chg_ledger/:source_id takes {rows: [...]} of at most @max_ledger_batch rows under @max_ledger_body_bytes, authenticated exactly as POST /api/v1/change_events/:source_id (same HMAC, window, identical 401, revoked-root check). The answer is 200 {inserted, duplicates, rejected: [{index, reason}]}; a row that fails validation is rejected by index and never fails the batch."
+    },
+    {
+      "id": "AC-50.1.3",
+      "description": "kind is open: chg and gate rows are validated against the shadow Row shape (v, kind, repo, host, sha, at_ms, verdict in pass|fail|error|skipped, ms); review_round, flaky and runner rows need only v, kind, repo, host, at_ms; any other kind is stored with those fields so chg can add kinds without a loopctl release."
+    },
+    {
+      "id": "AC-50.1.4",
+      "description": "A row whose repo is not the source's repo is rejected with reason repo_mismatch, so one source's secret cannot write another repository's ledger."
+    },
+    {
+      "id": "AC-50.1.5",
+      "description": "A nightly Oban cron deletes rows older than 180 days in bounded batches, and the request path makes no outbound call. The operation/2 spec documents the 401, the batch and body caps (one module attribute each, shared by guard and spec), and the rejected-row reasons."
+    },
+    {
+      "id": "AC-50.1.6",
+      "description": "Tenant isolation: tenant A's source cannot write or read tenant B's rows."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-50.1.1",
+      "name": "a batch inserts and a redelivery is all duplicates",
+      "type": "integration",
+      "preconditions": ["an enrolled :chg source"],
+      "steps": ["post a signed batch of a chg row and a gate row", "post the same batch again"],
+      "expected_results": ["first answer inserted: 2", "second answer inserted: 0, duplicates: 2"]
+    },
+    {
+      "id": "TC-50.1.2",
+      "name": "one bad row does not fail the batch",
+      "type": "integration",
+      "preconditions": ["an enrolled :chg source"],
+      "steps": ["post a batch with a valid row, a row missing sha, and a row for another repo"],
+      "expected_results": ["inserted: 1", "rejected names index 1 invalid_row and index 2 repo_mismatch"]
+    },
+    {
+      "id": "TC-50.1.3",
+      "name": "refusals share the 401",
+      "type": "integration",
+      "preconditions": ["an enrolled :chg source"],
+      "steps": ["post with a wrong signature", "post to an unknown source id", "post an oversized body"],
+      "expected_results": ["identical 401 bodies for the first two", "413 for the oversized body", "no rows"]
+    },
+    {
+      "id": "TC-50.1.4",
+      "name": "unknown kind is stored",
+      "type": "integration",
+      "preconditions": ["an enrolled :chg source"],
+      "steps": ["post a row of kind cache_sample"],
+      "expected_results": ["inserted: 1 with kind cache_sample"]
+    },
+    {
+      "id": "TC-50.1.5",
+      "name": "prune",
+      "type": "unit",
+      "preconditions": ["rows at 181 and 179 days old"],
+      "steps": ["run the prune worker"],
+      "expected_results": ["only the 181-day row is gone"]
+    },
+    {
+      "id": "TC-50.1.6",
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": ["sources in tenants A and B"],
+      "steps": ["insert rows through A", "list rows as B"],
+      "expected_results": ["B sees none of A's rows"]
+    }
+  ],
+  "technical_notes": [
+    "Signature verification, the revoked-root check and the 401 are the change-events plug path; reuse it, never a second HMAC implementation.",
+    "Insert with insert_all on_conflict: :nothing inside with_tenant; count inserted from the returned rows.",
+    "The shadow Row type is chg cli/src/shadow.rs; the field list is loopctl#1014's issue body."
+  ],
+  "dependencies": []
+}

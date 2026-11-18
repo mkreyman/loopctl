@@ -200,6 +200,16 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   def pull_request(_repo, number), do: {:error, {:invalid_pr_number, number}}
 
+  @impl true
+  def pull_request_body(repo, number) when is_integer(number) and number > 0 do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, pr} <- get(repo, "/pulls/#{number}") do
+      pull_request_body_facts(pr)
+    end
+  end
+
+  def pull_request_body(_repo, number), do: {:error, {:invalid_pr_number, number}}
+
   # GitHub's compare endpoint lists at most this many files and says nothing about the rest.
   @compare_file_cap 300
 
@@ -944,6 +954,30 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   defp pull_request_facts(body), do: {:error, {:unreadable_pull_request, shape(body)}}
+
+  defp pull_request_body_facts(%{"merged" => merged} = pr) when is_boolean(merged) do
+    body = pr["body"]
+    merge_sha = pr["merge_commit_sha"]
+
+    {:ok,
+     %{
+       body: if(is_binary(body) and body != "", do: body),
+       merged?: merged,
+       merged_at: if(merged, do: iso_datetime(pr["merged_at"])),
+       merge_sha: if(merged and is_binary(merge_sha), do: merge_sha)
+     }}
+  end
+
+  defp pull_request_body_facts(body), do: {:error, {:unreadable_pull_request, shape(body)}}
+
+  defp iso_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      {:error, _} -> nil
+    end
+  end
+
+  defp iso_datetime(_value), do: nil
 
   defp strings?(values), do: Enum.all?(values, &is_binary/1)
   defp counts?(values), do: Enum.all?(values, &(is_integer(&1) and &1 >= 0))
