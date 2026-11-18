@@ -725,12 +725,17 @@ defmodule Loopctl.ObanConfig do
            # only, no forge call. Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.StoryCompletionWorker},
-           # US-47.3: finds chg changes with an event held ahead of a gap for 10 minutes, or
-           # bound to a non-terminal story and quiet for 6 hours, and enqueues ONE pull job
-           # per change (unique on the change). Every five minutes: the shorter threshold is
-           # ten, so a gap is pulled at 10-15 minutes. Local reads only; the pull is the job's.
-           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           # US-47.3 / US-50.2: flags chg changes with an event held ahead of a gap for 10
+           # minutes, or bound to a non-terminal story and quiet for 6 hours, and raises ONE
+           # operator alert per change. Every five minutes: the shorter threshold is ten, so
+           # a gap is flagged at 10-15 minutes. Local reads and writes only; loopctl pulls
+           # nothing, the fleet sender resends. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
            {"*/5 * * * *", Loopctl.Workers.ChangeReconcileSweepWorker},
+           # US-50.1: retention for `chg_ledger_rows`, 180 days by `at`, bounded per tenant.
+           # Nothing else deletes from it. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"40 3 * * *", Loopctl.Workers.ChgLedgerPruneWorker},
            # US-47.4: drains the revert-issue outbox — opens the GitHub issue a chg revert of
            # a `done` story owes, so the revert is triaged as a new report. Every two minutes,
            # like the issue-closure drainer, and for its reason: up to two bounded GitHub calls

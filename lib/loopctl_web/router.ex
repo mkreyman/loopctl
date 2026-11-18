@@ -172,10 +172,11 @@ defmodule LoopctlWeb.Router do
     post "/intake/github/:source_id", GithubIntakeController, :deliver
   end
 
-  # US-47.3 / US-50.2 — the fleet chg senders' change-events webhook and cursor read.
-  # Authenticated like the GitHub intake one, by an HMAC over the raw body (captured by the
-  # same LoopctlWeb.Plugs.IntakeRawBody) or, for the GET, over its path and query, so they sit
-  # outside `:authenticated` too, behind the same per-IP throttle on a bucket of their own.
+  # US-47.3 / US-50.2 / US-50.1 — the fleet chg senders' change-events webhook, cursor read
+  # and ledger batch. Authenticated like the GitHub intake one, by an HMAC over the raw body
+  # (captured by the same LoopctlWeb.Plugs.IntakeRawBody) or, for the GET, over its path and
+  # query, so they sit outside `:authenticated` too, behind the same per-IP throttle on a
+  # bucket of their own.
   pipeline :change_events do
     plug LoopctlWeb.Plugs.GithubIntakeThrottle, bucket: "change_events_ip"
   end
@@ -185,6 +186,7 @@ defmodule LoopctlWeb.Router do
 
     post "/change_events/:source_id", ChangeEventController, :create
     get "/change_events/:source_id/cursor", ChangeEventController, :cursor
+    post "/chg_ledger/:source_id", ChgLedgerController, :create
   end
 
   scope "/swaggerui" do

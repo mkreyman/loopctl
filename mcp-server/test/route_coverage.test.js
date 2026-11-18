@@ -71,7 +71,8 @@
  *     (`router.ex:169-173`, piped through `GithubIntakeThrottle`),
  *     `POST /api/v1/change_events/:source_id` is the fleet chg senders' event webhook,
  *     HMAC-signed the same way (US-47.3, Epic 47 PRD §5), and its signed cursor read
- *     `GET /api/v1/change_events/:source_id/cursor` (US-50.2), and
+ *     `GET /api/v1/change_events/:source_id/cursor` (US-50.2) and ledger batch
+ *     `POST /api/v1/chg_ledger/:source_id` (US-50.1), and
  *     `GET /api/v1/tenants/:id/audit_public_key` is unauthenticated for an EXTERNAL verifier
  *     (`tenant_audit_key_controller.ex:6-7`: "intended for external verification").
  *
@@ -158,6 +159,7 @@ const DECLARED = {
   "POST /api/v1/intake/github/:param": "machine", // GithubIntakeController.deliver
   "POST /api/v1/change_events/:param": "machine", // ChangeEventController.create — the fleet chg senders' event webhook (US-47.3)
   "GET /api/v1/change_events/:param/cursor": "machine", // ChangeEventController.cursor — the senders' signed cursor read (US-50.2)
+  "POST /api/v1/chg_ledger/:param": "machine", // ChgLedgerController.create — the senders' signed ledger batch (US-50.1)
   "GET /api/v1/openapi": "machine", // OpenApiSpex.Plug.RenderSpec — a 607 KB spec for API tooling
 
   // ── ceremony: a WebAuthn challenge an MCP tool cannot answer ─────────────

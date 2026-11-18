@@ -201,22 +201,63 @@ defmodule Loopctl.Changes.Events do
   def read_cursor(source_id, %{path: path, query: query} = input, opts \\ [])
       when is_binary(path) and is_binary(query) do
     now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:second) end)
-    signed = Map.put(input, :raw_body, Signature.get_body(path, query))
 
-    with {:ok, source} <- authenticate(source_id, signed, now),
-         {:ok, change_id} <- required_change_id(input[:change_id]) do
+    signed = %{
+      raw_body: Signature.get_body(path, query),
+      timestamp: input[:timestamp],
+      signature: input[:signature]
+    }
+
+    signed(source_id, signed, Keyword.put(opts, :now, now), fn held ->
+      case required_change_id(input[:change_id]) do
+        {:ok, change_id} -> cursor_view(held.tenant_id, repo_key(held.repo_full_name), change_id)
+        {:error, bad_request} -> Repo.rollback(bad_request)
+      end
+    end)
+  end
+
+  @doc """
+  Runs `fun.(held_source)` for one signed request to `source_id`, and is the ONE way a chg
+  sender's request is authenticated: the change-event push, the cursor read (US-50.2) and the
+  ledger batch (US-50.1) all come through here or through `receive_push/3`, which judges the
+  same way.
+
+  `input` carries `:raw_body` (the bytes the signature covers), `:timestamp` and
+  `:signature`. The signature is checked against the source's secret, then the source is held
+  `FOR SHARE` in a tenant transaction, its tenant and chg root judged, and the signature
+  verified again against the held row; `fun` runs inside that transaction. Every refusal is
+  `{:error, :unauthorized}`, counted by `event_refused/3`. `fun` may `Repo.rollback/1` with
+  `{:bad_request, code}`, which comes back as `{:error, {:bad_request, code}}`; any other
+  rollback is `{:error, :busy}` or `{:error, :apply_failed}` as for a push.
+
+  `opts`: `:now` and `:lock_timeout_ms`, as for `receive_push/3`.
+  """
+  @spec signed(term(), push_input(), keyword(), (Source.t() -> result)) ::
+          {:ok, result}
+          | {:error, :unauthorized | {:bad_request, String.t()} | :busy | :apply_failed}
+        when result: term()
+  def signed(source_id, %{raw_body: raw_body} = input, opts, fun)
+      when is_binary(raw_body) and is_function(fun, 1) do
+    now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:second) end)
+
+    with {:ok, source} <- authenticate(source_id, input, now) do
+      Logger.metadata(tenant_id: source.tenant_id)
+
       source.tenant_id
       |> in_held_source(source, opts, fn held ->
-        reauthenticate!(held, signed, now)
-        cursor_view(held.tenant_id, repo_key(held.repo_full_name), change_id)
+        reauthenticate!(held, input, now)
+        fun.(held)
       end)
       |> case do
-        {:ok, view} ->
-          {:ok, view}
+        {:ok, value} ->
+          {:ok, value}
 
         {:error, {:refused, reason}} ->
           event_refused(source.id, source, reason)
           {:error, :unauthorized}
+
+        {:error, {:bad_request, code}} when is_binary(code) ->
+          {:error, {:bad_request, code}}
 
         {:error, reason} ->
           failed(source, reason)
