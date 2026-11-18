@@ -46,6 +46,16 @@ defmodule Loopctl.ApiSpec.Messages do
       "subtree can record it."
   end
 
+  @doc "The 409 `chg_review_dispatch_mismatch` message (a source-minted key off its revision)."
+  @spec chg_review_dispatch_mismatch() :: String.t()
+  def chg_review_dispatch_mismatch do
+    "This key was minted by the intake source for ONE revision of one change " <>
+      "(POST /api/v1/change_events/:source_id/review_dispatch), and it records a review only " <>
+      "of that revision's commit, only while its dispatch is live. The `commit_sha` sent is " <>
+      "another revision's, or the dispatch was revoked by a later mint for the same revision. " <>
+      "Ask for a key for the revision you reviewed."
+  end
+
   @doc "The 422 `commit_sha_not_bound` message (review-complete on a chg story)."
   @spec commit_sha_not_bound() :: String.t()
   def commit_sha_not_bound do

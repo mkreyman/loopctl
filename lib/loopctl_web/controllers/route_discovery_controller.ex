@@ -975,7 +975,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
           "GitHub's own webhook delivery endpoint — called by GitHub, not by you, and there is " <>
             "no MCP tool. Authenticated by an HMAC over the RAW body against the secret minted " <>
             "at enrolment, never by an API key. Configure it as the Payload URL with content " <>
-            "type application/json and the Issues event only. Every failure is the SAME 401 " <>
+            "type application/json and the Issues and Pull requests events. Every failure is the SAME 401 " <>
             "invalid_signature — unknown or revoked source, suspended tenant, missing or wrong " <>
             "signature, or a payload whose repository.full_name does not match — so Recent " <>
             "Deliveries cannot tell you which."

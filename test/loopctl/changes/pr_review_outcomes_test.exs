@@ -83,7 +83,32 @@ defmodule Loopctl.Changes.PrReviewOutcomesTest do
   defp outcomes(tenant_id),
     do: AdminRepo.all(from o in PrReviewOutcome, where: o.tenant_id == ^tenant_id)
 
+  defp outcome_jobs(source) do
+    worker = inspect(Loopctl.Workers.PrReviewOutcomeWorker)
+
+    Loopctl.Repo.all(
+      from j in Oban.Job,
+        where: j.worker == ^worker and fragment("?->>'source_id' = ?", j.args, ^source.id)
+    )
+  end
+
   describe "TC-50.4.2: a merge enqueues once and records one row" do
+    test "a redelivery and a second delivery of one merge enqueue one job", %{conn: conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      payload = merged_pr(7, source.repo_full_name)
+      delivery = Ecto.UUID.generate()
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert conn |> deliver(secret, source, payload, delivery) |> json_response(200)
+        # The same X-GitHub-Delivery: a redelivery.
+        assert build_conn() |> deliver(secret, source, payload, delivery) |> json_response(200)
+        # A new delivery id for the same merge, while the first job is still pending.
+        assert build_conn() |> deliver(secret, source, payload) |> json_response(200)
+
+        assert [_one] = outcome_jobs(source)
+      end)
+    end
+
     test "two deliveries of the merge store one parsed row", %{conn: conn} do
       {secret, source} = fixture(:intake_source, %{})
       stub_forge(@body)
@@ -223,6 +248,41 @@ defmodule Loopctl.Changes.PrReviewOutcomesTest do
                  since: @merged_at
                )
                |> Enum.filter(&(&1.pr_number == 12))
+    end
+  end
+
+  describe "totals/2" do
+    test "counts every outcome in range, past any list limit, in SQL" do
+      {_secret, source} = fixture(:intake_source, %{})
+      {_secret_b, source_b} = fixture(:intake_source, %{})
+      repo = String.downcase(source.repo_full_name)
+      facts = %{body: @body, merged?: true, merged_at: @merged_at, merge_sha: nil}
+
+      for n <- 1..3, do: {:ok, _} = PrReviewOutcomes.record(source, n, facts)
+
+      {:ok, _} =
+        PrReviewOutcomes.record(source, 4, %{
+          facts
+          | body: "none",
+            merged_at: ~U[2026-01-01 00:00:00Z]
+        })
+
+      {:ok, _} = PrReviewOutcomes.record(source_b, 1, facts)
+      round_row!(source, repo, 2)
+
+      assert [_one] = PrReviewOutcomes.list(source.tenant_id, limit: 1)
+
+      assert %{
+               merged: 4,
+               by_severity: %{"high" => 3, "low" => 3},
+               by_disposition: %{"fixed" => 3, "wrong" => 3},
+               without_round: 3
+             } = PrReviewOutcomes.totals(source.tenant_id)
+
+      assert %{merged: 3, without_round: 2} =
+               PrReviewOutcomes.totals(source.tenant_id, since: @merged_at)
+
+      assert %{merged: 1} = PrReviewOutcomes.totals(source_b.tenant_id)
     end
   end
 

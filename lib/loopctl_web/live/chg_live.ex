@@ -99,12 +99,13 @@ defmodule LoopctlWeb.ChgLive do
   end
 
   @doc """
-  The DOM id of a review outcome's row: its repo and PR number, with every character a CSS id
-  selector would need escaped (the `/` of `owner/name`, a `.`) turned into `-`.
+  The DOM id of a review outcome's row: its repo hex-encoded, then its PR number. Hex keeps the
+  id a plain CSS selector AND injective: replacing `/` and `.` with `-` gave `a/b-c` and
+  `a-b/c` one id, and a stream with two rows under one id renders one of them.
   """
   @spec outcome_dom_id(%{repo: String.t(), pr_number: pos_integer()}) :: String.t()
   def outcome_dom_id(%{repo: repo, pr_number: n}),
-    do: "outcome-" <> String.replace(repo, ~r/[^a-z0-9_-]/, "-") <> "-#{n}"
+    do: "outcome-" <> Base.encode16(repo, case: :lower) <> "-#{n}"
 
   defp period(value) do
     if Enum.any?(@periods, fn {key, _label, _days} -> key == value end),

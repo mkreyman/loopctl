@@ -185,7 +185,8 @@ defmodule LoopctlWeb.IntakeSourceController do
       "Binds one GitHub repository to one ACTIVE WORK project and returns its webhook secret " <>
         "ONCE, as `webhook_secret`, with the path to configure as the webhook URL, " <>
         "`webhook_path`. Configure the repository webhook with that URL on this host, " <>
-        "content type `application/json`, the secret, and the `Issues` event. Issue text " <>
+        "content type `application/json`, the secret, and the `Issues` and `Pull requests` " <>
+        "events (a merged pull request records its review outcome, US-50.4). Issue text " <>
         "arriving there is stored only as untrusted data and never becomes a story. Requires " <>
         "user role and a human-anchored tenant; a caller whose key was minted by a dispatch " <>
         "is refused with 403 `api_key_mint_forbidden`. 422 when the repository is not " <>

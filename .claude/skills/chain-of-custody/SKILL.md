@@ -132,7 +132,10 @@ binding, review-complete additionally demands (after the three gates above, neve
 reviewer whose LIVE lineage is a STRICT descendant of the chg root of the source that delivered
 the change (`chg_reviewer_required`; the root key too), a `commit_sha` that is an applied
 `submitted` revision of the CURRENT binding (`commit_sha_not_bound`), and one verdict per reviewer
-dispatch — a unique index, not a read (`chg_review_already_recorded`). Its mirror: a caller whose
+dispatch — a unique index, not a read (`chg_review_already_recorded`). A source-minted key
+(US-50.3) reviews only the revision it was minted for, while its dispatch is live
+(`chg_review_dispatch_mismatch`), judged under the review dispatch's row lock that a re-mint
+also takes. Its mirror: a caller whose
 MINTING lineage is rooted at any registered `chg_root_dispatch_id` (live or revoked source, either
 mode) is refused `chg_root_cannot_verify` on verify / reject / verify-all / bulk verify+reject /
 backfill / bulk mark-complete and `chg_root_review_only` on claim / bulk claim / report, before

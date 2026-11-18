@@ -243,13 +243,16 @@ defmodule Loopctl.Changes.Dashboard do
           avg(json_int(r.raw, "floor"))
         }
 
+    # A miss is judged on rows that SELECTED: a `mode = all` row ran the whole suite, so its pass
+    # against a failing gate is a flaky or environmental difference, not a selection that left
+    # a test out.
     misses =
-      from r in ledger(tenant_id, filters),
+      from r in selecting,
         join: g in LedgerRow,
         on:
           g.tenant_id == ^tenant_id and g.repo == r.repo and g.sha == r.sha and g.kind == "gate" and
             g.verdict == "fail",
-        where: r.kind == "chg" and r.verdict == "pass",
+        where: r.verdict == "pass",
         distinct: [desc: r.at, asc: r.id],
         order_by: [desc: r.at, asc: r.id],
         limit: @list_limit,
@@ -358,30 +361,22 @@ defmodule Loopctl.Changes.Dashboard do
   defp sample_fields(_raw), do: []
 
   @doc """
-  Review outcomes per merged PR since `since` (`PrReviewOutcomes.list/2`), newest first, and the
-  findings over all of them counted by severity and by disposition.
-  `%{outcomes: [outcome], by_severity: %{severity => n}, by_disposition: %{disposition => n},
-  without_round: n}`.
+  Review outcomes per merged PR in range (`PrReviewOutcomes.list/2`), newest first and at most
+  `list_limit/0` of them, and the totals over EVERY merged PR in range
+  (`PrReviewOutcomes.totals/2`), so the counts never shrink to the listed page.
+  `%{outcomes: [outcome], merged: n, by_severity: %{severity => n},
+  by_disposition: %{disposition => n}, without_round: n}`.
   """
   @spec review_outcomes(Ecto.UUID.t(), filters()) :: panel(map())
   def review_outcomes(tenant_id, filters) do
-    opts =
-      [since: filters.since, until: Map.get(filters, :until), limit: @list_limit] ++
-        repo_opt(filters)
+    opts = [since: filters.since, until: Map.get(filters, :until)] ++ repo_opt(filters)
 
-    case PrReviewOutcomes.list(tenant_id, opts) do
-      {:error, :heavy_read_overloaded} ->
-        :unavailable
-
-      outcomes ->
-        findings = Enum.flat_map(outcomes, & &1.findings)
-
-        %{
-          outcomes: outcomes,
-          by_severity: Enum.frequencies_by(findings, &(&1["severity"] || "unrated")),
-          by_disposition: Enum.frequencies_by(findings, &(&1["disposition"] || "none")),
-          without_round: Enum.count(outcomes, & &1.merged_without_counted_round)
-        }
+    with outcomes when is_list(outcomes) <-
+           PrReviewOutcomes.list(tenant_id, [limit: @list_limit] ++ opts),
+         %{} = totals <- PrReviewOutcomes.totals(tenant_id, opts) do
+      Map.put(totals, :outcomes, outcomes)
+    else
+      {:error, :heavy_read_overloaded} -> :unavailable
     end
   end
 
@@ -391,14 +386,14 @@ defmodule Loopctl.Changes.Dashboard do
   @doc """
   Changes the reconcile sweep flagged `gap` or `stale` and that are still flagged, newest flag
   first, each with its cursor. `[%{id, repo, change_id, attention, attention_at, applied_seq,
-  last_event_at}]`. `host` does not apply; `since` bounds `attention_at`.
+  last_event_at}]`. This is CURRENT state, so neither `since` nor `until` applies: a change
+  flagged before the period and never cleared still needs attention. `host` does not apply.
   """
   @spec attention(Ecto.UUID.t(), filters()) :: panel([map()])
   def attention(tenant_id, filters) do
     query =
       from c in Cursor,
         where: c.tenant_id == ^tenant_id and not is_nil(c.attention),
-        where: c.attention_at >= ^filters.since,
         order_by: [desc: c.attention_at, asc: c.id],
         limit: @list_limit,
         select: %{
@@ -413,7 +408,6 @@ defmodule Loopctl.Changes.Dashboard do
 
     query
     |> by_repo(filters)
-    |> before_until(filters, :attention_at)
     |> then(&read(tenant_id, &1))
   end
 

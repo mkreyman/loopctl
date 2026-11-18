@@ -11,6 +11,7 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Changes.Events
+  alias Loopctl.Changes.ReviewCustody
   alias Loopctl.Changes.ReviewDispatches
   alias Loopctl.Changes.Signature
   alias Loopctl.Dispatches
@@ -156,13 +157,64 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
       assert entry.payload["revision"] == 1
     end
 
-    test "the reviewer is the per-source system agent, never the implementer", ctx do
+    test "the reviewer is the revision's system agent, never the implementer", ctx do
       minted = mint!(ctx)
       d = dispatch(minted["dispatch_id"])
 
       assert %{name: name} = AdminRepo.get!(Loopctl.Agents.Agent, d.agent_id)
-      assert name == ReviewDispatches.agent_name(ctx.source.id)
+      assert name == ReviewDispatches.agent_name(ctx.source.id, "C1", 1)
       refute d.agent_id == ctx.story.assigned_agent_id
+    end
+
+    test "a live key for one revision does not block the next revision's mint", ctx do
+      first = mint!(ctx)
+      assert first["api_key"] |> review_complete(ctx.story, sha("a")) |> json_response(201)
+      assert is_nil(dispatch(first["dispatch_id"]).revoked_at)
+
+      submit!(ctx, "C1", 2, 2, sha("b"))
+      second = mint!(ctx, 2)
+
+      assert is_nil(dispatch(first["dispatch_id"]).revoked_at)
+      assert second["api_key"] |> review_complete(ctx.story, sha("b")) |> json_response(201)
+    end
+  end
+
+  describe "a minted key reviews only its own revision" do
+    test "a revision-1 key naming revision 2's sha is 409 chg_review_dispatch_mismatch", ctx do
+      submit!(ctx, "C1", 2, 2, sha("b"))
+      minted = mint!(ctx, 1)
+
+      assert %{"error" => %{"code" => "chg_review_dispatch_mismatch"}} =
+               minted["api_key"] |> review_complete(ctx.story, sha("b")) |> json_response(409)
+
+      # Revision 2 has recorded no verdict, so its own key can still be minted and record.
+      second = mint!(ctx, 2)
+      assert second["api_key"] |> review_complete(ctx.story, sha("b")) |> json_response(201)
+    end
+
+    test "a revoked minted dispatch is refused inside the review's transaction", ctx do
+      minted = mint!(ctx)
+
+      {1, _} =
+        AdminRepo.update_all(from(d in Dispatch, where: d.id == ^minted["dispatch_id"]),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert {:error, :chg_review_dispatch_mismatch} =
+               ReviewCustody.hold_minted_dispatch(
+                 AdminRepo,
+                 ctx.tenant_id,
+                 minted["dispatch_id"],
+                 sha("a")
+               )
+
+      assert {:ok, :not_minted} =
+               ReviewCustody.hold_minted_dispatch(
+                 AdminRepo,
+                 ctx.tenant_id,
+                 Ecto.UUID.generate(),
+                 sha("a")
+               )
     end
   end
 
@@ -233,10 +285,34 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
     end
 
     test "a malformed body is 400 invalid_request", %{conn: conn} = ctx do
-      for body <- [%{change_id: "C1"}, %{change_id: "C1", revision: 0}, %{revision: 1}] do
+      for body <- [
+            %{change_id: "C1"},
+            %{change_id: "C1", revision: 0},
+            %{revision: 1},
+            %{change_id: "C1", revision: 1, extra: true}
+          ] do
         assert %{"error" => %{"code" => "invalid_request"}} =
                  conn |> request(ctx, body) |> json_response(400)
       end
+    end
+
+    test "a signed change-event push replayed here is 400, and mints nothing", ctx do
+      # The same bytes a push signs: an envelope carries change_id and revision among others.
+      envelope =
+        build(:chg_event, %{
+          change_id: "C1",
+          event_seq: 1,
+          kind: "submitted",
+          revision: 1,
+          sha: sha("a"),
+          data: %{"story_id" => ctx.story.id}
+        })
+
+      assert %{"error" => %{"code" => "invalid_request"}} =
+               build_conn() |> request(ctx, envelope) |> json_response(400)
+
+      assert AdminRepo.all(from(d in Dispatch, where: d.parent_dispatch_id == ^ctx.root.id)) ==
+               []
     end
 
     test "a custody-halted tenant mints nothing: 503 tenant_halted", %{conn: conn} = ctx do

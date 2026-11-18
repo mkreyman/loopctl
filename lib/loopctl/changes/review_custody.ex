@@ -75,8 +75,10 @@ defmodule Loopctl.Changes.ReviewCustody do
   alias Loopctl.Changes.Binding
   alias Loopctl.Changes.Event
   alias Loopctl.Changes.Landings
+  alias Loopctl.Changes.ReviewDispatch
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.GitSha
   alias Loopctl.Intake.Source
 
@@ -173,6 +175,55 @@ defmodule Loopctl.Changes.ReviewCustody do
   end
 
   defp bound_revision(_tenant_id, _chg, _commit_sha), do: {:error, :commit_sha_not_bound}
+
+  @doc """
+  Inside the review's own transaction on `repo` (US-50.3): when `dispatch_id` was minted by an
+  intake source (`Loopctl.Changes.ReviewDispatches`), takes that review dispatch's row lock,
+  then refuses `{:error, :chg_review_dispatch_mismatch}` when the dispatch is revoked or
+  `commit_sha` is not the sha of the revision it was minted for. `:ok` for a `nil` dispatch and
+  for a dispatch no intake source minted.
+
+  The lock is the one `ReviewDispatches` takes before it decides a re-mint, so a verdict and a
+  re-mint for one revision serialise: whichever commits first, the other sees it.
+  """
+  @spec hold_minted_dispatch(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil, term()) ::
+          {:ok, :not_minted | :held} | {:error, :chg_review_dispatch_mismatch}
+  def hold_minted_dispatch(_repo, _tenant_id, nil, _commit_sha), do: {:ok, :not_minted}
+
+  def hold_minted_dispatch(repo, tenant_id, dispatch_id, commit_sha) do
+    minted =
+      repo.one(
+        from r in ReviewDispatch,
+          where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id,
+          lock: "FOR UPDATE"
+      )
+
+    case minted do
+      nil -> {:ok, :not_minted}
+      %ReviewDispatch{} = row -> judge_minted(repo, tenant_id, row, commit_sha)
+    end
+  end
+
+  defp judge_minted(repo, tenant_id, row, commit_sha) do
+    if repo.exists?(live_dispatch(tenant_id, row)) and
+         repo.exists?(revision_submitted(tenant_id, row, commit_sha)),
+       do: {:ok, :held},
+       else: {:error, :chg_review_dispatch_mismatch}
+  end
+
+  defp live_dispatch(tenant_id, row) do
+    from d in Dispatch,
+      where: d.tenant_id == ^tenant_id and d.id == ^row.dispatch_id and is_nil(d.revoked_at)
+  end
+
+  # The minted row's own revision, submitted by its own source with exactly this sha.
+  defp revision_submitted(tenant_id, row, commit_sha) do
+    from e in Event,
+      where: e.tenant_id == ^tenant_id and e.source_id == ^row.source_id,
+      where: e.repo == ^row.repo and e.change_id == ^row.change_id,
+      where: e.kind == "submitted" and e.revision == ^row.revision and e.sha == ^commit_sha,
+      where: not is_nil(e.applied_at)
+  end
 
   @doc """
   Whether `story_id` has a chg review recorded for the revision commit `sha` — what a

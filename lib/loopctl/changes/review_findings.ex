@@ -74,6 +74,9 @@ defmodule Loopctl.Changes.ReviewFindings do
       if byte_size(body) > @max_body_bytes, do: binary_part(body, 0, @max_body_bytes), else: body
 
     body = if String.valid?(body), do: body, else: String.replace_invalid(body)
+    # U+0000 is valid UTF-8 but Postgres refuses it in text and jsonb, where the parse is
+    # stored, so it is removed here rather than failing the job on body content.
+    body = String.replace(body, <<0>>, "")
 
     sections = sections(body)
 

@@ -279,9 +279,12 @@ defmodule LoopctlWeb.ChangeEventController do
       "US-50.3. A fleet machine's chgd asks for the key a review of one `(change_id, " <>
         "revision)` records its verdict with. A machine endpoint with no MCP tool, signed " <>
         "exactly like the event POST. loopctl mints an `:orchestrator` child of the source's " <>
-        "`chg_root_dispatch_id`, attributed to the per-source system agent, living " <>
+        "`chg_root_dispatch_id`, attributed to a system agent per (change, revision), living " <>
         "#{Dispatches.max_expires_seconds()} seconds. It records a review on that revision " <>
-        "(`commit_sha` = the revision's sha) and is refused claim, report, verify and reject. " <>
+        "(`commit_sha` = the revision's sha) and is refused claim, report, verify and reject; " <>
+        "a review naming any other sha, or made after its dispatch is revoked, is 409 " <>
+        "`chg_review_dispatch_mismatch`. The body is exactly `{change_id, revision}`: any " <>
+        "other key is 400 `invalid_request`, so a signed event push cannot replay here. " <>
         "Whoever holds the source's `change_events_secret` can mint these; the root key's " <>
         "expiry does not matter, its revocation does. Every authentication refusal, a revoked " <>
         "root included, is the event POST's 401 `invalid_signature`. The revision must have " <>

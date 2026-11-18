@@ -99,10 +99,75 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
     limit = opts |> Keyword.get(:limit, 100) |> max(1) |> min(500)
 
     query =
-      from o in PrReviewOutcome,
-        where: o.tenant_id == ^tenant_id,
+      from o in filtered(tenant_id, opts),
         order_by: [desc_nulls_last: o.merged_at, desc: o.pr_number],
         limit: ^limit
+
+    with rows when is_list(rows) <- heavy_all(tenant_id, query),
+         counts when is_map(counts) <- rounds(tenant_id, rows) do
+      Enum.map(rows, &with_rounds(&1, counts))
+    end
+  end
+
+  @doc """
+  Totals over EVERY outcome `opts` selects (the same `:repo`, `:since` and `:until` as
+  `list/2`, no limit): how many merged, the findings counted by severity and by disposition,
+  and how many merged without a counted round. In SQL, so a long period's counts never come
+  from a truncated list.
+  `%{merged: n, by_severity: %{severity => n}, by_disposition: %{disposition => n},
+  without_round: n}`.
+  """
+  @spec totals(Ecto.UUID.t(), keyword()) :: map() | {:error, :heavy_read_overloaded}
+  def totals(tenant_id, opts \\ []) when is_binary(tenant_id) do
+    base = filtered(tenant_id, opts)
+
+    findings =
+      from o in base,
+        inner_lateral_join: f in fragment("SELECT unnest(?) AS v", o.findings),
+        on: true,
+        group_by: [
+          fragment("coalesce(?->>'severity', 'unrated')", f.v),
+          fragment("coalesce(?->>'disposition', 'none')", f.v)
+        ],
+        select: {
+          fragment("coalesce(?->>'severity', 'unrated')", f.v),
+          fragment("coalesce(?->>'disposition', 'none')", f.v),
+          count()
+        }
+
+    counted =
+      from r in LedgerRow,
+        where:
+          r.tenant_id == ^tenant_id and r.kind == @round_kind and
+            r.repo == parent_as(:outcome).repo and
+            fragment("(?->>'pr')", r.raw) == fragment("(?)::text", parent_as(:outcome).pr_number),
+        select: 1
+
+    merged =
+      from o in base,
+        as: :outcome,
+        select: {count(o.id), filter(count(o.id), not exists(subquery(counted)))}
+
+    with groups when is_list(groups) <- heavy_all(tenant_id, findings),
+         [{merged_count, without}] <- heavy_all(tenant_id, merged) do
+      %{
+        merged: merged_count,
+        by_severity: sum_by(groups, fn {severity, _disposition, n} -> {severity, n} end),
+        by_disposition: sum_by(groups, fn {_severity, disposition, n} -> {disposition, n} end),
+        without_round: without
+      }
+    end
+  end
+
+  defp sum_by(groups, pair) do
+    Enum.reduce(groups, %{}, fn group, acc ->
+      {key, n} = pair.(group)
+      Map.update(acc, key, n, &(&1 + n))
+    end)
+  end
+
+  defp filtered(tenant_id, opts) do
+    query = from o in PrReviewOutcome, where: o.tenant_id == ^tenant_id
 
     query =
       case Keyword.get(opts, :repo) do
@@ -116,15 +181,9 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
         _ -> query
       end
 
-    query =
-      case Keyword.get(opts, :until) do
-        %DateTime{} = until -> where(query, [o], o.merged_at < ^until)
-        _ -> query
-      end
-
-    with rows when is_list(rows) <- heavy_all(tenant_id, query),
-         counts when is_map(counts) <- rounds(tenant_id, rows) do
-      Enum.map(rows, &with_rounds(&1, counts))
+    case Keyword.get(opts, :until) do
+      %DateTime{} = until -> where(query, [o], o.merged_at < ^until)
+      _ -> query
     end
   end
 

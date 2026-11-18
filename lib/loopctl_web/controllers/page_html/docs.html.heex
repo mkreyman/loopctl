@@ -724,7 +724,7 @@
                 <span class="text-accent-400">POST</span> /api/v1/intake/github/:source_id
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                The GitHub webhook, authenticated by HMAC rather than an API key. Configure it for the Issues event only. Every authentication failure answers the same 401 invalid_signature.
+                The GitHub webhook, authenticated by HMAC rather than an API key. Configure it for the Issues and Pull requests events; a merged pull request records its review outcome. Every authentication failure answers the same 401 invalid_signature.
               </p>
             </div>
             <div class="bg-slate-800 border border-slate-700 rounded-md p-3">

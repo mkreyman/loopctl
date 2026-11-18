@@ -21,14 +21,22 @@ defmodule Loopctl.Changes.ReviewDispatches do
   ## One live dispatch per review
 
   Per `(source, change_id, revision)` there is one live review dispatch. A second request
-  revokes the earlier one and mints afresh ONLY while no dispatch minted for that key has
+  revokes the earlier one and mints afresh ONLY while no dispatch minted for that revision has
   recorded a review, so a lost response is retryable and a recorded verdict is never
   re-mintable (`409 review_already_recorded`). The change's cursor row is held `FOR UPDATE` for
   the decision, the per-change lock every event ingest takes, so two requests for one change
-  never mint concurrently.
+  never mint concurrently; the revision's `chg_review_dispatches` rows are held `FOR UPDATE`
+  too, the lock a review by one of their keys takes (`ReviewCustody.hold_minted_dispatch/4`),
+  so a verdict in flight and a re-mint serialise. A minted key reviews only its own revision.
 
-  The reviewer identity is a per-source system agent, `system:chg-reviewer:<source_id>`, in the
-  reserved `system:` namespace no key can register into.
+  The reviewer identity is a system agent per revision (`agent_name/3`), in the reserved
+  `system:` namespace no key can register into. Per revision because an api key is unique per
+  (tenant, agent, role) while unrevoked: one agent per source let one live key block every
+  other review of the source.
+
+  The request body is exactly `{change_id, revision}`: the signed string is the same
+  `<ts>.<body>` a change-event push signs, so a push envelope, which carries both keys among
+  others, must not decode here.
 
   ## Refusals
 
@@ -40,6 +48,7 @@ defmodule Loopctl.Changes.ReviewDispatches do
 
   import Ecto.Query
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.AuditChain
@@ -48,6 +57,7 @@ defmodule Loopctl.Changes.ReviewDispatches do
   alias Loopctl.Changes.Events
   alias Loopctl.Changes.ReviewDispatch
   alias Loopctl.Dispatches
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Tenants.Tenant
@@ -91,15 +101,30 @@ defmodule Loopctl.Changes.ReviewDispatches do
     end
   end
 
-  @doc "The reviewer agent's name for a source."
-  @spec agent_name(Ecto.UUID.t()) :: String.t()
-  def agent_name(source_id), do: "system:chg-reviewer:" <> source_id
+  @doc """
+  The reviewer agent's name for one revision of one change of a source:
+  `system:chg-reviewer:<source_id>:<digest>`, the digest the first 16 hex of
+  `sha256("<change_id>\\n<revision>")`. One agent per revision, not per source: an api key is
+  unique per (tenant, agent, role) while unrevoked, so a per-source agent let one live review
+  key block every other review of that source for its four hours.
+  """
+  @spec agent_name(Ecto.UUID.t(), String.t(), pos_integer()) :: String.t()
+  def agent_name(source_id, change_id, revision) do
+    digest =
+      :crypto.hash(:sha256, "#{change_id}\n#{revision}")
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 16)
 
+    "system:chg-reviewer:" <> source_id <> ":" <> digest
+  end
+
+  # Exactly `{change_id, revision}`. An open match let a captured, signed change-event push
+  # (which carries both keys and signs the same `<ts>.<body>` string) replay here as a mint.
   defp decode(raw_body) do
     case Jason.decode(raw_body) do
-      {:ok, %{"change_id" => change_id, "revision" => revision}}
-      when is_binary(change_id) and is_integer(revision) and revision >= 1 and
-             revision <= 2_147_483_647 ->
+      {:ok, %{"change_id" => change_id, "revision" => revision} = body}
+      when map_size(body) == 2 and is_binary(change_id) and is_integer(revision) and
+             revision >= 1 and revision <= 2_147_483_647 ->
         if Regex.match?(@change_id_format, change_id),
           do: {:ok, change_id, revision},
           else: :error
@@ -117,11 +142,11 @@ defmodule Loopctl.Changes.ReviewDispatches do
     with :ok <- not_halted(tenant_id),
          :ok <- lock_change(tenant_id, repo, change_id),
          :ok <- submitted(source, repo, change_id, revision),
-         prior = prior_dispatch_ids(source, repo, change_id, revision),
-         :ok <- no_verdict(tenant_id, prior),
+         {:ok, agent_id} <- reviewer_agent(tenant_id, source.id, change_id, revision),
+         prior = prior_dispatch_ids(source, repo, change_id, revision, agent_id),
+         :ok <- no_verdict(tenant_id, prior, agent_id),
          :ok <- revoke_all(tenant_id, prior),
-         :ok <- no_verdict(tenant_id, prior),
-         {:ok, agent_id} <- reviewer_agent(tenant_id, source.id),
+         :ok <- no_verdict(tenant_id, prior, agent_id),
          {:ok, %{dispatch: dispatch, raw_key: raw_key}} <-
            Dispatches.mint_chg_reviewer(tenant_id, source.chg_root_dispatch_id, agent_id) do
       entry = record!(source, repo, change_id, revision, dispatch)
@@ -169,24 +194,41 @@ defmodule Loopctl.Changes.ReviewDispatches do
 
   defp not_submitted, do: {:error, {:rejected, 422, "revision_not_submitted"}}
 
-  defp prior_dispatch_ids(source, repo, change_id, revision) do
-    Repo.all(
-      from r in ReviewDispatch,
-        where:
-          r.tenant_id == ^source.tenant_id and r.source_id == ^source.id and r.repo == ^repo and
-            r.change_id == ^change_id and r.revision == ^revision,
-        select: r.dispatch_id
-    )
+  # Every dispatch this revision's reviewer could still hold: the recorded ones, taken FOR
+  # UPDATE (the row lock `ReviewCustody.hold_minted_dispatch/4` takes inside a review, so a
+  # verdict and this decision serialise), and any live dispatch of the revision's agent, which
+  # covers a dispatch whose recording row rolled back after its AdminRepo mint committed.
+  defp prior_dispatch_ids(source, repo, change_id, revision, agent_id) do
+    recorded =
+      Repo.all(
+        from r in ReviewDispatch,
+          where:
+            r.tenant_id == ^source.tenant_id and r.source_id == ^source.id and r.repo == ^repo and
+              r.change_id == ^change_id and r.revision == ^revision,
+          lock: "FOR UPDATE",
+          select: r.dispatch_id
+      )
+
+    live =
+      AdminRepo.all(
+        from d in Dispatch,
+          where:
+            d.tenant_id == ^source.tenant_id and d.agent_id == ^agent_id and is_nil(d.revoked_at),
+          select: d.id
+      )
+
+    Enum.uniq(recorded ++ live)
   end
 
   # Checked before AND after the revoke: a review that committed between the first read and the
-  # revocation is caught by the second, so its verdict is never followed by a fresh key.
-  defp no_verdict(_tenant_id, []), do: :ok
-
-  defp no_verdict(tenant_id, dispatch_ids) do
+  # revocation is caught by the second, so its verdict is never followed by a fresh key. A
+  # verdict by the revision's agent counts too, whichever of its dispatches recorded it.
+  defp no_verdict(tenant_id, dispatch_ids, agent_id) do
     if Repo.exists?(
          from rr in ReviewRecord,
-           where: rr.tenant_id == ^tenant_id and rr.reviewer_dispatch_id in ^dispatch_ids
+           where:
+             rr.tenant_id == ^tenant_id and
+               (rr.reviewer_dispatch_id in ^dispatch_ids or rr.reviewer_agent_id == ^agent_id)
        ),
        do: {:error, {:rejected, 409, "review_already_recorded"}},
        else: :ok
@@ -201,10 +243,10 @@ defmodule Loopctl.Changes.ReviewDispatches do
     end)
   end
 
-  # The per-source reviewer identity. `ON CONFLICT DO NOTHING` then a read, so two first mints
-  # for one source do not fail each other.
-  defp reviewer_agent(tenant_id, source_id) do
-    name = agent_name(source_id)
+  # The revision's reviewer identity. `ON CONFLICT DO NOTHING` then a read, so two first mints
+  # for one revision do not fail each other.
+  defp reviewer_agent(tenant_id, source_id, change_id, revision) do
+    name = agent_name(source_id, change_id, revision)
     now = DateTime.utc_now()
 
     Repo.insert_all(
@@ -217,7 +259,7 @@ defmodule Loopctl.Changes.ReviewDispatches do
           agent_type: :orchestrator,
           status: :active,
           last_seen_at: now,
-          metadata: %{"source_id" => source_id},
+          metadata: %{"source_id" => source_id, "change_id" => change_id, "revision" => revision},
           inserted_at: now,
           updated_at: now
         }
@@ -236,31 +278,43 @@ defmodule Loopctl.Changes.ReviewDispatches do
     end
   end
 
+  # The mint committed on AdminRepo already, apart from this Repo transaction. So a failure
+  # here revokes the new dispatch before rolling back: a rolled-back mint leaves no live key no
+  # row records. (A crash between the two is covered by the next mint for the revision, which
+  # revokes every live dispatch of the revision's agent.)
   defp record!(source, repo, change_id, revision, dispatch) do
-    Repo.insert!(%ReviewDispatch{
+    row = %ReviewDispatch{
       tenant_id: source.tenant_id,
       source_id: source.id,
       repo: repo,
       change_id: change_id,
       revision: revision,
       dispatch_id: dispatch.id
-    })
+    }
 
-    case AuditChain.append_in_tenant_transaction(source.tenant_id, %{
-           action: "chg_review_dispatch_minted",
-           actor_lineage: [],
-           entity_type: "dispatch",
-           entity_id: dispatch.id,
-           payload: %{
-             "source_id" => source.id,
-             "repo" => repo,
-             "change_id" => change_id,
-             "revision" => revision,
-             "dispatch_id" => dispatch.id
-           }
-         }) do
-      {:ok, entry} -> entry
-      {:error, reason} -> Repo.rollback({:audit_failed, reason})
+    with {:ok, _row} <- Repo.insert(row),
+         {:ok, entry} <- audit(source, repo, change_id, revision, dispatch) do
+      entry
+    else
+      {:error, reason} ->
+        _ = Dispatches.revoke(source.tenant_id, dispatch.id)
+        Repo.rollback({:audit_failed, reason})
     end
+  end
+
+  defp audit(source, repo, change_id, revision, dispatch) do
+    AuditChain.append_in_tenant_transaction(source.tenant_id, %{
+      action: "chg_review_dispatch_minted",
+      actor_lineage: [],
+      entity_type: "dispatch",
+      entity_id: dispatch.id,
+      payload: %{
+        "source_id" => source.id,
+        "repo" => repo,
+        "change_id" => change_id,
+        "revision" => revision,
+        "dispatch_id" => dispatch.id
+      }
+    })
   end
 end

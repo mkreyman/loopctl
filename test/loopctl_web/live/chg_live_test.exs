@@ -76,7 +76,9 @@ defmodule LoopctlWeb.ChgLiveTest do
     })
 
     row!(source, %{kind: "gate", host: "minis", sha: s1, verdict: "fail", ms: 1000, raw: %{}})
-    row!(source, %{kind: "gate", host: "x1", sha: s2, verdict: "pass", ms: 6000, raw: %{}})
+    # s2's chg check ran `mode = all` and passed where the gate failed: NOT a miss, since it
+    # selected nothing out.
+    row!(source, %{kind: "gate", host: "x1", sha: s2, verdict: "fail", ms: 6000, raw: %{}})
 
     row!(source, %{
       kind: "flaky",
@@ -188,7 +190,11 @@ defmodule LoopctlWeb.ChgLiveTest do
       assert has_element?(view, "#runner-list", "load=0.5")
 
       outcome_id = LoopctlWeb.ChgLive.outcome_dom_id(%{repo: s.repo, pr_number: 9})
-      assert outcome_id =~ ~r/\Aoutcome-[a-z0-9_-]+-9\z/
+      assert outcome_id =~ ~r/\Aoutcome-[a-f0-9]+-9\z/
+
+      refute LoopctlWeb.ChgLive.outcome_dom_id(%{repo: "a/b-c", pr_number: 1}) ==
+               LoopctlWeb.ChgLive.outcome_dom_id(%{repo: "a-b/c", pr_number: 1})
+
       assert has_element?(view, "##{outcome_id}", "no counted round")
       assert has_element?(view, "#reviews-without-round", "1")
 
@@ -233,6 +239,18 @@ defmodule LoopctlWeb.ChgLiveTest do
       assert has_element?(view, "#runner-list", "No runner samples")
       assert has_element?(view, "#review-outcomes", "No merged PRs")
       assert has_element?(view, "#attention-list", "No change is flagged")
+
+      # Each list's empty <li> is always in the DOM (shown by CSS when it is the only child), so
+      # the empty text alone proves nothing: no OTHER row may be present.
+      for {list, empty} <- [
+            {"flaky-list", "flaky-empty"},
+            {"runner-list", "runner-empty"},
+            {"review-outcomes", "outcomes-empty"},
+            {"attention-list", "attention-empty"}
+          ] do
+        refute has_element?(view, "##{list} > li:not(##{empty})"), "#{list} has a row"
+      end
+
       refute render(view) =~ "CHG-GAP-1"
       refute render(view) =~ source.tenant_id
     end

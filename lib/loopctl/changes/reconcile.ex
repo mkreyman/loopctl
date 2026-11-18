@@ -115,7 +115,9 @@ defmodule Loopctl.Changes.Reconcile do
   Flags one change for `condition` and raises its operator alert, once.
 
   The write is conditional on the flag not being set to `condition` already (and, for
-  `:stale`, on no flag at all), so two sweeps racing on one change alert once. Answers
+  `:stale`, on no flag at all), so two sweeps racing on one change alert once, and on the
+  condition still holding at `now`, so an event that landed after the candidate read keeps
+  a healthy change unflagged. Answers
   `:flagged`, or `:unchanged` when the change was already flagged or is gone.
   """
   @spec flag(candidate(), condition(), DateTime.t()) :: :flagged | :unchanged
@@ -132,8 +134,10 @@ defmodule Loopctl.Changes.Reconcile do
         {count, _} =
           Repo.update_all(
             from(c in Cursor,
+              as: :cursor,
               where: c.tenant_id == ^tenant_id and c.repo == ^repo and c.change_id == ^change_id,
-              where: ^unflagged_for(condition)
+              where: ^unflagged_for(condition),
+              where: ^still_holds(condition, now)
             ),
             set: [attention: label, attention_at: now, updated_at: now]
           )
@@ -151,6 +155,29 @@ defmodule Loopctl.Changes.Reconcile do
 
   defp unflagged_for(:gap), do: dynamic([c], is_nil(c.attention) or c.attention != "gap")
   defp unflagged_for(:stale), do: dynamic([c], is_nil(c.attention))
+
+  # The candidate's condition, re-judged in the flag's own UPDATE. The sweep reads candidates
+  # first and flags them one by one, so an event that arrived in between (clearing a gap, or
+  # ending the quiet) must keep the flag off rather than leave a healthy change flagged until
+  # its next event.
+  defp still_holds(:stale, now) do
+    cutoff = DateTime.add(now, -@stale_after_seconds, :second)
+    dynamic([c], c.last_event_at < ^cutoff)
+  end
+
+  defp still_holds(:gap, now) do
+    cutoff = DateTime.add(now, -@gap_after_seconds, :second)
+
+    waiting =
+      from e in Event,
+        where:
+          e.tenant_id == parent_as(:cursor).tenant_id and e.repo == parent_as(:cursor).repo and
+            e.change_id == parent_as(:cursor).change_id and is_nil(e.applied_at) and
+            e.inserted_at < ^cutoff,
+        select: 1
+
+    dynamic(exists(subquery(waiting)))
+  end
 
   defp alert(tenant_id, change_id, label, now) do
     :telemetry.execute([:loopctl, :changes, :attention], %{count: 1}, %{condition: label})

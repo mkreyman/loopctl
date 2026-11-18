@@ -34,7 +34,8 @@ defmodule LoopctlWeb.GithubIntakeController do
       "The webhook URL of an intake source (`POST /api/v1/intake/sources` returns it). " <>
         "Configure the GitHub repository webhook with this URL, content type " <>
         "`application/json` (form-encoded is also accepted), the returned secret, and the " <>
-        "`Issues` event. No API key: the request is authenticated by `X-Hub-Signature-256`, " <>
+        "`Issues` and `Pull requests` events (a merged pull request records its review " <>
+        "outcome, US-50.4). No API key: the request is authenticated by `X-Hub-Signature-256`, " <>
         "an HMAC-SHA256 of the raw body under the source's secret. The body may be at most " <>
         "#{@max_body_bytes} bytes (413 `payload_too_large`). The payload's " <>
         "`repository.full_name` must equal the source's repository. An unknown or revoked " <>

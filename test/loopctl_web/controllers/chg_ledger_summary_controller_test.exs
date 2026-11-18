@@ -61,6 +61,21 @@ defmodule LoopctlWeb.ChgLedgerSummaryControllerTest do
     })
 
     row!(source, %{kind: "gate", host: "minis", sha: s1, verdict: "fail", ms: 1000})
+
+    # A selecting check that passed where the gate failed: the one real miss. The `mode = all`
+    # row above passed on a failing gate too, and is NOT a miss: it selected nothing out.
+    s2 = String.duplicate("2", 40)
+
+    row!(source, %{
+      kind: "chg",
+      host: "minis",
+      sha: s2,
+      verdict: "pass",
+      ms: 300,
+      raw: %{"mode" => "affected", "selected" => ["a_test.exs"]}
+    })
+
+    row!(source, %{kind: "gate", host: "minis", sha: s2, verdict: "fail", ms: 1000})
     row!(source, %{kind: "runner", host: "x1", ms: 42, raw: %{"load" => "0.5"}})
 
     # Outside a narrowed window: ten days back.
@@ -100,9 +115,34 @@ defmodule LoopctlWeb.ChgLedgerSummaryControllerTest do
         assert data[panel] == expected[panel], "#{panel} differs from Dashboard's"
       end
 
-      assert %{"fallbacks" => 1, "checks" => 2} = data["fallbacks"]
+      assert %{"fallbacks" => 1, "checks" => 3} = data["fallbacks"]
+
+      assert [%{"sha" => "2222222222222222222222222222222222222222"}] =
+               data["selection"]["misses"]
+
       assert data["filters"]["repo"] == repo
       assert {:ok, _, _} = DateTime.from_iso8601(data["filters"]["since"])
+    end
+
+    test "a change flagged before the period and never cleared is still listed", ctx do
+      flagged_at = DateTime.add(DateTime.utc_now(), -30, :day)
+
+      AdminRepo.insert!(%Loopctl.Changes.Cursor{
+        tenant_id: ctx.source.tenant_id,
+        source_id: ctx.source.id,
+        repo: Events.repo_key(ctx.source.repo_full_name),
+        change_id: "CHG-OLD",
+        applied_seq: 1,
+        last_event_at: flagged_at,
+        attention: "stale",
+        attention_at: flagged_at
+      })
+
+      assert [%{"change_id" => "CHG-OLD"}] =
+               ctx.agent_key
+               |> summary(%{})
+               |> json_response(200)
+               |> get_in(["data", "attention"])
     end
 
     test "host and since narrow it", ctx do

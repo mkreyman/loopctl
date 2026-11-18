@@ -126,6 +126,28 @@ defmodule LoopctlWeb.ChgLedgerControllerTest do
       assert Enum.map(rejected, & &1["reason"]) == ["invalid_row", "invalid_row", "invalid_row"]
     end
 
+    test "a U+0000 in a value or key is invalid_row and the rest are stored",
+         %{conn: conn} = ctx do
+      raw =
+        batch([
+          row("chg"),
+          row("flaky", %{"note" => "a" <> <<0>> <> "b"}),
+          row("flaky", %{("k" <> <<0>>) => 1}),
+          # A literal backslash-u text is not a NUL and is stored.
+          row("flaky", %{"note" => "\\u0000 is text"})
+        ])
+
+      assert %{"inserted" => 2, "rejected" => rejected} =
+               conn |> post_batch(ctx, raw) |> json_response(200)
+
+      assert rejected == [
+               %{"index" => 1, "reason" => "invalid_row"},
+               %{"index" => 2, "reason" => "invalid_row"}
+             ]
+
+      assert length(rows(ctx.tenant_id)) == 2
+    end
+
     test "the repo is matched case-insensitively", %{conn: conn} = ctx do
       assert %{"inserted" => 1} =
                conn

@@ -120,11 +120,53 @@ defmodule Loopctl.Changes.ReconcileTest do
     end
 
     test "a change flagged for anything is not a stale candidate", ctx do
+      assert {:ok, %{outcome: :held}} = push(ctx, event("C1", 3))
+
       Oban.Testing.with_testing_mode(:manual, fn ->
-        assert :flagged = Reconcile.flag(candidate(ctx, "C1"), :gap, DateTime.utc_now())
+        assert :flagged = Reconcile.flag(candidate(ctx, "C1"), :gap, later(11 * 60))
       end)
 
       assert mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id) == []
+    end
+  end
+
+  describe "flag/3 re-judges the condition in its own write" do
+    test "a gap filled after the candidate read is not flagged", ctx do
+      assert {:ok, %{outcome: :applied}} = push(ctx, event("C1", 1))
+      assert {:ok, %{outcome: :held}} = push(ctx, event("C1", 3))
+      now = later(11 * 60)
+      assert [_] = mine(Reconcile.gap_candidates(now, 100), ctx.tenant_id)
+
+      assert {:ok, _} = push(ctx, event("C1", 2))
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :unchanged = Reconcile.flag(candidate(ctx, "C1"), :gap, now)
+        assert alert_jobs("C1") == []
+      end)
+
+      assert %Cursor{attention: nil} = Events.get_cursor(ctx.tenant_id, @repo, "C1")
+    end
+
+    test "an event that ended the quiet after the candidate read is not flagged stale", ctx do
+      story = fixture(:story, %{tenant_id: ctx.tenant_id})
+
+      assert {:ok, _} =
+               push(ctx, event("C1", 1, %{kind: "submitted", data: %{"story_id" => story.id}}))
+
+      now = later(7 * 3_600)
+      assert [_] = mine(Reconcile.stale_candidates(now, 100), ctx.tenant_id)
+
+      # An arrival at `now`, as `touch_cursor` writes it.
+      {1, _} =
+        AdminRepo.update_all(
+          from(c in Cursor, where: c.tenant_id == ^ctx.tenant_id and c.change_id == "C1"),
+          set: [last_event_at: now]
+        )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :unchanged = Reconcile.flag(candidate(ctx, "C1"), :stale, now)
+        assert alert_jobs("C1") == []
+      end)
     end
   end
 
@@ -199,15 +241,15 @@ defmodule Loopctl.Changes.ReconcileTest do
       assert {:ok, _} = push(ctx, event("C1", 1))
 
       Oban.Testing.with_testing_mode(:manual, fn ->
-        assert :flagged = Reconcile.flag(candidate(ctx, "C1"), :stale, DateTime.utc_now())
-        assert :unchanged = Reconcile.flag(candidate(ctx, "C1"), :stale, DateTime.utc_now())
+        assert :flagged = Reconcile.flag(candidate(ctx, "C1"), :stale, later(7 * 3_600))
+        assert :unchanged = Reconcile.flag(candidate(ctx, "C1"), :stale, later(7 * 3_600))
       end)
 
       assert {:ok, _} = push(ctx, event("C1", 2))
       assert %Cursor{attention: nil} = Events.get_cursor(ctx.tenant_id, @repo, "C1")
 
       Oban.Testing.with_testing_mode(:manual, fn ->
-        assert :flagged = Reconcile.flag(candidate(ctx, "C1"), :stale, DateTime.utc_now())
+        assert :flagged = Reconcile.flag(candidate(ctx, "C1"), :stale, later(7 * 3_600))
         assert length(alert_jobs("C1")) == 2
       end)
     end

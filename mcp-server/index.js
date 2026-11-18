@@ -5039,7 +5039,10 @@ const TOOLS = [
       "chg_root_dispatch_id — else 409 chg_reviewer_required (chg-server's root key is " +
       "refused too); commit_sha is REQUIRED and must be the sha of a submitted revision of " +
       "the story's current change, else 422 commit_sha_not_bound; and one reviewer dispatch " +
-      "records one verdict, a second is 409 chg_review_already_recorded. On any other story " +
+      "records one verdict, a second is 409 chg_review_already_recorded. A key the intake " +
+      "source minted (review_dispatch, loopctl US-50.3) reviews only the revision it was " +
+      "minted for, and only while its dispatch is live, else 409 " +
+      "chg_review_dispatch_mismatch. On any other story " +
       "commit_sha is ignored and not stored. On a PULL-REQUEST-ROUTE story (loopctl " +
       "US-48.18) only the key of the story's bound verify@1 dispatch may record the review, " +
       "else 409 pr_route_verifier_only — a user key included.",

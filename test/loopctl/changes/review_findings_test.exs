@@ -34,6 +34,18 @@ defmodule Loopctl.Changes.ReviewFindingsTest do
   The new tool is additive.
   """
 
+  test "a U+0000 in the body is removed, so nothing stored can carry it" do
+    body =
+      "## Review findings\n\n1. fixed low a.ex:1 — a" <>
+        <<0>> <> "b\n2. not a fin" <> <<0>> <> "ding\n"
+
+    parsed = ReviewFindings.parse(body)
+
+    refute inspect(parsed) =~ <<0>>
+    assert [%{summary: "ab"}] = parsed.findings
+    assert parsed.unparsed == ["2. not a finding"]
+  end
+
   test "the vocabulary matches review-dispositions.py" do
     assert ReviewFindings.dispositions() ==
              ~w(fixed wrong intentional didnt-matter deferred routed)

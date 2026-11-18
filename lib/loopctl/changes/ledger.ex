@@ -14,7 +14,8 @@ defmodule Loopctl.Changes.Ledger do
   Each row is judged on its own. A row that fails is named in `rejected` by its index and
   reason, and never fails the batch:
 
-  - `invalid_row`: not an object, a required field missing or malformed, or larger than
+  - `invalid_row`: not an object, a required field missing or malformed, a U+0000 anywhere
+    (`jsonb` refuses it), or larger than
     `@max_row_bytes` encoded. Every row needs `v`, `kind`, `repo`, `host` and `at_ms`; a `chg`
     or `gate` row also needs `sha`, `verdict` (`pass|fail|error|skipped`) and `ms`. Any other
     kind is stored with the common fields, so chg can add kinds without a loopctl release.
@@ -249,10 +250,20 @@ defmodule Loopctl.Changes.Ledger do
 
   defp judge(_row, _repo), do: {:error, "invalid_row"}
 
+  # Postgres `jsonb` refuses U+0000 anywhere in a value or key, and the batch is ONE insert, so a
+  # single such row would fail every row with it. It is judged here, alone, as `invalid_row`.
+  # The check runs on the encoded form, where Jason writes NUL as the escape `\u0000`; a
+  # literal backslash before it is itself escaped (`\\u0000`), so only a real NUL matches the
+  # unescaped pattern below.
+  @nul_escape ~r/(?<!\\)(?:\\\\)*\\u0000/
+
   defp canonical_json(row) do
     case Jason.encode(canonical(row)) do
-      {:ok, encoded} when byte_size(encoded) <= @max_row_bytes -> {:ok, encoded}
-      _ -> {:error, "invalid_row"}
+      {:ok, encoded} when byte_size(encoded) <= @max_row_bytes ->
+        if Regex.match?(@nul_escape, encoded), do: {:error, "invalid_row"}, else: {:ok, encoded}
+
+      _ ->
+        {:error, "invalid_row"}
     end
   end
 

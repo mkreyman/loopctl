@@ -122,9 +122,15 @@ defmodule LoopctlWeb.ChgLedgerSummaryController do
                  review_outcomes: %OpenApiSpex.Schema{
                    description:
                      "Merged PRs' review findings by severity and disposition, and the count " <>
-                       "merged without a counted review round. " <> @panel_description
+                       "merged without a counted review round, totalled over every merged PR " <>
+                       "in the period; `outcomes` lists the newest of them. " <>
+                       @panel_description
                  },
-                 attention: %OpenApiSpex.Schema{description: @panel_description}
+                 attention: %OpenApiSpex.Schema{
+                   description:
+                     "Changes flagged gap or stale and still flagged. Current state: `since` " <>
+                       "and `until` do not apply. " <> @panel_description
+                 }
                }
              }
            }
