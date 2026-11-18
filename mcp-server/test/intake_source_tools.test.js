@@ -415,7 +415,7 @@ describe("intake_source_enroll", () => {
       );
 
       assert.equal(result.error, true);
-      assert.match(result.body, /`mode` must be `pr` or `chg`/);
+      assert.match(result.body, /`mode` must be `pr`, `chg` or `ledger`/);
       assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
     }
   });
@@ -916,6 +916,92 @@ describe("mode chg (US-47.2)", () => {
   });
 });
 
+// loopctl #1047: `ledger` is a KB scope's ledger-only source, and a `pr` source holding the
+// chg credentials sends its ledger without leaving `pr`.
+describe("mode ledger, and the ledger from a pr source (loopctl #1047)", () => {
+  function ledgerCreated() {
+    const fake = chgCreated();
+    return { ...fake, source: { ...fake.source, mode: "ledger" } };
+  }
+
+  test("enrol forwards mode ledger with both credentials, and the secret is in no result", async () => {
+    const { calls, apiCall } = fakeApi(ledgerCreated());
+
+    const result = await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        secret_file: secretFileIn("ledger.secret"),
+        mode: "ledger",
+        change_events_secret: CHG_SECRET,
+        chg_root_dispatch_id: ROOT_ID,
+      },
+      deps({ apiCall }),
+    );
+
+    assert.deepEqual(calls[0].body, {
+      repo_full_name: REPO,
+      project_id: PROJECT_ID,
+      mode: "ledger",
+      change_events_secret: CHG_SECRET,
+      chg_root_dispatch_id: ROOT_ID,
+    });
+    assert.equal(result.source.mode, "ledger");
+    assert.ok(!JSON.stringify(result).includes(CHG_SECRET), "the change-events secret leaked");
+  });
+
+  test("enrolling ledger without both credentials is refused locally, naming the 422", async () => {
+    for (const [i, extra] of [
+      { chg_root_dispatch_id: ROOT_ID },
+      { change_events_secret: CHG_SECRET },
+      {},
+    ].entries()) {
+      const { calls, apiCall } = fakeApi(ledgerCreated());
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          secret_file: secretFileIn(`ledger-missing-${i}.secret`),
+          mode: "ledger",
+          ...extra,
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true);
+      assert.match(result.body, /mode: ledger/);
+      assert.match(result.body, /422/);
+      assert.equal(calls.length, 0);
+      await assert.rejects(fs.stat(secretFileIn(`ledger-missing-${i}.secret`)));
+    }
+  });
+
+  test("a pr source is given the credentials without its mode being named or changed", async () => {
+    const { calls, apiCall } = fakeApi(created());
+    await updateIntakeSource(
+      { source_id: SOURCE_ID, change_events_secret: CHG_SECRET, chg_root_dispatch_id: ROOT_ID },
+      deps({ apiCall }),
+    );
+    assert.deepEqual(calls[0].body, {
+      change_events_secret: CHG_SECRET,
+      chg_root_dispatch_id: ROOT_ID,
+    });
+  });
+
+  test("the declarations and README rows describe ledger and the pr-source ledger", () => {
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      const tool = loadTools().find((t) => t.name === name);
+      const readmeRow =
+        README.split("\n").find((line) => line.startsWith(`| \`${name}\` |`)) ?? "";
+      for (const text of [tool.description, readmeRow]) {
+        assert.match(text, /ledger/, name);
+        assert.match(text, /KB scope/i, name);
+        assert.match(text, /stays `pr`/i, name);
+      }
+    }
+  });
+});
+
 describe("intake_source_list", () => {
   test("GETs the sources, with include_revoked only on request", async () => {
     const { calls, apiCall } = fakeApi({ sources: [] });
@@ -1105,7 +1191,7 @@ describe("intake_source_update", () => {
       deps({ apiCall }),
     );
 
-    assert.match(result.body, /`mode` must be `pr` or `chg`/);
+    assert.match(result.body, /`mode` must be `pr`, `chg` or `ledger`/);
     assert.equal(calls.length, 0);
   });
 
@@ -1364,7 +1450,11 @@ describe("the descriptions carry what a caller needs instead of the controller",
       const tool = loadTools().find((t) => t.name === name);
       // Copied out of the vm realm the declarations were evaluated in, so deepEqual compares
       // values and not array prototypes.
-      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], ["pr", "chg"], name);
+      assert.deepEqual(
+        [...(tool.inputSchema.properties.mode?.enum ?? [])],
+        ["pr", "chg", "ledger"],
+        name,
+      );
       assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], SOURCE_MODES, name);
     }
     for (const text of [description("intake_source_enroll"), row("intake_source_enroll")]) {

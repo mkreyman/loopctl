@@ -45,7 +45,8 @@ defmodule Loopctl.Changes.Landings do
     do: Map.get(newest_bindings(repo, tenant_id, [story_id]), story_id)
 
   @doc """
-  The newest APPLIED `landed` event of each binding's change, keyed by `{repo, change_id}`,
+  The newest APPLIED, ROUTED `landed` event of each binding's change (an event a non-`chg`
+  source delivered moved nothing and lands nothing, issue #1047), keyed by `{repo, change_id}`,
   with the `repo_full_name` of the intake source that delivered it (`source_repo`).
   """
   @spec newest_applied_landings(Ecto.Repo.t(), Ecto.UUID.t(), [Binding.t()]) ::
@@ -64,7 +65,7 @@ defmodule Loopctl.Changes.Landings do
         where:
           e.tenant_id == ^tenant_id and e.repo in ^Enum.map(bindings, & &1.repo) and
             e.change_id in ^Enum.map(bindings, & &1.change_id) and e.kind == "landed" and
-            not is_nil(e.applied_at),
+            not is_nil(e.applied_at) and e.routed,
         distinct: [asc: e.repo, asc: e.change_id],
         order_by: [desc: e.event_seq],
         select: %{

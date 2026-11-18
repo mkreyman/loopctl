@@ -16,7 +16,17 @@ defmodule LoopctlWeb.IntakeSourceController do
   webhook authenticates with, it belongs to no lineage either, and the root is the custody
   input that decides whose reviews a `chg` story accepts. A bare `mode: chg` is included
   because it RE-ACTIVATES whichever secret and root the source kept from an earlier `chg`
-  stint — registering them again without naming them.
+  stint — registering them again without naming them. `mode: ledger` is held to it for the
+  same reason.
+
+  ## A ledger credential for a kb scope (issue #1047)
+
+  `mode: ledger` enrols a repository that has only a `:kb` scope: `project_id` names the kb
+  scope, and the source holds the chg credentials and nothing else — no dispatch binding, no
+  merge route, no GitHub delivery. It goes through the SAME gates as any enrolment (user role,
+  human-anchored tenant, unlineaged caller, and a root only the operator key can mint), so it
+  opens no surface a kb scope did not already have: the kb carve-out (`create_kb_scope`) is
+  untouched, and a kb scope still cannot carry work.
   """
 
   use LoopctlWeb, :controller
@@ -82,15 +92,27 @@ defmodule LoopctlWeb.IntakeSourceController do
               "back to `pr` KEEPS both and ignores them, and every write that leaves the " <>
               "source `chg` re-checks the root. A switch to `chg` is 409 " <>
               "`pr_route_in_flight` while a story of the project holds a merge allow it has " <>
-              "not merged on. NOT nullable: an explicit null or any other value is a 422."
+              "not merged on. `ledger` (issue #1047): a kb scope's ledger-only credential — " <>
+              "`project_id` names an active KB SCOPE, both credentials are required as for " <>
+              "`chg`, and the source is never a dispatch binding, never a merge route, and " <>
+              "refuses every GitHub delivery. `pr` and `chg` need a work project and `ledger` a " <>
+              "kb scope, so a switch between `ledger` and the other two is a 422. Sending is " <>
+              "not routing: a source in ANY mode that holds both credentials authenticates on " <>
+              "the chg ledger and change-event endpoints, and only a `chg` source's events " <>
+              "move a stage or bind a change; a `pr` or `ledger` source's are recorded with " <>
+              "`routed: false`. NOT nullable: an explicit null or any other value is a 422."
 
   @change_events_secret_doc "WRITE-ONLY. The HMAC key chg-server signs its event webhook " <>
                               "with (`POST /api/v1/change_events/:source_id`); chg-server " <>
                               "must hold the same value. It " <>
                               Source.change_events_secret_rule() <>
                               ". Encrypted at rest and NEVER returned by any response, so " <>
-                              "keep your own copy. Required when the source is `chg`; on a " <>
-                              "`pr` source an explicit null clears it. Not GitHub's " <>
+                              "keep your own copy. Required when the source is `chg` or " <>
+                              "`ledger`; a `pr` source MAY hold it (with " <>
+                              "`chg_root_dispatch_id`), and then sends its chg ledger " <>
+                              "(`POST /api/v1/chg/ledger/:source_id`) and change events " <>
+                              "while the merge route stays the pull request. On a `pr` " <>
+                              "source an explicit null clears it. Not GitHub's " <>
                               "`webhook_secret`, which is never reused."
 
   @chg_root_doc "The dispatch chg-server's key was minted from (PRD §6): reviews of a `chg` " <>
@@ -101,8 +123,9 @@ defmodule LoopctlWeb.IntakeSourceController do
                   "the source `chg` — a secret rotation or a base-branch edit on a `chg` " <>
                   "source whose root has since been revoked is the same 422 until a live root " <>
                   "is named. " <>
-                  "Required when the source is `chg`; on a `pr` source an explicit null " <>
-                  "clears it."
+                  "Required when the source is `chg` or `ledger`, and on a `pr` source " <>
+                  "that is to send its chg ledger and events (with " <>
+                  "`change_events_secret`); on a `pr` source an explicit null clears it."
 
   @triage_requires_ticket_doc "WHICH ISSUES ARE TRIAGED. False (the default): every issue " <>
                                 "the webhook delivers. True: only an issue HomeCareBilling " <>
@@ -164,7 +187,7 @@ defmodule LoopctlWeb.IntakeSourceController do
         description: @required_checks_doc
       },
       triage_requires_ticket: %Schema{type: :boolean, description: @triage_requires_ticket_doc},
-      mode: %Schema{type: :string, enum: ["pr", "chg"], description: @mode_doc},
+      mode: %Schema{type: :string, enum: ["pr", "chg", "ledger"], description: @mode_doc},
       chg_root_dispatch_id: %Schema{
         type: :string,
         format: :uuid,
@@ -196,7 +219,11 @@ defmodule LoopctlWeb.IntakeSourceController do
         "the body does not name it, and `mode` to `pr`. Enrolling in mode `chg` (US-47.2) " <>
         "also needs `change_events_secret` and `chg_root_dispatch_id` (422 naming the " <>
         "missing field otherwise), and a root that is not a parentless, unrevoked, " <>
-        "orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`.",
+        "orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`. Enrolling in " <>
+        "mode `ledger` (issue #1047) takes an ACTIVE KB SCOPE as `project_id` (422 otherwise; " <>
+        "`pr` and `chg` take a work project) and both chg credentials: the source sends the " <>
+        "repository's chg ledger and change events and is never a dispatch binding or a merge " <>
+        "route, and its webhook refuses every GitHub delivery, so do not configure one.",
     request_body:
       {"Intake source", "application/json",
        %Schema{
@@ -225,7 +252,7 @@ defmodule LoopctlWeb.IntakeSourceController do
            },
            mode: %Schema{
              type: :string,
-             enum: ["pr", "chg"],
+             enum: ["pr", "chg", "ledger"],
              description: "Optional, `pr` when omitted. " <> @mode_doc
            },
            change_events_secret: %Schema{
@@ -376,7 +403,7 @@ defmodule LoopctlWeb.IntakeSourceController do
            },
            mode: %Schema{
              type: :string,
-             enum: ["pr", "chg"],
+             enum: ["pr", "chg", "ledger"],
              description: "Optional; omitted leaves it as it is. " <> @mode_doc
            },
            change_events_secret: %Schema{
@@ -502,7 +529,7 @@ defmodule LoopctlWeb.IntakeSourceController do
   # hands back another lineaged key, which this refuses again.
   defp guard_chg_credentials(conn, params) do
     if Map.has_key?(params, "change_events_secret") or
-         Map.has_key?(params, "chg_root_dispatch_id") or params["mode"] == "chg",
+         Map.has_key?(params, "chg_root_dispatch_id") or params["mode"] in ["chg", "ledger"],
        do:
          RequireUnlineagedCaller.call(
            conn,

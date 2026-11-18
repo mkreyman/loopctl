@@ -347,11 +347,14 @@ defmodule Loopctl.Changes.EventEffects do
     end
   end
 
+  # ROUTED events only (issue #1047): an event a `pr` or `ledger` source delivered was applied
+  # with no effect, so it is no half of a pair and supersedes no revision once the source is
+  # switched to `chg`. Only the earlier events this route acted on count.
   defp earlier(tenant_id, %Event{} = event) do
     from e in Event,
       where:
         e.tenant_id == ^tenant_id and e.repo == ^event.repo and e.change_id == ^event.change_id and
-          e.event_seq < ^event.event_seq
+          e.event_seq < ^event.event_seq and e.routed
   end
 
   defp superseded_revision?(tenant_id, event) do

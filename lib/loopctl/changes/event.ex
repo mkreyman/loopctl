@@ -11,6 +11,10 @@ defmodule Loopctl.Changes.Event do
     it as an instruction, and nothing but the effects module reads it at all.
   - `received_via` is `"push"` (the webhook). Rows written before US-50.2 may read `"pull"`,
     from the retired chg-server gap pull.
+  - `routed` is whether the event was applied under a `chg` source (issue #1047). A `pr` or
+    `ledger` source may deliver events too, and they are stored, ordered and audited, but
+    applied with no stage or binding effect (`routed: false`). Every reader that treats an
+    applied event as evidence for a stage move or a custody gate reads only `routed` ones.
 
   Written only by `Loopctl.Changes.Events` from a validated `Loopctl.Changes.Envelope`; there
   is no changeset because no field of this row is ever cast from a request. `tenant_id` and
@@ -35,6 +39,7 @@ defmodule Loopctl.Changes.Event do
     field :received_via, :string
     field :applied_at, :utc_datetime_usec
     field :effect, :map
+    field :routed, :boolean, default: true
 
     timestamps()
   end

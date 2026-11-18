@@ -168,7 +168,7 @@ defmodule Loopctl.Changes.ReviewCustody do
             where:
               e.tenant_id == ^tenant_id and e.repo == ^binding.repo and
                 e.change_id == ^binding.change_id and e.kind == "submitted" and
-                e.sha == ^commit_sha and not is_nil(e.applied_at)
+                e.sha == ^commit_sha and not is_nil(e.applied_at) and e.routed
         )
 
     if bound?, do: :ok, else: {:error, :commit_sha_not_bound}
@@ -233,7 +233,7 @@ defmodule Loopctl.Changes.ReviewCustody do
       where: e.tenant_id == ^tenant_id and e.source_id == ^row.source_id,
       where: e.repo == ^row.repo and e.change_id == ^row.change_id,
       where: e.kind == "submitted" and e.revision == ^row.revision and e.sha == ^commit_sha,
-      where: not is_nil(e.applied_at)
+      where: not is_nil(e.applied_at) and e.routed
   end
 
   @doc """

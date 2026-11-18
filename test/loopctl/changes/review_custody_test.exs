@@ -316,6 +316,33 @@ defmodule Loopctl.Changes.ReviewCustodyTest do
                review(ctx, ctx.story, child(ctx).lineage_path, %{"commit_sha" => sha("c")})
     end
 
+    # Issue #1047: a `pr` source still sends events, unrouted. A revision submitted during a
+    # `pr` stint moved nothing, so it is not a revision a chg review may name once the source is
+    # `chg` again.
+    test "a revision submitted while the source was pr is not bound", ctx do
+      :ok = submit!(ctx, ctx.story, "C1", 1, 1, sha("a"))
+
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "pr"})
+
+      assert {:ok, %{outcome: :applied}} =
+               push(
+                 ctx,
+                 event("C1", 2, "submitted", %{
+                   revision: 2,
+                   sha: sha("e"),
+                   data: %{"story_id" => ctx.story.id}
+                 })
+               )
+
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "chg"})
+
+      assert {:error, :commit_sha_not_bound} =
+               review(ctx, ctx.story, child(ctx).lineage_path, %{"commit_sha" => sha("e")})
+
+      assert {:ok, _} =
+               review(ctx, ctx.story, child(ctx).lineage_path, %{"commit_sha" => sha("a")})
+    end
+
     test "a submitted revision held ahead of a gap is not bound until it applies", ctx do
       :ok = submit!(ctx, ctx.story, "C1", 1, 1, sha("a"))
 

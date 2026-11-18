@@ -251,7 +251,11 @@ defmodule Loopctl.Changes.TrunkEvidence do
     }
   end
 
-  # The highest `event_seq` of an APPLIED `reverted` event of each binding's change.
+  # The highest `event_seq` of an APPLIED `reverted` event of each binding's change, ROUTED OR
+  # NOT (issue #1047). Every other reader of applied events counts only routed ones, because an
+  # event delivered under a `pr` or `ledger` source must not stand in as evidence FOR a gate. A
+  # revert is evidence AGAINST one: the landing is off trunk whichever mode the source was in
+  # when chg reported it, so ignoring it would verify a reverted landing.
   defp newest_reverts(_repo, _tenant_id, []), do: %{}
 
   defp newest_reverts(repo, tenant_id, bindings) do

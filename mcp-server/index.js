@@ -9310,7 +9310,8 @@ const TOOLS = [
       "admits outside text into the queue of a project whose stories an implementer will act " +
       "on). 422 when the repository is not `owner/name`, when an ACTIVE source already binds " +
       "that repository (revoke it first — the uniqueness is partial on not-yet-revoked), when " +
-      "the project is missing, archived or not a work project, or when `target_epic_id` names " +
+      "the project is missing, archived or the wrong kind for the mode (a work project for " +
+      "`pr`/`chg`, a KB scope for `ledger`), or when `target_epic_id` names " +
       "an epic outside that project. 429 when rate limited.\n\n" +
       "NAME `base_branch` AT ENROLMENT for a repository whose trunk is not `master`. It is the " +
       "branch every dispatch for this repository is cut FROM, it defaults to `master` when the " +
@@ -9327,7 +9328,16 @@ const TOOLS = [
       "here, and 422 at the server, without them — and a root that is not a parentless, " +
       "unrevoked, orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`. The " +
       "change-events secret is write-only: no response and no tool result ever carries it. " +
-      "Any other mode, null included, is refused.",
+      "Any other mode, null included, is refused.\n\n" +
+      "SENDING IS NOT ROUTING (loopctl #1047). The two chg credentials authenticate the " +
+      "ledger (POST /api/v1/chg_ledger/:source_id) and change-event endpoints in EVERY mode. " +
+      "A `pr` source that holds them stays `pr`: its merge precondition still reads the PR, " +
+      "and its change events are recorded without binding or moving any story. `ledger` " +
+      "enrols a repository that has NO work project for the ledger alone: `project_id` must " +
+      "then be an active KB scope (create_kb_scope), both credentials are required as for " +
+      "`chg`, the source is never a dispatch binding (place_dispatch and candidate selection " +
+      "skip it), and GitHub deliveries to it are refused. `ledger` on a work project, or " +
+      "`pr`/`chg` on a kb scope, is 422 at the server.",
     inputSchema: {
       type: "object",
       properties: {
@@ -9340,8 +9350,9 @@ const TOOLS = [
         project_id: {
           type: "string",
           description:
-            "The ACTIVE WORK project (UUID) whose queue this repository's issues feed. A `kb` " +
-            "scope or an archived project is a 422.",
+            "The ACTIVE WORK project (UUID) whose queue this repository's issues feed — or, " +
+            "with `mode: ledger`, the active KB scope the ledger-only source belongs to. The " +
+            "wrong kind for the mode, or an archived project, is a 422.",
         },
         target_epic_id: {
           type: "string",
@@ -9366,20 +9377,23 @@ const TOOLS = [
         },
         mode: {
           type: "string",
-          enum: ["pr", "chg"],
+          enum: ["pr", "chg", "ledger"],
           description:
             "Optional. How this repository's changes reach its base branch: `pr` (the " +
             "default; the merge gate reads a pull request by number) or `chg` (the change " +
             "protocol lands them and the PR route is closed, 409 `change_protocol_enrolled`; " +
-            "needs the two fields below). Not nullable.",
+            "needs the two fields below). `ledger` routes nothing: a KB scope's ledger-only " +
+            "source, which also needs the two fields below. Not nullable.",
         },
         change_events_secret: {
           type: "string",
           description:
-            "WRITE-ONLY; required with `mode: chg`. The HMAC key chg-server signs its event " +
-            "webhook with (POST /api/v1/change_events/:source_id); chg-server must hold the " +
-            "same value. 32-256 bytes (422 otherwise). Encrypted at rest and NEVER returned by " +
-            "any response or tool result. A tool input lands in the transcript, so prefer " +
+            "WRITE-ONLY; required with `mode: chg` or `mode: ledger`, and accepted on a `pr` " +
+            "source, which then sends its ledger too. The HMAC key chg signs its ledger " +
+            "batches and change events with (POST /api/v1/chg_ledger/:source_id and " +
+            "/api/v1/change_events/:source_id); chg must hold the same value. 32-256 bytes " +
+            "(422 otherwise). Encrypted at rest and NEVER returned by any response or tool " +
+            "result. A tool input lands in the transcript, so prefer " +
             "`change_events_secret_file`. Not GitHub's webhook secret.",
         },
         change_events_secret_file: {
@@ -9392,7 +9406,8 @@ const TOOLS = [
         chg_root_dispatch_id: {
           type: "string",
           description:
-            "Required with `mode: chg`. The dispatch (UUID) chg-server's key was minted from: " +
+            "Required with `mode: chg` or `mode: ledger`, and with the secret on a `pr` source " +
+            "(a signed request is refused without both). The dispatch (UUID) chg's key was minted from: " +
             "a PARENTLESS, UNREVOKED, ORCHESTRATOR-role dispatch of this tenant, minted by the " +
             "operator key with `dispatch` and no parent. Anything else — a child, a revoked " +
             "or agent-role dispatch, another tenant's or an unknown id — is refused 422 " +
@@ -9440,7 +9455,7 @@ const TOOLS = [
     description:
       "LIST THE TENANT'S GITHUB INTAKE SOURCES (GET /api/v1/intake/sources): per source its " +
       "`id` (the webhook URL is /api/v1/intake/github/<id>), `project_id`, `repo_full_name`, " +
-      "`base_branch`, `mode` (`pr` or `chg`), `chg_root_dispatch_id`, `target_epic_id`, " +
+      "`base_branch`, `mode` (`pr`, `chg` or `ledger`), `chg_root_dispatch_id`, `target_epic_id`, " +
       "`revoked_at` and " +
       "timestamps. Active sources only " +
       "unless `include_revoked` is true.\n\n" +
@@ -9468,8 +9483,14 @@ const TOOLS = [
     description:
       "SET WHERE A SOURCE'S WORK LANDS (PATCH /api/v1/intake/sources/:id): `target_epic_id`, " +
       "the epic triaged stories are created in, `base_branch`, the branch every dispatch " +
-      "for this repository is cut FROM and carries, `mode`, the merge route (`pr` or `chg`), " +
-      "and a `chg` source's `change_events_secret` and `chg_root_dispatch_id`.\n\n" +
+      "for this repository is cut FROM and carries, `mode`, the merge route (`pr` or `chg`, " +
+      "or `ledger` on a KB scope), and the `change_events_secret` and `chg_root_dispatch_id` " +
+      "that authenticate a source's chg ledger and change events.\n\n" +
+      "LEDGER FROM A `pr` SOURCE (loopctl #1047): naming both credentials on a `pr` source " +
+      "lets chg send its ledger and change events for that repository while the source STAYS " +
+      "`pr` — the merge precondition still reads the PR, and the events move no story. Do not " +
+      "switch to `chg` for that. A mode change between a work project's modes (`pr`, `chg`) " +
+      "and `ledger` is 422: a source never moves between a work project and a KB scope.\n\n" +
       "PRESENCE DECIDES, AND A FIELD YOU DO NOT NAME IS LEFT EXACTLY AS IT WAS. Naming " +
       "none of them is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
       "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
@@ -9493,8 +9514,9 @@ const TOOLS = [
       "write until a live one is named, while switching to `pr` is never blocked). Switching " +
       "to `pr` KEEPS both and ignores " +
       "them; on a `pr` source an explicit null clears either, and on a `chg` source a null is " +
-      "a 422. Naming either credential, or setting `mode` to `chg` (which re-activates the " +
-      "kept ones), needs the tenant's operator key — a user-role key NO DISPATCH MINTED — " +
+      "a 422. Naming either credential, or setting `mode` to `chg` or `ledger` (which " +
+      "re-activates the kept ones), needs the tenant's operator key — a user-role key NO " +
+      "DISPATCH MINTED — " +
       "and anything else is 403 `chg_registration_forbidden`; a key minted by a dispatch " +
       "beneath yours is refused the same way. The secret is write-only and " +
       "never comes back.\n\n" +
@@ -9534,17 +9556,20 @@ const TOOLS = [
         },
         mode: {
           type: "string",
-          enum: ["pr", "chg"],
+          enum: ["pr", "chg", "ledger"],
           description:
             "`pr` (the merge gate reads a pull request) or `chg` (the change protocol lands " +
-            "changes; the PR route is closed). Not nullable. Omit to leave the current value " +
-            "alone.",
+            "changes; the PR route is closed) on a work project; `ledger` on a KB scope. A " +
+            "switch across project kinds is 422. Not nullable. Omit to leave the current " +
+            "value alone.",
         },
         change_events_secret: {
           type: ["string", "null"],
           description:
-            "WRITE-ONLY. The HMAC key chg-server signs its event webhook with, 32-256 bytes; " +
-            "never returned. Null clears it on a `pr` source (422 on a `chg` one). Prefer " +
+            "WRITE-ONLY. The HMAC key chg signs its ledger batches and change events with, " +
+            "32-256 bytes; never returned. On a `pr` source it (with `chg_root_dispatch_id`) " +
+            "lets chg send the ledger while the source stays `pr`. Null clears it on a `pr` " +
+            "source (422 on a `chg` or `ledger` one). Prefer " +
             "`change_events_secret_file`. Omit to leave it alone.",
         },
         change_events_secret_file: {
@@ -9559,8 +9584,8 @@ const TOOLS = [
           description:
             "The parentless, unrevoked, orchestrator-role dispatch of this tenant chg-server's " +
             "key was minted from; anything else is 422 `chg_root_invalid`, and the root a `chg` " +
-            "source keeps is re-checked on every write to it. Null clears it on a " +
-            "`pr` source (422 on a `chg` one). Omit to leave it alone.",
+            "or `ledger` source keeps is re-checked on every write to it. Null clears it on a " +
+            "`pr` source (422 on a `chg` or `ledger` one). Omit to leave it alone.",
         },
         required_checks: {
           type: "array",

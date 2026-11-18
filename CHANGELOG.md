@@ -6,6 +6,25 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The chg ledger and change events from a `pr` source, and intake mode `ledger`
+  (2026-11-18, #1047).** `POST /api/v1/chg_ledger/:source_id` and
+  `POST /api/v1/change_events/:source_id` now authenticate any source that holds both
+  `change_events_secret` and a live `chg_root_dispatch_id`, whatever its mode. Only a `chg`
+  source's events bind stories or move stages; any other source's events are stored,
+  cursored and audited with effect `recorded` and `routed: false`, and no custody gate reads
+  them (a `reverted` event still counts against verification in every mode). A `pr` source's
+  merge precondition still reads the PR. Reviewer minting
+  (`POST /api/v1/change_events/:source_id/review_dispatch`) stays `chg`-only, with the same
+  401. The new mode `ledger` enrolls a repository with no work project on an active KB scope,
+  needs both credentials, is never a dispatch binding, and refuses GitHub deliveries; a mode
+  change between a work project's modes and `ledger` is 422. The migration `20261119100000`
+  widens the `intake_sources` mode and credential CHECKs and adds
+  `change_events.routed boolean NOT NULL DEFAULT true` (a constant default, so no rewrite;
+  rows written before it are chg-routed, which is what they were). Deploy order: migrate
+  first. A node still on the old code never writes `routed` (the default is right for the
+  only events it accepts, a `chg` source's) and still answers 401 to a `pr` source, which the
+  sender retries. Enroll a `ledger` source only after every node runs the new code: an old
+  node cannot load a source row whose mode it does not know.
 - **Operator browser login and the `/chg` dashboard (2026-11-18, US-50.5).** `/login` signs
   a tenant's human in with the passkey enrolled at signup (usernameless, user verification
   required; a security key enrolled without a resident credential cannot sign in, so enroll a

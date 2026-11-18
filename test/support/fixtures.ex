@@ -3194,6 +3194,41 @@ defmodule Loopctl.Fixtures do
     %{secret: secret, source: source, root: root}
   end
 
+  # Issue #1047: a chg SENDER credential that is not the change protocol's route, through
+  # `Loopctl.Intake.create_source/3`. `mode: "ledger"` (the default) enrols it on a fresh ACTIVE
+  # `:kb` scope; `mode: "pr"` on a fresh work project, as a `pr` source holding both chg
+  # credentials. Returns `%{secret:, source:, root:, project:}`. Optional: `:tenant_id`,
+  # `:repo_full_name`, `:mode`, `:project_id`.
+  def fixture(:ledger_source, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:tenant).id end)
+    mode = Map.get(attrs, :mode, "ledger")
+    root = fixture(:chg_root_dispatch, %{tenant_id: tenant_id})
+    secret = "chg-secret-" <> Base.encode16(:crypto.strong_rand_bytes(16))
+
+    project =
+      case Map.get(attrs, :project_id) do
+        nil ->
+          kind = if mode == "ledger", do: :kb, else: :work
+          fixture(:project, %{tenant_id: tenant_id, kind: kind})
+
+        project_id ->
+          AdminRepo.get!(Project, project_id)
+      end
+
+    {_webhook_secret, source} =
+      fixture(:intake_source, %{
+        tenant_id: tenant_id,
+        project_id: project.id,
+        repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/infra"),
+        mode: mode,
+        change_events_secret: secret,
+        chg_root_dispatch_id: root.id
+      })
+
+    %{secret: secret, source: source, root: root, project: project}
+  end
+
   # An intake SOURCE + RECORD pair inserted DIRECTLY (#805), bypassing
   # `Loopctl.Intake.receive_github_delivery/2` so a test does not have to sign a webhook
   # delivery to get a record to link a story to. Returns the record.
