@@ -1,0 +1,69 @@
+{
+  "id": "US-50.5",
+  "title": "Operator browser login and the chg dashboard",
+  "epic": {
+    "id": "epic_50",
+    "name": "chg change ledger and dashboard"
+  },
+  "priority": "medium",
+  "phase": "chg_ledger",
+  "story": {
+    "as_a": "operator",
+    "i_want_to": "open one page that answers the chg audit questions",
+    "so_that": "the 2026-10-28 audit takes a page load instead of ssh into four machines"
+  },
+  "rationale": "loopctl#1014 'Done when': the audit questions are answered from one page.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-50.5.1",
+      "description": "An operator logs in from a browser with a WebAuthn assertion against the tenant's enrolled authenticator; the session lasts at most 12 hours, is signed and HttpOnly, and lands in a new :operator live_session whose on_mount refuses an unauthenticated socket."
+    },
+    {
+      "id": "AC-50.5.2",
+      "description": "/chg shows, filterable by repo, host and period: gate outcomes over time (pass, fail, error, skipped) and the fallback rate (mode all with its reason); selection quality (selected against the floor, missed tests); time per gate phase (hydrate_ms, static_ms, affected_ms, tests_ms, and lock wait when rows carry it)."
+    },
+    {
+      "id": "AC-50.5.3",
+      "description": "/chg also shows flaky tests (rows of kind flaky with their quarantine or issue reference), review outcomes per merged PR with findings by severity and disposition and merged_without_counted_round flagged (US-50.4), runner samples (kind runner), and changes flagged gap or stale (US-50.2) with their cursor."
+    },
+    {
+      "id": "AC-50.5.4",
+      "description": "Aggregations run on HeavyReadRepo through Loopctl.HeavyRead, scoped by tenant, and each panel renders an empty state rather than an error when no rows exist."
+    },
+    {
+      "id": "AC-50.5.5",
+      "description": "The page follows docs/design-system.md (dark, slate, Geist Mono for ids, hosts and shas) and is checked at desktop and phone width before review."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-50.5.1",
+      "name": "unauthenticated is redirected",
+      "type": "integration",
+      "preconditions": [],
+      "steps": ["GET /chg with no session"],
+      "expected_results": ["redirect to the login page"]
+    },
+    {
+      "id": "TC-50.5.2",
+      "name": "panels render from seeded rows",
+      "type": "integration",
+      "preconditions": ["a logged-in operator", "seeded gate, chg, flaky, runner rows and one outcome"],
+      "steps": ["mount /chg", "filter by one host"],
+      "expected_results": ["each panel has its element id and counts matching the seed", "the filter narrows the counts"]
+    },
+    {
+      "id": "TC-50.5.3",
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": ["rows in tenant A", "operator of tenant B"],
+      "steps": ["mount /chg as B"],
+      "expected_results": ["empty states only"]
+    }
+  ],
+  "technical_notes": [
+    "WebAuthn assertion code exists for custody claims; the thread-page browser login deleted with Epic 45 (#984, introduced in 32abe613) is the prior shape to restore, not to re-invent.",
+    "Use streams for long lists; no LiveComponents."
+  ],
+  "dependencies": ["US-50.1", "US-50.2", "US-50.4"]
+}

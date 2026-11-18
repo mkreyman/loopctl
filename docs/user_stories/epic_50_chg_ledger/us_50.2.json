@@ -1,0 +1,78 @@
+{
+  "id": "US-50.2",
+  "title": "Sender-driven gap fill; delete the chg-server pull",
+  "epic": {
+    "id": "epic_50",
+    "name": "chg change ledger and dashboard"
+  },
+  "priority": "high",
+  "phase": "chg_ledger",
+  "story": {
+    "as_a": "fleet machine's chg outbox sender",
+    "i_want_to": "learn from loopctl which events of a change it is still missing",
+    "so_that": "a gap fills from whichever machine holds the event, with no chg-server for loopctl to pull from"
+  },
+  "rationale": "There is no chg-server (Mark, 2026-10-28), so Loopctl.Changes.ChgClient has nothing to call. loopctl#1014 comment 3, question 1.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-50.2.1",
+      "description": "Every 2xx answer of POST /api/v1/change_events/:source_id, duplicates included, carries cursor: {change_id, applied_through, held: [seq...]} for the event's change, read in the same transaction that applied it."
+    },
+    {
+      "id": "AC-50.2.2",
+      "description": "GET /api/v1/change_events/:source_id/cursor?change_id=<id> answers the same cursor, signed over \"<timestamp>.GET.<path>?<query>\"; an unknown change answers applied_through: 0, held: [] (not 404, so ids cannot be probed), and every refusal is the change-events 401."
+    },
+    {
+      "id": "AC-50.2.3",
+      "description": "Loopctl.Changes.ChgClient, Loopctl.Changes.ReqChgClient, Loopctl.MockChgClient, the :chg_client and :chg_server_url config and the CHG_SERVER_URL row in deploy/FLY_SECRETS.md are deleted, and no code pulls events."
+    },
+    {
+      "id": "AC-50.2.4",
+      "description": "The gap sweep (an event held ahead of a gap for 10 minutes) and the staleness sweep (a bound change whose story is not terminal and has had no event for 6 hours) no longer pull: each raises one operator alert per change per condition (deduplicated until the condition clears) and records the change as gap or stale for the dashboard."
+    },
+    {
+      "id": "AC-50.2.5",
+      "description": "Epic 47's PRD §5 and US-47.3's technical notes say the pull is retired and point here; CHANGELOG.md records CHG_SERVER_URL's removal."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-50.2.1",
+      "name": "the answer carries the cursor",
+      "type": "integration",
+      "preconditions": ["a bound change"],
+      "steps": ["post seq 1", "post seq 3", "post seq 3 again"],
+      "expected_results": ["first answer applied_through 1, held []", "second applied_through 1, held [3]", "third duplicate: true with the same cursor"]
+    },
+    {
+      "id": "TC-50.2.2",
+      "name": "cursor endpoint",
+      "type": "integration",
+      "preconditions": ["seq 1 and 3 present"],
+      "steps": ["signed GET cursor for the change", "signed GET cursor for an unknown change", "GET with a bad signature"],
+      "expected_results": ["applied_through 1, held [3]", "applied_through 0, held []", "the change-events 401"]
+    },
+    {
+      "id": "TC-50.2.3",
+      "name": "a gap alerts once and pulls nothing",
+      "type": "integration",
+      "preconditions": ["seq 3 held for 11 minutes"],
+      "steps": ["run the gap sweep twice"],
+      "expected_results": ["one operator alert", "the change is flagged gap", "no outbound call"]
+    },
+    {
+      "id": "TC-50.2.4",
+      "name": "filling the gap clears the flag",
+      "type": "integration",
+      "preconditions": ["a change flagged gap"],
+      "steps": ["post the missing seq"],
+      "expected_results": ["both apply", "the gap flag clears"]
+    }
+  ],
+  "technical_notes": [
+    "The cursor is Loopctl.Changes.Cursor; held seqs are the stored, unapplied events of the change.",
+    "The sweep worker keeps its schedule; only the pull is removed. The alert goes through the existing operator-alert path the signature-refused pull used.",
+    "Delete what is dead: no tombstone comments for the removed client."
+  ],
+  "dependencies": []
+}

@@ -1,0 +1,61 @@
+{
+  "id": "US-50.6",
+  "title": "Read API and MCP tool for the ledger summary",
+  "epic": {
+    "id": "epic_50",
+    "name": "chg change ledger and dashboard"
+  },
+  "priority": "medium",
+  "phase": "chg_ledger",
+  "story": {
+    "as_a": "Claude session on the fleet",
+    "i_want_to": "ask loopctl the chg audit questions through an MCP tool",
+    "so_that": "a session can answer them without a browser and without curl, which the fleet guard refuses"
+  },
+  "rationale": "CLAUDE.md: an operator-facing endpoint is not done until an MCP tool calls it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-50.6.1",
+      "description": "GET /api/v1/chg_ledger/summary (role :agent, tenant from the key) answers the same aggregates the dashboard shows, filtered by repo, host, since and until, computed by the same context functions the LiveView calls."
+    },
+    {
+      "id": "AC-50.6.2",
+      "description": "MCP tool chg_ledger_summary calls it; it is declared and dispatched in mcp-server/index.js, has a row in mcp-server/README.md, and its description names the filters and the key it needs. A wiring test pins declaration and dispatch."
+    },
+    {
+      "id": "AC-50.6.3",
+      "description": "The operation/2 spec documents the filters, the period cap (at most 90 days per call, one module attribute) and the answer shape."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-50.6.1",
+      "name": "summary matches the dashboard source",
+      "type": "integration",
+      "preconditions": ["seeded rows"],
+      "steps": ["GET summary for one repo"],
+      "expected_results": ["the counts equal the context function's"]
+    },
+    {
+      "id": "TC-50.6.2",
+      "name": "period cap",
+      "type": "integration",
+      "preconditions": [],
+      "steps": ["GET with a 120-day period"],
+      "expected_results": ["422 naming the cap"]
+    },
+    {
+      "id": "TC-50.6.3",
+      "name": "tool wiring",
+      "type": "unit",
+      "preconditions": [],
+      "steps": ["node --test the wiring test"],
+      "expected_results": ["chg_ledger_summary is declared and dispatched"]
+    }
+  ],
+  "technical_notes": [
+    "Follow an existing read tool's lib/ module shape in mcp-server.",
+    "Bump the mcp-server version so mcp-autopublish ships it."
+  ],
+  "dependencies": ["US-50.1", "US-50.4"]
+}
