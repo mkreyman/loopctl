@@ -16,6 +16,10 @@ defmodule Loopctl.Changes.Findings do
   | `flaky_test` | a `flaky` row with no quarantine | repo + test | the row's repository |
   | `missing_review` | a merged PR with no counted review round (`PrReviewOutcomes`) | repo + PR | the PR's repository |
   | `stuck_change` | a cursor flagged `gap` or `stale` for more than `stuck_after_hours/0` | source + change | the cursor's repository |
+  | `source_silent` | a (source, host) with rows on 3 of the previous 7 days and none in the last day | source + host | the chg repository |
+
+  A `source_silent` finding has no loop story to merge; it moves to `:fixed` when its sender
+  sends again (`mark_resumed/2`), and from there closes and reopens like any other.
 
   A repository is filed on only through a live intake source of the same tenant, which is the
   credential's scope and the intake path the issue returns through. A finding whose repository
@@ -69,6 +73,8 @@ defmodule Loopctl.Changes.Findings do
   @max_loop_depth 2
   @max_fix_attempts 2
   @quiet_days 7
+  @silent_lookback_days 7
+  @silent_active_days 3
   @label "chg-loop"
   @escalated_label "chg-loop-escalated"
   @default_chg_repo "mkreyman/chg"
@@ -175,7 +181,7 @@ defmodule Loopctl.Changes.Findings do
   @spec sweep_tenant(Ecto.UUID.t(), DateTime.t(), keyword()) :: map()
   def sweep_tenant(tenant_id, now \\ DateTime.utc_now(), opts \\ []) do
     # Fixed first, so a sighting tonight on a fix merged today is judged against that fix.
-    fixed = mark_fixed(tenant_id, now)
+    fixed = mark_fixed(tenant_id, now) + mark_resumed(tenant_id, now)
     sightings = derive(tenant_id, now, opts)
     record_sightings(tenant_id, sightings, now)
     closed = plan_closures(tenant_id, now)
@@ -195,7 +201,77 @@ defmodule Loopctl.Changes.Findings do
     selection_misses(tenant_id, since, chg_repo(opts)) ++
       flaky_tests(tenant_id, since, sources) ++
       missing_reviews(tenant_id, since, sources) ++
-      stuck_changes(tenant_id, now, sources)
+      stuck_changes(tenant_id, now, sources) ++
+      silent_sources(tenant_id, now, sources, chg_repo(opts))
+  end
+
+  # US-51.4: a (source, host) that sent rows on at least `@silent_active_days` of the
+  # `@silent_lookback_days` before the last day, and none in the last day. One read over the
+  # tenant's rows since the lookback start, grouped (`chg_ledger_rows (tenant_id, at)`).
+  # Filed on the chg repository, where the sender lives. The sighting is the sweep itself, so
+  # each silent night counts once.
+  defp silent_sources(tenant_id, now, sources, chg_repo) do
+    day_ago = DateTime.add(now, -86_400, :second)
+    lookback = DateTime.add(now, -(@silent_lookback_days + 1) * 86_400, :second)
+
+    from(r in LedgerRow,
+      where: r.tenant_id == ^tenant_id and r.at >= ^lookback and r.at <= ^now,
+      group_by: [r.source_id, r.host],
+      having:
+        fragment(
+          "count(DISTINCT (? AT TIME ZONE 'UTC')::date) FILTER (WHERE ? < ?) >= ?",
+          r.at,
+          r.at,
+          ^day_ago,
+          ^@silent_active_days
+        ) and max(r.at) < ^day_ago,
+      select: {r.source_id, r.host, max(r.at)}
+    )
+    |> AdminRepo.all()
+    |> Enum.filter(fn {source_id, _host, _last} -> Map.has_key?(sources, source_id) end)
+    |> Enum.map(fn {source_id, host, last} ->
+      %{
+        kind: "source_silent",
+        fingerprint: bounded("#{source_id}:#{host}", 512),
+        repo_full_name: chg_repo,
+        at: now,
+        sha: nil,
+        evidence: %{
+          "source_id" => source_id,
+          "source_repo" => Map.fetch!(sources, source_id),
+          "host" => host,
+          "last_row_at" => DateTime.to_iso8601(last)
+        }
+      }
+    end)
+  end
+
+  @doc """
+  US-51.4: moves each filed `source_silent` finding whose (source, host) sent a row in the
+  last day to `:fixed`, so it closes after the quiet period like any fixed finding and
+  reopens if the sender goes quiet again. Returns how many moved.
+  """
+  @spec mark_resumed(Ecto.UUID.t(), DateTime.t()) :: non_neg_integer()
+  def mark_resumed(tenant_id, now \\ DateTime.utc_now()) do
+    day_ago = DateTime.add(now, -86_400, :second)
+
+    recent =
+      from r in LedgerRow,
+        where:
+          r.tenant_id == parent_as(:finding).tenant_id and r.at >= ^day_ago and
+            fragment("?::text", r.source_id) ==
+              fragment("?->>'source_id'", parent_as(:finding).evidence) and
+            r.host == fragment("?->>'host'", parent_as(:finding).evidence),
+        select: 1
+
+    from(f in Finding,
+      as: :finding,
+      where: f.tenant_id == ^tenant_id and f.kind == "source_silent" and f.state == :filed,
+      where: exists(recent),
+      select: f.id
+    )
+    |> AdminRepo.all()
+    |> Enum.count(&fix(tenant_id, &1, nil, now))
   end
 
   # `%{source_id => repo_full_name, {:key, repo_key} => repo_full_name}` for the tenant's live
@@ -665,8 +741,7 @@ defmodule Loopctl.Changes.Findings do
 
   defp close(%Finding{} = finding, now) do
     text = """
-    No sighting in the #{@quiet_days} days since the fix was seen merged \
-    (#{finding.fix_merge_sha}). Closing.
+    No sighting in the #{@quiet_days} days since #{fixed_by(finding)}. Closing.
 
     - last sighting: #{DateTime.to_iso8601(finding.last_seen_at)}
     - occurrences in all: #{finding.occurrences}
@@ -694,6 +769,9 @@ defmodule Loopctl.Changes.Findings do
       {:ok, outcome} -> outcome
     end
   end
+
+  defp fixed_by(%Finding{fix_merge_sha: nil}), do: "the signal stopped"
+  defp fixed_by(%Finding{fix_merge_sha: sha}), do: "the fix was seen merged (#{sha})"
 
   @doc """
   The finding behind an action whose `reopen` the forge refused for good (the issue was

@@ -490,6 +490,57 @@ defmodule Loopctl.Changes.FindingsTest do
     end
   end
 
+  describe "source_silent (US-51.4)" do
+    defp rows_on_days!(source, days_ago) do
+      for d <- days_ago do
+        ledger!(source, "gate", %{at: DateTime.add(@now, -d * 86_400, :second), verdict: "pass"})
+      end
+    end
+
+    test "a sender active on 3 of the last 7 days and quiet for a day is a finding", ctx do
+      rows_on_days!(ctx.hcb, [2, 4, 6])
+
+      assert [s] = Findings.derive(ctx.tenant_id, @now, opts())
+      assert s.kind == "source_silent"
+      assert s.repo_full_name == @chg_repo
+      assert s.fingerprint == "#{ctx.hcb.id}:minis"
+      assert s.evidence["source_repo"] == "mkreyman/home_care_billing"
+    end
+
+    test "two active days, or a row in the last day, is not silence", ctx do
+      rows_on_days!(ctx.hcb, [2, 4])
+      assert Findings.derive(ctx.tenant_id, @now, opts()) == []
+
+      rows_on_days!(ctx.chg, [2, 4, 6])
+      ledger!(ctx.chg, "gate", %{at: DateTime.add(@now, -600, :second), verdict: "pass"})
+      assert Findings.derive(ctx.tenant_id, @now, opts()) == []
+    end
+
+    test "a sender that resumes is fixed, then closes after the quiet period", ctx do
+      rows_on_days!(ctx.hcb, [2, 4, 6])
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      [finding] = findings(ctx.tenant_id)
+      assert finding.state == :filed
+
+      AdminRepo.update_all(from(f in Finding, where: f.id == ^finding.id),
+        set: [issue_number: 77]
+      )
+
+      day2 = DateTime.add(@now, 86_400, :second)
+      ledger!(ctx.hcb, "gate", %{at: DateTime.add(day2, -600, :second), verdict: "pass"})
+
+      assert %{fixed: 1} = Findings.sweep_tenant(ctx.tenant_id, day2, opts())
+      assert %Finding{state: :fixed, fix_merge_sha: nil} = AdminRepo.get(Finding, finding.id)
+
+      later = DateTime.add(day2, Findings.quiet_days() * 86_400, :second)
+      ledger!(ctx.hcb, "gate", %{at: DateTime.add(later, -600, :second), verdict: "pass"})
+
+      assert %{closed: 1} = Findings.sweep_tenant(ctx.tenant_id, later, opts())
+      assert action_of(ctx.tenant_id, :close).body =~ "the signal stopped"
+    end
+  end
+
   describe "tenant isolation" do
     test "one tenant's ledger never becomes another tenant's finding", ctx do
       %{source: other} = fixture(:chg_source, %{repo_full_name: "mkreyman/home_care_billing"})
