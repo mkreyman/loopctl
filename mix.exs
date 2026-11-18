@@ -29,11 +29,9 @@ defmodule Loopctl.MixProject do
       # security gate, in `precommit` and the Security CI job. It caught the
       # 2026-07 postgrex/decimal/cowlib advisories that the previously-wired
       # mix_audit (curated GHSA mirror) missed and that its runtime clone could
-      # fail-open on. Acknowledged here: advisories with no published fix, and
-      # ones whose fix is DECLINED for a stated reason, each with its recheck
-      # condition inline. hex.audit only WARNS when an entry stops matching, so a
-      # stale entry does not fail CI; the mint pin in deps/0 is what keeps the
-      # declined fix from arriving silently.
+      # fail-open on. Acknowledged here: advisories with no published fix, each
+      # with its recheck condition inline. hex.audit only WARNS when an entry stops
+      # matching, so a stale entry does not fail CI.
       hex: [
         ignore_advisories: [
           # No cowboy or cowlib ignores remain: cowboy 2.21.0 and cowlib 2.22.0
