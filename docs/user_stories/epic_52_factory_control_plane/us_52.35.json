@@ -1,0 +1,50 @@
+{
+  "id": "US-52.35",
+  "title": "End to end: an escalation resolved by another holder, seen on the timeline and the overview",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_5",
+  "story": {"as_a": "Mark", "i_want_to": "see one real item escalated by one holder, refused to that holder, re-queued by another and delivered, against the sandbox repo", "so_that": "release 5's promise that nothing waits for me is proven on the deployed system, not only in unit tests"},
+  "rationale": "PRD R4's end-to-end path is 'an escalation resolved by another holder'. Unit and ConnCase tests prove each guard in isolation; only a run through the real API, a real runner and the sandbox repo proves the pieces compose: the holder credential, the escalation event's actor, the self guard, the holder edge, placement and the merge gate. This story extends the end-to-end suite release 2 created rather than adding a second harness.",
+  "acceptance_criteria": [
+    {"id": "AC-52.35.1", "description": "A new scenario in the end-to-end suite registers two holders A and B through holder_register, opens a sandbox issue, and waits (bounded, 15 minutes) for the item to reach claimed with A's holder as the claim's holder."},
+    {"id": "AC-52.35.2", "description": "A escalates the item through escalate_story with a reason; the scenario asserts the item is at escalated and the timeline's newest transition names A's holder_id as actor."},
+    {"id": "AC-52.35.3", "description": "A's own resolve_escalation(to: queued) answers 409 self_resolve_blocked, and the item is still at escalated with an unchanged stage row."},
+    {"id": "AC-52.35.4", "description": "B's resolve_escalation(to: queued) answers 200; the item then reaches done (bounded, 30 minutes) through placement, review, merge and verify on the sandbox repo, with a merged sandbox PR."},
+    {"id": "AC-52.35.5", "description": "work_item_timeline for the item lists, in order, A's escalation, B's holder_resolution and the transition into done, each with its actor and a non-empty reason."},
+    {"id": "AC-52.35.6", "description": "The scenario reads factory_overview for the sandbox project with window_days 1 before A escalates and again after the item is done, and throughput.done has grown by at least one; whether this item left escalated is read from its own work_item_timeline (its stage is done and no escalation follows B's holder_resolution), never from the overview's counts, which other runs in the shared sandbox project also move."},
+    {"id": "AC-52.35.7", "description": "The scenario cleans up whatever it created even when it fails (closes the sandbox issue and PR, revokes both holder credentials), and a failure prints the item's full timeline."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.35.1", "verifies": ["AC-52.35.1", "AC-52.35.2", "AC-52.35.3", "AC-52.35.4", "AC-52.35.5", "AC-52.35.6"], "name": "mix e2e --only escalation_other_holder against the sandbox", "type": "integration", "preconditions": ["deployed loopctl with release 5; sandbox mkreyman/loopctl-e2e-sandbox enrolled; at least one live runner"], "steps": ["run the scenario"], "expected_results": ["the item is done, the self resolve was refused, the timeline and overview assertions pass"]},
+    {"id": "TC-52.35.2", "verifies": ["AC-52.35.7"], "name": "a forced failure still cleans up and prints the timeline", "type": "integration", "preconditions": ["the scenario with an injected failing assertion after the escalation step (E2E_FAIL_AT=after_escalate)"], "steps": ["run the scenario", "list open sandbox issues and the run's holder keys"], "expected_results": ["scenario fails with the timeline printed; no open issue or live key of this run remains"]},
+    {"id": "TC-52.35.3", "verifies": ["AC-52.35.3"], "name": "the self guard holds against the deployed API (curl step inside the scenario)", "type": "integration", "preconditions": ["the item escalated by A"], "steps": ["POST /api/v1/stories/:id/stage/resolve with A's key"], "expected_results": ["409 with error.code self_resolve_blocked"]}
+  ],
+  "technical_notes": [
+    "Suite: the end-to-end suite (mix e2e, sandbox mkreyman/loopctl-e2e-sandbox) is provided by release 2 (README names table: end-to-end suite); add one scenario module beside its existing ones and reuse its sandbox issue, cleanup and bounded-wait helpers. Do not add a second harness.",
+    "Holders: holder_register and the holder credential are provided by release 3 (README names table: holder, holder credential).",
+    "APIs used: escalate_story (mcp-server/index.js:4954), resolve_escalation opened to holders by US-52.31, work_item_timeline (US-52.29), factory_overview (US-52.30).",
+    "The holder that claims first is not chosen by the scenario: it claims the item itself with A's credential through claim_story (lib/loopctl_web/router.ex claim route) rather than waiting for a runner, so the escalating holder is known; B's resolution then sends it to the runner pool for delivery.",
+    "Bounded waits poll the stage route every 10 s and fail with the timeline at the bound; nothing waits without a deadline."
+  ],
+  "dependencies": [
+    "US-52.29",
+    "US-52.30",
+    "US-52.31"
+  ],
+  "non_goals": [
+    "The sweep path (no holder acts): US-52.34's own tests; an end-to-end of the sweep would take the 30-minute grace window.",
+    "Intervention verbs end to end: covered by their ConnCase tests."
+  ],
+  "failure_modes": {"partition": "AC-52.35.4: each wait is bounded and polls; a lost answer is re-read from the stage route, never assumed.", "state": "AC-52.35.7: the scenario's own artefacts (issue, PR, holder keys) are cleaned up on success and failure, so a crashed run leaves no state for the next.", "retry": "AC-52.35.7: a rerun creates its own issue and holders, so two runs never share an item.", "slow": "AC-52.35.4: a delivery slower than 30 minutes fails the scenario with the timeline printed, rather than hanging the suite.", "reach": "n/a: the scenario runs as one mix process against the deployed API; it schedules nothing."},
+  "definition_of_done": [
+    "mix e2e --only escalation_other_holder passes against production and the sandbox, and its run is linked in the release PR.",
+    "The sandbox repo has no open issue or PR left by the run."
+  ],
+  "defaults": [
+    "Bounds: 15 minutes to claim, 30 minutes from resolution to done (owner may change).",
+    "The escalating holder claims the item itself rather than waiting for a runner, so the scenario knows who escalated."
+  ],
+  "expected_size": {"insertions": 220, "files": 3},
+  "estimated_tokens": 250000
+}

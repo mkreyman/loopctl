@@ -1,0 +1,54 @@
+{
+  "id": "US-52.30",
+  "title": "Factory overview: what is in flight, waiting, delivered and failing, per repo and fleet-wide",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_5",
+  "story": {"as_a": "Mark in fleet_dash", "i_want_to": "see per repo and for the whole fleet what is moving, what is waiting and why things fail", "so_that": "I can choose where to look and intervene, without anything turning red to get my attention"},
+  "rationale": "PRD R4: 'per repo and fleet-wide: what is in flight, what is waiting, throughput and failure classes'. Nothing aggregates the delivery stage machine today: GET /projects/:id/progress (project_controller.ex:717) counts stories by agent_status, which is the claim's status and says nothing about stages, escalations or throughput; GET /escalations (EscalationInbox.list/2, escalation_inbox.ex:237) lists escalated rows one by one. This story adds the one aggregate read fleet_dash polls, built on story_stages and the event log.",
+  "acceptance_criteria": [
+    {"id": "AC-52.30.1", "description": "Loopctl.Delivery.Overview.for_tenant/2 (tenant_id, opts) returns %{projects: [row], fleet: totals} with one row per active project of the tenant that has a live intake source or a story_stages row, each naming project_id, slug and repo_key; fleet is the sum of the rows."},
+    {"id": "AC-52.30.2", "description": "Each row's in_flight is a count per stage for claimed, worktree, implementing, reviewing, pr_open, ci, merged, deployed and verified, read from story_stages."},
+    {"id": "AC-52.30.3", "description": "Each row's waiting holds counts for detected, triaged and queued, and escalated counted per EscalationInbox.reason_class/1 of the edge each item entered escalated over, each with the age in seconds of its oldest item."},
+    {"id": "AC-52.30.4", "description": "Each row's throughput holds, over a window of window_days (default 7, allowed 1..30), the count of transitions into done and the median seconds from an item's 'opened' event to its transition into done."},
+    {"id": "AC-52.30.5", "description": "Each row's failure_classes counts, over the same window, the transitions into escalated and into failed grouped by edge, so a class is named by the machine's own edge and never by reason text."},
+    {"id": "AC-52.30.6", "description": "GET /api/v1/factory/overview (role: :agent) takes optional project_id and window_days; window_days outside 1..30 or a non-integer is 400 naming the range; a project_id of another tenant or unknown is 404; another tenant's stories never appear in any count."},
+    {"id": "AC-52.30.7", "description": "MCP tool factory_overview calls the route with project_id and window_days, has a mcp-server/README.md row and a wiring test; its description says the counts are read from the stage machine and that drill-down is work_item_timeline."},
+    {"id": "AC-52.30.8", "description": "A migration adds index story_stage_events_tenant_to_stage_inserted_idx on (tenant_id, to_stage, inserted_at) WHERE event = 'transitioned', CONCURRENTLY, and the window queries of AC-52.30.4 and AC-52.30.5 use it (EXPLAIN in the test shows an index scan on a seeded table)."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.30.1", "verifies": ["AC-52.30.1", "AC-52.30.2"], "name": "rows per project and fleet totals, stage counts (DataCase)", "type": "integration", "preconditions": ["tenant with projects chg and hcb, each with an intake source fixture; stage rows at claimed, ci and merged in chg, implementing in hcb; an archived project with stage rows"], "steps": ["Overview.for_tenant(tenant.id, [])"], "expected_results": ["two rows, the archived project absent; fleet in_flight sums both"]},
+    {"id": "TC-52.30.2", "verifies": ["AC-52.30.3"], "name": "waiting counts by reason class with oldest age (DataCase)", "type": "integration", "preconditions": ["escalated rows entered over :attempts_exhausted, :merge_gate and :triage_escalate at known times; two queued rows"], "steps": ["Overview.for_tenant(tenant.id, now: fixed_now)"], "expected_results": ["session_failed 1, gate_refused 1, triage_escalated 1, each with its age; queued 2"]},
+    {"id": "TC-52.30.3", "verifies": ["AC-52.30.4", "AC-52.30.5"], "name": "throughput and failure classes inside the window only (DataCase)", "type": "integration", "preconditions": ["three items reaching done 2, 5 and 9 days ago; one :merge_gate escalation 3 days ago; one :triage_reject 10 days ago"], "steps": ["Overview.for_tenant(tenant.id, window_days: 7, now: fixed_now)"], "expected_results": ["done 2 with their median; failure_classes %{merge_gate: 1}, triage_reject outside the window"]},
+    {"id": "TC-52.30.4", "verifies": ["AC-52.30.6"], "name": "route parameters, roles and tenant isolation (ConnCase)", "type": "integration", "preconditions": ["a holder agent key and a user key in tenant A; a project in tenant B"], "steps": ["GET /api/v1/factory/overview", "?window_days=0", "?window_days=abc", "?project_id=<tenant B project>"], "expected_results": ["200 for both keys; 400; 400; 404"]},
+    {"id": "TC-52.30.5", "verifies": ["AC-52.30.7"], "name": "factory_overview wiring and request shape (node --test)", "type": "unit", "preconditions": ["mcp-server tool list and a stub apiCall"], "steps": ["call factory_overview({project_id, window_days: 14})"], "expected_results": ["GET /api/v1/factory/overview?project_id=...&window_days=14"]},
+    {"id": "TC-52.30.6", "verifies": ["AC-52.30.8"], "name": "window queries use the transition index (DataCase)", "type": "integration", "preconditions": ["5,000 seeded transitioned events across stages; ANALYZE story_stage_events"], "steps": ["EXPLAIN the throughput query Overview builds"], "expected_results": ["plan names story_stage_events_tenant_to_stage_inserted_idx"]}
+  ],
+  "technical_notes": [
+    "Stage counts: story_stages has index (tenant_id, stage) (priv/repo/migrations/20260915120000_create_story_stages.exs:62); the overview names its own sets, because neither StageMachine helper is one of them: in_flight is StageMachine.in_flight_stages/0 (claimed through ci, lib/loopctl/delivery/stage_machine.ex:642, the stages a runner holds) plus merged, deployed and verified, which that helper leaves out on purpose (:169-172); waiting is detected, triaged, queued and escalated, while terminal_stages/0 (:646) counts escalated as terminal. A test asserts that every stage of StageMachine.stages/0 (:634) falls in exactly one of in_flight, waiting, done and failed, so a stage added to the machine fails it until the overview places it.",
+    "Reason classes: EscalationInbox.reason_class/1 (lib/loopctl/delivery/escalation_inbox.ex:185) over the edge of the newest 'transitioned' event into escalated, the same read EscalationInbox uses; the escalation inbox route GET /escalations (router.ex:478) stays as the per-item drill-down.",
+    "Project rows: Projects with status active joined to Intake.live_sources_query/1 (lib/loopctl/intake.ex:1293) or to story_stages through stories.project_id; repo_key is provided by US-52.1.",
+    "Why not extend GET /projects/:id/progress: Projects.get_project_progress/2 (project_controller.ex:720) is a per-project count of stories.agent_status read by existing clients; stage aggregates are a different fact, and the overview is fleet-wide, which a project-scoped route cannot be.",
+    "Every query runs on Repo inside Repo.with_tenant/2 with an explicit tenant_id predicate, one aggregate query per section, under a statement_timeout of 5 s; a timeout is 503 busy, never a partial answer.",
+    "Migration: CREATE INDEX CONCURRENTLY needs @disable_ddl_transaction and @disable_migration_lock; name it after git fetch origin (README Lanes rule 3).",
+    "MCP: lib/factory.js with the request shape, declaration and case in mcp-server/index.js, README row, wiring test."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Per-item history: US-52.29.",
+    "Whether a project's intake is paused: US-52.33 adds it to this read.",
+    "Alerts, colours or thresholds: nothing in the overview draws attention (PRD R4)."
+  ],
+  "failure_modes": {"partition": "n/a: aggregate reads inside one request against loopctl's own Postgres; no other service.", "state": "AC-52.30.2: every count is derived from story_stages and the event log at read time; the overview stores nothing, so a restart or deploy loses nothing and nothing can drift.", "retry": "AC-52.30.6: a GET with no side effect, so a retried read is harmless.", "slow": "AC-52.30.8: window queries run on a partial index and under a 5 s statement timeout (technical_notes), so a large tenant degrades to a 503 rather than holding a connection.", "reach": "n/a: runs inline in the request process; nothing is queued."},
+  "definition_of_done": [
+    "factory_overview from an MCP session on production returns one row for each of chg, loopctl and home_care_billing with non-negative counts, and fleet equals their sum.",
+    "EXPLAIN on production for the throughput query shows the new index."
+  ],
+  "defaults": [
+    "Window: 7 days, allowed 1..30 (owner may change).",
+    "Median, not mean, for detected-to-done time.",
+    "Statement timeout for the overview queries: 5 s."
+  ],
+  "expected_size": {"insertions": 320, "files": 7},
+  "estimated_tokens": 280000
+}

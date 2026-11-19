@@ -1,0 +1,60 @@
+{
+  "id": "US-52.58",
+  "title": "Every self-hosted CI job starts from a fresh tree, its own TMPDIR and its own database, warmed from the published snapshot",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_9",
+  "story": {"as_a": "CI job on any fleet-ci host", "i_want_to": "start from a clean tree, a temp dir and a test database made for me alone, and get warm build state only from the read-only snapshot", "so_that": "nothing a killed or earlier job left behind can change my result, and I am still as fast as a warm slot"},
+  "rationale": "Mark on R8: 'I'm surprised it's not the case yet. That was the idea from the very beginning!' Today loopctl's self-hosted jobs keep _build and deps between jobs on purpose (ci.yml:89-131, `clean: false` at :148 and a `git clean -e /_build -e /deps` at :171), because Mix keys its manifest on the source path and a slot's own path is the only place a tree stays warm (KB 09245ceb). That kept state is what a killed job poisons: a stale Mix build lock hung chg's jobs for 600 s (chg#119). KB 09245ceb names the remedy for state shared across runners, a job container mounting every tree at one path, and holds it in reserve 'only if cross-runner sharing becomes necessary'; R8 makes it necessary. US-52.56 and US-52.57 give the snapshot it is warmed from.",
+  "acceptance_criteria": [
+    {"id": "AC-52.58.1", "description": "Every job in .github/workflows/ci.yml whose runs-on includes self-hosted (lint, test, retrieval-eval, security, dialyzer, scale-test, scale-nightly, and the snapshot job of AC-52.58.6) declares `container:` with image `ghcr.io/mkreyman/loopctl-ci@sha256:<digest>` and options containing `--network host`, so its tree is mounted at /__w/loopctl/loopctl on every host."},
+    {"id": "AC-52.58.2", "description": "No job in ci.yml sets `clean: false` on actions/checkout or runs a `git clean` that excepts /_build or /deps, and no actions/cache step lists _build, deps or priv/plts; the KEEPING THE COMPILED TREE header and the per-runner-name PLT cache step are gone."},
+    {"id": "AC-52.58.3", "description": "Every self-hosted job sets TMPDIR to ${{ runner.temp }} in its job-level env, so Mix's lock files and every temp file live in the per-job temp dir the runner empties at each job start."},
+    {"id": "AC-52.58.4", "description": "Every job that creates a test database sets MIX_TEST_PARTITION to `_ci_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}` (scale-nightly keeps its per-matrix-file suffix after that prefix) and ends with an `if: always()` step that drops `loopctl_test${MIX_TEST_PARTITION}`; the name matches infra-ci-db-reap's `_ci_` filter, which stays as the backstop for a killed job."},
+    {"id": "AC-52.58.5", "description": "Every Elixir job runs a step `Warm from snapshot` before its first mix compile: `chg snapshot fetch . HEAD` then `chg ws hydrate .`, with timeout-minutes 5; exit 3 or a timeout prints `snapshot: miss` and the job continues cold, and any other non-zero exit fails the step."},
+    {"id": "AC-52.58.6", "description": "A `snapshot` job runs only on a push to master, after test passes, in environment snapshot-publish (deployment branches: master only, holding LOOPCTL_ORCH_KEY); it runs `chg snapshot build --here HEAD` then `chg snapshot push . HEAD`. A pull_request event never runs it."},
+    {"id": "AC-52.58.7", "description": "The image is built from ci/image/Dockerfile: FROM the hexpm/elixir image at ci.yml's ELIXIR_VERSION and OTP_VERSION, plus git, curl, zstd, tar, postgresql-client and the chg CLI at the version release/manifest.toml names; its FROM tag and chg version must equal those two files' values."},
+    {"id": "AC-52.58.8", "description": "When the warm step reports behind 0 (the snapshot is HEAD's), the Test job's compile step fails the job if mix prints a `Compiling` line for project modules: a snapshot that recompiles at its own path is a defect to fix, not a slow run to accept."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.58.1", "verifies": ["AC-52.58.1", "AC-52.58.3"], "name": "guard: every self-hosted job runs in the pinned container with a per-job TMPDIR (ExUnit over the parsed workflow)", "type": "unit", "preconditions": ["test/loopctl/ci_fresh_job_test.exs parsing .github/workflows/ci.yml with YamlElixir (a dependency in mix.exs), where Loopctl.CiWarningsAsErrorsTest reads it by regex (test/loopctl/ci_warnings_as_errors_test.exs:46,91)"], "steps": ["for each job whose runs-on contains self-hosted, read container.image, container.options and env.TMPDIR"], "expected_results": ["image matches ~r/@sha256:[0-9a-f]{64}$/, options contain --network host, TMPDIR is ${{ runner.temp }}"]},
+    {"id": "TC-52.58.2", "verifies": ["AC-52.58.2"], "name": "guard: no kept tree and no cached build output", "type": "unit", "preconditions": ["the parsed workflow"], "steps": ["scan every checkout step's with.clean, every run script for `git clean`, every actions/cache step's path"], "expected_results": ["no clean: false, no -e /_build or -e /deps, no _build, deps or priv/plts path"]},
+    {"id": "TC-52.58.3", "verifies": ["AC-52.58.4"], "name": "guard: per-job database name and its always-drop", "type": "unit", "preconditions": ["the parsed workflow"], "steps": ["for each job running mix ecto.create or mix test, read env.MIX_TEST_PARTITION and the steps with if: always()"], "expected_results": ["the partition contains run_id, run_attempt and github.job; a dropdb step names loopctl_test${MIX_TEST_PARTITION}"]},
+    {"id": "TC-52.58.4", "verifies": ["AC-52.58.5", "AC-52.58.8"], "name": "guard: warm step precedes compile and treats exit 3 as a miss", "type": "unit", "preconditions": ["the parsed workflow"], "steps": ["find each Elixir job's first step running mix compile or mix test and the step before it", "read the Test job's compile step script"], "expected_results": ["a step named Warm from snapshot comes first, has timeout-minutes 5 and maps exit 3 to `snapshot: miss`; the compile script greps for Compiling when behind is 0"]},
+    {"id": "TC-52.58.5", "verifies": ["AC-52.58.6"], "name": "guard: the snapshot job publishes from master only", "type": "unit", "preconditions": ["the parsed workflow"], "steps": ["read jobs.snapshot.if, needs, environment and run steps"], "expected_results": ["if requires push and refs/heads/master; needs includes test; environment snapshot-publish; build --here precedes push"]},
+    {"id": "TC-52.58.6", "verifies": ["AC-52.58.7"], "name": "guard: the image's toolchain and chg match the workflow and the manifest", "type": "unit", "preconditions": ["ci/image/Dockerfile, ci.yml env, release/manifest.toml"], "steps": ["parse the FROM tag and the chg version the Dockerfile installs"], "expected_results": ["Elixir and OTP equal ELIXIR_VERSION and OTP_VERSION; chg equals the manifest's chg CLI version"]}
+  ],
+  "technical_notes": [
+    "Self-hosted jobs today: lint .github/workflows/ci.yml:134, test :304, retrieval-eval :514, security :745, dialyzer :835, scale-test :930, scale-nightly :1273. pgbouncer-e2e, smoke-preflight, deploy and smoke are ubuntu-latest and stay out of scope (release 11 owns them).",
+    "Deleted, with their comments: the header at ci.yml:89-131, each job's `clean: false` (:148, :343 and the same in the other jobs) and its `Clean the workspace, keeping the compiled tree` step (ci.yml:151, :346, :549, :758, :848, :991, :1394), and the per-runner PLT cache at :909-915. The tailwind/esbuild binary cache (:262-282) stays: it is keyed by tool version and ref-scoped.",
+    "Database today: MIX_TEST_PARTITION ci<run_id> at ci.yml:329, TEST_DB_PORT and PGPORT 5433 at :332-336, created at :445, dropped if: always() at :507-512; scale-nightly's suffix at :1453. config/test.exs builds the name at :84 from the partition read at :74 and the port at :45, so no config change is needed.",
+    "TMPDIR: chg's own ci.yml already does this per job (/home/mkreyman/workspace/chg/.github/workflows/ci.yml:151-155, chg#119); infra's runbook pins a fixed TMPDIR for nuc's tmpfs (infra runbooks/ci-runner-setup.md:383-393), which RUNNER_TEMP under _work also avoids.",
+    "Snapshot contents come from .chg/adapter.toml:9 (deps, _build, priv/plts) and mix chg.snapshot (chg adapters/elixir/lib/mix/tasks/chg.snapshot.ex:112-126). Set DIALYZER_PLT_CORE_PATH=priv/plts in the snapshot job as the dialyzer job does (ci.yml:927), so the core PLT travels in the snapshot; the container fixes the OTP root, which makes it portable (KB 09245ceb, PLTs).",
+    "Check compile: mix.exs:20 already sets elixirc_options: [check_cwd: false] for chg; the container makes the path equal anyway.",
+    "Root-owned files: a container job's steps run as root inside the slot's _work. infra's job-completed hook hands _work back after every job (infra runbooks/ci-runner-setup.md:1240-1263); before this lands, confirm ACTIONS_RUNNER_HOOK_JOB_COMPLETED is in every fleet-ci slot's .env on beelink, minis, x1, ryzen and nuc. infra's provisioning has not moved into this repo yet (PRD R10).",
+    "Image publishing: a workflow on changes to ci/image/** builds and pushes ghcr.io/mkreyman/loopctl-ci with GITHUB_TOKEN (packages: write); ci.yml then pins the new digest in the same PR. The chg CLI comes from the release artifact release/manifest.toml names (provided by release 2, README names table: release manifest).",
+    "Guard tests follow Loopctl.CiWarningsAsErrorsTest (test/loopctl/ci_warnings_as_errors_test.exs), which binds ci.yml's test step (ci.yml:477)."
+  ],
+  "dependencies": [
+    "US-52.56",
+    "US-52.57"
+  ],
+  "non_goals": [
+    "The end-to-end proof that a killed job leaves nothing behind: US-52.59.",
+    "Moving the ubuntu-latest jobs or authenticating installers for a private repo: release 11.",
+    "Runner registration and capacity reports by the host daemon: release 7."
+  ],
+  "failure_modes": {"partition": "AC-52.58.5: when loopctl or the object store is unreachable the warm step reports a miss and the job builds cold, so CI keeps judging commits.", "state": "AC-52.58.2: no build output survives a job; warm state comes only from the read-only snapshot, and the check of record stays the GitHub Actions run.", "retry": "AC-52.58.4: a re-run gets its own database through run_attempt, so it never meets its first attempt's half-migrated one; a re-run of the snapshot job meets the store's if-none-match and publishes nothing twice.", "slow": "AC-52.58.5: the warm step is capped at 5 minutes and a timeout is a miss, so a slow store costs at most that before the cold build.", "reach": "AC-52.58.1: a job runs on whichever fleet-ci host takes it, at the same path in the same image, so its snapshot and its database name do not depend on the host."},
+  "definition_of_done": [
+    "Three consecutive master runs land on at least two different fleet-ci hosts, each Test job logs a snapshot hit, and its compile step shows no Compiling line for project modules when behind is 0.",
+    "The Test job's median wall clock over those runs is no more than 10% above the median of the last ten master Test jobs before the change (gh run list); the PR body records both numbers.",
+    "SELECT datname FROM pg_database WHERE datname LIKE 'loopctl_test_ci_%' on beelink's CI Postgres (5433) shows no database of a finished run."
+  ],
+  "defaults": [
+    "Image name ghcr.io/mkreyman/loopctl-ci, pinned by digest (owner may change).",
+    "Warm step timeout 5 minutes; speed budget 10% over the pre-change median.",
+    "GitHub environment snapshot-publish, deployment branches master only."
+  ],
+  "expected_size": {"insertions": 260, "files": 4},
+  "estimated_tokens": 380000
+}

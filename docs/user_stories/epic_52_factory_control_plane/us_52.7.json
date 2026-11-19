@@ -1,0 +1,59 @@
+{
+  "id": "US-52.7",
+  "title": "The release manifest names one compatible set, and each set is tagged and published",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_2",
+  "story": {"as_a": "session releasing the factory", "i_want_to": "read in one file which versions of the server, runner, chg, its adapters and the MCP package belong together, and find that set tagged with its artifacts", "so_that": "the fleet can be rolled to a named set and every client can be judged against it"},
+  "rationale": "PRD R7: 'One manifest names compatible versions of every part.' Nothing does today: the server is mix.exs version 1.0.0 (mix.exs:7), the runner 0.1.0 (runner/mix.exs:7), chg 0.1.0 (chg/cli/Cargo.toml:3), the MCP package 3.19.0 (mcp-server/package.json:3), and the only cross-part version anyone checks is the runner contract's major (runner_contract.ex:4566-4570). chg is released from its own repo's v* tags (chg .github/workflows/release.yml:8-10), which US-52.11 archives. The manifest is the set record; each part's own file stays the source of its own version, and a check keeps the two equal.",
+  "acceptance_criteria": [
+    {"id": "AC-52.7.1", "description": "release/manifest.toml holds set = <positive integer> and one [components.<name>] table for each of server, runner, chg, chg_adapter_elixir, chg_adapter_typescript, chg_adapter_generic and mcp, each with version, minimum and source (the file its version is read from: mix.exs, runner/mix.exs, chg/cli/Cargo.toml, chg/adapters/elixir/mix.exs, chg/cli/Cargo.toml, chg/cli/Cargo.toml, mcp-server/package.json)."},
+    {"id": "AC-52.7.2", "description": "mix loopctl.release_set --check exits 1 and names each component whose manifest version differs from the version its source file declares, and exits 0 when none does; it is a step of mix precommit and of ci.yml's lint job."},
+    {"id": "AC-52.7.3", "description": "mix loopctl.release_set --bump, when some source version differs, increments set, and for each such component sets minimum to its previous version and version to the source's; a component whose source did not change keeps both values; with no difference it prints 'no component changed' and leaves the file byte-identical."},
+    {"id": "AC-52.7.4", "description": "Loopctl.ReleaseSet reads release/manifest.toml at compile time (@external_resource) and exposes set/0 and component/1 returning %{version: v, minimum: m}; a missing file, a missing component or a version that is neither semver nor the literal \"unreported\" fails compilation with the file and key named."},
+    {"id": "AC-52.7.5", "description": "GET /.well-known/loopctl carries release: %{set: n, components: %{name => %{version, minimum}}} from Loopctl.ReleaseSet, and GET /.well-known/loopctl/schema.json declares the release object."},
+    {"id": "AC-52.7.6", "description": "The Dockerfile copies release/manifest.toml into the build stage before mix compile, so the deployed server's discovery document reports the manifest it was built from."},
+    {"id": "AC-52.7.7", "description": ".github/workflows/factory-release.yml, when the CI workflow completes successfully on a master commit (workflow_run) whose manifest set has no tag factory-<set>, tags that commit factory-<set> and publishes GitHub release factory-<set> carrying chg-x86_64-unknown-linux-musl, its .sha256 and manifest.toml; a re-run finding the tag uploads the assets with --clobber and creates no second tag or release."},
+    {"id": "AC-52.7.8", "description": "chg/scripts/install.sh --release factory-<n> downloads chg-<target> and its .sha256 from mkreyman/loopctl's release factory-<n> and refuses to install when the checksum does not match."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.7.1", "verifies": ["AC-52.7.1", "AC-52.7.2"], "name": "--check passes on the committed tree and names a drifted component (ExUnit, Mix task)", "type": "unit", "preconditions": ["a temp copy of release/manifest.toml and the seven source files; the task takes its root as an option"], "steps": ["run --check on the copy", "set runner/mix.exs version to 9.9.9, run --check"], "expected_results": ["exit 0; exit 1 naming runner, 9.9.9 and the manifest's version"]},
+    {"id": "TC-52.7.2", "verifies": ["AC-52.7.3"], "name": "--bump moves only changed components (ExUnit, Mix task)", "type": "unit", "preconditions": ["temp copy at set 3 with runner 0.2.0 minimum 0.1.0 and chg 0.2.0 minimum 0.2.0"], "steps": ["raise runner/mix.exs to 0.3.0, run --bump", "run --bump again"], "expected_results": ["set 4; runner version 0.3.0 minimum 0.2.0; chg unchanged; second run prints 'no component changed' and the file is unchanged"]},
+    {"id": "TC-52.7.3", "verifies": ["AC-52.7.4"], "name": "ReleaseSet reads the manifest and refuses a malformed one", "type": "unit", "preconditions": ["ReleaseSet.parse!/2 (the compile-time reader, callable on a string and a file name)"], "steps": ["parse! the committed manifest", "parse! one missing [components.chg]", "parse! one with version = \"latest\""], "expected_results": ["a map with seven components; raises naming components.chg; raises naming the bad version"]},
+    {"id": "TC-52.7.4", "verifies": ["AC-52.7.5"], "name": "discovery document carries the release set (ConnCase)", "type": "integration", "preconditions": ["no key"], "steps": ["GET /.well-known/loopctl", "GET /.well-known/loopctl/schema.json"], "expected_results": ["release.set == ReleaseSet.set(); release.components.runner.version == ReleaseSet.component(:runner).version; the schema declares release"]},
+    {"id": "TC-52.7.5", "verifies": ["AC-52.7.6", "AC-52.7.7"], "name": "Dockerfile and release workflow shape (ExUnit reading the files)", "type": "unit", "preconditions": ["Dockerfile; .github/workflows/factory-release.yml"], "steps": ["find the COPY of release/manifest.toml and the first mix compile line", "parse the workflow"], "expected_results": ["the COPY precedes compile; the workflow triggers on workflow_run of CI, completed, branch master, proceeds only on conclusion success, runs on [self-hosted, fleet-ci], checks for an existing tag before creating one, and uploads with --clobber"]},
+    {"id": "TC-52.7.6", "verifies": ["AC-52.7.8"], "name": "install.sh fetches from the loopctl release and checks the sum (chg/tests, gh stubbed on PATH)", "type": "integration", "preconditions": ["a gh stub that records argv and writes a binary plus a .sha256 into -D, once matching and once not"], "steps": ["install.sh --release factory-2 --dest $TMP with the matching sum", "the same with a wrong sum"], "expected_results": ["gh called with -R mkreyman/loopctl factory-2; installed; then non-zero and nothing written to $TMP"]}
+  ],
+  "technical_notes": [
+    "Versions today: mix.exs:7 (1.0.0), runner/mix.exs:7 (0.1.0), chg/cli/Cargo.toml:3 (0.1.0), chg/adapters/elixir/mix.exs:10 (1.0.0), mcp-server/package.json:3 (3.19.0). The TypeScript and generic adapters have no version file and are installed from the same tree as chg (chg/scripts/install-system.sh), so their source is chg/cli/Cargo.toml. The factory pack is not a component until release 8 creates it (README names table).",
+    "The first set is 1. Its minimum for runner is \"unreported\" (every runner in the field predates version reporting, US-52.8); for every other component minimum equals version.",
+    "TOML parsing in Elixir needs a dependency: {:toml, \"~> 0.7\"} (defaults). Rust already has the toml crate (chg/cli/Cargo.toml); shell readers use python3 -I with tomllib, which chg's scripts already require.",
+    "Mix task: lib/mix/tasks/loopctl.release_set.ex beside lib/mix/tasks/loopctl.runner_contract.ex (the export task this mirrors); add 'loopctl.release_set --check' to aliases.precommit after loopctl.check_env_docs (mix.exs:294) and as a step of the lint job (ci.yml:134). Reading each source: Mix.Project-free regexes for mix.exs version:, Cargo.toml [package] version, package.json \"version\"; the task takes a root option so tests run on a temp copy.",
+    "Discovery: LoopctlWeb.WellKnownController @discovery_base (well_known_controller.ex:29-77), discovery_body/0 at :99, the schema at :175-238. The controller already reads mcp-server/package.json at compile time (:20-27) for mcp_server.npm_version; that field stays (mcp_version reads it) and must equal release.components.mcp.version, which the --check guarantees.",
+    "Dockerfile: COPY mcp-server/package.json at :46 is the precedent; add COPY release/manifest.toml release/manifest.toml beside it.",
+    "Release workflow replaces chg .github/workflows/release.yml (build :20-44 on fleet-ci with scripts/ci-rust-toolchain.sh, publish :46-63). Run chg's build from chg/; the release body is the manifest. Permissions contents: write on the publish job only.",
+    "install.sh: the gh release download at chg/scripts/install.sh:57-61 changes repository and tag form; its help text (:4-7) names factory-<n>.",
+    "No new table, context or route; one new field on an existing unauthenticated document, so no MCP tool (mcp_version already reads that document)."
+  ],
+  "dependencies": [
+    "US-52.4",
+    "US-52.5"
+  ],
+  "non_goals": [
+    "Clients reporting their version and the server refusing an old one: US-52.8.",
+    "Installing a set on the fleet: US-52.10.",
+    "A factory pack component: release 8."
+  ],
+  "failure_modes": {"partition": "AC-52.7.7: a publish that loses GitHub midway leaves the tag; the next run finds it and uploads the assets again.", "state": "AC-52.7.4: the set lives in release/manifest.toml in git and is compiled into the server; each part's own version lives in its own source file, and AC-52.7.2 keeps the two equal.", "retry": "AC-52.7.7: a re-run never creates a second tag or release; AC-52.7.3: a repeated --bump with nothing changed writes nothing.", "slow": "n/a: the workflow keeps chg's 20-minute build timeout; nothing on a request path waits on GitHub.", "reach": "n/a: the task runs in the caller's shell and the workflow on the fleet-ci pool; nothing is queued in the server."},
+  "defaults": [
+    "Set numbering: an integer starting at 1, tag factory-<set> (owner may prefer a date form).",
+    "Elixir TOML dependency: toml ~> 0.7 (owner may choose another parser).",
+    "A component is compatible from its minimum up: the previous set's version and anything newer (US-52.8 enforces it)."
+  ],
+  "definition_of_done": [
+    "After the epic merges: gh release view factory-1 -R mkreyman/loopctl lists chg-x86_64-unknown-linux-musl, its .sha256 and manifest.toml.",
+    "https://loopctl.com/.well-known/loopctl, read with WebFetch after the deploy, shows release.set 1 and release.components.runner.version equal to runner/mix.exs's."
+  ],
+  "expected_size": {"insertions": 380, "files": 9},
+  "estimated_tokens": 350000
+}

@@ -1,0 +1,57 @@
+{
+  "id": "US-52.20",
+  "title": "End-to-end: two sessions on one machine and one repo never collide",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_3",
+  "story": {"as_a": "Mark, rolling a factory release", "i_want_to": "have the end-to-end suite prove that sessions are separate holders against the real server and the real MCP server", "so_that": "the shared-identity defect (loopctl#707) cannot come back unnoticed, on any later release or model change"},
+  "rationale": "PRD R7 assigns release 3 the path 'two sessions on one machine and one repo never colliding' and makes the suite the executable spec of the five concepts. loopctl#1065 shipped green in loopctl's own tests and broken against a client (PRD section 1), and #707's collision lived entirely between two clients sharing one key, which no context or controller test can see. So the proof drives two real MCP server processes, as two sessions do, against the server the suite deploys.",
+  "acceptance_criteria": [
+    {"id": "AC-52.20.1", "description": "The suite gains scenario two_sessions_one_repo: it starts two mcp-server processes on one machine with the same LOOPCTL_AGENT_KEY, different CLAUDE_SESSION_ID values and two worktrees of the sandbox repo, and asserts two live interactive holders with the same agent_id and host and different holder ids."},
+    {"id": "AC-52.20.2", "description": "Each session switches its worktree to its own branch, and within two heartbeat intervals the server holds two work items, one per branch, each with assigned_holder_id equal to that session's holder."},
+    {"id": "AC-52.20.3", "description": "Session B's claim_story, start_story, renew_story_claim and work_item_note on session A's item each return 409 held_by_other_holder naming A's holder, and A's item is unchanged afterwards (same claim_epoch, same assigned_holder_id)."},
+    {"id": "AC-52.20.4", "description": "Session B's channel_claim on a ref session A claimed returns 409 already_claimed, never ok with already_held."},
+    {"id": "AC-52.20.5", "description": "The scenario reads state only through the MCP tools and GitHub, as US-52.9's suite does (e2e/ has the deps req and jason only, no database connection and no server config of its own); each item's claim is read through get_story, and the event-log form of this scenario's facts (each item's claimed event names its own holder with a reason, and no event names the other session's holder) is added to it by US-52.29 through work_item_timeline."},
+    {"id": "AC-52.20.6", "description": "Killing session A's MCP process with SIGKILL (no holder_end) leads, polled every 10 s, to A's item unclaimed (get_story: assigned_holder_id nil), while B's holder_heartbeat through B's MCP still answers 200 and B's item is unchanged. The wait is bounded from the SIGKILL by the deployed lease, read as lease_until minus the answer's time from B's heartbeat just before the kill (AC-52.13.6), plus two reclaim sweep intervals (300 s each, lib/loopctl/oban_config.ex:642) plus a 60 s margin; the scenario never needs A's credential or A's heartbeat answers, which lived only in A's killed process."},
+    {"id": "AC-52.20.7", "description": "The happy path asserts that its placed story's assigned_holder_id is a runner_session holder whose host is the runner the story was placed on and whose session_id is the uuid the runner launched the session with."},
+    {"id": "AC-52.20.8", "description": "two_sessions_one_repo ends with session B's holder_end, after which no live holder, open item or live channel claim of the scenario remains (the suite's leaves-nothing-open check passes)."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.20.1", "verifies": ["AC-52.20.1", "AC-52.20.2"], "name": "two sessions register and each opens its own item", "type": "integration", "preconditions": ["mix e2e environment with the sandbox repo cloned into two worktrees on the suite host (provided by release 2, README names table: end-to-end suite)"], "steps": ["start mcp-server A (CLAUDE_SESSION_ID=e2e-a, cwd worktree 1) and B (e2e-b, worktree 2)", "git switch -c e2e/a-<run> in worktree 1 and e2e/b-<run> in worktree 2", "wait two heartbeat intervals"], "expected_results": ["two live holders, one agent_id, one host; two items on the two branches held by their own holders"]},
+    {"id": "TC-52.20.2", "verifies": ["AC-52.20.3", "AC-52.20.4"], "name": "B reaching for A's work is refused on every verb", "type": "integration", "preconditions": ["TC-52.20.1 state; A has claimed channel ref e2e-ref-<run>"], "steps": ["through B's MCP: claim_story, start_story, renew_story_claim, work_item_note on A's item; channel_claim e2e-ref-<run>"], "expected_results": ["four 409 held_by_other_holder naming A's holder; 409 already_claimed; A's item epoch and holder unchanged"]},
+    {"id": "TC-52.20.3", "verifies": ["AC-52.20.5"], "name": "the scenario reads loopctl only through its API", "type": "unit", "preconditions": ["e2e/mix.exs and the scenario module"], "steps": ["read e2e/mix.exs deps", "grep the scenario module for Postgrex, Ecto and Repo"], "expected_results": ["deps exactly req and jason; no match"]},
+    {"id": "TC-52.20.4", "verifies": ["AC-52.20.6"], "name": "a killed session lapses alone", "type": "integration", "preconditions": ["TC-52.20.2 state, against loopctl.com with the lease and sweep interval US-52.19 set (no suite-specific server config)"], "steps": ["call holder_heartbeat through B's MCP and compute the lease from its answer", "SIGKILL A's MCP process", "poll get_story for both items every 10 s, bounded at lease + 600 s + 60 s from the kill", "call holder_heartbeat through B's MCP"], "expected_results": ["A's item unclaimed", "B's heartbeat 200 and B's item unchanged"]},
+    {"id": "TC-52.20.5", "verifies": ["AC-52.20.7"], "name": "the happy path's placed story names its runner-session holder", "type": "integration", "preconditions": ["release 2's happy-path scenario"], "steps": ["after placement, read the story and its holder; read the runner's run state for the session id"], "expected_results": ["kind runner_session, host = runner name, session_id = launched uuid"]},
+    {"id": "TC-52.20.6", "verifies": ["AC-52.20.8"], "name": "the scenario leaves nothing open", "type": "integration", "preconditions": ["TC-52.20.4 state"], "steps": ["B calls holder_end", "run the suite's leaves-nothing-open check for the scenario's run id"], "expected_results": ["no live holder, open item or live channel claim for the run"]}
+  ],
+  "technical_notes": [
+    "The suite (e2e/, mix e2e, sandbox repo mkreyman/loopctl-e2e-sandbox, its happy path and its leaves-nothing-open check) is provided by release 2 (README names table: end-to-end suite); this story adds a scenario in that suite's own layout and extends the happy path. Re-ground the scenario API when release 3's branch is cut (README, Releases).",
+    "Holders, credentials, heartbeat and holder_end: US-52.13; held_by_other_holder and channel claims by holder: US-52.14; runner-session holders and the launched session uuid: US-52.15; item events: US-52.16; work_item_note: US-52.17; branch items opened by the MCP heartbeat: US-52.18; lapse and sweep: US-52.19.",
+    "The two sessions are mcp-server processes (mcp-server/index.js, spawned with node and driven over stdio by the suite), not Claude Code sessions: the MCP process is the holder (US-52.13), so this exercises the real client without spending model tokens.",
+    "Every name the scenario creates (branches, refs) carries the run id so parallel or repeated runs never meet, and the scenario's cleanup deletes its remote branches in the sandbox repo.",
+    "The scenario runs against loopctl.com with the lease and sweep interval US-52.19 sets; it reads the lease from B's heartbeat answer instead of configuring a server, so the bounded wait follows whatever lease is deployed (README names table: end-to-end suite). The sweep interval is the ReclaimExpiredClaimsWorker cron, */5 (lib/loopctl/oban_config.ex:642); a change to that cron changes the scenario's constant in the same PR."
+  ],
+  "dependencies": [
+    "US-52.13",
+    "US-52.14",
+    "US-52.15",
+    "US-52.16",
+    "US-52.17",
+    "US-52.18",
+    "US-52.19"
+  ],
+  "non_goals": [
+    "Moving an item between machines or into and out of an interactive session: release 7's suite paths (PRD R7).",
+    "An escalation resolved by another holder: release 5's suite path.",
+    "A message reaching an idle session: release 4's suite path."
+  ],
+  "failure_modes": {"partition": "AC-52.20.6: the scenario cuts one session off for good (SIGKILL) and asserts the server ends it and frees its item without touching the other.", "state": "AC-52.20.5: every assertion reads loopctl's records through its API, never the sessions' own memory or the server's database.", "retry": "AC-52.20.8: names carry the run id and the scenario cleans up, so a rerun after a failed run starts clean and cannot collide with leftovers.", "slow": "AC-52.20.2: waits are bounded by heartbeat intervals and the lease, polled with a deadline; a run past the deadline fails with what it saw rather than hanging.", "reach": "AC-52.20.1: the sessions run as local MCP processes on the suite host and reach loopctl only through its API, as fleet sessions do."},
+  "defaults": [
+    "Bound on the lapse wait: the deployed lease plus two 300 s sweep intervals plus 60 s, from the SIGKILL, polled every 10 s; the lease and the sweep are production's (US-52.19)."
+  ],
+  "definition_of_done": [
+    "mix e2e two_sessions_one_repo passes against loopctl.com after the release-3 deploy, and its run is linked in the release PR; the refusals it asserts are also pinned by US-52.14's ConnCase test, which fails when the holder check is reverted."
+  ],
+  "expected_size": {"insertions": 380, "files": 5},
+  "estimated_tokens": 350000
+}

@@ -1,0 +1,57 @@
+{
+  "id": "US-52.5",
+  "title": "chg moves into chg/ with its history; everything that names chg's repo follows it",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_2",
+  "story": {"as_a": "session changing the factory", "i_want_to": "find chg's CLI, adapters and scripts, with their history, under chg/ in the loopctl repo, and have loopctl and chg's own scripts treat chg/ in this repo as chg", "so_that": "a gate change and the server change it needs ship in one reviewed commit"},
+  "rationale": "PRD R10 moves chg (CLI and adapters) into this repo in release 2. Three things name chg's repo or its root layout today and would silently point at an archived repo: loopctl files chg's own selection misses on Findings.chg_repo/1, default \"mkreyman/chg\" (lib/loopctl/changes/findings.ex:88), and clears a Gate B :prove_effect with the selection replay only on that repo (merge_precondition.ex:1052-1058); the runner reads the replay script at bin/chg-replay-selection.py (runner selection_replay.ex:72), which builds cli/Cargo.toml at the repo root (chg-replay-selection.py:172-176); and chg-loop.py routes chg's causes to \"mkreyman/chg\" (chg-loop.py:63, :108-109). Once chg lives in the loopctl repo, the selection proof must also stop applying to loopctl's own server paths.",
+  "acceptance_criteria": [
+    {"id": "AC-52.5.1", "description": "release/import-history.sh https://github.com/mkreyman/chg chg imports chg's master under chg/ (CLI chg/cli, adapters chg/adapters/*, chg/bin, chg/scripts, chg/tests, chg/docs, chg/.chg) and records it in release/imports.toml, so git log --format=%s -- chg/cli/src/outbox.rs lists the subjects git log --format=%s -- cli/src/outbox.rs lists in mkreyman/chg."},
+    {"id": "AC-52.5.2", "description": "chg/scripts/install.sh --dest <tmp> run from the imported tree builds chg from chg/Cargo.toml with chg/.tool-versions' Rust, and <tmp>/chg --version ends with 'commit <sha12>)' naming the loopctl commit checked out."},
+    {"id": "AC-52.5.3", "description": "Loopctl.Changes.Findings.chg_repo/1 answers \"mkreyman/loopctl\" when neither opts[:chg_repo] nor CHG_FINDINGS_REPO is set, and deploy/FLY_SECRETS.md's CHG_FINDINGS_REPO row names that default."},
+    {"id": "AC-52.5.4", "description": "On a selection-proof repository, MergePrecondition clears :prove_effect through Loopctl.Changes.SelectionProof.judge/2 only when every Gate B effect-path match of the change lies under chg/; it does not call SelectionProof when every match lies outside chg/, and that change is judged exactly as a change on a repository that is not selection-proof."},
+    {"id": "AC-52.5.5", "description": "A change whose effect-path matches lie both under chg/ and outside it is not cleared by a passing SelectionProof: its :prove_effect outcome stands as for a change on a repository that is not selection-proof, and the refusal names the matches outside chg/."},
+    {"id": "AC-52.5.6", "description": "chg/bin/chg-replay-selection.py builds each side from <--chg checkout>/chg/cli/Cargo.toml and chg/scripts/install-elixir-adapter.sh at that side's commit, and runner LoopctlRunner.SelectionReplay reads the script from chg/bin/chg-replay-selection.py at origin/<base>."},
+    {"id": "AC-52.5.7", "description": "chg/bin/chg-loop.py routes a cause whose path lies under chg/ of a mkreyman/loopctl source, or under the old workspace/chg/ path, to \"mkreyman/loopctl\", and its CHG constant is \"mkreyman/loopctl\"."},
+    {"id": "AC-52.5.8", "description": "chg/.loopctl/ (a repo-root loop-mode marker, read only at a repository root) is deleted; chg/.chg/loop.toml stays, and chg-loop.py's default --config resolves to it from chg/bin."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.5.1", "verifies": ["AC-52.5.1"], "name": "chg history is walkable under chg/", "type": "integration", "preconditions": ["the epic branch after the import; a clone of mkreyman/chg at release/imports.toml's imported_sha"], "steps": ["git log --format=%s -- chg/cli/src/outbox.rs", "git -C <clone> log --format=%s -- cli/src/outbox.rs"], "expected_results": ["identical lists"]},
+    {"id": "TC-52.5.2", "verifies": ["AC-52.5.2"], "name": "install.sh builds from chg/ and names the loopctl commit (chg/tests, run by chg-ci)", "type": "integration", "preconditions": ["rust per chg/.tool-versions"], "steps": ["chg/scripts/install.sh --dest $TMP --no-elixir-adapter", "$TMP/chg --version"], "expected_results": ["ends with 'commit <git rev-parse --short=12 HEAD>)'"]},
+    {"id": "TC-52.5.3", "verifies": ["AC-52.5.3"], "name": "the findings repository defaults to loopctl (DataCase)", "type": "unit", "preconditions": ["no :chg_findings_repo in the injected opts"], "steps": ["Findings.chg_repo([])", "Findings.chg_repo(chg_repo: \"o/r\")"], "expected_results": ["\"mkreyman/loopctl\"; \"o/r\""]},
+    {"id": "TC-52.5.4", "verifies": ["AC-52.5.4", "AC-52.5.5"], "name": "selection proof scope on the chg repo by effect-match location (DataCase)", "type": "integration", "preconditions": ["tenant; a story at ci on mkreyman/loopctl with an intake source; Gate B triggers whose effect_paths are chg/cli/src/select/** and lib/loopctl/delivery/**; a SelectionProof stub injected through opts that records its calls and answers :pass"], "steps": ["evaluate a change touching only chg/cli/src/select/x.rs", "a change touching only lib/loopctl/delivery/x.ex", "a change touching both"], "expected_results": ["first: cleared by the proof; second: proof not called, outcome as for a non-proof repo; third: not cleared, refusal lists lib/loopctl/delivery/x.ex"]},
+    {"id": "TC-52.5.5", "verifies": ["AC-52.5.4"], "name": "tenant isolation: another tenant's story on the same repo is not judged (DataCase)", "type": "integration", "preconditions": ["tenant A story at ci; tenant B with no story"], "steps": ["MergePrecondition.evaluate(tenant_b.id, story_a.id, opts)"], "expected_results": ["{:error, :not_found}"]},
+    {"id": "TC-52.5.6", "verifies": ["AC-52.5.6"], "name": "replay builds from chg/ (chg/tests/replay-selection-test.py) and the runner reads the moved script (runner ExUnit)", "type": "integration", "preconditions": ["the replay test's fixture checkout laid out with chg/cli and chg/scripts", "runner selection_replay_test.exs with a repo whose origin/<base> holds chg/bin/chg-replay-selection.py"], "steps": ["python3 chg/tests/replay-selection-test.py", "cd runner && mix test test/loopctl_runner/selection_replay_test.exs"], "expected_results": ["both green; the runner test fails when the script sits only at bin/"]},
+    {"id": "TC-52.5.7", "verifies": ["AC-52.5.7", "AC-52.5.8"], "name": "chg-loop routing and config path (chg/tests/loop-test.py)", "type": "unit", "preconditions": ["route() and parse defaults"], "steps": ["route(\"mkreyman/loopctl\", \"chg/cli/src/x.rs\")", "route(\"mkreyman/home_care_billing\", \"/home/u/workspace/chg/cli/x.rs\")", "route(\"mkreyman/loopctl\", \"lib/x.ex\")", "the parser's --config default"], "expected_results": ["mkreyman/loopctl three times; the default ends with chg/.chg/loop.toml"]}
+  ],
+  "technical_notes": [
+    "Source: /home/mkreyman/workspace/chg (Cargo workspace Cargo.toml with members [\"cli\"]; chg version 0.1.0 at cli/Cargo.toml:3; rust 1.99.1 in .tool-versions). Every script resolves its root from its own path (install.sh:63 'root=$(cd \"$(dirname \"$0\")/..\" ...)'; install-elixir-adapter.sh:31; install-system.sh:54), so they work unchanged from chg/scripts. cli/build.rs:16-49 reads the enclosing repository's HEAD for CHG_BUILD_SHA, which is now the loopctl commit.",
+    "chg/.github/ is ported and deleted by US-52.6; chg/hooks/post-checkout stays chg's own file.",
+    "Findings: @default_chg_repo at lib/loopctl/changes/findings.ex:88, chg_repo/1 at :152-157; config at config/runtime.exs:163-180; FLY_SECRETS.md:197. The intake source that files land on is loopctl's own (0265e194, mode pr, project a40edb79); mkreyman/chg's source (7c2ca807) is revoked by US-52.11.",
+    "MergePrecondition.selection_proof/4 at lib/loopctl/delivery/merge_precondition.ex:1052-1060 decides by repository only; the effect matches come from GateB.evaluate(:merge, ...) (lib/loopctl/delivery_gates/gate_b.ex:191). Thread the match list into selection_proof/4 and split it by the chg/ prefix. The prefix is one module attribute (@chg_prefix \"chg/\") read by both the split and its refusal text. SelectionProof itself (lib/loopctl/changes/selection_proof.ex) is unchanged.",
+    "The Gate B triggers for mkreyman/chg live in DELIVERY_GATES_CONFIG (a Fly secret with DELIVERY_GATES_CONFIG_SHA256, deploy/FLY_SECRETS.md). Its mkreyman/chg entry moves into the mkreyman/loopctl entry with every path prefixed chg/; the session updates both secrets in the deploy that ships this story (definition_of_done).",
+    "Replay script: chg-replay-selection.py build_locked/4 at :157-199 builds src/cli/Cargo.toml and runs src/scripts/install-elixir-adapter.sh; both become src/chg/.... Runner: @script at runner lib/loopctl_runner/selection_replay.ex:72, read through Worktree.commit_file/4; argv --chg repo_path at :299-311 is the loopctl checkout. The runner config's selection_replay entry (repo key and paths) is migrated on each machine by US-52.10's installer.",
+    "chg-loop.py: CLAUDE_CONFIG, CHG at :63; route/2 at :102-112; --config default BIN.parent/.chg/loop.toml at :550. A cause's fingerprint includes its owner (:115-116), so causes seen before the move get new fingerprints under mkreyman/loopctl: their open issues on mkreyman/chg are transferred by US-52.11, whose marker comments let chg-loop find them again.",
+    "No new table, context, route or tool."
+  ],
+  "dependencies": [
+    "US-52.4"
+  ],
+  "non_goals": [
+    "CI for chg/ and the chg release artifact: US-52.6 and US-52.7.",
+    "Switching installed chg binaries, adapters and infra's chg jobs to this source: US-52.10.",
+    "Archiving mkreyman/chg, transferring its issues and merging its loopctl project: US-52.11."
+  ],
+  "failure_modes": {"partition": "AC-52.5.1: the import is US-52.4's script, which leaves nothing half written when the fetch fails.", "state": "AC-52.5.3: which repository receives chg's findings is one value, chg_repo/1, read per call from opts or config.", "retry": "AC-52.5.4: the merge precondition is a pure judgement over the stage row's head; evaluating it twice gives the same outcome.", "slow": "n/a: no new network call; the precondition's forge reads are unchanged.", "reach": "n/a: the precondition runs inline in its caller (MergeSweepWorker or the route); the scripts run where their caller runs them."},
+  "defaults": [
+    "CHG_FINDINGS_REPO default: mkreyman/loopctl (owner may set another repository).",
+    "Selection-proof scope inside the loopctl repo: the chg/ prefix (owner may widen it to runner/ later)."
+  ],
+  "definition_of_done": [
+    "fly secrets list -a loopctl shows DELIVERY_GATES_CONFIG and DELIVERY_GATES_CONFIG_SHA256 changed in the deploy that ships this story, and the decoded config has no mkreyman/chg key and has chg/-prefixed effect paths under mkreyman/loopctl.",
+    "In a remote console after deploy, Loopctl.Changes.Findings.chg_repo([]) returns \"mkreyman/loopctl\"."
+  ],
+  "expected_size": {"insertions": 140, "files": 9},
+  "estimated_tokens": 350000
+}

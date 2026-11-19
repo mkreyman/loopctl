@@ -1,0 +1,57 @@
+{
+  "id": "US-52.57",
+  "title": "Any machine fetches a published snapshot through URLs loopctl signs",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_9",
+  "story": {"as_a": "CI job or holder on any machine", "i_want_to": "fetch the snapshot nearest my commit that master already built, and publish one when I am master's snapshot job", "so_that": "a fresh tree starts warm on every machine, and losing a machine loses speed, never work"},
+  "rationale": "PRD R8 wants warm state that any machine can fetch or rebuild, and R3 limits a holder's working set to loopctl, the git remote and secrets loopctl issues. chg's design says the opposite today: snapshots are built locally and never downloaded (chg/docs/design.md:283), so each of the fleet-ci hosts and each slot warms its own tree. loopctl holds no blob store (no S3 client in lib/), and its database is the wrong place for archives of hundreds of megabytes. This story keeps the archives in an object store and has loopctl sign short-lived URLs for named objects only, so no machine ever holds a bucket credential.",
+  "acceptance_criteria": [
+    {"id": "AC-52.57.1", "description": "POST /api/v1/projects/:id/snapshots/urls with {\"op\":\"get\",\"objects\":[names]} at role :agent returns 200 {\"urls\":{name: url}}: a SigV4 presigned GET, valid 900 s, for the object `<tenant_id>/<project_id>/<name>` in the bucket named by SNAPSHOT_BUCKET."},
+    {"id": "AC-52.57.2", "description": "Each name must match `index/<40 lowercase hex>.json` or `<64 lowercase hex>.tar.zst`, and objects holds 1 to 64 names; anything else answers 422 with error.code invalid_snapshot_object naming the first bad name."},
+    {"id": "AC-52.57.3", "description": "op \"put\" requires role :orchestrator (an :agent key gets 403); each URL is a presigned PUT whose signed headers include `if-none-match: *`, so the object store refuses a second write of an existing name, and published objects are never overwritten."},
+    {"id": "AC-52.57.4", "description": "Every op \"put\" answer writes one audit row (Loopctl.Audit.create_log_entry/3) with action snapshot_publish_authorized, entity the project, and the object names in new_state."},
+    {"id": "AC-52.57.5", "description": "A project id of another tenant answers 404; with SNAPSHOT_BUCKET unset the route answers 503 with error.code snapshot_store_unconfigured."},
+    {"id": "AC-52.57.6", "description": "The MCP tool snapshot_urls (project_id, op, objects) calls the route; its description says get needs an agent key, put an orchestrator key, and names the 422, 404 and 503 codes; it has a mcp-server/README.md row and a wiring test."},
+    {"id": "AC-52.57.7", "description": "`chg snapshot push <repo> <sha>` packs the local snapshot of <sha> into `<key>.tar.zst`, uploads it, and only after that upload succeeds uploads `index/<sha>.json` = {key, sha, sha256, bytes, toolchain, build_path}; a 412 from the store counts as already published (exit 0); a snapshot with toolchain `none` is never pushed (exit 2)."},
+    {"id": "AC-52.57.8", "description": "`chg snapshot fetch <repo> <sha>` asks for the index of <sha> and its first 50 first-parent ancestors, takes the nearest whose toolchain and build_path equal this tree's, downloads the archive, and unpacks it into the local store only when its SHA-256 equals the index's; a mismatch, a missing archive or no fitting index exits 3 and leaves the store unchanged."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.57.1", "verifies": ["AC-52.57.1", "AC-52.57.2"], "name": "get URLs and name validation (ConnCase)", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id}); an :agent key; the signer's clock injected as ~U[2026-11-19 12:00:00Z] and a test bucket in config/test.exs"], "steps": ["POST /api/v1/projects/#{project.id}/snapshots/urls op get with index/<sha>.json and <key>.tar.zst", "the same with ../x, an uppercase sha and 65 names"], "expected_results": ["two URLs whose path ends <tenant_id>/<project_id>/<name> and whose X-Amz-Expires is 900", "422 invalid_snapshot_object each time"]},
+    {"id": "TC-52.57.2", "verifies": ["AC-52.57.3", "AC-52.57.4"], "name": "put needs an orchestrator key, signs if-none-match and is audited (ConnCase)", "type": "integration", "preconditions": ["as TC-52.57.1 plus an :orchestrator key"], "steps": ["POST op put with the agent key", "POST op put with the orchestrator key", "Audit.list_entries(tenant.id, action: \"snapshot_publish_authorized\")"], "expected_results": ["403; then 200 with X-Amz-SignedHeaders containing if-none-match; one audit row naming the objects"]},
+    {"id": "TC-52.57.3", "verifies": ["AC-52.57.5"], "name": "tenant isolation and an unconfigured store (ConnCase)", "type": "integration", "preconditions": ["a second tenant's project; the bucket name injected as nil for one request through the controller's conn private option"], "steps": ["POST op get on the other tenant's project", "POST op get with no bucket"], "expected_results": ["404; 503 snapshot_store_unconfigured"]},
+    {"id": "TC-52.57.4", "verifies": ["AC-52.57.6"], "name": "snapshot_urls is declared, dispatched and documented (node --test)", "type": "unit", "preconditions": ["mcp-server tool list"], "steps": ["call the tool's lib function with a fake fetch", "read the declaration and README"], "expected_results": ["POST /api/v1/projects/<id>/snapshots/urls with op and objects; the description names 403, 404, 422 and 503"]},
+    {"id": "TC-52.57.5", "verifies": ["AC-52.57.7"], "name": "push uploads the archive before the index and treats 412 as done (chg integration test)", "type": "integration", "preconditions": ["a local snapshot built by `chg snapshot build --here`; a fake loopctl and a fake object store served by a test HTTP server that records request order and answers 412 to a repeated PUT"], "steps": ["chg snapshot push repo HEAD", "the same again", "the same with a fake store that fails the archive PUT"], "expected_results": ["archive PUT then index PUT; second run exit 0 with no new object; third run uploads no index"]},
+    {"id": "TC-52.57.6", "verifies": ["AC-52.57.8"], "name": "fetch picks the nearest fitting ancestor and refuses a bad digest", "type": "integration", "preconditions": ["the fake store holding indexes for HEAD~3 (other toolchain) and HEAD~5 (this toolchain and path), and their archives"], "steps": ["chg snapshot fetch repo HEAD", "corrupt the HEAD~5 archive byte 100; empty the store; fetch again"], "expected_results": ["first unpacks HEAD~5 into snapshots/<sha5>; second exits 3 and snapshots/ is empty"]}
+  ],
+  "technical_notes": [
+    "Route: add `post \"/projects/:id/snapshots/urls\", SnapshotController, :urls` beside the other project routes in the authenticated /api/v1 scope (lib/loopctl_web/router.ex:245-246, project routes at :524-531). Role plugs per action as DispatchController does (lib/loopctl_web/controllers/dispatch_controller.ex:35-36): :agent for the route, and the controller refuses op put below :orchestrator with the same 403 body RequireRole renders.",
+    "Project lookup: Projects.get_project/2 (lib/loopctl/projects.ex:114), tenant-scoped, so another tenant's id is a 404.",
+    "Signing: Req.Utils.aws_sigv4_url/1 (deps/req/lib/req/utils.ex:133) takes access key, secret, region, service :s3, datetime, method, url, expires and headers. Req.Utils is @moduledoc false, so wrap it in one module, Loopctl.Snapshots.Signer, whose test pins the URL shape; the clock is an argument (CLAUDE.md, Dependency Injection), never Application.put_env.",
+    "Why no existing concept serves: the tenant GitHub credential (router.ex:371-373) hands a stored long-lived credential to its caller, which here would give every agent key write access to the whole bucket; a per-object URL limited to 900 s does not. loopctl's database is not used for archives (hundreds of MB each).",
+    "Config: SNAPSHOT_BUCKET, AWS_ENDPOINT_URL_S3, AWS_REGION, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in config/runtime.exs; `fly storage create` sets the last four as app secrets for a Tigris bucket. Each gets a row in deploy/FLY_SECRETS.md (mix loopctl.check_env_docs, CLAUDE.md Doc hygiene). The 422, 403, 404 and 503 go in the action's operation/2 spec.",
+    "chg's loopctl client: cli/src/outbox.rs:324 post_bearer/4 (curl with the key on stdin and the witness bootstrap header) and Config::url at :94 (CHG_LOOPCTL_URL). Push reads LOOPCTL_ORCH_KEY, fetch LOOPCTL_AGENT_KEY, the names the MCP server already uses (CLAUDE.md, MCP Server). Uploads and downloads go through curl too; packing uses `tar --zstd` (zstd must be on PATH).",
+    "Fetch writes into the local store exactly like a build: unpack into snapshots/.fetch-<key>-<pid>, write .chg-snapshot.json last, then rename into snapshots/<sha> under Store::lock_exclusive (cli/src/store.rs:197), as snapshot.rs:195-211 swaps a build into place. The project id comes from the repo's loopctl config (outbox.rs Config::source at :105) or CHG_PROJECT_ID.",
+    "Update chg/docs/design.md:283 ('never downloaded') and section 3.5 (:127-145) in the same change: snapshots are now published by master's snapshot job and fetched by any machine."
+  ],
+  "dependencies": [
+    "US-52.56"
+  ],
+  "non_goals": [
+    "The CI workflow steps that call fetch and push: US-52.58.",
+    "Deleting old snapshot objects: a bucket lifecycle rule expiring objects 30 days after creation, set when the bucket is created (defaults).",
+    "Dev-box shadow checks fetching snapshots: they keep building locally."
+  ],
+  "failure_modes": {"partition": "AC-52.57.8: when loopctl or the object store cannot be reached, fetch exits 3 with the store unchanged and the caller builds cold, so a partition costs speed, never a wrong tree.", "state": "AC-52.57.7: an archive is reachable only through its index, which is written after the archive, so a crash mid-push leaves an unreferenced archive and never a referenced partial one.", "retry": "AC-52.57.3: every PUT carries if-none-match, so a retried push meets 412 and changes nothing.", "slow": "AC-52.57.1: a URL is valid 900 s, so a slow download finishes on the URL it started with; a fetch slower than that fails and exits 3 like any other miss (AC-52.57.8).", "reach": "AC-52.57.6: the route is reached by the snapshot_urls MCP tool and by chg through the same HTTP API, from any machine holding a loopctl key."},
+  "definition_of_done": [
+    "On production, snapshot_urls with op get for a nonexistent index returns a URL that answers 404 from the bucket, and SELECT count(*) FROM audit_log WHERE action = 'snapshot_publish_authorized' grows by one after one put.",
+    "On x1, `chg snapshot fetch ~/workspace/loopctl HEAD` after master's snapshot job ran restores a snapshot that minis built (see US-52.58)."
+  ],
+  "defaults": [
+    "URL lifetime 900 s; at most 64 objects per call; fetch looks back 50 first-parent commits (owner may change).",
+    "Bucket `loopctl-snapshots` on Tigris in loopctl's Fly org, objects expire 30 days after creation.",
+    "Publishing needs an :orchestrator key; fetching an :agent key."
+  ],
+  "expected_size": {"insertions": 520, "files": 11},
+  "estimated_tokens": 420000
+}

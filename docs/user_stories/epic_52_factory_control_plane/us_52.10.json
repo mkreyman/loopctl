@@ -1,0 +1,55 @@
+{
+  "id": "US-52.10",
+  "title": "One command moves every machine to the manifest's set, verifies each, and rolls back on a red e2e",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_2",
+  "story": {"as_a": "session releasing the factory", "i_want_to": "run release/rollout.sh once and have every fleet machine install the set's runner and chg from the loopctl repo, prove it joined at that set, and see the e2e pass", "so_that": "no machine is left on an old part or on the archived repos, and a bad set is undone without hand work"},
+  "rationale": "PRD R7: 'One command rolls the fleet to that set and verifies each machine.' Today each part is installed per machine from its own repo's checkout: runner rel/install.sh builds from the checkout it sits in (rel/install.sh, repo=$(cd \"$(dirname \"$0\")/..\")), chg scripts/install.sh builds or downloads into ~/.local/bin/chg and install-system.sh writes /usr/local/bin/chg on CI hosts, and infra's chg jobs pull ~/workspace/chg (infra scripts/jobs/chg-job.sh, scripts/runner-deps.sh:285). After US-52.11 archives those repos, those checkouts stop moving. This story is also how existing installs switch source: the same prefixes, units and config, built from a tag of this repo.",
+  "acceptance_criteria": [
+    {"id": "AC-52.10.1", "description": "release/install-machine.sh <set>, on one machine, clones or fetches mkreyman/loopctl into ~/.local/share/loopctl-factory/sets/<set> at tag factory-<set>, installs that tree's .tool-versions toolchains with asdf when missing, and swaps ~/.local/share/loopctl-factory/current to it with a symlink rename; it keeps the three newest sets, and two concurrent runs are serialised by an mkdir lock, the second exiting 75 'busy'."},
+    {"id": "AC-52.10.2", "description": "Before replacing the runner, install-machine.sh sets the running runner draining (bin/loopctl_runner rpc calling LoopctlRunner.Control.set_draining/2, runner control.ex:420) and waits up to 60 minutes for its in-flight dispatches to reach zero; on timeout it undrains it, leaves the runner and chg unchanged and reports status runner_busy."},
+    {"id": "AC-52.10.3", "description": "install-machine.sh installs the runner with current/runner/rel/install.sh into the existing prefix ~/.local/share/loopctl-runner, unit loopctl-runner.service or com.loopctl.runner and config ~/.config/loopctl-runner/runner.json, rewriting a selection_replay entry keyed mkreyman/chg to mkreyman/loopctl with chg/-prefixed paths; it installs chg with current/chg/scripts/install.sh into ~/.local/bin/chg, and with install-system.sh too where /usr/local/bin/chg already exists."},
+    {"id": "AC-52.10.4", "description": "install-machine.sh prints one JSON line {host, set, status, runner_version, chg_version} where status is ok only when chg --version (both installs where two exist) names the set's chg version and the tag's commit, and the runner's joined.json (US-52.8) is newer than the restart and names release_set <set>; a machine already at the set prints status unchanged and restarts nothing."},
+    {"id": "AC-52.10.5", "description": "release/rollout.sh first requires /.well-known/loopctl release.set to equal the manifest's set and npm view loopctl-mcp-server@<mcp version> to exist, then runs install-machine.sh on each host of FLEET_MACHINES in turn over ssh under nice, continues past an unreachable host (status unreachable), and prints one summary table."},
+    {"id": "AC-52.10.6", "description": "When every host is ok or unchanged, rollout.sh dispatches .github/workflows/e2e.yml and waits for it; if e2e fails, it runs install-machine.sh <previous set> on every host it moved, prints the e2e run URL and exits 1; with any host failed or unreachable it skips e2e and exits 1."},
+    {"id": "AC-52.10.7", "description": "In infra, scripts/jobs/chg-job.sh and scripts/runner-deps.sh read chg from ~/.local/share/loopctl-factory/current/chg (no git pull of their own), and systemd/infra-chg-loop.service passes --repo mkreyman/loopctl, in a pull request to mkreyman/infra merged before US-52.11 archives mkreyman/chg."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.10.1", "verifies": ["AC-52.10.1"], "name": "set checkout, symlink swap, retention and lock (ExUnit, shell under test)", "type": "integration", "preconditions": ["a temp HOME; a local bare repo standing in for mkreyman/loopctl with tags factory-1..factory-4; asdf, runner and chg installers stubbed on PATH"], "steps": ["install-machine.sh 1, then 2, 3, 4", "hold the lock dir and run again"], "expected_results": ["current points at sets/4; only sets 2..4 remain; the locked run exits 75 printing busy"]},
+    {"id": "TC-52.10.2", "verifies": ["AC-52.10.2"], "name": "drain wait and runner_busy (shell under test)", "type": "integration", "preconditions": ["a bin/loopctl_runner stub answering rpc with in_flight counts from a script file"], "steps": ["counts 2,1,0", "counts stuck at 1 with the wait shortened by LOOPCTL_FACTORY_DRAIN_S=3"], "expected_results": ["the install proceeds after 0; then status runner_busy, set_draining(false) called, the installer stubs never called"]},
+    {"id": "TC-52.10.3", "verifies": ["AC-52.10.3", "AC-52.10.4"], "name": "installs into the existing prefixes and verifies the join (shell under test)", "type": "integration", "preconditions": ["temp HOME with runner.json holding selection_replay {\"mkreyman/chg\": {...}}; /usr/local/bin/chg simulated by LOOPCTL_FACTORY_SYSTEM_BIN; stubs writing joined.json with release_set from an env var"], "steps": ["install-machine.sh 2 with joined.json release_set 2", "with release_set 1", "again at 2 after success"], "expected_results": ["status ok, both chg installs called, runner.json re-keyed with chg/ paths; then status failed join_set_mismatch; then status unchanged with no installer call"]},
+    {"id": "TC-52.10.4", "verifies": ["AC-52.10.5", "AC-52.10.6"], "name": "rollout preflight, unreachable host, e2e rollback (shell under test)", "type": "integration", "preconditions": ["stubs for curl (well-known), npm, ssh (per-host scripted outcome) and gh (workflow run and watch with a scripted conclusion)"], "steps": ["well-known set 1 with manifest set 2", "hosts a ok, b unreachable", "hosts a, b ok and e2e failing"], "expected_results": ["exit 1 before any ssh; exit 1 with b unreachable and no gh workflow run; install-machine.sh 1 sent to a and b, exit 1 printing the run URL"]},
+    {"id": "TC-52.10.5", "verifies": ["AC-52.10.7"], "name": "infra reads chg from the factory tree (infra's tests)", "type": "unit", "preconditions": ["the infra PR branch"], "steps": ["grep the three files for workspace/chg and mkreyman/chg", "run chg-job.sh with a temp HOME holding a fake current/chg"], "expected_results": ["no match; the job runs the fake tree's bin/ without a git pull"]}
+  ],
+  "technical_notes": [
+    "Runner installer: runner rel/install.sh (prefix ~/.local/share/loopctl-runner, releases/<stamp>, current symlink, history, mkdir lock .install.lock, keeps 3 releases, preflight via bin/loopctl_runner eval \"LoopctlRunner.Application.preflight()\", systemd user unit loopctl-runner.service or launchd com.loopctl.runner). It builds from its own checkout, so running it from sets/<n>/runner builds the set's runner into the same prefix: this is the source switch, with no unit or config change. Draining: LoopctlRunner.Control.set_draining/2 at runner lib/loopctl_runner/control.ex:420; in-flight count from the same rpc.",
+    "chg installers: chg scripts/install.sh (default dest ~/.local/bin/chg, then install-elixir-adapter.sh --all-installed) and scripts/install-system.sh (/usr/local/bin/chg and /usr/local/share/chg adapters, CI hosts). KB: chg has two installs per machine (~/.local/bin and /usr/local/bin), and a non-interactive PATH can find either, so both are verified.",
+    "Hosts: FLEET_MACHINES in claude-config hooks/lib/fleet-name.sh:35 (minis mac-mini beelink blockit nuc x1 ryzen), read by sourcing that file. beelink and nuc need '. \"$HOME/.asdf/asdf.sh\"' in a non-interactive ssh (USER.md), so install-machine.sh sources it when present. Each host runs under nice -n 10 (memory: batch work on fleet boxes runs niced).",
+    "Server preflight: /.well-known/loopctl release (US-52.7). MCP: not installed per machine in this release; machines launch loopctl-mcp-server@latest through claude-config bin/loopctl-mcp.sh, so the rollout checks npm has the set's version and US-52.8's refusal covers a stale one.",
+    "e2e: gh workflow run e2e.yml -R mkreyman/loopctl, then gh run watch on that run id (US-52.9). Rollback reinstalls the previous set (manifest set - 1, still in sets/ because three are kept), which is backward compatible by US-52.8's rule.",
+    "infra (separate repo mkreyman/infra): scripts/jobs/chg-job.sh (CHG=${INFRA_CHG_DIR:-$HOME/workspace/chg}, pulls master --ff-only), scripts/runner-deps.sh:285 (chg_src=${CHG_SRC:-$HOME/workspace/chg}), scripts/systemd/infra-chg-loop.service:20 (--repo mkreyman/chg). A released fix now reaches these jobs at the next rollout, not at the next merge (defaults).",
+    "No new table, context, route or tool."
+  ],
+  "dependencies": [
+    "US-52.8",
+    "US-52.9"
+  ],
+  "non_goals": [
+    "Pinning the MCP package per machine: release 8.",
+    "Rolling the server: the master deploy in ci.yml stays its only path.",
+    "Archiving the old repos: US-52.11."
+  ],
+  "failure_modes": {"partition": "AC-52.10.5: an unreachable host is reported unreachable and the rollout continues to the next; the run then exits 1 and skips e2e, so a partial fleet is never declared done.", "state": "AC-52.10.1: which set a machine runs is the current symlink under ~/.local/share/loopctl-factory, swapped by rename; the runner's own release history stays in its prefix.", "retry": "AC-52.10.4: a re-run on a machine already at the set reports unchanged and restarts nothing; AC-52.10.1: a concurrent run exits busy.", "slow": "AC-52.10.2: a busy runner is waited on for at most 60 minutes, then left untouched and reported runner_busy.", "reach": "AC-52.10.4: each machine proves it reached the set through joined.json, written by the runner after loopctl admitted its join."},
+  "defaults": [
+    "Hosts are rolled one at a time, niced (owner may parallelise).",
+    "A failed e2e rolls every moved host back to the previous set.",
+    "infra's chg jobs run the released tree, not chg master."
+  ],
+  "definition_of_done": [
+    "release/rollout.sh run once after the epic merges prints ok or unchanged for every reachable host and a green e2e run.",
+    "runner_pool shows every connected runner at the manifest's runner_version."
+  ],
+  "expected_size": {"insertions": 380, "files": 6},
+  "estimated_tokens": 400000
+}

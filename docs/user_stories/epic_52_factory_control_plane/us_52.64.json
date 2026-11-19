@@ -1,0 +1,52 @@
+{
+  "id": "US-52.64",
+  "title": "Every GitHub-hosted job is moved to fleet-ci or measured against the free allowance before the repo goes private",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_11",
+  "story": {"as_a": "session that maintains loopctl's CI", "i_want_to": "run every job of a private loopctl on the self-hosted fleet-ci pool, except the jobs kept on GitHub-hosted runners for a stated reason and measured", "so_that": "the private repo's billed minutes are known before the flip and stay inside the account's allowance"},
+  "rationale": "PRD R12: jobs on ubuntu-latest become billed GitHub-hosted minutes once the repo is private, so each moves to fleet-ci or is measured first. Today ten jobs are hosted: pgbouncer-e2e, smoke-preflight, deploy and smoke in ci.yml, the four jobs of mcp-server-ci.yml, mcp-autopublish.yml's autopublish and npm-publish.yml's publish. pgbouncer-e2e (1.4-2.4 min, every push and PR, ci.yml:63-65) and the four mcp-server-ci jobs (every push and PR, each billed as at least one minute) are the recurring cost. deploy and smoke stay hosted for a security reason ci.yml:78-87 already records. On a private repo, npm also refuses `--provenance`, which both publish jobs pass, so the publish jobs fail on the first version bump after the flip unless this story changes them.",
+  "acceptance_criteria": [
+    {"id": "AC-52.64.1", "description": "The pgbouncer-e2e job (ci.yml:1129) runs on [self-hosted, fleet-ci] with the fork-PR guard every self-hosted job carries (ci.yml:142). Postgres is a service container on a loopback port that Docker picks, as scale-test does (ci.yml:948-963). pgbouncer is a second service container, pinned by digest, on a loopback port that Docker picks. The job no longer runs apt-get or sudo, and PGBOUNCER_URL is built from the port that Docker picked."},
+    {"id": "AC-52.64.2", "description": "The jobs changes, version-bump, test and mcp-gate of mcp-server-ci.yml (:30, :60, :75, :111) run on [self-hosted, fleet-ci] with the fork-PR guard. The required context names stay unchanged, so `gh api repos/mkreyman/loopctl/branches/master/protection/required_status_checks --jq .contexts` lists the same contexts as before the change."},
+    {"id": "AC-52.64.3", "description": "Both publish jobs (mcp-autopublish.yml:65, npm-publish.yml:56) run `npm publish --access public` without `--provenance`, and stay on ubuntu-latest, so the NPM_TOKEN never reaches a fleet-ci host."},
+    {"id": "AC-52.64.4", "description": "scripts/ci/hosted-minutes.sh sums the billed GitHub-hosted minutes over the last 30 days for every private repo of the owner. It rounds each job up to a whole minute, as GitHub bills, and prints one line per repo and job plus a total. The result is recorded with its date in ci.yml's SELF-HOSTED SPLIT header (ci.yml:58-87), which this story rewrites to list only the jobs that stay hosted, each with its reason."},
+    {"id": "AC-52.64.5", "description": "test/loopctl/ci_hosted_jobs_test.exs parses every file in .github/workflows/ and fails, naming the workflow file and the job id, when a job that runs on a GitHub-hosted label is not in the test's allowlist. The allowlist holds smoke-preflight, deploy, smoke, autopublish and publish, each with its reason."},
+    {"id": "AC-52.64.6", "description": "The same test fails, naming the job, when a job that runs on [self-hosted, fleet-ci] has no fork-PR guard in its `if:`."},
+    {"id": "AC-52.64.7", "description": "The test fails when the total from scripts/ci/hosted-minutes.sh that is recorded in the ci.yml header is more than 50% of the allowance that the header names (2,000 minutes a month on GitHub Free, 3,000 on Pro)."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.64.1", "verifies": ["AC-52.64.1"], "name": "pgbouncer-e2e green on a fleet-ci slot while a second loopctl run uses the same host", "type": "integration", "preconditions": ["the branch pushed; two fleet-ci slots free on one host"], "steps": ["push twice in quick succession on two branches", "read both runs' Pgbouncer e2e jobs: runner name and the ports the job log prints"], "expected_results": ["both green on one host with different ports; no apt-get line in either log"]},
+    {"id": "TC-52.64.2", "verifies": ["AC-52.64.2"], "name": "MCP Server Gate reports from a fleet-ci runner and the protection contexts are unchanged", "type": "integration", "preconditions": ["a PR touching mcp-server/"], "steps": ["read the run's jobs with gh run view --json jobs", "gh api .../required_status_checks --jq .contexts"], "expected_results": ["the four jobs have fleet-ci runner names; the contexts match the list read before the change"]},
+    {"id": "TC-52.64.3", "verifies": ["AC-52.64.3", "AC-52.64.5"], "name": "publish jobs carry no --provenance and are the hosted allowlist (unit)", "type": "unit", "preconditions": ["the workflow files parsed with YamlElixir, as test/loopctl/ci_scale_nightly_cron_test.exs does"], "steps": ["collect each run step of autopublish and publish", "add a fixture workflow with an ubuntu-latest job named extra"], "expected_results": ["no step contains --provenance; the fixture fails with 'extra.yml: job extra runs on a GitHub-hosted runner and is not in the allowlist'"]},
+    {"id": "TC-52.64.4", "verifies": ["AC-52.64.6"], "name": "a fleet-ci job with no fork guard fails the test (unit)", "type": "unit", "preconditions": ["a fixture workflow with a [self-hosted, fleet-ci] job and no if:"], "steps": ["run the guard check on it"], "expected_results": ["the test fails", "the failure names the job"]},
+    {"id": "TC-52.64.5", "verifies": ["AC-52.64.4"], "name": "hosted-minutes.sh rounds each job up and totals per repo (shell test)", "type": "unit", "preconditions": ["a stub gh on PATH that answers two repos' runs and jobs from fixture JSON: jobs of 61 s and 5 s on ubuntu-latest, one on fleet-ci"], "steps": ["bash scripts/ci/hosted-minutes.sh --owner mkreyman --days 30"], "expected_results": ["3 minutes for the repo (2 + 1), the fleet-ci job not counted"]},
+    {"id": "TC-52.64.6", "verifies": ["AC-52.64.7"], "name": "a recorded total above half the allowance fails the test (unit)", "type": "unit", "preconditions": ["a header fixture recording 1,100 minutes against a 2,000-minute allowance"], "steps": ["run the allowance check on the fixture"], "expected_results": ["the test fails, because 1,100 minutes is more than 50% of the 2,000-minute allowance"]}
+  ],
+  "technical_notes": [
+    "Hosted jobs today: ci.yml pgbouncer-e2e :1129 (runs-on :1142), smoke-preflight :1621 (:1623), deploy :1655 (:1657), smoke :1673 (:1692); mcp-server-ci.yml changes :32, version-bump :64, test :79, mcp-gate :115; mcp-autopublish.yml autopublish :19; npm-publish.yml publish :10.",
+    "Self-hosted jobs already carry the fork-PR guard (#881), ci.yml:137-142; scale-test's service-container pattern with a loopback port that Docker picks and a tmpfs data dir is at ci.yml:930-975. pgbouncer is installed by apt today at ci.yml:1206-1266; the e2e is test/loopctl/pgbouncer_startup_params_test.exs, run at :1268-1271.",
+    "smoke-preflight stays hosted because it probes loopctl.com from outside the fleet: the case it exists for is a runner that cannot reach the app (ci.yml:1615-1619). deploy and smoke stay hosted for the credential reason at ci.yml:78-87 (also infra runbooks/ci-runner-setup.md:690-705).",
+    "npm refuses provenance from a private source repository and from self-hosted runners, so `--provenance` is removed. That is why the publish jobs cannot move, and npm's provenance badge goes away with it. mcp-autopublish.yml:62-66 and npm-publish.yml:55-58 publish today.",
+    "The new test follows test/loopctl/ci_scale_nightly_cron_test.exs, which parses ci.yml with yaml_elixir (mix.exs:193). It is async: true and reads files only.",
+    "Billed minutes: GitHub bills a private repo's hosted job by the whole minute, from an account allowance shared by every private repo of the owner. That is why hosted-minutes.sh lists the owner's private repos (`gh repo list mkreyman --visibility private`) instead of loopctl alone, and reads each run's jobs (`gh api repos/:o/:r/actions/runs/:id/jobs`).",
+    "The fleet-ci pool already serves loopctl (infra runbooks/ci-runner-setup.md:1884), so no infra change is needed. Repo visibility does not change runner registration."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Flipping the repo private: US-52.66.",
+    "Removing the fork-PR guards: a collaborator's fork of a private repo can still open a PR, so the guard keeps its meaning.",
+    "Moving deploy or smoke onto the fleet: refused for the credential reason at ci.yml:78-87."
+  ],
+  "failure_modes": {"partition": "AC-52.64.1: if a fleet-ci host loses its service containers mid-job, the job fails and GitHub re-queues it on any slot; no state outlives the job because both containers are per job.", "state": "AC-52.64.4: the measurement is recorded in ci.yml next to the jobs it measures, and AC-52.64.7 checks it in every test run, so a later reader never has to re-derive it.", "retry": "AC-52.64.1: a re-run of pgbouncer-e2e gets fresh containers on new ports, so two attempts on one host never share a database or a port.", "slow": "AC-52.64.1: the service containers carry health checks with a bounded number of retries, as scale-test's do, so a slow image start fails the job inside its 15-minute timeout (ci.yml:1143) instead of hanging.", "reach": "AC-52.64.2: each job runs on whichever fleet-ci slot the pool hands it; the required context is reached by its unchanged name."},
+  "definition_of_done": [
+    "bash scripts/ci/hosted-minutes.sh --owner mkreyman --days 30 prints a total, and that total with its date is in the ci.yml header.",
+    "On the merge commit's CI run, gh run view --json jobs shows ubuntu-latest only for smoke-preflight, deploy and smoke."
+  ],
+  "defaults": [
+    "Allowance threshold: the recorded hosted total may use at most 50% of the plan's monthly allowance (owner may change).",
+    "Account plan for the allowance: Pro, 3,000 minutes a month. The plan is a fact only Mark holds; the header names the plan it assumes."
+  ],
+  "expected_size": {"insertions": 220, "files": 6},
+  "estimated_tokens": 250000
+}

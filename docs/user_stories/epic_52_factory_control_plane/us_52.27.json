@@ -1,0 +1,52 @@
+{
+  "id": "US-52.27",
+  "title": "Real-time delivery: fleet_dash subscribers see every message on commit",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_4",
+  "story": {"as_a": "Mark in fleet_dash", "i_want_to": "see every message of my tenant as it lands", "so_that": "the dashboard shows the bus as it moves instead of polling it"},
+  "rationale": "PRD R11: fleet_dash subscribes to the message stream. The coordination-bus design chose store-and-poll and no WebSockets for agents (docs/repo-coordination-bus.md section 5), and the only socket loopctl serves outside LiveView is LoopctlWeb.RunnerSocket (lib/loopctl_web/runner_socket.ex:48), which authenticates only runner tokens (runner_socket.ex:55-101), so fleet_dash, which holds a user api key, needs a socket of its own. Waking an idle session through its machine's runner is US-52.27a, split from this story so its measurement never holds back the subscription; it computes its wakes in the after-commit step this story adds.",
+  "acceptance_criteria": [
+    {"id": "AC-52.27.1", "description": "After a message's transaction commits, Messages broadcasts {:message, summary} on the PubSub topic messages:<tenant_id>, where summary is id, attachment kind and id, attachment_seq, agent_id, author_holder_id, inserted_at and a body preview of at most 512 bytes."},
+    {"id": "AC-52.27.2", "description": "LoopctlWeb.MessageSocket at /socket/messages authenticates the api key in the x-loopctl-api-key header with Loopctl.Auth.verify_api_key/1, and LoopctlWeb.MessageChannel admits a join of topic messages:tenant only for a key of role :user or above, pushing a message event per summary of that key's tenant."},
+    {"id": "AC-52.27.3", "description": "A join of messages:tenant may carry since, the inserted_at of the last summary the client saw; MessageChannel subscribes first, then pushes, oldest first, the summary of every message of the key's tenant (channel posts, DMs and item threads alike) inserted at or after since minus 60 s, at most 500, followed by a catchup_truncated event when more remain. The 60 s margin covers a message inserted before since that committed after it, because Messages.insert/2 runs its transaction with a 30 s timeout, so no send commits more than 30 s after its inserted_at; the client drops a summary whose id it already holds, so the overlap loses nothing and shows nothing twice. A since that is not an ISO 8601 timestamp refuses the join with reason invalid_since."},
+    {"id": "AC-52.27.4", "description": "Messages broadcasts only from its after-commit step, once per committed message and never inside the send's transaction: a send whose transaction rolls back (a body the denylist refuses, a failed insert) broadcasts nothing, and a send deduplicated on its idempotency_key commits nothing and broadcasts nothing."},
+    {"id": "AC-52.27.5", "description": "MessageChannel refuses a join of messages:tenant by an :agent or :orchestrator key with reason unauthorized, and MessageSocket refuses the connection when the x-loopctl-api-key header is missing or Loopctl.Auth.verify_api_key/1 rejects it."},
+    {"id": "AC-52.27.6", "description": "MessageChannel subscribes a joined socket only to messages:<tenant_id> of its own key's tenant (the client names the literal topic messages:tenant, never a tenant id), so a user key of tenant B receives no push for a message of tenant A."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.27.1", "verifies": ["AC-52.27.1"], "name": "broadcast a summary after commit (DataCase)", "type": "integration", "preconditions": ["Phoenix.PubSub.subscribe(Loopctl.PubSub, \"messages:\" <> tenant.id)"], "steps": ["Messages.send/4 a 2 KiB channel message"], "expected_results": ["one {:message, summary} with a 512-byte preview and the stored id"]},
+    {"id": "TC-52.27.2", "verifies": ["AC-52.27.2"], "name": "fleet_dash socket: a user key joins and receives its tenant's messages (ChannelCase)", "type": "integration", "preconditions": ["user key in tenant A (test/support/channel_case.ex)"], "steps": ["connect MessageSocket with the key in x-loopctl-api-key and join messages:tenant", "send a message in tenant A"], "expected_results": ["the tenant A user receives one message push carrying the summary"]},
+    {"id": "TC-52.27.3", "verifies": ["AC-52.27.3"], "name": "a reconnecting subscriber catches up on what it missed (ChannelCase)", "type": "integration", "preconditions": ["user key in tenant A; in tenant A a channel post at T1, then a DM and an item-thread message at T2, then a channel post C whose inserted_at is T2 + 1 s but which committed after the client saw T2 + 20 s; a message in tenant B at T2; T1 is more than 60 s before T2"], "steps": ["join messages:tenant with since = T2", "join with since = T2 + 20 s", "join with since = T1 and the cap injected as 2", "join with since = 'yesterday'"], "expected_results": ["the DM, the thread message and C pushed oldest first, nothing from tenant B", "C is pushed although its inserted_at is before since", "two summaries then catchup_truncated", "{:error, %{reason: \"invalid_since\"}}"]},
+    {"id": "TC-52.27.4", "verifies": ["AC-52.27.4"], "name": "a refused or deduplicated send broadcasts nothing (DataCase)", "type": "integration", "preconditions": ["Phoenix.PubSub.subscribe(Loopctl.PubSub, \"messages:\" <> tenant.id)"], "steps": ["Messages.send/4 a message whose body fails the denylist", "Messages.send/4 a message with idempotency_key k, then the same send again with k"], "expected_results": ["nothing for the refused send; exactly one {:message, summary} for the two sends with k"]},
+    {"id": "TC-52.27.5", "verifies": ["AC-52.27.5"], "name": "agent and orchestrator keys cannot subscribe; a bad key cannot connect (ChannelCase)", "type": "integration", "preconditions": ["agent key and orchestrator key in tenant A (test/support/channel_case.ex)"], "steps": ["connect MessageSocket with each key and join messages:tenant", "connect with no x-loopctl-api-key header", "connect with a revoked key"], "expected_results": ["each join {:error, %{reason: \"unauthorized\"}}", "connect fails", "connect fails"]},
+    {"id": "TC-52.27.6", "verifies": ["AC-52.27.6"], "name": "another tenant's subscriber sees nothing (ChannelCase)", "type": "integration", "preconditions": ["user key in tenant A and user key in tenant B, both joined to messages:tenant"], "steps": ["send a message in tenant A"], "expected_results": ["tenant A's socket receives one message push; tenant B's socket receives nothing"]}
+  ],
+  "technical_notes": [
+    "PubSub: broadcast with Phoenix.PubSub.broadcast(Loopctl.PubSub, ...) after Messages.send/4's transaction returns {:ok, ...} (never inside it); the cluster carries it to the node holding each socket, as Runners.dispatch_topic/1 does (lib/loopctl/runners.ex:131, broadcast :699-716). A send deduplicated on its idempotency_key commits nothing and broadcasts nothing.",
+    "New socket because none could serve: LiveView's /live socket is browser-session-bound and RunnerSocket admits only runner tokens. Mount /socket/messages in lib/loopctl_web/endpoint.ex beside /runner/socket (:72-75) with websocket connect_info [:x_headers], longpoll false, an explicit drainer (issue #815: every socket's drainer is explicit and fly.toml kill_timeout derives from them, endpoint.ex:56-59).",
+    "The after-commit step is a function Messages calls once per committed message; US-52.27a adds the wake routing to the same step, so a message is announced to subscribers and to runners from one place."
+  ],
+  "dependencies": [
+    "US-52.23",
+    "US-52.24"
+  ],
+  "non_goals": [
+    "Waking an idle session through its machine's runner, and the measurement that picks the mechanism: US-52.27a.",
+    "The session-side hooks (SessionStart inbox block, tool-round reads) and deleting session-message.sh: US-52.28.",
+    "Keeping one machine per region running so subscriptions survive Fly suspend: release 10 (PRD R9); until then fleet_dash reconnects and catches up with since (AC-52.27.3).",
+    "fleet_dash's subscriber code: fleet_dash stays its own repository, mkreyman/fleet_dash (docs/factory/architecture.md, non-goals). When this story ships, the session posts the socket contract (path /socket/messages, the x-loopctl-api-key header, topic messages:tenant, the message and catchup_truncated events, the since join parameter) as a handoff on fleet_dash's loopctl channel, and fleet_dash's repo builds the client."
+  ],
+  "failure_modes": {"partition": "AC-52.27.3: a fleet_dash socket cut off from loopctl misses pushes while disconnected; every message was stored before its broadcast (AC-52.27.4), so on reconnect fleet_dash joins with since set to the last summary it saw and the channel pushes every message it missed, DMs and item threads included; the inbox read is no path for it, because GET /api/v1/inbox needs a holder credential (US-52.24).", "state": "AC-52.27.1: PubSub and sockets carry only copies; the message stays in Postgres, so losing a node or a socket loses no message.", "retry": "AC-52.27.4: the broadcast follows a commit, so a rolled-back send broadcasts nothing and a deduplicated retry commits and broadcasts nothing.", "slow": "AC-52.27.2: a slow subscriber's pushes queue in its own channel process; the sender's transaction never waits on a socket.", "reach": "AC-52.27.1: the broadcast travels over the cluster's PubSub to whichever node holds each fleet_dash socket."},
+  "definition_of_done": [
+    "On production, a websocket client joined to /socket/messages topic messages:tenant with Mark's user key receives a message_send from a session within 2 s of the send, and a rejoin with since receives a DM sent while it was disconnected.",
+    "The socket-contract handoff is posted on fleet_dash's loopctl channel (non_goals)."
+  ],
+  "defaults": [
+    "Only :user and :superadmin keys may subscribe to messages:tenant (fleet_dash).",
+    "Body preview in a broadcast summary: at most 512 bytes.",
+    "Catch-up on join: at most 500 summaries, then catchup_truncated."
+  ],
+  "expected_size": {"insertions": 220, "files": 6},
+  "estimated_tokens": 220000
+}

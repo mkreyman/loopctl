@@ -1,0 +1,50 @@
+{
+  "id": "US-52.40",
+  "title": "Measure the checkpoint diff bound and the interactive-move grant before building them",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_7",
+  "story": {"as_a": "factory engineer starting release 7", "i_want_to": "measure real working-tree diff sizes and what a UserPromptSubmit hook sees, and record both in one measurement doc", "so_that": "the checkpoint bound and the boundary-move grant are chosen from data, as docs/factory/architecture.md section 9 requires, not guessed"},
+  "rationale": "PRD section 9 leaves two release-7 questions open and says each is settled inside the release, by measurement, before anything depends on it: the diff bound a checkpoint carries (R1, section 7 point 4) and whether a UserPromptSubmit hook can tell that Mark typed the move command (R2). Nothing measures either today: the closest bound is the untyped 16 KiB channel-post body (lib/loopctl/coordination/channel_post.ex:97), which the PRD rules out for checkpoints, and claude-config's UserPromptSubmit hooks (hooks/kb-recall-on-prompt.sh:73 reads .prompt and calls loopctl with a 3 s cap at :306) were never asked where a prompt came from. US-52.41 and US-52.45 read this story's numbers and rule.",
+  "acceptance_criteria": [
+    {"id": "AC-52.40.1", "description": "scripts/factory/measure-worktree-diffs.sh <root>... prints one JSON line per git worktree under the roots with path, repo, branch, base, diff_bytes, untracked_bytes and captured_at, where base is the branch's upstream when set and otherwise its merge-base with origin's default branch, and diff_bytes is the byte count of `git diff --binary <base>` streamed into wc -c, untracked non-ignored files included through intent-to-add in a temporary index (GIT_INDEX_FILE pointing at a copy)."},
+    {"id": "AC-52.40.2", "description": "The script never changes a measured worktree: the worktree's index file, its working files and its refs are byte-identical before and after a run."},
+    {"id": "AC-52.40.3", "description": "scripts/factory/diff_bound.exs <jsonl>... prints the sample count, p50, p95, p99 and max of diff_bytes and the chosen bound: p99 rounded up to the next 64 KiB, clamped to the range 256 KiB to 4 MiB."},
+    {"id": "AC-52.40.4", "description": "docs/factory/measurements/release-7.md carries one line `bound_bytes: <n>` holding diff_bound.exs's output for the fleet-wide sample, with the machines measured, the sample count, the percentiles and the date."},
+    {"id": "AC-52.40.5", "description": "scripts/factory/probe-user-prompt-submit.sh, run as a UserPromptSubmit hook, appends one JSON line per prompt (session_id, cwd, the prompt's first 200 characters, its byte length, a UTC timestamp) to the log named by PROBE_LOG, prints nothing and exits 0, including when PROBE_LOG is unset or unwritable."},
+    {"id": "AC-52.40.6", "description": "The measurement doc has one row per origin and platform (Linux on minis, macOS on mac-mini) stating whether UserPromptSubmit fired and the prompt's first token, for: a typed `/work-item-move <item> loop`; a message release 4's host daemon delivers into an idle session; a peer's SendMessage; a subagent dispatch; a headless `claude -p` session; and whether the hook reached loopctl with the session's holder credential within 2 s."},
+    {"id": "AC-52.40.7", "description": "The doc carries one line `grant_rule: slash_command` when a typed command was the only origin whose prompt starts with `/work-item-move` on both platforms, else `grant_rule: fleet_dash_only` with the origin that defeated it; a doc check fails when either line is missing or holds another value."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.40.1", "verifies": ["AC-52.40.1", "AC-52.40.2"], "name": "the measuring script counts a fixture worktree's diff and leaves it untouched (bash test)", "type": "unit", "preconditions": ["scripts/factory/tests/measure-worktree-diffs-test.sh builds a bare origin and a worktree with one pushed commit, a 3000-byte tracked edit, a 500-byte untracked file and an ignored file"], "steps": ["sha256 the worktree's index, files and `git for-each-ref` output", "run the script on the parent directory", "sha256 again"], "expected_results": ["one line with diff_bytes covering the edit and the untracked file, not the ignored one; every hash unchanged"]},
+    {"id": "TC-52.40.2", "verifies": ["AC-52.40.1"], "name": "a branch with no upstream is measured against its merge-base", "type": "unit", "preconditions": ["the fixture worktree on a local-only branch two commits past origin/main"], "steps": ["run the script"], "expected_results": ["base is the merge-base sha and diff_bytes includes the two unpushed commits"]},
+    {"id": "TC-52.40.3", "verifies": ["AC-52.40.3"], "name": "the bound rule on fixed samples", "type": "unit", "preconditions": ["three fixture JSONL files: all under 10 KiB; p99 at 300,001 bytes; p99 at 9 MiB"], "steps": ["elixir scripts/factory/diff_bound.exs on each"], "expected_results": ["262144, 327680 and 4194304"]},
+    {"id": "TC-52.40.4", "verifies": ["AC-52.40.5"], "name": "the probe logs and never blocks", "type": "unit", "preconditions": ["a UserPromptSubmit input JSON fixture"], "steps": ["pipe it to the probe with PROBE_LOG set", "again with PROBE_LOG pointing into a read-only directory"], "expected_results": ["one line logged, empty stdout, exit 0 both times"]},
+    {"id": "TC-52.40.5", "verifies": ["AC-52.40.4", "AC-52.40.6", "AC-52.40.7"], "name": "the measurement doc carries the bound, every probe row and the rule (doc check)", "type": "unit", "preconditions": ["scripts/factory/tests/measurement-doc-test.sh"], "steps": ["grep the doc for bound_bytes, the ten probe rows and grant_rule"], "expected_results": ["bound_bytes is an integer in range; grant_rule is one of the two values"]}
+  ],
+  "technical_notes": [
+    "Where a diff can live today, and why none serves: story_stage_events.data is capped at 8,000 bytes (Stages.max_event_data_bytes/0, lib/loopctl/delivery/stages.ex:201,399); a channel post body at 16,384 (channel_post.ex:97); the runner's dispatch objects at 48,000 (runner_contract.ex:1164). The bound decides US-52.41's column CHECK and its refusal, so it is measured before US-52.41 builds.",
+    "Diff shape matches what a checkpoint will carry (US-52.41, US-52.44, US-52.46): `git diff --binary <base>` over a temporary index in which untracked, non-ignored files are added with `git add --intent-to-add`. Base is the pushed head of the branch, so committed-but-unpushed work counts, as it travels with a move.",
+    "Run the script on every machine in claude-config's FLEET_MACHINES (hooks/lib/fleet-name.sh) over `~/workspace/*` and over the runner's runs directory (loopctl-runner's kept worktrees, LoopctlRunner.Worktree.status_after/1 'kept', /home/mkreyman/workspace/loopctl-runner/lib/loopctl_runner/worktree.ex:1360; runner/ after release 2). Live worktrees are the handoff points: a session that stops mid-work leaves exactly this state.",
+    "Probe origins: the idle-session delivery is release 4's host-daemon duty (provided by release 4, README names table: host daemon). A headless `claude -p` is how loopctl-runner starts sessions (LoopctlRunner.Session, /home/mkreyman/workspace/loopctl-runner/lib/loopctl_runner/session.ex); if it fires the hook, US-52.45 must refuse grants to non-interactive holders, which it does either way.",
+    "The probe hook is registered by a temporary entry in the probing machine's settings and removed after the run; it is not shipped. Probe scripts follow the plain-command rule: one script file per job, run as `bash <script>`.",
+    "The holder credential the hook presents is the file US-52.28 writes, $HOME/.claude/loopctl-holders/<session_id>.key, matched by the session_id in the hook's stdin JSON; measure the round trip to GET /api/v1/inbox (US-52.24), the read release 4's hooks already make with it."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Building checkpoints: US-52.41. Building the grant: US-52.45.",
+    "A standing diff-size metric: the bound is re-measured only when a refusal rate says it is wrong (US-52.41 logs each refusal)."
+  ],
+  "failure_modes": {"partition": "n/a: offline scripts run on each machine against local git; no service is called except the probe's one timed request (AC-52.40.6 records whether it fits in 2 s).", "state": "AC-52.40.4: the measured bound and the grant rule live in one committed doc; nothing is cached on a machine.", "retry": "AC-52.40.2: a run is read-only, so re-running it adds a sample and changes nothing.", "slow": "AC-52.40.1: diff size is streamed into wc -c, so a huge worktree costs time, never memory.", "reach": "AC-52.40.6: the probe runs inside the measured session on each platform; nothing runs elsewhere."},
+  "defaults": [
+    "Bound rule: p99 rounded up to 64 KiB, at least 256 KiB, at most 4 MiB.",
+    "Command text measured: `/work-item-move <item> <target>`; US-52.45 builds the same name.",
+    "If grant_rule is fleet_dash_only, US-52.45 builds the user-key path alone and its slash-command criteria are not built."
+  ],
+  "definition_of_done": [
+    "docs/factory/measurements/release-7.md committed with samples from minis, x1, ryzen, beelink, nuc and mac-mini, bound_bytes and grant_rule.",
+    "The probe hook entry is gone from every settings file it was added to (grep settings.json on both probe machines)."
+  ],
+  "expected_size": {"insertions": 220, "files": 4},
+  "estimated_tokens": 150000
+}

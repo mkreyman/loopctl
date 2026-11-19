@@ -1,0 +1,57 @@
+{
+  "id": "US-52.24",
+  "title": "inbox: a session reads its DMs, its items' threads and its channel by cursor",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_4",
+  "story": {"as_a": "session holding work items", "i_want_to": "read everything addressed to me (my DMs, the threads of the items I hold, my repo's channel) from where I last stopped, and mark it read only when I have it", "so_that": "nothing is skipped, nothing is read twice, and an item I take over arrives with its whole thread"},
+  "rationale": "PRD R11: every session has exactly one inbox (its DMs plus the threads of the items it holds), read by a cursor kept per attachment, and a holder that takes an item over starts that thread at its beginning. Today the only reads are channel_recent (Coordination.recent_page/3, lib/loopctl/coordination.ex:3571), newest-first with a 5 s look-back that re-delivers on purpose and leaves exact-once dedup to the client (:256-281), and channel_get. No read is per session, and no cursor is stored on the server: the existing Loopctl.Coordination.ChannelCursor (lib/loopctl/coordination/channel_cursor.ex:1) is an opaque keyset-paging token, not a stored read position, so it cannot serve; the stored cursor is a new table.",
+  "acceptance_criteria": [
+    {"id": "AC-52.24.1", "description": "A table channel_cursors (tenant_id, holder_id FK holders ON DELETE CASCADE, attachment_kind dm | story | channel, attachment_id, last_seq bigint default 0, timestamps), RLS enabled, schema Loopctl.Coordination.InboxCursor, with the unique index channel_cursors_holder_attachment_uidx on (holder_id, attachment_kind, attachment_id)."},
+    {"id": "AC-52.24.2", "description": "Messages.inbox/3 (tenant_id, holder_id, opts) returns, for each attachment of the holder's inbox (its own DMs, the thread of every story whose assigned_holder_id is the holder, and the channel of opts[:project_id] when given), the messages with attachment_seq above that attachment's last_seq in ascending order, at most opts[:limit] in total (default 50, clamped to 200) with has_more, and moves no cursor."},
+    {"id": "AC-52.24.3", "description": "Messages.ack/3 (tenant_id, holder_id, [%{kind, id, seq}]) sets each cursor's last_seq to the greater of its current value and seq, creating the row when absent; a seq above the attachment's highest attachment_seq answers {:error, {:ack_beyond_end, kind, id}}, and an attachment outside the holder's inbox answers {:error, {:not_in_inbox, kind, id}}, with no cursor changed by a refused call."},
+    {"id": "AC-52.24.4", "description": "A holder that becomes a story's assigned holder (a claim or a takeover) has no cursor on that thread, so its next inbox read returns the thread from attachment_seq 1, and the previous holder's cursor neither moves nor is read."},
+    {"id": "AC-52.24.5", "description": "GET /api/v1/inbox (project_id, limit) and POST /api/v1/inbox/ack ({acks: [...]}) need a holder credential (role: :agent with a holder_id): any other key answers 403 code holder_credential_required; the response groups messages as {dms, threads: [{story_id, messages}], channel} with each attachment's highest returned seq."},
+    {"id": "AC-52.24.6", "description": "The MCP tool inbox takes optional project_id, limit and ack; with ack it posts the acks first and then reads, and its description says the cursor moves only on ack, so an unacked message is returned again."},
+    {"id": "AC-52.24.7", "description": "A message that commits on an attachment after a read and before its ack is returned by the next read: an ack carries the seq the caller last received, never the attachment's current end."},
+    {"id": "AC-52.24.8", "description": "Projects.Merge.merge_into/4 deletes the channel cursors whose attachment_id is the source project, so a holder reads the merged channel from its start once."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.24.1", "verifies": ["AC-52.24.1", "AC-52.24.2"], "name": "inbox gathers DMs, held threads and the channel past each cursor (DataCase)", "type": "integration", "preconditions": ["holder H (fixture(:holder), US-52.13); stories S1 held by H (assigned_holder_id, US-52.14) and S2 held by another holder; 2 DMs to H, 3 messages on S1, 1 on S2, 2 on the channel"], "steps": ["Messages.inbox(tenant.id, H.id, project_id: project.id)", "Messages.inbox(tenant.id, H.id, [])"], "expected_results": ["first: 2 dms, S1's 3 in seq order, 2 channel, nothing from S2; second: no channel section; neither call writes a channel_cursors row"]},
+    {"id": "TC-52.24.2", "verifies": ["AC-52.24.2"], "name": "limit and has_more (DataCase)", "type": "integration", "preconditions": ["H with 60 unread DMs"], "steps": ["inbox(limit: 50)", "ack the 50th seq, inbox again", "inbox(limit: 500)"], "expected_results": ["50 and has_more true; 10 and has_more false; the clamp returns at most 200"]},
+    {"id": "TC-52.24.3", "verifies": ["AC-52.24.3"], "name": "ack is monotonic and refuses foreign or impossible positions (DataCase)", "type": "integration", "preconditions": ["H with DMs at seq 1..3; S2 held by another holder"], "steps": ["ack dm seq 2", "ack dm seq 1", "ack dm seq 9", "ack story S2 seq 1", "ack a batch of dm seq 3 and S2 seq 1"], "expected_results": ["last_seq 2, still 2; {:error, {:ack_beyond_end, :dm, H.id}}; {:error, {:not_in_inbox, :story, S2.id}}; the batch is refused whole and last_seq stays 2"]},
+    {"id": "TC-52.24.4", "verifies": ["AC-52.24.4"], "name": "a takeover reads the whole thread once (DataCase)", "type": "integration", "preconditions": ["S1 held by H1 with 4 messages, H1 acked all; H1 unclaims; H2 claims S1 (Progress.claim_story/3 with H2's credential)"], "steps": ["inbox for H2", "ack seq 4 for H2", "inbox for H2 again", "read H1's cursor row"], "expected_results": ["4 messages; then none; H1's last_seq still 4"]},
+    {"id": "TC-52.24.5", "verifies": ["AC-52.24.5"], "name": "routes need a holder credential (ConnCase)", "type": "integration", "preconditions": ["holder credential; plain agent key; orchestrator key; user key"], "steps": ["GET /api/v1/inbox and POST /api/v1/inbox/ack with each key"], "expected_results": ["holder credential 200 with dms/threads/channel; the others 403 holder_credential_required"]},
+    {"id": "TC-52.24.6", "verifies": ["AC-52.24.6"], "name": "inbox tool posts acks before reading", "type": "unit", "preconditions": ["mcp-server with a stubbed fetch recording calls"], "steps": ["call inbox {project_id, ack: [{kind: \"dm\", id: h, seq: 3}]}"], "expected_results": ["POST /api/v1/inbox/ack then GET /api/v1/inbox?project_id=...; tool declared and dispatched (node --test); description says the cursor moves only on ack"]},
+    {"id": "TC-52.24.7", "verifies": ["AC-52.24.7"], "name": "a message arriving between read and ack is not skipped (DataCase)", "type": "integration", "preconditions": ["H with DMs seq 1..2"], "steps": ["inbox for H (returns seq 1..2)", "send DM seq 3", "ack dm seq 2", "inbox for H"], "expected_results": ["the second read returns exactly seq 3"]},
+    {"id": "TC-52.24.8", "verifies": ["AC-52.24.8"], "name": "merge drops the source channel's cursors (DataCase)", "type": "integration", "preconditions": ["H acked source channel seq 3; source and target projects"], "steps": ["Projects.Merge.merge_into(tenant.id, source.id, target.id, [])", "count channel_cursors for attachment_id = source.id"], "expected_results": ["0"]},
+    {"id": "TC-52.24.9", "verifies": ["AC-52.24.2"], "name": "tenant isolation: another tenant's holder sees nothing (DataCase)", "type": "integration", "preconditions": ["DMs and a held thread in tenant A; holder HB in tenant B"], "steps": ["Messages.inbox(tenant_b.id, HB.id, project_id: project_a.id)", "Messages.inbox(tenant_b.id, holder_a.id, [])"], "expected_results": ["empty sections both times"]}
+  ],
+  "technical_notes": [
+    "Name: the table is channel_cursors (README names table), the schema Loopctl.Coordination.InboxCursor, because Loopctl.Coordination.ChannelCursor is already the keyset codec (channel_cursor.ex:1-53) used by recent_page/3.",
+    "Ordering: attachment_seq and channel_posts_attachment_seq_uidx are provided by US-52.22; commit order equals attachment_seq order per attachment, so `attachment_seq > last_seq` needs no look-back. The read uses that index per attachment; one query per attachment kind, with the held-story set from stories.assigned_holder_id (provided by US-52.14).",
+    "Holder credential: conn.assigns.current_api_key.holder_id (api_keys.holder_id, provided by US-52.13); the plug is a small RequireHolder in lib/loopctl_web/plugs/, used by the inbox controller only.",
+    "Inbox messages carry the full body (each at most 16 384 bytes, channel_post.ex:97); the SessionStart and tool-round hooks (US-52.28) render bounded previews themselves.",
+    "Excluded from every inbox section: quarantined rows (quarantined_at IS NOT NULL), as every coordination read does today (channel_post.ex:202-212).",
+    "Merge: lib/loopctl/projects/merge.ex; channel_cursors has no project_id column, so it is not in @project_tables; the delete runs in the merge transaction.",
+    "Routes under the authenticated /api/v1 scope (router.ex:245), operation/2 with 403 holder_credential_required and 422 ack_beyond_end / not_in_inbox; MCP: mcp-server/lib/messages.js (US-52.23) gains the inbox request shape, a declaration and a case in index.js, README row; CHANGELOG.md: new endpoints."
+  ],
+  "dependencies": [
+    "US-52.22"
+  ],
+  "non_goals": [
+    "Deleting a holder's cursors and DMs when its session ends: US-52.25.",
+    "The SessionStart inbox block and the tool-round hook: US-52.28.",
+    "A thread history view for fleet_dash: release 5 (README names table: visibility, work_item_timeline)."
+  ],
+  "failure_modes": {"partition": "AC-52.24.3 and AC-52.24.6: a cursor moves only on an explicit ack naming a seq the caller received, so a read whose reply is lost in a partition is returned again on reconnect.", "state": "AC-52.24.1: read positions live in channel_cursors in Postgres, so a session restart or a successor holder reads on from the stored position.", "retry": "AC-52.24.3: ack takes the greater of the stored and acked seq, so a retried or reordered ack never moves a cursor back and never past what was received (AC-52.24.7).", "slow": "AC-52.24.2: a slow reader gets the same unacked messages again, in order, so slow means late and never lost or skipped.", "reach": "n/a: inline in the request process; the session reaches its inbox by its holder credential from any machine."},
+  "definition_of_done": [
+    "From an MCP session: inbox returns a DM sent to it by message_send from another session; inbox with that DM's ack then returns no DM; SELECT last_seq FROM channel_cursors WHERE holder_id = <holder> AND attachment_kind = 'dm' equals the DM's attachment_seq."
+  ],
+  "defaults": [
+    "Inbox page: 50 messages, clamped to 200 (owner may change).",
+    "The channel section is included only when the caller passes project_id (the session's repo project)."
+  ],
+  "expected_size": {"insertions": 420, "files": 9},
+  "estimated_tokens": 380000
+}

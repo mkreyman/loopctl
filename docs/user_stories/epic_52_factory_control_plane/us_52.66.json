@@ -1,0 +1,56 @@
+{
+  "id": "US-52.66",
+  "title": "Installers fetch release artifacts with a token, and the repo is flipped private by a checked script",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_11",
+  "story": {"as_a": "session installing or rolling the factory on a machine", "i_want_to": "fetch the release set's artifacts from the private loopctl repo with a token I name, and have the visibility flip refuse to run until everything that reads the repo can still read it", "so_that": "the flip to private breaks no install, no roll and no CI run, and leaves the MCP package public"},
+  "rationale": "PRD R12: once runner and chg live in a private repo, their installers fetch release artifacts with a token, and a future cloud session needs a deploy token. chg's installer today downloads with `gh release download` and whatever account gh is acting as (chg scripts/install.sh:57-60). On this fleet a direnv GH_TOKEN can pin a different identity, and that identity answers a private repo with 'Could not resolve' or 404, the same answer as a missing release. The flip itself is one API call, but it is safe only when every reader keeps access. That covers CI and branch protection (a private repo on GitHub Free loses branch protection), the installers, and the npm package.",
+  "acceptance_criteria": [
+    {"id": "AC-52.66.1", "description": "release/fetch-artifact.sh <part> <version> <dest> downloads the named part's asset for the version from mkreyman/loopctl's GitHub release and checks its sha256 file. It authenticates with LOOPCTL_ARTIFACT_TOKEN when that is set, and otherwise with `gh auth token --user mkreyman`. It never uses an ambient GH_TOKEN alone."},
+    {"id": "AC-52.66.2", "description": "fetch-artifact.sh first reads `repos/mkreyman/loopctl` with its token. On 404 or 401 it exits 4 with 'token cannot read mkreyman/loopctl: set LOOPCTL_ARTIFACT_TOKEN to a token with contents:read on it'. A readable repo with no such release or asset exits 5 and names the tag and the asset."},
+    {"id": "AC-52.66.3", "description": "chg's installer (`--release`) and the release-set roll command fetch every artifact through fetch-artifact.sh, and no other script in the repo calls `gh release download` for mkreyman/loopctl."},
+    {"id": "AC-52.66.4", "description": "scripts/factory/go-private.sh --check exits 0 only when all four preconditions hold: the plan read through `gh api user` is not free; every hosted job is in the allowlist of test/loopctl/ci_hosted_jobs_test.exs; fetch-artifact.sh succeeds for every part of release/manifest.toml with LOOPCTL_ARTIFACT_TOKEN; and no template links the repo. Otherwise it exits 3 and names each failed precondition."},
+    {"id": "AC-52.66.5", "description": "go-private.sh --apply runs --check, then `gh repo edit mkreyman/loopctl --visibility private --accept-visibility-change-consequences`, then exits 0 only when every post-flip check holds: the repo reads private; master's required_status_checks contexts equal the list it saved before the flip; an unauthenticated request for the newest release asset answers 404; and `npm view loopctl-mcp-server version` still answers."},
+    {"id": "AC-52.66.6", "description": "go-private.sh --apply on a repo that is already private runs only the post-flip checks and exits with their result, so a re-run after a partial failure never flips twice."},
+    {"id": "AC-52.66.7", "description": "When the saved protection contexts no longer read back after the flip, --apply sets the visibility back to public, exits 6 and prints the contexts it lost. A private repo is never left without its required checks."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.66.1", "verifies": ["AC-52.66.1", "AC-52.66.2"], "name": "fetch-artifact.sh token choice and exit codes (shell test)", "type": "unit", "preconditions": ["test/scripts/fetch_artifact_test.sh with a stub gh on PATH that logs the Authorization it was given and answers from fixtures", "GH_TOKEN=ghp_other set in the environment"], "steps": ["run with LOOPCTL_ARTIFACT_TOKEN=t1 against a release fixture", "run unset, with the stub's `gh auth token --user mkreyman` answering t2", "run with the repo read answering 404", "run with the repo readable and the asset missing", "run with a sha256 that does not match"], "expected_results": ["t1 used, then t2, never ghp_other; exit 4 with the message; exit 5 naming the tag and asset; non-zero on the checksum mismatch with nothing left at dest"]},
+    {"id": "TC-52.66.2", "verifies": ["AC-52.66.3"], "name": "one download path for loopctl artifacts (unit)", "type": "unit", "preconditions": ["git ls-files"], "steps": ["grep the tracked scripts for `gh release download` naming mkreyman/loopctl"], "expected_results": ["matches only in release/fetch-artifact.sh"]},
+    {"id": "TC-52.66.3", "verifies": ["AC-52.66.4"], "name": "--check names each failed precondition (shell test)", "type": "unit", "preconditions": ["stub gh answering plan free; a stub fetch-artifact.sh failing for runner; a fixture template with the repo link"], "steps": ["bash scripts/factory/go-private.sh --check"], "expected_results": ["exit 3; output names the plan, the runner artifact and the template"]},
+    {"id": "TC-52.66.4", "verifies": ["AC-52.66.5", "AC-52.66.6"], "name": "--apply flips once and verifies; a re-run only verifies (shell test)", "type": "unit", "preconditions": ["stub gh recording each call, the repo public with contexts [Lint, Test]; stub npm view answering 3.20.0; stub curl answering 404 unauthenticated"], "steps": ["go-private.sh --apply", "go-private.sh --apply again with the stub now answering private"], "expected_results": ["one `repo edit --visibility private` call across both runs; both exit 0"]},
+    {"id": "TC-52.66.5", "verifies": ["AC-52.66.7"], "name": "lost protection rolls the visibility back (shell test)", "type": "unit", "preconditions": ["stub gh whose protection read answers 403 'Upgrade to GitHub Pro' after the flip"], "steps": ["go-private.sh --apply"], "expected_results": ["a `repo edit --visibility public` call follows the private one; exit 6; output lists Lint and Test"]}
+  ],
+  "technical_notes": [
+    "chg's installer today: /home/mkreyman/workspace/chg/scripts/install.sh:57-60 (`gh release download \"$tag\" -R mkreyman/chg` plus a sha256 check). Release 2 moves it into chg/ (README names table: chg source). Its release workflow uploads with gh at /home/mkreyman/workspace/chg/.github/workflows/release.yml:47-63; the asset names and the tag scheme in mkreyman/loopctl are provided by release 2 (README names table: release manifest).",
+    "The runner installs by building on the target machine from a checkout (/home/mkreyman/workspace/loopctl-runner/README.md:140, :341-343). Its access to a private repo is the git remote over each machine's own SSH key, which is unchanged; it fetches no artifact unless release 2's manifest gives it one, and then it goes through fetch-artifact.sh.",
+    "The release-set roll command and release/manifest.toml are provided by release 2 (README names table: release manifest); this story only swaps their download call.",
+    "The hosted-job allowlist is provided by US-52.64 (test/loopctl/ci_hosted_jobs_test.exs) and the template scan by US-52.65; --check runs both test files with `mix test` instead of re-implementing them.",
+    "Required contexts today: Lint, Test, Security, Dialyzer, Retrieval Eval, Pgbouncer e2e (US-27.13), Scale Tests (US-27.1), MCP Server Gate (read 2026-11-19 with gh api .../branches/master/protection/required_status_checks). Branch protection on a private repo owned by a user needs GitHub Pro; on Free it stops applying, which is the case AC-52.66.7 rolls back.",
+    "Making a repo private detaches its public forks, and they stay public: FinanceAlex/loopctl (last push 2026-07-23) keeps that snapshot. PRD R12 already requires that security never depends on hidden source, so the fork changes nothing; the runbook records it.",
+    "Loopctl's own delivery reads mkreyman/loopctl through Loopctl.Verification.Credential.for_read/2 (lib/loopctl/verification/credential.ex:55). Unauthenticated reads stop working once the repo is private (deploy/FLY_SECRETS.md:182), so the runbook's first step reads MCP github_credential and requires has_token or operator_repositories to cover mkreyman/loopctl.",
+    "Runbook: docs/factory/runbooks/go-private.md, with the cloud-session deploy token: a fine-grained token with contents:read on mkreyman/loopctl only, set as LOOPCTL_ARTIFACT_TOKEN in the cloud environment."
+  ],
+  "dependencies": [
+    "US-52.64",
+    "US-52.65"
+  ],
+  "non_goals": [
+    "Minting artifact tokens from loopctl (an endpoint or a GitHub App): no cloud session runs today (PRD section 2), and a token loopctl hands to any agent key would expose the private source across tenants. The deploy token is documented, not issued.",
+    "Moving or re-auditing CI jobs: US-52.64.",
+    "Extending the end-to-end suite: PRD R7 assigns no path to R12."
+  ],
+  "failure_modes": {"partition": "AC-52.66.6: if GitHub becomes unreachable between the flip and its checks, a re-run of --apply finds the repo private and runs only the checks, so a cut connection never leaves the flip unverified.", "state": "AC-52.66.5: GitHub's repo settings are the one record of visibility and protection; the script saves the contexts it read before the flip and compares the read-back with them, never with a list typed in the script.", "retry": "AC-52.66.6: --apply is idempotent; a second run never issues a second visibility change.", "slow": "AC-52.66.2: every gh and curl call in both scripts runs under `timeout 60`, and a timeout exits non-zero with the call named, so a slow GitHub fails the step instead of hanging the install.", "reach": "AC-52.66.1: an install runs on the target machine with a token that machine names; a cloud session reaches the artifacts with the documented deploy token in LOOPCTL_ARTIFACT_TOKEN."},
+  "definition_of_done": [
+    "gh api repos/mkreyman/loopctl --jq .visibility returns private, and the required_status_checks contexts equal the eight listed in technical_notes.",
+    "On minis with a Centerfield GH_TOKEN in the environment, chg's installer with --release installs the manifest's chg version.",
+    "curl -sI the newest release asset URL with no token returns 404; npm view loopctl-mcp-server version returns the current version."
+  ],
+  "defaults": [
+    "Token variable name: LOOPCTL_ARTIFACT_TOKEN; the fallback is gh's stored mkreyman login (owner may change).",
+    "A free GitHub plan refuses the flip at --check (exit 3), because branch protection would stop applying. The plan is a money fact only Mark holds."
+  ],
+  "expected_size": {"insertions": 260, "files": 5},
+  "estimated_tokens": 280000
+}

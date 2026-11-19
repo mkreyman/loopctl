@@ -1,0 +1,55 @@
+{
+  "id": "US-52.16",
+  "title": "The work item's event log: every event names its holder and its reason",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_3",
+  "story": {"as_a": "holder, or Mark reading fleet_dash", "i_want_to": "read one log of everything that happened to a work item, each row saying which holder did it and why", "so_that": "taking an item over, auditing it and showing it in a view all read the same record"},
+  "rationale": "PRD section 3: every state change of a work item is one row in an append-only log with its actor and its reason, extending the stage events and the audit chain, never a parallel store. Today story_stage_events (lib/loopctl/delivery/stage_event.ex:40-54) records only stage-row changes, names its actor by a free-text actor_label, carries a reason only when a caller put one in data, and requires a stage row (story_stage_id NOT NULL, priv/repo/migrations/20260915120000_create_story_stages.exs:96-98), so a claim, a release or a note on a story outside the delivery machine leaves no row at all.",
+  "acceptance_criteria": [
+    {"id": "AC-52.16.1", "description": "story_stage_events gains actor_holder_id (nullable FK holders; nil means the system acted) and reason (text NOT NULL, CHECK length(reason) BETWEEN 1 AND 2000); the migration backfills reason for existing rows from data->>'reason', else the edge, else the event name, before setting NOT NULL."},
+    {"id": "AC-52.16.2", "description": "story_stage_id, to_stage and lock_version become nullable, and a CHECK story_stage_events_stage_fields requires all three for the stage events (opened, transitioned, effect_recorded, rebound, merge_gate_unevaluated, post_deploy_unresolved, merge_instructed, runner_absence); the story_stage_events_event allow-list gains the non-stage events claimed, released and note_written."},
+    {"id": "AC-52.16.3", "description": "Stages.insert_event/7 becomes insert_event/2 taking a map that requires reason and accepts actor_holder_id; every existing stage write passes a reason: the caller's :reason option when given, else StageMachine.edge_reason/1 for a transition's edge (a fixed sentence per edge), else the event's fixed sentence from StageEvent.reasons/0."},
+    {"id": "AC-52.16.4", "description": "Stages.record_item_event/4 (tenant_id, story_id, event, opts with :reason, :actor_holder_id, :data, :idempotency_key, :repo) writes a non-stage event for any story of the tenant, with or without a stage row, carrying the story's current claim_epoch; a blank reason is {:error, :reason_required}."},
+    {"id": "AC-52.16.5", "description": "A record_item_event/4 call repeated with the same (tenant_id, story_id, idempotency_key) returns {:ok, :replayed} and writes nothing (partial unique index story_stage_events_idempotency_uidx WHERE idempotency_key IS NOT NULL)."},
+    {"id": "AC-52.16.6", "description": "Progress.claim_story/3, unclaim_story/3, force_unclaim_story/3, reclaim_expired_claim/3 and BulkOperations.bulk_claim/4 each write a claimed or released item event inside their own transaction, with the caller's holder (nil for the sweep and for force-unclaim's orchestrator) and reasons 'claimed', 'released by holder', 'force-unclaimed: <reason param>' and 'lease expired'."},
+    {"id": "AC-52.16.7", "description": "Stages.list_events/2 returns stage and non-stage events in one order (inserted_at, then id), and every existing reader that walks transitions (list_transitions/2, EscalationInbox's latest-escalation lateral read) still sees only event = transitioned rows."},
+    {"id": "AC-52.16.8", "description": "Another tenant's events are never returned by list_events/2 and record_item_event/4 refuses a story of another tenant with {:error, :not_found}."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.16.1", "verifies": ["AC-52.16.1", "AC-52.16.2"], "name": "migration backfills reason and the CHECKs hold (DataCase)", "type": "integration", "preconditions": ["rows inserted under the old shape: one with data reason, one with only an edge, one opened"], "steps": ["run the migration up in the test's sandbox via the migration module's up/0 against a copy table", "insert a transitioned row with story_stage_id nil", "insert a claimed row with story_stage_id nil"], "expected_results": ["reasons 'r', the edge, 'opened'; the transitioned insert violates story_stage_events_stage_fields; the claimed insert succeeds"]},
+    {"id": "TC-52.16.2", "verifies": ["AC-52.16.3"], "name": "stage writes always carry a reason (DataCase)", "type": "integration", "preconditions": ["story with a stage row at queued"], "steps": ["Stages.advance(tenant, story, {:queued, :claimed}, actor_label: \"t\")", "Stages.advance with reason: \"placed on x1\""], "expected_results": ["first row's reason = StageMachine.edge_reason(:forward); second 'placed on x1'"]},
+    {"id": "TC-52.16.3", "verifies": ["AC-52.16.4", "AC-52.16.5"], "name": "item events on a story with no stage row, blank reason, replay (DataCase)", "type": "integration", "preconditions": ["story with no story_stages row; holder H (provided by US-52.13)"], "steps": ["record_item_event(tenant, story, \"note_written\", reason: \"plan set\", actor_holder_id: h, idempotency_key: k)", "the same call", "record_item_event with reason: \"\""], "expected_results": ["{:ok, event}; {:ok, :replayed} and one row; {:error, :reason_required}"]},
+    {"id": "TC-52.16.4", "verifies": ["AC-52.16.6"], "name": "claim and release paths write their events (DataCase)", "type": "integration", "preconditions": ["contracted story; holder H"], "steps": ["claim as H, unclaim as H, claim, force_unclaim, claim with an expired lease and run reclaim_expired_claim/3"], "expected_results": ["events claimed(H), released(H), claimed(H), released(nil, 'force-unclaimed: ...'), claimed, released(nil, 'lease expired') in order"]},
+    {"id": "TC-52.16.5", "verifies": ["AC-52.16.7"], "name": "transition readers ignore non-stage events (DataCase)", "type": "integration", "preconditions": ["escalated story with a later released and note_written event"], "steps": ["Stages.list_transitions/2", "EscalationInbox.list/2"], "expected_results": ["only transitioned rows; the inbox row keeps its escalation edge"]},
+    {"id": "TC-52.16.6", "verifies": ["AC-52.16.8"], "name": "tenant isolation of the log (DataCase)", "type": "integration", "preconditions": ["two tenants each with a story and events"], "steps": ["Stages.list_events(tenant_a, story_b.id)", "record_item_event(tenant_a, story_b.id, \"note_written\", reason: \"x\")"], "expected_results": ["[]; {:error, :not_found}"]}
+  ],
+  "technical_notes": [
+    "Why this table and not a new one: PRD section 3 and section 4 row 'stage events + audit chain'. story_stage_events is already the complete per-story record and Stages is its only writer (lib/loopctl/delivery/stages.ex:1-7); the audit chain stays the tamper-evident subset (StageMachine.chained?/3) and is not changed here.",
+    "insert_event/7 at stages.ex:2622-2640 is called from open/3 (:278), open_for_change_in_tenant_transaction/4 (:338), start_for_change_in_tenant_transaction/3 (:383) and every transition and effect path; grep insert_event( for the full set when building. list_events/2 :451, list_transitions/2 :434 (already filters event == transitioned).",
+    "The allow-list is the CHECK last rewritten by priv/repo/migrations/20261107200000_add_merge_instruction_and_runner_absence.exs:52-59, mirrored by StageEvent's moduledoc (stage_event.ex:28-30); this migration rewrites both, with a down/0 that refuses while non-stage rows exist, in that migration's style (:62-74).",
+    "Claim and release writers: do_claim_story/3 lib/loopctl/progress.ex:283 (AdminRepo multi, add a Multi.run after :stage), unclaim_multi/3 :1627, force_unclaim_story/3 :4015, reclaim_expired_claim/3 :2365, BulkOperations.bulk_claim/4 lib/loopctl/bulk_operations.ex:61. They run on AdminRepo, so record_item_event/4 takes :repo (default Repo inside with_tenant/2).",
+    "assigned_holder_id and the :holder_id claim option are provided by US-52.14; holders by US-52.13.",
+    "EscalationInbox's lateral read: lib/loopctl/delivery/escalation_inbox.ex:286-294 filters event = transitioned AND to_stage = escalated and joins on story_stage_id, so nullable story_stage_id leaves it unchanged; Gate A reads through list_transitions/2 (lib/loopctl/delivery/gate_a_input.ex:38).",
+    "data stays bounded by Stages.max_event_data_bytes/0 (stages.ex:399); reason has its own 2000-character CHECK so it can be shown whole."
+  ],
+  "dependencies": [
+    "US-52.13",
+    "US-52.14"
+  ],
+  "non_goals": [
+    "The note_written writer and the notes it points at: US-52.17.",
+    "Move and intervention events: release 7 (move verb) and release 5 (intervention verbs) add their event names to this allow-list.",
+    "A timeline API over this log: release 5 (README names table: visibility)."
+  ],
+  "failure_modes": {"partition": "AC-52.16.5: a holder that replays its events after a partition sends each with its idempotency key, so the replay writes nothing twice.", "state": "AC-52.16.1: the log is story_stage_events in loopctl's Postgres, append-only; claims write their event in the claim's own transaction (AC-52.16.6), so no event exists for a change that rolled back.", "retry": "AC-52.16.5: idempotency_key under a partial unique index makes a retried item event a no-op.", "slow": "n/a: every write is one insert inside a transaction that already exists, and reads are one indexed query on (tenant_id, story_id, inserted_at) (create_story_stages.exs:113).", "reach": "n/a: written inline by the request or worker that changes the item; nothing is queued."},
+  "defaults": [
+    "Fixed reason sentences per edge and per stage event live in StageMachine.edge_reason/1 and StageEvent.reasons/0; their wording is the implementer's within one sentence each.",
+    "Backfilled reason for old rows: data reason, else edge, else event name."
+  ],
+  "definition_of_done": [
+    "On production after deploy: SELECT count(*) FROM story_stage_events WHERE reason IS NULL OR reason = '' returns 0, and a story claimed by a holder shows a claimed row with its actor_holder_id."
+  ],
+  "expected_size": {"insertions": 340, "files": 9},
+  "estimated_tokens": 400000
+}

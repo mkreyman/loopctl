@@ -1,0 +1,56 @@
+{
+  "id": "US-52.6",
+  "title": "CI and the commit gate judge runner/ and chg/ inside the loopctl repo, each only when it changed",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_2",
+  "story": {"as_a": "session committing a factory change", "i_want_to": "have the commit gate and CI run runner's and chg's own checks when I touch runner/ or chg/, and skip the server's suite when I touch nothing else", "so_that": "every part of the factory is gated in this repo, and a runner fix does not pay for a full server run"},
+  "rationale": "After US-52.4 and US-52.5 the runner and chg have no CI at all: GitHub runs only the root .github/workflows, loopctl-runner never had a workflow, and chg's ci.yml now sits inert at chg/.github/workflows/ci.yml. The commit gate misses them too: the fleet pre-commit gates only the root mix project when the repo root has a mix.exs (claude-config git-hooks/pre-commit:97-98), so a runner commit runs the server's mix precommit and never the runner's, and a chg commit runs no Rust check. PRD R7 puts CI capacity at its budget ceiling, so each part runs its checks only when its paths changed.",
+  "acceptance_criteria": [
+    {"id": "AC-52.6.1", "description": ".github/scripts/changed-areas.sh <base> <head> prints, one per line and sorted, the areas the diff touches: runner for runner/** or priv/runner_contract/**, chg for chg/**, e2e for e2e/**, server for every other path; release/** and .github/** count as every area."},
+    {"id": "AC-52.6.2", "description": ".github/workflows/runner-ci.yml runs on push to master and epic/** and on pull_request to master; its runner job (runs-on [self-hosted, fleet-ci], working-directory runner) runs compile --warnings-as-errors, deps.unlock --check-unused, format --check-formatted, credo --strict, dialyzer and test, and is skipped by its if: when changed-areas.sh does not print runner."},
+    {"id": "AC-52.6.3", "description": ".github/workflows/chg-ci.yml carries every job of chg's ci.yml (rust on linux and the macos leg, volume-setup, elixir-adapter, typescript-adapter, generic-adapter with loop-test and replay-selection-test) with working directories under chg/, on the same runner labels, skipped when changed-areas.sh does not print chg; chg/.github/ is deleted."},
+    {"id": "AC-52.6.4", "description": "Every job of .github/workflows/ci.yml except deploy and smoke is skipped by its if: when changed-areas.sh prints no server area, and runs exactly as today when it prints server; deploy runs on every master push in which no job failed or was cancelled, a job skipped by area included, so every green merge to master deploys whatever area it touched."},
+    {"id": "AC-52.6.5", "description": "No job in runner-ci.yml or chg-ci.yml runs on a GitHub-hosted runner: every runs-on resolves to [self-hosted, fleet-ci] or the CI_RUNNER_MACOS repository variable, never ubuntu-latest or macos-*."},
+    {"id": "AC-52.6.6", "description": ".githooks/pre-commit runs mix precommit in runner/ when a staged path is under runner/, and runs cargo fmt --all --check, cargo clippy --all-targets --locked -- -D warnings and cargo test --locked in chg/ when a staged path is under chg/ outside chg/adapters/; a failing check stops the commit with the area named."},
+    {"id": "AC-52.6.7", "description": ".githooks/pre-commit runs mix format --check-formatted, mix compile --warnings-as-errors and mix test in chg/adapters/elixir when a staged path is under it, and node --test test/unit.test.mjs test/integration.test.mjs in chg/adapters/typescript when a staged path is under that one."},
+    {"id": "AC-52.6.8", "description": ".githooks/pre-commit hands to the fleet hook ($HOME/.git-hooks/pre-commit) only when a staged path lies outside runner/, chg/ and e2e/; a commit staging only runner/ or chg/ paths never runs the root mix precommit."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.6.1", "verifies": ["AC-52.6.1"], "name": "changed-areas classification (ExUnit, shell under test)", "type": "unit", "preconditions": ["a temp repo with commits touching runner/lib/x.ex; priv/runner_contract/v1.json; chg/cli/src/x.rs; lib/x.ex; release/manifest.toml; e2e/test/x.exs"], "steps": ["run changed-areas.sh for each single-commit range", "for a range touching runner/ and lib/"], "expected_results": ["runner; runner; chg; server; chg e2e runner server; e2e; runner server"]},
+    {"id": "TC-52.6.2", "verifies": ["AC-52.6.2", "AC-52.6.3", "AC-52.6.4", "AC-52.6.5"], "name": "workflow shape guard (ExUnit reading YAML with yaml_elixir)", "type": "unit", "preconditions": [".github/workflows/{ci,runner-ci,chg-ci}.yml"], "steps": ["parse each workflow", "for each job, read runs-on, if and working-directory"], "expected_results": ["runner and chg jobs gated on their area and on fleet-ci or CI_RUNNER_MACOS; every ci.yml job but deploy and smoke gated on the server area; deploy's if: admits skipped needs and refuses failed or cancelled ones; no ubuntu-latest in the two new files; chg/.github absent"]},
+    {"id": "TC-52.6.3", "verifies": ["AC-52.6.6", "AC-52.6.8"], "name": "the commit gate routes by staged area (ExUnit, shell under test)", "type": "integration", "preconditions": ["a temp clone with .githooks/pre-commit; PATH stubs for mix, cargo and a fake $HOME/.git-hooks/pre-commit that each append their argv and cwd to a log and exit with a configured code"], "steps": ["stage runner/lib/x.ex, run the hook", "stage chg/cli/src/x.rs", "stage lib/x.ex and runner/lib/x.ex", "stage runner/lib/x.ex with the stub mix failing"], "expected_results": ["runner/ mix precommit only; the three cargo calls in chg/ only; the fleet hook and runner precommit; non-zero exit naming runner"]},
+    {"id": "TC-52.6.4", "verifies": ["AC-52.6.7"], "name": "adapter areas run their own checks (ExUnit, shell under test)", "type": "integration", "preconditions": ["as TC-52.6.3, plus a node stub"], "steps": ["stage chg/adapters/elixir/lib/x.ex", "stage chg/adapters/typescript/lib/x.mjs"], "expected_results": ["the three mix calls in chg/adapters/elixir; node --test in chg/adapters/typescript; no cargo call for either"]}
+  ],
+  "technical_notes": [
+    "chg's workflow to port: /home/mkreyman/workspace/chg/.github/workflows/ci.yml (jobs rust :30-90, volume-setup :92-127, elixir-adapter :128-200, typescript-adapter :201-262, generic-adapter :263-283). Its scripts are referenced as scripts/ci-rust-toolchain.sh and bin/chg-volume-setup.sh from the chg root; under chg/ they are chg/scripts/... with working-directory: chg. The macos leg reads vars.CI_RUNNER_MACOS (:43); set the same repository variable on mkreyman/loopctl (definition_of_done). chg/.github/workflows/release.yml is replaced by US-52.7; chg/.github/workflows/pr-body.yml is not ported (defaults).",
+    "loopctl ci.yml: triggers :3-30, concurrency :43-45, jobs from :133 (lint :134, test :304, retrieval-eval :514, security :745, dialyzer :835, scale-test :930, pgbouncer-e2e :1129, scale-nightly :1273, smoke-preflight :1621, deploy :1655 with needs at :1661, smoke :1673). Add one changes job that runs changed-areas.sh against github.event.before (push) or the PR base and exposes server/runner/chg/e2e outputs; every gated job needs it. A first push of a new branch (before = 0000...) counts as every area.",
+    "A job skipped by its if: reports as skipped, which branch protection accepts for a required check; a workflow skipped by on.paths would leave the check pending, which is why no workflow here uses paths filters. The scheduled 02:00 run (ci.yml:16) counts as every area.",
+    "Workflow guard tests already read ci.yml (test/loopctl/ci_scale_nightly_cron_test.exs, test/loopctl/ci_warnings_as_errors_test.exs); the new guard goes beside them as test/loopctl/factory_ci_workflows_test.exs. YAML parsing: yaml_elixir is a dependency (mix.exs:193).",
+    "Commit gate: .githooks/pre-commit today only execs $HOME/.git-hooks/pre-commit (the fleet hook), which gates the root project alone when $ROOT/mix.exs exists (claude-config git-hooks/pre-commit:97-108). .githooks/install.sh points core.hooksPath at the dispatcher that runs this file. Staged paths come from git diff --cached --name-only -z --diff-filter=ACMRD, NUL-safe, as the fleet hook reads them.",
+    "The shell tests follow test/loopctl/githooks_pre_push_test.exs: async: true, a temp repo per case, stubs on PATH, no network.",
+    "No new table, context, route or tool.",
+    "Deploy: a job whose needs were skipped is itself skipped by default, so deploy's if: (ci.yml:1662) becomes always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled'); its needs list (:1661) is unchanged. Every green merge to master deploys (KB 4d3fd7bb); only the checks are skipped by area."
+  ],
+  "dependencies": [
+    "US-52.4",
+    "US-52.5"
+  ],
+  "non_goals": [
+    "The release tag and the chg artifact build: US-52.7.",
+    "CI for e2e/ (its compile and lint job, and the nightly run): US-52.9.",
+    "Moving the fleet pre-commit itself into this repo: release 8 (README release block 52.50-52.55)."
+  ],
+  "failure_modes": {"partition": "n/a: CI jobs and the hook run on one machine against its checkout; nothing here is a call to another service.", "state": "AC-52.6.1: which areas a change touches is computed from the diff on every run and stored nowhere.", "retry": "AC-52.6.1: a re-run of a workflow or a re-tried commit computes the same areas from the same diff and runs the same checks.", "slow": "n/a: each job keeps the timeout-minutes its source workflow had; nothing new waits on a network.", "reach": "AC-52.6.5: every job runs on the fleet-ci pool or the macOS variable's runner, the runners loopctl's CI already uses."},
+  "defaults": [
+    "chg's pr-body.yml check is not ported: loopctl's master has no pr-body check today, and adding one would gate every server PR (owner may add it repo-wide).",
+    "The runner and chg job names (runner, rust (linux), elixir-adapter, typescript-adapter, generic-adapter) are added to master's required status checks (owner may trim)."
+  ],
+  "definition_of_done": [
+    "gh api repos/mkreyman/loopctl/branches/master/protection/required_status_checks --jq .contexts lists the runner and chg job names; gh variable list -R mkreyman/loopctl shows CI_RUNNER_MACOS.",
+    "On the epic branch, a push touching only runner/ shows the runner job green and every ci.yml job but changes skipped (gh run view).",
+    "On master after the epic merges, a merge touching only runner/ shows the server jobs skipped and Deploy succeeded (gh run view)."
+  ],
+  "expected_size": {"insertions": 420, "files": 6},
+  "estimated_tokens": 300000
+}

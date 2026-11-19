@@ -1,0 +1,52 @@
+{
+  "id": "US-52.51",
+  "title": "Factory policy: every delivery-loop rule value decided once, on the server",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_8",
+  "story": {"as_a": "session or hook enforcing a delivery-loop rule", "i_want_to": "read the rule's value from loopctl's one factory policy", "so_that": "a rule changes in one place and the prose, the hooks and the server can never state two different values"},
+  "rationale": "PRD section 3, concept 4: every rule is decided once, on the server; hooks and prose are generated from that policy or are thin calls to it. Today one value lives in several places with nothing checking they agree: the review ceilings are in claude-config CLAUDE.md:54 and in review-round-counter (README.md:9-12, hooks.ts), the PR-body sections in CLAUDE.md:50 and in gate-pr-body.sh via bin/pr-body-sections.sh, the epic-merge tip age in gate-epic-merge-green-base.sh:141. This story makes factory/policy.toml the one source, compiled into the server and served to every client.",
+  "acceptance_criteria": [
+    {"id": "AC-52.51.1", "description": "Loopctl.Factory.Policy reads factory/policy.toml at compile time (@external_resource) and the build fails, naming the key path, when the file has an unknown key, a missing required key or a value of the wrong type."},
+    {"id": "AC-52.51.2", "description": "Loopctl.Factory.Policy.get/0 returns %Policy{schema: 1, version: v, rules: map} where v is the lowercase hex sha256 of the policy file's bytes."},
+    {"id": "AC-52.51.3", "description": "Loopctl.Factory.Policy.fetch!/1 takes a dotted path (\"review_rounds.code.ceiling\") and returns its value, or raises Loopctl.Factory.Policy.UnknownRule naming the path."},
+    {"id": "AC-52.51.4", "description": "The shipped policy.toml holds today's values: review_rounds prose normal 1 ceiling 2, code normal 2 ceiling 3; open_prs_per_session 2; epics_open_per_repo 3; pr_body.required_sections [\"Testing\", \"Risk\", \"How to revert\"]; review.default_level \"medium\" and review.max_level \"high\"; epic_merge.new_tip_seconds 600; protected_branches [\"master\", \"main\"]."},
+    {"id": "AC-52.51.5", "description": "GET /api/v1/factory/policy, behind RequireRole role: :agent, answers 200 {schema, version, rules} with an ETag header equal to the version, and 304 with no body when If-None-Match carries that version."},
+    {"id": "AC-52.51.6", "description": "The policy is product, not tenant data: keys of two different tenants receive the same version and rules, and a request with no valid key is answered 401."},
+    {"id": "AC-52.51.7", "description": "The MCP tool factory_policy calls GET /api/v1/factory/policy, says in its description that it needs any tenant key and refuses nothing else, and is pinned by a wiring test and a row in mcp-server/README.md."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.51.1", "verifies": ["AC-52.51.1"], "name": "a malformed policy is refused with its key path (unit, Policy.parse/1 on fixture strings)", "type": "unit", "preconditions": ["fixture TOML strings: an unknown key review_rounds.code.ceilng, a missing pr_body, review_rounds.code.ceiling = \"3\""], "steps": ["Loopctl.Factory.Policy.parse(toml) for each"], "expected_results": ["{:error, {:unknown_key, [\"review_rounds\", \"code\", \"ceilng\"]}}, {:error, {:missing_key, [\"pr_body\"]}}, {:error, {:wrong_type, [\"review_rounds\", \"code\", \"ceiling\"], :integer}}"]},
+    {"id": "TC-52.51.2", "verifies": ["AC-52.51.2", "AC-52.51.4"], "name": "the compiled policy carries today's values and its file hash (unit)", "type": "unit", "preconditions": ["the committed factory/policy.toml"], "steps": ["Policy.get()", "compare version with :crypto.hash(:sha256, File.read!(\"factory/policy.toml\"))"], "expected_results": ["Policy.get() returns %Policy{schema: 1, version: v, rules: map}", "v equals the lowercase hex sha256 of factory/policy.toml's bytes", "rules hold today's values: review_rounds prose normal 1 ceiling 2, code normal 2 ceiling 3; open_prs_per_session 2; epics_open_per_repo 3; pr_body.required_sections [\"Testing\", \"Risk\", \"How to revert\"]; review.default_level \"medium\", review.max_level \"high\"; epic_merge.new_tip_seconds 600; protected_branches [\"master\", \"main\"]"]},
+    {"id": "TC-52.51.3", "verifies": ["AC-52.51.3"], "name": "fetch!/1 resolves a path and raises on an unknown one (unit)", "type": "unit", "preconditions": [], "steps": ["Policy.fetch!(\"review_rounds.code.ceiling\")", "Policy.fetch!(\"review_rounds.code.nope\")"], "expected_results": ["3; raises UnknownRule with path review_rounds.code.nope"]},
+    {"id": "TC-52.51.4", "verifies": ["AC-52.51.5"], "name": "200 with ETag, then 304 (ConnCase)", "type": "integration", "preconditions": ["tenant = fixture(:tenant); an agent key from fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"], "steps": ["GET /api/v1/factory/policy", "GET again with If-None-Match: <etag>"], "expected_results": ["200 with schema, version, rules; 304 with an empty body"]},
+    {"id": "TC-52.51.5", "verifies": ["AC-52.51.6"], "name": "two tenants see one policy; no key is 401 (ConnCase)", "type": "integration", "preconditions": ["two tenants with an agent key each"], "steps": ["GET /api/v1/factory/policy with each key", "GET with no Authorization header"], "expected_results": ["equal bodies; 401"]},
+    {"id": "TC-52.51.6", "verifies": ["AC-52.51.7"], "name": "factory_policy tool request shape and wiring (node --test)", "type": "unit", "preconditions": ["mcp-server/test/factory_policy_tool.test.js with a stubbed fetch"], "steps": ["call the factory_policy handler", "read the tool list and the dispatch switch"], "expected_results": ["GET /api/v1/factory/policy; declared and dispatched"]}
+  ],
+  "technical_notes": [
+    "Why a new module and route: Loopctl.DeliveryGates.Triggers (lib/loopctl/delivery_gates/triggers.ex:1-30) is the Gate B path document, operator-pinned by sha256 and kept out of source on purpose ('the list is a map of which paths skip human review'), with a closed per-repo schema (@repo_keys at :37); delivery-loop rules are reviewed product behaviour that must ship with the release set, so they cannot live there. Loopctl.SystemConfig (lib/loopctl/system_config.ex:1-25) holds live-tunable integer knobs with a node-local cache whose cross-node refresh is unbounded during a netsplit or rolling deploy, so a hook and a node could read two values; the policy must equal the generated pack exactly, which only a compiled file gives.",
+    "Gate B's independent_paths (renamed from human_paths in release 2, US-52.12) stays in Triggers: it is per-repo operator data, not a fleet rule.",
+    "Value sources this story copies, so the shipped file starts equal to today: review ceilings /home/mkreyman/workspace/claude-config/plugins/review-round-counter/README.md:9-12 and CLAUDE.md:54; two open PRs CLAUDE.md:46; three epics CLAUDE.md:58; PR-body sections CLAUDE.md:50; review levels CLAUDE.md:51; tip age hooks/gate-epic-merge-green-base.sh:141 (EPIC_MERGE_NEW_TIP_SECONDS, default 600).",
+    "The REVIEW CAP pause at the ceiling (CLAUDE.md:54, hooks/lib/review-cap.sh:1-20) is carried over unchanged as review_rounds.cap_pause = true; this story changes no rule's meaning, only where its value lives.",
+    "Route: add get \"/factory/policy\" to the agent-role /api/v1 scope beside get \"/chg_ledger/summary\" (lib/loopctl_web/router.ex:550); release 5 adds /factory/overview in the same scope (README names table: visibility). Controller pattern: ChgLedgerSummaryController (lib/loopctl_web/controllers/chg_ledger_summary_controller.ex:30, plug LoopctlWeb.Plugs.RequireRole, [role: :agent]). operation/2 lists 200, 304, 401.",
+    "lib/loopctl/factory/policy.ex; the TOML parser is the one US-52.50 uses. schema is an integer bumped on any key rename or removal; clients accept their own schema and the previous one (PRD R7).",
+    "MCP: mcp-server/lib/factory-policy.js, declaration and case in mcp-server/index.js, row in the 'Runner and delivery-loop tools' table of mcp-server/README.md (:522); the route_coverage sweep (mcp-server/test/route_coverage.test.js) then finds the route covered.",
+    "CHANGELOG.md: a new public route, operator-facing (CLAUDE.md, Doc hygiene)."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Generating hooks and prose from the policy: US-52.52.",
+    "Counting review rounds on the server: US-52.53.",
+    "Per-repo overrides of a rule (the .chg/policy.toml [review] map keeps its role in chg)."
+  ],
+  "failure_modes": {"partition": "AC-52.51.5: a client that cannot reach loopctl keeps the policy.json the pack shipped with (US-52.52); the ETag lets it confirm on reconnect that nothing changed without re-reading the body.", "state": "AC-52.51.1: the policy lives in factory/policy.toml under version control and is compiled into the release, so every node of one release serves the same bytes and a restart loses nothing.", "retry": "AC-52.51.5: the route is a read; a retried GET returns the same version or a 304.", "slow": "AC-52.51.5: the 304 path sends no body, so a slow client re-checks with one small response.", "reach": "n/a: the policy is compiled into each node and served inline in the request process; nothing is queued."},
+  "defaults": [
+    "Every value in AC-52.51.4 is today's value from claude-config (owner may change any in factory/policy.toml).",
+    "The route is open to any tenant key at role agent; it carries no tenant data."
+  ],
+  "definition_of_done": [
+    "From an MCP session: factory_policy returns rules.review_rounds.code.ceiling = 3 and a version equal to sha256sum factory/policy.toml on the deployed commit."
+  ],
+  "expected_size": {"insertions": 260, "files": 7},
+  "estimated_tokens": 250000
+}
