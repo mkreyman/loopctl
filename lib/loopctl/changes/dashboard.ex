@@ -34,7 +34,9 @@ defmodule Loopctl.Changes.Dashboard do
     reason is the row's `selection` text.
   - SELECTION QUALITY is read on `chg` rows that selected (`mode` present and not `all`): the
     size of `selected` against the row's `floor` when it carries one. A MISS is a `chg` row that
-    passed on a commit whose `gate` row failed: the selection left out a test that mattered.
+    passed on a commit whose `gate` row failed: the selection left out a test that mattered. A
+    gate row with `source: "hook"` is the pre-push hook's decision on the push, not a verdict on
+    the tests, and never makes a miss (`LedgerRow.failing_test_gates/1`, #1061).
   - Phase times are the `chg` row's `hydrate_ms`, `static_ms`, `affected_ms` and `tests_ms`, and
     `lock_wait_ms` on rows that carry it.
   """
@@ -290,7 +292,7 @@ defmodule Loopctl.Changes.Dashboard do
   @doc """
   Selection quality on `chg` rows that selected: how many, the mean and largest number of tests
   selected, the mean `floor` on rows that carry one, and the misses (a passing `chg` row on a
-  commit whose `gate` row failed), newest first. `%{checks: n, mean_selected: float | nil,
+  commit whose `gate` row failed, hook-sourced gate rows excluded), newest first. `%{checks: n, mean_selected: float | nil,
   max_selected: n | nil, mean_floor: float | nil, misses: [%{repo, host, sha, at}]}`.
   """
   @spec selection(Ecto.UUID.t(), filters()) :: panel(map())
@@ -311,13 +313,12 @@ defmodule Loopctl.Changes.Dashboard do
 
     # A miss is judged on rows that SELECTED: a `mode = all` row ran the whole suite, so its pass
     # against a failing gate is a flaky or environmental difference, not a selection that left
-    # a test out.
+    # a test out. A hook-sourced gate row judges the push, not the tests, so it never makes a
+    # miss (#1061, `LedgerRow.failing_test_gates/1`).
     misses =
       from r in selecting,
-        join: g in LedgerRow,
-        on:
-          g.tenant_id == ^tenant_id and g.repo == r.repo and g.sha == r.sha and g.kind == "gate" and
-            g.verdict == "fail",
+        join: g in subquery(LedgerRow.failing_test_gates(tenant_id)),
+        on: g.tenant_id == ^tenant_id and g.repo == r.repo and g.sha == r.sha,
         where: r.verdict == "pass",
         distinct: [desc: r.at, asc: r.id],
         order_by: [desc: r.at, asc: r.id],

@@ -124,6 +124,38 @@ defmodule LoopctlWeb.ChgLedgerSummaryControllerTest do
       assert {:ok, _, _} = DateTime.from_iso8601(data["filters"]["since"])
     end
 
+    # #1061: a hook-sourced gate row is the pre-push hook's decision on the push, not a verdict
+    # on the tests, so a selecting pass beside it is not a miss.
+    test "a failing hook-sourced gate row makes no selection miss", ctx do
+      seed!(ctx.source)
+      s3 = String.duplicate("3", 40)
+
+      row!(ctx.source, %{
+        kind: "chg",
+        host: "minis",
+        sha: s3,
+        verdict: "pass",
+        raw: %{"mode" => "subset"}
+      })
+
+      row!(ctx.source, %{
+        kind: "gate",
+        host: "minis",
+        sha: s3,
+        verdict: "fail",
+        raw: %{"source" => "hook", "reason" => "walk lane failed"}
+      })
+
+      data =
+        ctx.agent_key
+        |> summary(%{repo: ctx.source.repo_full_name})
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert [%{"sha" => "2222222222222222222222222222222222222222"}] =
+               data["selection"]["misses"]
+    end
+
     test "a change flagged before the period and never cleared is still listed", ctx do
       flagged_at = DateTime.add(DateTime.utc_now(), -30, :day)
 

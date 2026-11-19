@@ -12,7 +12,7 @@ defmodule Loopctl.Changes.Findings do
 
   | kind | from | fingerprint | filed on |
   |---|---|---|---|
-  | `selection_miss` | a selecting `chg` row that passed on a sha whose `gate` row failed | repo + sha | the chg repository (`chg_repo/1`) |
+  | `selection_miss` | a selecting `chg` row that passed on a sha whose `gate` row failed (never a `source: "hook"` row, `LedgerRow.failing_test_gates/1`) | repo + sha | the chg repository (`chg_repo/1`) |
   | `flaky_test` | a `flaky` row with no quarantine | repo + test | the row's repository |
   | `missing_review` | a merged PR at least `review_grace_hours/0` old with no counted review round (`PrReviewOutcomes`); OFF unless `missing_reviews?/1` | repo + PR | the PR's repository |
   | `stuck_change` | a cursor flagged `gap` or `stale` for more than `stuck_after_hours/0` | source + change | the cursor's repository |
@@ -317,12 +317,11 @@ defmodule Loopctl.Changes.Findings do
     |> Map.new()
   end
 
+  # Paired only with a gate's verdict on the tests, never the pre-push hook's (#1061).
   defp selection_misses(tenant_id, since, chg_repo) do
     from(r in LedgerRow,
-      join: g in LedgerRow,
-      on:
-        g.tenant_id == r.tenant_id and g.repo == r.repo and g.sha == r.sha and g.kind == "gate" and
-          g.verdict == "fail",
+      join: g in subquery(LedgerRow.failing_test_gates(tenant_id)),
+      on: g.tenant_id == r.tenant_id and g.repo == r.repo and g.sha == r.sha,
       where:
         r.tenant_id == ^tenant_id and r.kind == "chg" and r.verdict == "pass" and
           r.at >= ^since and

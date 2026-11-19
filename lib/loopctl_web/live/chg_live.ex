@@ -304,7 +304,8 @@ defmodule LoopctlWeb.ChgLive do
               <.stat label="mean floor" value={decimal(@selection.mean_floor)} />
             </dl>
             <p class="text-xs text-slate-500">
-              A miss is a chg check that passed on a commit whose gate failed.
+              A miss is a chg check that passed on a commit whose gate failed its tests; the
+              pre-push hook's own decision does not count.
             </p>
             <ul id="selection-misses" phx-update="stream" class="space-y-1">
               <li id="misses-empty" class="hidden text-xs text-slate-500 only:block">
