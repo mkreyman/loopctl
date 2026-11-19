@@ -6,6 +6,12 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`missing_review` findings are off unless `CHG_MISSING_REVIEWS=true` (2026-11-19).** The
+  nightly chg sweep filed a "merged with no review" issue for every merged PR with no counted
+  review round, but chg does not yet send a round run before `gh pr create`, so every
+  ordinary reviewed merge read as unreviewed. When on, a merge is judged only once it is 24 h
+  old and stays in view for 48 h after that. Turn it on once `chg_ledger_summary` shows rounds
+  on ordinary merges. No migration.
 - **A `ledger` intake source may sit on a work project (2026-11-19).** `POST
   /api/v1/intake/sources` with `mode: ledger` now takes an active work project as well as a
   kb scope. This is for a repository like reportex or cron_books, whose channel is a work
