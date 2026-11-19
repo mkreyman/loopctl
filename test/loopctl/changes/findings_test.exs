@@ -161,6 +161,13 @@ defmodule Loopctl.Changes.FindingsTest do
 
       assert fingerprint.(e, %{"failures" => cut, "failures_sha256" => String.upcase(sent)}) ==
                "home_care_billing@#{e}:" <> binary_part(sha_of.(cut), 0, 12)
+
+      # A cut row whose failures had no names arrives with `failures: []`; the hash still
+      # keeps it apart from a bare `repo@sha` miss.
+      f = String.duplicate("f", 40)
+
+      assert fingerprint.(f, %{"failures" => [], "failures_sha256" => sent}) ==
+               "home_care_billing@#{f}:" <> binary_part(sent, 0, 12)
     end
 
     test "a full run, a passing gate, or a row outside the window is not a miss", ctx do

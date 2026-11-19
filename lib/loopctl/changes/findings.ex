@@ -443,15 +443,16 @@ defmodule Loopctl.Changes.Findings do
   # `failures_sha256`: the same hash, taken over the FULL list. Hashing the cut list would
   # merge two runs that differ only past the 50th failure, so the sent hash wins when it is
   # well formed. Being the same form, it leaves every untruncated row's fingerprint unchanged.
-  defp failures_digest(%{"failures" => [_ | _] = failures} = raw) do
-    digest =
-      case raw["failures_sha256"] do
-        <<_::binary-size(64)>> = sent -> if sha256_hex?(sent), do: sent, else: digest_of(failures)
-        _absent_or_malformed -> digest_of(failures)
-      end
-
-    ":" <> binary_part(digest, 0, 12)
+  # It is read BEFORE the list: a cut row whose failures carry no names arrives with
+  # `failures: []`, and only the sent hash still tells two such runs apart.
+  defp failures_digest(%{"failures_sha256" => sent} = raw) when is_binary(sent) do
+    if sha256_hex?(sent),
+      do: ":" <> binary_part(sent, 0, 12),
+      else: failures_digest(Map.delete(raw, "failures_sha256"))
   end
+
+  defp failures_digest(%{"failures" => [_ | _] = failures}),
+    do: ":" <> binary_part(digest_of(failures), 0, 12)
 
   defp failures_digest(_raw), do: ""
 
