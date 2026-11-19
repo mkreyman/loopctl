@@ -244,6 +244,41 @@ fn send_delivers_each_row_once_and_keeps_a_torn_line() {
 }
 
 #[test]
+fn from_start_resends_everything_and_never_lowers_the_saved_offset() {
+    let fake = Fake::start();
+    let m = Machine::new("acme/widget", &fake);
+    let log = m.shadow_log("widget");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, format!("{}\n{}\n", row("a", 1), row("b", 2))).unwrap();
+    fake.answer(ok_batch);
+    m.chg().args(["outbox", "send"]).assert().success();
+    assert_eq!(fake.take().len(), 1);
+
+    // A replay that fails part way leaves the delivered rows counted as delivered.
+    fake.answer(|_| (503, r#"{"error":{"code":"busy"}}"#.into()));
+    m.chg()
+        .args(["outbox", "send", "--force", "--from-start"])
+        .assert()
+        .code(1);
+    assert_eq!(fake.take().len(), 1);
+    let out = m.chg().args(["outbox", "status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0 row(s) unsent"), "{text}");
+
+    // A replay that succeeds offers every row again; a plain send after it sends nothing.
+    fake.answer(ok_batch);
+    m.chg()
+        .args(["outbox", "send", "--force", "--from-start"])
+        .assert()
+        .success();
+    let reqs = fake.take();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].json()["rows"].as_array().unwrap().len(), 2);
+    m.chg().args(["outbox", "send"]).assert().success();
+    assert!(fake.take().is_empty());
+}
+
+#[test]
 fn a_failure_backs_off_and_resends_the_same_rows() {
     let fake = Fake::start();
     let m = Machine::new("acme/widget", &fake);

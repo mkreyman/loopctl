@@ -43,6 +43,8 @@ pub const MAX_ROWS: usize = 500;
 pub const MAX_BODY: usize = 900_000;
 /// Batches per file per run; the rest waits for the next run.
 pub const MAX_BATCHES: usize = 40;
+/// loopctl's `Loopctl.Changes.Ledger` `@max_row_bytes`: one row, canonically encoded.
+pub const MAX_ROW_BYTES: usize = 16_384;
 /// A row unsent for longer than this fails `chg doctor`.
 pub const STALE_MS: u64 = 24 * 3600 * 1000;
 const BACKOFF_BASE_MS: u64 = 30_000;
@@ -416,10 +418,21 @@ fn lines_from(path: &Path, offset: u64, max: usize) -> Result<Vec<Line>, String>
 /// The row a line becomes on the wire: its JSON object with `repo` set to the source's
 /// `owner/name` (the shadow log names the repo by its key). Deterministic, so a resend
 /// hashes the same.
+///
+/// A row over loopctl's `MAX_ROW_BYTES` is refused there as `invalid_row`. The only field that
+/// grows that large is a `chg` row's `selected` test list (a selection of thousands of files),
+/// and loopctl does not read it, so on the wire it becomes `selected_count`. The shadow log
+/// keeps the full list for `chg shadow report`.
 pub fn wire_row(line: &str, repo: &str) -> Option<Value> {
     let mut v: Value = serde_json::from_str(line.trim()).ok()?;
+    v.as_object_mut()?
+        .insert("repo".into(), Value::String(repo.to_string()));
+    let too_big = serde_json::to_vec(&v).is_ok_and(|b| b.len() > MAX_ROW_BYTES);
     let obj = v.as_object_mut()?;
-    obj.insert("repo".into(), Value::String(repo.to_string()));
+    if too_big && let Some(n) = obj.get("selected").and_then(Value::as_array).map(Vec::len) {
+        obj.remove("selected");
+        obj.insert("selected_count".into(), Value::from(n));
+    }
     Some(v)
 }
 
@@ -473,19 +486,26 @@ fn send_file(
     secret: &[u8],
     file: &Path,
     state: &mut State,
+    from_start: bool,
 ) -> Result<Sent, Failure> {
     let key = file.display().to_string();
     let len = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-    let mut offset = state.files.get(&key).copied().unwrap_or(0);
-    if offset > len {
-        // Rewritten or truncated: send it again from the start; loopctl drops duplicates.
+    let saved = state.files.get(&key).copied().unwrap_or(0);
+    // `--from-start` replays from byte 0 but never saves below `mark`, the offset loopctl had
+    // already answered for, so a replay cut short leaves no delivered row counted as unsent.
+    let mark = if from_start && saved <= len { saved } else { 0 };
+    let mut offset = saved;
+    if offset > len || from_start {
+        // Rewritten or truncated, or `--from-start`: send it again from the start; loopctl
+        // drops duplicates.
         offset = 0;
     }
     let path = format!("/api/v1/chg_ledger/{}", src.source_id);
     let mut sent = Sent::default();
     let mut max_rows = MAX_ROWS;
     let mut batches = 0;
-    while batches < MAX_BATCHES {
+    // A from-start pass covers the whole file in one run; it is manual and one-off.
+    while from_start || batches < MAX_BATCHES {
         let lines = lines_from(file, offset, max_rows).map_err(Failure::Retry)?;
         if lines.is_empty() {
             break;
@@ -523,7 +543,7 @@ fn send_file(
         }
         if rows.is_empty() {
             offset = through;
-            state.files.insert(key.clone(), offset);
+            state.files.insert(key.clone(), offset.max(mark));
             write_state(state).map_err(Failure::Retry)?;
             continue;
         }
@@ -557,7 +577,7 @@ fn send_file(
             401 => return Err(Failure::Refused(REFUSED.into())),
             _ => return Err(Failure::Retry(reply.brief())),
         }
-        state.files.insert(key.clone(), offset);
+        state.files.insert(key.clone(), offset.max(mark));
         write_state(state).map_err(Failure::Retry)?;
     }
     Ok(sent)
@@ -610,7 +630,9 @@ fn try_lock() -> Result<Option<File>, String> {
 
 /// Sends every configured repo's unsent ledger rows and pending change events. `force`
 /// ignores the backoff.
-pub fn send(force: bool) -> Result<Summary, String> {
+/// `from_start` sends every file again from its first byte, once (after a sender fix, so the
+/// rows loopctl refused before are offered again). loopctl counts the rest as duplicates.
+pub fn send(force: bool, from_start: bool) -> Result<Summary, String> {
     let Some(cfg) = load()? else {
         return Ok(Summary::default());
     };
@@ -659,7 +681,7 @@ pub fn send(force: bool) -> Result<Summary, String> {
         };
         let mut failed: Option<Failure> = None;
         for file in ledger_files(src) {
-            match send_file(&url, src, &secret, &file, &mut state) {
+            match send_file(&url, src, &secret, &file, &mut state, from_start) {
                 Ok(s) => {
                     out.sent.inserted += s.inserted;
                     out.sent.duplicates += s.duplicates;
@@ -1171,6 +1193,32 @@ mod tests {
         assert_eq!(r["repo"], "mkreyman/home_care_billing");
         assert!(wire_row("not json", "a/b").is_none());
         assert!(wire_row("[1]", "a/b").is_none());
+    }
+
+    #[test]
+    fn wire_row_fits_a_large_selection_under_loopctls_row_cap() {
+        let tests: Vec<String> = (0..3000)
+            .map(|i| format!("test/x/y_{i}_test.exs"))
+            .collect();
+        let line = serde_json::json!({"v":1,"kind":"chg","repo":"r","sha":"s","verdict":"pass",
+                                      "ms":1,"mode":"subset","selected":tests})
+        .to_string();
+        assert!(line.len() > MAX_ROW_BYTES);
+        let r = wire_row(&line, "a/r").unwrap();
+        assert_eq!(r["selected_count"], 3000);
+        assert!(r.get("selected").is_none());
+        assert!(serde_json::to_vec(&r).unwrap().len() <= MAX_ROW_BYTES);
+        assert_eq!(
+            wire_row(&line, "a/r"),
+            Some(r),
+            "deterministic, so a resend hashes the same"
+        );
+
+        let small = r#"{"v":1,"kind":"chg","selected":["test/a_test.exs"]}"#;
+        assert_eq!(
+            wire_row(small, "a/r").unwrap()["selected"][0],
+            "test/a_test.exs"
+        );
     }
 
     #[test]

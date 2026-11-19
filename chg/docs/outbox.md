@@ -28,11 +28,11 @@ With no `~/.chg/loopctl.toml` nothing is sent and nothing fails.
 | `~/.chg/outbox/<key>.flaky.jsonl` | `flaky`: `test`, `run_id` | `chg flaky` |
 | `refs/chg/<change>/events` on the remote | change events | `chg event emit` |
 
-`<key>` is the repo's name (`home_care_billing`). Each ledger row is sent with `repo` set to the source's `owner/name`; loopctl rejects a row naming another repository.
+`<key>` is the repo's name (`home_care_billing`). Each ledger row is sent with `repo` set to the source's `owner/name`; loopctl rejects a row naming another repository. loopctl also refuses a row over 16 KB as `invalid_row`. A `chg` row that selected thousands of tests is that large, so on the wire its `selected` list becomes `selected_count`. loopctl does not read the list, and the shadow log keeps it.
 
 `chg outbox send` sends each file from the byte offset loopctl last answered for (`~/.chg/outbox/state.json`), in batches of up to 500 rows and 900 KB, at most 40 batches per file per run. The first send of a file is the backfill of everything already in it. A line still being written (no newline yet) waits for the next run. A row loopctl rejects (`invalid_row`, `repo_mismatch`), or one that is not JSON, is written to `~/.chg/outbox/rejected.jsonl` and never blocks the rows after it. loopctl keys a row on `(source, host, sha256 of the row)`, so resending is safe: a crash between loopctl's answer and the saved offset resends the batch, and loopctl counts it as duplicates.
 
-A failure (network, 5xx, 429, a 401) stops that repo for the run and backs it off: 30 s, doubling to 1 h. `--force` ignores the backoff. A 401 means the source id, the secret, the source's chg root or this machine's clock (5-minute window) is wrong.
+A failure (network, 5xx, 429, a 401) stops that repo for the run and backs it off: 30 s, doubling to 1 h. `--force` ignores the backoff. `--from-start` sends every file again from its first byte, whole, in one run, without the batch cap. Use it after a sender fix, so rows loopctl refused before are offered again; loopctl counts the rest as duplicates. It never saves an offset below the one loopctl had already answered for, so a replay cut short leaves no delivered row counted as unsent. A 401 means the source id, the secret, the source's chg root or this machine's clock (5-minute window) is wrong.
 
 Every writer starts a detached `chg outbox send --quiet` after writing (`CHG_OUTBOX_NO_KICK` turns that off); its output goes to `~/.chg/outbox/send.log`. One send runs at a time per machine; a second exits at once.
 

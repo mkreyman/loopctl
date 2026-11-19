@@ -251,6 +251,10 @@ enum OutboxCmd {
         /// Ignore the backoff.
         #[arg(long)]
         force: bool,
+        /// Send every file again from its start, this once: after a sender fix, so rows
+        /// loopctl refused before are offered again. The rest count as duplicates.
+        #[arg(long)]
+        from_start: bool,
         /// Print nothing unless something failed.
         #[arg(long)]
         quiet: bool,
@@ -520,7 +524,12 @@ fn main() -> ExitCode {
         }
         Top::Doctor { repo } => doctor(&repo_root(repo)),
         Top::Outbox { command } => match command {
-            OutboxCmd::Send { force, quiet, json } => outbox_send(force, quiet, json),
+            OutboxCmd::Send {
+                force,
+                from_start,
+                quiet,
+                json,
+            } => outbox_send(force, from_start, quiet, json),
             OutboxCmd::Status { json } => outbox_status(json),
         },
         Top::Event { command } => match command {
@@ -864,8 +873,8 @@ fn ledger_flaky(repo: &Path, ids: &[String], run_id: &str) {
     }
 }
 
-fn outbox_send(force: bool, quiet: bool, json: bool) -> ExitCode {
-    let s = match chg::outbox::send(force) {
+fn outbox_send(force: bool, from_start: bool, quiet: bool, json: bool) -> ExitCode {
+    let s = match chg::outbox::send(force, from_start) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("chg: outbox send: {e}");
