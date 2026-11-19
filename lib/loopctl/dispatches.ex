@@ -19,6 +19,7 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.HeavyRead
+  alias Loopctl.Intake.Source
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants
 
@@ -1078,15 +1079,26 @@ defmodule Loopctl.Dispatches do
     end
   end
 
+  # A chg ROOT is never a verifier: it is a lineage anchor (a minted one holds no key at all),
+  # and its whole subtree is refused verify (`chg_root_cannot_verify`). The exclusion reads the
+  # same set that refusal does: any source of the tenant naming it, live or revoked.
   defp candidate_query(tenant_id) do
     now = DateTime.utc_now()
 
+    chg_roots =
+      from(s in Source,
+        where:
+          s.tenant_id == parent_as(:d).tenant_id and s.chg_root_dispatch_id == parent_as(:d).id
+      )
+
     from(d in Dispatch,
+      as: :d,
       where:
         d.tenant_id == ^tenant_id and
           is_nil(d.revoked_at) and
           d.expires_at > ^now and
-          d.role in [:orchestrator, :agent],
+          d.role in [:orchestrator, :agent] and
+          not exists(chg_roots),
       order_by: [asc: d.created_at],
       limit: @verifier_pool_limit
     )

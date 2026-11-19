@@ -75,6 +75,12 @@ defmodule Loopctl.Intake.ChgRootMintTest do
 
   defp sweep, do: RevokeExpiredDispatchesWorker.perform(%Oban.Job{})
 
+  defp candidate?(dispatch_id),
+    do:
+      DateTime.utc_now()
+      |> RevokeExpiredDispatchesWorker.expired_candidates()
+      |> Enum.any?(&(&1.id == dispatch_id))
+
   defp roots(tenant_id),
     do:
       AdminRepo.all(
@@ -235,6 +241,45 @@ defmodule Loopctl.Intake.ChgRootMintTest do
     end
   end
 
+  describe "verifier selection" do
+    test "never draws a chg root, minted or named, live source or revoked" do
+      tenant = fixture(:tenant)
+      source = pr_source(tenant.id)
+
+      {:ok, %Source{}} =
+        Intake.update_source(tenant.id, source.id, %{
+          change_events_secret: @secret,
+          mint_chg_root: true
+        })
+
+      # The minted root is the tenant's only live dispatch, so the pool is empty.
+      assert {:error, :no_eligible_verifier} =
+               Dispatches.select_verifier(tenant.id, Ecto.UUID.generate(), [])
+
+      AdminRepo.update_all(from(s in Source, where: s.id == ^source.id),
+        set: [revoked_at: DateTime.utc_now()]
+      )
+
+      assert {:error, :no_eligible_verifier} =
+               Dispatches.select_verifier(tenant.id, Ecto.UUID.generate(), [])
+    end
+
+    test "another tenant's source naming the id does not hide it from this tenant's pool" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      root = fixture(:chg_root_dispatch, %{tenant_id: tenant_a.id})
+      other = pr_source(tenant_b.id)
+
+      AdminRepo.update_all(from(s in Source, where: s.id == ^other.id),
+        set: [chg_root_dispatch_id: root.id, change_events_secret: @secret]
+      )
+
+      # Still a candidate (the pool is non-empty), so the answer is the seed's, not the pool's.
+      refute Dispatches.select_verifier(tenant_a.id, Ecto.UUID.generate(), []) ==
+               {:error, :no_eligible_verifier}
+    end
+  end
+
   describe "the expiry sweep" do
     test "keeps a root a live source names; the source still authenticates after it" do
       tenant = fixture(:tenant)
@@ -274,7 +319,30 @@ defmodule Loopctl.Intake.ChgRootMintTest do
       sweep()
 
       assert %Dispatch{revoked_at: nil} = AdminRepo.get!(Dispatch, root.id)
-      refute is_nil(AdminRepo.get!(ApiKey, root.api_key_id).revoked_at)
+      key = AdminRepo.get!(ApiKey, root.api_key_id)
+      refute is_nil(key.revoked_at)
+
+      # Once its key is revoked, the root is no longer a candidate on any later run.
+      refute candidate?(root.id)
+      assert key.revoked_at
+    end
+
+    test "a minted (keyless) named root is never a candidate, an unnamed one is" do
+      tenant = fixture(:tenant)
+      source = pr_source(tenant.id)
+
+      {:ok, %Source{chg_root_dispatch_id: root_id}} =
+        Intake.update_source(tenant.id, source.id, %{
+          change_events_secret: @secret,
+          mint_chg_root: true
+        })
+
+      unnamed = fixture(:chg_root_dispatch, %{tenant_id: tenant.id})
+      expire!(root_id)
+      expire!(unnamed.id)
+
+      refute candidate?(root_id)
+      assert candidate?(unnamed.id)
     end
 
     test "revokes a root once its source is revoked" do

@@ -807,7 +807,7 @@ defmodule Loopctl.Intake do
   # key, and `RevokeExpiredDispatchesWorker` leaves a row a live source names unrevoked.
   #
   # A root being NAMED by this write is judged for expiry, though, with a margin of
-  # `@chg_root_naming_margin_seconds`. The sweep's exemption reads which roots a live source
+  # `Source.chg_root_naming_margin_seconds/0`. The sweep's exemption reads which roots a live source
   # names in its own statement, and a source write that commits WHILE that statement runs is
   # not in its snapshot: naming a root on the edge of its expiry could commit just as the sweep
   # revokes it, and every post from the source would then be 401. A root with the margin left
@@ -829,10 +829,8 @@ defmodule Loopctl.Intake do
     end
   end
 
-  @chg_root_naming_margin_seconds 300
-
   defp judge_root_fresh(tenant_id, root_id) do
-    floor = DateTime.add(DateTime.utc_now(), @chg_root_naming_margin_seconds, :second)
+    floor = DateTime.add(DateTime.utc_now(), Source.chg_root_naming_margin_seconds(), :second)
 
     if AdminRepo.exists?(
          from d in Dispatch,

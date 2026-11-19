@@ -135,9 +135,9 @@ defmodule LoopctlWeb.IntakeSourceController do
                   "request names it (on a `pr` source too) and on EVERY write that leaves " <>
                   "the source `chg` — a secret rotation or a base-branch edit on a `chg` " <>
                   "source whose root has since been revoked is the same 422 until a live root " <>
-                  "is named. A root being NAMED must also have at least 300 s left before " <>
-                  "its expiry, so the expiry sweep cannot revoke it as it is enrolled; " <>
-                  "once named, its expiry no longer matters. " <>
+                  "is named (or `mint_chg_root` mints one). The margin keeps the expiry " <>
+                  "sweep from revoking a root as it is enrolled; once named, its expiry no " <>
+                  "longer matters. " <>
                   "Required when the source is `chg` or `ledger`, and on a `pr` source " <>
                   "that is to send its chg ledger and events (with " <>
                   "`change_events_secret`); on a `pr` source an explicit null clears it."
@@ -232,9 +232,12 @@ defmodule LoopctlWeb.IntakeSourceController do
         "work project, or archived, or `target_epic_id` names an epic that is not in that " <>
         "project. The secret is encrypted at rest. `base_branch` defaults to `master` when " <>
         "the body does not name it, and `mode` to `pr`. Enrolling in mode `chg` (US-47.2) " <>
-        "also needs `change_events_secret` and `chg_root_dispatch_id` (422 naming the " <>
-        "missing field otherwise), and a root that is not a parentless, unrevoked, " <>
-        "orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`. Enrolling in " <>
+        "also needs `change_events_secret` and a root, `mint_chg_root: true` (loopctl mints " <>
+        "a keyless one) or `chg_root_dispatch_id` (422 naming the missing field otherwise, " <>
+        "and 422 with both). A named root that is not a parentless, unrevoked, " <>
+        "orchestrator-role dispatch of this tenant with more than " <>
+        "#{Source.chg_root_naming_margin_seconds()} s left is 422 `chg_root_invalid`. " <>
+        "Enrolling in " <>
         "mode `ledger` (issue #1047) takes an ACTIVE KB SCOPE as `project_id` (422 otherwise; " <>
         "`pr` and `chg` take a work project) and both chg credentials: the source sends the " <>
         "repository's chg ledger and change events and is never a dispatch binding or a merge " <>
@@ -390,11 +393,13 @@ defmodule LoopctlWeb.IntakeSourceController do
         "are 404 — revoking CLEARS the target so the epic can be deleted, and repointing one " <>
         "would restore that block on a source that will never report again. Requires user " <>
         "role and a human-anchored tenant. 422 when the epic is not in the project. " <>
-        "`mode`, `change_events_secret` and `chg_root_dispatch_id` (US-47.2): switching to " <>
-        "`chg` needs both credentials on the resulting source (422 naming the missing one), " <>
-        "and the root is re-checked on every write that leaves the source `chg` (422 " <>
-        "`chg_root_invalid`); switching to `pr` keeps them. " <>
-        "A body naming `change_events_secret` or `chg_root_dispatch_id`, or setting `mode` " <>
+        "`mode`, `change_events_secret`, `chg_root_dispatch_id` and `mint_chg_root` " <>
+        "(US-47.2): switching to `chg` needs both credentials on the resulting source (422 " <>
+        "naming the missing one), and the root is re-checked on every write that leaves the " <>
+        "source `chg` (422 `chg_root_invalid`); `mint_chg_root: true` replaces a missing or " <>
+        "revoked root with a new keyless one; switching to `pr` keeps them. " <>
+        "A body naming `change_events_secret`, `chg_root_dispatch_id` or `mint_chg_root`, " <>
+        "or setting `mode` " <>
         "to `chg`, from a key a dispatch minted is 403 `#{@chg_ceiling_code}`: " <>
         @chg_ceiling_message <>
         " " <>

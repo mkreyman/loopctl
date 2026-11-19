@@ -81,6 +81,7 @@ defmodule Loopctl.Intake.Source do
   # encrypted and stored per row.
   @min_change_events_secret_bytes 32
   @max_change_events_secret_bytes 256
+  @chg_root_naming_margin_seconds 300
 
   @derive {Jason.Encoder,
            only: [
@@ -319,10 +320,15 @@ defmodule Loopctl.Intake.Source do
   def chg_root_requirement,
     do:
       "chg_root_dispatch_id must name a PARENTLESS, UNREVOKED, ORCHESTRATOR-role dispatch of " <>
-        "this tenant: the root chg-server's key was minted from, created by the tenant's " <>
-        "operator key with POST /api/v1/dispatches and no parent_dispatch_id. An id that " <>
-        "names no such dispatch of this tenant, including another tenant's, is refused the " <>
-        "same way."
+        "this tenant with more than #{@chg_root_naming_margin_seconds} seconds left before " <>
+        "it expires. An id that names no such dispatch of this tenant, including another " <>
+        "tenant's, is refused the same way. To get a root, send mint_chg_root: true instead " <>
+        "of an id: loopctl mints a keyless root in the same write, and the expiry sweep keeps " <>
+        "it while a live source names it."
+
+  @doc "How long a NAMED chg root must still have before it expires, in seconds."
+  @spec chg_root_naming_margin_seconds() :: pos_integer()
+  def chg_root_naming_margin_seconds, do: @chg_root_naming_margin_seconds
 
   # The status a session posts about its OWN work (claude-config#677): the implementer attesting
   # itself, the shape chain of custody refuses, so it can never be a required check.
