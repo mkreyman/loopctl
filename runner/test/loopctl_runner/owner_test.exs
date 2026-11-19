@@ -6,6 +6,13 @@ defmodule LoopctlRunner.OwnerTest do
   import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
+  # A test tagged `:owner_dir` gets a directory of the suite's own (`LoopctlRunner.TestTmp`),
+  # removed when the suite ends. Not ExUnit's `:tmp_dir`, which lands in the project's `tmp/` and
+  # is never removed (test_helper.exs fails the run on anything left there).
+  setup context do
+    if context[:owner_dir], do: {:ok, owner_dir: tmp_dir!("owner")}, else: :ok
+  end
+
   # A live os process that is not a BEAM, ended when the test is.
   defp live_sleep! do
     port =
@@ -97,9 +104,9 @@ defmodule LoopctlRunner.OwnerTest do
     refute Owner.alive?(%{owner!() | "beam_start_id" => nil, "beam_started" => nil})
   end
 
-  @tag :tmp_dir
+  @tag :owner_dir
   test "a start in the other kernel's form cannot be judged: alive and warned, unless it is gone",
-       %{tmp_dir: dir} do
+       %{owner_dir: dir} do
     # Calling a live owner dead reaps its run, so what cannot be compared is kept, and said. A pid
     # that no longer exists is dead whatever form its start was recorded in. In a VM of its own:
     # the warning is said once per outage, and in this one a concurrent test may already have.
@@ -250,9 +257,9 @@ defmodule LoopctlRunner.OwnerTest do
     dir
   end
 
-  @tag :tmp_dir
+  @tag :owner_dir
   test "only a ps that exits 1 saying nothing is a gone pid; one that says why cannot tell", %{
-    tmp_dir: dir
+    owner_dir: dir
   } do
     # A `ps` that failed is not an answer about the pid: read as "gone", it called a live owner
     # dead and reaped its run. A record master wrote is judged through `ps` on every kernel.
@@ -340,8 +347,8 @@ defmodule LoopctlRunner.OwnerTest do
   describe "macOS, where a start is the one the kernel recorded, read through ps in UTC" do
     @describetag clock: :utc
 
-    @tag :tmp_dir
-    test "one process's start reads the same under every timezone and locale", %{tmp_dir: dir} do
+    @tag :owner_dir
+    test "one process's start reads the same under every timezone and locale", %{owner_dir: dir} do
       # The daemon runs under launchd, a `mix loopctl.reap` under a shell: two TZs, two locales,
       # judging one record. What `ps` prints moves with both, so the start is read under neither.
       with_ps(dir)
@@ -373,10 +380,10 @@ defmodule LoopctlRunner.OwnerTest do
       assert Owner.alive?(%{owner | "beam_start_id" => "utc:#{head}#{secs} #{year}"})
     end
 
-    @tag :tmp_dir
+    @tag :owner_dir
     test "with no ps nothing raises, an owner is alive, and this BEAM records no start until ps" <>
            " answers",
-         %{tmp_dir: dir} do
+         %{owner_dir: dir} do
       # Cannot tell is alive: calling a live owner dead reaps its run. But this BEAM's OWN start is
       # never guessed: a record written without it, or with a stand-in, reads dead to every
       # check. The failure is not kept, so the first call after ps returns records the real one.
@@ -396,9 +403,9 @@ defmodule LoopctlRunner.OwnerTest do
       assert out =~ ~r/<<"beam_started">> => <<"/
     end
 
-    @tag :tmp_dir
+    @tag :owner_dir
     test "a ps that prints something that is not a start cannot tell, and records none", %{
-      tmp_dir: dir
+      owner_dir: dir
     } do
       # Compared exactly, a row that is not a start would call every live owner dead.
       fake_ps!(dir, "echo 'not a start'\n")
@@ -414,8 +421,8 @@ defmodule LoopctlRunner.OwnerTest do
       assert out =~ ~s|`ps -o lstart=` printed "not a start\\n"|
     end
 
-    @tag :tmp_dir
-    test "cannot-tell is said once per outage, naming what failed", %{tmp_dir: dir} do
+    @tag :owner_dir
+    test "cannot-tell is said once per outage, naming what failed", %{owner_dir: dir} do
       # Twice in one outage is one warning; a ps that answers ends the outage, so the next one is
       # said too — a stuck state that recurs is seen each time it does.
       ps_dir = with_ps(Path.join(dir, "with-ps"))
@@ -432,9 +439,9 @@ defmodule LoopctlRunner.OwnerTest do
       assert out =~ "`ps` could not be run"
     end
 
-    @tag :tmp_dir
+    @tag :owner_dir
     test "a ps that ran and exited non-zero is a dead owner, and spends no warning", %{
-      tmp_dir: dir
+      owner_dir: dir
     } do
       # The pid is gone: that is an answer, not a cannot-tell. Once PATH loses `ps`, the one
       # warning this outage gives is still there to be said.
@@ -450,9 +457,9 @@ defmodule LoopctlRunner.OwnerTest do
       assert length(String.split(out, "cannot tell whether os pid")) == 2
     end
 
-    @tag :tmp_dir
+    @tag :owner_dir
     test "judging an owner costs one ps, alive or dead, and none for a pid below 1", %{
-      tmp_dir: dir
+      owner_dir: dir
     } do
       # Every run, lock and grant sweep asks; one `ps` answers existence and start together. A pid
       # below 1 names no process, and `ps -p 0` or `-p -1` is not asked what that means.

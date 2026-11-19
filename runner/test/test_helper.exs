@@ -27,6 +27,44 @@ LoopctlRunner.TestStragglers.arm()
 ExUnit.after_suite(&LoopctlRunner.TestTmp.sweep_suite/1)
 ExUnit.after_suite(&LoopctlRunner.TestStragglers.sweep_suite/1)
 
+# NOTHING IS LEFT IN THE WORKING TREE: ExUnit's `tmp_dir` tag (`@tag`, `@describetag` or
+# `@moduletag`, in any spelling) creates `tmp/<module>/<test>` under the project and never removes
+# it, so every run, the commit gate's included, left more behind. Judged by the effect, not by
+# reading test source: any entry under `tmp/` that was not there when the suite started fails the
+# run. Tests take `TestSupport.tmp_dir!/1`, which `TestTmp` removes.
+project_tmp = Path.expand("../tmp", __DIR__)
+
+project_tmp_entries = fn ->
+  case File.ls(project_tmp) do
+    {:ok, modules} ->
+      for module <- modules,
+          dir = Path.join(project_tmp, module),
+          entry <- if(File.dir?(dir), do: File.ls!(dir), else: [""]),
+          do: Path.join(dir, entry)
+
+    {:error, _} ->
+      []
+  end
+end
+
+project_tmp_at_start = MapSet.new(project_tmp_entries.())
+
+ExUnit.after_suite(fn _results ->
+  left = Enum.reject(project_tmp_entries.(), &MapSet.member?(project_tmp_at_start, &1))
+
+  unless left == [] do
+    IO.puts(:stderr, """
+
+    THE SUITE LEFT FILES IN THE WORKING TREE:
+      #{Enum.join(Enum.take(Enum.sort(left), 20), "\n  ")}
+    A test asked ExUnit for its tmp_dir, which is never removed. Use tmp_dir!/1 from
+    LoopctlRunner.TestSupport instead, then delete what is listed above.
+    """)
+
+    System.at_exit(fn _ -> System.halt(3) end)
+  end
+end)
+
 # NO TEST WRITES TO OR DELETES FROM THE OPERATOR'S REAL ~/.claude: every test takes a grant
 # directory it made (`TestSupport.config_map/2`). This is the check that sees a breach either
 # way — a grant or pending file this BEAM left there, or a live session's grant that went missing
