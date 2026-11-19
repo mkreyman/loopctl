@@ -163,7 +163,8 @@ enum Top {
     },
     /// Ask loopctl for the review key of one (change, revision) under the source's chg
     /// root (loopctl US-50.3). Prints loopctl's answer: `{dispatch_id, api_key,
-    /// expires_at}`. The key is shown once; hand it to the review job only. A repeat
+    /// expires_at}`, and keeps it (0600) in `<git dir>/chg/review/`, where `chg review`
+    /// reads it. The key is shown once; hand it to the review job only. A repeat
     /// before a verdict revokes the earlier key and mints afresh. Exit 0 minted, 1 refused
     /// (409 `review_already_recorded`, 422 `revision_not_submitted`; loopctl's error on
     /// stderr), 2 could not ask.
@@ -1127,6 +1128,13 @@ fn review_dispatch_cmd(repo: &Path, change: &str, revision: u64) -> ExitCode {
     };
     match chg::events::review_dispatch(&cfg, &slug, change, revision) {
         Ok(r) if r.status == 201 || r.status == 200 => {
+            // Kept where `chg review` reads it, so a key minted here is the one it records with.
+            let kept = chg::change::review_key_path(repo, change, revision)
+                .and_then(|p| chg::change::keep_review_key(&p, r.body.trim()));
+            if let Err(e) = kept {
+                eprintln!("chg: review-dispatch: keeping the key: {e}");
+                return ExitCode::from(2);
+            }
             println!("{}", r.body.trim());
             ExitCode::SUCCESS
         }

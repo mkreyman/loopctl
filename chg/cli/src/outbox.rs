@@ -310,6 +310,64 @@ fn curl(
     })
 }
 
+/// A POST of `body` to `<url><path>` with `Authorization: Bearer <key>`. The key goes to
+/// curl as a config line on stdin, never on its command line, where `ps` would show it.
+pub fn post_bearer(url: &str, path: &str, key: &str, body: &[u8]) -> Result<Reply, String> {
+    if key.is_empty() || key.contains(['"', '\\', '\n', '\r']) {
+        return Err("the review key is not a bearer token".to_string());
+    }
+    let target = format!("{url}{path}");
+    let mut c = Command::new("curl");
+    c.args([
+        "-sS",
+        "--max-time",
+        "30",
+        "--connect-timeout",
+        "10",
+        "-X",
+        "POST",
+        "-K",
+        "-",
+        "-H",
+        "Accept: application/json",
+        "-H",
+        "Content-Type: application/json",
+        "-w",
+        "\n%{http_code}",
+        "--data-binary",
+    ])
+    .arg(String::from_utf8_lossy(body).as_ref())
+    .arg("--")
+    .arg(&target)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("starting curl: {e}"))?;
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let _ = stdin.write_all(format!("header = \"Authorization: Bearer {key}\"\n").as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "curl POST {target}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    let status = code
+        .trim()
+        .parse()
+        .map_err(|_| format!("curl POST {target}: no status in its output"))?;
+    Ok(Reply {
+        status,
+        body: body.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------------------
 // State: one byte offset per ledger file, and one backoff per repo.
 

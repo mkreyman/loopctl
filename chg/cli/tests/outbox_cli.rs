@@ -93,7 +93,9 @@ impl Fake {
                     headers,
                     body: String::from_utf8(body).unwrap(),
                 };
-                let (status, text) = if signature_ok(&req) {
+                // A bearer call (review-complete) is the handler's to judge by its key.
+                let bearer = req.headers.contains_key("authorization");
+                let (status, text) = if bearer || signature_ok(&req) {
                     (h.lock().unwrap())(&req)
                 } else {
                     (401, r#"{"error":{"code":"invalid_signature"}}"#.to_string())
@@ -857,6 +859,12 @@ fn lifecycle_fake(fake: &Fake) -> Arc<Mutex<Vec<Value>>> {
             .map(str::to_string)
             .or_else(|| r.json()["change_id"].as_str().map(str::to_string))
             .unwrap_or_default();
+        if r.path().ends_with("/review-complete") {
+            return match r.headers.get("authorization").map(String::as_str) {
+                Some("Bearer k") => (201, r#"{"data":{}}"#.into()),
+                _ => (401, r#"{"error":{"status":401}}"#.into()),
+            };
+        }
         if r.path().ends_with("/review_dispatch") {
             let rev = r.json()["revision"].as_u64().unwrap();
             let submitted = e
@@ -968,6 +976,10 @@ fn submit_review_land_emit_the_story_lifecycle_once() {
     let r2 = commit(&a, "g", "2");
     let s2 = json_out(m.chg().args(["submit", "--repo"]).arg(&a));
     assert_eq!(s2["revision"], 2);
+    // The kept key has expired: loopctl answers 401, chg mints afresh and records once.
+    let key2 = PathBuf::from(s2["review_key"].as_str().unwrap());
+    fs::write(&key2, r#"{"dispatch_id":"old","api_key":"stale"}"#).unwrap();
+    fake.take();
     fs::write(&f, "[]").unwrap();
     let rv = json_out(
         m.chg()
@@ -977,6 +989,19 @@ fn submit_review_land_emit_the_story_lifecycle_once() {
             .arg(&a),
     );
     assert_eq!(rv["outcome"], "approved");
+    let records: Vec<Req> = fake
+        .take()
+        .into_iter()
+        .filter(|r| r.path() == "/api/v1/stories/S-1/review-complete")
+        .collect();
+    let auth: Vec<&str> = records
+        .iter()
+        .map(|r| r.headers["authorization"].as_str())
+        .collect();
+    assert_eq!(auth, ["Bearer stale", "Bearer k"]);
+    assert_eq!(records[1].json()["commit_sha"], r2.as_str());
+    assert_eq!(records[1].json()["findings_count"], 0);
+    assert!(fs::read_to_string(&key2).unwrap().contains("disp-1"));
 
     // Not merged yet: land refuses and emits nothing.
     let gh = t.path().join("gh");

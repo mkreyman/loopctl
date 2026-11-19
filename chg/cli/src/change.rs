@@ -6,7 +6,7 @@
 //! | verb | events, all with `sha` = the revision commit |
 //! |---|---|
 //! | `submit --story S` | `submitted {story_id, branch}` (binds the change to S), then a review key |
-//! | `review --findings F` | `review_approved {by: "model"}` for `[]`, else `review_findings {findings, round, dispatch_key}` |
+//! | `review --findings F` | for `[]`, a loopctl review record with the revision's review key, then `review_approved {by: "model"}`; else `review_findings {findings, round, dispatch_key}` |
 //! | `land` | `check_passed {checks, ms}` from the merged PR's required checks, then `landed {merge_sha, pr, base}` |
 //!
 //! A change is one branch. Its state lives in `<git common dir>/chg/changes/<branch>.json`,
@@ -431,6 +431,9 @@ pub fn review(repo: &Path, remote: &str, findings: &Value) -> Result<Reviewed, R
     }
     let round = c.rounds + 1;
     let outcome = if list.is_empty() {
+        // The verdict goes to loopctl as a review record before the event, so a refused
+        // record leaves nothing emitted and a rerun starts clean.
+        record_review(repo, &c, &rev)?;
         emit(
             repo,
             remote,
@@ -460,6 +463,96 @@ pub fn review(repo: &Path, remote: &str, findings: &Value) -> Result<Reviewed, R
         round,
         already: false,
     })
+}
+
+/// The body `POST /stories/:id/review-complete` takes for a clean review of `sha`.
+pub fn review_record_body(sha: &str) -> Value {
+    json!({
+        "review_type": "chg",
+        "findings_count": 0,
+        "fixes_count": 0,
+        "disproved_count": 0,
+        "commit_sha": sha,
+        "summary": "chg review: no findings"
+    })
+}
+
+/// The `api_key` of a kept review-dispatch answer.
+pub fn api_key_of(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v["api_key"].as_str().map(str::to_string))
+}
+
+/// Mints the review key of `(change, n)` afresh and keeps it where `chg review` reads it.
+/// `Ok(None)`: loopctl already holds a review of that revision (409), so there is nothing
+/// to record with a key.
+fn remint_review_key(
+    repo: &Path,
+    cfg: &outbox::Config,
+    change: &str,
+    n: u64,
+) -> Result<Option<String>, String> {
+    let slug = git::origin_slug(repo).ok_or("the repo has no origin to name it")?;
+    let r = events::review_dispatch(cfg, &slug, change, n)?;
+    match r.status {
+        200 | 201 => {
+            let body = r.body.trim();
+            keep_review_key(&review_key_path(repo, change, n)?, body)?;
+            api_key_of(body)
+                .map(Some)
+                .ok_or_else(|| "loopctl's review key answer holds no api_key".to_string())
+        }
+        409 => Ok(None),
+        s => Err(format!("minting a review key: HTTP {s} {}", r.code())),
+    }
+}
+
+/// Records a clean review of `rev` in loopctl with the revision's review key, the child of
+/// the source's chg root that `chg submit` kept (US-47.5). Without it every landing is
+/// escalated `review_missing`. A change bound to no story has nothing to record. A key
+/// that is absent, or that loopctl no longer accepts (401: expired or revoked), is minted
+/// afresh once; when loopctl answers the mint with 409, it already holds this revision's
+/// review and there is nothing left to record.
+fn record_review(repo: &Path, c: &Change, rev: &Revision) -> Result<(), Refusal> {
+    let Some(story) = c.story_id.as_deref() else {
+        return Ok(());
+    };
+    let cfg =
+        outbox::load()?.ok_or_else(|| format!("{} is absent", outbox::config_path().display()))?;
+    let url = cfg.url();
+    let target = format!("/api/v1/stories/{story}/review-complete");
+    let body = review_record_body(&rev.sha).to_string();
+    let post = |key: &str| outbox::post_bearer(&url, &target, key, body.as_bytes());
+    let kept = fs::read_to_string(review_key_path(repo, &c.change_id, rev.n)?)
+        .ok()
+        .and_then(|t| api_key_of(&t));
+    let r = match kept {
+        Some(key) => {
+            let r = post(&key)?;
+            if r.status != 401 {
+                r
+            } else {
+                match remint_review_key(repo, &cfg, &c.change_id, rev.n)? {
+                    Some(fresh) => post(&fresh)?,
+                    None => return Ok(()),
+                }
+            }
+        }
+        None => match remint_review_key(repo, &cfg, &c.change_id, rev.n)? {
+            Some(fresh) => post(&fresh)?,
+            None => return Ok(()),
+        },
+    };
+    match r.status {
+        200 | 201 => Ok(()),
+        // One verdict per reviewer dispatch: a rerun after a crash finds it recorded.
+        409 if r.code() == "chg_review_already_recorded" => Ok(()),
+        s => Err(Refusal::Failed(format!(
+            "loopctl refused the review record: HTTP {s} {}",
+            r.code()
+        ))),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -650,6 +743,32 @@ fn gh_json(args: &[&str]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clean_review_record_names_the_revision_and_balances_its_counts() {
+        let sha = "3f786850e387550fdab836ed7e6dc881de23001b";
+        let b = review_record_body(sha);
+        assert_eq!(b["commit_sha"], sha);
+        assert_eq!(b["review_type"], "chg");
+        // loopctl refuses a record whose fixes + disproved differ from findings.
+        assert_eq!(b["findings_count"], 0);
+        assert_eq!(b["fixes_count"], 0);
+        assert_eq!(b["disproved_count"], 0);
+    }
+
+    #[test]
+    fn the_api_key_is_read_from_a_kept_answer() {
+        let t = r#"{"dispatch_id":"d","api_key":"lc_abc","expires_at":"x"}"#;
+        assert_eq!(api_key_of(t).as_deref(), Some("lc_abc"));
+        assert_eq!(api_key_of(r#"{"dispatch_id":"d"}"#), None);
+        assert_eq!(api_key_of("not json"), None);
+    }
+
+    #[test]
+    fn a_review_key_with_a_quote_is_not_sent() {
+        let e = outbox::post_bearer("http://127.0.0.1:9", "/x", "a\"b", b"{}").unwrap_err();
+        assert!(e.contains("not a bearer token"), "{e}");
+    }
 
     #[test]
     fn change_ids_are_valid_and_distinct() {
