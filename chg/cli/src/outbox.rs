@@ -312,10 +312,63 @@ fn curl(
 
 /// A POST of `body` to `<url><path>` with `Authorization: Bearer <key>`. The key goes to
 /// curl as a config line on stdin, never on its command line, where `ps` would show it.
+///
+/// loopctl's authenticated routes demand a witness header (US-26.5.2): the caller's last
+/// known signed tree head, or, once per key, `X-Loopctl-STH-Bootstrap: true`. chg keeps no
+/// STH, so it bootstraps; when loopctl refuses that because the key's grace is already
+/// spent (`412 witness_bootstrap_already_consumed`), its answer carries the current head in
+/// `x-loopctl-current-sth`, and the request is sent once more with it. Only that code
+/// retries: the witness plug halts before the operation runs, while a granted bootstrap
+/// also carries the header on whatever the operation itself answers, so a retry keyed on
+/// status alone would run the operation twice.
 pub fn post_bearer(url: &str, path: &str, key: &str, body: &[u8]) -> Result<Reply, String> {
     if key.is_empty() || key.contains(['"', '\\', '\n', '\r']) {
         return Err("the review key is not a bearer token".to_string());
     }
+    let (r, sth) = post_bearer_once(url, path, key, body, "X-Loopctl-STH-Bootstrap: true")?;
+    match sth {
+        Some(sth)
+            if r.status == 412
+                && r.code() == "witness_bootstrap_already_consumed"
+                && sth_shaped(&sth) =>
+        {
+            let (again, _) = post_bearer_once(
+                url,
+                path,
+                key,
+                body,
+                &format!("X-Loopctl-Last-Known-STH: {sth}"),
+            )?;
+            Ok(again)
+        }
+        _ => Ok(r),
+    }
+}
+
+/// `<position>:<22 base64url chars>`, the shape loopctl sends and accepts. Anything else is
+/// never echoed back as a header.
+pub fn sth_shaped(sth: &str) -> bool {
+    match sth.split_once(':') {
+        Some((pos, sig)) => {
+            !pos.is_empty()
+                && pos.len() <= 19
+                && pos.bytes().all(|b| b.is_ascii_digit())
+                && sig.len() == 22
+                && sig
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
+        None => false,
+    }
+}
+
+fn post_bearer_once(
+    url: &str,
+    path: &str,
+    key: &str,
+    body: &[u8],
+    witness: &str,
+) -> Result<(Reply, Option<String>), String> {
     let target = format!("{url}{path}");
     let mut c = Command::new("curl");
     c.args([
@@ -332,8 +385,10 @@ pub fn post_bearer(url: &str, path: &str, key: &str, body: &[u8]) -> Result<Repl
         "Accept: application/json",
         "-H",
         "Content-Type: application/json",
+        "-H",
+        witness,
         "-w",
-        "\n%{http_code}",
+        "\n%header{x-loopctl-current-sth}\n%{http_code}",
         "--data-binary",
     ])
     .arg(String::from_utf8_lossy(body).as_ref())
@@ -357,15 +412,20 @@ pub fn post_bearer(url: &str, path: &str, key: &str, body: &[u8]) -> Result<Repl
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    let (rest, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    let (body, sth) = rest.rsplit_once('\n').unwrap_or(("", rest));
     let status = code
         .trim()
         .parse()
         .map_err(|_| format!("curl POST {target}: no status in its output"))?;
-    Ok(Reply {
-        status,
-        body: body.to_string(),
-    })
+    let sth = Some(sth.trim().to_string()).filter(|s| !s.is_empty());
+    Ok((
+        Reply {
+            status,
+            body: body.to_string(),
+        },
+        sth,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1402,6 +1462,24 @@ pub fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sth_shape_is_position_and_a_22_char_prefix() {
+        assert!(sth_shaped("7:AAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(sth_shaped("123:abc-_EFGHIJKLMNOPQRSTU"));
+        for bad in [
+            "",
+            "7",
+            ":AAAAAAAAAAAAAAAAAAAAAA",
+            "x:AAAAAAAAAAAAAAAAAAAAAA",
+            "7:AAAA",
+            "7:AAAAAAAAAAAAAAAAAAAAA=",
+            "7:AAAAAAAAAAAAAAAAAAAAAA\r\nX: y",
+            "99999999999999999999:AAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(!sth_shaped(bad), "{bad:?}");
+        }
+    }
 
     /// RFC 4231 test case 2.
     #[test]

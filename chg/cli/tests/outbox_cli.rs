@@ -21,6 +21,8 @@ const GIT_ISOLATED: [(&str, &str); 2] = [
 ];
 const SECRET: &str = "s3cret-for-tests";
 const SOURCE: &str = "11111111-2222-3333-4444-555555555555";
+/// A signed tree head as loopctl writes it: `<position>:<22 base64url chars>`.
+const STH: &str = "7:AAAAAAAAAAAAAAAAAAAAAA";
 
 #[derive(Debug, Clone)]
 struct Req {
@@ -101,9 +103,16 @@ impl Fake {
                     (401, r#"{"error":{"code":"invalid_signature"}}"#.to_string())
                 };
                 s.lock().unwrap().push(req);
+                // loopctl sends its current STH as a response header; a handler asks for it
+                // by putting it at `error.current_sth` in the body.
+                let sth = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v["error"]["current_sth"].as_str().map(str::to_string))
+                    .map(|v| format!("x-loopctl-current-sth: {v}\r\n"))
+                    .unwrap_or_default();
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{sth}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
                     text.len()
                 );
             }
@@ -860,8 +869,20 @@ fn lifecycle_fake(fake: &Fake) -> Arc<Mutex<Vec<Value>>> {
             .or_else(|| r.json()["change_id"].as_str().map(str::to_string))
             .unwrap_or_default();
         if r.path().ends_with("/review-complete") {
-            return match r.headers.get("authorization").map(String::as_str) {
-                Some("Bearer k") => (201, r#"{"data":{}}"#.into()),
+            // Like loopctl: a key's bootstrap grace is spent, so a bootstrap is refused
+            // with the current STH, and the request carrying that STH is served.
+            let bootstrap = r.headers.get("x-loopctl-sth-bootstrap").map(String::as_str);
+            let known = r.headers.get("x-loopctl-last-known-sth").map(String::as_str);
+            return match (r.headers.get("authorization").map(String::as_str), bootstrap, known) {
+                (Some("Bearer k"), _, Some(STH)) => (201, r#"{"data":{}}"#.into()),
+                (Some("Bearer k"), Some("true"), None) => (
+                    412,
+                    json!({"error":{"code":"witness_bootstrap_already_consumed","current_sth":STH}})
+                        .to_string(),
+                ),
+                (Some("Bearer k"), _, _) => {
+                    (412, r#"{"error":{"code":"witness_header_missing"}}"#.into())
+                }
                 _ => (401, r#"{"error":{"status":401}}"#.into()),
             };
         }
@@ -998,9 +1019,29 @@ fn submit_review_land_emit_the_story_lifecycle_once() {
         .iter()
         .map(|r| r.headers["authorization"].as_str())
         .collect();
-    assert_eq!(auth, ["Bearer stale", "Bearer k"]);
-    assert_eq!(records[1].json()["commit_sha"], r2.as_str());
-    assert_eq!(records[1].json()["findings_count"], 0);
+    assert_eq!(auth, ["Bearer stale", "Bearer k", "Bearer k"]);
+    // Every record carries a witness header: a bootstrap first, then the STH loopctl gave.
+    let witness: Vec<(Option<&str>, Option<&str>)> = records
+        .iter()
+        .map(|r| {
+            (
+                r.headers.get("x-loopctl-sth-bootstrap").map(String::as_str),
+                r.headers
+                    .get("x-loopctl-last-known-sth")
+                    .map(String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        witness,
+        [
+            (Some("true"), None),
+            (Some("true"), None),
+            (None, Some(STH))
+        ]
+    );
+    assert_eq!(records[2].json()["commit_sha"], r2.as_str());
+    assert_eq!(records[2].json()["findings_count"], 0);
     assert!(fs::read_to_string(&key2).unwrap().contains("disp-1"));
 
     // Not merged yet: land refuses and emits nothing.
@@ -1141,4 +1182,37 @@ fn a_lost_state_write_never_emits_twice_and_no_revision_is_skipped() {
         kinds_on_chain(&origin, &change),
         ["submitted#1", "submitted#2"]
     );
+}
+
+/// A granted bootstrap carries the current STH on whatever the operation answers, so only
+/// the witness plug's own refusal is retried: an operation's 409 or 412 is sent once.
+#[test]
+fn only_a_spent_bootstrap_is_retried_with_the_head() {
+    let fake = Fake::start();
+    fake.answer(|r| match r.headers.get("x-loopctl-last-known-sth") {
+        Some(_) => (201, r#"{"data":{}}"#.into()),
+        None if r.path() == "/spent" => (
+            412,
+            json!({"error":{"code":"witness_bootstrap_already_consumed","current_sth":STH}})
+                .to_string(),
+        ),
+        None if r.path() == "/conflict" => (
+            409,
+            json!({"error":{"code":"chg_review_already_recorded","current_sth":STH}}).to_string(),
+        ),
+        None => (
+            412,
+            json!({"error":{"code":"some_precondition","current_sth":STH}}).to_string(),
+        ),
+    });
+    let post = |p: &str| chg::outbox::post_bearer(&fake.url, p, "k", b"{}").unwrap();
+
+    assert_eq!(post("/spent").status, 201);
+    assert_eq!(fake.take().len(), 2);
+    for (path, status) in [("/conflict", 409), ("/other", 412)] {
+        assert_eq!(post(path).status, status);
+        let sent = fake.take();
+        assert_eq!(sent.len(), 1, "{path} was retried");
+        assert_eq!(sent[0].headers["x-loopctl-sth-bootstrap"], "true");
+    }
 }
