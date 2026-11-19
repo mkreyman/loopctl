@@ -16,6 +16,7 @@ defmodule Loopctl.Changes.FindingsTest do
   alias Loopctl.Changes.FindingFiler
   alias Loopctl.Changes.Findings
   alias Loopctl.Changes.LedgerRow
+  alias Loopctl.Changes.PrReviewOutcomes
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Record
@@ -88,6 +89,46 @@ defmodule Loopctl.Changes.FindingsTest do
 
   defp actions(tenant_id) do
     AdminRepo.all(from a in FindingAction, where: a.tenant_id == ^tenant_id)
+  end
+
+  describe "derive/3 missing reviews" do
+    # The round reaches the ledger after the merge (review-round-counter links the PR, chg's
+    # outbox sends on its own cadence), so a fresh merge with no round yet is not a finding.
+    setup ctx do
+      facts = fn ago ->
+        %{body: nil, merged?: true, merged_at: DateTime.add(@now, -ago, :second), merge_sha: nil}
+      end
+
+      grace = Findings.review_grace_hours() * 3600
+      window = Findings.window_hours() * 3600
+      # 1: fresh. 2: just settled. 3: settled a full window ago, still in view on a second
+      # sweep. 4: past grace + window, out of view.
+      for {n, ago} <- [
+            {1, 3600},
+            {2, grace + 60},
+            {3, grace + window - 60},
+            {4, grace + window + 60}
+          ],
+          do: {:ok, _} = PrReviewOutcomes.record(ctx.hcb, n, facts.(ago))
+
+      :ok
+    end
+
+    defp missing_prs(tenant_id, opts) do
+      Findings.derive(tenant_id, @now, opts)
+      |> Enum.filter(&(&1.kind == "missing_review"))
+      |> Enum.map(& &1.evidence["pr"])
+      |> Enum.sort()
+    end
+
+    test "judges only settled merges, and keeps each in view for a window past the grace", ctx do
+      assert missing_prs(ctx.tenant_id, opts(missing_reviews: true)) == [2, 3]
+    end
+
+    test "is off unless turned on", ctx do
+      assert missing_prs(ctx.tenant_id, opts()) == []
+      refute Findings.missing_reviews?()
+    end
   end
 
   describe "derive/3" do

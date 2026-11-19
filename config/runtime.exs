@@ -168,6 +168,12 @@ case System.get_env("CHG_FINDINGS_DAILY_CAP") &&
   _ -> :ok
 end
 
+# CHG_MISSING_REVIEWS=true turns on missing_review findings (Findings.missing_reviews?/1);
+# anything else leaves them off.
+if System.get_env("CHG_MISSING_REVIEWS") == "true" do
+  config :loopctl, :chg_missing_reviews, true
+end
+
 case System.get_env("CHG_FINDINGS_REPO") do
   repo when is_binary(repo) and repo != "" -> config :loopctl, :chg_findings_repo, repo
   _ -> :ok
