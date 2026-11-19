@@ -120,6 +120,47 @@ enum Top {
         #[command(subcommand)]
         command: EventCmd,
     },
+    /// Submit HEAD as the branch's next revision: push it to `refs/chg/<change>/<n>`, emit
+    /// `submitted` (with `story_id`, which binds the change to that loopctl story), deliver
+    /// it, and keep the revision's review key in `<git dir>/chg/review/` (mode 0600). Prints
+    /// `{change_id, revision, sha, story_id, already, review_key}`. Idempotent. Exit 0; 1
+    /// refused; 2 failed; 3 submitted, but no review key (run `chg review-dispatch`).
+    Submit {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// The loopctl story this change implements.
+        #[arg(long)]
+        story: Option<String>,
+        /// Skip asking loopctl for a review key.
+        #[arg(long)]
+        no_review_key: bool,
+    },
+    /// Record the review of the branch's last revision (HEAD must be it). `--findings` is
+    /// the reviewer's JSON array: `[]` emits `review_approved {by: "model"}`, anything else
+    /// `review_findings`. Exit 0; 1 refused; 2 failed.
+    Review {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        findings: PathBuf,
+    },
+    /// After `gh pr merge`: check that the branch's PR merged with its last revision as
+    /// head and the merge commit is on the base, then emit `check_passed` (from the PR's
+    /// required checks) and `landed {merge_sha}`. Idempotent. Exit 0; 1 refused (not merged
+    /// yet, checks not green, no clean review); 2 failed.
+    Land {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// The change's branch (default: the current one; it may be deleted by now).
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Ask loopctl for the review key of one (change, revision) under the source's chg
     /// root (loopctl US-50.3). Prints loopctl's answer: `{dispatch_id, api_key,
     /// expires_at}`. The key is shown once; hand it to the review job only. A repeat
@@ -582,6 +623,38 @@ fn main() -> ExitCode {
                 }
             }),
         },
+        Top::Submit {
+            repo,
+            remote,
+            story,
+            no_review_key,
+        } => with_worktree(repo, |r| {
+            submit_cmd(r, &remote, story.as_deref(), !no_review_key)
+        }),
+        Top::Review {
+            repo,
+            remote,
+            findings,
+        } => with_worktree(repo, |r| {
+            let v = match std::fs::read_to_string(&findings)
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("chg: review: {}: {e}", findings.display());
+                    return ExitCode::from(2);
+                }
+            };
+            change_out("review", chg::change::review(r, &remote, &v))
+        }),
+        Top::Land {
+            repo,
+            remote,
+            branch,
+        } => with_worktree(repo, |r| {
+            change_out("land", chg::change::land(r, &remote, branch.as_deref()))
+        }),
         Top::ReviewDispatch {
             repo,
             change,
@@ -952,6 +1025,85 @@ fn outbox_status(json: bool) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn change_out<T: serde::Serialize>(verb: &str, r: Result<T, chg::change::Refusal>) -> ExitCode {
+    match r {
+        Ok(v) => {
+            println!("{}", serde_json::to_string(&v).expect("serializes"));
+            ExitCode::SUCCESS
+        }
+        Err(chg::change::Refusal::Refused(e)) => {
+            eprintln!("chg: {verb}: {e}");
+            ExitCode::from(1)
+        }
+        Err(chg::change::Refusal::Failed(e)) => {
+            eprintln!("chg: {verb}: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn submit_cmd(repo: &Path, remote: &str, story: Option<&str>, want_key: bool) -> ExitCode {
+    let s = match chg::change::submit(repo, remote, story) {
+        Ok(s) => s,
+        Err(e) => return change_out::<()>("submit", Err(e)),
+    };
+    let mut out = serde_json::to_value(&s).expect("serializes");
+    let key = if want_key {
+        review_key(repo, &s)
+    } else {
+        Ok(None)
+    };
+    let code = match key {
+        Ok(p) => {
+            out["review_key"] = serde_json::json!(p.map(|p| p.display().to_string()));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "chg: submit: submitted, but no review key: {e}; run `chg review-dispatch --change {} --revision {}`",
+                s.change_id, s.revision
+            );
+            out["review_key"] = serde_json::Value::Null;
+            ExitCode::from(3)
+        }
+    };
+    println!("{out}");
+    code
+}
+
+/// Delivers `submitted`, then asks for the revision's review key and keeps it (0600).
+/// `Ok(None)`: loopctl already holds a review of this revision.
+fn review_key(repo: &Path, s: &chg::change::Submitted) -> Result<Option<PathBuf>, String> {
+    let cfg = chg::outbox::load()?
+        .ok_or_else(|| format!("{} is absent", chg::outbox::config_path().display()))?;
+    let slug = git::origin_slug(repo).ok_or("the repo has no origin to name it")?;
+    let path = chg::change::review_key_path(repo, &s.change_id, s.revision)?;
+    if s.already && path.exists() {
+        return Ok(Some(path));
+    }
+    let mut last = String::new();
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        if let Err(e) = chg::change::deliver_now(&cfg, &slug, &s.change_id) {
+            last = e;
+            continue;
+        }
+        match chg::events::review_dispatch(&cfg, &slug, &s.change_id, s.revision)? {
+            r if r.status == 201 || r.status == 200 => {
+                chg::change::keep_review_key(&path, r.body.trim())?;
+                return Ok(Some(path));
+            }
+            r if r.status == 409 => return Ok(None),
+            // `revision_not_submitted`: loopctl has not applied `submitted` yet.
+            r if r.status == 422 => last = format!("HTTP 422 {}", r.code()),
+            r => return Err(format!("HTTP {} {}", r.status, r.code())),
+        }
+    }
+    Err(last)
 }
 
 fn review_dispatch_cmd(repo: &Path, change: &str, revision: u64) -> ExitCode {

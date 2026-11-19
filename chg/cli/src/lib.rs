@@ -1,6 +1,7 @@
 //! `chg`: the client side of the change system (design §3.4, §3.13).
 
 pub mod adapter;
+pub mod change;
 pub mod check;
 pub mod clone;
 pub mod contract;

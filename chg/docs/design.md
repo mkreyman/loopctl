@@ -122,7 +122,7 @@ The CLI is the only surface, because hooks, Bash-native sessions and the runner 
 
 `chg wait` watches the change's event chain (`git ls-remote` on `refs/chg/<id>/events`, re-armed every 55 s). The ci-status plugin's push-a-prompt-on-settle behaviour is re-pointed at the same chain, so a session learns that its change landed, failed or was reverted without polling.
 
-Built so far for phase 2's record: `chg event emit|sync` (the chain and its delivery), `chg review-dispatch` (a loopctl review key for one revision) and `chg outbox send|status` (docs/outbox.md).
+Built so far for phase 2's record: `chg event emit|sync` (the chain and its delivery), `chg review-dispatch` (a loopctl review key for one revision), `chg outbox send|status` (docs/outbox.md), and a v0 of the lifecycle verbs (`cli/src/change.rs`): `chg submit [--story S]` pushes `refs/chg/<id>/<n>`, emits `submitted` and keeps the revision's review key; `chg review --findings F` emits `review_approved {by: "model"}` or `review_findings`; `chg land`, run after `gh pr merge`, emits `check_passed` from the PR's required checks and `landed {merge_sha}`. Landing itself is still `gh pr merge`, and a change continues only on the machine that submitted it.
 
 ### 3.5 Workspaces in seconds
 

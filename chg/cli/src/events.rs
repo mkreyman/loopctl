@@ -263,6 +263,30 @@ fn fetch_chain(dir: &Path, remote: &str, change: &str) -> Result<Option<String>,
     Ok(Some(tip))
 }
 
+/// Whether the change's chain on `remote` already holds a `kind` event for `revision`:
+/// the check that makes a caller's retry after a lost local write emit nothing twice.
+pub fn on_chain(
+    repo: &Path,
+    remote: &str,
+    change: &str,
+    kind: &str,
+    revision: u64,
+) -> Result<bool, String> {
+    let git_dir = git::common_dir(repo)?;
+    let Some(tip) = fetch_chain(&git_dir, remote, change)? else {
+        return Ok(false);
+    };
+    let commits = git::text(&git_dir, &["rev-list", &tip])?;
+    for c in commits.lines() {
+        let v: Value =
+            serde_json::from_str(&event_at(&git_dir, c)?).map_err(|e| format!("event {c}: {e}"))?;
+        if v["kind"] == kind && v["revision"].as_u64() == Some(revision) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The raw `event.json` of commit `rev`.
 fn event_at(dir: &Path, rev: &str) -> Result<String, String> {
     let mut c = git::cmd(dir);

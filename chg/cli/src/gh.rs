@@ -27,16 +27,41 @@ pub fn text(args: &[&str]) -> Result<String, String> {
 /// `text`, but gh is killed and an error returned once `limit` passes. For short answers
 /// only: stdout is read after exit, so output past the pipe buffer would block gh.
 pub fn text_within(args: &[&str], limit: std::time::Duration) -> Result<String, String> {
+    let r = ran_within(args, limit)?;
+    if !r.ok {
+        return Err(format!(
+            "gh {}: exited {}: {}",
+            args.join(" "),
+            r.status,
+            r.stderr
+        ));
+    }
+    Ok(r.stdout)
+}
+
+/// What a gh run said, whatever its exit status: some gh commands (`pr checks`) report a
+/// state through the status and still print their JSON.
+#[derive(Debug)]
+pub struct Ran {
+    pub ok: bool,
+    pub status: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs `gh <args>` like `text_within`, but returns its output for any exit status. `Err`
+/// only when gh could not run or gave no answer within `limit`.
+pub fn ran_within(args: &[&str], limit: std::time::Duration) -> Result<Ran, String> {
     let mut c = cmd();
     c.args(args);
     run_within(c, &args.join(" "), limit)
 }
 
-fn run_within(mut c: Command, what: &str, limit: std::time::Duration) -> Result<String, String> {
+fn run_within(mut c: Command, what: &str, limit: std::time::Duration) -> Result<Ran, String> {
     use std::io::Read;
     let mut child = c
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run gh: {e}"))?;
     let deadline = std::time::Instant::now() + limit;
@@ -54,14 +79,19 @@ fn run_within(mut c: Command, what: &str, limit: std::time::Duration) -> Result<
             Err(e) => return Err(format!("waiting for gh: {e}")),
         }
     };
-    let mut out = String::new();
+    let (mut out, mut err) = (String::new(), String::new());
     if let Some(mut o) = child.stdout.take() {
         let _ = o.read_to_string(&mut out);
     }
-    if !status.success() {
-        return Err(format!("gh {what}: exited {status}"));
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut err);
     }
-    Ok(out.trim().to_string())
+    Ok(Ran {
+        ok: status.success(),
+        status: status.to_string(),
+        stdout: out.trim().to_string(),
+        stderr: err.trim().to_string(),
+    })
 }
 
 /// `gh <args>` whose stdout is JSON.
@@ -89,12 +119,15 @@ mod tests {
 
         let mut fast = Command::new("echo");
         fast.arg("[1]");
-        assert_eq!(
-            run_within(fast, "fast", Duration::from_secs(5)).unwrap(),
-            "[1]"
-        );
+        let r = run_within(fast, "fast", Duration::from_secs(5)).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.stdout, "[1]");
 
-        let fail = Command::new("false");
-        assert!(run_within(fail, "fail", Duration::from_secs(5)).is_err());
+        // A non-zero exit still returns what was printed, on both streams.
+        let mut fail = Command::new("sh");
+        fail.args(["-c", "echo '[]'; echo why >&2; exit 8"]);
+        let r = run_within(fail, "fail", Duration::from_secs(5)).unwrap();
+        assert!(!r.ok);
+        assert_eq!((r.stdout.as_str(), r.stderr.as_str()), ("[]", "why"));
     }
 }

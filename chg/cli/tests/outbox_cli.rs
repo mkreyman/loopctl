@@ -842,3 +842,278 @@ fn review_dispatch_posts_exactly_change_and_revision() {
         .code(1)
         .stderr(predicates::str::contains("review_already_recorded"));
 }
+
+/// A fake loopctl that applies every event in order and mints a review key once the
+/// revision's `submitted` is applied.
+fn lifecycle_fake(fake: &Fake) -> Arc<Mutex<Vec<Value>>> {
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let ev = events.clone();
+    fake.answer(move |r| {
+        let mut e = ev.lock().unwrap();
+        let change = r
+            .target
+            .split("change_id=")
+            .nth(1)
+            .map(str::to_string)
+            .or_else(|| r.json()["change_id"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        if r.path().ends_with("/review_dispatch") {
+            let rev = r.json()["revision"].as_u64().unwrap();
+            let submitted = e
+                .iter()
+                .any(|x| x["kind"] == "submitted" && x["revision"] == rev);
+            return if submitted {
+                (201, r#"{"dispatch_id":"disp-1","api_key":"k","expires_at":"x"}"#.into())
+            } else {
+                (422, r#"{"error":{"code":"revision_not_submitted"}}"#.into())
+            };
+        }
+        if r.method == "POST" {
+            let v = r.json();
+            if v["event_seq"].as_u64() == Some(e.len() as u64 + 1) {
+                e.push(v);
+            }
+        }
+        let cur = json!({"change_id": change, "applied_through": e.len(), "held": []});
+        if r.method == "GET" {
+            (200, cur.to_string())
+        } else {
+            (200, json!({"status":"ok","outcome":"applied","duplicate":false,"applied_seq":e.len(),"cursor":cur}).to_string())
+        }
+    });
+    events
+}
+
+fn commit(dir: &Path, file: &str, text: &str) -> String {
+    fs::write(dir.join(file), text).unwrap();
+    git(dir, &["add", file]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            file,
+        ],
+    );
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+fn json_out(c: &mut Command) -> Value {
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn submit_review_land_emit_the_story_lifecycle_once() {
+    let fake = Fake::start();
+    let events = lifecycle_fake(&fake);
+    let t = tempfile::tempdir().unwrap();
+    let (origin, _seed) = origin_and_clone(t.path());
+    let a = clone(&origin, &t.path().join("a"));
+    let m = Machine::new("acme/widget", &fake);
+    git(&a, &["checkout", "-q", "-b", "feat/x"]);
+    let r1 = commit(&a, "g", "1");
+
+    let s = json_out(m.chg().args(["submit", "--story", "S-1", "--repo"]).arg(&a));
+    let change = s["change_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        (s["revision"].as_u64(), s["already"].as_bool()),
+        (Some(1), Some(false))
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", &format!("refs/chg/{change}/1")]),
+        r1
+    );
+    let key = PathBuf::from(s["review_key"].as_str().unwrap());
+    assert_eq!(
+        fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(fs::read_to_string(&key).unwrap().contains("disp-1"));
+
+    // A repeat changes nothing.
+    let again = json_out(m.chg().args(["submit", "--story", "S-1", "--repo"]).arg(&a));
+    assert_eq!(again["already"], true);
+    m.chg()
+        .args(["submit", "--story", "S-2", "--repo"])
+        .arg(&a)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("bound to story S-1"));
+
+    // Findings, then a fixed revision with a clean review.
+    let f = t.path().join("findings.json");
+    fs::write(&f, r#"[{"summary":"bug"}]"#).unwrap();
+    let rv = json_out(
+        m.chg()
+            .args(["review", "--findings"])
+            .arg(&f)
+            .arg("--repo")
+            .arg(&a),
+    );
+    assert_eq!(
+        (rv["outcome"].as_str(), rv["round"].as_u64()),
+        (Some("findings"), Some(1))
+    );
+    let r2 = commit(&a, "g", "2");
+    let s2 = json_out(m.chg().args(["submit", "--repo"]).arg(&a));
+    assert_eq!(s2["revision"], 2);
+    fs::write(&f, "[]").unwrap();
+    let rv = json_out(
+        m.chg()
+            .args(["review", "--findings"])
+            .arg(&f)
+            .arg("--repo")
+            .arg(&a),
+    );
+    assert_eq!(rv["outcome"], "approved");
+
+    // Not merged yet: land refuses and emits nothing.
+    let gh = t.path().join("gh");
+    fs::write(&gh, "#!/bin/sh\necho '[]'\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    m.chg()
+        .env("CHG_GH", &gh)
+        .args(["land", "--repo"])
+        .arg(&a)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("no merged PR"));
+
+    // "Merge": master fast-forwards to revision 2; gh names it as PR 9's merge.
+    git(&a, &["push", "-q", "origin", "HEAD:master"]);
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n list) echo '[{{\"number\":9,\"headRefOid\":\"{r2}\",\"mergeCommit\":{{\"oid\":\"{r2}\"}},\"baseRefName\":\"master\"}}]' ;;\n checks) echo '[{{\"name\":\"test\",\"bucket\":\"pass\",\"startedAt\":\"2026-11-19T03:00:00Z\",\"completedAt\":\"2026-11-19T03:00:05Z\"}}]' ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    let l = json_out(m.chg().env("CHG_GH", &gh).args(["land", "--repo"]).arg(&a));
+    assert_eq!(
+        (l["pr"].as_u64(), l["merge_sha"].as_str()),
+        (Some(9), Some(r2.as_str()))
+    );
+    let l2 = json_out(m.chg().env("CHG_GH", &gh).args(["land", "--repo"]).arg(&a));
+    assert_eq!(l2["already"], true);
+
+    m.chg().args(["outbox", "send"]).assert().success();
+    let e = events.lock().unwrap();
+    let seen: Vec<(String, u64, String)> = e
+        .iter()
+        .map(|x| {
+            (
+                x["kind"].as_str().unwrap().to_string(),
+                x["revision"].as_u64().unwrap(),
+                x["sha"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want = [
+        ("submitted", 1, &r1),
+        ("review_findings", 1, &r1),
+        ("submitted", 2, &r2),
+        ("review_approved", 2, &r2),
+        ("check_passed", 2, &r2),
+        ("landed", 2, &r2),
+    ]
+    .map(|(k, n, s)| (k.to_string(), n, s.clone()));
+    assert_eq!(seen, want);
+    assert_eq!(e[0]["data"]["story_id"], "S-1");
+    assert_eq!(e[1]["data"]["dispatch_key"], "disp-1");
+    assert_eq!(e[3]["data"], json!({"by": "model"}));
+    assert_eq!(e[4]["data"], json!({"checks": ["test"], "ms": 5000}));
+    assert_eq!(
+        e[5]["data"],
+        json!({"merge_sha": r2, "pr": 9, "base": "master"})
+    );
+}
+
+fn kinds_on_chain(origin: &Path, change: &str) -> Vec<String> {
+    let tip = format!("refs/chg/{change}/events");
+    git(origin, &["rev-list", "--reverse", &tip])
+        .lines()
+        .map(|c| {
+            let v: Value = serde_json::from_str(&git(
+                origin,
+                &["cat-file", "blob", &format!("{c}:event.json")],
+            ))
+            .unwrap();
+            format!("{}#{}", v["kind"].as_str().unwrap(), v["revision"])
+        })
+        .collect()
+}
+
+#[test]
+fn a_lost_state_write_never_emits_twice_and_no_revision_is_skipped() {
+    let fake = Fake::start();
+    let _events = lifecycle_fake(&fake);
+    let t = tempfile::tempdir().unwrap();
+    let (origin, _seed) = origin_and_clone(t.path());
+    let a = clone(&origin, &t.path().join("a"));
+    let m = Machine::new("acme/widget", &fake);
+    git(&a, &["checkout", "-q", "-b", "feat/y"]);
+    commit(&a, "g", "1");
+    let s = json_out(
+        m.chg()
+            .args(["submit", "--no-review-key", "--repo"])
+            .arg(&a),
+    );
+    let change = s["change_id"].as_str().unwrap().to_string();
+
+    // A story offered after revision 1 went out without one is refused, not dropped.
+    m.chg()
+        .args(["submit", "--story", "S-9", "--no-review-key", "--repo"])
+        .arg(&a)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("binds with the next revision"));
+
+    // The emit happened but the flag was lost (a kill before the save).
+    let state = a.join(".git/chg/changes/feat-y.json");
+    let text = fs::read_to_string(&state).unwrap();
+    fs::write(
+        &state,
+        text.replace("\"submitted\": true", "\"submitted\": false"),
+    )
+    .unwrap();
+    let again = json_out(
+        m.chg()
+            .args(["submit", "--no-review-key", "--repo"])
+            .arg(&a),
+    );
+    assert_eq!(again["revision"], 1);
+    assert_eq!(kinds_on_chain(&origin, &change), ["submitted#1"]);
+
+    // Lost again, and HEAD has moved: revision 1 is settled before revision 2 goes out.
+    let text = fs::read_to_string(&state).unwrap();
+    fs::write(
+        &state,
+        text.replace("\"submitted\": true", "\"submitted\": false"),
+    )
+    .unwrap();
+    commit(&a, "g", "2");
+    let s2 = json_out(
+        m.chg()
+            .args(["submit", "--story", "S-9", "--no-review-key", "--repo"])
+            .arg(&a),
+    );
+    assert_eq!(
+        (s2["revision"].as_u64(), s2["story_id"].as_str()),
+        (Some(2), Some("S-9"))
+    );
+    assert_eq!(
+        kinds_on_chain(&origin, &change),
+        ["submitted#1", "submitted#2"]
+    );
+}
