@@ -1,0 +1,52 @@
+{
+  "id": "US-52.27a",
+  "title": "A machine's runner wakes its idle sessions when a message arrives for them",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_4",
+  "story": {"as_a": "session waiting for input on a fleet machine", "i_want_to": "be woken by my machine's runner when a message arrives for me", "so_that": "a message to an idle session no longer waits until someone types"},
+  "rationale": "PRD R11: the coordination-bus design chose store-and-poll and no WebSockets for agents (docs/repo-coordination-bus.md section 5), which misses the idle session; an idle session is woken by its machine's host daemon, which holds a Phoenix Channels subscription and hands the message over through Claude Code's local cross-session delivery. The runner already holds one: it joins runner:<runner_id> on LoopctlWeb.RunnerSocket (lib/loopctl_web/runner_socket.ex:48) and receives control -> runner pushes (dispatch, merge; lib/loopctl/api_spec/runner_contract.ex:29-39). PRD section 9 leaves the wake mechanism to a measurement on Linux and macOS, with delivery at the next turn as the fallback. Split from US-52.27 so this measurement-gated half never holds back fleet_dash's subscription.",
+  "acceptance_criteria": [
+    {"id": "AC-52.27a.1", "description": "For a committed DM, or a thread message whose story has an assigned_holder_id, whose recipient holder is live (ended_at nil), loopctl pushes inbox_wake {holder_id, session_id, unread} (no body) on runner:<runner_id> of each live runner of the tenant whose joined machine equals the holder's host, only to runners that joined declaring runner contract 1.36.0 (which adds RunnerInboxWake) or later."},
+    {"id": "AC-52.27a.2", "description": "On every runner join, and every 300 s while joined, LoopctlWeb.RunnerChannel pushes inbox_wake for each live holder of the tenant whose host equals the runner's machine and whose inbox (Messages.inbox/3) is not empty, so a wake lost to a node restart, a dropped broadcast or a suspended machine is sent again."},
+    {"id": "AC-52.27a.3", "description": "The runner (runner/lib/loopctl_runner/control.ex handle_message/4) validates inbox_wake against the contract and hands it to LoopctlRunner.SessionWake, which wakes one holder at most once per 60 s, coalescing every wake inside that window into one."},
+    {"id": "AC-52.27a.4", "description": "docs/factory/measurements/idle-session-wake.md records, for Linux (minis) and macOS (mac-mini), whether the runner process can deliver a fixed text into an idle interactive Claude Code session through the local cross-session delivery (a direct write to the session's local socket, then the restricted headless courier of claude-config bin/fleet-nudge.sh) with no approval prompt, whether the recipient can be addressed by its session id, and the delivery latency."},
+    {"id": "AC-52.27a.5", "description": "LoopctlRunner.SessionWake uses, per operating system, the first mechanism the measurement shows working, sending only the fixed text 'You have unread loopctl inbox messages. Read them with the inbox tool now.'; where none worked it uses the NextTurn adapter, which delivers nothing, logs the gap once per runner start, and leaves delivery to the session's next tool round."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.27a.1", "verifies": ["AC-52.27a.1"], "name": "wake routed to the runner on the holder's machine (ChannelCase, runner_channel tests)", "type": "integration", "preconditions": ["fixture(:runner) R1 joined with machine \"minis\" at contract 1.36.0; R2 joined with machine \"x1\"; R3 on minis joined at 1.35.0; holder H on host minis holding story S; ended holder E on minis"], "steps": ["send a DM to H", "send a thread message on S", "send a DM to E (refused, US-52.25)", "send a channel message"], "expected_results": ["R1 gets two inbox_wake pushes for H with no body field; R2 and R3 get none; nothing for E or the channel message"]},
+    {"id": "TC-52.27a.2", "verifies": ["AC-52.27a.2"], "name": "join and periodic reconciliation re-send lost wakes (ChannelCase)", "type": "integration", "preconditions": ["holder H on minis with one unacked DM sent while no runner was joined; holder G on minis with an empty inbox"], "steps": ["join R1 (machine minis)", "send :reconcile_inbox to the channel process (the 300 s timer's message)"], "expected_results": ["one inbox_wake for H on join and one on the tick; none for G"]},
+    {"id": "TC-52.27a.3", "verifies": ["AC-52.27a.3"], "name": "runner coalesces wakes per holder (runner ExUnit)", "type": "unit", "preconditions": ["SessionWake with a recording adapter and an injected clock"], "steps": ["deliver 5 inbox_wake for H within 10 s", "advance the clock 61 s and deliver one more", "deliver an inbox_wake missing session_id"], "expected_results": ["the adapter is called twice for H; the malformed payload is refused by contract validation and never reaches the adapter"]},
+    {"id": "TC-52.27a.4", "verifies": ["AC-52.27a.4", "AC-52.27a.5"], "name": "adapter selection follows the recorded measurement (runner ExUnit)", "type": "unit", "preconditions": ["runner config with wake adapters {linux: Courier, macos: NextTurn} as the measurement file records; a fake courier executable that records its argv"], "steps": ["SessionWake.wake(H) on linux", "SessionWake.wake(H) on macos twice"], "expected_results": ["linux: the courier runs once with the fixed text and H's session id and no other text; macos: nothing runs and one gap log line is written for the runner's life"]}
+  ],
+  "technical_notes": [
+    "Trigger: the wake routing runs in the after-commit step US-52.27 adds to Messages (AC-52.27.1), never inside the send's transaction.",
+    "Runner channel: RunnerChannel subscribes to a per-runner wake topic in handle_info(:after_join) (lib/loopctl_web/runner_channel.ex:209, Presence.track :229) and pushes inbox_wake like merge (:280-289); the runner's machine is the joined RunnerJoin machine field (runner_contract.ex RunnerJoin; runner side join_payload/4 in loopctl-runner lib/loopctl_runner/control.ex:436-470, at runner/ after release 2). Holder host and session_id: holders.host and holders.session_id (US-52.13). Wake routing lookup: live holders of the message's recipient, then Runners.pool/1 (runners.ex:147) entries whose meta machine equals the host.",
+    "Contract: add RunnerInboxWake (holder_id, session_id, unread integer >= 1) and the control -> runner event inbox_wake to lib/loopctl/api_spec/runner_contract.ex (event table :29-39, @version :436, event map :4605-4611), bump to 1.36.0 (after release 3's 1.35.0, US-52.15), regenerate the export the runner reads; the runner's catch-all handle_message/4 (control.ex:1573) keeps ignoring it on an older runner, so either side may deploy first (R7).",
+    "Security: the wake carries no body, so a session that registered a false host (holders.host is session-reported, PRD R4) can at most cause a wake on the wrong machine, which finds no such session; the message itself is read only with the recipient's own credential (US-52.24).",
+    "Measurement method: on each OS start an interactive claude session in tmux, let it go idle, then from a process running as the runner's user try (a) a direct write to the session's local delivery socket and (b) the courier flag set at claude-config bin/fleet-nudge.sh:1153-1161 (--tools SendMessage,ListAgents, --strict-mcp-config, --disallowedTools mcp__*, cwd ~/.claude/courier-cwd); a macOS courier started outside the GUI session needs the published credential file (bin/mac-creds-publish.sh, session-message.sh:51-58). Record the claude version, the result and the latency. PRD section 9 open question; the result decides the adapter map in runner config, and the gap, if any, is written in the same file.",
+    "Courier adapter: runner/lib/loopctl_runner/session_wake/courier.ex runs the courier with stdin closed (fleet-nudge.sh:1144-1152 explains why) under the runner's existing process-group supervision (loopctl-runner lib/loopctl_runner/process_group.ex), with a 120 s timeout; a failed wake is logged and dropped, because the reconciliation tick (AC-52.27a.2) sends it again."
+  ],
+  "dependencies": [
+    "US-52.23",
+    "US-52.24",
+    "US-52.27"
+  ],
+  "non_goals": [
+    "fleet_dash's subscription to the message stream: US-52.27.",
+    "The session-side hooks (SessionStart inbox block, tool-round reads) and deleting session-message.sh: US-52.28.",
+    "Capacity reports and CI runner registration on the runner socket: release 7 (README names table: host daemon).",
+    "Keeping one machine per region running so subscriptions survive Fly suspend: release 10 (PRD R9); until then the reconciliation tick covers a dropped socket."
+  ],
+  "failure_modes": {"partition": "AC-52.27a.2: a runner cut off from loopctl misses wakes; when it rejoins, the join pushes a wake for every holder on its machine with unread messages, and the messages themselves were stored before any push (AC-52.27.1).", "state": "AC-52.27a.1: sockets and wakes carry only hints; the message and its read position stay in Postgres, so losing a node, a socket or a wake loses no message.", "retry": "AC-52.27a.3: duplicate wakes inside 60 s collapse into one, and an extra wake only makes the session read an inbox whose cursor already prevents a second delivery.", "slow": "AC-52.27a.5: a slow or failed courier is dropped after its timeout and the 300 s reconciliation (AC-52.27a.2) wakes again; where waking does not work the session still gets the message at its next tool round.", "reach": "AC-52.27a.1: the wake reaches the session's machine by matching holders.host to the runner's joined machine and travels over PubSub to whichever node holds that runner's socket."},
+  "definition_of_done": [
+    "docs/factory/measurements/idle-session-wake.md exists with a result for minis and for mac-mini, and the runner config's adapter map matches it.",
+    "On minis: an interactive session left idle receives the wake text within 30 s of a message_send to its holder id from a session on x1, and its next turn reads the message with inbox."
+  ],
+  "defaults": [
+    "Reconciliation interval 300 s; per-holder wake coalescing window 60 s; courier timeout 120 s (owner may change).",
+    "Wake text: 'You have unread loopctl inbox messages. Read them with the inbox tool now.'"
+  ],
+  "expected_size": {"insertions": 420, "files": 9},
+  "estimated_tokens": 380000
+}

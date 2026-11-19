@@ -41,7 +41,7 @@
     "Opening an ad-hoc item on a branch, its epic and the MCP heartbeat that opens it: US-52.18 (release 3); this story adds no second open route and no branch hook.",
     "fleet_dash's display of ad-hoc items: fleet_dash reads factory_overview (release 5).",
     "Closing an ad-hoc item when its branch merges: release 5's close verb, or the PR's existing delivery path.",
-    "Two sessions on one repo colliding: US-52.49's end-to-end path."
+    "Two sessions on one repo colliding: US-52.20's end-to-end path (release 3), which US-52.45 extends with the checkpoint and move refusals."
   ],
   "failure_modes": {"partition": "AC-52.46.1: an interactive session that disappears loses its claim at lease end, and its item waits reserved for an interactive holder instead of being taken by the loop; its later checkpoints are stored fenced (US-52.42).", "state": "AC-52.46.4: the pulled worktree is built from the item's checkpoint in loopctl and the git remote; nothing is read from the source machine.", "retry": "AC-52.46.3: the migration writes only where pending_move is nil, so a re-run after a failed deploy writes nothing; a repeated pull claims the item the caller already holds as release 3's idempotent claim answers.", "slow": "AC-52.46.4: work_item_pull claims last, so a slow fetch or apply holds no claim.", "reach": "AC-52.46.2: a re-registered session reaches its reserved item by re-opening its branch from any machine; fleet_dash reaches it by item id."},
   "defaults": [

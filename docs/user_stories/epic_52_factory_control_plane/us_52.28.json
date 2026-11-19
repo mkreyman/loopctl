@@ -30,18 +30,18 @@
     "Credential: the hook reads $HOME/.claude/loopctl-holders/<session_id>.key, matching the session_id in the hook's stdin JSON to the MCP process's CLAUDE_SESSION_ID (US-52.13 AC-52.13.8). A session whose MCP server has not registered yet has no file and the hook does nothing.",
     "Callers of session-message.sh to move: bin/fleet-watch.py, hooks/lib/session-triage.sh, skills/shepherd/SKILL.md, CLAUDE.md line 31, README.md, docs/harness/xps13.md, bin/install-mac-creds-publish.sh and bin/mac-creds-publish.sh comments, hooks/tests/fleet-name-canary.sh (grep -rln session-message.sh in claude-config, 2026-11-19).",
     "Nudger: bin/fleet-nudge.sh remote arm :265-340 (args :271, remote= :325, ssh :326-334); delivery is already local-only (:77, :975), so what goes is the ssh observation hop and its --local-only flag plumbing.",
-    "e2e: add the path under e2e/ in the shape release 2's harness uses; the idle session is started on B by the harness, not by the runner; the wake adapter used on B is whatever US-52.27's measurement selected.",
+    "e2e: add the path under e2e/ in the shape release 2's harness uses; the idle session is started on B by the harness, not by the runner; the wake adapter used on B is whatever US-52.27a's measurement selected.",
     "loopctl docs: docs/repo-coordination-bus.md section 5 (store-and-poll, no websockets) and section 3.3 (TEAM CHANNEL, turn-boundary pull) are rewritten to point at PRD R11: inbox by cursor, tool-round hook, runner wake, fleet_dash subscription."
   ],
   "dependencies": [
     "US-52.24",
     "US-52.25",
-    "US-52.27"
+    "US-52.27a"
   ],
   "non_goals": [
     "Deleting handoff posts, the handoff tool and channel_claims: release 7 (README names table: move verb).",
     "Moving the hooks into this repo: release 8 (README release block 52.50-52.55).",
-    "Waking idle sessions (the runner side): US-52.27."
+    "Waking idle sessions (the runner side): US-52.27a."
   ],
   "failure_modes": {"partition": "AC-52.28.3: when loopctl is unreachable the hook exits 0 with nothing and acks nothing, so every message is delivered at a later tool round once the link returns.", "state": "AC-52.28.1 and AC-52.28.3: hooks hold only a copy of the credential and a poll timestamp; read positions live in loopctl's channel_cursors, so a session restart or a new machine reads on from the server.", "retry": "AC-52.28.3: the hook acks only after printing, so a crash between read and ack re-delivers on the next round and never loses; AC-52.28.7 asserts the second read after an ack is empty.", "slow": "AC-52.28.3: a 3 s curl timeout bounds each poll and the 20 s interval bounds how often a busy session pays it.", "reach": "AC-52.28.7: a session on another machine is reached by holder id through loopctl and woken by its own machine's runner, proven end to end."},
   "definition_of_done": [

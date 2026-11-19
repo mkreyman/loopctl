@@ -15,7 +15,8 @@ stories are re-grounded against the code the releases before it left behind: eac
 is re-checked, and any story that a merged release made wrong is fixed before it is built.
 
 Story ids are allocated in blocks per release; a release uses its block from the start, and an
-unused tail stays unassigned.
+unused tail stays unassigned. A story split after its block was written keeps its number and
+the new half takes a letter suffix (52.27a, 52.31a).
 
 | release | branch | PRD requirements | story block |
 |---|---|---|---|
@@ -40,8 +41,8 @@ listed in that release's section below.
 |---|---|---|
 | runner source in this repo | `runner/` (the loopctl-runner mix project, history preserved) | release 2 |
 | chg source in this repo | `chg/` (the Rust workspace `chg/cli` and the adapters `chg/adapters/*`, history preserved) | release 2 |
-| release manifest | `release/manifest.toml`: one compatible version of server, runner, chg CLI, each chg adapter and MCP package; the factory pack joins it in release 8 | release 2 |
-| end-to-end suite | `e2e/`, run by `mix e2e` against the sandbox repo `mkreyman/loopctl-e2e-sandbox`, nightly and on every factory release | release 2 |
+| release manifest | `release/manifest.toml`: one compatible version of server, runner, chg CLI, each chg adapter and MCP package; the factory pack joins it in release 8 (52.52) | release 2 |
+| end-to-end suite | `e2e/`, run by `mix e2e` against the sandbox repo `mkreyman/loopctl-e2e-sandbox`, nightly and on every factory release. It is a black box against loopctl.com and the two fleet runners 52.9 enrols for the sandbox (`e2e/config/sandbox.exs`): a scenario reads state only through the API and GitHub, and the suite builds no server and opens no database connection | release 2 |
 | holder | table `holders`, schema `Loopctl.Holders.Holder`, context `Loopctl.Holders`: one row per session (`kind`: `runner_session`, `interactive`, `cloud`), with `agent_id`, `session_id`, `host`, `worktree`, `dispatch_id`, `lease_until`, `last_seen_at`, `ended_at`, `ended_reason` | release 3 |
 | holder credential | an `api_keys` row at role `:agent` carrying `holder_id`, minted by `POST /api/v1/holders` (MCP `holder_register`); a runner session's holder is minted by placement instead, because the runner is the one server-attested source of its host. From release 4 the MCP server also writes it to `$HOME/.claude/loopctl-holders/<session_id>.key` (mode 0600) for the session's hooks | release 3, 4 |
 | the claim's holder | `stories.assigned_holder_id`; a claim by any other holder is refused | release 3 |
@@ -180,7 +181,14 @@ How the lanes share one branch:
 
 ## Design coverage
 
-No screen.
+Releases 1-10 add no screen. Release 11 adds one public page and changes the public pages'
+links; each is bound to `docs/design-system.md`:
+
+| screen | change | design-system sections | story |
+|---|---|---|---|
+| `GET /docs/delivery-loop` (new) | renders `docs/agent-delivery-loop.md` with the docs page's nav and WikiShowLive's prose classes | 2 Color Palette (dark only), 3 Typography, 4 Layout Principles, 5 Navigation (Landing Page) and Code Blocks | 52.65 |
+| landing and docs top nav | the GitHub link becomes the npm package link, labelled npm, in the template and in the design system's drawing | 5 Navigation (Landing Page) | 52.65 |
+| terms and privacy Contact sections | the operator address replaces GitHub issues | 3 Typography | 52.65 |
 
 ## What "done" means, for every story
 
@@ -264,7 +272,7 @@ No screen.
 | 52.16 | Event log: every event names its holder and its reason | 52.13, 52.14 |
 | 52.17 | Work item notes; orchestrator_state folded in and deleted | 52.13, 52.14, 52.16 |
 | 52.18 | Interactive work on a branch becomes a work item | 52.13, 52.14, 52.16 |
-| 52.19 | Session holder lease measured and set | 52.13, 52.14, 52.16 |
+| 52.19 | Session holder lease measured and set | 52.13, 52.14, 52.15, 52.16 |
 | 52.20 | E2E: two sessions on one machine and one repo never collide | 52.13-52.19 |
 
 **Names it adds:**
@@ -281,7 +289,7 @@ No screen.
 - **Notes and work items:** `story_notes`, the context `Loopctl.WorkItems`, `Stories.next_number/2` and `Stages.open_started_in_tenant_transaction/4`.
 - **Lease:** `HOLDER_HEARTBEAT_SECONDS`, `HOLDER_LEASE_SECONDS`, `mix loopctl.session_gaps` and `docs/factory/measurements/session-holder-lease.md`.
 - **Error codes:** `held_by_other_holder`, `holder_lease_expired`, `branch_held`, `holder_credential_required` and `no_target_epic`.
-- **Runner contract:** version 1.34.0.
+- **Runner contract:** version 1.35.0 (release 2's 52.8 takes 1.34.0).
 
 **Hub files, with their owner story:**
 
@@ -316,8 +324,9 @@ No screen.
 | 52.24 | inbox: a session reads its DMs, its items' threads and its channel by cursor | 52.22 |
 | 52.25 | A DM never outlives its session | 52.23, 52.24 |
 | 52.26 | No per-session rate cap; one tenant-wide, cluster-global limit | — |
-| 52.27 | Real-time delivery: subscribers see a message on commit, and a machine's runner wakes its idle sessions | 52.23, 52.24 |
-| 52.28 | Sessions read their inbox at start and at each tool round; the old cross-machine paths are deleted | 52.24, 52.25, 52.27 |
+| 52.27 | Real-time delivery: fleet_dash subscribers see every message on commit | 52.23, 52.24 |
+| 52.27a | A machine's runner wakes its idle sessions when a message arrives for them | 52.23, 52.24, 52.27 |
+| 52.28 | Sessions read their inbox at start and at each tool round; the old cross-machine paths are deleted | 52.24, 52.25, 52.27a |
 
 **Names it adds:**
 - **Locks (52.21):** the table `channel_locks`, the schema `Loopctl.Coordination.ChannelLock` and the index `channel_locks_slot_uidx`.
@@ -330,7 +339,8 @@ No screen.
   - `LoopctlWeb.MessageSocket` at `/socket/messages`;
   - `LoopctlWeb.MessageChannel` on the topic `messages:tenant`;
   - the runner event `inbox_wake` and `LoopctlRunner.SessionWake`;
-  - `docs/factory/measurements/idle-session-wake.md`.
+  - `docs/factory/measurements/idle-session-wake.md`;
+  - runner contract 1.36.0, which adds `RunnerInboxWake` (52.27a).
 - **Session side:** the hook `inbox-on-tool.sh`, `INBOX_POLL_SECONDS`, and the holder credential file `$HOME/.claude/loopctl-holders/<session_id>.key`.
 
 **Hub files, with their owner story:**
@@ -342,7 +352,7 @@ No screen.
 | `channel_post_controller.ex` | 52.22 | 52.23, 52.26 |
 | `mcp-server/index.js`, `mcp-server/README.md` | 52.23 | 52.24, 52.25, 52.28 |
 | `router.ex` | 52.23 | 52.24 |
-| `runner_contract.ex` | 52.27 | — |
+| `runner_contract.ex` | 52.27a | — |
 | `CHANGELOG.md` | 52.21 | every other story |
 
 **API parity:**
@@ -361,6 +371,7 @@ No screen.
 | 52.29 | Work-item timeline | — |
 | 52.30 | Factory overview | — |
 | 52.31 | Holders resolve escalations; self-resolution is refused | — |
+| 52.31a | A chg landing on an independent path is held until it is independently verified | 52.12, 52.31 |
 | 52.32 | Intervention verbs: requeue, retriage, cancel, close | 52.31 |
 | 52.33 | Intake pause and resume | 52.30 |
 | 52.34 | Stronger-holder escalation sweep | 52.31, 52.32 |
@@ -369,9 +380,10 @@ No screen.
 **Names it adds:**
 - **Modules:**
   - `Loopctl.Delivery.Timeline`, `Overview`, `Interventions` and `EscalationSweep`;
-  - `Loopctl.Workers.EscalationSweepWorker`, which replaces `EscalationDigestWorker`.
+  - `Loopctl.Workers.EscalationSweepWorker`, which replaces `EscalationDigestWorker`;
+  - `Loopctl.Workers.ChgIndependentPathsWorker` (52.31a).
 - **Stage machine:**
-  - the edges `:holder_resolution`, `:retriage`, `:cancelled`, `:closed` and `:holders_exhausted`;
+  - the edges `:holder_resolution`, `:retriage`, `:cancelled`, `:closed`, `:holders_exhausted` and `:independent_unverified` (52.31a);
   - the release cause `:intervention`.
 - **Error codes:** `self_resolve_blocked`, `holder_required`, `review_missing_unreviewed`, `self_intervention_blocked`, `not_requeueable`, `already_landed`, `no_intake_source` and `independent_verification`.
 - **Columns and indexes:**
@@ -388,8 +400,9 @@ No screen.
 |---|---|---|
 | `router.ex` | 52.29 | 52.30, 52.32, 52.33 |
 | `mcp-server/index.js`, `mcp-server/README.md` | 52.29 | 52.30-52.33 |
-| `stage_machine.ex` | 52.31 | 52.32, 52.34 |
-| `escalations.ex` | 52.31 | 52.32 |
+| `stage_machine.ex` | 52.31 | 52.31a, 52.32, 52.34 |
+| `escalations.ex` | 52.31 | 52.31a, 52.32 |
+| CLAUDE.md trust-model section | 52.31 | 52.32 |
 | `CHANGELOG.md` | 52.31 | 52.32-52.34 |
 | `docs/agent-delivery-loop.md` | 52.31 | 52.34 |
 | `FLY_SECRETS.md` | 52.34 | — |
@@ -417,7 +430,7 @@ No screen.
 - **Modules and events:** `Loopctl.Delivery.IntakeRecheck`, the event `rechecked`, and the candidate predicates `:rechecked` and `:intake_not_paused`.
 - **Stage machine:** the edges `:recheck_fixed`, `:recheck_duplicate` and `:recheck_stale`; the verdicts `:already_fixed`, `:duplicate` and `:no_longer_reproduces`.
 - **Evidence:** `issue_closures.evidence` and `PullRequestSource.closing_references/3`.
-- **Dispatch:** the spec `recheck@1` (message `recheck_result`, payload `:recheck_payload`), with `RECHECK_WALL_CLOCK_SECONDS` and `RECHECK_MAX_TURNS`.
+- **Dispatch:** the spec `recheck@1` (message `recheck_result`, payload `:recheck_payload`), with `RECHECK_WALL_CLOCK_SECONDS` and `RECHECK_MAX_TURNS`, and runner contract 1.37.0, which adds the recheck kind.
 
 **Hub files, with their owner story:**
 
@@ -441,7 +454,7 @@ No screen.
 | 52.44 | A runner session hands over mid-stage; the target machine resumes | 52.42, 52.43 |
 | 52.45 | Only Mark crosses the interactive boundary (user key or one-shot grant) | 52.40, 52.43 |
 | 52.46 | Interactive work is a work item: start, pull, never taken by the loop | 52.42, 52.44, 52.45 |
-| 52.47 | Host daemon capacity reports; placement by readiness and load | — |
+| 52.47 | Host daemon capacity reports; placement by readiness and load | 52.44 |
 | 52.48 | The host daemon owns the GitHub Actions runner pool | 52.47 |
 | 52.49 | Handoffs and channel_claims deleted; open rows become work items | 52.41, 52.45, 52.46 |
 
@@ -455,6 +468,7 @@ No screen.
 - **Host daemon:** `LoopctlRunner.HostReport`, `LoopctlRunner.CiPool`, `runner/ci/` and `PLACEMENT_MAX_LOAD_PER_CORE` (1.0).
 - **Handoff migration:** `Loopctl.Factory.MigrateHandoffs`.
 - **Measurements:** `docs/factory/measurements/release-7.md` (`bound_bytes`, `grant_rule`).
+- **Runner contract:** 1.38.0 (52.44), then 1.39.0 (52.47), in that order: 52.47 depends on 52.44 so two lanes never claim one version.
 
 **Hub files, with their owner story:**
 
@@ -484,7 +498,7 @@ No screen.
 | 52.50 | claude-config's factory half moves into factory/ with its history, traced item by item | — |
 | 52.51 | Factory policy: every delivery-loop rule value decided once, on the server | — |
 | 52.52 | The factory pack: a plugin marketplace built from factory/src and the server policy | 52.50, 52.51 |
-| 52.53 | Review rounds are counted on the work item; the counter plugin becomes a thin call | 52.50, 52.51 |
+| 52.53 | Review rounds are counted on the work item; the counter plugin becomes a thin call | 52.50, 52.51, 52.52 |
 | 52.54 | claude-config installs the pack and deletes what moved and what retired | 52.52, 52.53 |
 | 52.55 | The e2e suite runs on the pack alone and proves a rule change ships from this repo | 52.52, 52.53 |
 
@@ -498,7 +512,8 @@ No screen.
   - `hooks/lib/policy.sh` and `hooks/lib/loopctl.sh`;
   - the stable link `~/.claude/factory`.
 - **Review rounds (52.53):** `Loopctl.Factory.ReviewRounds`, the routes `/api/v1/review_rounds` and `/api/v1/review_rounds/:round_id/void`, and the error codes `review_ceiling_reached`, `review_round_not_found`, `attestation_reason_required` and `work_item_not_found`.
-- **E2E (52.55):** `E2E.ConfigDir`, `E2E.WriteScope` and `FACTORY_POLICY_PATH`.
+- **Release manifest (52.52):** the component `[components.factory_pack]`.
+- **E2E (52.55):** `E2E.ConfigDir` and `E2E.WriteScope`.
 
 **E2E paths:** `policy_change_ships`, `review_count_moves` and `previous_pack`. They are R10's done test.
 
@@ -508,6 +523,7 @@ No screen.
 |---|---|---|
 | `mcp-server/index.js`, `mcp-server/README.md` | 52.51 | 52.53 |
 | `.github/workflows/ci.yml` | 52.50 | 52.52 |
+| `release/manifest.toml` | 52.52 | — |
 | `CHANGELOG.md` | 52.51 | 52.53 |
 
 **API parity:**

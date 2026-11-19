@@ -12,7 +12,7 @@
     {"id": "AC-52.35.3", "description": "A's own resolve_escalation(to: queued) answers 409 self_resolve_blocked, and the item is still at escalated with an unchanged stage row."},
     {"id": "AC-52.35.4", "description": "B's resolve_escalation(to: queued) answers 200; the item then reaches done (bounded, 30 minutes) through placement, review, merge and verify on the sandbox repo, with a merged sandbox PR."},
     {"id": "AC-52.35.5", "description": "work_item_timeline for the item lists, in order, A's escalation, B's holder_resolution and the transition into done, each with its actor and a non-empty reason."},
-    {"id": "AC-52.35.6", "description": "factory_overview for the sandbox project counts the item in throughput done for window_days 1, and its waiting.escalated holds no item of this run."},
+    {"id": "AC-52.35.6", "description": "The scenario reads factory_overview for the sandbox project with window_days 1 before A escalates and again after the item is done, and throughput.done has grown by at least one; whether this item left escalated is read from its own work_item_timeline (its stage is done and no escalation follows B's holder_resolution), never from the overview's counts, which other runs in the shared sandbox project also move."},
     {"id": "AC-52.35.7", "description": "The scenario cleans up whatever it created even when it fails (closes the sandbox issue and PR, revokes both holder credentials), and a failure prints the item's full timeline."}
   ],
   "test_cases": [

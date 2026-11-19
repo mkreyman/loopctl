@@ -5,7 +5,7 @@
   "priority": "medium",
   "phase": "factory_release_5",
   "story": {"as_a": "Mark in fleet_dash, or a session that sees a repo flooding the loop", "i_want_to": "pause a repo's intake and resume it later", "so_that": "new issues stop costing triage while the work already in flight carries on, and nothing reported is lost"},
-  "rationale": "PRD R4 lists 'pause or resume a repo's intake' among the intervention verbs. The only switch today is DISPATCH_DRIVER_ENABLED (dispatch_driver.ex:254), which is global and stops in-flight placement too, and revoking the intake source (Intake.revoke_source/3, intake.ex:1263) cuts the webhook so reports are lost. A pause is a per-source fact the triage path reads: the webhook keeps recording, and promotion and triage dispatch skip the source until it resumes.",
+  "rationale": "PRD R4 lists 'pause or resume a repo's intake' among the intervention verbs. The only switch today is DISPATCH_DRIVER_ENABLED (dispatch_driver.ex:254), which is global and stops in-flight placement too, and revoking the intake source (Intake.revoke_source/3, intake.ex:1393) cuts the webhook so reports are lost. A pause is a per-source fact the triage path reads: the webhook keeps recording, and promotion and triage dispatch skip the source until it resumes.",
   "acceptance_criteria": [
     {"id": "AC-52.33.1", "description": "intake_sources gains paused_at (utc_datetime_usec, nullable) and paused_reason (text, at most 1000 codepoints, nullable), set only by Intake.set_paused/4 and Intake.clear_paused/3, never cast by create_changeset/2 or update_source/4."},
     {"id": "AC-52.33.2", "description": "While a source is paused, TriageTriggerWorker.candidates/1 skips its pending_triage records, which stay pending_triage, so they promote on the first run after resume."},
@@ -26,11 +26,11 @@
     {"id": "TC-52.33.7", "verifies": ["AC-52.33.8"], "name": "intake_pause and intake_resume wiring (node --test)", "type": "unit", "preconditions": ["mcp-server tool list; stub apiCall and uuidv4"], "steps": ["call intake_pause({project_id, reason})", "call intake_resume({project_id})"], "expected_results": ["POST /api/v1/projects/<id>/intake/pause and /resume with an intervention_id"]}
   ],
   "technical_notes": [
-    "Source schema: lib/loopctl/intake/source.ex:114-158; add the two fields beside revoked_at (:158). Writers mirror update_source/4's chain-entry-per-change pattern (lib/loopctl/intake.ex:618, append_update at :763), on AdminRepo with the explicit tenant_id predicate the module uses.",
-    "Why not PATCH /intake/sources/:id: IntakeSourceController is role: :user (lib/loopctl_web/controllers/intake_source_controller.ex:46) and @updatable_fields (intake.ex:600) are configuration; a pause is an intervention open to holders (PRD R4), so it is its own pair of writers and routes, and the source row stays the one record of the fact.",
+    "Source schema: lib/loopctl/intake/source.ex:114-158; add the two fields beside revoked_at (:158). Writers mirror update_source/4's chain-entry-per-change pattern (lib/loopctl/intake.ex:748, append_update at :898), on AdminRepo with the explicit tenant_id predicate the module uses.",
+    "Why not PATCH /intake/sources/:id: IntakeSourceController is role: :user (lib/loopctl_web/controllers/intake_source_controller.ex:46) and @updatable_fields (intake.ex:730) are configuration; a pause is an intervention open to holders (PRD R4), so it is its own pair of writers and routes, and the source row stays the one record of the fact.",
     "Promotion: TriageTriggerWorker.candidates/1 (lib/loopctl/workers/triage_trigger_worker.ex:359) adds a join on intake_sources with paused_at IS NULL.",
     "Triage: add :intake_not_paused to Loopctl.Agents.Candidates (lib/loopctl/agents/candidates.ex, beside :single_active_source at :365, which it requires) and to triage@1's predicate list (lib/loopctl/agents/specs/triage_v1.ex).",
-    "Webhook: Intake.receive_github_delivery/2 (intake.ex:1524) authenticates on active_source/1, which reads revoked_at, not paused_at; it is untouched.",
+    "Webhook: Intake.receive_github_delivery/2 (intake.ex:1654) authenticates on active_source/1, which reads revoked_at, not paused_at; it is untouched.",
     "Idempotency: the intervention_id is stored in the chain entry's metadata and checked before the write under the source row lock (SELECT ... FOR UPDATE).",
     "Overview: Overview.for_tenant/2 is provided by US-52.30.",
     "Routes in lib/loopctl_web/router.ex beside /projects/:id/progress (:527); MCP in lib/factory.js (US-52.30) plus declarations and cases in mcp-server/index.js; CHANGELOG.md lists the routes."

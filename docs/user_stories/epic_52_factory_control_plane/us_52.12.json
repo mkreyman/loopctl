@@ -36,7 +36,7 @@
     "US-52.9"
   ],
   "non_goals": [
-    "Judging independent paths on the chg route when a change lands, and the hold that waits for verification: US-52.31 (it needs the holder resolve edge).",
+    "Judging independent paths on the chg route when a change lands, and the hold that waits for verification: US-52.31a (it needs US-52.31's holder resolve edge).",
     "Comparing verifier and implementer by holder identity instead of dispatch lineage: US-52.15 (release 3) switches verify_lineage_separated/4.",
     "A chg-side check before chg lands: loopctl judges the landing it is told about; a pre-land query from chg to loopctl is not in PRD R4.",
     "Server-side effect proof for effect_paths: unchanged."
