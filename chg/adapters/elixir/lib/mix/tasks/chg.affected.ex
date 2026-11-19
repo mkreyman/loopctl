@@ -6,7 +6,9 @@ defmodule Mix.Tasks.Chg.Affected do
 
       mix chg.affected --base <sha>
 
-  It selects by coverage when `chg` hands it a record in `CHG_COVER`
+  A change that touches only comments and documentation (`ChgAdapter.DocOnly`) selects no
+  tests, and its reason names the files treated as doc-only. Otherwise it selects by
+  coverage when `chg` hands it a record in `CHG_COVER`
   (`ChgAdapter.Record.given/1`): the test files whose recorded run executed a module whose
   compiled code differs now, or that read a changed path `chg` names in `CHG_READ` (those
   matching `read_at_runtime`). Otherwise it selects from the module graph and
@@ -22,7 +24,7 @@ defmodule Mix.Tasks.Chg.Affected do
   """
   use Mix.Task
 
-  alias ChgAdapter.{Digest, Graph, Record, Refs, Select}
+  alias ChgAdapter.{Digest, DocOnly, Graph, Record, Refs, Select}
 
   @impl true
   def run(args) do
@@ -38,13 +40,40 @@ defmodule Mix.Tasks.Chg.Affected do
       with {:ok, changed} <- ChgAdapter.changed_paths(base),
            :ok <- ChgAdapter.path_dep_change(base),
            {:ok, graph} <- Graph.read() do
-        case by_coverage(base, changed, graph) do
-          {:error, why} -> by_graph(changed, graph, why)
+        with :code <- doc_only(base, changed, graph),
+             {:error, why} <- by_coverage(base, changed, graph) do
+          by_graph(changed, graph, why)
+        else
+          {:doc_only, files} -> {:subset, DocOnly.reason(files), []}
           selected -> selected
         end
       end
 
     emit(doc)
+  end
+
+  # Doc-only against the base AND against every commit selection would compare with (the
+  # coverage record's, the snapshot reference cache's): selection also counts what changed
+  # since those, so code changed there must not hide behind a doc-only diff. With neither,
+  # selection could not run, and neither does this.
+  defp doc_only(base, changed, graph) do
+    refs =
+      for {:ok, %{sha: sha}} <- [Record.given(base), Refs.read()], do: sha
+
+    judged =
+      for {sha, paths} <- [
+            {base, {:ok, changed}} | Enum.map(refs, &{&1, ChgAdapter.changed_paths(&1)})
+          ] do
+        with {:ok, paths} <- paths, do: DocOnly.judge_tree(paths, sha, graph.external)
+      end
+
+    case judged do
+      [{:doc_only, _} = verdict | rest] when rest != [] ->
+        if Enum.all?(rest, &match?({:doc_only, _}, &1)), do: verdict, else: :code
+
+      _ ->
+        :code
+    end
   end
 
   # Coverage selection when `chg` handed over a usable record.

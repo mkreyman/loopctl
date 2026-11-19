@@ -383,6 +383,67 @@ defmodule ChgAdapter.IntegrationTest do
   defp warning_lines(out),
     do: out |> String.split("\n") |> Enum.filter(&(&1 =~ ~r/^\S+\.exs?:\d+/)) |> Enum.sort()
 
+  test "a doc-only change selects no tests and skips dialyzer; code or a broken heredoc does not (#92)",
+       ctx do
+    snapshot!(ctx)
+    reports = "lib/sample/reports.ex"
+    original = File.read!(Path.join(ctx.dir, reports))
+    # A one-line moduledoc becomes a formatted heredoc: text and line count both change.
+    heredoc = ~s("""\n  Unrelated to the other contexts, and documented at length.\n  """)
+    edit!(ctx, reports, &String.replace(&1, ~s("Unrelated to the other contexts."), heredoc))
+
+    assert {%{"mode" => "subset", "tests" => [], "reason" => reason}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"])
+
+    assert reason == "doc-only change (comments and docs only): #{reports}"
+    {out, 0} = sh_merged(ctx, ["chg.static", "--base", "HEAD"])
+    assert out =~ "chg: dialyzer skipped, doc-only change"
+
+    # A code line beside the doc edit: the normal selection, which names no doc-only file.
+    edit!(ctx, reports, &String.replace(&1, "Enum.sum(xs)", "Enum.sum(xs) + 0"))
+    assert {%{"reason" => reason}, 0} = chg(ctx, ["chg.affected", "--base", "HEAD"])
+    refute reason =~ "doc-only"
+
+    # A heredoc whose terminator was edited is not documentation: compile reports it.
+    edit!(ctx, reports, fn src ->
+      src |> String.replace(" + 0", "") |> String.replace(~s(  \"""\n), ~s(  \""\n))
+    end)
+
+    assert {%{"ok" => false, "failures" => failures}, 1} =
+             chg(ctx, ["chg.static", "--base", "HEAD"])
+
+    assert Enum.any?(failures, &(&1["check"] == "compile"))
+
+    # Code committed after the snapshot is not hidden by a doc-only diff on top of it.
+    File.write!(Path.join(ctx.dir, reports), original)
+    edit!(ctx, reports, &String.replace(&1, "Enum.sum(xs)", "Enum.sum(xs) + 0"))
+    git!(ctx.dir, ["commit", "-qam", "code after the snapshot"])
+    edit!(ctx, reports, &String.replace(&1, ~s("Unrelated to the other contexts."), heredoc))
+    assert {%{"reason" => reason}, 0} = chg(ctx, ["chg.affected", "--base", "HEAD"])
+    refute reason =~ "doc-only"
+
+    # A project that reads docs at run time has no doc-only change.
+    git!(ctx.dir, ["checkout", "--", reports])
+
+    File.write!(Path.join(ctx.dir, "lib/sample/doc_reader.ex"), """
+    defmodule Sample.DocReader do
+      def docs(m), do: Code.fetch_docs(m)
+    end
+    """)
+
+    git!(ctx.dir, ["add", "lib/sample/doc_reader.ex"])
+    git!(ctx.dir, ["commit", "-qm", "doc reader"])
+    snapshot!(ctx)
+    edit!(ctx, reports, &String.replace(&1, ~s("Unrelated to the other contexts."), heredoc))
+    assert {%{"reason" => reason}, 0} = chg(ctx, ["chg.affected", "--base", "HEAD"])
+    refute reason =~ "doc-only"
+  end
+
+  defp sh_merged(ctx, args) do
+    env = [{"MIX_ENV", nil}, {"MIX_BUILD_PATH", nil}, {"MIX_ARCHIVES", ctx.archives}]
+    System.cmd("mix", args, cd: ctx.dir, env: env ++ @isolated_git, stderr_to_stdout: true)
+  end
+
   test "a recorded run selects by compiled code: a comment selects nothing, a behaviour change its tests",
        ctx do
     snapshot!(ctx)
@@ -439,7 +500,12 @@ defmodule ChgAdapter.IntegrationTest do
            end)
 
     env = [{"CHG_COVER", record}]
-    edit!(ctx, "lib/sample/reports.ex", &("# a comment shifts every line\n" <> &1))
+    # A comment shifts every line, and a pipe changes the syntax but not the compiled code:
+    # not doc-only (#92), so coverage judges it by digest.
+    edit!(ctx, "lib/sample/reports.ex", fn src ->
+      "# a comment shifts every line\n" <> String.replace(src, "Enum.sum(xs)", "xs |> Enum.sum()")
+    end)
+
     git!(ctx.dir, ["commit", "-qam", "comment"])
 
     assert {%{"mode" => "subset", "tests" => [], "reason" => "coverage of " <> _}, 0} =
@@ -596,7 +662,13 @@ defmodule ChgAdapter.IntegrationTest do
                    env: [{"MIX_ENV", nil}, {"MIX_ARCHIVES", ctx.archives} | @isolated_git]
                  )
 
-        edit!(ctx, "lib/sample/reports.ex", &(&1 <> "\n"))
+        # A code edit: a whitespace-only one is doc-only and selects nothing (#92).
+        edit!(
+          ctx,
+          "lib/sample/reports.ex",
+          &String.replace(&1, "Enum.sum(xs)", "Enum.sum(xs) + 0")
+        )
+
         assert %{"mode" => "subset", "tests" => ["test/sample/reports_test.exs"]} = run.()
 
         edit!(ctx, "config/runtime.exs", &(&1 <> "\n"))

@@ -14,7 +14,8 @@ defmodule Mix.Tasks.Chg.Static do
       snapshot's `_build`;
     * dialyzer, when dialyxir is a dependency: `mix chg.dialyzer`, incremental from the
       snapshot's incremental PLT, or `mix dialyzer` against its classic PLT when there is
-      no incremental one or incremental mode cannot run.
+      no incremental one or incremental mode cannot run. A change that touches only
+      comments and documentation (`ChgAdapter.DocOnly`) skips it.
 
       mix chg.static --base <sha>
 
@@ -32,17 +33,21 @@ defmodule Mix.Tasks.Chg.Static do
     {opts, _} = OptionParser.parse!(args, strict: [base: :string])
     base = opts[:base] || Mix.raise("mix chg.static needs --base <sha>")
 
-    changed =
+    all_changed =
       case ChgAdapter.changed_paths(base) do
-        {:ok, paths} -> Enum.filter(paths, &(elixir_file?(&1) and File.regular?(&1)))
+        {:ok, paths} -> paths
         {:error, why} -> Mix.raise(why)
       end
+
+    changed = Enum.filter(all_changed, &(elixir_file?(&1) and File.regular?(&1)))
 
     failures =
       case ChgAdapter.deps_result() do
         :ok ->
-          format(format_inputs(changed)) ++
-            credo(credo_inputs(changed)) ++ compile() ++ dialyzer()
+          case format(format_inputs(changed)) ++ credo(credo_inputs(changed)) ++ compile() do
+            [] -> dialyzer_unless_doc_only(all_changed, base)
+            failed -> failed ++ dialyzer()
+          end
 
         # Every check would fail on the same missing deps: the fetch is the one failure.
         {:error, out} ->
@@ -182,6 +187,27 @@ defmodule Mix.Tasks.Chg.Static do
   defp under?(f, path),
     do: f == path or String.starts_with?(f, String.trim_trailing(path, "/") <> "/")
 
+  @doc """
+  True when dialyxir's ignore file (`dialyzer: [ignore_warnings: ...]`, by default
+  `.dialyzer_ignore.exs`) names a warning by line: a tuple holding a line number, a
+  `file:line:` string, or a file this cannot read as a list. No file: false.
+  """
+  def line_pinned_ignores?(config \\ Mix.Project.config()) do
+    path = get_in(config, [:dialyzer, :ignore_warnings]) || ".dialyzer_ignore.exs"
+
+    case Path.extname(path) == ".exs" && eval(path) do
+      {:ok, entries} when is_list(entries) -> Enum.any?(entries, &pinned?/1)
+      :missing -> false
+      _ -> File.exists?(path)
+    end
+  end
+
+  defp pinned?(entry) when is_tuple(entry),
+    do: entry |> Tuple.to_list() |> Enum.any?(&is_integer/1)
+
+  defp pinned?(entry) when is_binary(entry), do: entry =~ ~r/:\d+(:|$)/
+  defp pinned?(_), do: false
+
   defp eval(path) do
     if File.regular?(path), do: {:ok, path |> Code.eval_file() |> elem(0)}, else: :missing
   rescue
@@ -293,6 +319,21 @@ defmodule Mix.Tasks.Chg.Static do
   # In the env the snapshot built the PLTs in (`ChgAdapter.dep_env/1`): incremental from
   # the snapshot's incremental PLT when there is one (`mix chg.dialyzer`), else, or when
   # incremental mode cannot run here (its exit 3), `mix dialyzer` against the classic PLT.
+  # Documentation cannot change what dialyzer finds, so a doc-only change (#92) skips it
+  # once format, credo and compile have passed, unless the ignore file pins warnings to
+  # line numbers, which a comment or doc line moves. The module graph is read after
+  # `mix chg.compile` wrote it; when it cannot be read, dialyzer runs.
+  defp dialyzer_unless_doc_only(changed, base) do
+    with false <- line_pinned_ignores?(),
+         {:ok, graph} <- ChgAdapter.Graph.read(),
+         {:doc_only, files} <- ChgAdapter.DocOnly.judge_tree(changed, base, graph.external) do
+      IO.puts(:standard_error, "chg: dialyzer skipped, #{ChgAdapter.DocOnly.reason(files)}")
+      []
+    else
+      _ -> dialyzer()
+    end
+  end
+
   defp dialyzer do
     case ChgAdapter.dep_env(:dialyxir) do
       nil ->
