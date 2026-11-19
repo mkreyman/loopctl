@@ -14,11 +14,14 @@ defmodule Loopctl.Repo.RequeueCredentialAbandonedForgeRowsMigrationTest do
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
   alias Loopctl.Changes.RevertIssue
+  alias Loopctl.Changes.RevertIssueOpener
   alias Loopctl.Changes.RevertIssues
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Repo
   alias Loopctl.Repo.Migrations.RequeueCredentialAbandonedForgeRows, as: Requeue
   alias Loopctl.Test.MigrationFile
+  alias Loopctl.Verification.Credential
 
   @version 20_261_119_170_000
 
@@ -35,14 +38,20 @@ defmodule Loopctl.Repo.RequeueCredentialAbandonedForgeRowsMigrationTest do
 
   @credential ":credential_unavailable"
 
-  defp abandon(schema, id, reason, last_error) do
+  defp abandon(schema, id, reason, last_error, age_days) do
     {1, _} =
       AdminRepo.update_all(from(r in schema, where: r.id == ^id),
-        set: [status: :abandoned, abandoned_reason: reason, attempts: 6, last_error: last_error]
+        set: [
+          status: :abandoned,
+          abandoned_reason: reason,
+          attempts: 6,
+          last_error: last_error,
+          updated_at: DateTime.add(DateTime.utc_now(), -age_days, :day)
+        ]
       )
   end
 
-  defp revert!(ctx, reason, last_error) do
+  defp revert!(ctx, reason, last_error, age_days \\ 0) do
     story = fixture(:story, %{tenant_id: ctx.tenant_id})
     seq = System.unique_integer([:positive])
 
@@ -66,30 +75,54 @@ defmodule Loopctl.Repo.RequeueCredentialAbandonedForgeRowsMigrationTest do
       end)
 
     row = AdminRepo.one!(from r in RevertIssue, where: r.story_id == ^story.id)
-    abandon(RevertIssue, row.id, reason, last_error)
+    abandon(RevertIssue, row.id, reason, last_error, age_days)
     row
   end
 
-  defp closure!(ctx, reason, last_error) do
+  defp closure!(ctx, reason, last_error, age_days) do
     story = fixture(:story, %{tenant_id: ctx.tenant_id})
     row = fixture(:issue_closure, %{tenant_id: ctx.tenant_id, story_id: story.id})
-    abandon(IssueClosure, row.id, reason, last_error)
+    abandon(IssueClosure, row.id, reason, last_error, age_days)
     row
   end
 
-  test "requeues only rows the missing credential exhausted, in both outboxes", ctx do
-    for {schema, make} <- [{RevertIssue, &revert!/3}, {IssueClosure, &closure!/3}] do
-      waited = make.(ctx, "retries_exhausted", @credential)
-      forge = make.(ctx, "retries_exhausted", "{:github_api_error, 503}")
-      permanent = make.(ctx, "permanent_forge_failure", @credential)
+  # A revert row restarts at ONE attempt so its next claim searches for an issue an earlier
+  # attempt may have opened; a closure reads its issue on every attempt and restarts at zero.
+  test "requeues only recent rows the missing credential exhausted, in both outboxes", ctx do
+    for {schema, make, restart} <- [{RevertIssue, &revert!/4, 1}, {IssueClosure, &closure!/4, 0}] do
+      waited = make.(ctx, "retries_exhausted", @credential, 0)
+      forge = make.(ctx, "retries_exhausted", "{:github_api_error, 503}", 0)
+      permanent = make.(ctx, "permanent_forge_failure", @credential, 0)
+      old = make.(ctx, "retries_exhausted", @credential, 15)
 
       migrate_up()
 
-      assert %{status: :pending, attempts: 0, abandoned_reason: nil, next_attempt_at: nil} =
+      assert %{status: :pending, attempts: ^restart, abandoned_reason: nil, next_attempt_at: nil} =
                AdminRepo.get!(schema, waited.id)
 
       assert %{status: :abandoned} = AdminRepo.get!(schema, forge.id)
       assert %{status: :abandoned} = AdminRepo.get!(schema, permanent.id)
+      assert %{status: :abandoned} = AdminRepo.get!(schema, old.id)
     end
+  end
+
+  test "a requeued revert row searches before it creates, so it never opens a second issue",
+       ctx do
+    row = revert!(ctx, "retries_exhausted", @credential)
+    migrate_up()
+
+    stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+      {:ok,
+       %Credential{
+         kind: :operator_token,
+         repo: ForgeRepo.operator(repo)
+       }}
+    end)
+
+    expect(Loopctl.MockPullRequestSource, :find_issue, fn _repo, _search -> {:ok, 77} end)
+    expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
+
+    assert {:opened, nil} =
+             RevertIssueOpener.open(AdminRepo.get!(RevertIssue, row.id))
   end
 end

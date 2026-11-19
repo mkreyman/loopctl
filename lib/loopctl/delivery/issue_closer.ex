@@ -429,10 +429,6 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
-  # `retry_after` is PASSED THROUGH, not merely returned to the worker (#826 review, H1). It
-  # is the forge's own statement of when its window reopens — for a PRIMARY rate limit that is
-  # up to an hour out — and scheduling from the local backoff alone spent every attempt inside
-  # one window the forge had already told us the end of.
   defp wait_for_credential(%IssueClosure{} = closure, reason) do
     case ForgeOutbox.mark_configuration_wait(
            IssueClosure,
@@ -446,6 +442,10 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
+  # `retry_after` is PASSED THROUGH, not merely returned to the worker (#826 review, H1). It
+  # is the forge's own statement of when its window reopens — for a PRIMARY rate limit that is
+  # up to an hour out — and scheduling from the local backoff alone spent every attempt inside
+  # one window the forge had already told us the end of.
   defp defer(%IssueClosure{} = closure, reason, retry_after) do
     case IssueClosures.mark_transient_failure(closure.tenant_id, closure, reason, retry_after) do
       # The bound converted it: the row is abandoned, and this is the one path that reaches
