@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::Sha256;
 
-use crate::{events, git, shadow};
+use crate::{events, gh, git, shadow};
 
 /// loopctl's own cap is 500 rows (`Ledger.max_batch`).
 pub const MAX_ROWS: usize = 500;
@@ -996,12 +996,17 @@ fn split_rec(rest: &str) -> Option<(&str, &str, &str)> {
 /// The ledger rows a store holds for `repos` (lowercase `owner/name` keyed by common dir):
 /// a `review_round` row for every launch whose branch is linked to a PR, and a
 /// `review_round_void` row for each of those later voided (a refund or an `uncount`).
-/// A round on a branch with no PR yet is left for a later harvest. `slug_of_common`
-/// resolves a common dir to `owner/name`.
+/// `wanted` resolves a common dir to `owner/name`.
+///
+/// review-round-counter writes `rec:link` only when a round runs while the PR already
+/// exists. The delivery loop reviews BEFORE `gh pr create`, so a usual PR's round has no
+/// link. For a round with none, `ask(repo, branch, at_ms)` names the PRs whose head is that
+/// branch. A round whose branch has no PR yet, by either route, waits for a later harvest.
 pub fn review_rows(
     store: &Map<String, Value>,
     host: &str,
     wanted: &dyn Fn(&str) -> Option<String>,
+    ask: &mut dyn FnMut(&str, &str, u64) -> Vec<u64>,
 ) -> Vec<Value> {
     let mut links: HashMap<(&str, &str), Vec<u64>> = HashMap::new();
     let mut voids: HashMap<(&str, &str, &str), &Value> = HashMap::new();
@@ -1019,14 +1024,18 @@ pub fn review_rows(
         }
     }
     let mut repo_of: HashMap<&str, Option<String>> = HashMap::new();
+    // Newest first, so a limited `ask` spends itself on the rounds most likely to matter.
+    let mut rounds: Vec<(&str, &str, &str, u64, &Value)> = store
+        .iter()
+        .filter_map(|(k, v)| {
+            let (common, branch, id) = split_rec(k.strip_prefix("rec:round:")?)?;
+            let at_ms = id.split('-').next()?.parse::<u64>().ok()?;
+            Some((common, branch, id, at_ms, v))
+        })
+        .collect();
+    rounds.sort_by_key(|r| std::cmp::Reverse(r.3));
     let mut rows = Vec::new();
-    for (k, v) in store {
-        let Some(rest) = k.strip_prefix("rec:round:") else {
-            continue;
-        };
-        let Some((common, branch, id)) = split_rec(rest) else {
-            continue;
-        };
+    for (common, branch, id, at_ms, v) in rounds {
         let Some(repo) = repo_of
             .entry(common)
             .or_insert_with(|| wanted(common))
@@ -1034,16 +1043,16 @@ pub fn review_rows(
         else {
             continue;
         };
-        let Some(prs) = links.get(&(common, branch)) else {
-            continue;
+        let mut prs = match links.get(&(common, branch)) {
+            Some(prs) => prs.clone(),
+            None => ask(&repo, branch, at_ms),
         };
-        let mut prs = prs.clone();
+        if prs.is_empty() {
+            continue;
+        }
         prs.sort_unstable();
         prs.dedup();
-        let pr = *prs.last().expect("a link has a number");
-        let Some(at_ms) = id.split('-').next().and_then(|a| a.parse::<u64>().ok()) else {
-            continue;
-        };
+        let pr = *prs.last().expect("checked non-empty");
         let mut row = json!({
             "v": 1,
             "kind": "review_round",
@@ -1149,6 +1158,11 @@ pub fn harvest_reviews(cfg: &Config) -> Result<usize, String> {
         let slug = git::origin_slug(p)?;
         cfg.source(&slug).map(|s| s.repo.clone())
     };
+    let cache_path = dir().join("review_links.json");
+    let mut lookup = PrLookup::load(&cache_path, now_ms());
+    let mut ask = |repo: &str, branch: &str, at_ms: u64| -> Vec<u64> {
+        lookup.ask(repo, branch, at_ms, &mut prs_for_branch)
+    };
     let mut fresh: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut seen: HashMap<String, BTreeSet<(String, String)>> = HashMap::new();
     for store in rrc_stores() {
@@ -1158,7 +1172,7 @@ pub fn harvest_reviews(cfg: &Config) -> Result<usize, String> {
             .map_err(|e| format!("reading {}: {e}", store.display()))?;
         let map: Map<String, Value> =
             serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", store.display()))?;
-        for row in review_rows(&map, &host, &wanted) {
+        for row in review_rows(&map, &host, &wanted, &mut ask) {
             let repo = row["repo"].as_str().unwrap_or("").to_string();
             let Some(src) = cfg.source(&repo) else {
                 continue;
@@ -1179,12 +1193,128 @@ pub fn harvest_reviews(cfg: &Config) -> Result<usize, String> {
             }
         }
     }
+    // The cache only saves gh calls: failing to write it must not cost the rows.
+    if let Err(e) = lookup.save(&cache_path) {
+        eprintln!("chg outbox: {e} (review rounds are still sent)");
+    }
     let mut n = 0;
     for (path, rows) in fresh {
         append_rows(Path::new(&path), &rows)?;
         n += rows.len();
     }
     Ok(n)
+}
+
+/// How far back an unlinked round is looked up on GitHub, and how many branches one run asks about.
+const ASK_WINDOW_MS: u64 = 30 * 24 * 3600 * 1000;
+const ASK_BUDGET: usize = 60;
+/// How long "this branch has no PR" is believed before gh is asked again.
+const MISS_TTL_MS: u64 = 3600 * 1000;
+/// The longest one gh lookup may take.
+const GH_LOOKUP_SECS: u64 = 15;
+
+/// What gh last said about a branch's PRs, and when. An empty `prs` is "no PR yet".
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Lookup {
+    prs: Vec<u64>,
+    asked_ms: u64,
+}
+
+/// An unlinked round's PR, from gh, through `~/.chg/outbox/review_links.json`.
+/// - A found PR is believed for every round up to the time it was asked. A newer round on
+///   the branch asks again once, so a reused branch name moves to its newer PR.
+/// - "No PR yet" is believed for MISS_TTL_MS.
+/// - Only rounds from the last ASK_WINDOW_MS are asked about, at most ASK_BUDGET per run.
+/// - A failed gh call changes nothing.
+struct PrLookup {
+    cache: BTreeMap<String, Lookup>,
+    now: u64,
+    budget: usize,
+    changed: bool,
+}
+
+impl PrLookup {
+    fn load(path: &Path, now: u64) -> PrLookup {
+        PrLookup {
+            cache: fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default(),
+            now,
+            budget: ASK_BUDGET,
+            changed: false,
+        }
+    }
+
+    fn ask(
+        &mut self,
+        repo: &str,
+        branch: &str,
+        at_ms: u64,
+        gh: &mut dyn FnMut(&str, &str) -> Option<Vec<u64>>,
+    ) -> Vec<u64> {
+        let key = format!("{repo}:{branch}");
+        let known = self.cache.get(&key).cloned();
+        if let Some(k) = &known {
+            let hit = !k.prs.is_empty() && at_ms <= k.asked_ms;
+            let miss = k.prs.is_empty() && self.now.saturating_sub(k.asked_ms) < MISS_TTL_MS;
+            if hit || miss {
+                return k.prs.clone();
+            }
+        }
+        let stale = known.map(|k| k.prs).unwrap_or_default();
+        if at_ms < self.now.saturating_sub(ASK_WINDOW_MS) || self.budget == 0 {
+            return stale;
+        }
+        self.budget -= 1;
+        match gh(repo, branch) {
+            Some(prs) => {
+                self.cache.insert(
+                    key,
+                    Lookup {
+                        prs: prs.clone(),
+                        asked_ms: self.now,
+                    },
+                );
+                self.changed = true;
+                prs
+            }
+            None => stale,
+        }
+    }
+
+    /// Writes the cache if it changed, dropping entries older than the lookup window.
+    fn save(&mut self, path: &Path) -> Result<(), String> {
+        if !self.changed {
+            return Ok(());
+        }
+        let since = self.now.saturating_sub(ASK_WINDOW_MS);
+        self.cache.retain(|_, l| l.asked_ms >= since);
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec(&self.cache).unwrap_or_default())
+            .and_then(|_| fs::rename(&tmp, path))
+            .map_err(|e| format!("writing {}: {e}", path.display()))
+    }
+}
+
+/// The PRs (any state) whose head is `branch` in `repo`, by gh within GH_LOOKUP_SECS.
+/// None when gh fails or is too slow: the round waits instead of being credited to a guess.
+fn prs_for_branch(repo: &str, branch: &str) -> Option<Vec<u64>> {
+    let t = gh::text_within(
+        &[
+            "pr", "list", "-R", repo, "--head", branch, "--state", "all", "--json", "number",
+            "--limit", "20",
+        ],
+        std::time::Duration::from_secs(GH_LOOKUP_SECS),
+    )
+    .ok()?;
+    let v: Value = serde_json::from_str(&t).ok()?;
+    Some(
+        v.as_array()?
+            .iter()
+            .filter_map(|p| p["number"].as_u64())
+            .collect(),
+    )
 }
 
 /// Unix milliseconds as RFC 3339 UTC (`2026-11-18T21:33:01.140Z`).
@@ -1367,7 +1497,21 @@ mod tests {
         .unwrap();
         let wanted =
             |c: &str| (c == "/w/hcb/.git").then(|| "mkreyman/home_care_billing".to_string());
-        let rows = review_rows(&store, "minis", &wanted);
+        let mut asked = Vec::new();
+        let mut ask = |repo: &str, branch: &str, at: u64| {
+            asked.push((repo.to_string(), branch.to_string(), at));
+            Vec::new()
+        };
+        let rows = review_rows(&store, "minis", &wanted, &mut ask);
+        assert_eq!(
+            asked,
+            vec![(
+                "mkreyman/home_care_billing".to_string(),
+                "feat/unlinked".to_string(),
+                3000
+            )],
+            "only the unlinked round of a wanted repo is asked about"
+        );
         let kinds: Vec<(&str, u64)> = rows
             .iter()
             .map(|r| (r["kind"].as_str().unwrap(), r["at_ms"].as_u64().unwrap()))
@@ -1388,6 +1532,130 @@ mod tests {
         assert_eq!(rows[2]["round_id"], "2000-bbbbbbbb");
         assert_eq!(rows[2]["why"], "refund");
         assert!(rows[2].get("evidence").is_none());
+    }
+
+    #[test]
+    fn review_rows_take_the_pr_gh_names_for_an_unlinked_round() {
+        let store: Map<String, Value> = serde_json::from_value(json!({
+            "rec:round:/w/l/.git:fix/a:5000-eeeeeeee": {"via":"Skill","name":"lean-review","kind":"code"},
+            "rec:round:/w/l/.git:fix/a:6000-ffffffff": {"via":"Skill","name":"lean-review","kind":"code"},
+            "rec:round:/w/l/.git:fix/none:7000-gggggggg": {"via":"Skill","name":"lean-review","kind":"code"}
+        }))
+        .unwrap();
+        let wanted = |_: &str| Some("mkreyman/loopctl".to_string());
+        let mut ask = |_: &str, b: &str, _: u64| match b {
+            "fix/a" => vec![1055, 1040],
+            _ => vec![],
+        };
+        let rows = review_rows(&store, "minis", &wanted, &mut ask);
+        assert_eq!(rows.len(), 2, "fix/none has no PR yet and waits");
+        assert!(
+            rows.iter().all(|r| r["pr"] == 1055),
+            "the highest PR is credited"
+        );
+        assert_eq!(rows[0]["prs"], json!([1040, 1055]));
+    }
+
+    #[test]
+    fn pr_lookup_caches_hits_rechecks_newer_rounds_and_expires_misses() {
+        let now = 100 * 24 * 3600 * 1000;
+        let mut l = PrLookup {
+            cache: BTreeMap::new(),
+            now,
+            budget: 3,
+            changed: false,
+        };
+        let calls = std::cell::Cell::new(0);
+        let mut gh = |_: &str, b: &str| {
+            calls.set(calls.get() + 1);
+            match b {
+                "fix/a" => Some(vec![7]),
+                "down" => None,
+                _ => Some(vec![]),
+            }
+        };
+        assert_eq!(l.ask("o/r", "fix/a", now - 10, &mut gh), vec![7]);
+        assert_eq!(
+            l.ask("o/r", "fix/a", now - 20, &mut gh),
+            vec![7],
+            "an older round hits"
+        );
+        assert_eq!(l.ask("o/r", "none", now - 10, &mut gh), Vec::<u64>::new());
+        assert_eq!(
+            l.ask("o/r", "none", now - 5, &mut gh),
+            Vec::<u64>::new(),
+            "a fresh miss holds"
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            l.ask("o/r", "old", now - ASK_WINDOW_MS - 1, &mut gh),
+            Vec::<u64>::new(),
+            "outside the window: not asked"
+        );
+        assert_eq!(l.ask("o/r", "down", now, &mut gh), Vec::<u64>::new());
+        assert_eq!(calls.get(), 3, "budget of 3 spent");
+        assert!(
+            !l.cache.contains_key("o/r:down"),
+            "a failed gh call caches nothing"
+        );
+        assert_eq!(
+            l.ask("o/r", "other", now, &mut gh),
+            Vec::<u64>::new(),
+            "no budget left"
+        );
+        assert_eq!(calls.get(), 3);
+
+        // The next run: a round newer than the cached ask re-asks once; a miss past its TTL re-asks.
+        let mut l2 = PrLookup {
+            cache: l.cache.clone(),
+            now: now + MISS_TTL_MS,
+            budget: 5,
+            changed: false,
+        };
+        let mut calls2 = 0;
+        let mut gh2 = |_: &str, b: &str| {
+            calls2 += 1;
+            Some(if b == "fix/a" { vec![7, 9] } else { vec![] })
+        };
+        assert_eq!(l2.ask("o/r", "fix/a", now + 1, &mut gh2), vec![7, 9]);
+        assert_eq!(l2.ask("o/r", "fix/a", now + 2, &mut gh2), vec![7, 9]);
+        assert_eq!(l2.ask("o/r", "none", now, &mut gh2), Vec::<u64>::new());
+        assert_eq!(calls2, 2);
+
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("review_links.json");
+        l2.cache.insert(
+            "o/r:ancient".into(),
+            Lookup {
+                prs: vec![1],
+                asked_ms: 0,
+            },
+        );
+        l2.save(&p).unwrap();
+        let saved: BTreeMap<String, Lookup> =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(!saved.contains_key("o/r:ancient"), "pruned past the window");
+        assert_eq!(saved["o/r:fix/a"].prs, vec![7, 9]);
+    }
+
+    #[test]
+    fn review_rows_ask_newest_rounds_first() {
+        let store: Map<String, Value> = serde_json::from_value(json!({
+            "rec:round:/w/l/.git:a:1000-aaaaaaaa": {},
+            "rec:round:/w/l/.git:b:3000-bbbbbbbb": {},
+            "rec:round:/w/l/.git:c:2000-cccccccc": {}
+        }))
+        .unwrap();
+        let wanted = |_: &str| Some("o/r".to_string());
+        let mut order = Vec::new();
+        let mut ask = |_: &str, b: &str, _: u64| {
+            order.push(b.to_string());
+            vec![1]
+        };
+        let rows = review_rows(&store, "h", &wanted, &mut ask);
+        assert_eq!(order, ["b", "c", "a"]);
+        let at: Vec<u64> = rows.iter().map(|r| r["at_ms"].as_u64().unwrap()).collect();
+        assert_eq!(at, [1000, 2000, 3000], "rows still come out oldest first");
     }
 
     #[test]

@@ -695,6 +695,115 @@ fn review_rounds_are_harvested_once_and_sent() {
 }
 
 #[test]
+fn an_unlinked_round_takes_the_pr_gh_names_and_gh_is_asked_once() {
+    let fake = Fake::start();
+    let t = tempfile::tempdir().unwrap();
+    let (origin, _seed) = origin_and_clone(t.path());
+    let a = clone(&origin, &t.path().join("a"));
+    let common = fs::canonicalize(a.join(".git")).unwrap();
+    let m = Machine::new("acme/widget", &fake);
+    let c = common.display();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    fs::write(
+        &m.store,
+        json!({
+            // Reviewed before its PR existed: no rec:link (the delivery loop's order).
+            format!("rec:round:{c}:fix/a:{now}-aaaaaaaa"): {"via":"Skill","name":"lean-review","kind":"code"},
+            // Outside the lookup window: never asked about.
+            format!("rec:round:{c}:fix/old:1000-bbbbbbbb"): {"via":"Skill","name":"lean-review","kind":"code"},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let calls = t.path().join("gh-calls");
+    let gh = t.path().join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {}\necho '[{{\"number\":77}}]'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    fake.answer(ok_batch);
+    m.chg()
+        .env("CHG_GH", &gh)
+        .args(["outbox", "send"])
+        .assert()
+        .success();
+    m.chg()
+        .env("CHG_GH", &gh)
+        .args(["outbox", "send"])
+        .assert()
+        .success();
+    let asked = fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        asked.trim(),
+        "pr list -R acme/widget --head fix/a --state all --json number --limit 20",
+        "one gh call, for the recent unlinked branch only"
+    );
+    let reqs = fake.take();
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    let rows = reqs[0].json()["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["pr"], 77);
+    assert_eq!(rows[0]["branch"], "fix/a");
+}
+
+#[test]
+fn a_failed_lookup_cache_write_still_sends_the_rounds() {
+    let fake = Fake::start();
+    let t = tempfile::tempdir().unwrap();
+    let (origin, _seed) = origin_and_clone(t.path());
+    let a = clone(&origin, &t.path().join("a"));
+    let common = fs::canonicalize(a.join(".git")).unwrap();
+    let m = Machine::new("acme/widget", &fake);
+    let c = common.display();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    fs::write(
+        &m.store,
+        json!({
+            format!("rec:round:{c}:fix/a:{now}-aaaaaaaa"): {"via":"Skill","name":"lean-review","kind":"code"},
+            format!("rec:round:{c}:feat/x:1000-bbbbbbbb"): {"via":"Skill","name":"lean-review","kind":"code"},
+            format!("rec:link:{c}:feat/x:12"): {},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // A directory where the cache's temp file goes: the cache write fails.
+    fs::create_dir_all(m.home.path().join("outbox/review_links.json.tmp/x")).unwrap();
+    let gh = t.path().join("gh");
+    fs::write(&gh, "#!/bin/sh\necho '[{\"number\":77}]'\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    fake.answer(ok_batch);
+    m.chg()
+        .env("CHG_GH", &gh)
+        .args(["outbox", "send"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("review rounds are still sent"));
+    let reqs = fake.take();
+    let mut prs: Vec<u64> = reqs
+        .iter()
+        .flat_map(|r| r.json()["rows"].as_array().unwrap().clone())
+        .map(|r| r["pr"].as_u64().unwrap())
+        .collect();
+    prs.sort_unstable();
+    assert_eq!(
+        prs,
+        [12, 77],
+        "both the linked and the looked-up round are sent"
+    );
+}
+
+#[test]
 fn review_dispatch_posts_exactly_change_and_revision() {
     let fake = Fake::start();
     let t = tempfile::tempdir().unwrap();
