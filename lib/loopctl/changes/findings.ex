@@ -69,6 +69,13 @@ defmodule Loopctl.Changes.Findings do
 
   @window_hours 48
   @stuck_after_hours 24
+  # A merge is judged for a missing review only once it is this old. The round reaches the
+  # ledger AFTER the merge in the normal flow: review-round-counter links the branch to its PR
+  # number, and chg's outbox sends on its own cadence with backoff up to an hour; a round run
+  # before `gh pr create` (the delivery loop's normal order) is linked only when chg resolves
+  # the branch's PR itself. Judging at the first sweep filed a "merged with no review" issue
+  # for merges whose rounds were still in flight. 24 h is one sweep's slack beyond that.
+  @review_grace_hours 24
   @row_limit 5_000
   @default_daily_cap 5
   @max_loop_depth 2
@@ -102,6 +109,10 @@ defmodule Loopctl.Changes.Findings do
   @doc "How long a cursor stays flagged before it is a `stuck_change` finding, in hours."
   @spec stuck_after_hours() :: pos_integer()
   def stuck_after_hours, do: @stuck_after_hours
+
+  @doc "How old a merge must be before a missing review round is a finding, in hours."
+  @spec review_grace_hours() :: pos_integer()
+  def review_grace_hours, do: @review_grace_hours
 
   @doc "The label every loop issue carries."
   @spec label() :: String.t()
@@ -201,7 +212,7 @@ defmodule Loopctl.Changes.Findings do
 
     selection_misses(tenant_id, since, chg_repo(opts)) ++
       flaky_tests(tenant_id, since, sources) ++
-      missing_reviews(tenant_id, since, sources) ++
+      missing_reviews(tenant_id, since, now, sources) ++
       stuck_changes(tenant_id, now, sources) ++
       silent_sources(tenant_id, now, sources, chg_repo(opts))
   end
@@ -362,11 +373,13 @@ defmodule Loopctl.Changes.Findings do
     end)
   end
 
-  defp missing_reviews(tenant_id, since, sources) do
+  defp missing_reviews(tenant_id, since, now, sources) do
+    settled = DateTime.add(now, -@review_grace_hours * 3600, :second)
+
     case PrReviewOutcomes.list(tenant_id, since: since, limit: 500) do
       outcomes when is_list(outcomes) ->
         outcomes
-        |> Enum.filter(& &1.merged_without_counted_round)
+        |> Enum.filter(&(&1.merged_without_counted_round and settled?(&1, settled)))
         |> Enum.flat_map(&missing_review(&1, sources, since))
 
       # Shed load is not "no missing reviews"; it is no answer this run, and the next sweep
@@ -376,6 +389,10 @@ defmodule Loopctl.Changes.Findings do
         []
     end
   end
+
+  # An outcome with no merge time cannot be shown old enough, so it waits like a fresh one.
+  defp settled?(%{merged_at: %DateTime{} = at}, settled), do: DateTime.compare(at, settled) != :gt
+  defp settled?(_outcome, _settled), do: false
 
   defp missing_review(outcome, sources, since) do
     case Map.fetch(sources, {:key, outcome.repo}) do

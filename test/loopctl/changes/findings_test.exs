@@ -16,6 +16,7 @@ defmodule Loopctl.Changes.FindingsTest do
   alias Loopctl.Changes.FindingFiler
   alias Loopctl.Changes.Findings
   alias Loopctl.Changes.LedgerRow
+  alias Loopctl.Changes.PrReviewOutcomes
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Record
@@ -88,6 +89,29 @@ defmodule Loopctl.Changes.FindingsTest do
 
   defp actions(tenant_id) do
     AdminRepo.all(from a in FindingAction, where: a.tenant_id == ^tenant_id)
+  end
+
+  describe "derive/3 missing reviews" do
+    # The round reaches the ledger after the merge (review-round-counter links the PR, chg's
+    # outbox sends on its own cadence), so a fresh merge with no round yet is not a finding.
+    test "a merge with no counted round is a finding only once the grace has passed", ctx do
+      grace = Findings.review_grace_hours() * 3600
+
+      facts = fn ago ->
+        %{body: nil, merged?: true, merged_at: DateTime.add(@now, -ago, :second), merge_sha: nil}
+      end
+
+      {:ok, _} = PrReviewOutcomes.record(ctx.hcb, 1, facts.(3600))
+      {:ok, _} = PrReviewOutcomes.record(ctx.hcb, 2, facts.(grace + 60))
+
+      assert [s] =
+               Enum.filter(
+                 Findings.derive(ctx.tenant_id, @now, opts()),
+                 &(&1.kind == "missing_review")
+               )
+
+      assert s.evidence["pr"] == 2
+    end
   end
 
   describe "derive/3" do
