@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A `pr` or `chg` intake source on a kb scope promotes it to a work project (2026-11-19,
+  US-52.3).** `POST /api/v1/intake/sources` on an active `kind: kb` project used to be 422
+  ("must be an active work project"); it now enrols and turns the scope into a work project in
+  the same transaction, audited as `kind_promoted`. A `ledger` source still leaves a kb scope
+  as it is. Escalation handoffs are posted on the story's own project, keyed by that project's
+  `repo_url` basename (its slug when it has none); after this deploy, run
+  `docs/factory/runbooks/merge-duplicate-projects.md` to merge the four `-delivery` work
+  projects into their repos' scopes.
 - **`POST /api/v1/projects/:id/merge_into` merges one project into another (2026-11-19,
   US-52.2).** Every row of the source's `project_id` tables moves to `target_project_id` in one
   transaction; the source is archived with `metadata.merged_into`, and a kb target becomes a

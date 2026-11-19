@@ -12,23 +12,19 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
 
   ## Which channel (#1067)
 
-  The channel a session on the repo reads and may claim on: the project
-  `Projects.resolve_project/2` returns for the repo of the story's ONE active intake source
-  (`repo_full_name`), the same answer `resolve_project({repo_url})` gives a session. NOT the
-  story's work project: a delivery work project may carry no `repo_url` at all (chg-delivery),
-  so the repo resolves to a different project (the `chg` kb scope), and claude-config's
-  `gate-channel-claim-scope.sh` refuses a session's claim on another repo's channel. A handoff
-  posted on the work project was one no session in the repo could claim or finish.
-
-  Only when the story's project has no single active intake source, or its repo resolves to no
-  project (or to two), does the handoff fall back to the work project, with a warning logged.
+  The story's own project. A repo has one project and one channel (US-52.1), and a `pr`/`chg`
+  enrolment on a repo's kb scope promotes that scope rather than needing a second project
+  (US-52.3), so the project a story belongs to is the one `resolve_project({repo_url})` gives
+  a session in that repo: the channel it reads and may claim on. #1067 posted on the project
+  the intake source's repo resolved to, because a `-delivery` work project then differed from
+  its repo's kb scope; the merges in `docs/factory/runbooks/merge-duplicate-projects.md`
+  removed the last of those.
 
   ## The sweep (`sweep_tenant/2`, every five minutes)
 
   For each escalated story of the tenant, the handoff keyed
   `handoff:<repo>:escalation-<story_id>-g<generation>`, where `<repo>` is the basename of the
-  intake source's `repo_full_name` (else of the channel project's `repo_url`, else its slug),
-  the same anchor the `/handoff` skill derives:
+  project's `repo_url` (else its slug), the same anchor the `/handoff` skill derives:
 
   - **none posted** → post generation 1;
   - **the newest generation sits on another channel, or under another repo name** (it was
@@ -87,8 +83,6 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Delivery.EscalationInbox
   alias Loopctl.Delivery.StoryStage
-  alias Loopctl.Intake.Source
-  alias Loopctl.Projects
   alias Loopctl.Projects.Project
 
   require Logger
@@ -183,8 +177,9 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
       else: acc
   end
 
-  # Work project id => %{project_id: the channel to post on, repo: the anchor's repo part}.
-  # See "Which channel" in the moduledoc.
+  # Story project id => %{project_id: the channel to post on, repo: the anchor's repo part}.
+  # A repo has one project (US-52.1), so the story's own project IS its repo's channel; see
+  # "Which channel" in the moduledoc.
   defp channels(tenant_id, rows) do
     ids = rows |> Enum.map(& &1.project_id) |> Enum.uniq()
 
@@ -196,47 +191,10 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
       |> AdminRepo.all()
       |> Map.new()
 
-    sources =
-      from(s in Source,
-        where: s.tenant_id == ^tenant_id and s.project_id in ^ids and is_nil(s.revoked_at),
-        select: {s.project_id, s.repo_full_name}
-      )
-      |> AdminRepo.all()
-      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-
     Map.new(ids, fn id ->
       {url, slug} = Map.get(projects, id, {nil, nil})
-      {id, channel(tenant_id, id, url, slug, Map.get(sources, id, []))}
+      {id, %{project_id: id, repo: repo_name(url, slug)}}
     end)
-  end
-
-  defp channel(tenant_id, project_id, url, slug, [repo]) do
-    case Projects.resolve_project(tenant_id, repo_url: repo) do
-      {:ok, %Project{id: channel_id}, _matched_by} ->
-        %{project_id: channel_id, repo: repo_name(repo, slug)}
-
-      {:error, reason} ->
-        work_project(tenant_id, project_id, url, slug, {:repo_unresolved, repo, reason})
-    end
-  end
-
-  defp channel(tenant_id, project_id, url, slug, sources),
-    do: work_project(tenant_id, project_id, url, slug, {:active_intake_sources, length(sources)})
-
-  # No intake source is an expected shape (a work project that is its own repo's channel), so
-  # it logs at info; every five minutes at warning it would bury the cases that are failures:
-  # a repo that resolves to nothing or to two projects, or a project with several sources.
-  defp work_project(tenant_id, project_id, url, slug, why) do
-    level = if why == {:active_intake_sources, 0}, do: :info, else: :warning
-
-    Logger.log(
-      level,
-      "EscalationHandoffs: no repo channel for project #{project_id} (#{inspect(why)}); " <>
-        "posting its escalation handoffs on the work project",
-      tenant_id: tenant_id
-    )
-
-    %{project_id: project_id, repo: repo_name(url, slug)}
   end
 
   @doc """

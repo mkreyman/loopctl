@@ -9407,7 +9407,7 @@ const TOOLS = [
       "issue can reach a queue. It is also the binding place_dispatch reads — a project bound " +
       "to no source refuses 409 `no_intake_source`, and one bound to two refuses 409 " +
       "`ambiguous_intake_source`; this tool is what those two refusals mean by enrolling a " +
-      "source. Bind the repository to the project that already holds its repo_url: " +
+      "source. Bind the repository to the project that already holds its repo_url; a pr or chg source on that repo's kb scope promotes the scope to a work project (US-52.3). " +
       "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too)." +
       "\n\n" +
       "THE WEBHOOK SECRET IS RETURNED ONCE AND CAN NEVER BE READ AGAIN. The column is " +

@@ -284,7 +284,9 @@ defmodule Loopctl.Intake.Source do
   @doc """
   The project kinds a source in `mode` may be enrolled on: only `:work` for `pr` and `chg`
   (each is its project's dispatch binding and merge route, which a kb scope must never get),
-  either kind for `ledger` (it binds nothing). `Loopctl.Intake` checks it at enrolment and
+  either kind for `ledger` (it binds nothing). A `pr`/`chg` enrolment on a kb scope promotes
+  the scope to `:work` in the same transaction (US-52.3), so this still holds for every bound
+  source. `Loopctl.Intake` checks it at enrolment and
   refuses every mode switch into or out of `ledger`, so a source keeps what it was judged on.
   """
   @spec project_kinds(atom()) :: [:work | :kb, ...]

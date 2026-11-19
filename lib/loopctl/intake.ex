@@ -138,6 +138,7 @@ defmodule Loopctl.Intake do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
   alias Loopctl.Delivery.StoryStage
@@ -335,16 +336,83 @@ defmodule Loopctl.Intake do
   # through a `pr`/`chg` source. `ledger` takes both because it binds nothing: a repository
   # with only a kb scope, and one whose work project has no intake route, each get a ledger
   # credential and nothing else.
+  #
+  # A `pr`/`chg` source on an active `:kb` scope is accepted here and the scope is PROMOTED to
+  # `:work` in the insert's own transaction (`promote_to_work/3`, US-52.3), so the bound
+  # project is still a work project when the source exists. A repo has one project (US-52.1),
+  # so refusing would leave a kb-scoped repo no way to take delivery except the second project
+  # that rule now refuses.
   defp put_project(changeset, tenant_id, project_id) do
     kinds = Source.project_kinds(Ecto.Changeset.get_field(changeset, :mode))
 
-    case active_project(tenant_id, project_id, kinds) do
+    case active_project(tenant_id, project_id, [:kb, :work]) do
       {:ok, project} ->
         Ecto.Changeset.put_change(changeset, :project_id, project.id)
 
       {:error, message} ->
+        # "project not found" and "can't be blank" stand as they are; an inactive project is
+        # refused in the words of the mode's own kinds.
+        message =
+          if message == project_kind_message([:kb, :work]),
+            do: project_kind_message(kinds),
+            else: message
+
         Ecto.Changeset.add_error(changeset, :project_id, message)
     end
+  end
+
+  # Runs inside `insert_source/3`'s transaction, after the insert, so a refused enrolment
+  # rolls the promotion back with it. The project row is locked and re-read: it is promoted
+  # only while it is still an active `:kb` scope, and only for a mode that binds a work project.
+  defp promote_to_work(tenant_id, %Source{} = source, opts) do
+    kinds = Source.project_kinds(source.mode)
+
+    project =
+      from(p in Project,
+        where: p.tenant_id == ^tenant_id and p.id == ^source.project_id,
+        lock: "FOR UPDATE"
+      )
+      |> AdminRepo.one()
+
+    cond do
+      is_nil(project) or project.status != :active ->
+        {:error,
+         source
+         |> Ecto.Changeset.change()
+         |> Ecto.Changeset.add_error(:project_id, project_kind_message(kinds))}
+
+      project.kind in kinds ->
+        :ok
+
+      true ->
+        with {:ok, promoted} <-
+               project |> Ecto.Changeset.change(kind: :work) |> AdminRepo.update(),
+             {:ok, _} <- audit_promotion(tenant_id, promoted, source, opts) do
+          :ok
+        else
+          {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+          {:error, _step, reason, _changes} -> {:error, {:promotion_audit_failed, reason}}
+        end
+    end
+  end
+
+  defp audit_promotion(tenant_id, project, source, opts) do
+    Ecto.Multi.new()
+    |> Audit.log_in_multi(:audit, fn _ ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "project",
+        entity_id: project.id,
+        action: "kind_promoted",
+        actor_type: Keyword.get(opts, :actor_type, "api_key"),
+        actor_id: Keyword.get(opts, :actor_id),
+        actor_label: Keyword.get(opts, :actor_label),
+        metadata: %{"from" => "kb", "to" => "work", "intake_source_id" => source.id},
+        old_state: %{"kind" => "kb"},
+        new_state: %{"kind" => "work"}
+      }
+    end)
+    |> AdminRepo.transaction()
   end
 
   # OPTIONAL, and an absent value is not an error: see the schema. What IS an error is naming
@@ -495,6 +563,7 @@ defmodule Loopctl.Intake do
            :ok <- check_chg_root(tenant_id, changeset),
            :ok <- close_pr_route(tenant_id, changeset),
            {:ok, source} <- AdminRepo.insert(changeset),
+           :ok <- promote_to_work(tenant_id, source, opts),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
                action: "intake_source_created",
