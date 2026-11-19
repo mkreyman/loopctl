@@ -159,7 +159,7 @@ defmodule LoopctlRunner.SelectionReplayTest do
 
   defp block(verdict), do: "Judged.\n\n```json\n#{Jason.encode!(verdict)}\n```"
 
-  defp run(ctx, config, head) do
+  defp run(ctx, config, head, verify_extra \\ %{}) do
     dispatch = %{
       "dispatch_id" => Session.uuid4(),
       "story_id" => @story_id,
@@ -169,7 +169,7 @@ defmodule LoopctlRunner.SelectionReplayTest do
       "base_branch" => "master",
       "claim_epoch" => 4,
       "story" => %{"id" => @story_id, "title" => "Widen", "acceptance_criteria" => ["widens"]},
-      "verify" => %{"pr_number" => 7, "head_sha" => head}
+      "verify" => Map.merge(%{"pr_number" => 7, "head_sha" => head}, verify_extra)
     }
 
     {:ok, subject} = TriageRun.subject(ctx.template, dispatch)
@@ -226,6 +226,43 @@ defmodule LoopctlRunner.SelectionReplayTest do
                RunState.read(result.run_dir)
 
       assert ProcessGroup.marked(ProcessGroup.marker(marker)) == []
+    end
+
+    test "a story from a selection_miss replays at the finding's commit with its failures, and " <>
+           "the miss reaches the pass",
+         ctx do
+      miss_sha = String.duplicate("a", 40)
+      failures = ["test/a_test.exs:12", "-dashed test name"]
+      replay = Map.put(@replay, "miss", %{"sha" => miss_sha, "covered" => failures})
+      File.write!(Path.join(ctx.product, "replay.out"), Jason.encode!(replay))
+      head = pull_request!(ctx, [{"cli/src/cover.rs", "fn select() { widen() }\n"}])
+
+      result =
+        run(ctx, config_for(ctx, @pass), head, %{
+          "loop_finding" => %{"sha" => miss_sha, "failures" => failures}
+        })
+
+      assert {:agent_result, {"verify", 1}, sent} = result.outcome
+      assert sent["selection_replay"] == replay
+
+      argv = ctx.product |> Path.join("argv") |> File.read!() |> String.split("\n")
+      assert ["--miss", miss_sha] == argv |> Enum.drop_while(&(&1 != "--miss")) |> Enum.take(2)
+
+      assert Enum.filter(argv, &String.starts_with?(&1, "--failure")) ==
+               ["--failure=test/a_test.exs:12", "--failure=-dashed test name"]
+
+      assert [%{"data" => %{"miss" => ^miss_sha}}] =
+               events(result.run_dir, "selection_replay.started")
+    end
+
+    test "a story from no finding passes no miss", ctx do
+      head = pull_request!(ctx, [{"cli/src/cover.rs", "fn select() { widen() }\n"}])
+      result = run(ctx, config_for(ctx, @pass), head)
+
+      argv = ctx.product |> Path.join("argv") |> File.read!() |> String.split("\n")
+      refute Enum.any?(argv, &String.starts_with?(&1, "--miss"))
+      refute Enum.any?(argv, &String.starts_with?(&1, "--failure"))
+      assert [%{"data" => %{"miss" => nil}}] = events(result.run_dir, "selection_replay.started")
     end
 
     test "a replay that prints something outside the schema leaves the pass without it", ctx do
@@ -344,6 +381,47 @@ defmodule LoopctlRunner.SelectionReplayTest do
     assert {:gone, _} = LoopctlRunner.Reaper.end_session_outcome(state, 2_000)
     refute ProcessGroup.alive?(pgid)
     assert {:ok, _out, _status} = Task.await(task)
+  end
+
+  describe "a verify dispatch's loop_finding" do
+    defp verify_dispatch(loop_finding) do
+      %{
+        "kind" => "verify",
+        "story_id" => @story_id,
+        "branch" => "loop/story-1",
+        "base_branch" => "master",
+        "story" => %{"id" => @story_id, "title" => "Widen", "acceptance_criteria" => ["widens"]},
+        "verify" => %{
+          "pr_number" => 7,
+          "head_sha" => String.duplicate("b", 40),
+          "loop_finding" => loop_finding
+        }
+      }
+    end
+
+    test "a well-formed one is kept on the subject", ctx do
+      finding = %{"sha" => String.duplicate("a", 40), "failures" => ["t:1"]}
+      assert {:ok, subject} = TriageRun.subject(ctx.template, verify_dispatch(finding))
+      assert subject["verify"]["loop_finding"] == finding
+    end
+
+    for {name, finding} <- [
+          {"a short sha", %{"sha" => "abc", "failures" => []}},
+          {"an uppercase sha", %{"sha" => String.duplicate("A", 40), "failures" => []}},
+          {"an empty failure name", %{"sha" => String.duplicate("a", 40), "failures" => [""]}},
+          {"a 201-character name",
+           %{"sha" => String.duplicate("a", 40), "failures" => [String.duplicate("x", 201)]}},
+          {"51 failures",
+           %{"sha" => String.duplicate("a", 40), "failures" => List.duplicate("t", 51)}},
+          {"no failures key", %{"sha" => String.duplicate("a", 40)}}
+        ] do
+      test "#{name} refuses the dispatch rather than reaching the replay's command line", ctx do
+        assert {:error, detail} =
+                 TriageRun.subject(ctx.template, verify_dispatch(unquote(Macro.escape(finding))))
+
+        assert detail =~ "loop_finding is malformed"
+      end
+    end
   end
 
   describe "from_config/2" do

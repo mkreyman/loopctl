@@ -267,7 +267,8 @@ defmodule LoopctlRunner.TriageRun do
   @doc """
   What a dispatch of `template` is run over, read from the dispatch and validated: the `triage`
   object for triage@1 and reply_draft@1, and for verify@1 a map of the `story` object, the
-  `verify` object (`{pr_number, head_sha}`, contract 1.28.0), and the dispatch's `branch` and
+  `verify` object (`{pr_number, head_sha}`, contract 1.28.0, and from 1.33.0 an optional
+  `loop_finding`, the `selection_miss` the story fixes), and the dispatch's `branch` and
   `base_branch`. `:none` when the dispatch carries none, `{:error, detail}` when it is
   malformed. The one reading Control's accept path and the eval harness share.
   """
@@ -301,17 +302,30 @@ defmodule LoopctlRunner.TriageRun do
   # would be a verdict about nothing, and the head is about to name a commit and a path.
   @head ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
 
-  defp verify_object(%{"verify" => %{"pr_number" => pr, "head_sha" => head}})
+  defp verify_object(%{"verify" => %{"pr_number" => pr, "head_sha" => head} = verify})
        when is_integer(pr) and pr > 0 and is_binary(head) do
-    if head =~ @head,
-      do: {:ok, %{"pr_number" => pr, "head_sha" => head}},
-      else: {:error, "the verify dispatch's head_sha is not a full commit id"}
+    cond do
+      not (head =~ @head) ->
+        {:error, "the verify dispatch's head_sha is not a full commit id"}
+
+      not loop_finding?(verify) ->
+        {:error, "the verify dispatch's loop_finding is malformed"}
+
+      true ->
+        {:ok, Map.take(verify, ["pr_number", "head_sha", "loop_finding"])}
+    end
   end
 
   defp verify_object(%{"verify" => _}),
     do: {:error, "the verify dispatch's verify object is malformed"}
 
   defp verify_object(_dispatch), do: {:error, "the verify dispatch carries no verify object"}
+
+  # Contract 1.33.0: the `selection_miss` the story fixes, `{sha, failures}`, which the replay
+  # measures the head against (`SelectionReplay.put_miss/2`). Checked again here because its
+  # values become a commit argument and `--failure` arguments on the replay's command line.
+  defp loop_finding?(%{"loop_finding" => finding}), do: SelectionReplay.miss?(finding)
+  defp loop_finding?(_verify), do: true
 
   # An `agent_result` run's outcome in its own two shapes: a result, or none. `agent_result` has
   # no incomplete form, so every way such a run can fail to produce one — the session's, the
@@ -891,15 +905,17 @@ defmodule LoopctlRunner.TriageRun do
   # selection path, replays selection beside its session (`SelectionReplay`). Every other run, and
   # every replay that cannot start, is `:none`, traced with why.
   defp start_replay(config, {name, path, tree}, run_dir, trace, seq, opts) do
-    with %{"base_branch" => base} when is_binary(base) <- opts[:verify_subject],
+    with %{"base_branch" => base} = subject when is_binary(base) <- opts[:verify_subject],
          {:replay, plan} <- SelectionReplay.plan(config, name, tree, base),
+         plan = SelectionReplay.put_miss(plan, get_in(subject, ["verify", "loop_finding"])),
          {:started, handle} <-
            SelectionReplay.start(plan, path, run_dir, bound_ms: session_bound_ms(config, opts)) do
       Trace.emit(trace, "selection_replay.started", seq, %{
         "merge_base" => plan.merge_base,
         "head" => plan.head,
         "corpus" => plan.corpus,
-        "matched" => Enum.take(plan.matched, 20)
+        "matched" => Enum.take(plan.matched, 20),
+        "miss" => plan.miss && plan.miss.sha
       })
 
       {:started, handle}

@@ -199,7 +199,12 @@ defmodule LoopctlRunner.DispatchPrompt do
   defp render(:text, value), do: clean(value)
   defp render(:list, items), do: Enum.map_join(items, "\n", &("- " <> clean(&1)))
 
-  defp fence(name, body) do
+  @doc """
+  `body` between the lines `<<<UNTRUSTED name>>>` and `<<<END UNTRUSTED name>>>`. The caller
+  passes `body` through `clean/1` first, so it cannot hold a delimiter of its own.
+  """
+  @spec fence(String.t(), String.t()) :: String.t()
+  def fence(name, body) do
     "#{@open}UNTRUSTED #{name}#{@close}\n#{body}\n#{@open}END UNTRUSTED #{name}#{@close}"
   end
 

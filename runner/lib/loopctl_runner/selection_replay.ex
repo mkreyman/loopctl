@@ -33,7 +33,9 @@ defmodule LoopctlRunner.SelectionReplay do
 
   `product` names the entry's product checkout in `repos` (its deps fetched, as the script
   needs), and `corpus` (5..30, default 5: loopctl accepts no proof on fewer than 5 commits) how
-  many of its commits are replayed.
+  many of its commits are replayed. When the verify dispatch names the `selection_miss` the story
+  fixes (`verify.loop_finding`, contract 1.33.0), the script also runs the head's selection at
+  that commit (`--miss`) and reports which of the failed tests (`--failure`) it covers.
 
   ## When it is used, and when it is stopped
 
@@ -193,10 +195,34 @@ defmodule LoopctlRunner.SelectionReplay do
          head: head,
          product: product,
          corpus: entry.corpus,
-         matched: matched
+         matched: matched,
+         miss: nil
        }}
     end
   end
+
+  @doc """
+  Whether `loop_finding` is a `selection_miss` the replay can take: valid against the vendored
+  contract's `RunnerVerify.loop_finding`, whose bounds are read from the schema and never
+  re-typed here.
+  """
+  @spec miss?(term()) :: boolean()
+  def miss?(loop_finding) do
+    schema = Contract.schema_def("RunnerVerify") |> get_in(["properties", "loop_finding"])
+    Contract.validate_against(schema, loop_finding, "verify.loop_finding") == :ok
+  end
+
+  @doc """
+  `plan` with the dispatch's `loop_finding` as the miss to replay at, or unchanged when the
+  dispatch carries none. The script then runs the head's selection at that commit and reports
+  which of the failures it covers, which loopctl's `SelectionProof` requires of a story that came
+  from a `selection_miss`.
+  """
+  @spec put_miss(map(), map() | nil) :: map()
+  def put_miss(plan, %{"sha" => sha, "failures" => failures}),
+    do: %{plan | miss: %{sha: sha, failures: failures}}
+
+  def put_miss(plan, nil), do: plan
 
   defp configured(config, repo_name) do
     case Map.fetch(config.selection_replay, repo_name) do
@@ -268,20 +294,21 @@ defmodule LoopctlRunner.SelectionReplay do
       entry = %{"marker_id" => marker_id, "group_file" => group_file}
       RunState.update(run_dir, %{"selection_replay" => entry})
 
-      argv = [
-        "-I",
-        script,
-        "--chg",
-        repo_path,
-        "--base",
-        plan.merge_base,
-        "--head",
-        plan.head,
-        "--repo",
-        plan.product,
-        "--corpus",
-        Integer.to_string(plan.corpus)
-      ]
+      argv =
+        [
+          "-I",
+          script,
+          "--chg",
+          repo_path,
+          "--base",
+          plan.merge_base,
+          "--head",
+          plan.head,
+          "--repo",
+          plan.product,
+          "--corpus",
+          Integer.to_string(plan.corpus)
+        ] ++ miss_args(plan.miss)
 
       run_opts = [
         term_grace_ms: @term_grace_ms,
@@ -298,6 +325,13 @@ defmodule LoopctlRunner.SelectionReplay do
        %{task: task, entry: entry, stop_at_ms: System.monotonic_time(:millisecond) + timeout_ms}}
     end
   end
+
+  # Each name goes as `--failure=<name>`, one argument: a test name beginning with `-` would
+  # otherwise be read by argparse as an option of its own.
+  defp miss_args(nil), do: []
+
+  defp miss_args(%{sha: sha, failures: failures}),
+    do: ["--miss", sha | Enum.map(failures, &("--failure=" <> &1))]
 
   defp time_left(timeout_ms) when timeout_ms > 0, do: :ok
   defp time_left(_timeout_ms), do: {:skip, "the session's time leaves no room for a replay"}

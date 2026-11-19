@@ -13,7 +13,7 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.32.0. It
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.33.0. It
 declares every kind the contract dispatches, the list `@kinds` in `LoopctlRunner.Control`
 (`LoopctlRunner.Control.kinds/0`), which includes `spec_tune` (template `spec_tuner@1`,
 US-48.13). A
@@ -33,7 +33,10 @@ the config's `selection_replay` (chg), a change touching one of its `paths` glob
 REPLAYED (contract 1.32.0): beside the session, the runner runs `bin/chg-replay-selection.py`
 as the base holds it, comparing selection at the merge base and the head over the `product`'s
 last `corpus` commits, and adds its output to a `pass` as `selection_replay`, which loopctl
-reads to merge a selection change without a person (`LoopctlRunner.SelectionReplay`). A reject
+reads to merge a selection change without a person (`LoopctlRunner.SelectionReplay`). When the
+dispatch's `verify.loop_finding` names the `selection_miss` the story fixes (contract 1.33.0),
+the replay also runs the head's selection at that commit and reports which of its failed tests
+it covers, as `selection_replay.miss`. A reject
 stops the replay; a replay that fails or does not finish in the session's time leaves the pass
 without it, and loopctl escalates as before. A
 `reply_draft` session (template `reply_draft@1`, a `:draft`, contract 1.26.0) runs on triage's
