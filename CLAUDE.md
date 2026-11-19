@@ -209,6 +209,14 @@ dispatch-minted work yields `caller_lineage_required`, and `:ok` falls through t
 `stories_reported_done_requires_agent` does NOT cover this — it is satisfied whenever
 `implementer_dispatch_id IS NULL` — so the code guard is the enforcement.
 
+One path reaches `reported_done` WITHOUT a caller, so without this gate: on a chg story the
+`submitted` event that moves the story `implementing -> reviewing` reports it as the system
+actor (`EventEffects.report_submitted/3`, audit action `change_reported_done`, US-47.8). No
+caller could do it — the implementer is `self_report_blocked`, a chg-rooted key is
+`chg_root_review_only` — and chg's reviewer can record only on a reported story. It certifies
+nothing: review-complete and verify still run every gate below. The same event opens a stage
+row at `implementing` for a story claimed and started outside the runner.
+
 **review-complete** — `validate_not_self_review/3` — custody-orphan backstop first, then a
 **nil reviewer WITH AN EMPTY LINEAGE is deliberately PERMITTED**: that pair means a human
 operator on a user-role key. The empty-lineage half is load-bearing — a DISPATCH-minted
@@ -285,7 +293,7 @@ re-mint revokes the earlier one only while none has recorded a verdict (`409
 review_already_recorded` after), and a custody halt refuses it (`503 tenant_halted`). A landing with no chg review for its landed
 revision (`event.sha`, the revision commit — never `data.merge_sha`) is escalated in the
 landed event's own transaction over the control-only edge `:review_missing`
-(`EventEffects.after_move/5`, `lib/loopctl/changes/event_effects.ex:493`), and that hold
+(`EventEffects.after_move/5`, `lib/loopctl/changes/event_effects.ex:518`), and that hold
 fails CLOSED: a refused escalation rolls the whole landing back (`:busy`, or
 `change_event_failed`, logged and counted) so chg redelivers it — the merge never commits
 without its hold. Such a story is never verified: every path that reaches `verified` —

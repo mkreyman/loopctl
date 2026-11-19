@@ -101,6 +101,7 @@ defmodule Loopctl.Changes.EventEffects do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.GitSha
   alias Loopctl.Repo
+  alias Loopctl.WorkBreakdown.Story
 
   # The webhook is a machine caller: no API key, so no agent and no lineage (PRD §5). It can
   # bind a change, which is informational, and can never perform a custody act.
@@ -245,6 +246,27 @@ defmodule Loopctl.Changes.EventEffects do
     do: %{"outcome" => "refused", "reason" => Atom.to_string(reason)}
 
   # ── the stage mapping (US-47.4) ─────────────────────────────────────────────
+
+  # A story a session claimed and started outside the runner has no stage row until its first
+  # `submitted` (US-47.8): open it at `implementing`, under the epoch read with the story lock,
+  # and let the mapping move it like any other row. A story nobody has started stays rowless.
+  defp stage_effect(tenant_id, %Event{kind: "submitted"} = event, %{row: nil} = target) do
+    if started?(tenant_id, target.story_id) do
+      {:ok, row} =
+        Stages.open_for_change_in_tenant_transaction(
+          tenant_id,
+          target.story_id,
+          target.claim_epoch,
+          actor_label: @actor_label,
+          event_data: event_data(event)
+        )
+
+      {stage, pending} = stage_effect(tenant_id, event, %{target | row: row})
+      {Map.put(stage, "opened", "implementing"), pending}
+    else
+      {%{"outcome" => "no_stage_row"}, []}
+    end
+  end
 
   defp stage_effect(_tenant_id, _event, %{row: nil}), do: {%{"outcome" => "no_stage_row"}, []}
 
@@ -510,7 +532,53 @@ defmodule Loopctl.Changes.EventEffects do
     end
   end
 
+  # A submitted revision is the implementer's "done" (US-47.8). The implementer cannot report
+  # its own story (`self_report_blocked`) and a chg-rooted key may not report at all
+  # (`chg_root_review_only`), yet chg's reviewer can record only on a `reported_done` story —
+  # so the change protocol reports it here, as the system actor, in the transaction that moved
+  # it to review. It certifies nothing: the review (a chg-minted child, off the implementer's
+  # chain) and the verify (never chg-rooted) are the separation, and both still run.
+  defp after_move(tenant_id, %Event{kind: "submitted"} = event, target, :reviewing, result) do
+    {moved, pending} = result
+
+    case report_submitted(tenant_id, target.story_id, event) do
+      :reported -> {Map.put(moved, "report", "reported_done"), pending}
+      :unchanged -> result
+    end
+  end
+
   defp after_move(_tenant_id, _event, _target, _to, result), do: result
+
+  defp started?(tenant_id, story_id) do
+    Repo.exists?(
+      from s in Story,
+        where:
+          s.tenant_id == ^tenant_id and s.id == ^story_id and s.agent_status == :implementing and
+            not is_nil(s.assigned_agent_id)
+    )
+  end
+
+  # Only from `implementing`: a story already reported (a later revision) or not started is
+  # left as it is. The story row is locked by this transaction (`lock_target/2`).
+  defp report_submitted(tenant_id, story_id, event) do
+    now = DateTime.utc_now()
+
+    {count, _} =
+      Repo.update_all(
+        from(s in Story,
+          where:
+            s.tenant_id == ^tenant_id and s.id == ^story_id and s.agent_status == :implementing
+        ),
+        set: [agent_status: :reported_done, reported_done_at: now, updated_at: now]
+      )
+
+    if count == 1 do
+      history(tenant_id, story_id, "change_reported_done", event)
+      :reported
+    else
+      :unchanged
+    end
+  end
 
   defp review_hold_refused(_tenant_id, _event, _target, :busy), do: Repo.rollback(:busy)
 

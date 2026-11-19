@@ -283,6 +283,73 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  Opens a story's stage row at `implementing`, inside the caller's `Loopctl.Repo.with_tenant/2`
+  transaction, for a change-protocol story that a session claimed and started outside the
+  runner (US-47.8): chg's `submitted` is the first thing the delivery machine hears of it, and
+  without a row no event of the change can move the story (`no_stage_row`).
+
+  `implementing` and not `detected`, because the work it names is already being done: the
+  story's own `agent_status` says so, and the caller checks that before calling. The row is
+  bound to `epoch`, the story's current `claim_epoch`, read under the caller's story lock
+  (`lock_for_control_in_tenant_transaction/2`). The `opened` stage event carries `event_data`.
+
+  Returns `{:ok, row}` with the row locked, the row that already exists included (a replay
+  finds it and writes nothing).
+  """
+  @spec open_for_change_in_tenant_transaction(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          non_neg_integer(),
+          keyword()
+        ) :: {:ok, StoryStage.t()}
+  def open_for_change_in_tenant_transaction(tenant_id, story_id, epoch, opts) do
+    unless Repo.in_transaction?(),
+      do:
+        raise(
+          ArgumentError,
+          "open_for_change_in_tenant_transaction/4 needs a Loopctl.Repo transaction"
+        )
+
+    now = DateTime.utc_now()
+    id = Ecto.UUID.generate()
+
+    Repo.insert_all(
+      StoryStage,
+      [
+        %{
+          id: id,
+          tenant_id: tenant_id,
+          story_id: story_id,
+          stage: :implementing,
+          claim_epoch: epoch,
+          attempts: %{},
+          lock_version: 0,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing,
+      conflict_target: [:tenant_id, :story_id]
+    )
+
+    row = lock_row(tenant_id, story_id)
+
+    if row.id == id do
+      insert_event(
+        Repo,
+        row,
+        "opened",
+        nil,
+        nil,
+        Keyword.get(opts, :actor_label),
+        Keyword.get(opts, :event_data, %{})
+      )
+    end
+
+    {:ok, row}
+  end
+
+  @doc """
   The encoded size of the `:event_data` a transition may carry, in bytes.
 
   Public so a CALLER that composes `event_data` can fit it rather than discover the bound as
