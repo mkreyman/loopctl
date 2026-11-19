@@ -141,6 +141,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
@@ -260,15 +261,17 @@ defmodule Loopctl.Intake do
     project_id = Map.get(attrs, :project_id) || Map.get(attrs, "project_id")
     repo = Map.get(attrs, :repo_full_name) || Map.get(attrs, "repo_full_name")
     target_epic_id = Map.get(attrs, :target_epic_id) || Map.get(attrs, "target_epic_id")
+    {attrs, mint} = take_root_mint(attrs)
 
     changeset =
       %Source{tenant_id: tenant_id, webhook_secret: secret}
       |> Source.create_changeset(create_attrs(repo, attrs))
       |> put_project(tenant_id, project_id)
       |> put_target_epic(tenant_id, target_epic_id)
+      |> refuse_root_and_mint(mint)
 
     with {:ok, changeset} <- valid(changeset),
-         {:ok, source} <- insert_source(tenant_id, changeset, opts) do
+         {:ok, source} <- insert_source(tenant_id, changeset, root_mint_opts(mint, opts)) do
       {:ok, %{source: source, webhook_secret: secret}}
     end
   end
@@ -404,9 +407,59 @@ defmodule Loopctl.Intake do
   defp valid(%Ecto.Changeset{valid?: true} = changeset), do: {:ok, changeset}
   defp valid(changeset), do: {:error, changeset}
 
+  # `mint_chg_root: true` (the operator's way to give a source a chg root, US-50 follow-up):
+  # loopctl inserts the root itself, keyless and agentless (`Dispatches.mint_chg_root/3`), in
+  # the source write's own transaction. Its id is chosen HERE and placed in the attrs as
+  # `chg_root_dispatch_id`, so the changeset validates exactly as for a named root (the mode
+  # rule needs a root on a `chg` or `ledger` source) and nothing downstream has a second path.
+  # Naming a root AND asking for one is refused in `refuse_root_and_mint/2`.
+  defp take_root_mint(attrs) do
+    wanted? = fetch_either(attrs, :mint_chg_root, "mint_chg_root") == {:ok, true}
+    attrs = attrs |> Map.delete(:mint_chg_root) |> Map.delete("mint_chg_root")
+
+    cond do
+      not wanted? ->
+        {attrs, nil}
+
+      match?({:ok, _}, fetch_either(attrs, :chg_root_dispatch_id, "chg_root_dispatch_id")) ->
+        {attrs, :conflict}
+
+      true ->
+        root_id = Ecto.UUID.generate()
+        {Map.put(attrs, :chg_root_dispatch_id, root_id), {:mint, root_id}}
+    end
+  end
+
+  defp refuse_root_and_mint(changeset, :conflict),
+    do:
+      Ecto.Changeset.add_error(
+        changeset,
+        :chg_root_dispatch_id,
+        "name a chg_root_dispatch_id or set mint_chg_root, not both"
+      )
+
+  defp refuse_root_and_mint(changeset, _mint), do: changeset
+
+  defp root_mint_opts({:mint, root_id}, opts), do: Keyword.put(opts, :mint_chg_root, root_id)
+  defp root_mint_opts(_mint, opts), do: Keyword.delete(opts, :mint_chg_root)
+
+  defp mint_root(tenant_id, opts) do
+    case Keyword.get(opts, :mint_chg_root) do
+      nil ->
+        :ok
+
+      root_id ->
+        case Dispatches.mint_chg_root(tenant_id, root_id, Keyword.take(opts, [:actor_lineage])) do
+          {:ok, _dispatch} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
   defp insert_source(tenant_id, changeset, opts) do
     AdminRepo.transaction(fn ->
-      with :ok <- check_chg_root(tenant_id, changeset),
+      with :ok <- mint_root(tenant_id, opts),
+           :ok <- check_chg_root(tenant_id, changeset),
            :ok <- close_pr_route(tenant_id, changeset),
            {:ok, source} <- AdminRepo.insert(changeset),
            {:ok, _entry} <-
@@ -531,17 +584,25 @@ defmodule Loopctl.Intake do
              | {:pr_route_in_flight, [Ecto.UUID.t()]}}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
+    {attrs, mint} = take_root_mint(attrs)
+
     fields =
       for key <- @updatable_fields,
           Map.has_key?(attrs, key),
           do: key
 
-    if fields == [] do
+    if fields == [] and mint != :conflict do
       {:error, :nothing_to_update}
     else
       case active_source_of(tenant_id, source_id) do
-        nil -> {:error, :not_found}
-        %Source{} = source -> apply_update(tenant_id, source, attrs, fields, opts)
+        nil ->
+          {:error, :not_found}
+
+        %Source{} = source when mint == :conflict ->
+          {:error, source |> Ecto.Changeset.change() |> refuse_root_and_mint(mint)}
+
+        %Source{} = source ->
+          apply_update(tenant_id, source, attrs, fields, root_mint_opts(mint, opts))
       end
     end
   end
@@ -652,7 +713,8 @@ defmodule Loopctl.Intake do
   # the table it describes.
   defp write_update(tenant_id, changeset, fields, opts) do
     AdminRepo.transaction(fn ->
-      with :ok <- check_chg_root(tenant_id, changeset),
+      with :ok <- mint_root(tenant_id, opts),
+           :ok <- check_chg_root(tenant_id, changeset),
            :ok <- close_pr_route(tenant_id, changeset),
            {:ok, source} <- AdminRepo.update(changeset),
            :ok <- append_if(fields, :target_epic_id, tenant_id, source, opts),
@@ -741,16 +803,43 @@ defmodule Loopctl.Intake do
   # By id AND tenant: another tenant's dispatch is `nil` here, exactly like an id that names
   # nothing, so the two refusals are one and the same.
   #
-  # Expiry is NOT judged. A root's key expiring is chg-server's credential lapsing, which
-  # refuses every call it makes; it does not make the registration a different principal.
+  # Expiry of a root ALREADY registered is NOT judged: a root is a lineage anchor, not a held
+  # key, and `RevokeExpiredDispatchesWorker` leaves a row a live source names unrevoked.
+  #
+  # A root being NAMED by this write is judged for expiry, though, with a margin of
+  # `@chg_root_naming_margin_seconds`. The sweep's exemption reads which roots a live source
+  # names in its own statement, and a source write that commits WHILE that statement runs is
+  # not in its snapshot: naming a root on the edge of its expiry could commit just as the sweep
+  # revokes it, and every post from the source would then be 401. A root with the margin left
+  # cannot be a sweep candidate before this write commits.
   defp check_chg_root(tenant_id, %Ecto.Changeset{} = changeset) do
     mode = Ecto.Changeset.get_field(changeset, :mode)
     root_id = Ecto.Changeset.get_field(changeset, :chg_root_dispatch_id)
     named_root? = Ecto.Changeset.changed?(changeset, :chg_root_dispatch_id) and root_id != nil
 
-    if named_root? or Source.credentials_required?(mode),
-      do: judge_chg_root(tenant_id, root_id),
-      else: :ok
+    cond do
+      named_root? ->
+        with :ok <- judge_chg_root(tenant_id, root_id), do: judge_root_fresh(tenant_id, root_id)
+
+      Source.credentials_required?(mode) ->
+        judge_chg_root(tenant_id, root_id)
+
+      true ->
+        :ok
+    end
+  end
+
+  @chg_root_naming_margin_seconds 300
+
+  defp judge_root_fresh(tenant_id, root_id) do
+    floor = DateTime.add(DateTime.utc_now(), @chg_root_naming_margin_seconds, :second)
+
+    if AdminRepo.exists?(
+         from d in Dispatch,
+           where: d.id == ^root_id and d.tenant_id == ^tenant_id and d.expires_at > ^floor
+       ),
+       do: :ok,
+       else: {:error, :chg_root_invalid}
   end
 
   @pr_route_in_flight_message "A story on this source's project is at `ci` holding a recorded " <>

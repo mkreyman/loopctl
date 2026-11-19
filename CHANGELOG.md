@@ -6,6 +6,16 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A chg root is minted by loopctl and no longer expires (2026-11-18).** `POST` and
+  `PATCH /api/v1/intake/sources` take `mint_chg_root: true`: loopctl inserts a parentless,
+  keyless, agentless `:orchestrator` root in the source's own transaction and names it
+  (`422` beside a `chg_root_dispatch_id`; the operator key only, as for the credentials).
+  `RevokeExpiredDispatchesWorker` no longer revokes the ROW of a root an unrevoked source
+  names; its key, if it has one, is still revoked. Before this a root expired after 4 h and
+  every ledger post and change event from its source answered 401. A named root must now have
+  more than 300 s left (`422 chg_root_invalid`). Operator step after deploy: every source that
+  holds chg credentials with no live root gets `mint_chg_root: true`
+  (`intake_source_update`). No migration.
 - **The chg ledger and change events from a `pr` source, and intake mode `ledger`
   (2026-11-18, #1047).** `POST /api/v1/chg_ledger/:source_id` and
   `POST /api/v1/change_events/:source_id` now authenticate any source that holds both

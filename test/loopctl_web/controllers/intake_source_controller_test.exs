@@ -748,6 +748,58 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       assert switched["source"]["mode"] == "chg"
     end
 
+    test "mint_chg_root: the operator key gets a keyless root back, on create and update", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      authed = auth(conn, ctx.operator_key)
+
+      created =
+        authed
+        |> post(
+          ~p"/api/v1/intake/sources",
+          ctx
+          |> create_params("mkreyman/infra")
+          |> Map.merge(%{
+            "mode" => "chg",
+            "change_events_secret" => @chg_secret,
+            "mint_chg_root" => true
+          })
+        )
+        |> json_response(201)
+
+      root_id = created["source"]["chg_root_dispatch_id"]
+
+      assert %{api_key_id: nil, agent_id: nil} =
+               AdminRepo.get!(Loopctl.Dispatches.Dispatch, root_id)
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      updated =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "change_events_secret" => @chg_secret,
+          "mint_chg_root" => true
+        })
+        |> json_response(200)
+
+      assert is_binary(updated["source"]["chg_root_dispatch_id"])
+      refute updated["source"]["chg_root_dispatch_id"] == root_id
+
+      both =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "chg_root_dispatch_id" => root_id,
+          "mint_chg_root" => true
+        })
+        |> json_response(422)
+
+      assert Map.has_key?(both["error"]["details"], "chg_root_dispatch_id")
+    end
+
     test "a dispatch-minted key may not write the chg credentials, and may still rebase", %{
       conn: conn
     } do
@@ -768,6 +820,7 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       for body <- [
             %{"change_events_secret" => @chg_secret},
             %{"chg_root_dispatch_id" => root_id},
+            %{"mint_chg_root" => true},
             %{
               "mode" => "chg",
               "change_events_secret" => @chg_secret,

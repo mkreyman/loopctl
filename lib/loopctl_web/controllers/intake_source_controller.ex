@@ -119,6 +119,15 @@ defmodule LoopctlWeb.IntakeSourceController do
                               "source an explicit null clears it. Not GitHub's " <>
                               "`webhook_secret`, which is never reused."
 
+  @mint_chg_root_doc "Optional; `true` has loopctl mint this source's chg root itself, in the " <>
+                       "same write: a parentless orchestrator dispatch with no key and no " <>
+                       "agent, so it takes no agent's one-orchestrator-key slot, and the " <>
+                       "dispatch expiry sweep never revokes a root a live source names. The " <>
+                       "new id comes back as `chg_root_dispatch_id`. The way to give a " <>
+                       "source a root; naming one is for a root that already exists. 422 " <>
+                       "with `chg_root_dispatch_id` in the same body. Operator key only, " <>
+                       "like naming a root."
+
   @chg_root_doc "The dispatch chg-server's key was minted from (PRD §6): reviews of a `chg` " <>
                   "story are accepted only from its children. " <>
                   Source.chg_root_requirement() <>
@@ -126,7 +135,9 @@ defmodule LoopctlWeb.IntakeSourceController do
                   "request names it (on a `pr` source too) and on EVERY write that leaves " <>
                   "the source `chg` — a secret rotation or a base-branch edit on a `chg` " <>
                   "source whose root has since been revoked is the same 422 until a live root " <>
-                  "is named. " <>
+                  "is named. A root being NAMED must also have at least 300 s left before " <>
+                  "its expiry, so the expiry sweep cannot revoke it as it is enrolled; " <>
+                  "once named, its expiry no longer matters. " <>
                   "Required when the source is `chg` or `ledger`, and on a `pr` source " <>
                   "that is to send its chg ledger and events (with " <>
                   "`change_events_secret`); on a `pr` source an explicit null clears it."
@@ -270,8 +281,10 @@ defmodule LoopctlWeb.IntakeSourceController do
              type: :string,
              format: :uuid,
              description:
-               "Optional; required with `mode: chg` or `mode: ledger`. " <> @chg_root_doc
+               "Optional; required with `mode: chg` or `mode: ledger` unless " <>
+                 "`mint_chg_root` is set. " <> @chg_root_doc
            },
+           mint_chg_root: %Schema{type: :boolean, description: @mint_chg_root_doc},
            target_epic_id: %Schema{
              type: :string,
              format: :uuid,
@@ -425,6 +438,7 @@ defmodule LoopctlWeb.IntakeSourceController do
              nullable: true,
              description: "Optional; omitted leaves it as it is. " <> @chg_root_doc
            },
+           mint_chg_root: %Schema{type: :boolean, description: @mint_chg_root_doc},
            target_epic_id: %Schema{
              type: :string,
              format: :uuid,
@@ -504,6 +518,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_if_present(params, "triage_requires_ticket", :triage_requires_ticket)
       |> put_if_present(params, "change_events_secret", :change_events_secret)
       |> put_if_present(params, "chg_root_dispatch_id", :chg_root_dispatch_id)
+      |> put_mint_chg_root(params)
 
     with {:ok, %{source: source, webhook_secret: secret}} <-
            Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do
@@ -536,7 +551,8 @@ defmodule LoopctlWeb.IntakeSourceController do
   # hands back another lineaged key, which this refuses again.
   defp guard_chg_credentials(conn, params) do
     if Map.has_key?(params, "change_events_secret") or
-         Map.has_key?(params, "chg_root_dispatch_id") or params["mode"] in ["chg", "ledger"],
+         Map.has_key?(params, "chg_root_dispatch_id") or Map.has_key?(params, "mint_chg_root") or
+         params["mode"] in ["chg", "ledger"],
        do:
          RequireUnlineagedCaller.call(
            conn,
@@ -569,6 +585,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_if_present(params, "triage_requires_ticket", :triage_requires_ticket)
       |> put_if_present(params, "change_events_secret", :change_events_secret)
       |> put_if_present(params, "chg_root_dispatch_id", :chg_root_dispatch_id)
+      |> put_mint_chg_root(params)
 
     case Intake.update_source(tenant.id, source_id, attrs, actor_lineage: actor_lineage(conn)) do
       {:ok, source} ->
@@ -596,6 +613,13 @@ defmodule LoopctlWeb.IntakeSourceController do
         LoopctlWeb.FallbackController.call(conn, {:error, reason})
     end
   end
+
+  # Only a literal `true` mints. Anything else (false, a string, absent) asks for nothing, so a
+  # client that sends `"mint_chg_root": "false"` never gets a root it did not mean to ask for.
+  defp put_mint_chg_root(attrs, %{"mint_chg_root" => true}),
+    do: Map.put(attrs, :mint_chg_root, true)
+
+  defp put_mint_chg_root(attrs, _params), do: attrs
 
   defp put_if_present(attrs, params, key, field) do
     case Map.fetch(params, key) do

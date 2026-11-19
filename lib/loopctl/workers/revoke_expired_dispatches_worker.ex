@@ -15,6 +15,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Intake.Source
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -22,12 +23,21 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
 
     # Find expired, non-revoked dispatches. CROSS-TENANT by design — this is a sweep, so
     # `tenant_id` comes back on every row and the write below is grouped by it.
+    #
+    # A chg ROOT that a live intake source names is never a candidate: its row is a lineage
+    # anchor that the source's every ledger post, change event and reviewer mint is judged
+    # against (`Loopctl.Intake`'s `chg_root?/1` requires `revoked_at IS NULL`), and it outlives
+    # the 4h dispatch ceiling by design. Revoking it on expiry turned every chg enrolment into
+    # a 4h credential that nothing could renew. Its KEY, if an operator minted it with one, is
+    # still revoked: only the row is exempt. A root no live source names any more (the source
+    # revoked or repointed) is swept as before.
     expired =
       from(d in Dispatch,
         where: is_nil(d.revoked_at) and d.expires_at < ^now,
         select: %{id: d.id, tenant_id: d.tenant_id, api_key_id: d.api_key_id}
       )
       |> AdminRepo.all()
+      |> mark_named_roots()
 
     if expired != [] do
       revoke_expired_batch(expired, now)
@@ -55,8 +65,15 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
   # `dispatch_revoked` chain entry. Expiry is the credential's own TTL elapsing rather than a
   # principal revoking anything, so there is no actor to name on such an entry.
   defp revoke_expired_batch(expired, now) do
+    # Every expired KEY is revoked, a named chg root's included; only the named root's ROW is
+    # kept (see the candidate read). Such a row stays a candidate on every run, and the key
+    # write is idempotent on it (`is_nil(k.revoked_at)`).
     key_ids = expired |> Enum.map(& &1.api_key_id) |> Enum.reject(&is_nil/1)
-    by_tenant = Enum.group_by(expired, & &1.tenant_id, & &1.id)
+
+    by_tenant =
+      expired
+      |> Enum.reject(& &1.named_root?)
+      |> Enum.group_by(& &1.tenant_id, & &1.id)
 
     result =
       AdminRepo.transaction(fn ->
@@ -83,6 +100,24 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
     end
 
     result
+  end
+
+  # By tenant AND id: the read runs on `AdminRepo` (BYPASSRLS), so the source's tenant is
+  # matched explicitly. Never another tenant's source exempting this tenant's row.
+  defp mark_named_roots([]), do: []
+
+  defp mark_named_roots(expired) do
+    ids = Enum.map(expired, & &1.id)
+
+    named =
+      from(s in Source,
+        where: s.chg_root_dispatch_id in ^ids and is_nil(s.revoked_at),
+        select: {s.tenant_id, s.chg_root_dispatch_id}
+      )
+      |> AdminRepo.all()
+      |> MapSet.new()
+
+    Enum.map(expired, &Map.put(&1, :named_root?, MapSet.member?(named, {&1.tenant_id, &1.id})))
   end
 
   defp revoke_keys([], _now), do: []

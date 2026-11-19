@@ -70,6 +70,61 @@ defmodule Loopctl.Dispatches do
   def max_expires_seconds, do: @max_expires_seconds
 
   @doc """
+  Inserts a chg ROOT for an intake source (`Loopctl.Intake`'s `mint_chg_root`): a parentless
+  `:orchestrator` dispatch with id `root_id`, `lineage_path == [root_id]`, and NO key and NO
+  agent.
+
+  A chg root is a lineage anchor, never a held credential: the only thing ever minted under it
+  is a review child, server-side (`mint_chg_reviewer/4`). Minting it through `create_dispatch/3`
+  gave it a key nobody used, and that key took its agent's `api_keys_one_role_per_agent_idx`
+  slot, so the fleet's agent, which already held a live orchestrator key, could not have a root
+  at all. With no agent there is no slot to take.
+
+  Its `expires_at` is the usual ceiling and means nothing while a live source names it:
+  `Loopctl.Workers.RevokeExpiredDispatchesWorker` never revokes such a row.
+
+  Runs inside the caller's transaction (the source write), so a root never outlives a refused
+  enrolment. Only `Loopctl.Intake` calls it, behind the intake-source controller's operator-key
+  ceiling.
+  """
+  @spec mint_chg_root(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Dispatch.t()} | {:error, term()}
+  def mint_chg_root(tenant_id, root_id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(root_id) do
+    now = DateTime.utc_now()
+
+    AdminRepo.transaction(fn ->
+      with {:ok, dispatch} <-
+             %Dispatch{id: root_id, tenant_id: tenant_id}
+             |> Dispatch.changeset(%{
+               role: :orchestrator,
+               lineage_path: [root_id],
+               expires_at: DateTime.add(now, @max_expires_seconds, :second),
+               created_at: now
+             })
+             |> AdminRepo.insert(),
+           {:ok, _entry} <-
+             AuditChain.append(tenant_id, %{
+               action: "dispatch_created",
+               actor_lineage: Keyword.get(opts, :actor_lineage, []),
+               entity_type: "dispatch",
+               entity_id: dispatch.id,
+               payload: %{
+                 "lineage_path" => dispatch.lineage_path,
+                 "role" => "orchestrator",
+                 "expires_at" => DateTime.to_iso8601(dispatch.expires_at),
+                 "chg_root" => true,
+                 "keyless" => true
+               }
+             }) do
+        dispatch
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+  end
+
+  @doc """
   Mints one chg review dispatch (US-50.3): an `:orchestrator` child of the source's chg root
   `root_id`, for `agent_id`, living `#{@max_expires_seconds}` seconds, with its ephemeral key.
 

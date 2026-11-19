@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.17.0 — 2026-11-18
+
+### Added
+
+- **`intake_source_enroll` / `intake_source_update` take `mint_chg_root: true`**: loopctl mints
+  the source's chg root itself, keyless and agentless, in the same write, and returns its id as
+  `chg_root_dispatch_id`. It stands in for the root id wherever one is required, is refused
+  beside one (locally and 422), and must be a boolean. It is the way to get a root: one minted
+  with `dispatch` takes its agent's one orchestrator-key slot. The descriptions also name the
+  new 300 s naming margin on a named root.
+
 ## 3.15.0 — 2026-11-18
 
 ### Added
