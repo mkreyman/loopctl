@@ -514,10 +514,10 @@ is bound to `docs/design-system.md`:
 - **Policy (52.51):** `factory/policy.toml`, `Loopctl.Factory.Policy` and `GET /api/v1/factory/policy`.
 - **Pack (52.52):**
   - `mix factory.pack [--check]`;
-  - `factory/pack/` (the plugin `loopctl-factory`) and `factory/pack-review-rounds/`;
+  - `factory/pack/` (the plugin `loopctl-factory`), `factory/pack-review-rounds/` and `factory/pack-kb-first/` (the plugin `kb-first`);
   - the root `.claude-plugin/marketplace.json` (the marketplace `loopctl-factory`);
-  - `hooks/lib/policy.sh` and `hooks/lib/loopctl.sh`;
-  - the stable link `~/.claude/factory`.
+  - `hooks/lib/policy.sh`, `hooks/lib/loopctl.sh` and `bin/loopctl-mcp.sh` (the launcher of the user-scope `loopctl` MCP server);
+  - the stable link `~/.claude/factory` and the policy cache `~/.claude/factory-cache/policy.json`.
 - **Review rounds (52.53):** `Loopctl.Factory.ReviewRounds`, the routes `/api/v1/review_rounds` and `/api/v1/review_rounds/:round_id/void`, and the error codes `review_ceiling_reached`, `review_round_not_found`, `attestation_reason_required` and `work_item_not_found`.
 - **Release manifest (52.52):** the component `[components.factory_pack]`.
 - **E2E (52.55):** `E2E.ConfigDir` and `E2E.WriteScope`.
