@@ -130,6 +130,7 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Changes.Findings
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriageTrigger
   alias Loopctl.Intake
@@ -329,7 +330,8 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
     `:source_not_found` and the record escalates, which is a data inconsistency somebody has
     to look at rather than something to drop silently;
   - the TICKET: a source with `triage_requires_ticket` promotes only a record carrying a
-    `ticket_id`. Any other record stays `pending_triage` and makes no story, because triage
+    `ticket_id`, or the issue of one of the tenant's chg findings
+    (`Loopctl.Changes.Findings.loop_issue_query/0`, US-51.3). Any other record stays `pending_triage` and makes no story, because triage
     would never take it (`Loopctl.Agents.Candidates`, `:requires_ticket_if_source_says`) and
     a story nobody will work is clutter in the epic. Excluded from the read for the same
     reason a revoked source is; a record that gains a ticket later is promoted then;
@@ -356,6 +358,7 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   @spec candidates(keyword()) :: [Record.t()]
   def candidates(opts \\ []) do
     from(r in Record,
+      as: :record,
       left_join: src in Source,
       on: src.id == r.source_id and src.tenant_id == r.tenant_id,
       left_join: s in Story,
@@ -364,7 +367,9 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
       on: st.story_id == s.id and st.tenant_id == s.tenant_id,
       where: r.status == :pending_triage,
       where: is_nil(src.id) or is_nil(src.revoked_at),
-      where: is_nil(src.id) or not src.triage_requires_ticket or not is_nil(r.ticket_id),
+      where:
+        is_nil(src.id) or not src.triage_requires_ticket or not is_nil(r.ticket_id) or
+          exists(Findings.loop_issue_query()),
       where: is_nil(r.issue_state) or r.issue_state != "closed",
       where: is_nil(st.id),
       order_by: [asc: r.inserted_at, asc: r.id],

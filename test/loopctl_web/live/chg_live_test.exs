@@ -47,6 +47,26 @@ defmodule LoopctlWeb.ChgLiveTest do
     })
   end
 
+  defp finding!(tenant_id, attrs) do
+    at = DateTime.add(DateTime.utc_now(), -3600)
+    escalated? = attrs.state == :escalated
+
+    Loopctl.AdminRepo.insert!(
+      struct(
+        %Loopctl.Changes.Finding{
+          tenant_id: tenant_id,
+          fingerprint: Ecto.UUID.generate(),
+          repo_full_name: "mkreyman/home_care_billing",
+          first_seen_at: at,
+          last_seen_at: at,
+          escalated_at: if(escalated?, do: at),
+          escalated_reason: if(escalated?, do: "fix_attempts_2")
+        },
+        attrs
+      )
+    )
+  end
+
   defp seed!(source) do
     s1 = String.duplicate("1", 40)
     s2 = String.duplicate("2", 40)
@@ -158,7 +178,7 @@ defmodule LoopctlWeb.ChgLiveTest do
     setup %{conn: conn} do
       {_secret, source} = fixture(:intake_source, %{})
       seeded = seed!(source)
-      %{conn: operator(conn, source.tenant_id), seeded: seeded}
+      %{conn: operator(conn, source.tenant_id), seeded: seeded, tenant_id: source.tenant_id}
     end
 
     test "each panel has its element and counts matching the seed", %{conn: conn, seeded: s} do
@@ -217,6 +237,26 @@ defmodule LoopctlWeb.ChgLiveTest do
       assert has_element?(view, "#runner-list", "No runner samples")
     end
 
+    test "US-51.6: the findings panel counts by state and kind and lists the escalated", %{
+      conn: conn,
+      tenant_id: tenant_id
+    } do
+      finding!(tenant_id, %{state: :filed, kind: "flaky_test"})
+      finding!(tenant_id, %{state: :escalated, kind: "selection_miss", issue_number: 77})
+      finding!(tenant_id, %{state: :filed, kind: "flaky_test"})
+
+      {:ok, view, _html} = live(conn, ~p"/chg")
+
+      # The counts themselves, not the labels: each label renders whatever the tally holds.
+      assert view |> element("#findings-state-filed") |> render() =~ ~r/>\s*2\s*</
+      assert view |> element("#findings-state-escalated") |> render() =~ ~r/>\s*1\s*</
+      assert view |> element("#findings-state-queued") |> render() =~ ~r/>\s*0\s*</
+      assert view |> element("#findings-kind-flaky_test") |> render() =~ ~r/>\s*2\s*</
+      assert view |> element("#findings-kind-selection_miss") |> render() =~ ~r/>\s*1\s*</
+      assert has_element?(view, "#escalated-list", "#77")
+      assert has_element?(view, "#escalated-list", "fix_attempts_2")
+    end
+
     test "a host the page does not offer is ignored rather than trusted", %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/chg?host=nowhere")
       assert has_element?(view, "#fallback-rate", "50.0%")
@@ -227,6 +267,7 @@ defmodule LoopctlWeb.ChgLiveTest do
     test "an operator of tenant B sees only empty states over tenant A's rows", %{conn: conn} do
       {_secret, source} = fixture(:intake_source, %{})
       seed!(source)
+      finding!(source.tenant_id, %{state: :escalated, kind: "flaky_test", issue_number: 88})
 
       tenant_b = fixture(:tenant)
       {:ok, view, _html} = live(operator(conn, tenant_b.id), ~p"/chg")
@@ -246,7 +287,8 @@ defmodule LoopctlWeb.ChgLiveTest do
             {"flaky-list", "flaky-empty"},
             {"runner-list", "runner-empty"},
             {"review-outcomes", "outcomes-empty"},
-            {"attention-list", "attention-empty"}
+            {"attention-list", "attention-empty"},
+            {"escalated-list", "escalated-empty"}
           ] do
         refute has_element?(view, "##{list} > li:not(##{empty})"), "#{list} has a row"
       end

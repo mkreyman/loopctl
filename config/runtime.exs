@@ -158,6 +158,21 @@ case System.get_env("STORY_CLAIM_LEASE_SECONDS") &&
   _ -> :ok
 end
 
+# US-51.1: the chg feedback loop. CHG_FINDINGS_DAILY_CAP caps new loop issues per repository
+# per UTC day (positive integer; anything else leaves the default of 5 in
+# Loopctl.Changes.Findings.daily_cap/1). CHG_FINDINGS_REPO is the `owner/name` chg's own
+# selection misses are filed on (default mkreyman/chg).
+case System.get_env("CHG_FINDINGS_DAILY_CAP") &&
+       Integer.parse(System.get_env("CHG_FINDINGS_DAILY_CAP")) do
+  {cap, ""} when cap > 0 -> config :loopctl, :chg_findings_daily_cap, cap
+  _ -> :ok
+end
+
+case System.get_env("CHG_FINDINGS_REPO") do
+  repo when is_binary(repo) and repo != "" -> config :loopctl, :chg_findings_repo, repo
+  _ -> :ok
+end
+
 # #879 (US-44.5): seconds past a dispatch's wall clock before a driver-placed claim's lease
 # cap. Any INTEGER is taken as given, so a value below the runner capacity release grace
 # reaches Loopctl.Delivery.DispatchLease.validate!/0 and stops the boot instead of being

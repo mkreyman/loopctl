@@ -182,7 +182,13 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.DispatchPlacementController"
     ],
     runner_pool: ["LoopctlWeb.RunnerController"],
-    issue_intake: ["LoopctlWeb.IntakeSourceController", "LoopctlWeb.GitHubCredentialController"],
+    issue_intake: [
+      "LoopctlWeb.IntakeSourceController",
+      "LoopctlWeb.GitHubCredentialController",
+      # US-51.6 — clearing an escalated chg finding files a fresh issue through the tenant's
+      # intake source, so it is the same surface as enrolling that source.
+      "LoopctlWeb.ChgFindingController"
+    ],
     token_budgets: [
       "LoopctlWeb.TokenBudgetController",
       "LoopctlWeb.TokenUsageController",

@@ -50,6 +50,50 @@ defmodule Loopctl.Agents.Specs.VerifyV1 do
   @max_findings 10
   @max_finding_length 300
 
+  # US-51.5: chg's test-selection replay, judged by `Loopctl.Changes.SelectionProof`. Optional,
+  # so a runner that does not send it is unaffected; only a chg selection change needs it.
+  # Bounded to fit the 48 000-byte envelope beside the findings: 30 commits with 3 dropped
+  # names each, and 50 covered names, all at most 200 characters.
+  @test_name %OpenApiSpex.Schema{type: :string, minLength: 1, maxLength: 200}
+  @sha %OpenApiSpex.Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"}
+
+  @selection_replay_schema %OpenApiSpex.Schema{
+    type: :object,
+    required: [:corpus],
+    additionalProperties: false,
+    description:
+      "Only on a chg selection change: the replay of the head against its base. `corpus` " <>
+        "is one entry per replayed commit, with the tests the BASE selected that the head " <>
+        "did not (`dropped`, at most 3 named; any is a narrowing). `miss` is the replay at " <>
+        "the finding's commit: which of its failed tests the head selects.",
+    properties: %{
+      corpus: %OpenApiSpex.Schema{
+        type: :array,
+        maxItems: 30,
+        items: %OpenApiSpex.Schema{
+          type: :object,
+          required: [:sha, :base_count, :head_count, :dropped],
+          additionalProperties: false,
+          properties: %{
+            sha: @sha,
+            base_count: %OpenApiSpex.Schema{type: :integer, minimum: 0},
+            head_count: %OpenApiSpex.Schema{type: :integer, minimum: 0},
+            dropped: %OpenApiSpex.Schema{type: :array, maxItems: 3, items: @test_name}
+          }
+        }
+      },
+      miss: %OpenApiSpex.Schema{
+        type: :object,
+        required: [:sha, :covered],
+        additionalProperties: false,
+        properties: %{
+          sha: @sha,
+          covered: %OpenApiSpex.Schema{type: :array, maxItems: 50, items: @test_name}
+        }
+      }
+    }
+  }
+
   @doc "The most findings a verdict may carry."
   @spec max_findings() :: pos_integer()
   def max_findings, do: @max_findings
@@ -121,7 +165,8 @@ defmodule Loopctl.Agents.Specs.VerifyV1 do
           description:
             "What fails, one finding per entry; empty on a `pass`. On a `reject` they are " <>
               "the reason the story goes back to work."
-        }
+        },
+        selection_replay: @selection_replay_schema
       }
     },
     screens: %{

@@ -355,6 +355,31 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "US-51.1: chg finding crontab entries" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      %{crontab: cron_opts[:crontab]}
+    end
+
+    test "the nightly sweep runs once a day, after the ledger prune", %{crontab: crontab} do
+      assert {"10 4 * * *", Loopctl.Workers.ChgFindingSweepWorker} in crontab,
+             "without the sweep nothing turns the chg ledger into findings"
+
+      refute Loopctl.Workers.ChgFindingSweepWorker in Loopctl.ObanConfig.parked_crons()
+    end
+
+    test "the outbox drains every two minutes", %{crontab: crontab} do
+      assert {"*/2 * * * *", Loopctl.Workers.ChgFindingActionWorker} in crontab,
+             "without the drainer a filed finding never reaches GitHub"
+
+      refute Loopctl.Workers.ChgFindingActionWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "DispatchDriverWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

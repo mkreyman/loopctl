@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 3.17.0 — 2026-11-18
+## 3.17.0 — 2026-11-19
 
 ### Added
 
@@ -15,6 +15,20 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   beside one (locally and 422), and must be a boolean. It is the way to get a root: one minted
   with `dispatch` takes its agent's one orchestrator-key slot. The descriptions also name the
   new 300 s naming margin on a named root.
+
+## 3.16.0 — 2026-11-19
+
+### Added
+
+- **`chg_findings`** (loopctl US-51.6): the chg feedback loop's findings, filtered by
+  `state`, `kind`, `repo`, `limit`. Any tenant key.
+- **`chg_finding_clear`** (loopctl US-51.6): sends an escalated finding back to `queued` so
+  the loop files a fresh issue. Needs `LOOPCTL_USER_KEY` on a human-anchored tenant.
+
+### Changed
+
+- **`chg_ledger_summary`** returns a `findings` panel: counts per state and kind, and the
+  escalated findings.
 
 ## 3.15.0 — 2026-11-18
 

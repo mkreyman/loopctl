@@ -91,6 +91,7 @@ import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.j
 import { changeBindingGet as changeBindingGetRequest } from "./lib/change-bindings.js";
 import { agentOutcomes } from "./lib/agent-outcomes.js";
 import { chgLedgerSummary } from "./lib/chg-ledger-summary.js";
+import { chgFindings, chgFindingClear } from "./lib/chg-findings.js";
 import {
   clearGithubCredential as clearGithubCredentialRequest,
   githubCredential as githubCredentialRequest,
@@ -3515,6 +3516,22 @@ async function chgLedgerSummaryRead(args) {
       apiCall: (method, path, body) => apiCall(method, path, body, key),
     }),
   );
+}
+
+// US-51.6: the findings list is a READ keyed as chgLedgerSummaryRead is; clearing one is a
+// person's act and takes the EXACT user key through runnerDeps().
+async function chgFindingsRead(args) {
+  const key = process.env.LOOPCTL_AGENT_KEY;
+
+  return toContent(
+    await chgFindings(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, key),
+    }),
+  );
+}
+
+async function chgFindingClearCall(args) {
+  return toContent(await chgFindingClear(args, runnerDeps()));
 }
 
 async function resolveEscalation(args) {
@@ -9005,6 +9022,61 @@ const TOOLS = [
     },
   },
   {
+    name: "chg_findings",
+    description:
+      "THE CHG FEEDBACK LOOP'S FINDINGS (GET /api/v1/chg_findings, loopctl US-51.6): the " +
+      "problems the nightly sweep derived from the chg ledger and files as GitHub issues for " +
+      "the delivery loop to fix — `selection_miss`, `flaky_test`, `missing_review`, " +
+      "`stuck_change`, `source_silent` — newest sighting first. Each row: `id`, `kind`, " +
+      "`fingerprint`, `repo`, `state` (queued, filed, fixed, closed, escalated), " +
+      "`occurrences`, `fix_attempts`, `loop_depth`, `cycle`, `issue_number`, `issue_url`, " +
+      "`escalated_reason` and the timestamps.\n\n" +
+      "Filters, all optional: `state`, `kind`, `repo` (owner/name, any case), `limit` " +
+      "(default 50, at most 200). Any key of the tenant may read it (`role: :agent` with the " +
+      "hierarchy): LOOPCTL_API_KEY when set, else LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY. " +
+      "REFUSES: 422 for an unknown `state` or `kind` or a `limit` outside 1..200 (also " +
+      "refused locally, status 0, nothing sent); 401 for no key or one that does not " +
+      "authenticate. No 403: every key role clears the gate.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        state: {
+          type: "string",
+          enum: ["queued", "filed", "fixed", "closed", "escalated"],
+          description: "Only findings in this state.",
+        },
+        kind: {
+          type: "string",
+          enum: ["selection_miss", "flaky_test", "missing_review", "stuck_change", "source_silent"],
+          description: "Only findings of this kind.",
+        },
+        repo: { type: "string", description: "Only findings filed on this repository." },
+        limit: { type: "integer", description: "Default 50, at most 200." },
+      },
+    },
+  },
+  {
+    name: "chg_finding_clear",
+    description:
+      "SEND AN ESCALATED CHG FINDING ROUND THE LOOP AGAIN (POST " +
+      "/api/v1/chg_findings/:id/clear, loopctl US-51.6). The finding goes back to `queued` " +
+      "with its fix attempts reset and its issue number dropped, so the next nightly sweep " +
+      "files a fresh issue. The escalated issue is left open for you to close. Audited as " +
+      "`chg_finding_cleared`. Use it after a person has looked at why the loop escalated " +
+      "(depth 2, or two fixes that did not hold) and decided the loop should try again. " +
+      "REFUSES: 409 not_escalated for a finding in any other state; 404 for a finding the " +
+      "tenant does not hold; 403 for any key that is not user-role; 403 " +
+      "custody_tier_required on a tenant with no human anchor. Requires LOOPCTL_USER_KEY " +
+      "(user role), used exactly; refused locally when it is not set.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        finding_id: { type: "string", description: "The finding's id, from chg_findings." },
+      },
+      required: ["finding_id"],
+    },
+  },
+  {
     name: "change_binding_get",
     description:
       "THE CHG CHANGES BOUND TO A STORY (GET /api/v1/stories/:id/changes, loopctl US-47.7): " +
@@ -10774,6 +10846,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await agentOutcomesRead(args);
     case "chg_ledger_summary":
       return await chgLedgerSummaryRead(args);
+    case "chg_findings":
+      return await chgFindingsRead(args);
+    case "chg_finding_clear":
+      return await chgFindingClearCall(args);
 
     case "resolve_escalation":
       return await resolveEscalation(args);

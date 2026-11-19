@@ -742,6 +742,15 @@ defmodule Loopctl.ObanConfig do
            # a candidate (a marker read and a create), bounded per run. Keep in sync with the
            # crontab assertion in oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.ChangeRevertIssueWorker},
+           # US-51.1: the chg feedback loop's nightly sweep — derives findings from the
+           # ledger and decides which to file, within the per-repository daily cap. No
+           # outbound call. After the ledger prune (03:40) so it never reads rows being
+           # deleted. Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"10 4 * * *", Loopctl.Workers.ChgFindingSweepWorker},
+           # US-51.1: drains the findings outbox (open, close, reopen, escalate a loop issue).
+           # Every two minutes, like the revert-issue drainer, and for its reason. Keep in
+           # sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"*/2 * * * *", Loopctl.Workers.ChgFindingActionWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.
