@@ -34,5 +34,12 @@
     "home_care_billing": {
       "TEST_DB_BASE": "hcb_loop_{story}"
     }
+  },
+  "selection_replay": {
+    "chg": {
+      "product": "home_care_billing",
+      "paths": ["cli/src/cover.rs", "adapters/*/lib/**"],
+      "corpus": 5
+    }
   }
 }

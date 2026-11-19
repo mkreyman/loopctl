@@ -67,7 +67,7 @@ defmodule LoopctlRunner.ControlTest do
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
     # 1.30.0 or later is what loopctl requires before it sends `spec_tune` (US-48.13).
-    assert join["contract_version"] == "1.31.0"
+    assert join["contract_version"] == "1.32.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
     assert join["kinds"] == ["implement", "triage", "reply_draft", "verify", "spec_tune"]

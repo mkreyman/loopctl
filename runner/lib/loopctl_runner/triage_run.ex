@@ -136,6 +136,7 @@ defmodule LoopctlRunner.TriageRun do
     Run,
     RunState,
     ScratchRun,
+    SelectionReplay,
     Session,
     SpecTune,
     SpecTunerPrompt,
@@ -559,6 +560,7 @@ defmodule LoopctlRunner.TriageRun do
 
         with {:ok, prompt} <- prompt,
              :ok <- judged_head(tree, commit, run_dir, trace, seq) do
+          opts = if verify?(opts), do: Keyword.put(opts, :verify_subject, triage), else: opts
           judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts)
         end
       after
@@ -848,31 +850,117 @@ defmodule LoopctlRunner.TriageRun do
   end
 
   defp judge_session(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts) do
-    # Caught HERE, not only by the outer guard: Session.run/1 exits when its monitor dies, and the
-    # outer catch would return {:error, _} without ever reading the run directory — throwing away a
-    # verdict the session had already written and linked into place. `Run` catches the same exit
-    # locally for the same reason.
-    session =
-      try do
-        session(config, prompt, {name, path, tree.path}, run_dir, run_id, trace, seq, opts)
-      catch
-        # Only :exit, as `Run.run_session/7` does. A raise in here is the runner's own bug and
-        # belongs to the outer guard, which reports it as an error rather than dressing it up
-        # as something the session did.
-        :exit, reason ->
-          Trace.emit(trace, "session.crashed", seq, %{"reason" => inspect(reason)})
-          {:session_failed, inspect(reason)}
-      end
+    # Started WITH the session, so it spends the session's time and not time after it
+    # (`SelectionReplay`), and ended on every way out of here.
+    replay = start_replay(config, {name, path, tree.path}, run_dir, trace, seq, opts)
 
-    %{
-      run_id: run_id,
-      run_dir: run_dir,
-      # `:session` is the session's own report or nil; a failure to supervise it is not a
-      # report, and it is already carried in the outcome.
-      session: if(match?({:session_failed, _}, session), do: nil, else: session),
-      outcome: outcome(run_dir, session, template(opts), opts)
-    }
+    try do
+      # Caught HERE, not only by the outer guard: Session.run/1 exits when its monitor dies, and
+      # the outer catch would return {:error, _} without ever reading the run directory — throwing
+      # away a verdict the session had already written and linked into place. `Run` catches the
+      # same exit locally for the same reason.
+      session =
+        try do
+          session(config, prompt, {name, path, tree.path}, run_dir, run_id, trace, seq, opts)
+        catch
+          # Only :exit, as `Run.run_session/7` does. A raise in here is the runner's own bug and
+          # belongs to the outer guard, which reports it as an error rather than dressing it up
+          # as something the session did.
+          :exit, reason ->
+            Trace.emit(trace, "session.crashed", seq, %{"reason" => inspect(reason)})
+            {:session_failed, inspect(reason)}
+        end
+
+      %{
+        run_id: run_id,
+        run_dir: run_dir,
+        # `:session` is the session's own report or nil; a failure to supervise it is not a
+        # report, and it is already carried in the outcome.
+        session: if(match?({:session_failed, _}, session), do: nil, else: session),
+        outcome:
+          run_dir
+          |> outcome(session, template(opts), opts)
+          |> with_replay(replay, trace, seq)
+      }
+    after
+      stop_replay(replay, config)
+    end
   end
+
+  # A verify run of a repository with a `selection_replay` entry, whose change touches a
+  # selection path, replays selection beside its session (`SelectionReplay`). Every other run, and
+  # every replay that cannot start, is `:none`, traced with why.
+  defp start_replay(config, {name, path, tree}, run_dir, trace, seq, opts) do
+    with %{"base_branch" => base} when is_binary(base) <- opts[:verify_subject],
+         {:replay, plan} <- SelectionReplay.plan(config, name, tree, base),
+         {:started, handle} <-
+           SelectionReplay.start(plan, path, run_dir, bound_ms: session_bound_ms(config, opts)) do
+      Trace.emit(trace, "selection_replay.started", seq, %{
+        "merge_base" => plan.merge_base,
+        "head" => plan.head,
+        "corpus" => plan.corpus,
+        "matched" => Enum.take(plan.matched, 20)
+      })
+
+      {:started, handle}
+    else
+      {:skip, reason} ->
+        Trace.emit(trace, "selection_replay.skipped", seq, %{"reason" => reason})
+        :none
+
+      _not_verify ->
+        :none
+    end
+  rescue
+    error ->
+      Trace.emit(trace, "selection_replay.skipped", seq, %{"reason" => Exception.message(error)})
+      :none
+  end
+
+  # The most the session may run from now, as its own stop is aimed (`Story.stop_after/4`): the
+  # earlier of its wall clock and the dispatch's `deadline_at` less the kill grace and the margin.
+  defp session_bound_ms(config, opts) do
+    wall_clock_ms = wall_clock_s(config, opts) * 1000
+
+    case Story.stop_by(
+           Keyword.get(opts, :deadline_at),
+           config.kill_grace_s,
+           Story.deadline_margin_s()
+         ) do
+      nil ->
+        wall_clock_ms
+
+      stop_by ->
+        min(wall_clock_ms, max(DateTime.diff(stop_by, DateTime.utc_now(), :millisecond), 0))
+    end
+  end
+
+  # Only a verify PASS waits for the replay, because loopctl reads it only beside one; a pass
+  # whose replay failed is sent without it, which loopctl escalates to a person.
+  defp with_replay(
+         {:agent_result, {"verify", _} = key, %{"verdict" => "pass"} = result} = outcome,
+         {:started, handle},
+         trace,
+         seq
+       ) do
+    with {:ok, replay} <- SelectionReplay.await(handle),
+         {:ok, with_replay} <-
+           AgentResult.validate(Map.put(result, "selection_replay", replay), key) do
+      Trace.emit(trace, "selection_replay.attached", seq, %{"corpus" => length(replay["corpus"])})
+      {:agent_result, key, with_replay}
+    else
+      {:error, reason} ->
+        Trace.emit(trace, "selection_replay.failed", seq, %{"reason" => reason})
+        outcome
+    end
+  end
+
+  defp with_replay(outcome, _replay, _trace, _seq), do: outcome
+
+  defp stop_replay(:none, _config), do: :ok
+
+  defp stop_replay({:started, handle}, config),
+    do: SelectionReplay.stop(handle, config.kill_grace_s * 1000)
 
   # Preparing the run happens after the run directory and state.json exist, so the dispatch is
   # already this runner's: a raise here (a state write on a full volume, a prompt that will not

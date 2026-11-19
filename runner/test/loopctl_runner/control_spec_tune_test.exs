@@ -195,7 +195,7 @@ defmodule LoopctlRunner.ControlSpecTuneTest do
     assert_received {:test_loopctl, {:join, ^runner_id, join}}
     assert "spec_tune" in join["kinds"]
     assert %{"id" => "spec_tuner", "version" => 1} in join["specs"]
-    assert join["contract_version"] == "1.31.0"
+    assert join["contract_version"] == "1.32.0"
   end
 
   test "a spec_tune is accepted with no story, run keyed by its dispatch, and answered spec_tuner@1",

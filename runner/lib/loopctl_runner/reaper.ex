@@ -29,6 +29,7 @@ defmodule LoopctlRunner.Reaper do
     ProcessGroup,
     RunState,
     ScratchRun,
+    SelectionReplay,
     Trace,
     Worktree,
     WorktreeLock
@@ -209,8 +210,16 @@ defmodule LoopctlRunner.Reaper do
   atom, never the text, which is for the log.
   """
   @spec end_session_outcome(map(), non_neg_integer()) :: {:gone | :survived, String.t()}
-  def end_session_outcome(%{"status" => status} = state, grace_ms) when status in @in_flight,
-    do: end_group(state, grace_ms)
+  def end_session_outcome(%{"status" => status} = state, grace_ms) when status in @in_flight do
+    # The session first: it is what can still act on the run, so nothing it does waits on the
+    # replay's grace.
+    session = end_group(state, grace_ms)
+
+    case {session, end_replay(state, grace_ms)} do
+      {{_gone, text}, :survived} -> {:survived, text <> "; selection replay survived"}
+      {outcome, _replay} -> outcome
+    end
+  end
 
   def end_session_outcome(_state, _grace_ms), do: {:gone, "not in flight"}
 
@@ -244,6 +253,14 @@ defmodule LoopctlRunner.Reaper do
 
     Trace.close(trace)
   end
+
+  # A verify run's selection replay (`LoopctlRunner.SelectionReplay`) carries a marker of its
+  # own, recorded before it started, and leads a group recorded once it did; both are ended.
+  defp end_replay(%{"selection_replay" => %{"marker_id" => id} = entry}, grace_ms)
+       when is_binary(id),
+       do: verdict(SelectionReplay.terminate(entry, grace_ms))
+
+  defp end_replay(_state, _grace_ms), do: :gone
 
   # The session marker is an identity pids cannot counterfeit by being reused, so marked
   # processes are always ended. The group is signalled only while its leader is still

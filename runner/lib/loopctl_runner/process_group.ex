@@ -418,6 +418,11 @@ defmodule LoopctlRunner.ProcessGroup do
         nil -> nil
       end
 
+    # `on_start:` is told the child's pid before anything is read, so a caller can record it for
+    # whoever must end the command later.
+    on_start = Keyword.get(opts, :on_start)
+    if on_start && os_pid, do: on_start.(os_pid)
+
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     collect(port, os_pid, deadline, [], Keyword.get(opts, :term_grace_ms, 0))
   end
@@ -428,6 +433,11 @@ defmodule LoopctlRunner.ProcessGroup do
   @setsid_exec ~S|getpgrp() == $$ or POSIX::setsid() != -1 or die "setsid: $!\n"; | <>
                  ~S|exec { $ARGV[0] } @ARGV or die "exec: $!\n"|
 
+  # The same, with the command's stderr sent to the file named first instead of the Port.
+  @setsid_exec_stderr ~S|getpgrp() == $$ or POSIX::setsid() != -1 or die "setsid: $!\n"; | <>
+                        ~S|my $err = shift @ARGV; open(STDERR, ">", $err) or die "stderr: $!\n"; | <>
+                        ~S|exec { $ARGV[0] } @ARGV or die "exec: $!\n"|
+
   @doc """
   `run/5` for a command that starts children of its own, killing ALL of them on expiry.
 
@@ -437,12 +447,28 @@ defmodule LoopctlRunner.ProcessGroup do
   already start a Port child as a group leader (measured on macOS); this makes it a property of
   the function rather than of the runtime. A child that makes itself a session of its own (an
   `ssh` ControlPersist master) leaves the group, and nothing here reaches it.
+
+  `opts` are `run/5`'s: `term_grace_ms` gives the group TERM and that long before the KILL, and
+  `on_start` is told the group's id. `stderr_file:` sends the command's stderr to that file, so
+  the output returned is its stdout alone.
   """
-  @spec run_group(String.t(), [String.t()], pos_integer(), [{String.t(), String.t() | nil}]) ::
-          {:ok, binary(), non_neg_integer()} | {:error, :timeout}
-  def run_group(executable, args, timeout_ms, extra_env \\ []) do
+  @spec run_group(
+          String.t(),
+          [String.t()],
+          pos_integer(),
+          [{String.t(), String.t() | nil}],
+          keyword()
+        ) :: {:ok, binary(), non_neg_integer()} | {:error, :timeout}
+  def run_group(executable, args, timeout_ms, extra_env \\ [], opts \\ []) do
     perl = System.find_executable("perl") || raise "perl is required to run #{executable}"
-    run(perl, ["-MPOSIX", "-e", @setsid_exec, "--", executable | args], timeout_ms, extra_env)
+
+    prelude =
+      case Keyword.get(opts, :stderr_file) do
+        nil -> ["-MPOSIX", "-e", @setsid_exec, "--"]
+        file -> ["-MPOSIX", "-e", @setsid_exec_stderr, "--", file]
+      end
+
+    run(perl, prelude ++ [executable | args], timeout_ms, extra_env, opts)
   end
 
   # On expiry: with `term_grace_ms`, TERM first and that long to exit (git removes its own lock

@@ -1048,7 +1048,10 @@ defmodule LoopctlRunner.WorktreeTest do
           assert {:ok, _} = Worktree.refresh_detached(repo, tree)
         end)
 
-      assert reset == ""
+      # capture_log in an async module also collects what concurrent tests log, so "nothing said"
+      # is checked as nothing said about this tree, never as an empty capture.
+      refute reset =~ "triage tree"
+      refute reset =~ tree
       refute File.exists?(Path.join(tree, "left.txt"))
     end
 

@@ -13,7 +13,7 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.31.0. It
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.32.0. It
 declares every kind the contract dispatches, the list `@kinds` in `LoopctlRunner.Control`
 (`LoopctlRunner.Control.kinds/0`), which includes `spec_tune` (template `spec_tuner@1`,
 US-48.13). A
@@ -28,7 +28,14 @@ applies the verdict under its own verifier dispatch. Because its cwd is the impl
 alone runs with `--setting-sources user`: the operator's user-scoped setup applies, and the pull
 request's own `CLAUDE.md`, `.claude/` settings, hooks, agents and skills, and `.mcp.json` do not.
 The repository's rules reach it from the base instead: `CLAUDE.md` as `origin/<base>` holds it,
-in the prompt, up to 32 KiB (`LoopctlRunner.VerifyPrompt.base_rules/2`). A
+in the prompt, up to 32 KiB (`LoopctlRunner.VerifyPrompt.base_rules/2`). For a repository in
+the config's `selection_replay` (chg), a change touching one of its `paths` globs is also
+REPLAYED (contract 1.32.0): beside the session, the runner runs `bin/chg-replay-selection.py`
+as the base holds it, comparing selection at the merge base and the head over the `product`'s
+last `corpus` commits, and adds its output to a `pass` as `selection_replay`, which loopctl
+reads to merge a selection change without a person (`LoopctlRunner.SelectionReplay`). A reject
+stops the replay; a replay that fails or does not finish in the session's time leaves the pass
+without it, and loopctl escalates as before. A
 `reply_draft` session (template `reply_draft@1`, a `:draft`, contract 1.26.0) runs on triage's
 detached tree, reads the code (nothing it does there is pushed), writes a reply to the reporter that a person reviews
 before anything is sent, and ends with one fenced JSON `{"body": ...}` block. The runner checks

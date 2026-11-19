@@ -138,6 +138,17 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   wrote, so that tree's project and local settings, hooks, skills, agents and `.mcp.json` must
   not configure the session judging it (`lib/loopctl_runner/verify_prompt.ex`). The user scope
   still loads in full, so the operator's setup is inherited as above.
+- **verify@1's `selection_replay` is the RUNNER's measurement, never the session's**
+  (`LoopctlRunner.SelectionReplay`, contract 1.32.0). loopctl merges a chg selection change
+  without a person on it, so the party that read the implementer's code must not be able to
+  write it: `VerifyResult.complete/2` refuses any key of the session's beyond `verdict`,
+  `findings` and `head_sha`, and the replay script is read from `origin/<base>`, never from the
+  pull request's tree. It runs beside the session inside the session's own time bound (a
+  result sent after loopctl frees the reservation is refused), carries a marker of its own and
+  records the group it leads, both of which `Reaper` ends (the marker alone misses Apple binaries
+  on macOS), and is stopped on a reject. Its result is exactly one line of its stdout; stderr is
+  a file, so nothing that reaches stderr can append a measurement. A failed replay leaves the pass without it,
+  which escalates to a person; it never changes the verdict.
 - **Deny by NAME with a reason per name; never deny a class and grant exceptions back.** That
   inverts who has to notice a mistake: a class deny takes every capability in the class —
   `Agent`, `SendMessage`, `WebFetch` and `Skill` under a fixed tool list, tidewave and playwright

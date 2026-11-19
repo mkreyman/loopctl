@@ -22,6 +22,9 @@ defmodule LoopctlRunner.Config do
     :repos,
     :branch_prefixes,
     session_env: %{},
+    # Per repo, the selection replay a verify@1 run of that repo's pull requests attaches to a
+    # pass (`LoopctlRunner.SelectionReplay`). Empty: no repo is replayed.
+    selection_replay: %{},
     # WHERE THE SUBAGENT GIT GRANTS LIVE, as data rather than as a call to `System.user_home!/0`
     # buried in `Run.execute/3`. It is here because the SUITE exercises the production path: with
     # the directory hardcoded there, every test that ran a Run swept the operator's real
@@ -51,6 +54,7 @@ defmodule LoopctlRunner.Config do
           repos: %{optional(String.t()) => String.t()},
           branch_prefixes: [String.t()],
           session_env: %{optional(String.t()) => %{optional(String.t()) => String.t()}},
+          selection_replay: %{optional(String.t()) => LoopctlRunner.SelectionReplay.entry()},
           grant_dir: String.t() | nil,
           control: LoopctlRunner.ControlConfig.t() | nil,
           max_wall_clock_s: pos_integer(),
@@ -183,6 +187,7 @@ defmodule LoopctlRunner.Config do
          {:ok, repos} <- repos(map),
          {:ok, prefixes} <- branch_prefixes(map),
          {:ok, session_env} <- session_env(map, repos),
+         {:ok, replay} <- LoopctlRunner.SelectionReplay.from_config(map, repos),
          {:ok, control} <- control(map),
          {:ok, grant_dir} <- grant_dir(map),
          {:ok, ints} <- positive_ints(map) do
@@ -196,6 +201,7 @@ defmodule LoopctlRunner.Config do
            repos: repos,
            branch_prefixes: prefixes,
            session_env: session_env,
+           selection_replay: replay,
            control: control,
            grant_dir: grant_dir
          ] ++ ints

@@ -45,9 +45,15 @@ defmodule LoopctlRunner.WorkLeftBehindTest do
     repo = with_origin!()
     commit!(repo, "a.txt")
     # Pushed by another route, so this checkout's refs do not know: still left behind as far as
-    # it can tell, because it reads only what it holds.
+    # it can tell, because it reads only what it holds. The route is a second clone fetching the
+    # branch from this one: git 2.56 updates `refs/remotes/origin/*` even on a push to origin's
+    # bare URL, so pushing from this checkout no longer leaves its refs unaware.
     origin = git!(repo, ["remote", "get-url", "origin"])
-    git!(repo, ["push", "-q", origin, "loop/x:refs/heads/loop/x"])
+    other = Path.join(Path.dirname(repo), "other")
+    git!(Path.dirname(repo), ["clone", "-q", origin, other])
+    git!(other, ["fetch", "-q", repo, "loop/x:loop/x"])
+    git!(other, ["push", "-q", "origin", "loop/x"])
+    refute git!(repo, ["for-each-ref", "refs/remotes/origin/loop/x"]) =~ "loop/x"
     assert Worktree.work_left_behind(repo, "loop/x") == true
   end
 
