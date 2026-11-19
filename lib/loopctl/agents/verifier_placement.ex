@@ -31,7 +31,8 @@ defmodule Loopctl.Agents.VerifierPlacement do
   7. **Bind B** — `Progress.bind_verifier_dispatch/4`, which fails CLOSED on an empty lineage,
      a shared root or the implementer's agent, and retires any earlier report or verification.
   8. **Push** the `verify` dispatch: `dispatch_id` = B's id, the story object, and
-     `verify: {pr_number, head_sha}` off the stage row.
+     `verify: {pr_number, head_sha}` off the stage row, plus `loop_finding: {sha, failures}`
+     when the story fixes a chg `selection_miss` (contract 1.33.0).
 
   A refusal after the mint revokes B. B stays bound to the story when the push fails, revoked,
   which `:no_live_verifier_dispatch` reads as "nothing in flight", so the next pass places
@@ -49,7 +50,10 @@ defmodule Loopctl.Agents.VerifierPlacement do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ApiSpec.RunnerContract.RunnerVerify
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Changes.Finding
+  alias Loopctl.Changes.Findings
   alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryPayload
@@ -310,8 +314,48 @@ defmodule Loopctl.Agents.VerifierPlacement do
       "wall_clock_seconds" => ctx.budgets.wall_clock_seconds,
       "max_turns" => ctx.budgets.max_turns,
       "story" => object,
-      "verify" => %{"pr_number" => ctx.stage.pr_number, "head_sha" => ctx.stage.head_sha}
+      "verify" => verify_object(ctx)
     }
+  end
+
+  defp verify_object(ctx) do
+    verify = %{"pr_number" => ctx.stage.pr_number, "head_sha" => ctx.stage.head_sha}
+
+    case selection_miss(ctx.story) do
+      nil -> verify
+      miss -> Map.put(verify, "loop_finding", miss)
+    end
+  end
+
+  # The miss a `selection_miss` fix must cover (contract 1.33.0, US-51.7): the commit the gate
+  # failed at and the tests it failed there, exactly as loopctl recorded them on the finding,
+  # which is what `Loopctl.Changes.SelectionProof` checks the verifier's replay against. A
+  # finding with no usable sha or no failures sends nothing: the proof then fails on its own
+  # (`selection_miss_failures_unrecorded`, `selection_replay_wrong_miss`) rather than this
+  # placement sending a dispatch the contract refuses. `Runners.dispatch/3` takes the field off
+  # for a runner that joined declaring an older contract (`RunnerContract.fit_dispatch/2`).
+  defp selection_miss(%Story{tenant_id: tenant_id, intake_record_id: record_id}) do
+    case Findings.for_intake_record(tenant_id, record_id) do
+      %Finding{kind: "selection_miss", evidence: %{"sha" => sha, "failures" => failures}}
+      when is_binary(sha) and is_list(failures) ->
+        miss(sha, failures)
+
+      _other ->
+        nil
+    end
+  end
+
+  defp miss(sha, failures) do
+    names =
+      Enum.filter(failures, fn name ->
+        is_binary(name) and name != "" and
+          String.length(name) <= RunnerVerify.max_failure_length()
+      end)
+
+    if String.match?(sha, ~r/\A[0-9a-f]{40}\z/) and names != [] and
+         length(names) <= RunnerVerify.max_failures(),
+       do: %{"sha" => sha, "failures" => names},
+       else: nil
   end
 
   defp revoke(tenant_id, dispatch_id, caller) do

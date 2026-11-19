@@ -60,6 +60,8 @@ defmodule Loopctl.Delivery.TriagePayload do
 
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
   alias Loopctl.ApiSpec.RunnerContract.RunnerTriage
+  alias Loopctl.Changes.Finding
+  alias Loopctl.Changes.Findings
   alias Loopctl.Delivery.Untrusted
   alias Loopctl.Intake.Record
 
@@ -84,10 +86,67 @@ defmodule Loopctl.Delivery.TriagePayload do
     }
 
     case violations(triage) do
-      [] -> {:ok, triage}
+      [] -> {:ok, with_loop_finding(triage, record)}
       _ -> {:error, :triage_too_large}
     end
   end
+
+  # ## `loop_finding` (contract 1.33.0, US-51.7)
+  #
+  # loopctl's own record of the chg finding a loop issue was filed for, read by the record's
+  # `loop_finding_id` in the record's tenant (`Findings.for_record/1`), never from the issue
+  # text. It is added only when the object STILL FITS with it: the field's own maxima cost far
+  # more than the headroom the ordinary object leaves (`RunnerTriage`'s note), and a record that
+  # fit before 1.33.0 must not escalate for size because loopctl found more to say about it.
+  # Without it the record is exactly the object above, with the evidence inside the issue text.
+  defp with_loop_finding(triage, record) do
+    case Findings.for_record(record) do
+      nil ->
+        triage
+
+      %Finding{} = finding ->
+        candidate = Map.put(triage, :loop_finding, loop_finding(finding))
+        if ByteRule.bytes(candidate) <= RunnerTriage.max_bytes(), do: candidate, else: triage
+    end
+  end
+
+  defp loop_finding(%Finding{} = finding) do
+    %{
+      finding_id: finding.id,
+      kind: finding.kind,
+      fingerprint: String.slice(finding.fingerprint, 0, RunnerTriage.max_fingerprint_length()),
+      occurrences: finding.occurrences,
+      fix_attempts: finding.fix_attempts,
+      evidence: evidence(finding.evidence)
+    }
+  end
+
+  # The scalars only, as strings, sorted by key and bounded by the contract's caps. A finding's
+  # evidence is already bounded to those caps when it is recorded (`Findings`), so the slices
+  # cut nothing loopctl wrote; they keep a row written before those bounds within the contract.
+  # A list (a selection_miss's `failures`) is not a scalar and stays in the issue text.
+  defp evidence(evidence) when is_map(evidence) do
+    evidence
+    |> Enum.flat_map(fn
+      {key, value} when is_binary(key) and key != "" -> scalar(key, value)
+      _other -> []
+    end)
+    |> Enum.sort_by(& &1.key)
+    |> Enum.take(RunnerTriage.max_evidence())
+  end
+
+  defp evidence(_evidence), do: []
+
+  defp scalar(key, value) when is_binary(value) or is_number(value) or is_boolean(value) do
+    [
+      %{
+        key: String.slice(key, 0, RunnerTriage.max_evidence_key_length()),
+        value: value |> to_string() |> String.slice(0, RunnerTriage.max_evidence_value_length())
+      }
+    ]
+  end
+
+  defp scalar(_key, _value), do: []
 
   # EVERY DECLARED CAP, not just the byte rule — the same discipline
   # `Loopctl.Delivery.ImplementerInput.violations/1` applies, for the same reason and after

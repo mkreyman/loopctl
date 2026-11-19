@@ -31,11 +31,8 @@ defmodule Loopctl.Changes.SelectionProof do
   widening is the property that keeps a fix from hiding one.
   """
 
-  import Ecto.Query
-
-  alias Loopctl.AdminRepo
   alias Loopctl.Changes.Finding
-  alias Loopctl.Intake.Record
+  alias Loopctl.Changes.Findings
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
 
@@ -139,20 +136,10 @@ defmodule Loopctl.Changes.SelectionProof do
     end
   end
 
-  defp loop_finding(%{intake_record_id: nil}), do: nil
-
-  # `loop_finding_id` is written at admission on EVERY source (`Loopctl.Delivery.TriageTrigger`),
-  # and it is the one link a clear cannot break: a clear drops the finding's issue number, so a
-  # lookup by issue number would lose a cleared finding's miss and pass on widening alone.
-  defp loop_finding(%{tenant_id: tenant_id, intake_record_id: record_id}) do
-    AdminRepo.one(
-      from r in Record,
-        join: f in Finding,
-        on: f.id == r.loop_finding_id and f.tenant_id == r.tenant_id,
-        where: r.tenant_id == ^tenant_id and r.id == ^record_id,
-        select: f
-    )
-  end
+  # By `loop_finding_id`, never by issue number: a clear drops the issue number, and a lookup by
+  # it would lose a cleared finding's miss and pass on widening alone.
+  defp loop_finding(%{tenant_id: tenant_id, intake_record_id: record_id}),
+    do: Findings.for_intake_record(tenant_id, record_id)
 
   # Always read back from Postgres, so the keys are strings.
   defp field(map, key) when is_map(map), do: Map.get(map, key)

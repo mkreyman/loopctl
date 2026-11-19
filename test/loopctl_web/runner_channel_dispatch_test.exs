@@ -1219,6 +1219,43 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = accepts(runner, channel, "implement")
     end
 
+    # US-51.7: `RunnerVerify` is `additionalProperties: false`, so a runner vendoring 1.32.0
+    # would refuse the whole dispatch over `loop_finding`; it is taken off for that runner.
+    test "a verify loop_finding reaches only a runner that joined on 1.33.0 or later",
+         %{runner: runner, raw: raw, channel: channel} do
+      verify_payload = fn ->
+        payload = dispatch_payload(runner.tenant_id, %{"kind" => "verify"})
+
+        Map.merge(payload, %{
+          "story" => build(:runner_story, %{"id" => payload["story_id"]}),
+          "verify" => %{
+            "pr_number" => 7,
+            "head_sha" => String.duplicate("a", 40),
+            "loop_finding" => %{
+              "sha" => String.duplicate("b", 40),
+              "failures" => ["test/a_test.exs:12"]
+            }
+          }
+        })
+      end
+
+      join = %{"kinds" => ["verify"], "specs" => spec_refs([{"verify", 1}])}
+
+      channel =
+        rejoin_declaring(channel, raw, runner, Map.put(join, "contract_version", "1.32.0"))
+
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, verify_payload.())
+      assert_push "dispatch", %{verify: older}, reply_timeout()
+      refute Map.has_key?(older, :loop_finding)
+
+      _channel =
+        rejoin_declaring(channel, raw, runner, Map.put(join, "contract_version", "1.33.0"))
+
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, verify_payload.())
+      assert_push "dispatch", %{verify: current}, reply_timeout()
+      assert current.loop_finding.failures == ["test/a_test.exs:12"]
+    end
+
     # TC-48.8.2: the kind is declared, and the spec loopctl runs it under is not held.
     test "a declared kind whose spec the runner does not hold is not dispatched",
          %{runner: runner, raw: raw, channel: channel} do

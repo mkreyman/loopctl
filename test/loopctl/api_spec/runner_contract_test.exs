@@ -16,6 +16,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerStory
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
+  alias Loopctl.Changes.Finding
+  alias Loopctl.Changes.Findings
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.Runners.Usage
@@ -41,7 +43,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "a37111e2346694b859b74910697565efdb1142b475a71a590b800d1221d03dea"
+  @digest "1c63a50921e2df5b800a752d0e008bd0de4afd2ec28f7a73c6e74b78a900bb08"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -75,8 +77,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.32.0"
-      assert schema["x-contract-version"] == "1.32.0"
+      assert RunnerContract.version() == "1.33.0"
+      assert schema["x-contract-version"] == "1.33.0"
 
       # 1.30.0 (US-48.13): `spec_tune` is a kind a runner may be sent and the one kind that
       # names no story, so `story_id` left the schema's `required` (settled in code); its
@@ -1059,8 +1061,11 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # The same property for the dispatch half, and the case round 3 measured: untrusted's
       # cap was reachable only on a record the injection detector had never flagged, so two
       # identical reports took different paths for a reason no declared bound explained.
+      # `loop_finding` (1.33.0) is left out: it is OPTIONAL and built only when the object
+      # still fits with it, and its own figures are pinned in the "loop_finding" describe.
       widest =
         RunnerContract.RunnerTriage.schema().properties
+        |> Map.delete(:loop_finding)
         |> Map.new(fn {name, sub} -> {name, widest_value(sub)} end)
         |> Map.put(:truncated, true)
         |> Map.put(:issue_number, 999_999)
@@ -1131,6 +1136,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       widest = fn fill ->
         RunnerContract.RunnerTriage.schema().properties
+        |> Map.delete(:loop_finding)
         |> Map.new(fn {name, sub} -> {name, widest_value(sub, fill)} end)
         |> Map.put(:truncated, true)
         |> Map.put(:issue_number, 999_999)
@@ -3161,6 +3167,141 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["claim_ending_remedy"] =~ "session_ended"
       # `session_ended` keeps its own rules: a transient answer is still resent.
       assert connection["claim_ending_remedy"] =~ "`rate_limited` is resent"
+    end
+  end
+
+  describe "loop_finding (1.33.0, US-51.7)" do
+    alias Loopctl.ApiSpec.RunnerContract.RunnerTriage
+    alias Loopctl.ApiSpec.RunnerContract.RunnerVerify
+
+    # Every RunnerTriage field at its own maximum, in BMP text: the "worst ORDINARY case" the
+    # schema's note names.
+    defp ordinary_max do
+      %{
+        record_id: Ecto.UUID.generate(),
+        issue_number: 2_147_483_647,
+        html_url: String.duplicate("u", RunnerTriage.max_url_length()),
+        untrusted: String.duplicate("a", RunnerTriage.max_untrusted_length()),
+        truncated: true,
+        escalation_reasons:
+          List.duplicate(
+            String.duplicate("r", RunnerTriage.max_reason_length()),
+            RunnerTriage.max_reasons()
+          )
+      }
+    end
+
+    defp loop_finding_max do
+      %{
+        finding_id: Ecto.UUID.generate(),
+        kind: "missing_review",
+        fingerprint: String.duplicate("f", RunnerTriage.max_fingerprint_length()),
+        occurrences: 2_147_483_647,
+        fix_attempts: 2_147_483_647,
+        evidence:
+          for i <- 1..RunnerTriage.max_evidence() do
+            key =
+              String.pad_leading(
+                Integer.to_string(i),
+                RunnerTriage.max_evidence_key_length(),
+                "k"
+              )
+
+            %{key: key, value: String.duplicate("v", RunnerTriage.max_evidence_value_length())}
+          end
+      }
+    end
+
+    test "the measured worst cases, by name" do
+      # Unchanged by 1.33.0: the ordinary object at every maximum.
+      assert ByteRule.bytes(ordinary_max()) == 46_074
+      # `loop_finding` alone at its own maxima, many times the 1_926 the ordinary object leaves,
+      # which is why it is optional and built only when the whole object still fits.
+      assert ByteRule.bytes(%{loop_finding: loop_finding_max()}) == 30_992
+      assert ByteRule.bytes(Map.put(ordinary_max(), :loop_finding, loop_finding_max())) == 77_064
+    end
+
+    test "a triage loop_finding at its maxima passes the dispatch cast" do
+      story_id = Ecto.UUID.generate()
+
+      triage =
+        ordinary_max()
+        |> Map.put(:untrusted, "short")
+        |> Map.put(:loop_finding, loop_finding_max())
+        |> Jason.encode!()
+        |> Jason.decode!()
+
+      payload =
+        build(:runner_dispatch, %{"kind" => "triage", "story_id" => story_id, "triage" => triage})
+
+      assert {:ok, %{triage: %{loop_finding: %{evidence: [_ | _]}}}} =
+               RunnerContract.cast_dispatch(payload)
+    end
+
+    test "the triage kind enum is the finding kinds" do
+      enum = RunnerTriage.schema().properties.loop_finding.properties.kind.enum
+      assert Enum.sort(enum) == Enum.sort(Finding.kinds())
+    end
+
+    test "the verify caps are the finding's own" do
+      assert RunnerVerify.max_failures() == Findings.max_failure_names()
+    end
+
+    defp verify_dispatch(verify) do
+      story_id = Ecto.UUID.generate()
+
+      build(:runner_dispatch, %{
+        "kind" => "verify",
+        "story_id" => story_id,
+        "story" => build(:runner_story, %{"id" => story_id}),
+        "verify" => verify
+      })
+    end
+
+    @verify %{"pr_number" => 7, "head_sha" => String.duplicate("a", 40)}
+    @miss %{"sha" => String.duplicate("b", 40), "failures" => ["test/a_test.exs:12"]}
+
+    test "a verify dispatch carries a well-formed loop_finding and refuses a malformed one" do
+      assert {:ok, %{verify: %{loop_finding: %{sha: _, failures: ["test/a_test.exs:12"]}}}} =
+               RunnerContract.cast_dispatch(
+                 verify_dispatch(Map.put(@verify, "loop_finding", @miss))
+               )
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_dispatch(
+                 verify_dispatch(Map.put(@verify, "loop_finding", %{@miss | "sha" => "nope"}))
+               )
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_dispatch(
+                 verify_dispatch(
+                   Map.put(@verify, "loop_finding", %{
+                     @miss
+                     | "failures" => [
+                         String.duplicate("t", RunnerVerify.max_failure_length() + 1)
+                       ]
+                   })
+                 )
+               )
+    end
+
+    test "fit_dispatch keeps the verify loop_finding only for a runner on 1.33.0 or later" do
+      {:ok, dispatch} =
+        RunnerContract.cast_dispatch(verify_dispatch(Map.put(@verify, "loop_finding", @miss)))
+
+      assert %{verify: %{loop_finding: _}} = RunnerContract.fit_dispatch(dispatch, "1.33.0")
+      assert %{verify: %{loop_finding: _}} = RunnerContract.fit_dispatch(dispatch, "1.40.2")
+
+      for older <- ["1.32.0", "1.0.0", nil, "garbage"] do
+        fitted = RunnerContract.fit_dispatch(dispatch, older)
+        refute Map.has_key?(fitted.verify, :loop_finding)
+        assert fitted.verify.head_sha == dispatch.verify.head_sha
+      end
+    end
+
+    test "fit_dispatch leaves every other dispatch alone" do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(verify_dispatch(@verify))
+      assert RunnerContract.fit_dispatch(dispatch, "1.0.0") == dispatch
     end
   end
 end

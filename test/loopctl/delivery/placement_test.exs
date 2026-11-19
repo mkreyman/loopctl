@@ -1830,10 +1830,12 @@ defmodule Loopctl.Delivery.PlacementTest do
       # `verify` (contract 1.28.0) is the third nested object: the pull request number and the
       # head sha to judge, both loopctl's own values off the stage row. Neither is a credential
       # — the verifier dispatch's key never leaves loopctl (US-48.18).
-      assert RunnerContract.RunnerVerify.schema().properties |> Map.keys() |> Enum.sort() == [
-               :head_sha,
-               :pr_number
-             ]
+      # `loop_finding` (1.33.0) is the miss a selection fix must cover: a commit sha and
+      # test names, both off loopctl's own finding row.
+      verify = RunnerContract.RunnerVerify.schema().properties
+
+      assert verify |> Map.keys() |> Enum.sort() == [:head_sha, :loop_finding, :pr_number]
+      assert verify.loop_finding.properties |> Map.keys() |> Enum.sort() == [:failures, :sha]
 
       # `triage` (contract 1.7.0) is the second nested object and is pinned for the same
       # reason as `story`. Answering the question this test exists to ask: none of its fields
@@ -1841,13 +1843,28 @@ defmodule Loopctl.Delivery.PlacementTest do
       # array of loopctl's own detector codes, and `untrusted` is reporter text that has been
       # through `Untrusted.render/2` — text a session must treat as data, which is the
       # opposite of a credential and is fenced precisely so it cannot act as one.
-      assert RunnerContract.RunnerTriage.schema().properties |> Map.keys() |> Enum.sort() == [
+      triage = RunnerContract.RunnerTriage.schema().properties
+
+      assert triage |> Map.keys() |> Enum.sort() == [
                :escalation_reasons,
                :html_url,
                :issue_number,
+               :loop_finding,
                :record_id,
                :truncated,
                :untrusted
+             ]
+
+      # `loop_finding` (1.33.0) is loopctl's own finding row: ids, counts, a kind enum, a
+      # fingerprint it derived, and scalar evidence it derived from the chg ledger. No
+      # credential is ever stored on a finding.
+      assert triage.loop_finding.properties |> Map.keys() |> Enum.sort() == [
+               :evidence,
+               :finding_id,
+               :fingerprint,
+               :fix_attempts,
+               :kind,
+               :occurrences
              ]
 
       assert RunnerContract.RunnerStory.schema().properties |> Map.keys() |> Enum.sort() == [
