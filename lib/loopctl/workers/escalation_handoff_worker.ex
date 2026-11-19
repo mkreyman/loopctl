@@ -2,8 +2,8 @@ defmodule Loopctl.Workers.EscalationHandoffWorker do
   @moduledoc """
   Runs `Loopctl.Delivery.EscalationHandoffs.sweep_tenant/2` for every tenant holding an
   escalated story or an open escalation handoff (#1065): each escalated story gets a claimable
-  handoff on its project's channel, a stalled one is re-posted, and the handoff of a resolved
-  story is closed. Mark, 2026-11-19: nothing parks.
+  handoff on its repo's channel (#1067), a stalled one is re-posted, and the handoff of a
+  resolved story is closed. Mark, 2026-11-19: nothing parks.
 
   Every five minutes, HARDCODED: the interval is how long an escalation may go unseen by the
   sessions on its repo, and app boot must not gain an env var for it. Not behind
