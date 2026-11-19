@@ -36,7 +36,6 @@ defmodule Loopctl.Changes.SelectionProof do
   alias Loopctl.AdminRepo
   alias Loopctl.Changes.Finding
   alias Loopctl.Intake.Record
-  alias Loopctl.Intake.Source
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
 
@@ -142,26 +141,15 @@ defmodule Loopctl.Changes.SelectionProof do
 
   defp loop_finding(%{intake_record_id: nil}), do: nil
 
-  # The finding a story's issue was filed for, on EVERY source. `loop_finding_id` is written
-  # only where the ticket gate admitted the issue, and the chg repository's source is not
-  # ticket-gated, so keying on it alone skipped the coverage check exactly where selection
-  # misses are filed. The issue number on the record's own repository is the same rule
-  # intake admission uses (`Findings.loop_finding_for/1`); `loop_finding_id` still counts for
-  # a finding cleared since, whose issue number was reset.
+  # `loop_finding_id` is written at admission on EVERY source (`Loopctl.Delivery.TriageTrigger`),
+  # and it is the one link a clear cannot break: a clear drops the finding's issue number, so a
+  # lookup by issue number would lose a cleared finding's miss and pass on widening alone.
   defp loop_finding(%{tenant_id: tenant_id, intake_record_id: record_id}) do
     AdminRepo.one(
       from r in Record,
-        join: s in Source,
-        on: s.id == r.source_id and s.tenant_id == r.tenant_id,
         join: f in Finding,
-        on:
-          f.tenant_id == r.tenant_id and
-            (f.id == r.loop_finding_id or
-               (f.issue_number == r.issue_number and
-                  fragment("lower(?) = lower(?)", f.repo_full_name, s.repo_full_name))),
+        on: f.id == r.loop_finding_id and f.tenant_id == r.tenant_id,
         where: r.tenant_id == ^tenant_id and r.id == ^record_id,
-        order_by: [desc: f.id == r.loop_finding_id],
-        limit: 1,
         select: f
     )
   end

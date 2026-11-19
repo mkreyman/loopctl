@@ -14,10 +14,10 @@ defmodule Loopctl.Changes.FindingFiler do
      forge for the marker (`Findings.issue_search/1`): an attempt that created the issue and
      died before recording it left the marker in its body. A search that cannot confirm
      absence defers and creates nothing. The first attempt skips the read.
-  3. **Creates the issue** and records its number on the row at once
-     (`Findings.record_issue/3`).
-  4. **Labels it** `chg-loop` (additive and idempotent at the forge) and marks the row done,
-     which also gives the finding its issue number.
+  3. **Creates the issue** and records its number on the row AND the finding at once, in one
+     transaction (`Findings.record_issue/3`), so an issue whose label step later fails for
+     good still belongs to its finding.
+  4. **Labels it** `chg-loop` (additive and idempotent at the forge) and marks the row done.
 
   ## `:close`, `:reopen`, `:escalate` (US-51.2)
 

@@ -242,6 +242,31 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       assert finding_id == finding.id
     end
 
+    # The mark is what SelectionProof reads, and chg's own source is NOT ticket-gated.
+    test "an ungated source marks the record of a chg finding's issue too", %{tenant: tenant} do
+      {_source, record} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant.id,
+          repo_full_name: "mkreyman/loop_repo",
+          issue_number: 902,
+          triage_requires_ticket: false
+        })
+
+      finding = loop_finding!(tenant.id, "mkreyman/loop_repo", 902)
+
+      assert {:ok, %Story{}} = TriageTrigger.promote(record)
+      assert %Record{loop_finding_id: finding_id} = reload(record)
+      assert finding_id == finding.id
+    end
+
+    test "an ungated source promotes an issue no finding holds, unmarked", %{tenant: tenant} do
+      {_source, record} =
+        fixture(:intake_pair, %{tenant_id: tenant.id, issue_number: 903})
+
+      assert {:ok, %Story{}} = TriageTrigger.promote(record)
+      assert %Record{loop_finding_id: nil} = reload(record)
+    end
+
     test "a copied loop issue on a number no finding holds stays pending", %{tenant: tenant} do
       {_source, copy} =
         fixture(:intake_pair, %{

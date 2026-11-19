@@ -205,25 +205,16 @@ defmodule Loopctl.Changes.SelectionProofTest do
                SelectionProof.judge(story, @head)
     end
 
-    test "a finding on an ungated source is found by its issue, with no loop_finding_id", ctx do
+    test "a finding cleared since (its issue number dropped) still demands its miss", ctx do
       story =
         verdict!(ctx, %{
           result: %{"selection_replay" => replay(corpus(5), ["test/a_test.exs:1"])}
         })
 
-      record = AdminRepo.get!(Record, story.intake_record_id)
-      source = AdminRepo.get!(Loopctl.Intake.Source, record.source_id)
       finding = link_finding!(ctx, story)
 
-      AdminRepo.update_all(from(r in Record, where: r.id == ^record.id),
-        set: [loop_finding_id: nil]
-      )
-
       AdminRepo.update_all(from(f in Finding, where: f.id == ^finding.id),
-        set: [
-          issue_number: record.issue_number,
-          repo_full_name: String.upcase(source.repo_full_name)
-        ]
+        set: [issue_number: nil, cycle: 1, state: :queued]
       )
 
       assert {:fail, [{:selection_miss_not_covered, ["test/b_test.exs:2"]}]} =

@@ -155,15 +155,21 @@ defmodule Loopctl.Delivery.TriageTrigger do
   #
   # US-51.3: or for an issue the chg feedback loop filed, which loopctl knows by looking it up
   # in its own `chg_findings` (`Findings.loop_finding_for/1`), never by anything in the issue.
-  # The record is marked with that finding when it is admitted.
-  defp ticket_admitted(%Source{triage_requires_ticket: true}, %Record{ticket_id: nil} = record) do
+  #
+  # The record is marked with that finding on EVERY source, gated or not: the mark is what
+  # `Loopctl.Changes.SelectionProof` reads to find the miss a fix must cover, and it is the only
+  # link that survives a clear (which drops the finding's issue number). Marking only on the
+  # ticket gate's path left chg's own source, which is not ticket-gated and is where selection
+  # misses are filed, with no link at all, so the coverage check never ran there.
+  defp ticket_admitted(%Source{} = source, %Record{} = record) do
     case Findings.loop_finding_for(record) do
-      nil -> {:error, :ticket_required}
+      nil -> if ticket_required?(source, record), do: {:error, :ticket_required}, else: :ok
       finding_id -> mark_loop_finding(record, finding_id)
     end
   end
 
-  defp ticket_admitted(%Source{}, %Record{}), do: :ok
+  defp ticket_required?(%Source{triage_requires_ticket: true}, %Record{ticket_id: nil}), do: true
+  defp ticket_required?(%Source{}, %Record{}), do: false
 
   defp mark_loop_finding(%Record{loop_finding_id: finding_id}, finding_id), do: :ok
 
