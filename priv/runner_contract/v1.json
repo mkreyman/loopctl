@@ -2372,6 +2372,76 @@
             "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
             "type": "string"
           },
+          "selection_replay": {
+            "additionalProperties": false,
+            "description": "Only on a chg selection change: the replay of the head against its base. `corpus` is one entry per replayed commit, with the tests the BASE selected that the head did not (`dropped`, at most 3 named; any is a narrowing). `miss` is the replay at the finding's commit: which of its failed tests the head selects.",
+            "properties": {
+              "corpus": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "base_count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "dropped": {
+                      "items": {
+                        "maxLength": 200,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "maxItems": 3,
+                      "type": "array"
+                    },
+                    "head_count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "sha": {
+                      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "sha",
+                    "base_count",
+                    "head_count",
+                    "dropped"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 30,
+                "type": "array"
+              },
+              "miss": {
+                "additionalProperties": false,
+                "properties": {
+                  "covered": {
+                    "items": {
+                      "maxLength": 200,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 50,
+                    "type": "array"
+                  },
+                  "sha": {
+                    "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sha",
+                  "covered"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "corpus"
+            ],
+            "type": "object"
+          },
           "verdict": {
             "description": "`pass` when the pull request at `head_sha` meets every acceptance criterion, `reject` otherwise.",
             "enum": [
@@ -3022,5 +3092,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.31.0"
+  "x-contract-version": "1.32.0"
 }

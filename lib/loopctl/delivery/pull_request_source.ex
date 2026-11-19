@@ -333,6 +333,12 @@ defmodule Loopctl.Delivery.PullRequestSource do
               :ok | {:error, term()}
 
   @doc """
+  REOPENS a closed issue (US-51.2: a loop fix that did not hold). Idempotent at the forge:
+  reopening an open issue changes nothing.
+  """
+  @callback reopen_issue(repo(), pos_integer()) :: :ok | {:error, term()}
+
+  @doc """
   OPENS an issue with `title` and `body`, returning its number. Not idempotent: see the
   moduledoc for how the caller makes it so.
   """
@@ -406,6 +412,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @doc false
   def close_issue(%ForgeRepo{} = repo, a, b), do: impl().close_issue(repo, a, b)
+
+  @doc false
+  def reopen_issue(%ForgeRepo{} = repo, a), do: impl().reopen_issue(repo, a)
 
   @doc false
   def create_issue(%ForgeRepo{} = repo, a, b), do: impl().create_issue(repo, a, b)

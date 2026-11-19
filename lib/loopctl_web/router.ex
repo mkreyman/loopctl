@@ -548,6 +548,11 @@ defmodule LoopctlWeb.Router do
     # the fleet's own ledger rows, agent-role.
     get "/chg_ledger/summary", ChgLedgerSummaryController, :show
 
+    # US-51.6: the chg feedback loop's findings. The list is an agent-role read; clearing an
+    # escalated finding sends it round the loop again, so it is user-role and human-anchored.
+    get "/chg_findings", ChgFindingController, :index
+    post "/chg_findings/:id/clear", ChgFindingController, :clear
+
     # US-48.13: the improvement loop's drafts, and the operator's record that one landed in a
     # pull request. User-role both: traces carry ticket text, and `landed` certifies a person
     # merged a prompt change. loopctl applies nothing.

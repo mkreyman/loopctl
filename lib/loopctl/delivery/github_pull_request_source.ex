@@ -588,6 +588,16 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   def close_issue(_repo, number, _state_reason), do: {:error, {:invalid_issue_number, number}}
 
   @impl true
+  def reopen_issue(repo, number) when is_integer(number) and number > 0 do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, _body} <- patch(repo, "/issues/#{number}", %{state: "open"}) do
+      :ok
+    end
+  end
+
+  def reopen_issue(_repo, number), do: {:error, {:invalid_issue_number, number}}
+
+  @impl true
   def create_issue(repo, title, body) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, title} <- issue_title(title),

@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The chg feedback loop (2026-11-19, Epic 51).**
+  - **The nightly sweep:** `ChgFindingSweepWorker` (04:10 UTC) derives findings from the chg ledger: selection misses, unquarantined flaky tests, merges with no review, stuck changes, and silent senders. It files each finding as a GitHub issue on the owning repository's live intake source, through an outbox drained by `ChgFindingActionWorker`. It closes a finding that stayed quiet for 7 days after its fix, reopens one that recurs, and escalates the second recurrence or a loop depth of 2.
+  - **Env vars:** `CHG_FINDINGS_DAILY_CAP` (default 5 new issues per repository per day) and `CHG_FINDINGS_REPO` (default `mkreyman/chg`, where chg's own selection misses are filed).
+  - **Intake:** a loop-filed issue is admitted on a ticket-gated source without a ticket.
+  - **Merge gate:** on the chg repository, a `:prove_effect` change now clears Gate B when the verifier's `verify@1` verdict carries a passing `selection_replay` (runner contract 1.32.0, optional field). **Operator step after deploy:** nothing produces `:prove_effect` for chg until `DELIVERY_GATES_CONFIG` carries an `mkreyman/chg` entry whose `effect_paths` name chg's selection code (`cli/src/cover.rs`, `adapters/*/lib/**`), with `DELIVERY_GATES_CONFIG_SHA256` recomputed and `mix loopctl.gates.check_drift` run against chg's file list. Until then every chg selection fix escalates to a person, as before.
+  - **New API:** `GET /api/v1/chg_findings` (any key) and `POST /api/v1/chg_findings/:id/clear` (user key, human-anchored).
+  - **Migrations:** `20261119010000`, `20261119020000` and `20261119030000` add tables and columns only, so the rolling deploy needs no ordering.
 - **The chg ledger and change events from a `pr` source, and intake mode `ledger`
   (2026-11-18, #1047).** `POST /api/v1/chg_ledger/:source_id` and
   `POST /api/v1/change_events/:source_id` now authenticate any source that holds both

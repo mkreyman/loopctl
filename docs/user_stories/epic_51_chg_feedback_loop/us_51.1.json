@@ -1,0 +1,81 @@
+{
+  "id": "US-51.1",
+  "title": "Finding sweep: one evidence-carrying issue per fingerprint",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "high",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "fleet operator",
+    "i_want_to": "have loopctl turn what the chg ledger shows is wrong into GitHub issues on the repository that owns the fix",
+    "so_that": "the delivery loop fixes it without anyone watching a dashboard"
+  },
+  "rationale": "Mark, 2026-11-18: 'where's the positive feedback loop?' Epic 50 stores the signals; nothing acts on them. chg#22 S14 defines the guards; loopctl holds every machine's rows, so it fingerprints once instead of per machine.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.1.1",
+      "description": "A nightly Oban cron (ChgFindingSweepWorker) reads each tenant's ledger and review outcomes over a trailing 48-hour window (a rerun counts no row twice) and derives findings of four kinds: selection_miss (a chg row that passed on a sha whose gate row failed; fingerprint repo + sha + the gate's failures), flaky_test (a flaky row with no quarantine; fingerprint repo + test), missing_review (a merged PR with no counted review round; fingerprint repo + PR number), stuck_change (a cursor flagged gap or stale for more than 24 hours; fingerprint source + change_id)."
+    },
+    {
+      "id": "AC-51.1.2",
+      "description": "A finding is a row in a new tenant-scoped table chg_findings (RLS enabled) unique on (tenant_id, kind, fingerprint). A repeat sighting increments occurrences and last_seen_at on the existing row; it never creates a second row or a second issue."
+    },
+    {
+      "id": "AC-51.1.3",
+      "description": "Each new finding files one GitHub issue on its owning repository: selection_miss on the chg repository, flaky_test, missing_review and stuck_change on the repository the row names. The issue carries the label chg-loop, the evidence (shas, test names, PR number, timestamps) as loopctl's own values, acceptance criteria written as checks, and the closing criterion. The issue number is stored on the finding."
+    },
+    {
+      "id": "AC-51.1.4",
+      "description": "At most a configured number of new issues per repository per UTC day (default 5, one module attribute and an env override documented in deploy/FLY_SECRETS.md). A finding over the cap stays state queued and is filed on a later run, highest occurrences first."
+    },
+    {
+      "id": "AC-51.1.5",
+      "description": "A finding whose evidence sha is a commit the delivery loop itself merged (a story stage merged with that merge sha) carries loop_depth = 1 + the depth of the finding that story fixed; at depth 2 the finding is state escalated and no issue is filed."
+    },
+    {
+      "id": "AC-51.1.6",
+      "description": "Filing is idempotent across a crash: deciding to file moves the finding queued -> filed and inserts one open action in a chg_finding_actions outbox row in ONE transaction (unique on finding, action and generation); the drainer (ChgFindingActionWorker) writes an idempotency marker into the issue body and, on any attempt after the first, searches the repository for that marker before creating again."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.1.1",
+      "name": "a miss files one issue",
+      "type": "integration",
+      "preconditions": ["a chg pass row and a gate fail row on one sha"],
+      "steps": ["run the sweep twice"],
+      "expected_results": ["one finding, occurrences 1 then unchanged", "one issue create call on the chg repository"]
+    },
+    {
+      "id": "TC-51.1.2",
+      "name": "daily cap",
+      "type": "integration",
+      "preconditions": ["seven new findings on one repository"],
+      "steps": ["run the sweep"],
+      "expected_results": ["five filed, two queued, highest occurrences filed first"]
+    },
+    {
+      "id": "TC-51.1.3",
+      "name": "depth 2 escalates",
+      "type": "unit",
+      "preconditions": ["a miss on a merge sha of a story that fixed a depth-1 finding"],
+      "steps": ["derive"],
+      "expected_results": ["state escalated, no issue"]
+    },
+    {
+      "id": "TC-51.1.4",
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": ["rows in tenants A and B"],
+      "steps": ["sweep"],
+      "expected_results": ["each tenant's findings name only its own rows and repositories"]
+    }
+  ],
+  "technical_notes": [
+    "The GitHub write goes through a behaviour (Loopctl.Delivery.IssueFiler) with a Req implementation using the tenant's GitHub credential, mocked in tests.",
+    "Reads run on HeavyRead; writes on AdminRepo per tenant, like the reconcile sweep."
+  ],
+  "dependencies": []
+}

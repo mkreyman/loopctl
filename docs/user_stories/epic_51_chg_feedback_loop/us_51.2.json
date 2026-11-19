@@ -1,0 +1,54 @@
+{
+  "id": "US-51.2",
+  "title": "Closure: close on silence, reopen on recurrence, escalate after two failed fixes",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "high",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "fleet operator",
+    "i_want_to": "have a finding's issue closed only when its signal has stayed quiet, and reopened when it comes back",
+    "so_that": "a fix is judged by the ledger, not by a merged PR, and a fix that did not hold is retried or brought to me"
+  },
+  "rationale": "chg#22 S14 steps 5-6 and the 'two failed fixes, then a person' guard.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.2.1",
+      "description": "When the story the delivery loop made from a finding's issue reaches merged, the finding moves to fixed and records the merge sha and time."
+    },
+    {
+      "id": "AC-51.2.2",
+      "description": "The sweep closes the issue of a fixed finding not seen for a configured quiet period after the fix merged (default 7 days, one module attribute) with a comment naming the period and the last sighting, and moves it to closed."
+    },
+    {
+      "id": "AC-51.2.3",
+      "description": "A sighting of a fixed or closed finding's fingerprint after its fix merged increments fix_attempts, reopens the issue (or files it again if it cannot be reopened) with a 'fix did not hold' comment carrying the new occurrences, and moves it back to filed."
+    },
+    {
+      "id": "AC-51.2.4",
+      "description": "At fix_attempts 2 the finding moves to escalated instead of reopening, and the issue gets a comment and the label chg-loop-escalated; the sweep files nothing more for that fingerprint until a user-role key clears it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.2.1",
+      "name": "quiet period closes",
+      "type": "integration",
+      "preconditions": ["a fixed finding last seen before its merge"],
+      "steps": ["sweep at merge + 8 days"],
+      "expected_results": ["issue closed with the comment", "state closed"]
+    },
+    {
+      "id": "TC-51.2.2",
+      "name": "recurrence reopens, second recurrence escalates",
+      "type": "integration",
+      "preconditions": ["a fixed finding"],
+      "steps": ["sight it after the merge", "fix again, sight it again"],
+      "expected_results": ["reopened at attempt 1", "escalated at attempt 2, no reopen"]
+    }
+  ],
+  "technical_notes": [],
+  "dependencies": ["US-51.1"]
+}

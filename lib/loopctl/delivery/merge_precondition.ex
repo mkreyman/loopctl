@@ -196,6 +196,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   require Logger
 
+  alias Loopctl.Changes.Findings
+  alias Loopctl.Changes.SelectionProof
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.PullRequestSource
@@ -233,6 +235,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
           optional(:gate_a_input) => GateAInput.t(),
           optional(:trio_outputs_ignored) => boolean(),
           optional(:effect_proof) => map() | nil,
+          optional(:selection_proof) => :pass | {:fail, [term()]} | :not_applicable,
           # OPTIONAL, and the fallback behind it is deliberate: a caller of `judge/1` that
           # omits it gets the configured list, because a guard that disappears when a fact is
           # missing is the failure this key exists to prevent.
@@ -441,6 +444,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
     database by `Loopctl.Delivery.GateAInput`
   - `:effect_proof` — `%{intent: _, fixture_set: _, fixture_results: _, coverage: _}` for a
     change that touches an effect path. Absent, a `:prove_effect` outcome is a refusal
+  - `:selection_proof_repos` — the repositories whose `:prove_effect` outcome is cleared by
+    `Loopctl.Changes.SelectionProof`, the measured selection-widening proof (US-51.5). Default
+    `[Loopctl.Changes.Findings.chg_repo()]`. On those repositories the measured proof is the
+    ONLY thing that clears it; a caller's `:effect_proof` still never does
 
   ## Errors
 
@@ -671,7 +678,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
         proof = proof(gate_b, Map.get(facts, :effect_proof))
         verdict = %{verdict | gate_b: gate_b, proof: proof}
 
-        case own ++ gate_b_reasons(gate_b, proof) do
+        case own ++ gate_b_reasons(gate_b, proof, Map.get(facts, :selection_proof)) do
           [] -> %{verdict | decision: :allow, reasons: []}
           reasons -> refuse(verdict, reasons)
         end
@@ -804,10 +811,21 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp redact_contradiction(other), do: other
 
-  defp gate_b_reasons(%GateB.Result{outcome: :clear}, _proof), do: []
+  defp gate_b_reasons(%GateB.Result{outcome: :clear}, _proof, _selection), do: []
 
-  defp gate_b_reasons(%GateB.Result{outcome: :human, reasons: reasons}, _proof),
+  defp gate_b_reasons(%GateB.Result{outcome: :human, reasons: reasons}, _proof, _selection),
     do: Enum.map(reasons, &{:gate_b, &1})
+
+  # US-51.5: on a selection-proof repository the effect is proven by loopctl's own record of
+  # the verifier's replay (`Loopctl.Changes.SelectionProof`), never by the caller. This is the
+  # case the caller-asserted clause below was left open for.
+  defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, _proof, :pass), do: []
+
+  defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, _proof, {:fail, reasons}),
+    do: Enum.map(reasons, &{:selection_proof, &1})
+
+  defp gate_b_reasons(%GateB.Result{outcome: :prove_effect} = gate_b, proof, _not_applicable),
+    do: gate_b_reasons(gate_b, proof)
 
   defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, nil), do: [:effect_proof_required]
 
@@ -1003,7 +1021,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # `trio_outputs` is recorded as having done so, and nothing it sent is read.
       gate_a_input: GateAInput.for_story(story.tenant_id, story.id),
       trio_outputs_ignored: Keyword.has_key?(opts, :trio_outputs),
-      effect_proof: Keyword.get(opts, :effect_proof)
+      effect_proof: Keyword.get(opts, :effect_proof),
+      # US-51.5: judged only on a selection-proof repository, from the verifier's recorded
+      # verdict at the stage row's head. Never from the caller.
+      selection_proof: selection_proof(story, stage, repo, opts)
     }
 
     # NOT fetched when the decision will not read them: the merged branch and a moved head
@@ -1027,6 +1048,16 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
     Map.merge(facts, %{head_files: head_files, base_files: base_files})
   end
+
+  defp selection_proof(story, stage, {:ok, repo}, opts) do
+    repos = Keyword.get_lazy(opts, :selection_proof_repos, fn -> [Findings.chg_repo()] end)
+
+    if Enum.any?(repos, &(String.downcase(&1) == String.downcase(repo))),
+      do: SelectionProof.judge(story, stage.head_sha),
+      else: :not_applicable
+  end
+
+  defp selection_proof(_story, _stage, _repo, _opts), do: :not_applicable
 
   defp fetch_story(tenant_id, story_id) do
     case Stories.get_story(tenant_id, story_id) do

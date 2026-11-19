@@ -411,6 +411,10 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    Mox.stub(Loopctl.MockPullRequestSource, :reopen_issue, fn _repo, _number ->
+      {:error, :not_stubbed}
+    end)
+
     # US-47.4: a revert after `done` opens an issue. Fail-closed for the same reason as the
     # three writes above — an unstubbed test must never open a real issue.
     Mox.stub(Loopctl.MockPullRequestSource, :create_issue, fn _repo, _title, _body ->

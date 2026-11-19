@@ -1,0 +1,60 @@
+{
+  "id": "US-51.3",
+  "title": "Loop-filed issues enter intake on a ticket-gated source",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "high",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "fleet operator",
+    "i_want_to": "have issues loopctl filed itself triaged on a source that otherwise takes only support-ticket issues",
+    "so_that": "HomeCareBilling's flaky tests and missed reviews enter the loop"
+  },
+  "rationale": "Mark, 2026-11-18: 'Let's add this source to allow to enter the loop.' home_care_billing's source sets triage_requires_ticket, so a loop issue there would stay pending_triage for ever.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.3.1",
+      "description": "An intake record is admitted on a triage_requires_ticket source when its (source repository, issue number) is the issue of a chg_findings row of the same tenant. The admission is a lookup in loopctl's own table, never a label, marker or author in the issue, which anyone who can open an issue could type."
+    },
+    {
+      "id": "AC-51.3.2",
+      "description": "Such a record is marked with the finding id (intake_records.loop_finding_id), set when it is promoted. Delivering the finding to triage as loopctl-authored fields is US-51.7, because it changes the runner contract."
+    },
+    {
+      "id": "AC-51.3.3",
+      "description": "An issue that merely copies a loop issue's body, or carries the chg-loop label, on an issue number no finding holds stays pending_triage as today."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.3.1",
+      "name": "a loop issue is admitted",
+      "type": "integration",
+      "preconditions": ["a ticket-gated source", "a finding holding issue 40"],
+      "steps": ["deliver issues opened for 40"],
+      "expected_results": ["a story at detected, record marked loop_finding"]
+    },
+    {
+      "id": "TC-51.3.2",
+      "name": "a copied issue is not",
+      "type": "integration",
+      "preconditions": ["the same source"],
+      "steps": ["deliver issue 41 with the chg-loop label and a copied body"],
+      "expected_results": ["pending_triage, no story"]
+    },
+    {
+      "id": "TC-51.3.3",
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": ["tenant B's finding holds issue 40 of the same repository name"],
+      "steps": ["deliver issue 40 to tenant A's source"],
+      "expected_results": ["not admitted"]
+    }
+  ],
+  "technical_notes": [
+    "TriageTrigger.ticket_admitted/2 and the TriageTriggerWorker candidate query both change; they must agree."
+  ],
+  "dependencies": ["US-51.1"]
+}

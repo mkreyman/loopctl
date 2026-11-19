@@ -82,6 +82,7 @@ defmodule Loopctl.Agents.Candidates do
 
   import Ecto.Query
 
+  alias Loopctl.Changes.Findings
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
@@ -408,8 +409,15 @@ defmodule Loopctl.Agents.Candidates do
   # an untrusted field. It is still a CLAIM: whoever can open an issue can type both lines, so
   # on a private repository it keeps out issues filed in any other format, not a collaborator
   # set on forging one. Any other story is simply not a candidate and costs nothing.
+  #
+  # US-51.3: or an issue the chg feedback loop filed, known by loopctl's own `chg_findings`
+  # lookup (`Findings.loop_issue_query/0`), never by anything in the issue.
   defp apply_predicate(:requires_ticket_if_source_says, query, _kind) do
-    where(query, [source: b, record: rec], not b.requires_ticket or not is_nil(rec.ticket_id))
+    where(
+      query,
+      [source: b, record: rec],
+      not b.requires_ticket or not is_nil(rec.ticket_id) or exists(Findings.loop_issue_query())
+    )
   end
 
   # The ledger row is the thing that ENDS: `Loopctl.Runners.Capacity.heal/3` releases a

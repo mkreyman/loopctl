@@ -1,0 +1,38 @@
+{
+  "id": "US-51.4",
+  "title": "Silence detector: a source that stops sending is a finding",
+  "epic": {
+    "id": "epic_51",
+    "name": "chg feedback loop"
+  },
+  "priority": "medium",
+  "phase": "chg_feedback_loop",
+  "story": {
+    "as_a": "fleet operator",
+    "i_want_to": "be told when a source that normally sends ledger rows goes quiet",
+    "so_that": "an empty ledger never reads as nothing being wrong"
+  },
+  "rationale": "Every other finding is derived from rows. A broken sender produces no rows and therefore no findings, which looks exactly like a healthy fleet.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-51.4.1",
+      "description": "The sweep files a source_silent finding (fingerprint source id + host) for a (source, host) that sent rows on at least 3 of the previous 7 days and none in the last 24 hours, filed on the chg repository, where the sender lives."
+    },
+    {
+      "id": "AC-51.4.2",
+      "description": "It closes like any finding: rows from that (source, host) again for the quiet period close it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-51.4.1",
+      "name": "a quiet host is filed, a new host is not",
+      "type": "integration",
+      "preconditions": ["host a sent on 5 of 7 days, nothing today", "host b sent once, today"],
+      "steps": ["sweep"],
+      "expected_results": ["one source_silent finding, for host a"]
+    }
+  ],
+  "technical_notes": [],
+  "dependencies": ["US-51.1"]
+}
