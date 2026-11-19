@@ -68,6 +68,10 @@ defmodule Loopctl.Projects.Project do
     # changeset and never cast. One ACTIVE project per (tenant, repo_key) is held by
     # `projects_tenant_repo_key_active_uidx`, so a repo has one project and one channel.
     field :repo_key, :string
+    # Set when a kb scope is promoted to a work project (US-52.3), so its channel keeps the
+    # any-agent writes of a kb scope (`Coordination.project_writable_by_agent/4`). Never
+    # cast: only the promotion writes it.
+    field :open_channel, :boolean, default: false
     field :description, :string
     field :tech_stack, :string
     field :status, Ecto.Enum, values: @statuses, default: :active

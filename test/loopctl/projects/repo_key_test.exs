@@ -84,6 +84,10 @@ defmodule Loopctl.Projects.RepoKeyTest do
       assert {:error, failed} = AdminRepo.insert(changeset)
       assert Keyword.has_key?(failed.errors, :repo_key)
       assert {:ok, ^kb} = Projects.repo_holder(t.id, "github.com/mkreyman/chg")
+
+      # The loser of the race gets the same 409 the pre-check gives, not a changeset.
+      kb_id = kb.id
+      assert {:error, {:repo_has_project, ^kb_id}} = Projects.changeset_or_refusal(t.id, failed)
     end
   end
 

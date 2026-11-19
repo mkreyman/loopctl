@@ -569,7 +569,12 @@ defmodule Loopctl.Projects do
     end
   end
 
-  defp changeset_or_refusal(tenant_id, changeset) do
+  # Public only so the race it decides has a test that can fail: the `repo_free` pre-check
+  # answers every serial case first, so no ordinary call reaches it (TC-52.1.3).
+  @doc false
+  @spec changeset_or_refusal(Ecto.UUID.t(), Ecto.Changeset.t()) ::
+          {:error, Ecto.Changeset.t() | {:repo_has_project, Ecto.UUID.t()}}
+  def changeset_or_refusal(tenant_id, changeset) do
     with true <- Keyword.has_key?(changeset.errors, :repo_key),
          {:ok, holder} <-
            repo_holder(

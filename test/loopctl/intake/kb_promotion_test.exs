@@ -11,7 +11,9 @@ defmodule Loopctl.Intake.KbPromotionTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Coordination
   alias Loopctl.Intake
+  alias Loopctl.Projects
   alias Loopctl.Projects.Project
 
   setup do
@@ -124,5 +126,50 @@ defmodule Loopctl.Intake.KbPromotionTest do
 
     assert %{project_id: [_]} = errors_on(changeset)
     assert kind(kb.id) == :kb
+  end
+
+  test "a promotion rolls back when the insert after it fails", %{tenant: t, kb: kb} do
+    # A ledger source holds the repo without promoting; the pr source after it is promoted
+    # first and then refused by the one-active-source-per-repo index.
+    ledger =
+      Map.merge(
+        %{repo_full_name: "mkreyman/chg", project_id: kb.id, mode: "ledger"},
+        chg_credentials(t.id)
+      )
+
+    assert {:ok, _} = Intake.create_source(t.id, ledger)
+
+    assert {:error, %Ecto.Changeset{}} =
+             Intake.create_source(t.id, %{repo_full_name: "mkreyman/chg", project_id: kb.id})
+
+    assert %{kind: :kb, open_channel: false} = AdminRepo.get!(Project, kb.id)
+    assert promotions(t.id, kb.id) == []
+  end
+
+  test "a promoted kb scope keeps an open channel", %{tenant: t, kb: kb} do
+    {:ok, _} = Intake.create_source(t.id, %{repo_full_name: "mkreyman/chg", project_id: kb.id})
+    assert %{kind: :work, open_channel: true} = AdminRepo.get!(Project, kb.id)
+
+    outsider = fixture(:agent, %{tenant_id: t.id})
+    assert :ok = Coordination.project_writable_by_agent(t.id, outsider.id, kb.id, :agent)
+  end
+
+  test "a project with no repo takes the source's repo", %{tenant: t} do
+    bare = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+    {:ok, _} =
+      Intake.create_source(t.id, %{repo_full_name: "mkreyman/other", project_id: bare.id})
+
+    assert {:ok, %{id: id}} = Projects.repo_holder(t.id, "github.com/mkreyman/other")
+    assert id == bare.id
+    assert %{open_channel: false} = AdminRepo.get!(Project, bare.id)
+  end
+
+  test "a work project that was never a kb scope keeps the membership gate", %{tenant: t} do
+    work = fixture(:project, %{tenant_id: t.id})
+    outsider = fixture(:agent, %{tenant_id: t.id})
+
+    assert {:error, :not_found} =
+             Coordination.project_writable_by_agent(t.id, outsider.id, work.id, :agent)
   end
 end

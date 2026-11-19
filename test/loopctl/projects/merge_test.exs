@@ -36,6 +36,12 @@ defmodule Loopctl.Projects.MergeTest do
 
     {_secret, source} = source
 
+    # Enrolment now gives a repo-less project the source's repo (US-52.3); the production
+    # pairs predate that, so the work project is put back to holding no repo.
+    AdminRepo.update_all(from(p in Project, where: p.id == ^work.id),
+      set: [repo_url: nil, repo_key: nil]
+    )
+
     {:ok, post} =
       Coordination.create_post(tenant.id, work.id, agent.id, %{"body" => "on the work channel"})
 
@@ -191,6 +197,62 @@ defmodule Loopctl.Projects.MergeTest do
       foreign = fixture(:project)
       assert {:error, :not_found} = Merge.merge_into(t.id, other.id, foreign.id)
       assert {:error, :not_found} = Merge.merge_into(t.id, other.id, "not-a-uuid")
+    end
+  end
+
+  describe "review fixes" do
+    test "one UUID in two cases is the same project" do
+      tenant = fixture(:tenant)
+      p = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+
+      assert {:error, :same_project} =
+               Merge.merge_into(tenant.id, String.upcase(p.id), p.id)
+
+      assert %{status: :active} = AdminRepo.get!(Project, p.id)
+    end
+
+    test "a project-scoped token budget moves; a budget on both projects conflicts" do
+      %{tenant: t, work: work, kb: kb} = pair()
+      budget = fixture(:token_budget, %{tenant_id: t.id, scope_type: :project, scope_id: work.id})
+
+      assert {:ok, %{counts: %{"token_budgets" => 1}}} = Merge.merge_into(t.id, work.id, kb.id)
+      assert AdminRepo.get!(Loopctl.TokenUsage.Budget, budget.id).scope_id == kb.id
+
+      a = fixture(:project, %{tenant_id: t.id})
+      b = fixture(:project, %{tenant_id: t.id})
+      fixture(:token_budget, %{tenant_id: t.id, scope_type: :project, scope_id: a.id})
+      fixture(:token_budget, %{tenant_id: t.id, scope_type: :project, scope_id: b.id})
+
+      assert {:error, {:merge_conflicts, [%{table: "token_budgets"}]}} =
+               Merge.merge_into(t.id, a.id, b.id)
+    end
+
+    test "a repeat merge moves rows written to the archived source since" do
+      %{tenant: t, work: work, kb: kb} = pair()
+      {:ok, _} = Merge.merge_into(t.id, work.id, kb.id)
+
+      straggler =
+        fixture(:orchestrator_state, %{tenant_id: t.id, project_id: work.id, state_key: "late"})
+
+      assert {:ok, %{already_merged: true, counts: %{"orchestrator_states" => 1}}} =
+               Merge.merge_into(t.id, work.id, kb.id)
+
+      assert project_of(OrchestratorState, straggler.id) == kb.id
+
+      assert [_] =
+               AdminRepo.all(
+                 from a in AuditLog,
+                   where: a.entity_id == ^work.id and a.action == "merged_into_swept"
+               )
+    end
+
+    test "the promoted target keeps an open channel" do
+      %{tenant: t, work: work, kb: kb} = pair()
+      {:ok, _} = Merge.merge_into(t.id, work.id, kb.id)
+      assert %{kind: :work, open_channel: true} = AdminRepo.get!(Project, kb.id)
+
+      outsider = fixture(:agent, %{tenant_id: t.id})
+      assert :ok = Coordination.project_writable_by_agent(t.id, outsider.id, kb.id, :agent)
     end
   end
 

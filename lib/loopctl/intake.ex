@@ -361,42 +361,82 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # Runs inside `insert_source/3`'s transaction, after the insert, so a refused enrolment
-  # rolls the promotion back with it. The project row is locked and re-read: it is promoted
-  # only while it is still an active `:kb` scope, and only for a mode that binds a work project.
-  defp promote_to_work(tenant_id, %Source{} = source, opts) do
-    kinds = Source.project_kinds(source.mode)
+  # Runs inside `insert_source/3`'s transaction, BEFORE the insert, so any refusal after it
+  # (the insert itself, the audit chain) rolls it back. The project row is locked and re-read.
+  #
+  # For a `pr`/`chg` source it makes the bound project the repo's one project (US-52.3):
+  #   - a project with no `repo_url` takes the source's repo, so `resolve_project({repo_url})`
+  #     finds it and no second project can claim the repo (the index refuses a race);
+  #   - an active `:kb` scope is promoted to `:work`, keeping its open channel.
+  # A project that already holds a DIFFERENT repo is not refused yet: the test corpus binds
+  # sources that way throughout, and the refusal is tracked as its own issue.
+  # A `ledger` source binds nothing, so it changes nothing here.
+  #
+  # Returns `{:ok, promoted?}`.
+  defp prepare_project(tenant_id, changeset) do
+    mode = Ecto.Changeset.get_field(changeset, :mode)
+    repo = Ecto.Changeset.get_field(changeset, :repo_full_name)
+    kinds = Source.project_kinds(mode)
 
     project =
       from(p in Project,
-        where: p.tenant_id == ^tenant_id and p.id == ^source.project_id,
+        where:
+          p.tenant_id == ^tenant_id and
+            p.id == ^Ecto.Changeset.get_field(changeset, :project_id),
         lock: "FOR UPDATE"
       )
       |> AdminRepo.one()
 
     cond do
       is_nil(project) or project.status != :active ->
-        {:error,
-         source
-         |> Ecto.Changeset.change()
-         |> Ecto.Changeset.add_error(:project_id, project_kind_message(kinds))}
+        {:error, Ecto.Changeset.add_error(changeset, :project_id, project_kind_message(kinds))}
 
-      project.kind in kinds ->
-        :ok
+      mode == :ledger ->
+        {:ok, false}
 
       true ->
-        with {:ok, promoted} <-
-               project |> Ecto.Changeset.change(kind: :work) |> AdminRepo.update(),
-             {:ok, _} <- audit_promotion(tenant_id, promoted, source, opts) do
-          :ok
-        else
-          {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
-          {:error, _step, reason, _changes} -> {:error, {:promotion_audit_failed, reason}}
-        end
+        claim_repo(project, repo)
     end
   end
 
-  defp audit_promotion(tenant_id, project, source, opts) do
+  defp claim_repo(project, repo) do
+    changes =
+      [kind: :work]
+      |> then(&if(project.kind == :kb, do: [{:open_channel, true} | &1], else: &1))
+      |> then(fn changes ->
+        if is_nil(project.repo_url) do
+          url = "https://github.com/#{repo}"
+          [{:repo_url, url}, {:repo_key, RepoUrl.key(url)} | changes]
+        else
+          changes
+        end
+      end)
+
+    project
+    |> Ecto.Changeset.change(changes)
+    |> Ecto.Changeset.unique_constraint(:repo_key,
+      name: Project.repo_key_index(),
+      message: "already has a project in this tenant"
+    )
+    |> AdminRepo.update()
+    |> case do
+      {:ok, _} -> {:ok, project.kind == :kb}
+      {:error, changeset} -> {:error, changeset}
+    end
+  end
+
+  defp audit_promotion(_tenant_id, _source, false, _opts), do: :ok
+
+  defp audit_promotion(tenant_id, source, true, opts) do
+    case do_audit_promotion(tenant_id, source, opts) do
+      {:ok, _} -> :ok
+      {:error, _step, reason, _changes} -> {:error, {:promotion_audit_failed, reason}}
+    end
+  end
+
+  defp do_audit_promotion(tenant_id, source, opts) do
+    project = %{id: source.project_id}
+
     Ecto.Multi.new()
     |> Audit.log_in_multi(:audit, fn _ ->
       %{
@@ -562,8 +602,9 @@ defmodule Loopctl.Intake do
       with :ok <- mint_root(tenant_id, opts),
            :ok <- check_chg_root(tenant_id, changeset),
            :ok <- close_pr_route(tenant_id, changeset),
+           {:ok, promoted?} <- prepare_project(tenant_id, changeset),
            {:ok, source} <- AdminRepo.insert(changeset),
-           :ok <- promote_to_work(tenant_id, source, opts),
+           :ok <- audit_promotion(tenant_id, source, promoted?, opts),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
                action: "intake_source_created",

@@ -238,7 +238,8 @@ defmodule LoopctlWeb.ProjectController do
         "One transaction; audited as merged_into. The audit log and search telemetry keep " <>
         "naming :id. User role on a human-anchored tenant. dry_run: true returns the per-table " <>
         "counts and conflicts and writes nothing. A repeat call on an already-merged source " <>
-        "returns already_merged and moves nothing.",
+        "returns already_merged and moves only rows written to it since. A :project token " <>
+        "budget moves with the rows.",
     parameters: [id: [in: :path, type: :string, description: "Source project UUID"]],
     request_body:
       {"Merge params", "application/json",

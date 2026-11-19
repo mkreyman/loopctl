@@ -863,7 +863,8 @@ defmodule Loopctl.Coordination do
        member via story assignment — the gate is enforced for every role below
        `:user`.
 
-    3. **`:kb`-kind scope in the caller's own tenant** (issue #517) — a KB scope
+    3. **A repo's channel in the caller's own tenant**: a `:kb` scope (issue #517) or a
+       work project promoted from one (`open_channel`, US-52.3; see `repo_channel?/2`). A KB scope
        carries NO chain-of-custody surface: `RequireWorkProject` bars work
        attachment, so a kb-scope can NEVER have a story, and membership-by-story
        (path 1) is therefore structurally unsatisfiable for it. Without this path an
@@ -898,16 +899,15 @@ defmodule Loopctl.Coordination do
   @spec project_writable_by_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           :ok | {:error, :not_found}
   def project_writable_by_agent(tenant_id, agent_id, project_id, role) do
-    # Clause order is a hot-path optimization, NOT a semantic one: kb_scope? and
-    # agent_member_of_project? are mutually exclusive (a kb-scope structurally has
-    # no stories, so it can never satisfy membership), so either order yields the
-    # same verdict. Membership is checked FIRST because the dominant write is an
-    # agent acting on a WORK project it is a member of — that resolves in a single
-    # query, and the always-false kb_scope? probe is only paid on the rare kb path.
+    # Clause order is a hot-path optimization, NOT a semantic one: both clauses only
+    # ever answer :ok, so either order yields the same verdict. Membership is checked
+    # FIRST because the dominant write is an agent acting on a WORK project it is a
+    # member of — that resolves in a single query, and the repo_channel? probe is only
+    # paid for a non-member.
     cond do
       Role.role_at_least?(role, :user) -> :ok
       agent_member_of_project?(tenant_id, agent_id, project_id) -> :ok
-      kb_scope?(tenant_id, project_id) -> emit_kb_scope_write(tenant_id, agent_id, project_id)
+      repo_channel?(tenant_id, project_id) -> emit_kb_scope_write(tenant_id, agent_id, project_id)
       true -> {:error, :not_found}
     end
   end
@@ -958,9 +958,17 @@ defmodule Loopctl.Coordination do
   # A tenant that wants to freeze a channel deletes/expires its posts; a blanket
   # "reject writes to archived scopes" gate (both kinds) is a separate, deliberate
   # product decision left out of the #517 carve-out.
-  defp kb_scope?(tenant_id, project_id) do
+  #
+  # US-52.3: a kb scope that takes delivery is promoted to `:work` (by an intake enrolment or
+  # by a merge), and its channel must stay as open as it was: it is the repo's one channel, and
+  # the fleet's agent key, which holds no story there, hands off on it. The promotion therefore
+  # sets `projects.open_channel` (never cast, so no PATCH can set or clear it), and this probe
+  # reads "a kb scope, or a project promoted from one". A work project that was never a kb
+  # scope keeps the US-40.D3 membership gate exactly as before.
+  defp repo_channel?(tenant_id, project_id) do
     Project
-    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id and p.kind == :kb)
+    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id)
+    |> where([p], p.kind == :kb or p.open_channel)
     |> AdminRepo.exists?()
   end
 

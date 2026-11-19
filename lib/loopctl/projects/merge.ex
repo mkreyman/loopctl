@@ -37,6 +37,7 @@ defmodule Loopctl.Projects.Merge do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Projects.Project
+  alias Loopctl.TokenUsage.Budget, as: TokenBudget
 
   @project_tables ~w(
     agent_run_outcomes article_access_events articles channel_claims channel_posts corpora
@@ -125,8 +126,10 @@ defmodule Loopctl.Projects.Merge do
   Options: `:dry_run` (counts and conflicts, nothing written), and the audit actor
   `:actor_id`, `:actor_label`, `:actor_type`.
 
-  Returns `{:ok, result}`, `{:ok, %{already_merged: true}}` for a source already merged into
-  this target, or `{:error, reason}` with `{:merge_conflicts, conflicts}`, `:same_project`,
+  Returns `{:ok, result}`, or `{:ok, %{already_merged: true, counts: ...}}` for a source already
+  merged into this target: that call moves any row written to the archived source since (a
+  write that waited on the merge's lock, a session still holding the old id) and nothing else.
+  A `:project`-scoped token budget moves with the rows. Errors: `{:error, reason}` with `{:merge_conflicts, conflicts}`, `:same_project`,
   `:not_found`, `:target_not_active` or `:source_not_active`.
   """
   @spec merge_into(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
@@ -137,19 +140,21 @@ defmodule Loopctl.Projects.Merge do
              | :not_found
              | :target_not_active
              | :source_not_active}
-  def merge_into(tenant_id, source_id, target_id, opts \\ [])
-
-  def merge_into(_tenant_id, id, id, _opts), do: {:error, :same_project}
-
-  def merge_into(tenant_id, source_id, target_id, opts) do
+  def merge_into(tenant_id, source_id, target_id, opts \\ []) do
+    # Compared AFTER the cast: two spellings of one UUID (case) are one project.
     with {:ok, source_id} <- Ecto.UUID.cast(source_id),
-         {:ok, target_id} <- Ecto.UUID.cast(target_id) do
+         {:ok, target_id} <- Ecto.UUID.cast(target_id),
+         :ok <- two_projects(source_id, target_id) do
       AdminRepo.transaction(fn -> run(tenant_id, source_id, target_id, opts) end)
       |> unwrap()
     else
       :error -> {:error, :not_found}
+      {:error, :same_project} -> {:error, :same_project}
     end
   end
+
+  defp two_projects(id, id), do: {:error, :same_project}
+  defp two_projects(_source_id, _target_id), do: :ok
 
   defp unwrap({:ok, {:error, reason}}), do: {:error, reason}
   defp unwrap({:ok, {:ok, result}}), do: {:ok, result}
@@ -166,8 +171,9 @@ defmodule Loopctl.Projects.Merge do
 
     with {:ok, source} <- Map.fetch(projects, source_id) |> found(),
          {:ok, target} <- Map.fetch(projects, target_id) |> found(),
-         :ok <- mergeable(source, target) do
+         {:ok, how} <- mergeable(source, target) do
       base = %{source_id: source_id, target_id: target_id}
+      base = if how == :sweep, do: Map.put(base, :already_merged, true), else: base
       counts = counts(tenant_id, source_id)
       conflicts = conflicts(tenant_id, source_id, target_id)
 
@@ -178,24 +184,29 @@ defmodule Loopctl.Projects.Merge do
         conflicts != [] ->
           {:error, {:merge_conflicts, conflicts}}
 
+        how == :sweep ->
+          sweep(tenant_id, source, target, counts, opts)
+          {:ok, Map.merge(base, %{dry_run: false, counts: counts})}
+
         true ->
           promoted = apply_merge(tenant_id, source, target, counts, opts)
           {:ok, Map.merge(base, %{dry_run: false, counts: counts, promoted: promoted})}
       end
-    else
-      {:already_merged, result} -> {:ok, result}
-      {:error, reason} -> {:error, reason}
     end
   end
 
   defp found({:ok, project}), do: {:ok, project}
   defp found(:error), do: {:error, :not_found}
 
-  defp mergeable(%{status: :archived, metadata: %{"merged_into" => target_id}} = source, %{
-         id: target_id
-       }) do
-    {:already_merged, %{source_id: source.id, target_id: target_id, already_merged: true}}
-  end
+  # A source already merged into THIS target is swept again rather than answered from its
+  # status alone: the archived row stays a valid foreign-key target, so a write that waited on
+  # the merge's lock, or a session still holding the old id, can land rows on it afterwards.
+  # A repeat call moves those and nothing else (no promotion, no second archive).
+  defp mergeable(%{status: :archived, metadata: %{"merged_into" => target_id}}, %{
+         id: target_id,
+         status: :active
+       }),
+       do: {:ok, :sweep}
 
   defp mergeable(_source, %{status: status}) when status != :active,
     do: {:error, :target_not_active}
@@ -203,10 +214,11 @@ defmodule Loopctl.Projects.Merge do
   defp mergeable(%{status: status}, _target) when status != :active,
     do: {:error, :source_not_active}
 
-  defp mergeable(_source, _target), do: :ok
+  defp mergeable(_source, _target), do: {:ok, :merge}
 
   defp counts(tenant_id, source_id) do
-    Map.new(@project_tables, fn table ->
+    @project_tables
+    |> Map.new(fn table ->
       count =
         from(r in table,
           where: r.tenant_id == type(^tenant_id, :binary_id),
@@ -217,9 +229,81 @@ defmodule Loopctl.Projects.Merge do
 
       {table, count}
     end)
+    |> Map.put("token_budgets", AdminRepo.aggregate(budget_query(tenant_id, source_id), :count))
+  end
+
+  # `token_budgets` names its project by (scope_type :project, scope_id), not a project_id
+  # foreign key, so the schema-bound table list cannot see it; it moves with the rest. One
+  # budget per scope (`token_budgets_tenant_id_scope_type_scope_id_index`), so a budget on
+  # both projects is a conflict.
+  defp budget_query(tenant_id, project_id) do
+    from(b in TokenBudget,
+      where: b.tenant_id == ^tenant_id and b.scope_type == :project and b.scope_id == ^project_id
+    )
+  end
+
+  defp budget_conflicts(tenant_id, source_id, target_id) do
+    case {AdminRepo.one(budget_query(tenant_id, source_id)),
+          AdminRepo.one(budget_query(tenant_id, target_id))} do
+      {%TokenBudget{id: s}, %TokenBudget{id: t}} ->
+        [
+          %{
+            table: "token_budgets",
+            index: "token_budgets_tenant_id_scope_type_scope_id_index",
+            source_row_id: s,
+            target_row_id: t
+          }
+        ]
+
+      _ ->
+        []
+    end
+  end
+
+  defp move_rows(tenant_id, source, target) do
+    Enum.each(@project_tables, fn table ->
+      from(r in table,
+        where: r.tenant_id == type(^tenant_id, :binary_id),
+        where: r.project_id == type(^source.id, :binary_id)
+      )
+      |> AdminRepo.update_all(set: [project_id: Ecto.UUID.dump!(target.id)])
+    end)
+
+    AdminRepo.update_all(budget_query(tenant_id, source.id), set: [scope_id: target.id])
+  end
+
+  defp sweep(tenant_id, source, target, counts, opts) do
+    move_rows(tenant_id, source, target)
+
+    if Enum.any?(counts, fn {_table, n} -> n > 0 end) do
+      {:ok, _} =
+        Multi.new()
+        |> Audit.log_in_multi(:audit, fn _ ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "project",
+            entity_id: source.id,
+            action: "merged_into_swept",
+            actor_type: Keyword.get(opts, :actor_type, "api_key"),
+            actor_id: Keyword.get(opts, :actor_id),
+            actor_label: Keyword.get(opts, :actor_label),
+            metadata: %{"target_id" => target.id, "counts" => counts},
+            old_state: %{"status" => "archived"},
+            new_state: %{"status" => "archived", "merged_into" => target.id}
+          }
+        end)
+        |> AdminRepo.transaction()
+    end
+
+    :ok
   end
 
   defp conflicts(tenant_id, source_id, target_id) do
+    budget_conflicts(tenant_id, source_id, target_id) ++
+      unique_key_conflicts(tenant_id, source_id, target_id)
+  end
+
+  defp unique_key_conflicts(tenant_id, source_id, target_id) do
     Enum.flat_map(@unique_keys, fn key ->
       key_sql(key)
       |> AdminRepo.query!([
@@ -256,18 +340,12 @@ defmodule Loopctl.Projects.Merge do
   defp alias_where(where, a), do: String.replace(where, "%{a}", a)
 
   defp apply_merge(tenant_id, source, target, counts, opts) do
-    Enum.each(@project_tables, fn table ->
-      from(r in table,
-        where: r.tenant_id == type(^tenant_id, :binary_id),
-        where: r.project_id == type(^source.id, :binary_id)
-      )
-      |> AdminRepo.update_all(set: [project_id: Ecto.UUID.dump!(target.id)])
-    end)
+    move_rows(tenant_id, source, target)
 
     promoted = source.kind == :work and target.kind == :kb
 
     if promoted do
-      target |> Ecto.Changeset.change(kind: :work) |> AdminRepo.update!()
+      target |> Ecto.Changeset.change(kind: :work, open_channel: true) |> AdminRepo.update!()
     end
 
     source
