@@ -306,6 +306,34 @@ defmodule Loopctl.Changes.RevertIssuesTest do
       assert {:skipped, nil} = RevertIssueOpener.open(row)
     end
 
+    # #1058: the row is the only record that the revert happened, so a missing credential
+    # waits for one without a bound and hands back the claim's attempt.
+    test "a missing credential never abandons the row, and opens once one exists", ctx do
+      record!(ctx)
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
+
+      for _attempt <- 1..(Loopctl.ForgeOutbox.max_attempts() + 2) do
+        assert {:deferred, nil} = ctx |> only_row() |> make_due() |> RevertIssueOpener.open()
+      end
+
+      row = only_row(ctx)
+      assert %RevertIssue{status: :pending, attempts: 0} = row
+      assert row.last_error =~ "credential_unavailable"
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+        {:ok,
+         %Loopctl.Verification.Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :create_issue, fn _r, _t, _b -> {:ok, 9} end)
+      assert {:opened, nil} = row |> make_due() |> RevertIssueOpener.open()
+    end
+
     test "transient retries are bounded", ctx do
       record!(ctx)
 

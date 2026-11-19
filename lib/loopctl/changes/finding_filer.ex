@@ -31,7 +31,7 @@ defmodule Loopctl.Changes.FindingFiler do
   `Loopctl.Delivery.MergePrecondition.transient?/1`, the classification every forge drainer
   shares: transient backs the row off and permanent abandons on the first occurrence. A
   missing credential waits an hour per attempt with NO budget (`Findings.mark_configuration_wait/4`),
-  unlike the other drainers: a credential is configuration whose fix happens outside loopctl,
+  as every forge drainer does (`Loopctl.ForgeOutbox.mark_configuration_wait/5`): a credential is configuration whose fix happens outside loopctl,
   and the outbox row is the only thing that will ever tell anyone about the finding. Bounded,
   six hourly attempts abandoned the row and left its finding `:filed` with no issue for good,
   which is what happened to the first `selection_miss` (2026-11-19) while its repository was

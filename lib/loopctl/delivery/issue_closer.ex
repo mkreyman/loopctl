@@ -81,7 +81,9 @@ defmodule Loopctl.Delivery.IssueCloser do
   backoff alone spent every attempt inside one window and abandoned a closure the forge had
   already told us when to retry.
 
-  Even the transient path is bounded: `IssueClosures.max_attempts/0`. A fault that has not
+  Even the transient path is bounded: `IssueClosures.max_attempts/0`. A MISSING CREDENTIAL is
+  not a fault and is not bounded: the row waits an hour per attempt until the repository has
+  one (`Loopctl.ForgeOutbox.mark_configuration_wait/5`, #1058). A fault that has not
   cleared by then is a token or an outage, and an operator reading `intake_issue_closures` for
   `abandoned_reason = 'retries_exhausted'` is how it surfaces — and
   `IssueClosures.requeue_abandoned/1` is how they re-drive the backlog once the cause is
@@ -112,6 +114,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.Resolution
+  alias Loopctl.ForgeOutbox
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.Verification.Credential
@@ -413,12 +416,13 @@ defmodule Loopctl.Delivery.IssueCloser do
       MergePrecondition.transient?(reason) ->
         defer(closure, reason, retry_after)
 
-      # No credential (#936): wait an hour per attempt, within the same attempt budget. The
-      # wait is this ROW's, so it is not returned: a non-nil value halts the whole batch, and one
-      # tenant missing a credential says nothing about the forge the other rows will ask.
+      # No credential (#936): wait an hour per attempt with NO bound (#1058), because
+      # abandoning left the reporter's issue open for good even after the credential was
+      # configured. The wait is this ROW's, so it is not returned: a non-nil value halts the
+      # whole batch, and one tenant missing a credential says nothing about the forge the other
+      # rows will ask.
       Credential.configuration?(reason) ->
-        {outcome, _wait} = defer(closure, reason, Credential.configuration_retry_seconds())
-        {outcome, nil}
+        wait_for_credential(closure, reason)
 
       true ->
         abandon(closure, {:permanent_forge_failure, reason}, reason)
@@ -429,6 +433,19 @@ defmodule Loopctl.Delivery.IssueCloser do
   # is the forge's own statement of when its window reopens — for a PRIMARY rate limit that is
   # up to an hour out — and scheduling from the local backoff alone spent every attempt inside
   # one window the forge had already told us the end of.
+  defp wait_for_credential(%IssueClosure{} = closure, reason) do
+    case ForgeOutbox.mark_configuration_wait(
+           IssueClosure,
+           closure.tenant_id,
+           closure.id,
+           reason,
+           Credential.configuration_retry_seconds()
+         ) do
+      {:ok, _closure} -> {:deferred, nil}
+      {:error, :not_pending} -> {:skipped, nil}
+    end
+  end
+
   defp defer(%IssueClosure{} = closure, reason, retry_after) do
     case IssueClosures.mark_transient_failure(closure.tenant_id, closure, reason, retry_after) do
       # The bound converted it: the row is abandoned, and this is the one path that reaches
