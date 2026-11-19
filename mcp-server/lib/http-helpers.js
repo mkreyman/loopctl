@@ -26,15 +26,17 @@ export function buildQuery(pairs) {
 }
 
 /**
- * Path for `list_projects`, honoring page/page_size (#247, mcp-01).
+ * Path for `list_projects`, honoring page/page_size (#247, mcp-01) and
+ * include_archived (a merged-away project is archived, US-52.2).
  *
- * @param {{ page?: number, page_size?: number }} [args]
+ * @param {{ page?: number, page_size?: number, include_archived?: boolean }} [args]
  * @returns {string}
  */
-export function projectsPath({ page, page_size } = {}) {
+export function projectsPath({ page, page_size, include_archived } = {}) {
   return `/api/v1/projects${buildQuery([
     ["page", page],
     ["page_size", page_size],
+    ["include_archived", include_archived],
   ])}`;
 }
 

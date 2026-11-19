@@ -3835,12 +3835,18 @@ const TOOLS = [
     name: "list_projects",
     description:
       "List projects in the current tenant. Paginated (page/page_size); advance " +
-      "`page` to enumerate all projects. Response includes pagination meta.",
+      "`page` to enumerate all projects. Response includes pagination meta. " +
+      "Archived projects (a project merged into another, an archived kb scope) are " +
+      "left out unless include_archived is true.",
     inputSchema: {
       type: "object",
       properties: {
         page: { type: "integer", description: "Page number (default 1)." },
         page_size: { type: "integer", description: "Items per page (default 20)." },
+        include_archived: {
+          type: "boolean",
+          description: "true: list archived projects too. Default false.",
+        },
       },
       required: [],
     },

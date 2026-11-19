@@ -86,6 +86,12 @@ describe("#247 mcp-01: list_projects pagination (real projectsPath)", () => {
     assert.equal(url.searchParams.get("page_size"), "50");
   });
 
+  test("forwards include_archived, and omits it when unset", () => {
+    const url = new URL(`https://x${projectsPath({ include_archived: true })}`);
+    assert.equal(url.searchParams.get("include_archived"), "true");
+    assert.equal(projectsPath({ page: 1 }), "/api/v1/projects?page=1");
+  });
+
   test("forwards page alone", () => {
     assert.equal(projectsPath({ page: 3 }), "/api/v1/projects?page=3");
   });

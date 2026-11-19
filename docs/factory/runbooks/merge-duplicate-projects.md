@@ -13,7 +13,7 @@ project because the source was one.
 
 A fleet session with `LOOPCTL_USER_KEY` (a `:user` key no dispatch minted) on the
 human-anchored tenant. `merge_project` sends that key verbatim. The MCP package must be
-3.19.0 or later (`mcp_version`).
+3.19.0 or later (`mcp_version`); 3.19.1 for the `include_archived` check in step 4.
 
 ## The four pairs (ids as of 2026-11-19)
 
@@ -77,7 +77,16 @@ stays, with `metadata.merged_into` naming the target.
 
 | Pair | Date | Result |
 |------|------|--------|
-| chg-delivery into chg | | not yet run |
-| ads_for_care-delivery into ads_for_care | | not yet run |
-| claude-config-delivery into claude-config | | not yet run |
-| infra-pilot into infra | | not yet run |
+| chg-delivery into chg | 2026-11-19 | merged, promoted; no conflicts. Moved 17 stories, 1 epic, 1 source, 23 intake records, 8 channel posts, 1 claim, 4 run outcomes |
+| ads_for_care-delivery into ads_for_care | 2026-11-19 | merged, promoted; no conflicts. Moved 37 stories, 1 epic, 1 source, 5 intake records |
+| claude-config-delivery into claude-config | 2026-11-19 | merged, promoted; no conflicts. Moved 68 stories, 1 epic, 1 source, 76 intake records |
+| infra-pilot into infra | 2026-11-19 | merged, promoted; no conflicts. Moved 3 stories, 1 epic, 2 sources, 3 intake records |
+
+Checked after the merges, all four step-4 checks:
+- `resolve_project` returns each kept project as `kind: work`.
+- `intake_source_list` shows every source of the four repos on the kept project.
+- `list_projects` no longer lists any of the four sources as active. The archive is written
+  in the merge's own transaction. The 3.19.0 `list_projects` tool did not pass
+  `include_archived` through, so the archived rows themselves were not listed; 3.19.1 adds it.
+- `escalation_list` was empty, so there was no escalation handoff to re-post.
+  `channel_handoffs` on the four kept projects shows no `handoff:<slug>-delivery:...` key.
