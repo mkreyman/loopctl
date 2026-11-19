@@ -1270,6 +1270,26 @@ defmodule Loopctl.Changes.Findings do
     end
   end
 
+  @doc """
+  Records that the action cannot run until its repository has a forge credential: stays
+  `:pending`, due again in `wait_seconds`, with NO attempt bound (`Loopctl.Changes.FindingFiler`
+  says why). Every other failure goes through `mark_transient_failure/4` or `mark_abandoned/4`.
+  """
+  @spec mark_configuration_wait(Ecto.UUID.t(), FindingAction.t(), term(), pos_integer()) ::
+          {:ok, FindingAction.t()} | {:error, :not_pending}
+  def mark_configuration_wait(tenant_id, %FindingAction{} = action, reason, wait_seconds)
+      when is_integer(wait_seconds) and wait_seconds > 0 do
+    now = DateTime.utc_now()
+
+    ForgeOutbox.update_pending(FindingAction, tenant_id, action.id,
+      set: [
+        next_attempt_at: DateTime.add(now, wait_seconds, :second),
+        last_error: ForgeOutbox.error_text(reason),
+        updated_at: now
+      ]
+    )
+  end
+
   @doc "Records that loopctl will not perform this act, and why. Terminal."
   @spec mark_abandoned(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), term()) ::
           {:ok, FindingAction.t()} | {:error, :not_pending}

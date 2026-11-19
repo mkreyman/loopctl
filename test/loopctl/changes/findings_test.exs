@@ -19,6 +19,7 @@ defmodule Loopctl.Changes.FindingsTest do
   alias Loopctl.Changes.PrReviewOutcomes
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.ForgeOutbox
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.WorkBreakdown.Story
@@ -423,6 +424,29 @@ defmodule Loopctl.Changes.FindingsTest do
       assert {:abandoned, _} = FindingFiler.perform(ctx.action)
       assert [%FindingAction{status: :abandoned, issue_number: 40}] = actions(ctx.tenant_id)
       assert [%Finding{issue_number: 40, state: :filed}] = findings(ctx.tenant_id)
+    end
+
+    test "a missing credential keeps the row waiting past the attempt bound", ctx do
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :create_issue, 0, fn _r, _t, _b -> {:ok, 1} end)
+
+      # Already at the bound that abandons a transient failure.
+      AdminRepo.update_all(from(a in FindingAction, where: a.id == ^ctx.action.id),
+        set: [attempts: ForgeOutbox.max_attempts()]
+      )
+
+      [at_bound] = actions(ctx.tenant_id)
+      assert {:deferred, nil} = FindingFiler.perform(at_bound)
+
+      assert [%FindingAction{status: :pending, next_attempt_at: %DateTime{}} = row] =
+               actions(ctx.tenant_id)
+
+      assert row.last_error =~ "credential_unavailable"
+      assert DateTime.diff(row.next_attempt_at, DateTime.utc_now()) > 3_000
+      assert [%Finding{state: :filed, issue_number: nil}] = findings(ctx.tenant_id)
     end
 
     test "a revoked source abandons without a forge call", ctx do
