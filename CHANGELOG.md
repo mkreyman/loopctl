@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A missing forge credential never abandons a revert issue or an issue closure (2026-11-19,
+  #1058).** Both drainers now wait hourly without an attempt bound, as the finding filer
+  already did. Migration `20261119170000` returns to `pending` the rows of
+  `change_revert_issues` and `intake_issue_closures` that were abandoned `retries_exhausted`
+  in the last 14 days with `credential_unavailable` as their last error. Each one acts once
+  its repository has a credential. An older row stays abandoned; requeue a closure with
+  `IssueClosures.requeue_abandoned(abandoned_after: ...)`. The migration's `down` does
+  nothing. No env var.
 - **Runner contract 1.33.0: `loop_finding` on triage and verify dispatches (2026-11-19, US-51.7).**
   Minor, additive; re-vendor `priv/runner_contract/v1.json`. A triage dispatch for a loop-filed
   issue carries `triage.loop_finding` (`finding_id`, `kind`, `fingerprint`, `occurrences`,

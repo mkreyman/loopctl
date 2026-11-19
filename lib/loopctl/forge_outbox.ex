@@ -108,6 +108,33 @@ defmodule Loopctl.ForgeOutbox do
     )
   end
 
+  @doc """
+  Records that a row cannot run until its repository has a forge credential: it stays
+  `:pending`, due again in `wait_seconds`, with NO attempt bound, and the attempt the claim
+  counted is handed back.
+
+  Unbounded because the wait ends on an operator act, not on time: a row abandoned at the
+  transient bound was the only record of its act (a revert, a reporter's issue to close), and
+  configuring the credential later could not bring it back (#1058). The attempt goes back
+  because a wait made no forge call; kept, a long wait would leave the first real forge error
+  past the bound and abandon the row the wait existed to keep.
+  """
+  @spec mark_configuration_wait(module(), Ecto.UUID.t(), Ecto.UUID.t(), term(), pos_integer()) ::
+          {:ok, struct()} | {:error, :not_pending}
+  def mark_configuration_wait(schema, tenant_id, id, reason, wait_seconds)
+      when is_integer(wait_seconds) and wait_seconds > 0 do
+    now = DateTime.utc_now()
+
+    update_pending(schema, tenant_id, id,
+      set: [
+        next_attempt_at: DateTime.add(now, wait_seconds, :second),
+        last_error: error_text(reason),
+        updated_at: now
+      ],
+      inc: [attempts: -1]
+    )
+  end
+
   @doc "Stamps `field` with now on a `:pending` row."
   @spec stamp(module(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           {:ok, struct()} | {:error, :not_pending}

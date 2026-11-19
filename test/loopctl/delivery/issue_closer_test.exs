@@ -13,6 +13,7 @@ defmodule Loopctl.Delivery.IssueCloserTest do
   alias Loopctl.Delivery.IssueCloser
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Delivery.StageMachine
+  alias Loopctl.ForgeOutbox
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.MockPullRequestSource
@@ -277,7 +278,7 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       refute row.last_error =~ "🇺🇸"
     end
 
-    test "#936: no credential waits an hour within its budget, and closes once one exists", ctx do
+    test "#936: no credential waits an hour, and closes once one exists", ctx do
       closure = closure(ctx, :shipped)
 
       stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, repo ->
@@ -293,7 +294,8 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       row = reload(ctx)
       assert row.status == :pending
-      assert row.attempts == closure.attempts + 1
+      # The claim's attempt is handed back: a wait made no forge call (#1058).
+      assert row.attempts == closure.attempts
       assert row.last_error =~ "credential_unavailable"
       assert DateTime.diff(row.next_attempt_at, DateTime.utc_now()) > 3_000
 
@@ -313,6 +315,32 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       expect(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
 
       assert {:closed, nil} = IssueCloser.close(reload(ctx))
+    end
+
+    test "#1058: a missing credential never abandons a closure, however long it waits", ctx do
+      closure = closure(ctx, :shipped)
+
+      {1, _} =
+        AdminRepo.update_all(from(c in IssueClosure, where: c.id == ^closure.id),
+          set: [attempts: ForgeOutbox.max_attempts()]
+        )
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      for _ <- 1..3 do
+        {1, _} =
+          AdminRepo.update_all(from(c in IssueClosure, where: c.id == ^closure.id),
+            set: [next_attempt_at: nil]
+          )
+
+        assert {:deferred, nil} = IssueCloser.close(reload(ctx))
+      end
+
+      row = reload(ctx)
+      assert row.status == :pending
+      assert row.attempts == ForgeOutbox.max_attempts()
     end
 
     test "a 404 is abandoned on the first attempt and never retried", ctx do

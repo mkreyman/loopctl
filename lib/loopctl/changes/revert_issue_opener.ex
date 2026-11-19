@@ -24,7 +24,8 @@ defmodule Loopctl.Changes.RevertIssueOpener do
 
   `Loopctl.Delivery.MergePrecondition.transient?/1`, the classification every forge drainer
   shares: transient backs the row off, permanent abandons on the first occurrence, a missing
-  credential waits an hour per attempt within the same budget. A read in step 2 that fails is
+  credential waits an hour per attempt with NO budget (`Loopctl.ForgeOutbox.mark_configuration_wait/5`,
+  #1058), because the row is the only record that the revert happened. A read in step 2 that fails is
   a fault like any other — never "not found", which is what would open the duplicate.
 
   ## Where it runs
@@ -39,6 +40,7 @@ defmodule Loopctl.Changes.RevertIssueOpener do
   alias Loopctl.Changes.RevertIssues
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
+  alias Loopctl.ForgeOutbox
   alias Loopctl.Verification.Credential
 
   @typedoc """
@@ -117,12 +119,27 @@ defmodule Loopctl.Changes.RevertIssueOpener do
       match?({:issue_search_inconclusive, _pages}, reason) ->
         defer(row, reason, nil)
 
+      # No credential: wait an hour per attempt with NO bound (#1058). The row is the only
+      # record that a revert happened, so abandoning it lost the revert issue for good even
+      # after the credential was configured. The wait is this row's; nil keeps the batch going.
       Credential.configuration?(reason) ->
-        {outcome, _wait} = defer(row, reason, Credential.configuration_retry_seconds())
-        {outcome, nil}
+        wait_for_credential(row, reason)
 
       true ->
         abandon(row, "permanent_forge_failure", reason)
+    end
+  end
+
+  defp wait_for_credential(%RevertIssue{} = row, reason) do
+    case ForgeOutbox.mark_configuration_wait(
+           RevertIssue,
+           row.tenant_id,
+           row.id,
+           reason,
+           Credential.configuration_retry_seconds()
+         ) do
+      {:ok, _row} -> {:deferred, nil}
+      {:error, :not_pending} -> {:skipped, nil}
     end
   end
 
