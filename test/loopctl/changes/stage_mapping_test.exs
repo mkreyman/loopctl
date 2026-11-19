@@ -22,6 +22,7 @@ defmodule Loopctl.Changes.StageMappingTest do
   alias Loopctl.Changes.Signature
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -808,6 +809,41 @@ defmodule Loopctl.Changes.StageMappingTest do
                effect(ctx, "C1", 1)["stage"]
     end
 
+    test "a row triage left waiting in the queue is started and moved to review", ctx do
+      story = started_story(ctx, :implementing)
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: story.id,
+        stage: :queued,
+        claim_epoch: story.claim_epoch
+      })
+
+      assert {:ok, %{outcome: :applied}} = push(ctx, submitted("C1", 1, story))
+
+      assert row(ctx, story).stage == :reviewing
+      assert transitions(ctx, story) == [{"implementing", "reviewing", "forward"}]
+
+      assert %{"started_from" => "queued", "report" => "reported_done"} =
+               effect(ctx, "C1", 1)["stage"]
+    end
+
+    test "a runner-held row is not started by an event", ctx do
+      story = started_story(ctx, :implementing)
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: story.id,
+        stage: :worktree,
+        claim_epoch: story.claim_epoch
+      })
+
+      assert {:ok, _} = push(ctx, submitted("C1", 1, story))
+
+      assert row(ctx, story).stage == :escalated
+      refute Map.has_key?(effect(ctx, "C1", 1)["stage"], "started_from")
+    end
+
     test "it then runs the whole line to merged from chg's events alone", ctx do
       story = started_story(ctx, :implementing)
       reviewed!(ctx, story, sha("a"))
@@ -841,7 +877,29 @@ defmodule Loopctl.Changes.StageMappingTest do
       assert reported.agent_status == :reported_done
       assert reported.reported_done_at
       assert reported.reported_by_agent_id == nil
-      assert "change_reported_done" in history(ctx.tenant_id, story.id)
+
+      assert %AuditLog{actor_type: "system", new_state: %{"agent_status" => "reported_done"}} =
+               AdminRepo.one!(
+                 from a in AuditLog,
+                   where: a.entity_id == ^story.id and a.action == "status_changed"
+               )
+    end
+
+    test "it announces the report on story.status_changed, as every report does", ctx do
+      webhook =
+        fixture(:webhook, %{tenant_id: ctx.tenant_id, events: ["story.status_changed"]})
+
+      story = started_story(ctx, :implementing)
+
+      assert {:ok, _} = push(ctx, submitted("C1", 1, story))
+
+      assert [%WebhookEvent{payload: payload}] =
+               AdminRepo.all(from e in WebhookEvent, where: e.webhook_id == ^webhook.id)
+
+      assert %{"story_id" => id, "old_status" => "implementing", "new_status" => "reported_done"} =
+               payload
+
+      assert id == story.id
     end
 
     test "a later revision reports nothing again", ctx do
@@ -854,7 +912,7 @@ defmodule Loopctl.Changes.StageMappingTest do
 
       assert AdminRepo.get!(Story, story.id).reported_done_at == first
       refute Map.has_key?(effect(ctx, "C1", 3)["stage"], "report")
-      assert Enum.count(history(ctx.tenant_id, story.id), &(&1 == "change_reported_done")) == 1
+      assert Enum.count(history(ctx.tenant_id, story.id), &(&1 == "status_changed")) == 1
     end
 
     test "a story not started is moved but not reported", ctx do

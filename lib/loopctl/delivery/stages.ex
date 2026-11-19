@@ -349,6 +349,44 @@ defmodule Loopctl.Delivery.Stages do
     {:ok, row}
   end
 
+  # The stages a story waits in before anyone holds it: triage and the queue. A runner-held
+  # row (`claimed`, `worktree`) is the runner's to move, and every later stage has an edge of
+  # its own.
+  @pre_claim_stages [:detected, :triaged, :queued]
+
+  @doc """
+  `open_for_change_in_tenant_transaction/4` for a story whose row EXISTS but still waits in
+  triage or the queue (#{inspect(@pre_claim_stages)}), because a session claimed the story by
+  hand (`follow_claim/4` keeps the stage and takes the new epoch). Moves the row to
+  `implementing` with a `rebound` stage event from its old stage, carrying `event_data`.
+
+  Only a row on `epoch`: one behind its story's epoch is fenced, and the caller says so.
+  Returns `{:ok, row}` — moved, or unchanged when it is at any other stage.
+  """
+  @spec start_for_change_in_tenant_transaction(StoryStage.t(), non_neg_integer(), keyword()) ::
+          {:ok, StoryStage.t()}
+  def start_for_change_in_tenant_transaction(%StoryStage{} = row, epoch, opts) do
+    if row.stage in @pre_claim_stages and row.claim_epoch == epoch do
+      now = DateTime.utc_now()
+
+      {1, [moved]} =
+        Repo.update_all(
+          from(s in StoryStage,
+            where: s.id == ^row.id and s.stage == ^row.stage and s.claim_epoch == ^epoch,
+            select: s
+          ),
+          set: [stage: :implementing, updated_at: now],
+          inc: [lock_version: 1]
+        )
+
+      data = Map.put(Keyword.get(opts, :event_data, %{}), "started_by", "change_submitted")
+      insert_event(Repo, moved, "rebound", row.stage, nil, Keyword.get(opts, :actor_label), data)
+      {:ok, moved}
+    else
+      {:ok, row}
+    end
+  end
+
   @doc """
   The encoded size of the `:event_data` a transition may carry, in bytes.
 
@@ -699,7 +737,7 @@ defmodule Loopctl.Delivery.Stages do
   holds is a deadlock; taking the stronger lock first is not.
   """
   @spec lock_for_control_in_tenant_transaction(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, %{claim_epoch: non_neg_integer(), row: StoryStage.t() | nil}}
+          {:ok, %{claim_epoch: non_neg_integer(), started: boolean(), row: StoryStage.t() | nil}}
           | {:error, :not_found}
   def lock_for_control_in_tenant_transaction(tenant_id, story_id) do
     unless Repo.in_transaction?(),
@@ -712,12 +750,15 @@ defmodule Loopctl.Delivery.Stages do
     from(s in Story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
       lock: "FOR NO KEY UPDATE",
-      select: s.claim_epoch
+      select: %{
+        claim_epoch: s.claim_epoch,
+        started: s.agent_status == :implementing and not is_nil(s.assigned_agent_id)
+      }
     )
     |> Repo.one()
     |> case do
       nil -> {:error, :not_found}
-      epoch -> {:ok, %{claim_epoch: epoch, row: lock_row(tenant_id, story_id)}}
+      story -> {:ok, Map.put(story, :row, lock_row(tenant_id, story_id))}
     end
   end
 

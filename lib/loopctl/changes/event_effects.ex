@@ -101,6 +101,8 @@ defmodule Loopctl.Changes.EventEffects do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.GitSha
   alias Loopctl.Repo
+  alias Loopctl.Webhooks
+  alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.WorkBreakdown.Story
 
   # The webhook is a machine caller: no API key, so no agent and no lineage (PRD §5). It can
@@ -120,7 +122,9 @@ defmodule Loopctl.Changes.EventEffects do
   @history_shas ~w(merge_sha sha landed_sha revert_sha)
   @history_ids ~w(revert_change_id verification_id)
 
-  @type pending :: [{:bind, Changes.pending_bind()} | {:entry, AuditChain.Entry.t()}]
+  @type pending :: [
+          {:bind, Changes.pending_bind()} | {:entry, AuditChain.Entry.t()} | {:webhook, map()}
+        ]
 
   @doc """
   Applies `event` for `tenant_id`, inside the caller's tenant transaction.
@@ -155,7 +159,30 @@ defmodule Loopctl.Changes.EventEffects do
     Enum.each(pending, fn
       {:bind, bind} -> Changes.after_bind_commit(bind)
       {:entry, entry} -> AuditChain.announce_entry(entry)
+      {:webhook, params} -> announce_status_changed(params)
     end)
+  end
+
+  # After commit, so a report that rolled back is never announced. A failure here loses the
+  # notification, never the report: it is logged and the event stands.
+  defp announce_status_changed(%{tenant_id: tenant_id, project_id: project_id} = params) do
+    webhooks = EventGenerator.matching_webhooks(tenant_id, "story.status_changed", project_id)
+
+    case Webhooks.insert_events_with_delivery(
+           tenant_id,
+           webhooks,
+           "story.status_changed",
+           params.payload
+         ) do
+      {:ok, _events} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "story.status_changed webhook for a chg report not written: tenant_id=#{tenant_id} " <>
+            "story_id=#{params.payload["story_id"]} reason=#{inspect(reason)}"
+        )
+    end
   end
 
   # ── which story ─────────────────────────────────────────────────────────────
@@ -247,25 +274,26 @@ defmodule Loopctl.Changes.EventEffects do
 
   # ── the stage mapping (US-47.4) ─────────────────────────────────────────────
 
-  # A story a session claimed and started outside the runner has no stage row until its first
-  # `submitted` (US-47.8): open it at `implementing`, under the epoch read with the story lock,
-  # and let the mapping move it like any other row. A story nobody has started stays rowless.
-  defp stage_effect(tenant_id, %Event{kind: "submitted"} = event, %{row: nil} = target) do
-    if started?(tenant_id, target.story_id) do
-      {:ok, row} =
-        Stages.open_for_change_in_tenant_transaction(
-          tenant_id,
-          target.story_id,
-          target.claim_epoch,
-          actor_label: @actor_label,
-          event_data: event_data(event)
-        )
+  # A story a session claimed and started outside the runner (US-47.8) has no stage row, or
+  # one still waiting in triage or the queue, until its first `submitted`: the row is opened,
+  # or moved, to `implementing` under the epoch read with the story lock, and the mapping then
+  # moves it like any other row. A story nobody has started is left as it is.
+  defp stage_effect(
+         tenant_id,
+         %Event{kind: "submitted"} = event,
+         %{row: nil, started: true} = target
+       ) do
+    {:ok, row} =
+      Stages.open_for_change_in_tenant_transaction(
+        tenant_id,
+        target.story_id,
+        target.claim_epoch,
+        actor_label: @actor_label,
+        event_data: event_data(event)
+      )
 
-      {stage, pending} = stage_effect(tenant_id, event, %{target | row: row})
-      {Map.put(stage, "opened", "implementing"), pending}
-    else
-      {%{"outcome" => "no_stage_row"}, []}
-    end
+    {stage, pending} = stage_effect(tenant_id, event, %{target | row: row, started: false})
+    {Map.put(stage, "opened", "implementing"), pending}
   end
 
   defp stage_effect(_tenant_id, _event, %{row: nil}), do: {%{"outcome" => "no_stage_row"}, []}
@@ -281,6 +309,24 @@ defmodule Loopctl.Changes.EventEffects do
     )
 
     {%{"outcome" => "stale_row", "at" => Atom.to_string(row.stage)}, []}
+  end
+
+  defp stage_effect(
+         tenant_id,
+         %Event{kind: "submitted"} = event,
+         %{row: %StoryStage{} = row, started: true} = target
+       ) do
+    {:ok, started} =
+      Stages.start_for_change_in_tenant_transaction(row, target.claim_epoch,
+        actor_label: @actor_label,
+        event_data: event_data(event)
+      )
+
+    {stage, pending} = stage_effect(tenant_id, event, %{target | row: started, started: false})
+
+    if started.stage == row.stage,
+      do: {stage, pending},
+      else: {Map.put(stage, "started_from", Atom.to_string(row.stage)), pending}
   end
 
   defp stage_effect(tenant_id, event, %{row: %StoryStage{} = row} = target) do
@@ -542,42 +588,73 @@ defmodule Loopctl.Changes.EventEffects do
     {moved, pending} = result
 
     case report_submitted(tenant_id, target.story_id, event) do
-      :reported -> {Map.put(moved, "report", "reported_done"), pending}
+      {:reported, webhook} -> {Map.put(moved, "report", "reported_done"), pending ++ [webhook]}
       :unchanged -> result
     end
   end
 
   defp after_move(_tenant_id, _event, _target, _to, result), do: result
 
-  defp started?(tenant_id, story_id) do
-    Repo.exists?(
-      from s in Story,
-        where:
-          s.tenant_id == ^tenant_id and s.id == ^story_id and s.agent_status == :implementing and
-            not is_nil(s.assigned_agent_id)
-    )
-  end
-
   # Only from `implementing`: a story already reported (a later revision) or not started is
-  # left as it is. The story row is locked by this transaction (`lock_target/2`).
+  # left as it is. The story row is locked by this transaction (`lock_target/2`). It records
+  # what every report records (`Progress.report_story/4`): a `status_changed` audit entry here,
+  # and the `story.status_changed` webhook after commit, because webhook events are written on
+  # AdminRepo and would otherwise announce a report this transaction could still roll back.
   defp report_submitted(tenant_id, story_id, event) do
     now = DateTime.utc_now()
 
-    {count, _} =
-      Repo.update_all(
-        from(s in Story,
-          where:
-            s.tenant_id == ^tenant_id and s.id == ^story_id and s.agent_status == :implementing
-        ),
-        set: [agent_status: :reported_done, reported_done_at: now, updated_at: now]
-      )
+    case Repo.update_all(
+           from(s in Story,
+             where:
+               s.tenant_id == ^tenant_id and s.id == ^story_id and
+                 s.agent_status == :implementing,
+             select: %{project_id: s.project_id, epic_id: s.epic_id}
+           ),
+           set: [agent_status: :reported_done, reported_done_at: now, updated_at: now]
+         ) do
+      {1, [story]} ->
+        {:ok, _entry} =
+          Audit.create_log_entry(
+            tenant_id,
+            %{
+              entity_type: "story",
+              entity_id: story_id,
+              action: "status_changed",
+              actor_type: "system",
+              actor_label: @actor_label,
+              old_state: %{"agent_status" => "implementing"},
+              new_state: %{
+                "agent_status" => "reported_done",
+                "reported_done_at" => to_string(now),
+                "agent_id" => nil
+              },
+              metadata: event_data(event)
+            },
+            Repo
+          )
 
-    if count == 1 do
-      history(tenant_id, story_id, "change_reported_done", event)
-      :reported
-    else
-      :unchanged
+        {:reported, {:webhook, status_changed(tenant_id, story_id, story, now)}}
+
+      {0, _} ->
+        :unchanged
     end
+  end
+
+  defp status_changed(tenant_id, story_id, story, now) do
+    %{
+      tenant_id: tenant_id,
+      project_id: story.project_id,
+      payload: %{
+        "event" => "story.status_changed",
+        "story_id" => story_id,
+        "project_id" => story.project_id,
+        "epic_id" => story.epic_id,
+        "old_status" => "implementing",
+        "new_status" => "reported_done",
+        "agent_id" => nil,
+        "timestamp" => DateTime.to_iso8601(now)
+      }
+    }
   end
 
   defp review_hold_refused(_tenant_id, _event, _target, :busy), do: Repo.rollback(:busy)
