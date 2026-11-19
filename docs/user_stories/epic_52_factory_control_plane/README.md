@@ -387,13 +387,14 @@ is bound to `docs/design-system.md`:
   - `Loopctl.Workers.ChgIndependentPathsWorker` (52.31a).
 - **Stage machine:**
   - the edges `:holder_resolution`, `:retriage`, `:cancelled`, `:closed`, `:holders_exhausted`, `:independent_unverified` and `:independent_verified` (52.31a);
-  - the release cause `:intervention`.
+  - the release cause `:intervention`;
+  - the stage event kind `independent_hold` (52.31a).
 - **Error codes:** `self_resolve_blocked`, `holder_required`, `review_missing_unreviewed`, `self_intervention_blocked`, `not_requeueable`, `already_landed`, `no_intake_source` and `independent_verification`.
 - **Columns and indexes:**
   - `intake_sources.paused_at` and `paused_reason`;
   - `intervention_id`, with the index `story_stage_events_intervention_uidx`;
   - the index `story_stage_events_tenant_to_stage_inserted_idx`.
-- **Config and payloads:** `STRONGER_HOLDER_MODEL`, Gate B document v2 (`independent_paths`, `independent_checks`), the Gate B outcome `:independent` and the dispatch payload field `model`.
+- **Config and payloads:** `STRONGER_HOLDER_MODEL` and the dispatch payload field `model`. Gate B document v2 (`independent_paths`, `independent_checks`) and the outcome `:independent` come from US-52.12 (release 2).
 - **Runner contract:** 1.37.0 (52.34), one bump carrying the dispatch field `model` and the review dispatch kind.
 
 **Deleted:** `StoryHistoryController` and the `/stories/:id/history` route, the digest functions in `EscalationInbox`, and `EscalationDigestWorker`.
@@ -406,7 +407,8 @@ is bound to `docs/design-system.md`:
 | `mcp-server/index.js`, `mcp-server/README.md` | 52.29 | 52.30-52.33, 52.31a |
 | `stage_machine.ex` | 52.31 | 52.31a, 52.32, 52.34 |
 | `escalations.ex` | 52.31 | 52.31a, 52.32 |
-| CLAUDE.md trust-model section | 52.31 | 52.32 |
+| CLAUDE.md trust-model section | 52.31 | 52.31a, 52.32 |
+| `progress.ex` (verify, verify-all, backfill), `bulk_operations.ex` (bulk verify, bulk mark-complete) | 52.31a | — |
 | `CHANGELOG.md` | 52.31 | 52.31a, 52.32-52.34 |
 | `docs/agent-delivery-loop.md` | 52.31 | 52.34 |
 | `FLY_SECRETS.md` | 52.34 | — |
