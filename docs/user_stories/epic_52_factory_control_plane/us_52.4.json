@@ -1,0 +1,53 @@
+{
+  "id": "US-52.4",
+  "title": "loopctl-runner moves into runner/ with its history, and reads the one runner contract",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_2",
+  "story": {"as_a": "session changing the factory", "i_want_to": "find the runner's source, with its full history, under runner/ in the loopctl repo, compiled against the contract file the server exports", "so_that": "a server change and the runner change it needs are one commit, reviewed and tested together, with no vendored copy to fall behind"},
+  "rationale": "PRD R10 and section 8 row 2 move loopctl-runner into this repo first, so every later release is built here alone. Today the runner is a separate repo (mkreyman/loopctl-runner) that VENDORS the server's contract: LoopctlRunner.Contract compiles runner priv/runner_contract/v1.json (contract.ex:20-21), a copy of loopctl priv/runner_contract/v1.json, and contract_version_canary_test.exs exists only to catch prose that still names an old vendored version. Two copies of one fact is the defect class the PRD names; in one repo the copy is deleted and the runner reads the server's export.",
+  "acceptance_criteria": [
+    {"id": "AC-52.4.1", "description": "release/import-history.sh <source_url> <prefix> rewrites the source repo's master with git filter-repo --to-subdirectory-filter <prefix> in a temporary clone and merges it into the current branch with --allow-unrelated-histories, so git log --format=%s -- runner/lib/loopctl_runner/contract.ex lists the same subjects, in the same order, as git log --format=%s -- lib/loopctl_runner/contract.ex in mkreyman/loopctl-runner."},
+    {"id": "AC-52.4.2", "description": "The script records each import in release/imports.toml as one [[import]] table {repo, prefix, imported_sha}; a re-run after the source gained commits merges only those commits (the rewrite is deterministic, so already-imported commits keep their rewritten SHAs) and updates imported_sha; a re-run with no new commits writes nothing and exits 0 printing 'up to date: <repo> at <sha12>'."},
+    {"id": "AC-52.4.3", "description": "The script exits 2 and changes nothing (branch head and release/imports.toml byte-identical) when the working tree is dirty, when <prefix>/ exists with no imports.toml entry for it, or when the fetch or the filter-repo rewrite fails."},
+    {"id": "AC-52.4.4", "description": "LoopctlRunner.Contract's @external_resource is Path.expand(\"../../../priv/runner_contract/v1.json\", __DIR__), the file Loopctl.ApiSpec.RunnerContract.export_path/0 names; runner/priv/runner_contract/ and runner/test/contract_version_canary_test.exs are deleted, and no file named v1.json exists under runner/."},
+    {"id": "AC-52.4.5", "description": "runner/test/loopctl_runner/contract_test.exs asserts LoopctlRunner.Contract.version() equals the x-contract-version read at test time from the repository root's priv/runner_contract/v1.json."},
+    {"id": "AC-52.4.6", "description": "The runner's prose no longer states a contract version: runner/README.md, runner/docs/agent-delivery-loop.md and the Contract moduledoc point at priv/runner_contract/v1.json instead, and lib/loopctl/api_spec/runner_contract.ex and lib/mix/tasks/loopctl.runner_contract.ex stop describing the file as one mkreyman/loopctl-runner vendors."},
+    {"id": "AC-52.4.7", "description": "From runner/, mix precommit (runner/mix.exs aliases) passes on the imported tree, and MIX_ENV=prod mix release builds a release whose bin/loopctl_runner eval 'IO.puts(LoopctlRunner.Contract.version())' prints the root export's x-contract-version."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.4.1", "verifies": ["AC-52.4.1", "AC-52.4.2"], "name": "import, then re-import after new source commits, then re-import with none (ExUnit, shell under test)", "type": "integration", "preconditions": ["a temp source repo with 3 commits touching lib/a.ex; a temp target repo with one commit; git filter-repo on PATH (the test skips with a named reason only when it is absent, and CI installs it)"], "steps": ["run release/import-history.sh <source> runner in the target", "add 2 commits to the source; run again", "run again with no change"], "expected_results": ["git log -- runner/lib/a.ex shows 3 then 5 subjects; imports.toml imported_sha follows the source tip; the third run prints 'up to date' and creates no commit"]},
+    {"id": "TC-52.4.2", "verifies": ["AC-52.4.3"], "name": "refusals leave the branch and imports.toml untouched (ExUnit, shell under test)", "type": "integration", "preconditions": ["target repo as TC-52.4.1"], "steps": ["dirty the tree, run", "create runner/ with no entry, run", "pass an unreachable source URL, run"], "expected_results": ["exit 2 each time; HEAD and imports.toml unchanged"]},
+    {"id": "TC-52.4.3", "verifies": ["AC-52.4.4", "AC-52.4.5"], "name": "the runner compiles against the root export", "type": "unit", "preconditions": ["runner/ on the epic branch"], "steps": ["cd runner && mix test test/loopctl_runner/contract_test.exs", "Path.wildcard(\"runner/**/v1.json\") from the repository root"], "expected_results": ["version equality holds; the wildcard is empty"]},
+    {"id": "TC-52.4.4", "verifies": ["AC-52.4.6"], "name": "no runner prose states a contract version", "type": "unit", "preconditions": ["runner/ on the epic branch"], "steps": ["in contract_test.exs, read the three runner files and assert none matches ~r/contract \\d+\\.\\d+\\.\\d+|x-contract-version` \\d/", "grep the two loopctl files for 'loopctl-runner vendors'"], "expected_results": ["no match in any of the five"]},
+    {"id": "TC-52.4.5", "verifies": ["AC-52.4.7"], "name": "runner gate and release build from runner/", "type": "integration", "preconditions": ["asdf with the root .tool-versions Elixir and Erlang"], "steps": ["cd runner && mix precommit", "MIX_ENV=prod mix release --path /tmp/r && /tmp/r/bin/loopctl_runner eval 'IO.puts(LoopctlRunner.Contract.version())'"], "expected_results": ["precommit exits 0; the printed version equals the root export's"]}
+  ],
+  "technical_notes": [
+    "Source: /home/mkreyman/workspace/loopctl-runner (mix project :loopctl_runner, version 0.1.0, mix.exs:7; aliases.precommit mix.exs:46-53; releases mix.exs:15-17). It has no .github/ and no .tool-versions: with no pin of its own, asdf resolves the root's (.tool-versions: erlang 28.5.0.2, elixir 1.19.5-otp-28). US-52.10's installer installs that pin where it is missing.",
+    "Contract: runner lib/loopctl_runner/contract.ex:20-21 (@external_resource + Jason.decode!); version/0 at :35. The vendored copy: runner priv/runner_contract/v1.json. The canary and its three prose sites: runner test/contract_version_canary_test.exs:40-46. Server side: Loopctl.ApiSpec.RunnerContract.export_path/0 (lib/loopctl/api_spec/runner_contract.ex:4704), moduledoc ':11' says mkreyman/loopctl-runner vendors it; lib/mix/tasks/loopctl.runner_contract.ex:6 likewise.",
+    "From runner/lib/loopctl_runner/contract.ex, ../../../priv is the repository root's priv/. A release built by mix release compiles the file in (it is an @external_resource read at compile time), so the release needs no file at runtime.",
+    "Use git filter-repo, not git subtree: filter-repo rewrites each old commit's paths, so git log and git blame on runner/... walk the old history without --follow. The rewrite runs in a mktemp clone (git clone --no-local <source>), never in the target's object store, and the merge commit's message is 'Import <repo> into <prefix>/ at <sha12>'.",
+    "release/imports.toml is the one record of which source commit each prefix holds; US-52.5 uses the same script for chg/, and US-52.11 runs it a last time, after archiving each source, before the epic merges.",
+    "Root tooling never reaches runner/: .formatter.exs inputs ('{config,lib,test}/**'), .credo.exs included ('lib/', 'test/', ...), elixirc_paths 'lib' (mix.exs:116-117) and the Dockerfile's explicit COPY list (Dockerfile:33-66) all stop at the root project. Nothing here changes them.",
+    "runner/CLAUDE.md and runner/docs/agent-delivery-loop.md come with the import; they are the runner's own and stay under runner/. The root docs/agent-delivery-loop.md is the operator page and is not merged with it.",
+    "Tests of the shell script live in the root suite (test/release/import_history_test.exs, async: true, each case in its own System.tmp_dir!/unique dir), like the .githooks tests (test/loopctl/githooks_pre_push_test.exs).",
+    "No new table, context, route or tool."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "CI for runner/ and the commit gate's routing of runner/ paths: US-52.6.",
+    "Switching installed runners to this source and archiving mkreyman/loopctl-runner: US-52.10 and US-52.11.",
+    "The runner reporting its own version on join: US-52.8."
+  ],
+  "failure_modes": {"partition": "AC-52.4.3: a fetch that fails or stalls leaves the branch and imports.toml unchanged, so a lost network costs a re-run, never a half import.", "state": "AC-52.4.2: which source commit each prefix holds lives only in release/imports.toml, committed with the import.", "retry": "AC-52.4.2: a re-run merges only commits not yet imported and writes nothing when there are none.", "slow": "AC-52.4.3: the rewrite works in a temporary clone, so a slow fetch delays the run and never leaves the target half written.", "reach": "n/a: a script run in the session's own worktree; no process outlives it."},
+  "defaults": [
+    "History tool: git filter-repo with --to-subdirectory-filter (owner may prefer git subtree; filter-repo keeps git log and blame on runner/ paths working without --follow).",
+    "The runner keeps its own mix project, deps and _build under runner/; it is not made an umbrella app of the server."
+  ],
+  "definition_of_done": [
+    "git -C <worktree> log --oneline -- runner/lib/loopctl_runner/control.ex | wc -l equals git -C ~/workspace/loopctl-runner log --oneline -- lib/loopctl_runner/control.ex | wc -l.",
+    "release/imports.toml names mkreyman/loopctl-runner, prefix runner, and imported_sha equal to mkreyman/loopctl-runner's master tip at import time."
+  ],
+  "expected_size": {"insertions": 160, "files": 8},
+  "estimated_tokens": 250000
+}

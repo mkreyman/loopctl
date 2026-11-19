@@ -1,0 +1,53 @@
+{
+  "id": "US-52.25",
+  "title": "A DM never outlives its session: refused once it ends, unread copies moved to its items",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_4",
+  "story": {"as_a": "session sending to another session", "i_want_to": "be refused, with the items it held and who holds them now, when the session I write to has ended, and have my unread DMs follow its work when it ends", "so_that": "no message waits forever in the inbox of a session that will never read it"},
+  "rationale": "PRD R11: a DM lives as long as its session; when the session ends the server re-sends each unread DM into the thread of every item the session held, one copy per item with its own id, or sweeps it if the session held none; and a DM to an ended session is refused at send time, naming the items it held and their current holders. Today nothing ends: a channel post lives 30 days whoever reads it, and session-message.sh to a gone session fails with exit 5 and the text is lost (claude-config bin/session-message.sh:38-40). Release 3 records the end as holders.ended_at through Holders.end_holder/3 (provided by US-52.13); this story hangs the DM's fate on that one transition.",
+  "acceptance_criteria": [
+    {"id": "AC-52.25.1", "description": "Messages.send/4 to a to_holder_id whose holder has ended_at set stores nothing and returns {:error, {:session_ended, held_items}}, rendered as 409 code session_ended with error.held_items = [{story_id, title, current_holder_id}] and the message 'that session has ended; write to one of its items instead (message_send with story_id)'."},
+    {"id": "AC-52.25.2", "description": "Messages.items_held_by/2 returns the stories of the holder's tenant on which a work-item event log row (story_stage_events.actor_holder_id, release 3) names the holder, each with its current assigned_holder_id, so the list includes items the holder released or handed on before it ended."},
+    {"id": "AC-52.25.3", "description": "Messages.on_holder_ended/3, called inside every transaction that sets holders.ended_at, copies each DM to the holder with attachment_seq above its dm cursor into the thread of every item from items_held_by/2 whose delivery stage is not done or failed: one new row per (DM, item), its own id, the original author and body, idempotency_key resent:<dm_id>:<story_id>, in the original DMs' order."},
+    {"id": "AC-52.25.4", "description": "In the same transaction on_holder_ended/3 deletes every DM to the holder and every channel_cursors row of the holder, so a holder that held no live item leaves no message behind (the unread DMs are swept)."},
+    {"id": "AC-52.25.5", "description": "on_holder_ended/3 run a second time for the same holder writes no second copy and deletes nothing more (the resent: idempotency keys collide and are skipped; the DMs are already gone)."},
+    {"id": "AC-52.25.6", "description": "A DM send racing the end is either refused with session_ended or stored before the end and then copied by it, never stored after the end: Messages.send/4 locks the recipient holder row FOR SHARE and the end locks it FOR UPDATE."},
+    {"id": "AC-52.25.7", "description": "items_held_by/2 and the 409's held_items never name a story or holder of another tenant."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.25.1", "verifies": ["AC-52.25.1"], "name": "DM to an ended holder is refused with its items (ConnCase)", "type": "integration", "preconditions": ["holder H1 claimed S1 and released it; H2 now holds S1; H1 holds S2; Holders.end_holder/3 on H1 (US-52.13)"], "steps": ["POST /api/v1/messages {to_holder_id: H1.id, body: \"x\"}"], "expected_results": ["409 session_ended, held_items [{S1, title, H2.id}, {S2, title, nil}] in story order; no row stored"]},
+    {"id": "TC-52.25.2", "verifies": ["AC-52.25.2"], "name": "items_held_by reads the event log, not only the current claim (DataCase)", "type": "integration", "preconditions": ["as TC-52.25.1, plus S3 never touched by H1"], "steps": ["Messages.items_held_by(tenant.id, H1.id)"], "expected_results": ["S1 and S2 with their current holders; not S3"]},
+    {"id": "TC-52.25.3", "verifies": ["AC-52.25.3", "AC-52.25.4"], "name": "end copies unread DMs to live items and sweeps the rest (DataCase)", "type": "integration", "preconditions": ["H1 held S1 (live), S5 (escalated) and S4 (done); DMs d1, d2, d3 to H1; H1 acked d1"], "steps": ["Holders.end_holder(tenant.id, H1.id, audit) (which calls Messages.on_holder_ended/3)", "read S1's thread, S4's thread, DMs to H1, H1's cursors"], "expected_results": ["S1's and S5's threads each gain copies of d2 then d3 with new ids and the original authors; S4 gains nothing; no DM to H1 remains; no cursor of H1 remains"]},
+    {"id": "TC-52.25.4", "verifies": ["AC-52.25.4"], "name": "a holder with no items leaves nothing (DataCase)", "type": "integration", "preconditions": ["holder H with two unread DMs and no event-log rows"], "steps": ["end H"], "expected_results": ["zero DMs to H; no thread message created"]},
+    {"id": "TC-52.25.5", "verifies": ["AC-52.25.5"], "name": "a second end changes nothing (DataCase)", "type": "integration", "preconditions": ["state after TC-52.25.3"], "steps": ["Messages.on_holder_ended(tenant.id, H1.id, [])"], "expected_results": ["S1's thread still holds exactly two copies"]},
+    {"id": "TC-52.25.6", "verifies": ["AC-52.25.6"], "name": "send and end race on the holder row (DataCase, async: false: two committed transactions racing, moduledoc says why)", "type": "integration", "preconditions": ["live holder H holding S1; Loopctl.Test.ProductionTopology for a second connection"], "steps": ["T1: begin end_holder for H and hold before commit", "T2: Messages.send DM to H (blocks on the row lock)", "commit T1, let T2 finish"], "expected_results": ["T2 answers {:error, {:session_ended, _}}; no DM to H exists; repeating with T2 first: the DM is copied to S1 by T1"]},
+    {"id": "TC-52.25.7", "verifies": ["AC-52.25.7"], "name": "tenant isolation of held items (DataCase)", "type": "integration", "preconditions": ["holder HA in tenant A held SA; tenant B"], "steps": ["Messages.items_held_by(tenant_b.id, HA.id)", "send from tenant B to HA after HA ended"], "expected_results": ["[]; 422 ownership_rejected (not 409), so tenant B learns nothing"]},
+    {"id": "TC-52.25.8", "verifies": ["AC-52.25.1"], "name": "message_send describes the refusal", "type": "unit", "preconditions": ["mcp-server tool list"], "steps": ["read message_send's description in node --test"], "expected_results": ["contains session_ended and held_items and says to write to an item"]}
+  ],
+  "technical_notes": [
+    "Hook point: Loopctl.Holders.end_holder/3 and POST /api/v1/holders/:id/end (US-52.13 AC-52.13.7) set ended_at in one transaction; on_holder_ended/3 is a step of that Ecto.Multi. Any other path release 3 adds that sets ended_at (a lease-lapse sweep, US-52.19) calls the same step; the step is the only place a DM is deleted.",
+    "Event log: story_stage_events with actor_holder_id (README names table: work-item event log, release 3). Closed stages: done and failed only. Not StageMachine.terminal_stages/0 (lib/loopctl/delivery/stage_machine.ex:646, @terminal ~w(done failed escalated) at :174): an escalated item still has a future holder (PRD section 4, release 5), so its thread gets the copy.",
+    "Copies go through Messages.insert/2 (US-52.22) so each gets its thread's next attachment_seq; the idempotency index is the one rebuilt in US-52.23 (tenant_id, agent_id, idempotency_key), keyed on the original author's agent_id.",
+    "Lock order: send takes the recipient holders row FOR SHARE before Messages.insert/2's advisory lock; end takes it FOR UPDATE first, then the per-thread advisory locks, so the two never deadlock.",
+    "409 session_ended in MessageController operation/2 (US-52.23) and FallbackController; CHANGELOG.md entry. The held_items title comes from stories.title; current_holder_id is stories.assigned_holder_id (US-52.14)."
+  ],
+  "dependencies": [
+    "US-52.23",
+    "US-52.24"
+  ],
+  "non_goals": [
+    "Ending holders whose session vanished without an end call: release 3 (US-52.19 sets the lease; its sweep calls the same step).",
+    "Moving an item's thread with a move: nothing to do, a thread is attached to the item (release 7's move verb, README names table)."
+  ],
+  "failure_modes": {"partition": "n/a: the end and the copy run in one transaction inside loopctl; a client that lost the end's reply retries and AC-52.25.5 makes the retry a no-op.", "state": "AC-52.25.3 and AC-52.25.4: the unread DMs become thread rows of live items in the same transaction that sets ended_at, so the end's commit is the only moment a DM changes attachment.", "retry": "AC-52.25.5: copies carry resent:<dm_id>:<story_id> idempotency keys, so a repeated end writes nothing twice.", "slow": "AC-52.25.6: a send slow to reach the holder row waits on the end's row lock and is then refused, never stored on an ended holder.", "reach": "n/a: runs inside the request or sweep transaction that ends the holder, on whichever node serves it."},
+  "definition_of_done": [
+    "End a test session that held a story and had one unread DM: SELECT count(*) FROM channel_posts WHERE to_holder_id = <holder> returns 0 and the story's thread shows the DM's body with idempotency_key resent:<dm id>:<story id>."
+  ],
+  "defaults": [
+    "Items whose delivery stage is done or failed get no copy; escalated items do (owner may change).",
+    "The refusal's wording: 'that session has ended; write to one of its items instead (message_send with story_id)'."
+  ],
+  "expected_size": {"insertions": 260, "files": 6},
+  "estimated_tokens": 320000
+}

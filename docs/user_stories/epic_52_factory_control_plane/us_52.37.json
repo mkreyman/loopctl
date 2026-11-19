@@ -1,0 +1,56 @@
+{
+  "id": "US-52.37",
+  "title": "Intake re-check: duplicates and failures that stopped reproducing close with evidence",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "medium",
+  "phase": "factory_release_6",
+  "story": {"as_a": "the delivery loop", "i_want_to": "recognise an issue that duplicates live work, or whose failing tests have passed on base since it was reported", "so_that": "neither costs a triage dispatch, and the reporter is told why with the proof"},
+  "rationale": "PRD R6 names three re-check outcomes; US-52.36 built the step and already_fixed. Duplicates today are found, if at all, by the triage trio reading prose (triage@1's 'not actionable ... duplicates another report' text, resolution.ex:72), after a dispatch is spent; chg's own findings already name the failing tests (Findings failure_names, findings.ex:514) and its gate rows record full-suite verdicts per base sha (chg_ledger_rows, ledger_row.ex:21-32), so both checks can be made from loopctl's records before triage. This story adds those two findings to IntakeRecheck; it adds no table.",
+  "acceptance_criteria": [
+    {"id": "AC-52.37.1", "description": "The finding duplicate holds when another story of the same project, not at done or failed and not this story, has an intake record with the same ticket_id, or a chg finding sharing at least one failure name with this record's finding; the re-check names the other story's id."},
+    {"id": "AC-52.37.2", "description": "A duplicate story moves detected -> failed over the new control-only edge :recheck_duplicate, whose resolution verdict is the new :duplicate (not-actionable label, its own text), with evidence naming the other story's issue number and URL; the older story is never the one closed."},
+    {"id": "AC-52.37.3", "description": "The finding no_longer_reproduces holds when the record's chg finding names failures and, since the issue was opened, the source repo has at least 3 chg_ledger_rows of kind gate, verdict pass and raw source other than hook at shas PullRequestSource.contains?/3 reports in the base branch, and no failing gate row since then lists any of those names."},
+    {"id": "AC-52.37.4", "description": "A no_longer_reproduces story moves detected -> done over the new control-only edge :recheck_stale, whose resolution verdict is the new :no_longer_reproduces (not-actionable label, its own text asking the reporter to report again if it recurs), with evidence listing the passing rows' shas and times."},
+    {"id": "AC-52.37.5", "description": "A record with no chg finding, or a finding with no failure names, yields neither duplicate (by failure) nor no_longer_reproduces; issue text is never compared, so reporter wording cannot make or avoid a match."},
+    {"id": "AC-52.37.6", "description": "When more than one finding holds, the re-check acts on the first in the order already_fixed, duplicate, no_longer_reproduces and records all of them in the 'rechecked' event."},
+    {"id": "AC-52.37.7", "description": "Two stories that duplicate each other, re-checked in the same pass, close at most one: the duplicate check locks both stories' stage rows in story id order and re-reads the other's stage under the lock."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.37.1", "verifies": ["AC-52.37.1", "AC-52.37.2"], "name": "a newer issue for the same failure closes as a duplicate of the live one (DataCase)", "type": "integration", "preconditions": ["project P; story S1 at implementing whose record's finding names test A; new story S2 at detected whose finding names A and B"], "steps": ["IntakeRecheck.run(tenant.id, S2)"], "expected_results": ["S2 failed over recheck_duplicate; closure verdict duplicate, evidence names S1's issue; S1 unchanged"]},
+    {"id": "TC-52.37.2", "verifies": ["AC-52.37.1"], "name": "terminal or other-project stories are not duplicates (DataCase)", "type": "integration", "preconditions": ["a done story and another project's live story both with test A; S2 with test A"], "steps": ["IntakeRecheck.run(tenant.id, S2)"], "expected_results": ["no duplicate finding"]},
+    {"id": "TC-52.37.3", "verifies": ["AC-52.37.3", "AC-52.37.4"], "name": "three full-suite passes on base since the report close it as stale (DataCase, PullRequestSourceMock)", "type": "integration", "preconditions": ["finding names test A, issue opened at t0; 3 gate pass rows after t0 at shas contains? true; a hook-source pass row; a pass row before t0"], "steps": ["IntakeRecheck.run(tenant.id, story)"], "expected_results": ["done over recheck_stale; evidence lists exactly the 3 shas"]},
+    {"id": "TC-52.37.4", "verifies": ["AC-52.37.3"], "name": "a later failure of the named test, or a pass off base, keeps it open (DataCase, PullRequestSourceMock)", "type": "integration", "preconditions": ["the same 3 pass rows plus one gate fail row listing A after them; twin with one of the 3 shas contains? false"], "steps": ["IntakeRecheck.run for both"], "expected_results": ["neither is stale; both proceed to triage"]},
+    {"id": "TC-52.37.5", "verifies": ["AC-52.37.5"], "name": "identical issue text without a finding matches nothing (DataCase)", "type": "integration", "preconditions": ["two records with the same title and body, no ticket_id, no finding"], "steps": ["IntakeRecheck.run on the newer"], "expected_results": ["findings [none]"]},
+    {"id": "TC-52.37.6", "verifies": ["AC-52.37.6"], "name": "precedence when several findings hold (DataCase)", "type": "integration", "preconditions": ["a story that is both a duplicate and stale"], "steps": ["IntakeRecheck.run"], "expected_results": ["failed over recheck_duplicate; event lists duplicate and no_longer_reproduces"]},
+    {"id": "TC-52.37.7", "verifies": ["AC-52.37.7"], "name": "mutual duplicates close one (DataCase, two connections)", "type": "integration", "preconditions": ["two detected stories with the same ticket_id; Loopctl.Test.ProductionTopology"], "steps": ["IntakeRecheck.run on both concurrently"], "expected_results": ["exactly one at failed over recheck_duplicate; the older proceeds to triage"]}
+  ],
+  "technical_notes": [
+    "IntakeRecheck is provided by US-52.36; this story adds two finders and their edges.",
+    "Failure names: Findings.failure_names (lib/loopctl/changes/findings.ex:514) over finding.evidence['failures'] (finding.ex:31-54); the record's finding is Findings.for_record/1 (:584), the other stories' findings via Findings.loop_finding_for/1 (:1363) over stories.intake_record_id (lib/loopctl/work_breakdown/story.ex:121).",
+    "Gate rows: chg_ledger_rows (lib/loopctl/changes/ledger_row.ex:21-32); kind gate is the full-suite verdict and raw['failures'] lists failing tests (chg cli/src/shadow.rs:105); exclude raw source hook exactly as LedgerRow.failing_test_gates/1 does (ledger_row.ex:48-58). Query bounded to the source repo, at > issue opened_at, newest 50.",
+    "Ticket ids: Intake.Record ticket_id (lib/loopctl/intake/record.ex:63-91).",
+    "Edges and verdicts: add {:detected, :failed, :recheck_duplicate} and {:detected, :done, :recheck_stale} to @transitions (stage_machine.ex:286), control-only like :recheck_fixed; @resolution_verdicts (:708) and Resolution (resolution.ex:65-128) gain :duplicate and :no_longer_reproduces under the existing not-actionable label.",
+    "Why failed for a duplicate and done for stale: a duplicate's work lives on in the other story; a stale report needed no work, the same terminal as already_fixed (US-52.36).",
+    "Base containment calls go through PullRequestSource.contains?/3 (pull_request_source.ex:274), at most 3 per story, and a forge error is US-52.36's forge_unavailable."
+  ],
+  "dependencies": [
+    "US-52.36"
+  ],
+  "non_goals": [
+    "Comparing issue text for similarity: reporter text is untrusted and never decides a close.",
+    "Running the failing tests: US-52.38.",
+    "Merging duplicate threads or moving comments between issues."
+  ],
+  "failure_modes": {"partition": "AC-52.37.3: base containment that cannot be established is not a pass row; with fewer than 3 the story proceeds to triage.", "state": "AC-52.37.6: every finding is recorded in the append-only 'rechecked' event, so what the re-check knew is kept with the decision.", "retry": "AC-52.37.7: locks in story id order and a re-read under the lock make concurrent re-checks close at most one of two duplicates; US-52.36's guard makes a repeated pass a no-op.", "slow": "AC-52.37.3: ledger rows are read bounded (newest 50) and containment is checked for at most 3 shas per story.", "reach": "n/a: runs inside US-52.36's re-check step in the existing TriageDispatchWorker cron."},
+  "definition_of_done": [
+    "On production, a second sandbox issue carrying the same ticket_id as a live one is closed as a duplicate within five minutes with evidence linking the first.",
+    "SELECT edge, count(*) FROM story_stage_events WHERE edge IN ('recheck_duplicate','recheck_stale') GROUP BY edge runs, and each such event has a closure row with evidence."
+  ],
+  "defaults": [
+    "Stale needs 3 full-suite gate passes on base since the report, with no later failure of a named test (owner may change).",
+    "The newer story is the duplicate; the older one keeps the work.",
+    "duplicate and no_longer_reproduces use the existing not-actionable label with their own text."
+  ],
+  "expected_size": {"insertions": 300, "files": 6},
+  "estimated_tokens": 350000
+}

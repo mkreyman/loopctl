@@ -1,0 +1,56 @@
+{
+  "id": "US-52.62",
+  "title": "A holder keeps working through a loopctl outage and replays its journal on reconnect",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_10",
+  "story": {"as_a": "session holding a work item when loopctl stops answering", "i_want_to": "have my notes and checkpoints journaled locally and sent in order the moment loopctl answers again", "so_that": "an outage costs me nothing I recorded, and I never have to redo or re-send anything by hand"},
+  "rationale": "PRD R9: a holder that loses loopctl finishes its current lease, records its events and checkpoints locally and sends them on reconnect. Every session reaches loopctl through the MCP server, and today its apiCall (mcp-server/index.js:207) turns a network failure into an error result (status 0, :283-290), so a note or checkpoint written during an outage is simply lost and the session must notice and redo it. The runner already keeps owed socket messages on disk (LoopctlRunner.PendingStarts, LoopctlRunner.PendingVerdicts) for its own protocol; the holder-side writes need the same property in the one client every holder uses. PRD R7 assigns this release the end-to-end path 'loopctl unreachable mid-run'.",
+  "acceptance_criteria": [
+    {"id": "AC-52.62.1", "description": "When a work-item note or checkpoint write gets a network error, a timeout or a 502/503/504, the MCP server appends the write to the holder's journal as {event_id, seq, kind, story_id, claim_epoch, recorded_at, payload}, fsynced, and answers the tool call {queued: true, event_id} instead of an error."},
+    {"id": "AC-52.62.2", "description": "Each write carries a client-generated event_id (UUIDv7) from its first attempt, so the journaled entry and any earlier attempt that did reach loopctl share one id."},
+    {"id": "AC-52.62.3", "description": "A claim, start, report, escalate, renew, move or verify call that fails on the network is never journaled: it answers the error as today, with the message naming that loopctl is unreachable and that notes and checkpoints are being journaled."},
+    {"id": "AC-52.62.4", "description": "While the journal is non-empty, the MCP server tries holder_replay with the journaled entries in seq order on its next successful loopctl call and every 30 s, before sending any new note or checkpoint, so a holder's writes reach loopctl in the order it made them."},
+    {"id": "AC-52.62.5", "description": "An entry is removed from the journal when its replay result is applied, replayed, fenced or refused; it stays when the replay itself fails on the network, so nothing is dropped and nothing is removed before loopctl has recorded it."},
+    {"id": "AC-52.62.6", "description": "The tool `inbox`'s response (and the SessionStart inbox read) carries journal: {pending, oldest_recorded_at, last_fenced}, so a session sees what is still owed and which of its entries were fenced."},
+    {"id": "AC-52.62.7", "description": "The end-to-end scenario loopctl_unreachable_mid_run cuts the holder's route to loopctl after placement, has the holder write a note and a checkpoint, restores the route, and passes when both are on the item as applied, the item reaches done, and the holder's journal is empty."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.62.1", "verifies": ["AC-52.62.1", "AC-52.62.2"], "name": "a note written while loopctl is down is journaled under the id of its first attempt (node --test)", "type": "unit", "preconditions": ["a fetch stub that throws ECONNREFUSED; a temp LOOPCTL_JOURNAL_DIR; a holder credential env"], "steps": ["call the work-item note tool", "read the journal file"], "expected_results": ["the tool answers {queued: true, event_id}; the file holds one line with that event_id and seq 1; the stub saw a request body carrying the same event_id"]},
+    {"id": "TC-52.62.2", "verifies": ["AC-52.62.1"], "name": "a 503 and a timeout journal, a 409 does not (node --test)", "type": "unit", "preconditions": ["fetch stubs answering 503, a TimeoutError, and 409 stale_claim_epoch"], "steps": ["one checkpoint write against each stub"], "expected_results": ["two journal lines; the 409 is answered as an error and not journaled"]},
+    {"id": "TC-52.62.3", "verifies": ["AC-52.62.3"], "name": "control verbs are never journaled (node --test)", "type": "unit", "preconditions": ["a fetch stub that throws ECONNREFUSED"], "steps": ["call claim_story, start_story, report_story, escalate_story, renew_story_claim and work_item_move"], "expected_results": ["each answers an error naming loopctl as unreachable; the journal file is absent"]},
+    {"id": "TC-52.62.4", "verifies": ["AC-52.62.4", "AC-52.62.5"], "name": "reconnect replays in order and settles by outcome (node --test)", "type": "unit", "preconditions": ["a journal with seq 1, 2, 3; a fetch stub for holder_replay answering applied, fenced, then a network error on a second call"], "steps": ["make any successful loopctl call", "write a new note while the journal still holds an entry"], "expected_results": ["holder_replay received seq 1, 2, 3 in order; entries 1 and 2 removed, 3 kept; the new note is appended to the journal behind 3 rather than sent ahead of it"]},
+    {"id": "TC-52.62.5", "verifies": ["AC-52.62.6"], "name": "the inbox shows what is owed (node --test)", "type": "unit", "preconditions": ["a journal with two pending entries and a fenced result recorded for a third"], "steps": ["call inbox"], "expected_results": ["journal.pending 2, oldest_recorded_at the first entry's, last_fenced naming the third event_id"]},
+    {"id": "TC-52.62.6", "verifies": ["AC-52.62.7"], "name": "loopctl unreachable mid-run (e2e, sandbox repo)", "type": "integration", "preconditions": ["the end-to-end suite and sandbox repo (release 2); the holder's LOOPCTL_SERVER pointed at an E2E.Relay the scenario controls"], "steps": ["file an issue on the sandbox repo and let it be placed", "cut the relay once the holder has started", "let the holder write a note and a checkpoint", "restore the relay after 120 s"], "expected_results": ["work_item_timeline shows the note and checkpoint as applied in the order written; the item is done; the holder's journal file is empty; no queue holds the item"]}
+  ],
+  "technical_notes": [
+    "mcp-server/index.js: apiCall/5 at :207 returns {error: true, status: 0} on a network error or timeout (:283-290); DEFAULT_REQUEST_TIMEOUT_MS 30_000 at :150. The journal wraps the note and checkpoint tools' calls, not apiCall, so no other tool changes behaviour. New module mcp-server/lib/holder-journal.js holds append, read, settle and the replay loop.",
+    "Journal file: one JSON line per entry, default directory ~/.loopctl/journal, file name sha256(server URL + \":\" + holder_id), mode 0600, overridable with LOOPCTL_JOURNAL_DIR (row in mcp-server/README.md). Written append-then-fsync; settled by rewriting through a temp file and rename, the symlink-safe pattern in mcp-server/lib/witness-sth.js:120-140. The witness state lives under the OS temp dir (index.js:141-144); the journal does not, because a reboot must not drop it.",
+    "The journal is a copy, never the record (PRD R1, R3 cloud test): its loss costs only what was not yet replayed, the same as a holder that never checkpointed. seq is per holder, kept in the file, and restarts at the highest journaled seq + 1 after a restart.",
+    "holder_replay, its outcomes and the 200-entry bound are US-52.61's; a journal holding more entries is sent in consecutive bodies, waiting for each answer.",
+    "The work-item note tools are provided by release 3 (README names table: work-item notes) and the checkpoint tool by release 7 (README names table: checkpoint). Both gain the client event_id field in their request shape here if release 3 and 7 left it server-generated.",
+    "The runner's own socket messages stay on their existing disk stores, LoopctlRunner.PendingStarts (loopctl-runner lib/loopctl_runner/pending_starts.ex:1, at runner/ after release 2) and LoopctlRunner.PendingVerdicts (pending_verdicts.ex:1-31, whose replayed-true resend contract this journal mirrors). A headless session's own note and checkpoint writes go through the MCP server like any holder's, so the runner gains no second journal.",
+    "inbox and the SessionStart inbox read are provided by release 4 (README names table: messaging MCP tools); the journal block is added to the tool's response only, not to the server.",
+    "E2E.Relay is a TCP relay in e2e/support that the scenario opens and closes; the suite's layout, sandbox repo and `mix e2e` are provided by release 2 (README names table: end-to-end suite). The relay's cut is the only fault injected: loopctl itself keeps running, so the scenario also proves the lease outlives a 120 s outage (the lease is set by release 3)."
+  ],
+  "dependencies": [
+    "US-52.61"
+  ],
+  "non_goals": [
+    "The server side of replay, fencing and dedupe: US-52.61.",
+    "Monitoring loopctl's availability from outside: US-52.63.",
+    "Journaling messages to inboxes or DMs: message_send keeps its own idempotent id (release 4) and a failed send is the sender's to retry."
+  ],
+  "failure_modes": {"partition": "AC-52.62.1: during a partition the holder's notes and checkpoints go to its local journal and the tool call succeeds, so the holder keeps working its lease.", "state": "AC-52.62.5: an entry leaves the journal only once loopctl has recorded a result for it, so the record of every write ends in loopctl's Postgres and the journal holds only what is still owed.", "retry": "AC-52.62.2: the journaled entry reuses the event_id of the attempt that may already have reached loopctl, so its replay answers replayed instead of writing twice.", "slow": "AC-52.62.4: a timed-out write is journaled and replayed in order ahead of newer writes, so a slow connection delays writes and never reorders them.", "reach": "AC-52.62.7: the holder is reached through loopctl by its holder identity before, during and after the outage; the end-to-end scenario proves the item finishes with nobody intervening."},
+  "definition_of_done": [
+    "`mix e2e --only loopctl_unreachable_mid_run` passes against the sandbox repo, and the nightly run includes it.",
+    "On a dev box with loopctl blocked by an iptables rule for 2 minutes, an interactive session's note tool answers queued, and after the rule is removed the note is on the item and ~/.loopctl/journal holds no lines."
+  ],
+  "defaults": [
+    "Replay retry interval while the journal is non-empty: 30 s (owner may change).",
+    "Journal directory: ~/.loopctl/journal, override LOOPCTL_JOURNAL_DIR.",
+    "Statuses that journal a write: network error, timeout, 502, 503, 504."
+  ],
+  "expected_size": {"insertions": 330, "files": 6},
+  "estimated_tokens": 380000
+}

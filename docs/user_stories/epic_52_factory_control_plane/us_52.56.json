@@ -1,0 +1,52 @@
+{
+  "id": "US-52.56",
+  "title": "A chg snapshot is addressed by its content and can be built in the job's own tree",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_9",
+  "story": {"as_a": "CI job or holder that needs a warm build", "i_want_to": "name a chg snapshot by what it was built from (tree, toolchain, build path) and build it in the tree I am working in", "so_that": "any machine can tell whether a snapshot fits its tree before it uses one, and a snapshot built on one machine can serve another"},
+  "rationale": "PRD R8: warm state is a read-only, content-addressed snapshot that chg builds and any machine can fetch or rebuild. Today a snapshot is named by commit sha only (chg/cli/src/store.rs:36-50), lives in a per-machine, per-clone store (store.rs:147-158), and is built only at that store's build path under one build lock (snapshot.rs:99-121), so twelve CI slots on one host would queue on it and no other machine can use it. Its toolchain is not recorded at all, which is how a PLT holding another slot's OTP paths killed dialyzer on 2026-08-03 (KB 09245ceb). This story gives a snapshot a content key and an in-place build; publishing and fetching it is US-52.57.",
+  "acceptance_criteria": [
+    {"id": "AC-52.56.1", "description": "`chg snapshot key <repo> <sha>` prints one JSON line {\"key\", \"sha\", \"tree\", \"build_path\", \"toolchain\"}; key is the lowercase hex SHA-256 of the newline-joined fields: `chg-snapshot-v1`, the commit's tree id, the resolved build path, the adapter's toolchain string, the adapter kind and contract version, and the target OS and arch."},
+    {"id": "AC-52.56.2", "description": "Two commits with the same tree id, built at the same path with the same toolchain, get the same key; changing any one of tree, path or toolchain changes the key."},
+    {"id": "AC-52.56.3", "description": "The adapter contract gains an optional `toolchain` command; the Elixir adapter's `mix chg.toolchain` prints {\"toolchain\": \"elixir=V;otp=O;root=R\"}, where V is System.version(), O is the full OTP version from the OTP_VERSION file and R is :code.root_dir(). An adapter without the command gives the toolchain `none`."},
+    {"id": "AC-52.56.4", "description": "`chg snapshot build --here <sha>` builds the snapshot in the current work tree, which must be at <sha>, by running the adapter's `snapshot` command there, then copies (clones where the filesystem allows) the tree into the local store as `snapshots/<sha>` with meta fields `key`, `toolchain` and `built_in` = the tree's resolved path; it takes no build lock, because the tree is the caller's own."},
+    {"id": "AC-52.56.5", "description": "`chg snapshot build --here` refuses a tree with modified or untracked files (git status --porcelain not empty, ignored files excepted): exit 2, naming the first ten paths, and nothing is written to the store."},
+    {"id": "AC-52.56.6", "description": "A second `chg snapshot build --here` for a key the local store already holds prints {\"status\":\"exists\",\"key\":...} and runs no adapter command."},
+    {"id": "AC-52.56.7", "description": "`chg ws hydrate` never hydrates from a snapshot whose recorded toolchain differs from the adapter's current toolchain: such a snapshot is skipped as if absent (exit 3 when no other fits), and stderr names both toolchains. A snapshot with no recorded toolchain (built before this story) is still used, as today."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.56.1", "verifies": ["AC-52.56.1", "AC-52.56.2"], "name": "key derivation over tree, path and toolchain (cargo unit test in chg/cli)", "type": "unit", "preconditions": ["a temp git repo with commits A and B whose trees are equal, and C with a changed file", "a stub adapter whose toolchain command prints a fixed string"], "steps": ["snapshot::key for A and B at one path", "key for C; key for A at another path; key for A with the stub toolchain changed"], "expected_results": ["A == B; the other three each differ from A and from each other"]},
+    {"id": "TC-52.56.2", "verifies": ["AC-52.56.3"], "name": "mix chg.toolchain prints the running toolchain (ExUnit in chg/adapters/elixir)", "type": "unit", "preconditions": ["the adapter's test project"], "steps": ["run Mix.Tasks.Chg.Toolchain and decode its JSON"], "expected_results": ["elixir= System.version(); root= to_string(:code.root_dir())"]},
+    {"id": "TC-52.56.3", "verifies": ["AC-52.56.4", "AC-52.56.6"], "name": "an in-place build lands in the store under its key, and a second is a no-op (chg integration test, Elixir fixture)", "type": "integration", "preconditions": ["adapters/elixir/fixtures/sample checked out clean in a temp dir; CHG_STORE a temp dir"], "steps": ["chg snapshot build --here HEAD", "read snapshots/<sha>/.chg-snapshot.json", "chg snapshot build --here HEAD again with an adapter wrapper that records its invocations"], "expected_results": ["meta carries key, toolchain and built_in = the tree's path; the second run prints status exists and invokes nothing"]},
+    {"id": "TC-52.56.4", "verifies": ["AC-52.56.5"], "name": "a dirty tree is refused", "type": "integration", "preconditions": ["a clean fixture tree with one tracked file edited and one untracked file added"], "steps": ["chg snapshot build --here HEAD"], "expected_results": ["exit 2; stderr names both paths; snapshots/ is empty"]},
+    {"id": "TC-52.56.5", "verifies": ["AC-52.56.7"], "name": "hydrate skips a snapshot built with another toolchain, uses one with none recorded", "type": "integration", "preconditions": ["a store holding a snapshot of HEAD whose meta toolchain is elixir=0.0.0;otp=0;root=/x"], "steps": ["chg ws hydrate in a fresh worktree", "rewrite the meta without a toolchain field; hydrate again in another fresh worktree"], "expected_results": ["first exits 3 and names both toolchains; second hydrates"]}
+  ],
+  "technical_notes": [
+    "Today's paths are in /home/mkreyman/workspace/chg; release 2 moves them under chg/ in this repo (README names table: chg source in this repo). Cite and edit the moved files.",
+    "Meta: cli/src/store.rs:36-50 (sha, built_at_ms, from, work, ms, built_in); add `key` and `toolchain` as #[serde(default, skip_serializing_if = Option::is_none)] like built_in (:48), so old meta files still parse. Meta::is_built_at at :55.",
+    "Store layout and root: store.rs:1-17, root() at :64, Store::for_repo at :147 (store dir keyed by the clone's common dir), build_dir at :222, list at :257, nearest_ancestor at :273, gc at :322 (KEEP = 3 at :30). The in-place build writes into the same snapshots/<sha> dir, so list, nearest_ancestor, lease and GC need no change.",
+    "The existing build: snapshot.rs:60 build/3 and :80 build_inner/4 (build lock at :99-109, build dir clear at :120-122, adapter invoke at :160-170, meta at :172-182, swap into place under the exclusive lock at :195-211). --here reuses the meta write and the swap; it skips the lock, the clone-from-base and apply_diff (:224).",
+    "Tree id: `git rev-parse <sha>^{tree}` through git::cmd as snapshot.rs:225 does. SHA-256 comes from the sha2 crate chg already uses for HMAC (outbox.rs:174).",
+    "Adapter contract: CommandName and its placeholders at cli/src/contract.rs:90-94, manifest fields at :119 and :158; add `toolchain` as an optional command with no placeholders. Elixir adapter manifest adapters/elixir/adapter.toml; the snapshot task is lib/mix/tasks/chg.snapshot.ex (its own idempotence key at :99-110 already joins System.version and otp_release; the new task reads the full OTP version from Path.join([:code.root_dir(), \"releases\", otp_release, \"OTP_VERSION\"])).",
+    "Hydrate: cli/src/ws.rs:52 hydrate/1 picks the nearest ancestor at :68; filter by toolchain before that pick. CLI wiring: cli/src/main.rs:426 SnapshotCmd (add Key and the --here flag on Build), dispatch at :517-532.",
+    "Why the toolchain is in the key and the hydrate filter: a PLT records 552 paths under the Erlang install and 383 under Elixir (KB 09245ceb), so a snapshot from another OTP root is wrong, not merely slow."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Uploading and downloading snapshots between machines: US-52.57.",
+    "Running CI jobs in per-job trees that use these snapshots: US-52.58.",
+    "Changing the shadow check or gate-mode `chg check`, which keep building at the store's build path under the build lock."
+  ],
+  "failure_modes": {"partition": "n/a: a local CLI over the local git repo and the local store; no network call in this story.", "state": "AC-52.56.4: the snapshot lives in the machine's store as a cache; losing it costs a rebuild, and its meta records the key, toolchain and path that decide whether it fits a tree.", "retry": "AC-52.56.6: a repeated build of a key the store holds does nothing, so a retried job never builds twice.", "slow": "n/a: no network; the adapter's snapshot command keeps its existing wall-clock cap (cli/src/exec.rs:34 cap).", "reach": "n/a: runs inline in the chg process the caller started, in the caller's own tree."},
+  "definition_of_done": [
+    "On minis, `chg snapshot key ~/workspace/loopctl HEAD` twice prints the same key, and the key changes after `asdf` switches Erlang to another installed version.",
+    "`chg snapshot build --here HEAD` in a clean loopctl checkout leaves snapshots/<sha>/.chg-snapshot.json carrying key and toolchain."
+  ],
+  "defaults": [
+    "Key version string `chg-snapshot-v1`; bumping it invalidates every published snapshot (owner may change).",
+    "Dirty-tree refusal lists at most ten paths."
+  ],
+  "expected_size": {"insertions": 320, "files": 7},
+  "estimated_tokens": 300000
+}

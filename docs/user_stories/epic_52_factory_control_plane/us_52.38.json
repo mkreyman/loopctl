@@ -1,0 +1,57 @@
+{
+  "id": "US-52.38",
+  "title": "Re-run the reported failures on base (recheck@1), and hand every re-check finding to triage",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "medium",
+  "phase": "factory_release_6",
+  "story": {"as_a": "the delivery loop", "i_want_to": "run an issue's named failing tests at the base head before triage, and give triage what the re-check found", "so_that": "an issue that no longer reproduces closes on a real run, and the trio judges a report knowing what loopctl already established"},
+  "rationale": "PRD R6: 'no longer reproduces' and 'Pass re-check findings to triage'. US-52.37 judges staleness from gate rows chg already recorded, which needs three base runs; a repo with few pushes never accumulates them. A targeted run of the named failures at the base head answers in one dispatch. Runners already replay named failures for verification (loopctl-runner #100 passes each as --failure=<name> to chg-replay-selection.py), so this is a new judge spec on the existing dispatch machinery, not a new runner path. Today the triage payload (TriagePayload.build/1, triage_payload.ex:78) carries only the fenced report, so the trio re-derives facts loopctl already holds.",
+  "acceptance_criteria": [
+    {"id": "AC-52.38.1", "description": "A judge spec recheck@1 (kind 'recheck', budgets {:recheck_wall_clock_seconds, :recheck_max_turns}, result ['recheck_result']) has candidates: stage detected, an intake record whose chg finding names failures, no 'rechecked' event since entry into detected, no live dispatch of itself, source not paused; with RECHECK_WALL_CLOCK_SECONDS or RECHECK_MAX_TURNS unset it is disabled and US-52.36's pass re-checks such stories without it."},
+    {"id": "AC-52.38.2", "description": "The recheck dispatch's payload is the finding's failure names and the base branch only, never reporter text, and the runner template runs those names at the base head through the replay tool the verify template uses, answering recheck_result %{outcome: 'passes' | 'reproduces' | 'could_not_run', failures: [%{name, passed}], base_sha}."},
+    {"id": "AC-52.38.3", "description": "outcome passes moves the story detected -> done over :recheck_stale (US-52.37's edge and verdict) with evidence naming the base sha and each test; the 'rechecked' event records reproduction 'passes'."},
+    {"id": "AC-52.38.4", "description": "outcome reproduces or could_not_run leaves the story at detected and writes the 'rechecked' event with that reproduction result, so triage@1 takes the story on its next pass."},
+    {"id": "AC-52.38.5", "description": "A recheck dispatch unplaced for 30 minutes after the story entered detected, or released, revoked or expired without a result, makes US-52.36's pass write the 'rechecked' event with reproduction 'unavailable'; no story waits at detected longer than that bound for a re-check."},
+    {"id": "AC-52.38.6", "description": "The triage payload gains a 'recheck' object built from the newest 'rechecked' event only (findings, reproduction result, base sha, linked story ids), outside the fenced reporter text, and the triage@1 template tells the trio it is loopctl's own record."},
+    {"id": "AC-52.38.7", "description": "A recheck_result for a dispatch that is not the story's live recheck dispatch, or whose failures name a test the payload did not, is refused 409 and changes nothing."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.38.1", "verifies": ["AC-52.38.1"], "name": "candidates and the disabled state (DataCase)", "type": "integration", "preconditions": ["detected stories: one whose finding names test A, one with no finding, one already rechecked; budgets injected, then nil"], "steps": ["Dispatcher.candidates(RecheckV1.spec(), 10) with budgets", "IntakeRecheck pass with budgets nil"], "expected_results": ["only the first story; with nil budgets the pass writes its rechecked event with reproduction 'skipped'"]},
+    {"id": "TC-52.38.2", "verifies": ["AC-52.38.2"], "name": "payload carries names and base only (DataCase)", "type": "integration", "preconditions": ["a record whose body contains 'rm -rf' and whose finding names test A"], "steps": ["Dispatcher.run(RecheckV1.spec(), limit: 1) with a fixture runner"], "expected_results": ["payload has failures [A] and base_branch; no record body text"]},
+    {"id": "TC-52.38.3", "verifies": ["AC-52.38.3"], "name": "passes closes as stale with the run as evidence (DataCase)", "type": "integration", "preconditions": ["a live recheck dispatch for the story"], "steps": ["apply recheck_result passes with base_sha b1"], "expected_results": ["done over recheck_stale; closure evidence names b1 and test A"]},
+    {"id": "TC-52.38.4", "verifies": ["AC-52.38.4"], "name": "reproduces hands the story to triage (DataCase)", "type": "integration", "preconditions": ["a live recheck dispatch"], "steps": ["apply recheck_result reproduces", "TriageDispatcher.candidates(10)"], "expected_results": ["story at detected with a rechecked event; it is a triage candidate"]},
+    {"id": "TC-52.38.5", "verifies": ["AC-52.38.5"], "name": "an unplaced or lost re-check stops blocking after 30 minutes (DataCase)", "type": "integration", "preconditions": ["a candidate with no runner, entered detected 31 minutes ago; a second with a revoked recheck dispatch"], "steps": ["IntakeRecheck pass with now injected"], "expected_results": ["both get a rechecked event with reproduction 'unavailable'"]},
+    {"id": "TC-52.38.6", "verifies": ["AC-52.38.6"], "name": "triage payload carries the recheck object outside the fence (unit)", "type": "unit", "preconditions": ["a record and a rechecked event with findings [none] and reproduction reproduces"], "steps": ["TriagePayload.build(record, recheck)"], "expected_results": ["payload.recheck present; fenced report unchanged"]},
+    {"id": "TC-52.38.7", "verifies": ["AC-52.38.7"], "name": "a stray or widened result is refused (ConnCase over the runner channel test helper)", "type": "integration", "preconditions": ["a superseded recheck dispatch; a live one"], "steps": ["send recheck_result for the superseded", "send one naming test Z for the live"], "expected_results": ["both refused; story unchanged"]}
+  ],
+  "technical_notes": [
+    "Spec: lib/loopctl/agents/specs/recheck_v1.ex shaped like triage@1 (lib/loopctl/agents/specs/triage_v1.ex:20-82): archetype :judge, outcomes 'passes' => [{:detected, :done, :recheck_stale}] (control-only, as :judge requires), 'reproduces' and 'could_not_run' => [] with the event written by the verdict applier; if Loopctl.Agents.Spec refuses an empty outcome list, this story adds that case to check_archetype_transitions/1 (lib/loopctl/agents/spec.ex:651) with its test.",
+    "Payload: a new :recheck_payload in Spec's @payloads (spec.ex:183) and Dispatcher's @payload_builders (lib/loopctl/agents/dispatcher.ex:217, payload_input at :519).",
+    "Runner side: a recheck template in the runner source (release 2, README names table: runner source) reusing the verify template's replay of named failures (loopctl-runner#100: chg-replay-selection.py --failure=<name>, one argument per name); runner contract minor adds the recheck kind and recheck_result (lib/loopctl/api_spec/runner_contract.ex).",
+    "Budgets: RECHECK_WALL_CLOCK_SECONDS and RECHECK_MAX_TURNS have no default, like the triage pair (Dispatcher.budgets/1, dispatcher.ex:292); rows in deploy/FLY_SECRETS.md.",
+    "Bound: US-52.36's pass owns the 30-minute fallback, read from the stage row's entry into detected (Timeline.current/2's stage_entered_at, US-52.29) so the bound survives restarts.",
+    "Triage payload: TriagePayload.build/1 (lib/loopctl/delivery/triage_payload.ex:78) becomes build/2; reply_draft@1 shares :fenced_intake_report (lib/loopctl/agents/specs/reply_draft_v1.ex:71) and receives the same object, which is loopctl's own data.",
+    "Ordering with US-52.36: when recheck@1 is enabled and the finding names failures, US-52.36's inline pass records its findings in the dispatch's payload context and leaves the 'rechecked' event to the verdict applier or the fallback, so the event stays one per entry into detected."
+  ],
+  "dependencies": [
+    "US-52.29",
+    "US-52.36",
+    "US-52.37"
+  ],
+  "non_goals": [
+    "Running commands from the issue body: the payload never carries reporter text and the template runs only the replay tool.",
+    "Reproducing issues that name no failing test: triage judges those as today.",
+    "Choosing a runner that has the failing environment: the existing runner predicates apply."
+  ],
+  "failure_modes": {"partition": "AC-52.38.5: a runner that vanishes mid-run loses its lease; the dispatch expires and the pass records 'unavailable' within the bound.", "state": "AC-52.38.4: the result is a 'rechecked' event in the append-only log; the dispatch row and its lease are the existing dispatch machinery's, so a restart loses neither.", "retry": "AC-52.38.7: only the story's live recheck dispatch may answer, and the 'rechecked' event is written once per entry into detected (US-52.36's guard), so a resent result changes nothing.", "slow": "AC-52.38.5: a slow run is cut by RECHECK_WALL_CLOCK_SECONDS and the 30-minute bound, after which triage proceeds.", "reach": "AC-52.38.1: the dispatch is placed by the existing judge dispatch pass on a runner that declares the recheck kind; a story is reached again by the next pass if placement fails."},
+  "definition_of_done": [
+    "On production with the budgets set, a sandbox issue naming a test that now passes on base closes as no_longer_reproduces with evidence naming the base sha, after one recheck dispatch and no triage dispatch.",
+    "A triage dispatch's payload on production carries a recheck object."
+  ],
+  "defaults": [
+    "recheck@1 is off until RECHECK_WALL_CLOCK_SECONDS and RECHECK_MAX_TURNS are set; no default, because a run is spend.",
+    "A re-check never holds a story at detected longer than 30 minutes (owner may change)."
+  ],
+  "expected_size": {"insertions": 420, "files": 11},
+  "estimated_tokens": 550000
+}

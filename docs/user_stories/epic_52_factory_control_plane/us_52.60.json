@@ -1,0 +1,54 @@
+{
+  "id": "US-52.60",
+  "title": "loopctl runs in lax and den, with every machine kept running",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_10",
+  "story": {"as_a": "session on any machine of the fleet", "i_want_to": "reach a running loopctl machine in two Fly regions, none of them ever suspended", "so_that": "a lost machine or host in one region never takes loopctl away, and the real-time subscriptions R11 holds stay up"},
+  "rationale": "PRD R9: loopctl runs in lax plus Fly den, and each region keeps at least one machine that is never suspended. fly.toml cannot give that today: min_machines_running = 2 (fly.toml:180) binds only in primary_region = \"lax\" (fly.toml:5), and auto_stop_machines = \"suspend\" (fly.toml:176) would suspend a den machine. EXPECTED_APP_NODES = \"2\" (fly.toml:171) is the machine count Loopctl.DbCapacity multiplies the pools by and Loopctl.ClusterReadiness alarms against, so it must rise with the machine count. A region's machine count is not expressible in fly.toml at all, so it needs one checked-in list and a deploy step that holds it.",
+  "acceptance_criteria": [
+    {"id": "AC-52.60.1", "description": "fly.toml [http_service] sets auto_stop_machines = \"off\" (was \"suspend\"), so no machine in any region is ever stopped or suspended by the proxy; auto_start_machines stays true."},
+    {"id": "AC-52.60.2", "description": "deploy/regions.txt lists one line per region, \"<region> <machines>\", holding \"lax 2\" and \"den 1\"; fly.toml's EXPECTED_APP_NODES equals the sum of its counts (\"3\")."},
+    {"id": "AC-52.60.3", "description": "DbCapacity.fits?(DbCapacity.verified_live_max_connections(), n) is true for n = fly.toml's EXPECTED_APP_NODES, with @verified_live_max_connections and @verified_on re-measured against ecf-postgres (the database loopctl moved to) at release time."},
+    {"id": "AC-52.60.4", "description": "deploy/ensure-regions.sh reads deploy/regions.txt and, for each region whose app process group has fewer machines than its count, runs `flyctl scale count <count> --region <region> --process-group app --yes -a loopctl`; a region already at or above its count gets no scale call."},
+    {"id": "AC-52.60.5", "description": "After scaling, deploy/ensure-regions.sh exits 1 with a line `region <r>: <k> started machines, need <n>` for every region whose started machines are fewer than its count, and exits 0 otherwise."},
+    {"id": "AC-52.60.6", "description": "The ci.yml deploy job runs `bash deploy/ensure-regions.sh` as the step after `flyctl deploy --remote-only`, so a failed region check fails the deploy job before the post-deploy smoke."},
+    {"id": "AC-52.60.7", "description": "GET /health answers with a `region` field holding the FLY_REGION the answering machine runs in, or null off Fly; the status code still depends on database and Oban only."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.60.1", "verifies": ["AC-52.60.1", "AC-52.60.2"], "name": "fly.toml keeps every machine running and EXPECTED_APP_NODES matches the region list (unit, fly_toml_test)", "type": "unit", "preconditions": ["fly.toml and deploy/regions.txt read with the file's existing section/2 and env_table/1 helpers"], "steps": ["read [http_service] auto_stop_machines", "sum the counts in deploy/regions.txt and compare with [env] EXPECTED_APP_NODES"], "expected_results": ["auto_stop_machines is off; the sum equals EXPECTED_APP_NODES; the existing CLUSTER_PEERS_MAY_SUSPEND test still passes with the variable unset"]},
+    {"id": "TC-52.60.2", "verifies": ["AC-52.60.3"], "name": "the connection budget fits at the deployed node count (unit, db_capacity_test)", "type": "unit", "preconditions": ["EXPECTED_APP_NODES parsed from fly.toml with DbCapacity.parse_expected_app_nodes/1"], "steps": ["DbCapacity.fits?(DbCapacity.verified_live_max_connections(), nodes)", "DbCapacity.verified_on()"], "expected_results": ["true; verified_on is on or after the release-10 branch cut"]},
+    {"id": "TC-52.60.3", "verifies": ["AC-52.60.4"], "name": "ensure-regions scales only the short region (unit, stub flyctl)", "type": "unit", "preconditions": ["a temp dir on PATH holding a stub flyctl that answers `machines list --json` with two lax app machines and none in den, and appends every other argv to a log file"], "steps": ["System.cmd(\"bash\", [\"deploy/ensure-regions.sh\"]) with the stub first on PATH", "run it again with the stub now listing one started den machine"], "expected_results": ["the first run logs exactly one `scale count 1 --region den` call; the second run logs no scale call"]},
+    {"id": "TC-52.60.4", "verifies": ["AC-52.60.5"], "name": "ensure-regions fails naming the region that did not start (unit, stub flyctl)", "type": "unit", "preconditions": ["a stub flyctl whose den machine stays in state `stopped` after the scale call"], "steps": ["System.cmd(\"bash\", [\"deploy/ensure-regions.sh\"], stderr_to_stdout: true)"], "expected_results": ["exit status 1; output contains `region den: 0 started machines, need 1`"]},
+    {"id": "TC-52.60.5", "verifies": ["AC-52.60.6"], "name": "the deploy job checks regions right after the deploy (unit)", "type": "unit", "preconditions": [".github/workflows/ci.yml parsed with YamlElixir"], "steps": ["read jobs.deploy.steps and find the index of the `flyctl deploy --remote-only` step"], "expected_results": ["the next step's run is `bash deploy/ensure-regions.sh`"]},
+    {"id": "TC-52.60.6", "verifies": ["AC-52.60.7"], "name": "/health names the region, null off Fly (ConnCase)", "type": "integration", "preconditions": ["no FLY_REGION in the test environment; the default health checker stub"], "steps": ["GET /health", "the pure region reader on %{\"FLY_REGION\" => \"den\"} and on %{}"], "expected_results": ["200 with \"region\": null; the reader gives \"den\" and nil"]}
+  ],
+  "technical_notes": [
+    "fly.toml: primary_region :5, the [env] clustering comment :158-169 and EXPECTED_APP_NODES :171, [http_service] auto_stop_machines :176, auto_start_machines :177, min_machines_running :180 (keep it, with its comment changed to say it binds lax only and auto_stop off is what keeps den running). Rewrite the :163-169 comment for three machines in two regions.",
+    "test/loopctl/fly_toml_test.exs: section/2 :102, env_table/1 :85, the clustering describe :118-146. The CLUSTER_PEERS_MAY_SUSPEND test (:132) computes may_suspend? from auto_stop and min_running, so with auto_stop off it requires the variable to stay unset; no change to that test.",
+    "Loopctl.DbCapacity: @verified_live_max_connections 100 and @verified_on 2026-06-24 (lib/loopctl/db_capacity.ex:87-90) were measured on fly mpg; loopctl's database has since moved to ecf-postgres, whose max_connections is 300 shared by six databases, with per-role CONNECTION LIMITs (loopctl 80, rls_user 60; infra runbooks/postgres-monitoring.md:357-363). Re-measure the binding limit for loopctl's two roles and record it with its date. peak_total/2 (:294) at 3 nodes with the prod pools (:43) is 89; at 4 it is 111, so a second den machine needs a pool change first.",
+    "Clustering needs no change: DNS_CLUSTER_QUERY = loopctl.internal (fly.toml:170) resolves every started machine in every region over 6PN, and ClusterReadiness.readiness/0 (lib/loopctl/cluster_readiness.ex:153) reports :clustered at expected 3 once two peers are connected.",
+    "ci.yml: the deploy job is at .github/workflows/ci.yml:1655, its deploy step runs `flyctl deploy --remote-only` at :1669, and the post-deploy smoke job follows at :1673. ensure-regions.sh uses the same FLY_API_TOKEN the deploy step has; it reads regions.txt and machine state from `flyctl machines list --json -a loopctl` (fields region, state, config.metadata.fly_process_group).",
+    "/health: LoopctlWeb.HealthController.check/2 (lib/loopctl_web/controllers/health_controller.ex:49) json-encodes the checker's map; add region there, read through one pure function over an env map so the test needs no System.put_env (CLAUDE.md Test Conventions rule 2). The pattern is Loopctl.Runners.machine_id/0 (lib/loopctl/runners.ex:1555). Version stays undisclosed (#461 item 5, health_controller.ex:6). FLY_REGION gets a row in deploy/FLY_SECRETS.md beside FLY_MACHINE_ID (:72), and the EXPECTED_APP_NODES row (:88) changes its default text to the fly.toml value (mix loopctl.check_env_docs).",
+    "The database stays single-primary in lax (PRD R9): a den machine reaches ecf-postgres over 6PN across regions, so every query from den pays the lax-den round trip. That cost is measured in the definition of done, not designed away here."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "A read replica or a database in den: after the first incident (PRD R9).",
+    "Probing each region from outside: US-52.63, which reads the region field this story adds.",
+    "Restoring the database in den: US-52.63's drill and runbook."
+  ],
+  "failure_modes": {"partition": "AC-52.60.1: a partition that cuts one region off leaves the other region's machines running and serving, because none of them is ever suspended waiting for traffic to wake it.", "state": "AC-52.60.2: the per-region machine count lives in one checked-in file that the deploy reads and fly_toml_test binds to EXPECTED_APP_NODES, so the count cannot live only in Fly's machine list.", "retry": "AC-52.60.4: ensure-regions scales only a region below its count, so a re-run deploy job adds no machine.", "slow": "AC-52.60.5: a machine that is slow to start fails the deploy job with the region named, instead of the deploy reporting success with a region empty.", "reach": "AC-52.60.7: /health names the machine's region, so a probe that asked for a region can tell whether that region answered."},
+  "definition_of_done": [
+    "After the deploy: `flyctl machines list -a loopctl --json` shows two started app machines in lax and one in den, and none suspended after an hour with no traffic.",
+    "`curl -s -H 'fly-prefer-region: den' https://loopctl.com/health` returns 200 with \"region\": \"den\".",
+    "Loopctl.ClusterReadiness.readiness() on any machine (fly ssh console, bin/loopctl rpc) returns status :clustered with expected_nodes 3.",
+    "p50 and p95 of GET /api/v1/projects answered in den and in lax over 50 requests each are written into the PR body, as the measured cost of a den machine reaching the lax database."
+  ],
+  "defaults": [
+    "Machines per region: lax 2, den 1 (owner may change; a fourth machine needs a pool-size change first, technical_notes).",
+    "auto_stop_machines = \"off\" for every region, rather than a per-region setting Fly does not offer."
+  ],
+  "expected_size": {"insertions": 140, "files": 6},
+  "estimated_tokens": 200000
+}

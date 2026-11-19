@@ -1,0 +1,52 @@
+{
+  "id": "US-52.48",
+  "title": "The host daemon owns the machine's GitHub Actions runner pool and reports its free CI slots",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "medium",
+  "phase": "factory_release_7",
+  "story": {"as_a": "the factory running on a fleet machine", "i_want_to": "have one installed daemon that runs headless sessions, owns the GitHub Actions runner pool and reports its free CI slots to loopctl", "so_that": "CI capacity is a reported number in the same place as session capacity, and the pool's code lives and releases with the rest of the factory"},
+  "rationale": "PRD R3: the host daemon 'merges today's loopctl-runner process and the GitHub Actions runner registration' and reports 'free CI and session slots'; R10 moves 'infra's CI runner provisioning' into this repo. Today the pool is a separate 3,441-line supervisor in another repo (/home/mkreyman/workspace/infra/scripts/ci-runner-pool.sh, run by infra-ci-runner-pool.service), which mints single-use JIT runner configs per job (:11-15, mint_jitconfig :2044) and admits jobs by measured load (infra decision 0021); loopctl never sees its slots. US-52.47 gave the report a ci_slots field; this story fills it and brings the pool's code in.",
+  "acceptance_criteria": [
+    {"id": "AC-52.48.1", "description": "infra's scripts/ci-runner-pool.sh, runner-upgrade.sh, runner-deps.sh, ci-runner-limits.sh, ci-job-handback-install.sh, macos/actions-runner-install.sh, systemd/infra-ci-runner-pool.service, their tests under scripts/tests/ and runbooks/ci-runner-setup.md move to runner/ci/ with their git history, and runner/ci/tests/*.sh run green in this repo's CI."},
+    {"id": "AC-52.48.2", "description": "The runner's install script installs runner/ci/systemd/infra-ci-runner-pool.service with ExecStart pointing at the installed release's ci-runner-pool.sh, keeping KillMode=process, its runtime and state directories and its EnvironmentFile /etc/default/infra-ci-runner-pool unchanged."},
+    {"id": "AC-52.48.3", "description": "LoopctlRunner.CiPool runs `ci-runner-pool.sh --check-json` on each status tick with a 5 s timeout and maps it to ci_slots {total: slot count, free: slots in state ok, busy: slots busy or held, paused}; a timeout, a non-JSON answer or a non-null error field yields ci_slots null and one log line naming the reason."},
+    {"id": "AC-52.48.4", "description": "LoopctlRunner.CiPool.pause/0 stops the pool unit through systemctl (running jobs keep going under KillMode=process) and resume/0 starts it; both are idempotent, are reachable as `bin/loopctl_runner rpc 'LoopctlRunner.CiPool.pause()'` and `... resume()`, and the paused state is reported in ci_slots.paused."},
+    {"id": "AC-52.48.5", "description": "CiPool starts the pool only through the unit manager and only when the unit is not already active, so the daemon never runs a second supervisor beside a live unit; it never execs ci-runner-pool.sh in the supervisor mode itself."},
+    {"id": "AC-52.48.6", "description": "With [ci] absent or enabled = false in the daemon config, or on macOS (no pool unit), CiPool runs no check and controls no unit, and the daemon reports ci_slots null."},
+    {"id": "AC-52.48.7", "description": "infra's ryzen-mode.sh and ryzen-model-window.sh pause and resume CI through the daemon's rpc instead of stopping the unit by name, and infra-status.sh reads the pool through the moved script's path; infra keeps no copy of the moved files."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.48.1", "verifies": ["AC-52.48.1"], "name": "the moved pool tests run here (CI job)", "type": "unit", "preconditions": ["runner/ci/tests/ci-runner-pool-test.sh, runner-upgrade-test.sh and ci-job-handback-test.sh"], "steps": ["bash each test script from the repo root in the runner CI job", "git log --follow runner/ci/ci-runner-pool.sh"], "expected_results": ["every test exits 0; the log reaches infra's first commit of the file"]},
+    {"id": "TC-52.48.2", "verifies": ["AC-52.48.2"], "name": "the installed unit keeps its process model (bash test)", "type": "unit", "preconditions": ["the install script run against a temp root"], "steps": ["read the installed unit"], "expected_results": ["ExecStart under the release's runner/ci; KillMode=process; EnvironmentFile and directories unchanged"]},
+    {"id": "TC-52.48.3", "verifies": ["AC-52.48.3"], "name": "check-json mapped to ci_slots, and every failure (runner unit)", "type": "unit", "preconditions": ["CiPool with an injected command runner returning: fixture JSON with slots ok, ok, busy, held, broken; a 6 s sleep; 'not json'; JSON with error set"], "steps": ["CiPool.slots/1 for each"], "expected_results": ["%{total: 5, free: 2, busy: 2, paused: false}; then null three times with the reason logged"]},
+    {"id": "TC-52.48.4", "verifies": ["AC-52.48.4", "AC-52.48.5"], "name": "pause, resume and no second supervisor (runner unit)", "type": "unit", "preconditions": ["CiPool with an injected unit manager recording calls; unit active"], "steps": ["pause() twice", "resume() twice with the unit reported active after the first"], "expected_results": ["one stop; ci_slots.paused true; one start, none while active; no exec of the script without --check-json"]},
+    {"id": "TC-52.48.5", "verifies": ["AC-52.48.6"], "name": "CI disabled and macOS (runner unit)", "type": "unit", "preconditions": ["config without [ci]; config with enabled true and os :darwin"], "steps": ["CiPool.slots/1 and pause() under each"], "expected_results": ["null and no command run, both"]},
+    {"id": "TC-52.48.6", "verifies": ["AC-52.48.7"], "name": "infra's callers use the daemon (infra bash tests)", "type": "unit", "preconditions": ["infra's scripts/tests/ryzen-mode-test.sh and ryzen-model-window-test.sh with a stub loopctl_runner on PATH"], "steps": ["run both", "ls infra/scripts/ci-runner-pool.sh"], "expected_results": ["the stub receives pause then resume; no systemctl call on the pool unit; the file is absent"]}
+  ],
+  "technical_notes": [
+    "Why the daemon owns the unit instead of becoming its parent: the unit runs with KillMode=process so a supervisor restart leaves running jobs alone, and in ci.slice (CPUWeight=20, written by ci-runner-limits.sh :144) so a job yields to the developer (infra decision 0021). A pool started as a child of loopctl-runner.service would join that service's cgroup: a daemon restart would kill every running CI job, and jobs would lose the slice weighting.",
+    "History move: the same method release 2 used for runner/ and chg/ (README names table: runner source in this repo); infra's systemd unit and runbook move with the scripts, and infra's own references (ryzen-mode.sh:27,50, ryzen-model-window.sh:47, infra-status.sh:295-357, ci-job-handback-install.sh:186-194) change in an infra PR in this release.",
+    "Runner side (runner/): a new LoopctlRunner.CiPool under LoopctlRunner.Application's daemon children (/home/mkreyman/workspace/loopctl-runner/lib/loopctl_runner/application.ex:117), called from the status tick (control.ex:969) that US-52.47's HostReport uses; command execution goes through an injected runner module so tests never call systemctl (CLAUDE.md Dependency Injection).",
+    "--check-json's shape is documented in ci-runner-pool.sh's usage (:38-60): host, error, slots[] of {slot, state: ok|busy|held|stranded|broken}, counts. Stranded and broken slots count in total and in neither free nor busy.",
+    "JIT config minting keeps the box's GitHub auth (`gh api`, :2058) as today; moving that token to a loopctl-issued secret is R3's 'secrets loopctl issues' and is not done here (non_goals)."
+  ],
+  "dependencies": [
+    "US-52.47"
+  ],
+  "non_goals": [
+    "Rewriting the pool in Elixir: it moves as it is; its admission rules are unchanged.",
+    "Per-job scratch and warm snapshots: release 9 (PRD R8).",
+    "Issuing the pool's GitHub token from loopctl: a later story; the box's gh auth stays."
+  ],
+  "failure_modes": {"partition": "AC-52.48.3: the pool runs and admits jobs from GitHub whether or not loopctl is reachable; only the report pauses, and placement already skips a daemon whose sample is stale (US-52.47).", "state": "AC-52.48.2: the pool's slot state stays in its own runtime and state directories on the machine; loopctl holds only the latest reported count, re-sent every tick.", "retry": "AC-52.48.4: pause and resume are idempotent, so a repeated rpc from a ryzen model-window script changes nothing.", "slow": "AC-52.48.3: the check is bounded at 5 s, and a slow check reports ci_slots null rather than delaying the status.", "reach": "AC-52.48.4: the pool is reached on its machine through the daemon's rpc and the unit manager; loopctl reaches the daemon through its socket."},
+  "defaults": [
+    "Check timeout 5 s.",
+    "free = slots in state ok; busy = busy + held.",
+    "macOS reports ci_slots null until a pool runs there."
+  ],
+  "definition_of_done": [
+    "On beelink after rollout: runner_pool shows ci_slots for beelink matching `runner/ci/ci-runner-pool.sh --check-json` run by hand, and `bin/loopctl_runner rpc 'LoopctlRunner.CiPool.pause()'` leaves a running CI job finishing while no new one starts."
+  ],
+  "expected_size": {"insertions": 260, "files": 8},
+  "estimated_tokens": 300000
+}

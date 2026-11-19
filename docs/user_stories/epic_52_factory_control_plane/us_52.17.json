@@ -1,0 +1,60 @@
+{
+  "id": "US-52.17",
+  "title": "A work item carries its notes; orchestrator_state is folded in and deleted",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_3",
+  "story": {"as_a": "holder working an item", "i_want_to": "write the item's plan, progress, decisions and open questions onto the item itself", "so_that": "the next holder takes it over by reading its record, never by reconstructing it from a branch, a transcript or a prose handoff"},
+  "rationale": "PRD R1: a work item carries its plan, progress notes, decisions and open questions, and all work state lives in loopctl. A story today has only its spec (description, acceptance_criteria) and a metadata map that PATCH /api/v1/stories/:id replaces whole (CLAUDE.md, Chain-of-Custody Enforcement, lifecycle_entered_at), so a holder has nowhere safe to write progress. The one other place sessions keep loop state, orchestrator_states (lib/loopctl/orchestrator/orchestrator_state.ex:32-40), is a per-project JSON blob whose documented contents (docs/orchestration-guide.md:126-136: phase, last_verified, pending_review, cycle_counts) all duplicate story and stage state; PRD section 4 says release 3 folds it in or deletes it.",
+  "acceptance_criteria": [
+    {"id": "AC-52.17.1", "description": "A story_notes table (schema Loopctl.WorkItems.Note, context Loopctl.WorkItems) holds tenant_id, story_id, holder_id (nullable), author_api_key_id, section (plan | progress | decision | question), body (1 to 16384 bytes), idempotency_key (nullable) and inserted_at, append-only, with RLS enabled."},
+    {"id": "AC-52.17.2", "description": "WorkItems.write_note/4 accepts a note from the item's current holder (caller holder_id equals stories.assigned_holder_id) or from an orchestrator, user or superadmin key; any other agent-role caller gets {:error, {:held_by_other_holder, holder_id}}, or {:error, :not_holder} when the item has no holder."},
+    {"id": "AC-52.17.3", "description": "write_note/4 inserts the note and a note_written item event (Stages.record_item_event/4 with actor_holder_id, reason '<section> note', data {note_id, section}) in one transaction; if the event insert fails the note is not written."},
+    {"id": "AC-52.17.4", "description": "A note written again with the same (tenant_id, story_id, idempotency_key) returns the first note and writes no second note and no second event."},
+    {"id": "AC-52.17.5", "description": "WorkItems.list_notes/3 returns an item's notes oldest first, filtered by optional section, cursor-paginated (limit default 50, max 200, opaque after cursor), and its first page carries current: the newest note of each section."},
+    {"id": "AC-52.17.6", "description": "POST /api/v1/stories/:id/notes (role: :agent) and GET /api/v1/stories/:id/notes (role: :agent) expose them, with MCP tools work_item_note and work_item_notes declared, dispatched and in mcp-server/README.md; the write refusals render 409 held_by_other_holder / not_holder and 422 for a bad section or body size."},
+    {"id": "AC-52.17.7", "description": "Another tenant's story id is 404 on both routes and list_notes/3 never returns another tenant's notes."},
+    {"id": "AC-52.17.8", "description": "orchestrator_state is deleted: a migration copies each orchestrator_states row into audit_log (entity_type project, action orchestrator_state_retired, new_state = state_key, version and state_data) and drops the table; Loopctl.Orchestrator, Loopctl.Orchestrator.OrchestratorState, OrchestratorStateController, its three routes, the CLI state subcommand and their tests are removed, and the three paths answer 404."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.17.1", "verifies": ["AC-52.17.1", "AC-52.17.2", "AC-52.17.3"], "name": "holder, stranger and orchestrator writes; note and event together (DataCase)", "type": "integration", "preconditions": ["story claimed by holder H1 (assigned_holder_id provided by US-52.14); holder H2; an orchestrator key"], "steps": ["write_note as H1 section plan", "write_note as H2", "write_note as the orchestrator section decision", "write_note as H1 with a 16385-byte body"], "expected_results": ["{:ok, note} plus a note_written event naming H1; {:error, {:held_by_other_holder, h1}}; {:ok, note} with holder_id nil; changeset error on body"]},
+    {"id": "TC-52.17.2", "verifies": ["AC-52.17.3"], "name": "a failed event rolls the note back (DataCase)", "type": "integration", "preconditions": ["story deleted between the holder check and the event insert, simulated by passing a stale story id through write_note's injected story row (CLAUDE.md, Dependency Injection: the row as a value)"], "steps": ["write_note"], "expected_results": ["error, and SELECT count(*) FROM story_notes for that story is 0"]},
+    {"id": "TC-52.17.3", "verifies": ["AC-52.17.4"], "name": "a retried note is written once (DataCase)", "type": "integration", "preconditions": ["holder H1 holds the story"], "steps": ["write_note with idempotency_key k twice"], "expected_results": ["same note id; one note row; one note_written event"]},
+    {"id": "TC-52.17.4", "verifies": ["AC-52.17.5", "AC-52.17.7"], "name": "listing, current per section, pagination, isolation (DataCase)", "type": "integration", "preconditions": ["three plan notes and 60 progress notes; a second tenant with its own story and notes"], "steps": ["list_notes(tenant, story)", "follow the cursor", "list_notes(tenant, story, section: :plan)", "list_notes(tenant_a, story_b.id)"], "expected_results": ["50 then 13; current.plan is the newest plan; three plan notes; []"]},
+    {"id": "TC-52.17.5", "verifies": ["AC-52.17.6", "AC-52.17.7"], "name": "routes, status codes and roles (ConnCase)", "type": "integration", "preconditions": ["holder credentials H1 (holder) and H2; a user key; a story in another tenant"], "steps": ["POST notes as H1, as H2, with section \"memo\"", "GET notes as H2", "GET another tenant's story notes"], "expected_results": ["201; 409 held_by_other_holder; 422; 200; 404"]},
+    {"id": "TC-52.17.6", "verifies": ["AC-52.17.6"], "name": "MCP wiring for work_item_note and work_item_notes", "type": "unit", "preconditions": ["mcp-server with stubbed fetch"], "steps": ["call both tools"], "expected_results": ["POST and GET to the story's notes path with the agent key; both declared and dispatched (node --test)"]},
+    {"id": "TC-52.17.7", "verifies": ["AC-52.17.8"], "name": "orchestrator_state rows retire into audit_log and the routes are gone (DataCase + ConnCase)", "type": "integration", "preconditions": ["two orchestrator_states rows inserted before the migration in the migration test"], "steps": ["run the migration's up/0", "PUT and GET /api/v1/orchestrator/state/:project_id"], "expected_results": ["two orchestrator_state_retired audit rows carrying the state_data; table absent; 404 on both"]}
+  ],
+  "technical_notes": [
+    "Why a new table: stories.metadata is cast and whole-map-replaced by PATCH (CLAUDE.md, lifecycle_entered_at paragraph), so progress written there is erased by an ordinary request; description and acceptance_criteria are the spec; story_stage_events (US-52.16) is the log, and a note is state read by section and newest-first, which the log records but does not serve; channel_posts key slots are per agent and session with a retention window and no story; no row is copied into notes: US-52.22 (release 4) strips the key from existing non-handoff: slots, keeps them as 7-day channel messages, and refuses new keyed writes with keyed_slot_retired pointing at these notes.",
+    "Role: notes are a holder's progress on the item it holds, not work-breakdown data (CLAUDE.md, Before Changing Any Role Requirement, rule 2 keeps epics, stories and criteria at :orchestrator); this story adds that sentence to CLAUDE.md beside the KB carve-out. A note never changes acceptance criteria, status or custody fields.",
+    "Holder check reads stories.assigned_holder_id (provided by US-52.14) and the caller's api_keys.holder_id (provided by US-52.13); orchestrator+ via Loopctl.Auth.Role.role_at_least?/2. The event uses Stages.record_item_event/4 with :repo, provided by US-52.16.",
+    "Body bound 16384 bytes is the channel post body bound (lib/loopctl/coordination/channel_post.ex:97), referenced from one module attribute in the schema and the operation/2 spec (CLAUDE.md, Doc hygiene).",
+    "Routes join the stories routes in router.ex's authenticated scope (lib/loopctl_web/router.ex:461-466 neighbourhood) in a new WorkItemNoteController; route_coverage.test.js needs no gap rows for them because both get tools.",
+    "orchestrator_state removal: lib/loopctl/orchestrator.ex (save_state :47, get_state :87, get_state_history :128), lib/loopctl/orchestrator/orchestrator_state.ex, lib/loopctl_web/controllers/orchestrator_state_controller.ex, routes lib/loopctl_web/router.ex:595-597, RouteDiscoveryController entries lib/loopctl_web/controllers/route_discovery_controller.ex:442-457, the docs page section in lib/loopctl_web/controllers/page_html/docs.html.heex, CLI lib/loopctl/cli/commands/orchestrator.ex:68-110 and lib/loopctl/cli/main.ex:31, gap rows mcp-server/test/route_coverage.test.js:259-261, docs/orchestration-guide.md:120-153 (replaced by a pointer to work_item_note), Projects.Merge's table list lib/loopctl/projects/merge.ex:44 and its conflict entry :77-78, fixtures and tests (test/loopctl/orchestrator/orchestrator_test.exs, test/loopctl_web/controllers/orchestrator_state_controller_test.exs, test/loopctl/cli/commands/orchestrator_test.exs).",
+    "Fold-in check, recorded in the PR body: no MCP tool ever reached orchestrator_state (route_coverage.test.js:259-261 lists all three as gaps) and the fleet's guardrail refuses curl to loopctl (CLAUDE.md, MCP endpoint rule), so only the CLI or iex wrote it; every documented key duplicates story or stage state, so nothing is folded into notes and the rows go to audit_log as history. The migration's down/0 recreates the empty table only.",
+    "CHANGELOG.md: the removed /api/v1/orchestrator/state routes (breaking) and the new notes routes."
+  ],
+  "dependencies": [
+    "US-52.13",
+    "US-52.14",
+    "US-52.16"
+  ],
+  "non_goals": [
+    "Checkpoints (head, branch, working-tree diff): release 7 (README names table: checkpoint).",
+    "Retiring channel_posts keyed slots (keys stripped, rows kept as channel messages, new keyed writes refused keyed_slot_retired): US-52.22.",
+    "Showing notes in a timeline or in fleet_dash: release 5 (README names table: visibility)."
+  ],
+  "failure_modes": {"partition": "AC-52.17.4: a holder cut off mid-write resends the note with its idempotency key after reconnect and gets the first note back.", "state": "AC-52.17.1: notes live in story_notes beside the story; a session's memory of them is a copy, and the next holder reads list_notes (AC-52.17.5).", "retry": "AC-52.17.4: idempotency_key makes a retried write one note and one event.", "slow": "AC-52.17.5: reads are paginated with a bounded page, so a long-lived item never returns an unbounded body.", "reach": "n/a: written and read inline in the request process; nothing is queued."},
+  "defaults": [
+    "Writers: the item's current holder, plus orchestrator, user and superadmin keys.",
+    "Page size 50, maximum 200.",
+    "Retired orchestrator_states rows go to audit_log, not to notes."
+  ],
+  "definition_of_done": [
+    "From a session holding a story: work_item_note with section plan, then work_item_notes from a second session, returns the note with holder_id of the first session.",
+    "On production after deploy: SELECT count(*) FROM audit_log WHERE action = 'orchestrator_state_retired' equals the row count orchestrator_states had before the migration (read it first and put it in the PR body)."
+  ],
+  "expected_size": {"insertions": 420, "files": 12},
+  "estimated_tokens": 420000
+}

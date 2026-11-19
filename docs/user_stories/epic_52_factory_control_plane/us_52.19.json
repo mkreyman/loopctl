@@ -1,0 +1,60 @@
+{
+  "id": "US-52.19",
+  "title": "The session holder's lease is measured and set, and a holder's claims live by it",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_3",
+  "story": {"as_a": "holder working an item", "i_want_to": "keep my claims for as long as my session is alive, and lose them soon after it dies", "so_that": "a dead session never sits on an item for a day, and a live one is never robbed while its user is away"},
+  "rationale": "PRD R3: every holder's claim carries a lease, renewed while the holder works, and release 3 sets the session holder's lease and renewal interval by measurement (PRD section 9: how long interactive sessions go between tool calls). Today an interactive claim gets the global 24-hour lease (Progress.claim_lease_seconds/0, lib/loopctl/progress.ex:1763-1780) sized for a claimant that renews on its own schedule, so a crashed session holds its item for up to a day; runner claims already carry a shorter, wall-clock-capped lease (Loopctl.Delivery.DispatchLease, lib/loopctl/delivery/dispatch_lease.ex).",
+  "acceptance_criteria": [
+    {"id": "AC-52.19.1", "description": "mix loopctl.session_gaps PATH... reads Claude Code transcript JSONL files, groups entries by sessionId, and prints JSON with, per host directory given, the session count and the p50, p95, p99 and maximum gap in seconds between consecutive tool_use entries of one session, plus the count of gaps over 300 s and over 3600 s; a malformed line is counted under skipped_lines and never aborts the run."},
+    {"id": "AC-52.19.2", "description": "docs/factory/measurements/session-holder-lease.md records one run over the last 30 days of transcripts on every dev box (date, hosts, sessions, the percentiles), and the values it sets: HOLDER_HEARTBEAT_SECONDS and HOLDER_LEASE_SECONDS defaults in Loopctl.Holders, with the rule applied: renewal is driven by the MCP process's timer, not by tool calls, when the measured p99 tool-call gap exceeds the lease, and the lease is five heartbeat intervals."},
+    {"id": "AC-52.19.3", "description": "A claim made by a holder (Progress.claim_story/3 with :holder_id and no :lease_until) sets claimed_until to the holder's lease_until and claim_lease_cap to nil; a holder whose lease_until has passed or whose ended_at is set is refused {:error, :holder_lease_expired} (409 holder_lease_expired), so no holder claim is issued without a live lease."},
+    {"id": "AC-52.19.4", "description": "A holder heartbeat (Holders.heartbeat/3) moves claimed_until of every assigned or implementing story whose assigned_holder_id is that holder and whose claim_lease_cap is nil to the new lease_until, in the heartbeat's transaction, never to an earlier instant; capped claims are untouched."},
+    {"id": "AC-52.19.5", "description": "Progress.renew_claim/3 by a holder on an uncapped claim sets claimed_until to the holder's lease_until instead of now plus claim_lease_seconds/0; renewals by keys with no holder keep the global lease."},
+    {"id": "AC-52.19.6", "description": "A heartbeat arriving after the holder's lease_until is refused 409 holder_lease_expired, ends the holder (ended_reason lapsed) and revokes its credential; the MCP server answers that refusal by registering again (a new holder) and logging the lapse to stderr."},
+    {"id": "AC-52.19.7", "description": "ReclaimExpiredClaimsWorker, on each run, also ends every holder of kind interactive or cloud whose lease_until is before now (ended_reason lapsed, credential revoked), after releasing expired claims, so a dead session's holder and its claims are both gone within one lease plus one sweep interval."},
+    {"id": "AC-52.19.8", "description": "An explicit holder end releases each uncapped claim the holder holds through unclaim_story/3's path, with a released item event whose reason is 'holder ended', in the end's transaction."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.19.1", "verifies": ["AC-52.19.1"], "name": "gap statistics from fixture transcripts", "type": "unit", "preconditions": ["tmp_dir with two hosts' JSONL: session A tool_use at t=0, 10, 400 s; session B at 0, 4000 s; one malformed line"], "steps": ["Mix.Tasks.Loopctl.SessionGaps.run([host1, host2])"], "expected_results": ["per-host p50/p99/max match the hand-computed gaps; over_300 = 2, over_3600 = 1; skipped_lines = 1"]},
+    {"id": "TC-52.19.8", "verifies": ["AC-52.19.2"], "name": "the shipped defaults are the measured ones", "type": "unit", "preconditions": ["docs/factory/measurements/session-holder-lease.md with a line 'HOLDER_HEARTBEAT_SECONDS: <n>' and 'HOLDER_LEASE_SECONDS: <m>'"], "steps": ["parse both values from the doc; read Loopctl.Holders.default_heartbeat_seconds/0 and default_lease_seconds/0"], "expected_results": ["equal, and lease = 5 x heartbeat"]},
+    {"id": "TC-52.19.2", "verifies": ["AC-52.19.3"], "name": "a holder claim takes the holder's lease; a lapsed holder cannot claim (DataCase)", "type": "integration", "preconditions": ["holder H with lease_until now+300 s; holder L with lease_until in the past (holders provided by US-52.13)"], "steps": ["claim as H", "claim another story as L"], "expected_results": ["claimed_until == H.lease_until, claim_lease_cap nil; {:error, :holder_lease_expired}"]},
+    {"id": "TC-52.19.3", "verifies": ["AC-52.19.4", "AC-52.19.5"], "name": "heartbeat and renew move uncapped claims only (DataCase)", "type": "integration", "preconditions": ["H holds story S1 uncapped and S2 capped (lease_until passed to claim_story); a plain-key claim S3"], "steps": ["Holders.heartbeat(tenant, h, now)", "Progress.renew_claim(S1) as H", "renew_claim(S3) as the plain key"], "expected_results": ["S1 claimed_until = new lease_until, S2 unchanged; S1 again at lease_until; S3 at now + claim_lease_seconds"]},
+    {"id": "TC-52.19.4", "verifies": ["AC-52.19.6"], "name": "a late heartbeat ends the holder (ConnCase)", "type": "integration", "preconditions": ["holder whose lease_until is 1 s in the past"], "steps": ["POST heartbeat with its credential", "POST heartbeat again"], "expected_results": ["409 holder_lease_expired; then 401 (credential revoked)"]},
+    {"id": "TC-52.19.5", "verifies": ["AC-52.19.6"], "name": "MCP re-registers after a lapse", "type": "unit", "preconditions": ["mcp-server with stubbed fetch returning 409 holder_lease_expired on heartbeat"], "steps": ["advance timers one heartbeat"], "expected_results": ["one new POST /api/v1/holders and later calls use the new credential (node --test)"]},
+    {"id": "TC-52.19.6", "verifies": ["AC-52.19.7"], "name": "the sweep ends lapsed holders after releasing their claims (DataCase)", "type": "integration", "preconditions": ["interactive holder D with lease_until and its claim's claimed_until both in the past; a live holder; a runner_session holder with a past lease_until; a lapsed holder in another tenant"], "steps": ["perform ReclaimExpiredClaimsWorker"], "expected_results": ["D's claim released with a released event 'lease expired'; D ended lapsed; live and runner_session holders untouched; the other tenant's holder ended in its own tenant only"]},
+    {"id": "TC-52.19.7", "verifies": ["AC-52.19.8"], "name": "end releases the holder's claims (DataCase)", "type": "integration", "preconditions": ["H holds S1 uncapped"], "steps": ["Holders.end_holder(tenant, h, actor)"], "expected_results": ["S1 pending, assigned_holder_id nil, a released event with reason 'holder ended'"]}
+  ],
+  "technical_notes": [
+    "The measurement is PRD section 9's open question; the run happens inside this story, before its values are committed. Transcripts live under ~/.claude/projects/<project>/<session>.jsonl on each machine; copy each host's directory to one place (scp) and pass the directories; nothing is uploaded anywhere else. Hosts: minis, x1, ryzen, beelink, nuc, mac-mini, blockit (USER.md, Environment; xps13 is retired).",
+    "Expected finding, to be confirmed or overturned by the run: interactive sessions sit idle for hours while Mark is away, so renewal on tool calls would release his items while he is gone; the MCP process stays alive while the session is open, so its timer (US-52.13) is the renewal source and the lease bounds only how long a dead process keeps its claims.",
+    "Lease constants: Loopctl.Holders.lease_seconds/0 and heartbeat_seconds/0 (provided by US-52.13) take the measured defaults; deploy/FLY_SECRETS.md rows say what breaks if each is wrong (too short: live sessions lose items on a slow network; too long: a dead session holds items that long).",
+    "Claim lease: claim_lease_change/3 (lib/loopctl/progress.ex:1792-1805) gains the holder case; do_claim_story/3 (:283) reads the holder row under the story lock; renewal/4 (:2232-2257) and renew_claim/3 (:2193) take the holder's lease_until; the stories_claim_lease_within_cap CHECK is untouched because holder claims carry no cap.",
+    "The heartbeat's claims UPDATE takes story rows after the holder row; nothing else takes a holder row after a story row except the claim path, which reads the holder without locking it, so no lock cycle is added (lock order: stages.ex:62-84).",
+    "ReclaimExpiredClaimsWorker: lib/loopctl/workers/reclaim_expired_claims_worker.ex, calling Progress.reclaim_expired_claim/3 (progress.ex:2365) per story; the holder pass runs after it in the same perform. Runner-session holders end through the runner's session_ended message, never through this sweep.",
+    "assigned_holder_id provided by US-52.14; the released item event by US-52.16."
+  ],
+  "dependencies": [
+    "US-52.13",
+    "US-52.14",
+    "US-52.16"
+  ],
+  "non_goals": [
+    "Keeping an interactive item out of the loop after its holder ends: US-52.46 (release 7). Until then a lapsed or ended interactive holder's claims release through the normal paths (AC-52.19.7, AC-52.19.8) and the item is pending like any story; US-52.46 reserves the still-unheld ones at its deploy.",
+    "A holder replaying events and checkpoints after a partition: release 10 (PRD R9).",
+    "Changing the global claim lease or runner dispatch leases."
+  ],
+  "failure_modes": {"partition": "AC-52.19.6: a holder cut off past its lease is ended on its next heartbeat and its claims are released by the sweep (AC-52.19.7); on reconnect it registers anew and re-claims what is still free.", "state": "AC-52.19.4: the lease lives in holders.lease_until and each claim's claimed_until in loopctl; the MCP process holds only its timer.", "retry": "AC-52.19.4: a repeated heartbeat moves leases forward only, so a duplicate changes nothing; a repeated end releases nothing twice (AC-52.19.8 runs only for claims still held).", "slow": "AC-52.19.2: the lease is five heartbeat intervals, so up to four delayed or lost heartbeats keep the claims.", "reach": "AC-52.19.7: lapsed holders are found by the existing Oban cron on any loopctl node; a live holder is reached through its MCP process's heartbeat."},
+  "defaults": [
+    "Until the measurement runs: HOLDER_HEARTBEAT_SECONDS 60, HOLDER_LEASE_SECONDS 300 (five heartbeats).",
+    "Lease = 5 x heartbeat interval.",
+    "An explicit end releases the holder's claims at once rather than waiting for the lease."
+  ],
+  "definition_of_done": [
+    "docs/factory/measurements/session-holder-lease.md exists with the run's numbers from every reachable dev box, and a host that was unreachable is named as such.",
+    "Kill -9 a session's MCP process on minis while it holds a story; within lease plus one sweep interval SELECT assigned_holder_id FROM stories WHERE id = '<id>' is NULL and the holder row has ended_reason lapsed."
+  ],
+  "expected_size": {"insertions": 330, "files": 9},
+  "estimated_tokens": 350000
+}

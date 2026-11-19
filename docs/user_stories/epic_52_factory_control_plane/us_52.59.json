@@ -1,0 +1,51 @@
+{
+  "id": "US-52.59",
+  "title": "The end-to-end suite proves a killed CI job leaves nothing behind and a snapshot serves another host",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "medium",
+  "phase": "factory_release_9",
+  "story": {"as_a": "factory release about to roll out", "i_want_to": "run the sandbox repo's CI through a killed job, an unreachable snapshot store and a hop between hosts", "so_that": "a regression back to shared CI state fails the suite before it reaches the fleet"},
+  "rationale": "PRD R7 assigns no end-to-end path to R8 by name, but the defect R8 exists for was found only in production: a killed job's Mix build lock hung later jobs on the same host for 600 s (chg#119, fixed in chg by 7bbc5dc with per-run roots and a per-job TMPDIR). US-52.58's guards check the workflow's text; only a real run on real fleet-ci hosts shows that nothing survives a job, that a missing snapshot store costs speed and not a red run, and that a snapshot built on one host is exact on another. The sandbox repo of the end-to-end suite is where such runs cost nothing.",
+  "acceptance_criteria": [
+    {"id": "AC-52.59.1", "description": "The suite installs into the sandbox repo a workflow rendered from e2e/sandbox/ci.yml.eex, whose test job uses the same container image digest, TMPDIR, MIX_TEST_PARTITION pattern, warm step and always-drop step as loopctl's Test job, and takes a workflow_dispatch input `host` that it adds to runs-on as `[self-hosted, fleet-ci, <host>]`."},
+    {"id": "AC-52.59.2", "description": "Path ci_killed_job: the suite dispatches a sandbox run on host H, cancels it through the GitHub API once its compile step is in progress, dispatches a second run of the same commit on H, and passes only when the second run succeeds with its compile step under 120 s."},
+    {"id": "AC-52.59.3", "description": "Path ci_snapshot_unreachable: a run dispatched with the input `snapshot_url` set to http://127.0.0.1:9 logs `snapshot: miss` from the warm step and still succeeds."},
+    {"id": "AC-52.59.4", "description": "Path ci_cross_host_snapshot: after the sandbox's snapshot job publishes from host A, a run of the same commit on host B logs a snapshot hit with behind 0 and no `Compiling` line for the sandbox's own modules."},
+    {"id": "AC-52.59.5", "description": "The sandbox workflow's last step, run if: always(), prints `leftover: <n>`, the number of databases on the CI Postgres whose name contains `_ci_<run_id>_`, after the drop; every path fails when a run it started logs a leftover above 0."},
+    {"id": "AC-52.59.6", "description": "The three paths are tagged :ci_isolation, run with the rest of `mix e2e` nightly and on every factory release, and each fails, naming the run URL and the step, when a run it waits on has not finished within 30 minutes."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.59.1", "verifies": ["AC-52.59.1"], "name": "the sandbox template matches loopctl's Test job (unit, no network)", "type": "unit", "preconditions": ["e2e/sandbox/ci.yml.eex rendered with host beelink; .github/workflows/ci.yml parsed"], "steps": ["compare container.image, env.TMPDIR, env.MIX_TEST_PARTITION's shape, the warm step's run text and the drop step"], "expected_results": ["equal on each; runs-on is [self-hosted, fleet-ci, beelink]"]},
+    {"id": "TC-52.59.2", "verifies": ["AC-52.59.2", "AC-52.59.5"], "name": "e2e path ci_killed_job against mkreyman/loopctl-e2e-sandbox", "type": "integration", "preconditions": ["the sandbox repo with the rendered workflow pushed; a GitHub token able to dispatch and cancel its runs; host beelink"], "steps": ["dispatch run 1 on beelink; poll its jobs until the compile step is in_progress; cancel it", "dispatch run 2 on beelink; wait for it"], "expected_results": ["run 2 succeeds; its compile step's duration < 120 s; both runs' logs (run 1's if: always() step included) show leftover: 0"]},
+    {"id": "TC-52.59.3", "verifies": ["AC-52.59.3"], "name": "e2e path ci_snapshot_unreachable", "type": "integration", "preconditions": ["as TC-52.59.2"], "steps": ["dispatch with snapshot_url=http://127.0.0.1:9; wait"], "expected_results": ["the warm step logs snapshot: miss; the run succeeds"]},
+    {"id": "TC-52.59.4", "verifies": ["AC-52.59.4"], "name": "e2e path ci_cross_host_snapshot", "type": "integration", "preconditions": ["a sandbox commit pushed to master; hosts beelink (A) and x1 (B)"], "steps": ["wait for the master run's snapshot job on beelink to succeed", "dispatch the same commit on x1; read the warm and compile step logs"], "expected_results": ["behind 0; no Compiling line for project modules"]},
+    {"id": "TC-52.59.5", "verifies": ["AC-52.59.6"], "name": "a run that never finishes fails its path with the URL (unit, GitHub API stubbed)", "type": "unit", "preconditions": ["the suite's run-waiter with a stub API that always answers in_progress and an injected clock"], "steps": ["wait on a run with the clock advancing 31 minutes"], "expected_results": ["the path fails; the message carries the run URL and the in-progress step's name"]}
+  ],
+  "technical_notes": [
+    "The suite, its `mix e2e` task and the sandbox repo mkreyman/loopctl-e2e-sandbox are provided by release 2 (README names table: end-to-end suite). This story adds the paths under e2e/ and the template e2e/sandbox/ci.yml.eex; it adds no production code.",
+    "Template source of truth: loopctl's Test job as US-52.58 leaves it (.github/workflows/ci.yml:304 today). TC-52.59.1 is the guard that keeps the two from drifting.",
+    "Host labels: the fleet-ci pool registers each slot with its host's name as a label (infra runbooks/ci-runner-setup.md:42 for beelink's; per-host blocks at :1861-1945). ryzen is CI only while its model is off (infra decisions/0022), so the paths use beelink and x1 by default.",
+    "Cancelling: POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel; the compile step's state comes from GET .../runs/{run_id}/jobs. A cancelled job still runs its if: always() steps, so run 1's leftover line is readable.",
+    "The original defect and fix: chg adapters/elixir/test/integration_test.exs:12-19 (per-run roots named by OS pid and random bytes) and :59-60 (stale roots swept), chg .github/workflows/ci.yml:151-155 (per-job TMPDIR).",
+    "The CI Postgres and its reaper: infra runbooks/ci-runner-setup.md:800-869 (port 5433, `_ci_` names, reaper as backstop)."
+  ],
+  "dependencies": [
+    "US-52.58"
+  ],
+  "non_goals": [
+    "The paths PRD R7 names for other releases (escalation, red CI, moves, messaging): their own releases.",
+    "Measuring CI wall clock: US-52.58's definition of done.",
+    "Any change to the workflow or to chg: US-52.58 and US-52.57."
+  ],
+  "failure_modes": {"partition": "AC-52.59.3: the suite cuts the job off from loopctl and the snapshot store and asserts the job still passes cold.", "state": "AC-52.59.5: each run reports the databases left behind for its run id, and any leftover fails the path, so per-job state is shown destroyed rather than assumed.", "retry": "AC-52.59.2: a second run of the same commit after a killed one is the retry, and it must pass without waiting on anything the first left.", "slow": "AC-52.59.6: every wait on a GitHub run is bounded at 30 minutes and fails with the run URL, so a stuck runner never hangs the nightly suite.", "reach": "AC-52.59.4: the snapshot built on one host is consumed on another, through loopctl and the object store, never through the host's local disk."},
+  "definition_of_done": [
+    "`mix e2e --only ci_isolation` passes from minis against the sandbox, and its output links the five runs it started.",
+    "With US-52.58's TMPDIR line removed from the sandbox template, ci_killed_job fails (checked once on a scratch branch, not committed)."
+  ],
+  "defaults": [
+    "Hosts: beelink as A and H, x1 as B (owner may change).",
+    "Compile budget after a killed run: 120 s; wait bound per run: 30 minutes."
+  ],
+  "expected_size": {"insertions": 0, "files": 0},
+  "estimated_tokens": 250000
+}

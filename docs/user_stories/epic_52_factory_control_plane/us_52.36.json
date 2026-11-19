@@ -1,0 +1,59 @@
+{
+  "id": "US-52.36",
+  "title": "Intake re-check before triage: an issue already fixed on base closes with evidence",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_6",
+  "story": {"as_a": "the delivery loop", "i_want_to": "check an incoming issue against what base already contains before I spend a triage dispatch on it", "so_that": "an issue a merged change already fixed is closed with the proof, and no holder spends a session on it"},
+  "rationale": "PRD R6: 'Before triage, intake checks whether the issue is already fixed, a duplicate, or no longer reproduces, and closes it with the evidence.' Today TriageTrigger.promote/1 (triage_trigger.ex:108) creates the stub at detected and TriageDispatcher (triage_dispatcher.ex:141) dispatches triage@1 for every candidate, so an issue a merged PR already closed still costs a three-lens triage session; IssueClosure carries a verdict and a label but no evidence (issue_closure.ex:63-79). This story adds the re-check step to the triage dispatch pass, the first of three findings (already fixed), and the evidence field every auto-close carries from now on.",
+  "acceptance_criteria": [
+    {"id": "AC-52.36.1", "description": "Loopctl.Delivery.IntakeRecheck.run/2 (tenant_id, story) runs inside TriageDispatchWorker's pass before TriageDispatcher.run/1, over stories at detected that have an intake record, whose source is not paused, and that have no 'rechecked' event since their newest entry into detected; it writes one 'rechecked' event with data %{findings: [...], checked_at, base_sha}."},
+    {"id": "AC-52.36.2", "description": "triage@1's candidate predicates gain :rechecked, so TriageDispatcher.candidates/1 returns a detected story only after a 'rechecked' event newer than its newest entry into detected; a story re-entering detected (retriage, human re-triage) is re-checked again."},
+    {"id": "AC-52.36.3", "description": "The finding already_fixed holds when the record's chg finding (Findings.for_record/1) has state fixed with a fix_merge_sha that PullRequestSource.contains?/3 reports in the source's base branch, or when the new callback PullRequestSource.closing_references/3 returns a merged pull request into the base branch whose body or title closes the issue number with a GitHub closing keyword and whose merge commit base contains."},
+    {"id": "AC-52.36.4", "description": "An already_fixed story moves detected -> done over the new control-only edge :recheck_fixed in the same transaction as the 'rechecked' event; StageMachine.resolution_verdict/1 maps it to the new verdict :already_fixed, which Resolution maps to the existing loopctl:resolution-not-actionable label with its own resolution text naming the fix."},
+    {"id": "AC-52.36.5", "description": "issue_closures gains evidence (text, at most 2000 codepoints, built from loopctl-held facts only: PR number and URL, merge sha, finding id, ledger row ids), set for every verdict a re-check reaches, and IssueCloser posts it as an 'Evidence' section of the closing comment after the resolution text."},
+    {"id": "AC-52.36.6", "description": "A forge call that fails or times out records the finding forge_unavailable in the 'rechecked' event and lets the story proceed to triage, so a forge outage never holds an issue at detected."},
+    {"id": "AC-52.36.7", "description": "Running the pass twice over the same story writes one 'rechecked' event and at most one transition: the event write is guarded by the stage row lock and the 'no rechecked event since entry' condition re-read under it."},
+    {"id": "AC-52.36.8", "description": "An issue no merged change closes is not closed: the 'rechecked' event lists finding none and the story reaches TriageDispatcher.candidates/1 in the same pass."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.36.1", "verifies": ["AC-52.36.1", "AC-52.36.8"], "name": "the pass re-checks, then triage takes the story (DataCase, PullRequestSourceMock)", "type": "integration", "preconditions": ["a promoted story at detected under an intake source; mock closing_references -> []; a story under a paused source"], "steps": ["TriageDispatchWorker.perform/1", "Stages.list_events/2"], "expected_results": ["one rechecked event with findings [none]; a triage dispatch placed; the paused source's story untouched"]},
+    {"id": "TC-52.36.2", "verifies": ["AC-52.36.2"], "name": "triage waits for the re-check and re-checks after re-entry (DataCase)", "type": "integration", "preconditions": ["a detected story with no rechecked event; a story rechecked, then sent queued -> detected over :retriage"], "steps": ["TriageDispatcher.candidates(10)"], "expected_results": ["neither story is a candidate"]},
+    {"id": "TC-52.36.3", "verifies": ["AC-52.36.3", "AC-52.36.4"], "name": "a merged PR that closes the issue moves the item to done (DataCase, PullRequestSourceMock)", "type": "integration", "preconditions": ["mock closing_references returns PR 41 'Fixes #12' merged at sha m1; contains?(base, m1) true"], "steps": ["IntakeRecheck.run(tenant.id, story)"], "expected_results": ["stage done over recheck_fixed; closure verdict already_fixed, label loopctl:resolution-not-actionable"]},
+    {"id": "TC-52.36.4", "verifies": ["AC-52.36.3"], "name": "a chg finding fixed on base is enough; one fixed off base is not (DataCase)", "type": "integration", "preconditions": ["the record's finding with state fixed and fix_merge_sha f1; contains? true then false"], "steps": ["IntakeRecheck.run twice on two such stories"], "expected_results": ["first already_fixed; second none"]},
+    {"id": "TC-52.36.5", "verifies": ["AC-52.36.5"], "name": "the closing comment carries the evidence (DataCase, PullRequestSourceMock)", "type": "integration", "preconditions": ["an already_fixed closure row with evidence"], "steps": ["IssueCloser performs the row"], "expected_results": ["comment_issue body contains the resolution text, then 'Evidence', PR 41 and sha m1; no reporter text"]},
+    {"id": "TC-52.36.6", "verifies": ["AC-52.36.6"], "name": "a forge outage lets triage proceed (DataCase, PullRequestSourceMock)", "type": "integration", "preconditions": ["mock closing_references -> {:error, :timeout}"], "steps": ["TriageDispatchWorker.perform/1"], "expected_results": ["rechecked event with forge_unavailable; a triage dispatch placed"]},
+    {"id": "TC-52.36.7", "verifies": ["AC-52.36.7"], "name": "two passes at once write one event (DataCase, two connections)", "type": "integration", "preconditions": ["a detected story; Loopctl.Test.ProductionTopology"], "steps": ["IntakeRecheck.run concurrently twice"], "expected_results": ["one rechecked event"]},
+    {"id": "TC-52.36.8", "verifies": ["AC-52.36.3"], "name": "closing_references request shape (unit, Req.Test)", "type": "unit", "preconditions": ["GithubPullRequestSource with a Req.Test stub of the search API"], "steps": ["closing_references(repo, 12, base)"], "expected_results": ["one GET with is:pr is:merged base:<base> and the issue reference; parsed numbers, merge shas and bodies"]}
+  ],
+  "technical_notes": [
+    "Where it runs: TriageDispatchWorker (oban_config.ex:691, every minute) calls IntakeRecheck before TriageDispatcher.run/1 (lib/loopctl/delivery/triage_dispatcher.ex:141). Why not TriageTrigger.promote/1 (triage_trigger.ex:108): promote creates the stub inside a transaction on intake facts only and runs per record; a forge call there would hold the record lock across the network. The re-check is its own pass on the stub, so the stub is the single item every finding is recorded against.",
+    "Candidates: :rechecked joins Loopctl.Agents.Candidates' predicate set (lib/loopctl/agents/candidates.ex:101-134) and triage@1's list (lib/loopctl/agents/specs/triage_v1.ex); :intake_not_paused is provided by US-52.33.",
+    "Facts: Findings.for_record/1 (lib/loopctl/changes/findings.ex:584) and Finding fields state, fix_merge_sha (lib/loopctl/changes/finding.ex:31-54); PullRequestSource.contains?/3 (lib/loopctl/delivery/pull_request_source.ex:274); the new callback closing_references/3 joins the behaviour (:173-365) and GithubPullRequestSource uses the issues search API under its existing timeouts and token.",
+    "Closing keywords: close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved, followed by #N or owner/repo#N for the source's repo, case-insensitive; a mention without a keyword is not evidence.",
+    "Edge and verdict: add {:detected, :done, :recheck_fixed} to @transitions (stage_machine.ex:286) as control-only (refused by Stages.advance/4 from other callers, stages.ex:2114) and to @resolution_verdicts (:708) as :already_fixed; Resolution (lib/loopctl/delivery/resolution.ex:65-128) gains :already_fixed in @verdicts and for_verdict/1, keeping the two labels, because the reporting system binds to labels/0.",
+    "Evidence: issue_closures migration adds evidence; Stages.record_issue_closure/3 (stages.ex:981) takes it from the transition's event data; IssueCloser (lib/loopctl/delivery/issue_closer.ex) appends it. Evidence is built only from loopctl's records and forge fields it parsed (numbers, shas, URLs), never from issue or PR text, so it carries no reporter content.",
+    "The 'rechecked' event is a non-stage event of the work-item event log provided by release 3 (README names table: work-item event log); its data never carries forge text.",
+    "Docs: docs/agent-delivery-loop.md intake section and CHANGELOG.md (new edge, verdict, closing comment section)."
+  ],
+  "dependencies": [
+    "US-52.33"
+  ],
+  "non_goals": [
+    "Duplicate and stale findings: US-52.37.",
+    "Re-running the reported reproduction: US-52.38.",
+    "Re-opening an issue a re-check closed in error: the reporter reopens it, and the existing reopen path makes a new generation."
+  ],
+  "failure_modes": {"partition": "AC-52.36.6: a forge that cannot be reached is a forge_unavailable finding and triage proceeds; the re-check never blocks an issue on the forge.", "state": "AC-52.36.1: the re-check's result is a 'rechecked' event in the append-only log; a crash before it is written leaves the story at detected with no event, and the next pass re-checks it.", "retry": "AC-52.36.7: the event and any transition are written once under the stage row lock, so a retried or concurrent pass is a no-op.", "slow": "AC-52.36.6: each forge call runs under PullRequestSource's timeout and the pass checks at most the TriageDispatcher batch size per run, so a slow forge delays one batch and falls back to forge_unavailable.", "reach": "AC-52.36.1: the step runs inside the existing minute TriageDispatchWorker cron on any node; a story missed by a dead node is picked up by the next run."},
+  "definition_of_done": [
+    "On production, a sandbox issue opened after a merged sandbox PR that says 'Fixes #N' is closed within five minutes with the not-actionable label and a comment carrying an Evidence section naming that PR.",
+    "SELECT count(*) FROM runner_dispatches WHERE kind = 'triage' AND story_id = <that item> returns 0."
+  ],
+  "defaults": [
+    "already_fixed closes with the existing loopctl:resolution-not-actionable label and its own text, so HomeCareBilling's label binding keeps working.",
+    "A forge outage lets triage proceed rather than holding the issue.",
+    "Evidence at most 2000 codepoints, loopctl facts only."
+  ],
+  "expected_size": {"insertions": 420, "files": 12},
+  "estimated_tokens": 550000
+}

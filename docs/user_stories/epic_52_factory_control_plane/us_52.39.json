@@ -1,0 +1,46 @@
+{
+  "id": "US-52.39",
+  "title": "End to end: an issue already fixed on base closes with evidence and no triage",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_6",
+  "story": {"as_a": "Mark", "i_want_to": "see a real sandbox issue that a merged PR already fixed closed by intake with the proof, before any triage session runs", "so_that": "release 6's re-check is proven on the deployed system against the real forge"},
+  "rationale": "PRD R6's end-to-end path is 'an issue already fixed'. US-52.36's tests stub the forge; only the real GitHub search, closing keywords, base containment, the closure outbox and the label binding together prove the reporter is told with evidence and no dispatch is spent. This story adds one scenario to the end-to-end suite.",
+  "acceptance_criteria": [
+    {"id": "AC-52.39.1", "description": "A new scenario in the end-to-end suite opens sandbox issue N, opens and merges into the sandbox's base branch a PR whose body says 'Fixes #N', with intake for the sandbox paused (intake_pause) while it does so, then resumes intake."},
+    {"id": "AC-52.39.2", "description": "Within a bound of 10 minutes after resume the item is at done over edge recheck_fixed, read from the stage route."},
+    {"id": "AC-52.39.3", "description": "Issue N is closed and carries the loopctl:resolution-not-actionable label, and its closing comment contains the already-fixed resolution text and an Evidence section naming the PR number and its merge sha."},
+    {"id": "AC-52.39.4", "description": "work_item_timeline for the item shows a 'rechecked' event with finding already_fixed before the transition into done, and no triage dispatch exists for the item."},
+    {"id": "AC-52.39.5", "description": "The scenario cleans up whatever it created even when it fails (reverts the sandbox change, closes leftovers, resumes intake if it paused it), and a failure prints the item's timeline."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.39.1", "verifies": ["AC-52.39.1", "AC-52.39.2", "AC-52.39.3", "AC-52.39.4"], "name": "mix e2e --only already_fixed against the sandbox", "type": "integration", "preconditions": ["deployed loopctl with release 6; sandbox enrolled with a live intake source"], "steps": ["run the scenario"], "expected_results": ["item done over recheck_fixed; issue closed with label and evidence; no triage dispatch"]},
+    {"id": "TC-52.39.2", "verifies": ["AC-52.39.5"], "name": "a forced failure still cleans up and resumes intake", "type": "integration", "preconditions": ["E2E_FAIL_AT=after_merge"], "steps": ["run the scenario", "read the sandbox source's paused_at and open issues of the run"], "expected_results": ["scenario fails with the timeline printed; paused_at nil; nothing of the run left open"]},
+    {"id": "TC-52.39.3", "verifies": ["AC-52.39.4"], "name": "no triage dispatch for the item (step inside the scenario)", "type": "integration", "preconditions": ["the item done"], "steps": ["work_item_timeline and the dispatch list for the item"], "expected_results": ["no dispatch of kind triage"]}
+  ],
+  "technical_notes": [
+    "Suite: the end-to-end suite and its sandbox helpers are provided by release 2 (README names table: end-to-end suite); add one scenario module.",
+    "Why pause intake while setting up: without it the issue would be promoted and re-checked before the PR merged, so the scenario could not tell a re-check that works from one that ran too early; intake_pause and intake_resume are US-52.33.",
+    "Reads: the stage route (lib/loopctl_web/router.ex:474), work_item_timeline (US-52.29), the sandbox issue through the suite's GitHub helper.",
+    "The scenario merges a trivial sandbox file change and reverts it in cleanup, so the sandbox base never accumulates scenario commits."
+  ],
+  "dependencies": [
+    "US-52.29",
+    "US-52.33",
+    "US-52.36"
+  ],
+  "non_goals": [
+    "Duplicate and stale paths end to end: their DataCase tests cover them; a stale end to end needs three base runs.",
+    "The recheck@1 reproduction run end to end."
+  ],
+  "failure_modes": {"partition": "AC-52.39.2: the wait is bounded and re-reads the stage route; a lost answer is never assumed.", "state": "AC-52.39.5: cleanup restores the sandbox base and the source's pause state on success and failure.", "retry": "AC-52.39.5: each run opens its own issue and PR, so reruns never share an item.", "slow": "AC-52.39.2: past 10 minutes the scenario fails with the timeline printed rather than hanging.", "reach": "n/a: one mix process against the deployed API; it schedules nothing."},
+  "definition_of_done": [
+    "mix e2e --only already_fixed passes against production and the sandbox, and its run is linked in the release PR.",
+    "The sandbox intake source is not paused after the run."
+  ],
+  "defaults": [
+    "Bound: 10 minutes from resume to done (owner may change)."
+  ],
+  "expected_size": {"insertions": 160, "files": 2},
+  "estimated_tokens": 200000
+}

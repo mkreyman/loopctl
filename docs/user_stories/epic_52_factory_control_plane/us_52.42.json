@@ -1,0 +1,52 @@
+{
+  "id": "US-52.42",
+  "title": "A late holder's checkpoint is kept fenced for the current holder to apply or ignore",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_7",
+  "story": {"as_a": "holder whose lease lapsed during a partition", "i_want_to": "have my replayed checkpoint stored on the item as fenced instead of dropped or applied", "so_that": "the current holder decides whether my uncommitted work is used, and nothing I did is lost silently"},
+  "rationale": "PRD section 7 point 1: a lease that lapses during a partition is reclaimed and the late holder's replayed events are fenced by the claim epoch, 'exactly as runner reports are today', but its checkpoint, diff included, 'is not dropped. It is stored on the work item as a fenced checkpoint ... for the current holder to apply or ignore.' Today a stale epoch is simply refused (Progress.check_claim_epoch/3, lib/loopctl/progress.ex:2282; Stages.advance/4 refuses the old epoch, stages.ex:1698), so the work behind it is gone. US-52.41 refuses a caller that never held the item; this story keeps a caller that did.",
+  "acceptance_criteria": [
+    {"id": "AC-52.42.1", "description": "Checkpoints.record/4 from a holder whose presented claim_epoch is older than the story's, and whose holder id the item's log names on the claim at that epoch, stores the checkpoint with fenced: true, the presented claim_epoch and attrs done and next joined into summary, writes no progress note, and answers {:ok, checkpoint, :fenced}, rendered 202 with fenced: true and the current holder's id (null when none)."},
+    {"id": "AC-52.42.2", "description": "A fenced checkpoint changes nothing else on the item: its stage row, claim, assigned_holder_id, notes and newest unfenced checkpoint are byte-identical before and after, and the log gains one checkpoint_fenced event naming the late holder and its epoch."},
+    {"id": "AC-52.42.3", "description": "In the same transaction a thread message on the item, inserted through Loopctl.Coordination.Messages.insert/2, says 'Holder <id> (<kind> on <host>) left a fenced checkpoint <checkpoint_id> from epoch <n>: apply it or ignore it with work_item_checkpoint_resolve.'"},
+    {"id": "AC-52.42.4", "description": "Checkpoints.for_pull/2 returns the item's newest unfenced checkpoint (nil when none) and every fenced checkpoint whose resolution is null, oldest first; GET /api/v1/stories/:id/checkpoints?fenced=unresolved returns the same fenced set."},
+    {"id": "AC-52.42.5", "description": "POST /api/v1/stories/:id/checkpoints/:checkpoint_id/resolve (exact_role: :agent) with resolution applied or ignored and a reason, by the item's current holder, sets resolution, resolved_by_holder_id and resolved_at and appends a checkpoint_resolved event; repeating the same resolution answers 200 with the row and writes nothing, and a different one is refused 409 code already_resolved."},
+    {"id": "AC-52.42.6", "description": "Resolve is refused 409 code not_holder for any caller that is not the current holder, and 422 code not_fenced for an unfenced checkpoint."},
+    {"id": "AC-52.42.7", "description": "Each insert, fenced or not, deletes in its own transaction the item's checkpoints beyond the newest five that are unfenced or resolved; an unresolved fenced checkpoint is never deleted by this pruning."},
+    {"id": "AC-52.42.8", "description": "The MCP tool work_item_checkpoint_resolve reaches the resolve route, and work_item_checkpoint's description says a checkpoint from an ended claim is stored fenced and answered 202, with README rows and a wiring test."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.42.1", "verifies": ["AC-52.42.1", "AC-52.42.2"], "name": "a late holder's replay is stored fenced and touches nothing else (DataCase)", "type": "integration", "preconditions": ["story claimed by H1 at epoch e; H1's lease reclaimed (Progress.reclaim_expired_claim/3), then claimed by H2 at e+2; snapshot of the stage row, story, notes"], "steps": ["Checkpoints.record(tenant.id, story.id, h1, %{claim_epoch: e, diff: d, done: \"a\", next: \"b\", ...})"], "expected_results": ["{:ok, cp, :fenced} with fenced true and summary containing a and b; snapshot unchanged; one checkpoint_fenced event"]},
+    {"id": "TC-52.42.2", "verifies": ["AC-52.42.1"], "name": "a late write on an item nobody holds (ConnCase)", "type": "integration", "preconditions": ["story released to queued after H1's lease lapsed; H1's credential"], "steps": ["POST /api/v1/stories/:id/checkpoints with H1's old epoch"], "expected_results": ["202 fenced: true, current_holder_id null"]},
+    {"id": "TC-52.42.3", "verifies": ["AC-52.42.3"], "name": "the fenced checkpoint posts one thread message (DataCase)", "type": "integration", "preconditions": ["as TC-52.42.1"], "steps": ["record the fenced checkpoint", "replay it with the same id"], "expected_results": ["one channel_posts row with story_id = the story and the fixed text; the replay adds none"]},
+    {"id": "TC-52.42.4", "verifies": ["AC-52.42.4", "AC-52.42.7"], "name": "for_pull and pruning keep every unresolved fenced checkpoint (DataCase)", "type": "integration", "preconditions": ["seven unfenced checkpoints by H2 and two fenced by H1, one resolved ignored"], "steps": ["Checkpoints.for_pull(tenant.id, story.id)", "count rows after the seventh insert"], "expected_results": ["newest unfenced plus the one unresolved fenced; five unfenced-or-resolved rows remain plus the unresolved fenced one"]},
+    {"id": "TC-52.42.5", "verifies": ["AC-52.42.5", "AC-52.42.6"], "name": "resolve by the holder, a stranger and on an unfenced checkpoint (ConnCase)", "type": "integration", "preconditions": ["fenced checkpoint F and unfenced U on a story held by H2; credentials of H1 and H2"], "steps": ["H2 resolves F applied", "H2 resolves F applied again", "H2 resolves F ignored", "H1 resolves F", "H2 resolves U"], "expected_results": ["200 and one event; 200 with no event; 409 already_resolved; 409 not_holder; 422 not_fenced"]},
+    {"id": "TC-52.42.6", "verifies": ["AC-52.42.5"], "name": "tenant isolation on resolve and the fenced read (DataCase)", "type": "integration", "preconditions": ["fenced checkpoint in tenant A; a tenant-B holder"], "steps": ["Checkpoints.resolve(tenant_b.id, story_a.id, cp.id, ...)", "Checkpoints.for_pull(tenant_b.id, story_a.id)"], "expected_results": ["{:error, :not_found} both"]},
+    {"id": "TC-52.42.7", "verifies": ["AC-52.42.8"], "name": "resolve tool wiring and descriptions (node --test)", "type": "unit", "preconditions": ["mcp-server tool list; stubbed fetch"], "steps": ["call work_item_checkpoint_resolve", "read work_item_checkpoint's description"], "expected_results": ["POST to the resolve route with resolution and reason; description names fenced and 202"]}
+  ],
+  "technical_notes": [
+    "Built on US-52.41: same table, context, route and tool; record/4 gains the fenced branch where US-52.41 answers not_holder. 'Held at that epoch' reads the claim event release 3's log writes with actor_holder_id and claim_epoch (provided by release 3, README names table: work-item event log); stage events already carry claim_epoch (lib/loopctl/delivery/stage_event.ex:48).",
+    "Fencing mirrors runner reports: Stages.advance/4 and record_effect/5 refuse an old epoch before reading the row (stages.ex:1698-1699). A fenced checkpoint is the one write from an old epoch that is stored, and it is stored as data the current holder judges, never as item state.",
+    "The thread message goes through Loopctl.Coordination.Messages.insert/2 with story_id set (US-52.22 AC-52.22.1, AC-52.22.2), inside the checkpoint transaction, so it is stored before it is delivered and reaches whoever holds the item now (PRD R11).",
+    "A late holder's diff over the bound is refused like any other (US-52.41 AC-52.41.3); it then pushes its own wip/ branch, which needs git access and no lease, and records a fenced checkpoint with wip_branch (US-52.41 AC-52.41.4). PRD section 7 point 1.",
+    "Pruning keeps the store bounded at five full diffs per item plus the unresolved fenced ones; checkpoints of a story deleted go with it (FK ON DELETE CASCADE from US-52.41's migration)."
+  ],
+  "dependencies": [
+    "US-52.41"
+  ],
+  "non_goals": [
+    "Applying a fenced diff to a worktree: the current holder does it with git; work_item_pull (US-52.46) lists the unresolved ones and the runner's resume (US-52.44) passes them to the session.",
+    "Deciding for the holder: nothing auto-applies or auto-ignores a fenced checkpoint."
+  ],
+  "failure_modes": {"partition": "AC-52.42.1: a holder that worked through a partition and replays after its lease was reclaimed has its checkpoint kept fenced, not dropped and not applied.", "state": "AC-52.42.4: fenced checkpoints live in story_checkpoints and are read by for_pull/2, so the next holder sees them whatever machine it is on.", "retry": "AC-52.42.5: a repeated resolve with the same resolution writes nothing; the record's own id dedupes a replayed fenced write (US-52.41).", "slow": "AC-52.42.7: pruning bounds what an item keeps, so the read for a pull stays at five diffs plus the unresolved fenced ones.", "reach": "AC-52.42.3: the current holder learns of the fenced checkpoint through its item's thread, wherever it runs."},
+  "defaults": [
+    "Kept per item: five unfenced-or-resolved checkpoints plus every unresolved fenced one.",
+    "Thread message text as in AC-52.42.3."
+  ],
+  "definition_of_done": [
+    "In a DataCase run of TC-52.42.1, SELECT fenced, claim_epoch FROM story_checkpoints WHERE story_id = <story> returns the late row with fenced true at the old epoch, and the stage row's lock_version is unchanged."
+  ],
+  "expected_size": {"insertions": 260, "files": 6},
+  "estimated_tokens": 250000
+}
