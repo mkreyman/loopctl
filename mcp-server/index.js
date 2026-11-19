@@ -98,6 +98,7 @@ import {
   setGithubCredential as setGithubCredentialRequest,
 } from "./lib/github-credential.js";
 import { updateProject as updateProjectRequest } from "./lib/project-update.js";
+import { mergeProject as mergeProjectRequest } from "./lib/project-merge.js";
 import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
@@ -147,7 +148,6 @@ const WITNESS_FS = { readFileSync, writeFileSync, renameSync, lstatSync, unlinkS
 // `apiCall(..., { timeoutMs })` — e.g. the init-time generated-tools listing fetch,
 // which must degrade to static tools quickly rather than block connection setup.
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-
 // One witness client PER API KEY (#298 review HIGH-2): the STH is per-tenant and
 // each key resolves to a tenant server-side, so distinct keys must NOT share an
 // in-memory cache or a state file (a collision causes spurious 409s + false
@@ -978,6 +978,17 @@ async function deleteProject({ project_id }) {
 async function restoreProject({ project_id }) {
   const result = await apiCall("POST", `/api/v1/projects/${project_id}/restore`, {});
   return toContent(result);
+}
+
+// US-52.2: user role, so LOOPCTL_USER_KEY verbatim when set, as deleteProject does.
+async function mergeProject(args) {
+  const key = process.env.LOOPCTL_USER_KEY;
+  const userApiCall = key
+    ? (method, path, body) =>
+        apiCall(method, path, body, key, { exactKey: true, keyHint: "LOOPCTL_USER_KEY" })
+    : apiCall;
+
+  return toContent(await mergeProjectRequest(args, { apiCall: userApiCall }));
 }
 
 async function updateProject(args) {
@@ -3871,7 +3882,8 @@ const TOOLS = [
       "403 custody_tier_required, by design — a tenant must not be able to open a custody " +
       "surface for itself. If you only need a project row to scope KNOWLEDGE to the repo you " +
       "are on, use create_kb_scope instead (agent role, no human anchor). Call get_tenant " +
-      "first and read `capabilities` to see which of the two applies to your tenant.",
+      "first and read `capabilities` to see which of the two applies to your tenant. " +
+      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too).",
     inputSchema: {
       type: "object",
       properties: {
@@ -3896,7 +3908,8 @@ const TOOLS = [
   {
     name: "create_kb_scope",
     description:
-      "Create a knowledge-only project scope (kind: kb) for the current tenant. Unlike create_project (work project, orchestrator+ / human-anchored), this is available to an agent-rooted (KB-tier) tenant with an agent key: a kb scope carries NO chain-of-custody / work-breakdown surface (it cannot host epics/stories/dispatch/ui-tests), it exists only to partition knowledge articles by repo so captured/created articles can be project-scoped. Then resolve_project by its repo_url/slug and pass the returned id as project_id on article/knowledge writes. Counts toward the tenant's max_projects budget.",
+      "Create a knowledge-only project scope (kind: kb) for the current tenant. Unlike create_project (work project, orchestrator+ / human-anchored), this is available to an agent-rooted (KB-tier) tenant with an agent key: a kb scope carries NO chain-of-custody / work-breakdown surface (it cannot host epics/stories/dispatch/ui-tests), it exists only to partition knowledge articles by repo so captured/created articles can be project-scoped. Then resolve_project by its repo_url/slug and pass the returned id as project_id on article/knowledge writes. Counts toward the tenant's max_projects budget. " +
+      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too).",
     inputSchema: {
       type: "object",
       properties: {
@@ -4352,7 +4365,8 @@ const TOOLS = [
   {
     name: "restore_project",
     description:
-      "RESTORE an archived kind: work project (POST /api/v1/projects/:id/restore, the reverse of delete_project). Audited as unarchived; an already-active project comes back unchanged. Status cannot be changed any other way: PATCH /api/v1/projects/:id refuses a body carrying status with 422. Sent with the default key; the route needs orchestrator role or higher. Refusals: 422 when the tenant is at its max_projects cap (re-activating takes an active slot), 422 for a kind: kb scope (use restore_kb_scope), 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
+      "RESTORE an archived kind: work project (POST /api/v1/projects/:id/restore, the reverse of delete_project). Audited as unarchived; an already-active project comes back unchanged. Status cannot be changed any other way: PATCH /api/v1/projects/:id refuses a body carrying status with 422. Sent with the default key; the route needs orchestrator role or higher. Refusals: 422 when the tenant is at its max_projects cap (re-activating takes an active slot), 422 for a kind: kb scope (use restore_kb_scope), 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant. " +
+      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too).",
     inputSchema: {
       type: "object",
       properties: {
@@ -4365,9 +4379,30 @@ const TOOLS = [
     },
   },
   {
+    name: "merge_project",
+    description:
+      "MERGE one project into another (POST /api/v1/projects/:id/merge_into, US-52.2): every row of project_id (stories, epics, intake sources, channel posts and claims, articles, memories and the rest) moves to target_project_id in one transaction, project_id is archived with metadata.merged_into, and a kb target becomes a work project when project_id was one. The audit log and search telemetry keep naming project_id. Use it when a repo has two projects (a kb scope holding the repo_url and a '-delivery' work project): merge the work project INTO the kb scope, which keeps the channel id sessions already use. Run with dry_run: true first: it returns per-table counts and conflicts and writes nothing. A repeat call on an already-merged project returns already_merged: true and moves only rows written to the archived project since (run it again to sweep stragglers). A project-scoped token budget moves too. Sent with LOOPCTL_USER_KEY verbatim, else the default key. Refusals: 409 merge_conflicts when both projects hold a row under one per-project unique key (a story or epic number, a claim ref, a keyed channel post), with error.conflicts listing each; nothing moves. 422 for the same project twice, an archived target, or an archived project_id not merged into this target. 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant, 404 for an id not in your tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the project to merge away (it is archived)." },
+        target_project_id: {
+          type: "string",
+          description: "UUID of the project that keeps everything (the repo's kb scope or work project).",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "true: report per-table counts and conflicts, write nothing. Default false.",
+        },
+      },
+      required: ["project_id", "target_project_id"],
+    },
+  },
+  {
     name: "update_project",
     description:
-      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. A slug change renames the project's channel (kb scope or work project); when no name is sent and the name equaled the old slug, the name follows. A kb name different from its slug is 422, and a slug another project holds (archived included) is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field.",
+      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. A slug change renames the project's channel (kb scope or work project); when no name is sent and the name equaled the old slug, the name follows. A kb name different from its slug is 422, and a slug another project holds (archived included) is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field. " +
+      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too).",
     inputSchema: {
       type: "object",
       properties: {
@@ -9372,7 +9407,9 @@ const TOOLS = [
       "issue can reach a queue. It is also the binding place_dispatch reads — a project bound " +
       "to no source refuses 409 `no_intake_source`, and one bound to two refuses 409 " +
       "`ambiguous_intake_source`; this tool is what those two refusals mean by enrolling a " +
-      "source.\n\n" +
+      "source. Bind the repository to the project that already holds its repo_url; a pr or chg source on that repo's kb scope promotes the scope to a work project (US-52.3). " +
+      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too)." +
+      "\n\n" +
       "THE WEBHOOK SECRET IS RETURNED ONCE AND CAN NEVER BE READ AGAIN. The column is " +
       "encrypted at rest and redacted on the schema, so neither intake_source_list nor " +
       "intake_source_update ever carries it; losing it costs a revoke, a second enrolment and " +
@@ -10508,6 +10545,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await updateProject(args);
     case "restore_project":
       return await restoreProject(args);
+    case "merge_project":
+      return await mergeProject(args);
 
     case "get_progress":
       return await getProgress(args);

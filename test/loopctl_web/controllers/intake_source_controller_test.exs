@@ -8,6 +8,7 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
   alias Loopctl.Intake
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
+  alias Loopctl.Projects.Project
   alias LoopctlWeb.IntakeSourceController
 
   setup :verify_on_exit!
@@ -353,7 +354,9 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
     test "422 on a malformed repository, a duplicate, or an unusable project", %{conn: conn} do
       ctx = operator_ctx()
       authed = auth(conn, ctx.operator_key)
+      # A kb scope is usable since US-52.3 (a pr source promotes it); an archived one is not.
       kb = fixture(:project, %{tenant_id: ctx.tenant.id, kind: :kb})
+      {:ok, _} = AdminRepo.update(Project.archive_changeset(kb))
       other_tenant_project = fixture(:project, %{})
 
       assert json_response(

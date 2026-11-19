@@ -6,6 +6,34 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A `pr` or `chg` intake source on a kb scope promotes it to a work project (2026-11-19,
+  US-52.3).** `POST /api/v1/intake/sources` on an active `kind: kb` project used to be 422
+  ("must be an active work project"); it now enrols and turns the scope into a work project in
+  the same transaction, audited as `kind_promoted`. A `ledger` source still leaves a kb scope
+  as it is. A `pr`/`chg` enrolment on a project with no `repo_url` gives it the source's repo.
+  Migration `20261119210000` adds `projects.open_channel`: a promoted scope keeps the
+  any-agent channel writes of a kb scope (#517). Escalation handoffs are posted on the story's
+  own project, keyed by that project's `repo_url` basename (its slug when it has none).
+  **Deploy ordering:** run `docs/factory/runbooks/merge-duplicate-projects.md` immediately
+  after this deploy. Until a pair is merged, the sweep re-posts that repo's handoffs on the
+  `-delivery` work project's channel, which sessions in the repo do not resolve to.
+- **`POST /api/v1/projects/:id/merge_into` merges one project into another (2026-11-19,
+  US-52.2).** Every row of the source's `project_id` tables moves to `target_project_id` in one
+  transaction; the source is archived with `metadata.merged_into`, and a kb target becomes a
+  work project when the source was one. A `:project` token budget moves too. A repeat call on a
+  merged pair answers `already_merged: true` and moves any row written to the archived source
+  since. `audit_log` and `search_events` keep naming the source. `dry_run: true` reports per-table counts and conflicts; 409 `merge_conflicts` lists
+  rows both projects hold under one per-project unique key, and nothing moves. User key on a
+  human-anchored tenant. MCP tool `merge_project` (3.19.0). No migration, no env var.
+- **A repo has one project: a second is refused 409 `repo_already_has_project` (2026-11-19,
+  US-52.1).** Migration `20261119190000` adds `projects.repo_key` (the lowercased
+  `host/owner/repo` of `repo_url`) and the partial unique index
+  `projects_tenant_repo_key_active_uidx` on active projects. The migration RAISES, naming the
+  colliding project ids, when two active projects of one tenant already share a repo; archive
+  or merge one and re-run it. `POST /api/v1/projects`, `POST /api/v1/kb-scopes`,
+  `PATCH /api/v1/projects/:id`, both restore routes and `POST /api/v1/intake/sources` now answer
+  409 with `error.existing_project_id` when another active project holds the repo. An intake
+  source binds only to the project that holds its repo. No env var.
 - **Every escalated delivery story becomes a claimable handoff (2026-11-19, #1065).** A new
   five-minute cron, `EscalationHandoffWorker`, posts `handoff:<repo>:escalation-<story>-g<N>`
   on the story's project channel as the reserved `system:escalation-handoff` agent, re-posts

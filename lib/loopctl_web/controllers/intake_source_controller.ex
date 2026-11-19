@@ -27,8 +27,14 @@ defmodule LoopctlWeb.IntakeSourceController do
   dispatch binding, no merge route, no GitHub delivery. It goes through the SAME gates as any
   enrolment (user role, human-anchored tenant, unlineaged caller, and a root only the operator
   key can mint), so it opens no surface the project did not already have: the kb carve-out
-  (`create_kb_scope`) is untouched, a kb scope still cannot carry work, and a work project's
-  stories stay unbound, as they were with no source at all.
+  (`create_kb_scope`) is untouched, a ledger source leaves a kb scope a kb scope, and a work
+  project's stories stay unbound, as they were with no source at all.
+
+  ## A kb scope taking delivery (US-52.3)
+
+  A `pr` or `chg` source on a repo's active kb scope promotes the scope to `kind: work` in the
+  enrolment's own transaction (`kind_promoted` audit entry), so the repo keeps one project and
+  one channel instead of growing a `-delivery` work project. It goes through the same gates.
   """
 
   use LoopctlWeb, :controller
@@ -230,9 +236,11 @@ defmodule LoopctlWeb.IntakeSourceController do
         "arriving there is stored only as untrusted data and never becomes a story. Requires " <>
         "user role and a human-anchored tenant; a caller whose key was minted by a dispatch " <>
         "is refused with 403 `api_key_mint_forbidden`. 422 when the repository is not " <>
-        "`owner/name`, an active source already binds it, or the project is missing, not a " <>
-        "work project, or archived, or `target_epic_id` names an epic that is not in that " <>
-        "project. The secret is encrypted at rest. `base_branch` defaults to `master` when " <>
+        "`owner/name`, an active source already binds it, or the project is missing or " <>
+        "archived, or `target_epic_id` names an epic that is not in that project. A `pr` or " <>
+        "`chg` source on an active kb scope PROMOTES the scope to a work project in the same " <>
+        "transaction, audited as `kind_promoted` (US-52.3); a refused enrolment promotes " <>
+        "nothing. The secret is encrypted at rest. `base_branch` defaults to `master` when " <>
         "the body does not name it, and `mode` to `pr`. Enrolling in mode `chg` (US-47.2) " <>
         "also needs `change_events_secret` and a root, `mint_chg_root: true` (loopctl mints " <>
         "a keyless one) or `chg_root_dispatch_id` (422 naming the missing field otherwise, " <>
@@ -241,7 +249,7 @@ defmodule LoopctlWeb.IntakeSourceController do
         "#{Source.chg_root_naming_margin_seconds()} s left is 422 `chg_root_invalid`. " <>
         "Enrolling in " <>
         "mode `ledger` (issue #1047) takes an active kb scope or work project as `project_id` " <>
-        "(`pr` and `chg` take only a work project) and both chg credentials: the source sends the " <>
+        "and leaves a kb scope a kb scope, and both chg credentials: the source sends the " <>
         "repository's chg ledger and change events and is never a dispatch binding or a merge " <>
         "route, and its webhook refuses every GitHub delivery, so do not configure one.",
     request_body:
@@ -337,7 +345,9 @@ defmodule LoopctlWeb.IntakeSourceController do
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`pr_route_in_flight`, with `story_ids`, for a `chg` enrolment: " <>
+        {"`repo_already_has_project`, with `existing_project_id`, when another active " <>
+           "project of the tenant holds this repo (US-52.1: bind the source to that project). " <>
+           "`pr_route_in_flight`, with `story_ids`, for a `chg` enrolment: " <>
            Intake.pr_route_in_flight_message(), "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -528,7 +538,19 @@ defmodule LoopctlWeb.IntakeSourceController do
       |> put_mint_chg_root(params)
 
     with {:ok, %{source: source, webhook_secret: secret}} <-
-           Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do
+           Intake.create_source(
+             tenant.id,
+             attrs,
+             Keyword.put(
+               Keyword.take(LoopctlWeb.AuditContext.from_conn(conn), [
+                 :actor_type,
+                 :actor_id,
+                 :actor_label
+               ]),
+               :actor_lineage,
+               actor_lineage(conn)
+             )
+           ) do
       conn
       |> put_status(:created)
       |> json(%{

@@ -138,6 +138,7 @@ defmodule Loopctl.Intake do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
   alias Loopctl.Delivery.StoryStage
@@ -151,7 +152,9 @@ defmodule Loopctl.Intake do
   alias Loopctl.Intake.Source
   alias Loopctl.Intake.TicketFacts
   alias Loopctl.LocalGuc
+  alias Loopctl.Projects
   alias Loopctl.Projects.Project
+  alias Loopctl.Projects.RepoUrl
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -271,8 +274,21 @@ defmodule Loopctl.Intake do
       |> refuse_root_and_mint(mint)
 
     with {:ok, changeset} <- valid(changeset),
+         :ok <- repo_belongs_to(tenant_id, repo, Ecto.Changeset.get_field(changeset, :project_id)),
          {:ok, source} <- insert_source(tenant_id, changeset, root_mint_opts(mint, opts)) do
       {:ok, %{source: source, webhook_secret: secret}}
+    end
+  end
+
+  # A repo has one project (US-52.1): a source for repo R binds only to the project that holds
+  # R, or to a project when NO active project holds R. Binding R to a second project is how
+  # four repos came to carry a kb scope plus a `-delivery` work project, and two channels.
+  # `update_source/4` cannot change a source's repo or project, so this is the one path.
+  defp repo_belongs_to(tenant_id, repo, project_id) do
+    case Projects.repo_holder(tenant_id, RepoUrl.key(repo)) do
+      {:ok, %{id: ^project_id}} -> :ok
+      {:ok, holder} -> {:error, {:repo_has_project, holder.id}}
+      :error -> :ok
     end
   end
 
@@ -320,17 +336,144 @@ defmodule Loopctl.Intake do
   # through a `pr`/`chg` source. `ledger` takes both because it binds nothing: a repository
   # with only a kb scope, and one whose work project has no intake route, each get a ledger
   # credential and nothing else.
+  #
+  # A `pr`/`chg` source on an active `:kb` scope is accepted here and the scope is PROMOTED to
+  # `:work` in the insert's own transaction (`promote_to_work/3`, US-52.3), so the bound
+  # project is still a work project when the source exists. A repo has one project (US-52.1),
+  # so refusing would leave a kb-scoped repo no way to take delivery except the second project
+  # that rule now refuses.
   defp put_project(changeset, tenant_id, project_id) do
     kinds = Source.project_kinds(Ecto.Changeset.get_field(changeset, :mode))
 
-    case active_project(tenant_id, project_id, kinds) do
+    case active_project(tenant_id, project_id, [:kb, :work]) do
       {:ok, project} ->
         Ecto.Changeset.put_change(changeset, :project_id, project.id)
 
       {:error, message} ->
+        # "project not found" and "can't be blank" stand as they are; an inactive project is
+        # refused in the words of the mode's own kinds.
+        message =
+          if message == project_kind_message([:kb, :work]),
+            do: project_kind_message(kinds),
+            else: message
+
         Ecto.Changeset.add_error(changeset, :project_id, message)
     end
   end
+
+  # Runs inside `insert_source/3`'s transaction, BEFORE the insert, so any refusal after it
+  # (the insert itself, the audit chain) rolls it back. The project row is locked and re-read.
+  #
+  # For a `pr`/`chg` source it makes the bound project the repo's one project (US-52.3):
+  #   - a project with no `repo_url` takes the source's repo, so `resolve_project({repo_url})`
+  #     finds it and no second project can claim the repo (the index refuses a race);
+  #   - an active `:kb` scope is promoted to `:work`, keeping its open channel.
+  # A project that already holds a DIFFERENT repo is not refused yet: the test corpus binds
+  # sources that way throughout, and the refusal is tracked as its own issue.
+  # A `ledger` source binds nothing, so it changes nothing here.
+  #
+  # Returns `{:ok, claim}`: `nil` when nothing changed, else the project as it was and the
+  # fields written, which `audit_claim/4` records once the source exists.
+  defp prepare_project(tenant_id, changeset) do
+    mode = Ecto.Changeset.get_field(changeset, :mode)
+    repo = Ecto.Changeset.get_field(changeset, :repo_full_name)
+    kinds = Source.project_kinds(mode)
+
+    project =
+      from(p in Project,
+        where:
+          p.tenant_id == ^tenant_id and
+            p.id == ^Ecto.Changeset.get_field(changeset, :project_id),
+        lock: "FOR UPDATE"
+      )
+      |> AdminRepo.one()
+
+    cond do
+      is_nil(project) or project.status != :active ->
+        {:error, Ecto.Changeset.add_error(changeset, :project_id, project_kind_message(kinds))}
+
+      mode == :ledger ->
+        {:ok, nil}
+
+      true ->
+        claim_repo(tenant_id, project, repo)
+    end
+  end
+
+  defp claim_repo(tenant_id, project, repo) do
+    changes =
+      [kind: :work]
+      |> then(&if(project.kind == :kb, do: [{:open_channel, true} | &1], else: &1))
+      |> then(fn changes ->
+        if is_nil(project.repo_url) do
+          url = "https://github.com/#{repo}"
+          [{:repo_url, url}, {:repo_key, RepoUrl.key(url)} | changes]
+        else
+          changes
+        end
+      end)
+
+    update =
+      project
+      |> Ecto.Changeset.change(changes)
+      |> Ecto.Changeset.unique_constraint(:repo_key,
+        name: Project.repo_key_index(),
+        message: "already has a project in this tenant"
+      )
+
+    if update.changes == %{}, do: {:ok, nil}, else: write_claim(tenant_id, project, update)
+  end
+
+  defp write_claim(tenant_id, project, update) do
+    case AdminRepo.update(update) do
+      {:ok, _} -> {:ok, %{project: project, changes: update.changes}}
+      # The loser of an enrolment race for one repo gets the same 409 the pre-check gives.
+      {:error, failed} -> Projects.changeset_or_refusal(tenant_id, failed)
+    end
+  end
+
+  # One audit entry for whatever the enrolment wrote on the project: `kind_promoted` when a kb
+  # scope became a work project, `repo_claimed` when only the repo was taken. Both states carry
+  # every field written, so the log shows when and why the project took the repo.
+  defp audit_claim(_tenant_id, _source, nil, _opts), do: :ok
+
+  defp audit_claim(tenant_id, source, %{project: project, changes: changes}, opts) do
+    fields = Map.keys(changes)
+    old = project |> Map.take(fields) |> stringify()
+    new = stringify(changes)
+    promoted = Map.has_key?(changes, :kind)
+
+    metadata =
+      %{"intake_source_id" => source.id}
+      |> then(&if(promoted, do: Map.merge(&1, %{"from" => "kb", "to" => "work"}), else: &1))
+
+    Ecto.Multi.new()
+    |> Audit.log_in_multi(:audit, fn _ ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "project",
+        entity_id: project.id,
+        action: if(promoted, do: "kind_promoted", else: "repo_claimed"),
+        actor_type: Keyword.get(opts, :actor_type, "api_key"),
+        actor_id: Keyword.get(opts, :actor_id),
+        actor_label: Keyword.get(opts, :actor_label),
+        metadata: metadata,
+        old_state: old,
+        new_state: new
+      }
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, _} -> :ok
+      {:error, _step, reason, _changes} -> {:error, {:promotion_audit_failed, reason}}
+    end
+  end
+
+  defp stringify(map), do: Map.new(map, fn {k, v} -> {to_string(k), audit_value(v)} end)
+
+  defp audit_value(v) when is_boolean(v) or is_nil(v), do: v
+  defp audit_value(v) when is_atom(v), do: to_string(v)
+  defp audit_value(v), do: v
 
   # OPTIONAL, and an absent value is not an error: see the schema. What IS an error is naming
   # an epic that is not this tenant's or does not belong to this source's project — a source
@@ -479,7 +622,9 @@ defmodule Loopctl.Intake do
       with :ok <- mint_root(tenant_id, opts),
            :ok <- check_chg_root(tenant_id, changeset),
            :ok <- close_pr_route(tenant_id, changeset),
+           {:ok, claim} <- prepare_project(tenant_id, changeset),
            {:ok, source} <- AdminRepo.insert(changeset),
+           :ok <- audit_claim(tenant_id, source, claim, opts),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
                action: "intake_source_created",

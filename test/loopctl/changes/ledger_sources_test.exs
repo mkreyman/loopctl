@@ -478,23 +478,6 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
       assert %{project_id: ["must be an active kb scope or work project"]} = errors_on(changeset)
     end
 
-    test "a pr or chg source on a kb scope is refused", %{tenant: tenant} do
-      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
-
-      for mode <- ["pr", "chg"] do
-        assert {:error, %Ecto.Changeset{} = changeset} =
-                 Intake.create_source(
-                   tenant.id,
-                   Map.merge(
-                     %{repo_full_name: "mkreyman/infra", project_id: kb.id, mode: mode},
-                     chg_credentials(tenant.id)
-                   )
-                 )
-
-        assert %{project_id: ["must be an active work project"]} = errors_on(changeset)
-      end
-    end
-
     test "a ledger source needs both credentials", %{tenant: tenant} do
       kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
 

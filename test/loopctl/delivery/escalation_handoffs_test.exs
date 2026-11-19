@@ -16,6 +16,7 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
   alias Loopctl.Delivery.EscalationHandoffs
   alias Loopctl.Delivery.EscalationInbox
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Projects.Merge
   alias Loopctl.Projects.Project
 
   setup :verify_on_exit!
@@ -171,13 +172,52 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
     assert first.superseded_by == second.id
   end
 
-  describe "the channel (#1067)" do
-    # The chg-delivery shape: the work project has NO repo_url, its intake source names the
-    # repo, and the repo resolves to a kb scope a session in it reads and claims on.
-    defp repo_channel!(story) do
+  describe "the channel is the story's own project (US-52.3)" do
+    # The chg-delivery shape before its merge: a work project with no repo_url, so its
+    # handoffs were keyed under its slug.
+    defp delivery_project!(story) do
       AdminRepo.update_all(from(p in Project, where: p.id == ^story.project_id),
-        set: [repo_url: nil]
+        set: [repo_url: nil, slug: "chg-delivery"]
       )
+    end
+
+    test "a project with no repo_url keys the handoff by its slug, on that project" do
+      story = escalated!()
+      delivery_project!(story)
+
+      assert %{posted: 1, errors: []} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, DateTime.utc_now())
+
+      assert [post] = posts(story.tenant_id)
+      assert post.project_id == story.project_id
+      assert post.key == EscalationHandoffs.handoff_key("chg-delivery", story.id, 1)
+    end
+
+    test "a handoff under an old repo part is closed and re-posted under the project's" do
+      story = escalated!()
+      delivery_project!(story)
+      now = DateTime.utc_now()
+      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+
+      AdminRepo.update_all(from(p in Project, where: p.id == ^story.project_id),
+        set: [repo_url: "git@github.com:mkreyman/chg.git"]
+      )
+
+      assert %{moved: 1, errors: []} = EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+      assert [%{key: k}] = open_handoffs(story)
+      assert k == key(story, 2)
+
+      assert %{moved: 0, posted: 0, reposted: 0} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+
+      assert length(posts(story.tenant_id)) == 2
+    end
+
+    test "after a merge into the repo's kb scope, the handoff follows the story there" do
+      story = escalated!()
+      delivery_project!(story)
+      now = DateTime.utc_now()
+      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
 
       scope =
         fixture(:project, %{
@@ -187,71 +227,25 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
           repo_url: "git@github.com:mkreyman/chg.git"
         })
 
-      fixture(:intake_source, %{
-        tenant_id: story.tenant_id,
-        project_id: story.project_id,
-        repo_full_name: "mkreyman/chg"
-      })
-
-      scope
-    end
-
-    test "the handoff is posted on the channel the story's repo resolves to" do
-      story = escalated!()
-      scope = repo_channel!(story)
-
-      assert %{posted: 1, errors: []} =
-               EscalationHandoffs.sweep_tenant(story.tenant_id, DateTime.utc_now())
-
-      assert [post] = posts(story.tenant_id)
-      assert post.project_id == scope.id
-      assert post.key == key(story, 1)
-      assert [%{key: k}] = Coordination.directed_handoffs(story.tenant_id, scope.id)
-      assert k == key(story, 1)
-      assert open_handoffs(story) == []
-    end
-
-    test "a handoff already on the work project is closed there and moved to the repo's" do
-      story = escalated!()
-
-      AdminRepo.update_all(from(p in Project, where: p.id == ^story.project_id),
-        set: [slug: "chg-delivery"]
-      )
-
-      now = DateTime.utc_now()
-
-      # Posted before the repo had a channel: on the work project.
-      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
-      assert [%{project_id: work}] = posts(story.tenant_id)
-      assert work == story.project_id
-
-      scope = repo_channel!(story)
+      assert {:ok, _} =
+               Merge.merge_into(story.tenant_id, story.project_id, scope.id)
 
       assert %{moved: 1, errors: []} = EscalationHandoffs.sweep_tenant(story.tenant_id, now)
-      assert open_handoffs(story) == []
       assert [%{key: k}] = Coordination.directed_handoffs(story.tenant_id, scope.id)
       assert k == key(story, 2)
-
-      # Settled: a rerun moves nothing and posts nothing.
-      assert %{moved: 0, posted: 0, reposted: 0} =
-               EscalationHandoffs.sweep_tenant(story.tenant_id, now)
-
-      assert length(posts(story.tenant_id)) == 2
     end
 
-    test "close_story/3 closes the story's handoff at once, on whichever channel holds it" do
+    test "close_story/3 closes the story's handoff at once" do
       story = escalated!()
-      scope = repo_channel!(story)
       now = DateTime.utc_now()
       EscalationHandoffs.sweep_tenant(story.tenant_id, now)
 
       assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
-      assert Coordination.directed_handoffs(story.tenant_id, scope.id) == []
+      assert open_handoffs(story) == []
 
       assert %ChannelClaim{done_at: %DateTime{}} =
                AdminRepo.get_by(ChannelClaim, tenant_id: story.tenant_id, ref: key(story, 1))
 
-      # Nothing left to close; idempotent.
       assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
     end
 
@@ -260,18 +254,15 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
       now = DateTime.utc_now()
       EscalationHandoffs.sweep_tenant(story.tenant_id, now)
 
-      # This sweep read the escalated list...
       {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
       assert [_] = rows
 
-      # ...then the resolve committed and closed g1.
       AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
         set: [stage: :done]
       )
 
       assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
 
-      # The sweep's g2 is withdrawn the moment it is written.
       assert %{reposted: 0, closed: 1, errors: []} =
                EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
 
@@ -283,7 +274,6 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
       now = DateTime.utc_now()
       {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
 
-      # Resolved after the read; `close_story/3` found nothing to close.
       AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
         set: [stage: :done]
       )
@@ -296,12 +286,16 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
       assert open_handoffs(story) == []
     end
 
-    test "a pre-#1067 handoff of a story resolved mid-sweep leaves nothing open anywhere" do
+    test "an old-repo-part handoff of a story resolved mid-sweep leaves nothing open" do
       story = escalated!()
+      delivery_project!(story)
       now = DateTime.utc_now()
       EscalationHandoffs.sweep_tenant(story.tenant_id, now)
       {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
-      scope = repo_channel!(story)
+
+      AdminRepo.update_all(from(p in Project, where: p.id == ^story.project_id),
+        set: [repo_url: "git@github.com:mkreyman/chg.git"]
+      )
 
       AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
         set: [stage: :done]
@@ -311,7 +305,6 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
                EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
 
       assert open_handoffs(story) == []
-      assert Coordination.directed_handoffs(story.tenant_id, scope.id) == []
     end
   end
 

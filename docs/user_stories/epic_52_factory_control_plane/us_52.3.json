@@ -1,0 +1,48 @@
+{
+  "id": "US-52.3",
+  "title": "Delivery promotes the repo's project; the four duplicates are merged",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_1",
+  "story": {"as_a": "session working in a repo", "i_want_to": "have the repo's one project carry its knowledge, its channel and its delivery work", "so_that": "no repo ever needs a second project to start delivery, and today's four duplicates are gone"},
+  "rationale": "After US-52.1 a repo can hold one project, but a repo whose project is a kb scope still cannot take a pr or chg intake source: Intake.put_project/3 (lib/loopctl/intake.ex:323) only binds a :work project for those modes, which is exactly why the -delivery work projects were created. Enrolling delivery on the kb scope must promote it instead. Then the four duplicate pairs can be merged with US-52.2, and EscalationHandoffs no longer needs to find a repo channel apart from the story's own project (loopctl#1067 added that indirection only because the two differed).",
+  "acceptance_criteria": [
+    {"id": "AC-52.3.1", "description": "Intake.create_source/3 with mode pr or chg on an active :kb project of the tenant promotes it to kind :work in the source's transaction and binds the source to it."},
+    {"id": "AC-52.3.2", "description": "The promotion writes one audit entry, action kind_promoted, entity the project, metadata from: kb, to: work and the source id."},
+    {"id": "AC-52.3.3", "description": "A ledger source on a :kb project leaves its kind :kb."},
+    {"id": "AC-52.3.4", "description": "A create_source refused for any other reason (chg_root_invalid, a changeset error, repo_has_project) leaves the project :kb: the promotion rolls back with the insert."},
+    {"id": "AC-52.3.5", "description": "EscalationHandoffs posts an escalated story's handoff on the story's own project, with the anchor's repo part from that project's repo_url (its slug when it has none); the intake-source channel lookup and its work-project fallback are removed."},
+    {"id": "AC-52.3.6", "description": "An open escalation handoff whose key names another repo part (a pre-merge handoff:chg-delivery:... moved onto chg by the merge) is closed and re-posted as the next generation under the project's repo part, as before."},
+    {"id": "AC-52.3.7", "description": "docs/factory/runbooks/merge-duplicate-projects.md lists the four merges (chg-delivery into chg, ads_for_care-delivery into ads_for_care, claude-config-delivery into claude-config, infra-pilot into infra), the dry run and the checks to run after each, and records each run's result."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.3.1", "verifies": ["AC-52.3.1", "AC-52.3.2"], "name": "a pr source on a kb scope promotes it (DataCase)", "type": "integration", "preconditions": ["human-anchored tenant; fixture(:project, %{tenant_id: t.id, kind: :kb, slug: \"chg\", repo_url: \"git@github.com:mkreyman/chg.git\"})"], "steps": ["Intake.create_source(t.id, %{repo_full_name: \"mkreyman/chg\", project_id: kb.id})"], "expected_results": ["{:ok, _}; the project is :work; one kind_promoted audit entry"]},
+    {"id": "TC-52.3.2", "verifies": ["AC-52.3.3"], "name": "a ledger source leaves the kb scope as kb (DataCase)", "type": "integration", "preconditions": ["as TC-52.3.1; a chg root dispatch fixture"], "steps": ["create_source with mode ledger, change_events_secret and chg_root_dispatch_id"], "expected_results": ["{:ok, _}; the project is still :kb"]},
+    {"id": "TC-52.3.3", "verifies": ["AC-52.3.4"], "name": "a refused enrolment does not promote (DataCase)", "type": "integration", "preconditions": ["as TC-52.3.1"], "steps": ["create_source with mode chg and a chg_root_dispatch_id naming nothing"], "expected_results": ["{:error, :chg_root_invalid}; the project is still :kb"]},
+    {"id": "TC-52.3.4", "verifies": ["AC-52.3.1"], "name": "tenant isolation: another tenant's kb scope id is not found and not promoted (DataCase)", "type": "integration", "preconditions": ["tenant B's kb scope"], "steps": ["Intake.create_source(tenant_a.id, %{... project_id: b_scope.id})"], "expected_results": ["a project_id error; B's scope still :kb"]},
+    {"id": "TC-52.3.5", "verifies": ["AC-52.3.5"], "name": "the handoff is posted on the story's project under its repo name (DataCase)", "type": "integration", "preconditions": ["fixture(:escalated_story); its project's repo_url git@github.com:mkreyman/chg.git"], "steps": ["EscalationHandoffs.sweep_tenant(tenant_id, now)"], "expected_results": ["one post on the story's project, key handoff:chg:escalation-<id>-g1"]},
+    {"id": "TC-52.3.6", "verifies": ["AC-52.3.6"], "name": "a handoff under the old repo part is moved to the new one (DataCase)", "type": "integration", "preconditions": ["as TC-52.3.5, with the project's slug chg-delivery and no repo_url; one sweep run"], "steps": ["set repo_url to git@github.com:mkreyman/chg.git", "sweep again"], "expected_results": ["g1 under chg-delivery closed; g2 under chg open"]},
+    {"id": "TC-52.3.7", "verifies": ["AC-52.3.7"], "name": "the runbook exists and names the four pairs", "type": "unit", "preconditions": ["the docs tree"], "steps": ["read docs/factory/runbooks/merge-duplicate-projects.md"], "expected_results": ["each pair's source and target slug and id, and a result line for each"]}
+  ],
+  "technical_notes": [
+    "Intake.create_source/3: lib/loopctl/intake.ex:259; put_project/3 at :323 checks Source.project_kinds/1 against the project's kind; the promotion goes in insert_source's transaction (the same place the audit entry is written) so a refused insert rolls it back.",
+    "The enrol route already requires role :user, RequireHumanAnchor and an unlineaged caller (lib/loopctl_web/controllers/intake_source_controller.ex:46-48), so promotion adds no new path into a work project.",
+    "EscalationHandoffs: channels/2, channel/5 and work_project/5 in lib/loopctl/delivery/escalation_handoffs.ex were added by #1068 to find the repo channel apart from the story's project; delete them, keep on_target?/3 and move/7 for the repo-part case, and keep tenant-wide latest/2.",
+    "The merges run through the merge_project tool (US-52.2) on LOOPCTL_USER_KEY: dry run, then the merge, then resolve_project({repo_url}) and channel_handoffs on the target. Project ids on 2026-11-19: chg eba0b4df / chg-delivery b5343742, ads_for_care 9fe72eaf / ads_for_care-delivery 329be116, claude-config 478f72ab / claude-config-delivery 0fc4aa3c, infra 0917eacf / infra-pilot 2b124878."
+  ],
+  "dependencies": [
+    "US-52.1",
+    "US-52.2"
+  ],
+  "non_goals": [
+    "A general 'promote' endpoint: delivery enrolment is the only path that needs a work project.",
+    "Changing claude-config's channel-claim gate: once a repo has one project it needs no change."
+  ],
+  "failure_modes": {"partition": "n/a: the promotion and the enrolment are one transaction against loopctl's own database.", "state": "AC-52.3.1: the kind lives on the project row and changes only in the enrolment's transaction.", "retry": "AC-52.3.4: a retried enrolment either meets the active-repo index on intake_sources and is refused with the project left as the first attempt left it, or succeeds once.", "slow": "n/a: no network call on these paths.", "reach": "AC-52.3.5: the sweep runs in EscalationHandoffWorker every five minutes on any node, and reads everything it needs from the database."},
+  "definition_of_done": [
+    "On production after the merges: list_projects shows no project named *-delivery or infra-pilot active, and resolve_project for each of the four repos returns a kind work project.",
+    "intake_source_list shows every active source's project_id equal to resolve_project of its repo_full_name."
+  ],
+  "expected_size": {"insertions": 140, "files": 5},
+  "estimated_tokens": 250000
+}

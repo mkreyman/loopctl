@@ -526,17 +526,23 @@ defmodule Loopctl.Coordination do
 
     3. **A `:kb`-kind scope is tenant-wide-writable by ANY agent (issue #517).**
        `project_writable_by_agent/4` grants the write when the target is a
-       `:kb`-kind project in the caller's own tenant, WITHOUT a per-project
-       membership check (see path 3 in that function's moduledoc). So in a
+       `:kb`-kind project, or a work project promoted from one (`open_channel`,
+       US-52.3), in the caller's own tenant, WITHOUT a per-project membership
+       check (see path 3 in that function's moduledoc). So in a
        multi-agent tenant an `:agent` compromised on repo-C can post into a
        kb-scope channel that auto-injects (via the SessionStart preview) into a
        peer agent's session working that kb-scope — the intra-tenant, cross-scope
        injection surface US-40.D3's membership gate closes for WORK projects. This
        is a DELIBERATE accepted residual, not an oversight: (a) a kb-scope carries
        NO chain-of-custody surface (`RequireWorkProject` bars work attachment, so
-       it can never hold a story), so nothing custody-critical is exposed; (b) the
-       blast radius is bounded to a single tenant (the `tenant_id` predicate in
-       `kb_scope?/2` blocks cross-tenant reach) and, per post, to the 512-byte
+       it can never hold a story), so nothing custody-critical is exposed. A
+       PROMOTED scope does hold stories, sources and escalation handoffs; what
+       still holds is that a channel write (post, claim, graduate) changes no
+       custody state (report / review / verify are lineage-gated in `Progress`),
+       and that the promotion does not widen who could already write the
+       channel: it was the repo's kb scope, open to the same agents, the moment
+       before; (b) the blast radius is bounded to a single tenant (the
+       `tenant_id` predicate in `repo_channel?/2` blocks cross-tenant reach) and, per post, to the 512-byte
        SessionStart preview (`@preview_bytes`); and (c) it mirrors the #331/#505
        trust unit that already made `create_kb_scope` and all agent-role KB
        curation tenant-wide — a kb-scope is a shared, agent-native knowledge
@@ -863,7 +869,8 @@ defmodule Loopctl.Coordination do
        member via story assignment — the gate is enforced for every role below
        `:user`.
 
-    3. **`:kb`-kind scope in the caller's own tenant** (issue #517) — a KB scope
+    3. **A repo's channel in the caller's own tenant**: a `:kb` scope (issue #517) or a
+       work project promoted from one (`open_channel`, US-52.3; see `repo_channel?/2`). A KB scope
        carries NO chain-of-custody surface: `RequireWorkProject` bars work
        attachment, so a kb-scope can NEVER have a story, and membership-by-story
        (path 1) is therefore structurally unsatisfiable for it. Without this path an
@@ -880,9 +887,15 @@ defmodule Loopctl.Coordination do
        coordination_test.exs cover a brand-new agent with NO story assignment writing
        a kb-scope it did not create) — a kb-scope's whole point is any-agent
        collaboration, and an agent can already `knowledge_create` tenant-wide directly,
-       so this opens no boundary the tenant trust unit did not already grant. This is
-       NOT a cross-tenant hole:
-       `kb_scope?/2` re-applies the `tenant_id` predicate (as does the `post/4`
+       so this opens no boundary the tenant trust unit did not already grant.
+       A promoted scope (`open_channel`) is NOT custody-free: it holds stories, so
+       membership-by-story is satisfiable there, and the bypass is a choice, not a
+       structural necessity. It is kept because the scope is the repo's ONE channel
+       (US-52.1): the fleet's agent key hands off on it without holding a story in
+       it, and a channel write moves no custody state (report / review / verify are
+       lineage-gated). A work project that was never a kb scope keeps path 1's gate.
+       This is NOT a cross-tenant hole:
+       `repo_channel?/2` re-applies the `tenant_id` predicate (as does the `post/4`
        `get_project/2` guard upstream), so a kb-scope in ANOTHER tenant never
        reaches here — it is already `:not_found`. Consistent with the #331/#505
        carve-out that made `create_kb_scope` itself agent-role.
@@ -898,16 +911,15 @@ defmodule Loopctl.Coordination do
   @spec project_writable_by_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           :ok | {:error, :not_found}
   def project_writable_by_agent(tenant_id, agent_id, project_id, role) do
-    # Clause order is a hot-path optimization, NOT a semantic one: kb_scope? and
-    # agent_member_of_project? are mutually exclusive (a kb-scope structurally has
-    # no stories, so it can never satisfy membership), so either order yields the
-    # same verdict. Membership is checked FIRST because the dominant write is an
-    # agent acting on a WORK project it is a member of — that resolves in a single
-    # query, and the always-false kb_scope? probe is only paid on the rare kb path.
+    # Clause order is a hot-path optimization, NOT a semantic one: both clauses only
+    # ever answer :ok, so either order yields the same verdict. Membership is checked
+    # FIRST because the dominant write is an agent acting on a WORK project it is a
+    # member of — that resolves in a single query, and the repo_channel? probe is only
+    # paid for a non-member.
     cond do
       Role.role_at_least?(role, :user) -> :ok
       agent_member_of_project?(tenant_id, agent_id, project_id) -> :ok
-      kb_scope?(tenant_id, project_id) -> emit_kb_scope_write(tenant_id, agent_id, project_id)
+      repo_channel?(tenant_id, project_id) -> emit_kb_scope_write(tenant_id, agent_id, project_id)
       true -> {:error, :not_found}
     end
   end
@@ -933,7 +945,7 @@ defmodule Loopctl.Coordination do
     )
 
     Logger.info(
-      "coordination kb-scope member-bypass write " <>
+      "coordination repo-channel member-bypass write (kb scope or open_channel) " <>
         "(tenant=#{tenant_id} agent=#{agent_id} project=#{project_id})"
     )
 
@@ -941,7 +953,8 @@ defmodule Loopctl.Coordination do
   end
 
   # Issue #517: a `:kb`-kind scope OWNED by the caller's tenant is a shared,
-  # custody-free knowledge partition, writable by any agent in that tenant. The
+  # custody-free knowledge partition, writable by any agent in that tenant (a scope
+  # promoted to work keeps that, see the note at the end of this comment). The
   # `tenant_id` predicate is what keeps this tenant-safe — a kb-scope in another
   # tenant never matches. `exists?` compiles to `SELECT 1 ... LIMIT 1` and seeks the
   # `projects` primary key, so it never materializes a row. Like the sibling
@@ -958,9 +971,17 @@ defmodule Loopctl.Coordination do
   # A tenant that wants to freeze a channel deletes/expires its posts; a blanket
   # "reject writes to archived scopes" gate (both kinds) is a separate, deliberate
   # product decision left out of the #517 carve-out.
-  defp kb_scope?(tenant_id, project_id) do
+  #
+  # US-52.3: a kb scope that takes delivery is promoted to `:work` (by an intake enrolment or
+  # by a merge), and its channel must stay as open as it was: it is the repo's one channel, and
+  # the fleet's agent key, which holds no story there, hands off on it. The promotion therefore
+  # sets `projects.open_channel` (never cast, so no PATCH can set or clear it), and this probe
+  # reads "a kb scope, or a project promoted from one". A work project that was never a kb
+  # scope keeps the US-40.D3 membership gate exactly as before.
+  defp repo_channel?(tenant_id, project_id) do
     Project
-    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id and p.kind == :kb)
+    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id)
+    |> where([p], p.kind == :kb or p.open_channel)
     |> AdminRepo.exists?()
   end
 
@@ -2849,7 +2870,7 @@ defmodule Loopctl.Coordination do
     with {:ok, post} <- get_post(tenant_id, post_id),
          # Restore the agent-in-tenant binding that the membership probe used to give
          # for free (review). `project_writable_by_agent/4` no longer implies it on the
-         # kb path — `kb_scope?/2` ignores `agent_id` entirely (#517), so a misconfigured
+         # repo-channel path — `repo_channel?/2` ignores `agent_id` entirely (#517), so a misconfigured
          # key carrying a foreign-tenant `agent_id` (the agents/api_keys FKs are
          # non-composite, see the comment at post/4) could otherwise graduate a kb post
          # whose article carries a foreign agent's `visibility_agent_id`. Mirroring the

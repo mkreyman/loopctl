@@ -522,6 +522,7 @@ defmodule LoopctlWeb.Router do
     delete "/kb-scopes/:id", ProjectController, :archive_kb_scope
     post "/kb-scopes/:id/restore", ProjectController, :restore_kb_scope
     post "/projects/:id/restore", ProjectController, :restore
+    post "/projects/:id/merge_into", ProjectController, :merge_into
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
 

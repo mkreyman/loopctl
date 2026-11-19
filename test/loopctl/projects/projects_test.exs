@@ -942,24 +942,26 @@ defmodule Loopctl.ProjectsTest do
       assert found.slug == "gl-mirror"
     end
 
-    test "returns :ambiguous when two active projects share a repo_url" do
+    test "a repo_url resolves to the one active project that holds it (US-52.1)" do
       tenant = fixture(:tenant)
 
-      _one =
+      one =
         fixture(:project, %{
           tenant_id: tenant.id,
           slug: "dup-repo-one",
           repo_url: "https://github.com/acme/dup"
         })
 
-      _two =
-        fixture(:project, %{
-          tenant_id: tenant.id,
-          slug: "dup-repo-two",
-          repo_url: "https://github.com/acme/dup"
-        })
+      assert {:error, {:repo_has_project, holder}} =
+               Projects.create_project(tenant.id, %{
+                 name: "dup-repo-two",
+                 slug: "dup-repo-two",
+                 repo_url: "git@github.com:acme/dup.git"
+               })
 
-      assert {:error, :ambiguous} =
+      assert holder == one.id
+
+      assert {:ok, %{id: ^holder}, :repo_url} =
                Projects.resolve_project(tenant.id, repo_url: "https://github.com/acme/dup")
     end
 

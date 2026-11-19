@@ -15,6 +15,7 @@ defmodule LoopctlWeb.ProjectController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Projects
+  alias Loopctl.Projects.Merge
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -57,13 +58,16 @@ defmodule LoopctlWeb.ProjectController do
        ]
        when action in [:create]
 
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:update, :restore, :delete]
+  plug LoopctlWeb.Plugs.RequireHumanAnchor
+       when action in [:update, :restore, :delete, :merge_into]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :orchestrator]
        when action in [:create, :update, :restore]
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
+  # A merge moves every row of a project and archives it (US-52.2): set-based and not undone
+  # by any one call, so it sits with delete at :user.
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete, :merge_into]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
@@ -79,12 +83,18 @@ defmodule LoopctlWeb.ProjectController do
 
   tags(["Projects"])
 
+  # US-52.1: one response, cited by every route that can give a repo a second active project.
+  @repo_conflict {"repo_already_has_project: another active project of the tenant holds this " <>
+                    "repo_url; error.existing_project_id names it. A repo has one project.",
+                  "application/json", Schemas.ErrorResponse}
+
   operation(:create,
     summary: "Create project",
     description: "Creates a new project. Requires user+ role.",
     request_body: {"Project params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       201 => {"Project created", "application/json", Schemas.ProjectResponse},
+      409 => @repo_conflict,
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -100,6 +110,7 @@ defmodule LoopctlWeb.ProjectController do
     request_body: {"KB scope params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       201 => {"KB scope created", "application/json", Schemas.ProjectResponse},
+      409 => @repo_conflict,
       422 =>
         {"Validation error or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -134,6 +145,7 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Restored KB scope", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => @repo_conflict,
       422 =>
         {"Not a KB scope, or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -191,6 +203,7 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Updated project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => @repo_conflict,
       422 =>
         {"Validation error, or status in the body", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -210,7 +223,47 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Restored project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => @repo_conflict,
       422 => {"A kb scope, or project limit reached", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:merge_into,
+    summary: "Merge a project into another",
+    description:
+      "Moves every row of project :id (stories, epics, intake sources, channel posts and " <>
+        "claims, articles, memories and the rest) into target_project_id, archives :id with " <>
+        "metadata.merged_into, and promotes a kb target to work when :id was a work project. " <>
+        "One transaction; audited as merged_into. The audit log and search telemetry keep " <>
+        "naming :id. User role on a human-anchored tenant. dry_run: true returns the per-table " <>
+        "counts and conflicts and writes nothing. A repeat call on an already-merged source " <>
+        "returns already_merged and moves only rows written to it since. A :project token " <>
+        "budget moves with the rows.",
+    parameters: [id: [in: :path, type: :string, description: "Source project UUID"]],
+    request_body:
+      {"Merge params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:target_project_id],
+         properties: %{
+           target_project_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           dry_run: %OpenApiSpex.Schema{type: :boolean, default: false}
+         }
+       }},
+    responses: %{
+      200 => {"Merge result", "application/json", %OpenApiSpex.Schema{type: :object}},
+      403 =>
+        {"Not a user key, or not a human-anchored tenant", "application/json",
+         Schemas.ErrorResponse},
+      404 => {"Source or target not in your tenant", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"merge_conflicts: both projects hold a row under one per-project unique key; " <>
+           "error.conflicts lists each (table, index, source_row_id, target_row_id). Nothing " <>
+           "was moved.", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Same project, an archived target, or an archived source not merged into this target",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -288,8 +341,8 @@ defmodule LoopctlWeb.ProjectController do
       {:error, :project_limit_reached} ->
         {:error, :unprocessable_entity, "Project limit reached for this tenant"}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -325,8 +378,8 @@ defmodule LoopctlWeb.ProjectController do
       {:error, :project_limit_reached} ->
         {:error, :unprocessable_entity, "Project limit reached for this tenant"}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -383,8 +436,8 @@ defmodule LoopctlWeb.ProjectController do
       {:error, :project_limit_reached} ->
         {:error, :unprocessable_entity, "Project limit reached for this tenant"}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -491,8 +544,8 @@ defmodule LoopctlWeb.ProjectController do
         {:ok, updated} ->
           json(conn, %{project: project_json(updated)})
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -524,6 +577,57 @@ defmodule LoopctlWeb.ProjectController do
          "/api/v1/kb-scopes/:id/restore."}
 
   defp ensure_work_project(_project), do: :ok
+
+  @doc """
+  POST /api/v1/projects/:id/merge_into
+
+  Moves every row of project `:id` into `target_project_id` and archives `:id` (US-52.2).
+  User role on a human-anchored tenant. `dry_run: true` returns the row counts and any
+  conflicts and writes nothing.
+  """
+  def merge_into(conn, %{"id" => source_id} = params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+    dry_run = params["dry_run"] in [true, "true"]
+
+    case Merge.merge_into(
+           tenant_id,
+           source_id,
+           params["target_project_id"],
+           Keyword.put(audit_opts, :dry_run, dry_run)
+         ) do
+      {:ok, result} ->
+        json(conn, %{merge: result})
+
+      {:error, {:merge_conflicts, conflicts}} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          error: %{
+            status: 409,
+            code: "merge_conflicts",
+            message:
+              "Both projects hold rows with the same per-project key; resolve each conflict " <>
+                "(renumber, close or delete one row) and merge again. Nothing was moved.",
+            conflicts: conflicts
+          }
+        })
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:error, reason} ->
+        {:error, :unprocessable_entity, merge_refusal(reason)}
+    end
+  end
+
+  defp merge_refusal(:same_project), do: "A project cannot be merged into itself."
+
+  defp merge_refusal(:target_not_active),
+    do: "The target project is archived; restore it first or merge into an active project."
+
+  defp merge_refusal(:source_not_active),
+    do: "The source project is archived and was not merged into this target."
 
   @doc """
   DELETE /api/v1/projects/:id

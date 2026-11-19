@@ -277,7 +277,9 @@ defmodule Loopctl.IntakeTest do
       tenant = fixture(:tenant)
       good_project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: good_project.id})
+      # A kb scope is usable since US-52.3 (a pr source promotes it); an archived one is not.
       kb_project = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      {:ok, _} = AdminRepo.update(Project.archive_changeset(kb_project))
 
       # Every shape of unusable project, each with a target epic that is real and is fine
       # against SOME project — so an implementation that checks the epic against a project it

@@ -66,7 +66,8 @@ describe("update_project wiring", () => {
     assert.match(indexSource, /name: "update_project"/);
     assert.match(indexSource, /case "update_project":\s*\n\s*return await updateProject\(args\);/);
     assert.match(indexSource, /updateProjectRequest\(args, \{ apiCall: orchestratorPinnedApiCall \}\)/);
-    assert.match(indexSource, /ambiguous_resolution fleet-wide/);
+    // US-52.1: a second project on one repo is refused, not left ambiguous.
+    assert.match(indexSource, /refused 409 repo_already_has_project/);
   });
 });
 
