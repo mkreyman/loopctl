@@ -77,7 +77,10 @@ stays, with `metadata.merged_into` naming the target.
 
 | Pair | Date | Result |
 |------|------|--------|
-| chg-delivery into chg | | not yet run |
-| ads_for_care-delivery into ads_for_care | | not yet run |
-| claude-config-delivery into claude-config | | not yet run |
-| infra-pilot into infra | | not yet run |
+| chg-delivery into chg | 2026-11-19 | merged, promoted; no conflicts. Moved 17 stories, 1 epic, 1 source, 23 intake records, 8 channel posts, 1 claim, 4 run outcomes |
+| ads_for_care-delivery into ads_for_care | 2026-11-19 | merged, promoted; no conflicts. Moved 37 stories, 1 epic, 1 source, 5 intake records |
+| claude-config-delivery into claude-config | 2026-11-19 | merged, promoted; no conflicts. Moved 68 stories, 1 epic, 1 source, 76 intake records |
+| infra-pilot into infra | 2026-11-19 | merged, promoted; no conflicts. Moved 3 stories, 1 epic, 2 sources, 3 intake records |
+
+Checked after the merges: `resolve_project` returns each kept project as `kind: work`, and
+`intake_source_list` shows every source of the four repos on it.
