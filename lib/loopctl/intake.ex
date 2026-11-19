@@ -224,9 +224,12 @@ defmodule Loopctl.Intake do
 
   Returns `{:ok, %{source: source, webhook_secret: secret}}`. The secret is returned once.
 
-  `attrs` may also carry `:mode` (`"pr"` or `"chg"`, read by PRESENCE and defaulting to
-  `"pr"`; a `"chg"` source also needs `:change_events_secret` and `:chg_root_dispatch_id`, see
-  `Loopctl.Intake.Source` and `chg_root_invalid` below),
+  `attrs` may also carry `:mode` (`"pr"`, `"chg"` or `"ledger"`, read by PRESENCE and
+  defaulting to `"pr"`; a `"chg"` or `"ledger"` source also needs `:change_events_secret` and
+  `:chg_root_dispatch_id`, see `Loopctl.Intake.Source` and `chg_root_invalid` below; a `pr`
+  source MAY carry both, and then sends its chg ledger and events too). A `"ledger"` source
+  binds an ACTIVE `:kb` SCOPE instead of a work project (issue #1047): a repository with no
+  work project gets a ledger credential and nothing else,
   `:target_epic_id` (optional, and `nil` means "not answered") and
   `:base_branch` (optional, and read by PRESENCE: omit it for the `master` default, or name
   the branch this repository's dispatches are cut from — `main` for a repository created on
@@ -308,8 +311,15 @@ defmodule Loopctl.Intake do
     end
   end
 
+  # The project a source binds must be of the kind its mode requires (`Source.project_kind/1`):
+  # a `:work` project for `pr` and `chg`, a `:kb` scope for `ledger` (issue #1047). The kb
+  # half is what lets a repository with no work project hold a ledger credential WITHOUT a
+  # work project — and the work half is what keeps a `:kb` scope from ever becoming a dispatch
+  # binding or a merge route through a `pr`/`chg` source.
   defp put_project(changeset, tenant_id, project_id) do
-    case active_work_project(tenant_id, project_id) do
+    kind = Source.project_kind(Ecto.Changeset.get_field(changeset, :mode))
+
+    case active_project(tenant_id, project_id, kind) do
       {:ok, project} ->
         Ecto.Changeset.put_change(changeset, :project_id, project.id)
 
@@ -372,18 +382,24 @@ defmodule Loopctl.Intake do
 
   defp epic_in_project(_tenant_id, _project_id, _epic_id), do: :project_invalid
 
-  defp active_work_project(tenant_id, project_id) when is_binary(project_id) do
+  defp active_project(tenant_id, project_id, kind) when is_binary(project_id) do
     with {:ok, id} <- Ecto.UUID.cast(project_id),
          %Project{} = project <- AdminRepo.get_by(Project, id: id, tenant_id: tenant_id) do
-      if project.kind == :work and project.status == :active,
+      if project.kind == kind and project.status == :active,
         do: {:ok, project},
-        else: {:error, "must be an active work project"}
+        else: {:error, project_kind_message(kind)}
     else
       _ -> {:error, "project not found"}
     end
   end
 
-  defp active_work_project(_tenant_id, _project_id), do: {:error, "can't be blank"}
+  defp active_project(_tenant_id, _project_id, _kind), do: {:error, "can't be blank"}
+
+  defp project_kind_message(:work),
+    do: "must be an active work project"
+
+  defp project_kind_message(:kb),
+    do: "must be an active kb scope: mode ledger is a kb scope's ledger-only credential"
 
   defp valid(%Ecto.Changeset{valid?: true} = changeset), do: {:ok, changeset}
   defp valid(changeset), do: {:error, changeset}
@@ -553,7 +569,8 @@ defmodule Loopctl.Intake do
           cast_mode(
             changeset,
             Map.take(attrs, [:mode, :change_events_secret, :chg_root_dispatch_id])
-          ),
+          )
+          |> check_mode_kind(tenant_id),
         else: changeset
 
     changeset =
@@ -567,6 +584,35 @@ defmodule Loopctl.Intake do
       write_update(tenant_id, changeset, fields, opts)
     end
   end
+
+  # A mode switch never changes the kind of project a source sits on (issue #1047): `ledger`
+  # stays on its `:kb` scope and `pr`/`chg` on their work project. Without this a kb scope's
+  # ledger credential could be switched to `pr` and become the dispatch binding and merge
+  # route the kb scope is barred from, and a work project's source could be switched to
+  # `ledger` and silently stop binding its project's stories.
+  defp check_mode_kind(%Ecto.Changeset{valid?: true} = changeset, tenant_id) do
+    if Ecto.Changeset.changed?(changeset, :mode) do
+      wanted = Source.project_kind(Ecto.Changeset.get_field(changeset, :mode))
+      project_id = Ecto.Changeset.get_field(changeset, :project_id)
+
+      case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
+        %Project{kind: ^wanted} ->
+          changeset
+
+        _other ->
+          Ecto.Changeset.add_error(
+            changeset,
+            :mode,
+            "cannot move a source between a work project and a kb scope: " <>
+              "ledger is a kb scope's mode, pr and chg a work project's"
+          )
+      end
+    else
+      changeset
+    end
+  end
+
+  defp check_mode_kind(changeset, _tenant_id), do: changeset
 
   defp cast_required_checks(changeset, attrs) do
     changeset
@@ -674,8 +720,9 @@ defmodule Loopctl.Intake do
   # `dispatches` row, not taken on the caller's word.
   #
   # Judged whenever a write NAMES a root (whatever the mode), and on EVERY write whose resulting
-  # source is `chg` — a switch, a secret rotation, a base-branch edit alike — so a root kept from
-  # an earlier stint, or revoked since it was named, is re-judged rather than trusted. A write on a
+  # source is `chg` or `ledger` (`Source.credentials_required?/1`) — a switch, a secret
+  # rotation, a base-branch edit alike — so a root kept from an earlier stint, or revoked since
+  # it was named, is re-judged rather than trusted. A write on a
   # `chg` source whose root has been revoked is therefore `chg_root_invalid` until it names a live
   # root (or switches to `pr`, which is never blocked by the root it leaves behind). Naming one on
   # a `pr` source is judged too, and that is not tidiness: unjudged, an unknown id would fail the
@@ -701,7 +748,9 @@ defmodule Loopctl.Intake do
     root_id = Ecto.Changeset.get_field(changeset, :chg_root_dispatch_id)
     named_root? = Ecto.Changeset.changed?(changeset, :chg_root_dispatch_id) and root_id != nil
 
-    if named_root? or mode == :chg, do: judge_chg_root(tenant_id, root_id), else: :ok
+    if named_root? or Source.credentials_required?(mode),
+      do: judge_chg_root(tenant_id, root_id),
+      else: :ok
   end
 
   @pr_route_in_flight_message "A story on this source's project is at `ci` holding a recorded " <>
@@ -789,7 +838,7 @@ defmodule Loopctl.Intake do
   defp pr_modes?(repo, tenant_id, story_id) do
     modes =
       repo.all(
-        from s in live_sources_query(tenant_id),
+        from s in binding_sources_query(tenant_id),
           join: story in Story,
           on: story.project_id == s.project_id and story.tenant_id == s.tenant_id,
           where: story.id == ^story_id,
@@ -835,10 +884,16 @@ defmodule Loopctl.Intake do
   end
 
   @doc """
-  Re-reads a live `chg` source INSIDE the caller's transaction on `repo` and judges its root
-  by the same rule enrolment does (`check_chg_root/2`'s `judge_chg_root/3`): `{:ok, source}`,
-  `{:error, :not_chg_source}` (revoked, another tenant's, unknown, `pr`-mode or holding no
-  `change_events_secret`), `{:error, :tenant_inactive}` or `{:error, :chg_root_invalid}`.
+  Re-reads a live source holding the chg SENDER's credentials INSIDE the caller's transaction
+  on `repo` and judges its root by the same rule enrolment does (`check_chg_root/2`'s
+  `judge_chg_root/3`): `{:ok, source}`, `{:error, :not_chg_source}` (revoked, another
+  tenant's, unknown, or holding no `change_events_secret`), `{:error, :tenant_inactive}` or
+  `{:error, :chg_root_invalid}` (a root that is not a live chg root, or none at all).
+
+  ANY MODE (issue #1047): sending is not routing. A `pr` source that holds both credentials
+  sends its ledger and its change events, and so does a `ledger` one; what an event then DOES
+  is decided by the held source's `mode` (`Loopctl.Changes.Events`), and a caller that must be
+  `chg` checks the mode itself (`Loopctl.Changes.ReviewDispatches`).
 
   For the change-events webhook (US-47.3, AC-47.3.7). Enrolment judges the root only when a
   source is WRITTEN, so a root revoked between writes is caught here, on every event. Both
@@ -863,7 +918,7 @@ defmodule Loopctl.Intake do
       )
 
     case source do
-      %Source{mode: :chg, change_events_secret: secret} = source when is_binary(secret) ->
+      %Source{change_events_secret: secret} = source when is_binary(secret) ->
         with :ok <- judge_tenant_active(repo, tenant_id),
              :ok <- judge_chg_root(repo, tenant_id, source.chg_root_dispatch_id),
              do: {:ok, source}
@@ -956,7 +1011,7 @@ defmodule Loopctl.Intake do
     # The project is filtered IN SQL, so a tenant's other sources are never loaded; the
     # exactly-one rule stays `select_project_source/2`'s, the one derivation of it.
     tenant_id
-    |> live_sources_query()
+    |> binding_sources_query()
     |> where([s], s.project_id == ^project_id)
     |> AdminRepo.all()
     |> select_project_source(project_id)
@@ -967,6 +1022,10 @@ defmodule Loopctl.Intake do
   exactly one, or a refusal naming why. Shared by `source_for_project/2` (on `AdminRepo`) and
   by the triage gate screen (on `Loopctl.Repo`, alongside every other read that module makes),
   so the two gates cannot resolve a story to two different repositories (US-44.2).
+
+  A `ledger` source is never chosen and never counted (issue #1047): it is a `:kb` scope's
+  ledger-only credential, so it is no project's repository for a dispatch, and it does not
+  make a project's one real source `ambiguous` either.
   """
   @spec select_project_source([Source.t()], Ecto.UUID.t()) ::
           {:ok, Source.t()}
@@ -975,7 +1034,7 @@ defmodule Loopctl.Intake do
              | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}}
   def select_project_source(sources, project_id) do
     sources
-    |> Enum.filter(&(&1.project_id == project_id))
+    |> Enum.filter(&(&1.project_id == project_id and binding_mode?(&1.mode)))
     |> case do
       [source] -> {:ok, source}
       [] -> {:error, {:no_intake_source, project_id}}
@@ -990,6 +1049,20 @@ defmodule Loopctl.Intake do
       where: s.tenant_id == ^tenant_id and is_nil(s.revoked_at),
       order_by: [desc: s.inserted_at]
   end
+
+  @doc """
+  A tenant's live sources that may BIND a project to a repository — every live source but a
+  `ledger` one (issue #1047). The query for any read that resolves a story's repository or
+  merge route; `binding_mode?/1` is the same rule for a list already read.
+  """
+  @spec binding_sources_query(Ecto.UUID.t()) :: Ecto.Query.t()
+  def binding_sources_query(tenant_id) do
+    from s in live_sources_query(tenant_id), where: s.mode != ^:ledger
+  end
+
+  @doc "Whether a source in `mode` may bind a project to a repository: every mode but `ledger`."
+  @spec binding_mode?(atom()) :: boolean()
+  def binding_mode?(mode), do: mode != :ledger
 
   # The same shape as `repoint/3`, under its own action name: an operator reading the chain
   # must be able to tell a repoint from a rebase without opening the payload.
@@ -1344,9 +1417,13 @@ defmodule Loopctl.Intake do
     end
   end
 
+  # A `ledger` source is refused like an unknown one (issue #1047): it is a `:kb` scope's
+  # ledger credential, and a GitHub delivery to it would put outside text into the intake
+  # queue of a scope that may never carry work.
   defp authenticate(source_id, raw_body, signature) do
     case active_source(source_id) do
-      %Source{webhook_secret: secret} = source when is_binary(secret) ->
+      %Source{mode: mode, webhook_secret: secret} = source
+      when is_binary(secret) and mode != :ledger ->
         if Signature.valid?(secret, raw_body, signature),
           do: {:ok, source},
           else: {:error, :unauthorized}

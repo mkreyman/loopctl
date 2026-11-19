@@ -27,10 +27,29 @@ defmodule Loopctl.Intake.Source do
     checks it against the `dispatches` row inside the write's transaction; this module only
     validates presence and shape.
 
-  Switching a `chg` source back to `pr` KEEPS both: they are ignored while the mode is `pr`,
-  and switching back to `chg` re-checks the root rather than trusting the kept id. A caller
-  who wants them gone on a `pr` source sends an explicit `null`, which is a clear rather than
-  a silent loss; on a `chg` source the same `null` is a 422.
+  Switching a `chg` source back to `pr` KEEPS both. A caller who wants them gone on a `pr`
+  source sends an explicit `null`, which is a clear rather than a silent loss; on a `chg` source
+  the same `null` is a 422.
+
+  ## Sending is not routing (issue #1047)
+
+  The two credentials authenticate the chg SENDER — the ledger batch
+  (`POST /api/v1/chg/ledger/:source_id`) and change events
+  (`POST /api/v1/change_events/:source_id`) — in EVERY mode: a `pr` source that holds both
+  sends its ledger and its events like a `chg` one does, and its merge route stays the pull
+  request. What the mode decides is what an event DOES: only under a `chg` source does an event
+  bind a change, move a stage or count as evidence for a custody gate; under any other mode it
+  is stored, ordered and audited with `routed: false` (`Loopctl.Changes.Events`). Minting a chg
+  review dispatch stays `chg`-only (`Loopctl.Changes.ReviewDispatches`).
+
+  ## Mode `ledger` (issue #1047)
+
+  The mode of a source on a `:kb` scope: a repository that has no work project gets a ledger
+  credential and nothing else. It REQUIRES both credentials, as `chg` does, and a `:kb`
+  project; `pr` and `chg` require a `:work` project, so a source never changes kind of project
+  by switching mode (`Loopctl.Intake`). A `ledger` source is never a dispatch binding
+  (`Loopctl.Intake.select_project_source/2`), never a merge route, and every GitHub delivery to
+  it is refused.
 
   ## Trust boundary
 
@@ -100,8 +119,9 @@ defmodule Loopctl.Intake.Source do
 
     # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE. `:pr`: the merge gate reads a pull request by
     # number. `:chg` (US-47.2): the change protocol lands them, and the merge gate refuses the
-    # PR route outright. NOT NULL, default `:pr`; `intake_sources_mode` is the database's copy.
-    field :mode, Ecto.Enum, values: [:pr, :chg], default: :pr
+    # PR route outright. `:ledger` (issue #1047): a `:kb` scope's ledger-only credential, which
+    # routes nothing. NOT NULL, default `:pr`; `intake_sources_mode` is the database's copy.
+    field :mode, Ecto.Enum, values: [:pr, :chg, :ledger], default: :pr
 
     # THE CHECKS STORY VERIFICATION JUDGES A STORY'S COMMIT BY (US-26.4.6): GitHub Actions JOB
     # names, as they appear on the commit (a commit-status context can never satisfy one; see
@@ -129,7 +149,8 @@ defmodule Loopctl.Intake.Source do
     field :triage_requires_ticket, :boolean, default: false
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
 
-    # `:chg` only (see the moduledoc). Never in the encoder list: write-only.
+    # The chg sender's credentials, in any mode (see the moduledoc). Never in the encoder list:
+    # write-only.
     field :change_events_secret, Loopctl.Vault.Binary, redact: true
     field :chg_root_dispatch_id, :binary_id
     field :revoked_at, :utc_datetime_usec
@@ -213,10 +234,12 @@ defmodule Loopctl.Intake.Source do
   @doc """
   Everything `mode` and the `chg` credentials must satisfy, for every path that writes any of
   them: `mode` present (the column is NOT NULL, so there is no cleared state) and `pr` or
-  `chg`, which the `Ecto.Enum` cast already refuses otherwise; and, when the RESULTING mode is
-  `:chg`, both `change_events_secret` and `chg_root_dispatch_id` present
-  (`intake_sources_chg_requires_credentials` is the database's copy). Resulting, not changed: switching back to `chg` with the values a `pr` stint kept is
-  accepted here, and `Loopctl.Intake` re-checks the root.
+  `chg` or `ledger`, which the `Ecto.Enum` cast already refuses otherwise; and, when the
+  RESULTING mode is `:chg` or `:ledger` (`credentials_required?/1`), both
+  `change_events_secret` and `chg_root_dispatch_id` present
+  (`intake_sources_chg_requires_credentials` is the database's copy). Resulting, not changed:
+  switching back to `chg` with the values a `pr` stint kept is accepted here, and
+  `Loopctl.Intake` re-checks the root.
 
   A secret, when one is written, is #{@min_change_events_secret_bytes} to
   #{@max_change_events_secret_bytes} bytes: it is an HMAC key, and a short one is guessable.
@@ -238,13 +261,31 @@ defmodule Loopctl.Intake.Source do
   end
 
   defp validate_chg_credentials(changeset) do
-    if get_field(changeset, :mode) == :chg,
+    mode = get_field(changeset, :mode)
+
+    if credentials_required?(mode),
       do:
         validate_required(changeset, [:change_events_secret, :chg_root_dispatch_id],
-          message: "is required when mode is chg"
+          message: "is required when mode is #{mode}"
         ),
       else: changeset
   end
+
+  @doc """
+  Whether a source in `mode` must hold both chg credentials: `chg` (the change protocol lands
+  it) and `ledger` (the credential is all the source is). A `pr` source MAY hold them, and then
+  sends its ledger and events too.
+  """
+  @spec credentials_required?(atom()) :: boolean()
+  def credentials_required?(mode), do: mode in [:chg, :ledger]
+
+  @doc """
+  The project kind a source in `mode` must be enrolled on: `:kb` for `ledger`, `:work` for
+  `pr` and `chg`. `Loopctl.Intake` checks it at enrolment and on every mode switch.
+  """
+  @spec project_kind(atom()) :: :work | :kb
+  def project_kind(:ledger), do: :kb
+  def project_kind(_routing_mode), do: :work
 
   defp check_secret(:change_events_secret, secret) when is_binary(secret) do
     if byte_size(secret) in @min_change_events_secret_bytes..@max_change_events_secret_bytes,

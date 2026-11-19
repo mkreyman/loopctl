@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.15.0 — 2026-11-18
+
+### Added
+
+- **`intake_source_enroll` / `intake_source_update` take `mode: "ledger"`** (loopctl #1047):
+  a KB scope's ledger-only source, for a repository with no work project. It needs both
+  `change_events_secret` (or `_file`) and `chg_root_dispatch_id`, is refused locally without
+  them, is never a dispatch binding, and refuses GitHub deliveries. A switch between a work
+  project's modes and `ledger` is 422 at the server.
+
+### Changed
+
+- The descriptions and README rows say that the chg credentials authenticate the ledger and
+  change-event endpoints in every mode: a `pr` source holding them sends its ledger and stays
+  `pr`, and its events move no story.
+
 ## 3.14.1 — 2026-11-18
 
 ### Changed

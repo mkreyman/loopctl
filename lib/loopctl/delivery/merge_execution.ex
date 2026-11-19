@@ -433,9 +433,10 @@ defmodule Loopctl.Delivery.MergeExecution do
   # story's own epoch. On AdminRepo with explicit tenant predicates on every join; tenant ids
   # come back with each row and every write goes through the RLS repo.
   defp candidates(opts, cursor, limit) do
+    # A `ledger` source binds nothing (issue #1047; `Loopctl.Intake.binding_sources_query/1`).
     pr_projects =
       from src in Source,
-        where: is_nil(src.revoked_at),
+        where: is_nil(src.revoked_at) and src.mode != ^:ledger,
         group_by: [src.tenant_id, src.project_id],
         having: fragment("bool_and(? = 'pr')", src.mode),
         select: %{tenant_id: src.tenant_id, project_id: src.project_id}

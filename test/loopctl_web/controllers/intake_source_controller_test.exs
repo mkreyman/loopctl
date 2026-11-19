@@ -904,7 +904,7 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
           "properties"
         ])
 
-      assert props["mode"]["enum"] == ["pr", "chg"]
+      assert props["mode"]["enum"] == ["pr", "chg", "ledger"]
       assert props["change_events_secret"]["writeOnly"] == true
       assert props["change_events_secret"]["description"] =~ Source.change_events_secret_rule()
       assert props["chg_root_dispatch_id"]["description"] =~ Source.chg_root_requirement()
@@ -921,9 +921,102 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
           "properties"
         ])
 
-      assert patch_props["mode"]["enum"] == ["pr", "chg"]
+      assert patch_props["mode"]["enum"] == ["pr", "chg", "ledger"]
       assert patch_props["change_events_secret"]["writeOnly"] == true
       assert patch_props["chg_root_dispatch_id"]["description"] =~ "chg_root_invalid"
+    end
+  end
+
+  describe "mode ledger (issue #1047)" do
+    @ledger_secret String.duplicate("l", 48)
+
+    defp ledger_params(kb, root_id) do
+      %{
+        "repo_full_name" => "mkreyman/infra",
+        "project_id" => kb.id,
+        "mode" => "ledger",
+        "change_events_secret" => @ledger_secret,
+        "chg_root_dispatch_id" => root_id
+      }
+    end
+
+    test "enrols a kb scope for the ledger alone, and the secret never comes back", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      kb = fixture(:project, %{tenant_id: ctx.tenant.id, kind: :kb})
+      root_id = mint_root(build_conn(), ctx)
+
+      raw =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", ledger_params(kb, root_id))
+        |> response(201)
+
+      refute raw =~ @ledger_secret
+      body = Jason.decode!(raw)
+      assert body["source"]["mode"] == "ledger"
+      assert body["source"]["project_id"] == kb.id
+
+      kb_id = kb.id
+
+      assert {:error, {:no_intake_source, ^kb_id}} =
+               Intake.source_for_project(ctx.tenant.id, kb.id)
+    end
+
+    test "a ledger enrolment naming a work project is 422", %{conn: conn} do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+
+      refused =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", ledger_params(ctx.project, root_id))
+        |> json_response(422)
+
+      assert inspect(refused) =~ "must be an active kb scope"
+    end
+
+    test "an agent-rooted tenant cannot enrol one: the human anchor gate is unchanged", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {operator_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      kb = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      root = fixture(:chg_root_dispatch, %{tenant_id: tenant.id})
+
+      refused =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/intake/sources", ledger_params(kb, root.id))
+        |> json_response(403)
+
+      assert refused["error"]["code"] == "custody_tier_required"
+      assert Intake.list_sources(tenant.id) == []
+    end
+
+    test "a dispatch-minted key may not set mode ledger", %{conn: conn} do
+      ctx = operator_ctx()
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      %{"api_key" => %{"raw_key" => dispatched_key}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/dispatches", %{"role" => "user", "agent_id" => agent.id})
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      refused =
+        conn
+        |> auth(dispatched_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "ledger"})
+        |> json_response(403)
+
+      assert refused["error"]["code"] == "chg_registration_forbidden"
+      assert AdminRepo.get!(Source, source.id).mode == :pr
     end
   end
 

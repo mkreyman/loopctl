@@ -399,18 +399,35 @@ defmodule Loopctl.Changes.EventsTest do
       assert_nothing_written(ctx)
     end
 
-    test "a revoked source, and a source switched back to pr", ctx do
-      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "pr"})
+    # A `pr` source that KEEPS the credentials still sends (issue #1047, unrouted:
+    # `Loopctl.Changes.LedgerSourcesTest`); one whose credentials are cleared does not.
+    test "a revoked source, and a pr source holding no chg credentials", ctx do
+      {:ok, _} =
+        Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{
+          mode: "pr",
+          change_events_secret: nil,
+          chg_root_dispatch_id: nil
+        })
+
       assert {:error, :unauthorized} = push(ctx, event("C1", 1))
       source_id = ctx.source.id
       assert_receive {:refused, _, %{source: ^source_id, reason: :not_chg_source}}
 
+      assert_nothing_written(ctx)
+
+      # A revoked `chg` source, credentials intact.
+      revoked = fixture(:chg_source, %{tenant_id: ctx.tenant_id, repo_full_name: "mkreyman/chg"})
+
       {1, _} =
-        AdminRepo.update_all(from(s in Source, where: s.id == ^ctx.source.id),
-          set: [mode: :chg, revoked_at: DateTime.utc_now()]
+        AdminRepo.update_all(from(s in Source, where: s.id == ^revoked.source.id),
+          set: [revoked_at: DateTime.utc_now()]
         )
 
-      assert {:error, :unauthorized} = push(ctx, event("C1", 1))
+      revoked_event = event("C1", 1, %{repo: "mkreyman/chg"})
+
+      assert {:error, :unauthorized} =
+               push(ctx, revoked_event, source_id: revoked.source.id, secret: revoked.secret)
+
       assert_nothing_written(ctx)
     end
 

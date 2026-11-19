@@ -251,6 +251,22 @@ defmodule Loopctl.Changes.StageMappingTest do
       assert row(ctx, story).stage == :ci
     end
 
+    # Issue #1047: an approval a `pr`-mode stint recorded moved nothing, so it is no half of a
+    # pair once the source is `chg` again — only a routed approval makes the change ready.
+    test "an approval recorded while the source was pr is no half of a pair", ctx do
+      story = story_at(ctx, :reviewing)
+      bind!(ctx, story, "C1")
+
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "pr"})
+      assert {:ok, _} = push(ctx, event("C1", 1, "review_approved", %{data: %{"by" => "model"}}))
+      assert row(ctx, story).stage == :reviewing
+
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "chg"})
+      assert {:ok, _} = push(ctx, event("C1", 2, "check_passed"))
+      assert row(ctx, story).stage == :reviewing
+      assert effect(ctx, "C1", 2)["stage"]["for"] == "awaiting_review"
+    end
+
     test "a pair on different revisions, or on a superseded one, moves nothing", ctx do
       story = story_at(ctx, :reviewing)
       bind!(ctx, story, "C1")
