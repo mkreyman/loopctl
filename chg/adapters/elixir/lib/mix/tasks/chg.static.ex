@@ -12,7 +12,9 @@ defmodule Mix.Tasks.Chg.Static do
       a dependency, in an env it is declared for;
     * `mix compile --warnings-as-errors` (through `mix chg.compile`), incremental from the
       snapshot's `_build`;
-    * `mix dialyzer` against the snapshot's PLT, when dialyxir is a dependency.
+    * dialyzer, when dialyxir is a dependency: `mix chg.dialyzer`, incremental from the
+      snapshot's incremental PLT, or `mix dialyzer` against its classic PLT when there is
+      no incremental one or incremental mode cannot run.
 
       mix chg.static --base <sha>
 
@@ -288,19 +290,29 @@ defmodule Mix.Tasks.Chg.Static do
     end
   end
 
-  # In the env the snapshot built the PLT in (`ChgAdapter.dep_env/1`).
+  # In the env the snapshot built the PLTs in (`ChgAdapter.dep_env/1`): incremental from
+  # the snapshot's incremental PLT when there is one (`mix chg.dialyzer`), else, or when
+  # incremental mode cannot run here (its exit 3), `mix dialyzer` against the classic PLT.
   defp dialyzer do
     case ChgAdapter.dep_env(:dialyxir) do
       nil ->
         []
 
       env ->
-        {out, status} =
-          ChgAdapter.capture("mix", ["dialyzer", "--format", "short"], env: [{"MIX_ENV", env}])
-
+        {out, status} = dialyzer_run(env, File.regular?(Mix.Tasks.Chg.Dialyzer.iplt(env)))
         if status == 0, do: [], else: dialyzer_failures(out)
     end
   end
+
+  defp dialyzer_run(env, true) do
+    case ChgAdapter.capture("mix", ["chg.dialyzer"], env: [{"MIX_ENV", env}]) do
+      {_out, 3} -> dialyzer_run(env, false)
+      result -> result
+    end
+  end
+
+  defp dialyzer_run(env, false),
+    do: ChgAdapter.capture("mix", ["dialyzer", "--format", "short"], env: [{"MIX_ENV", env}])
 
   @doc "Warnings from `mix dialyzer --format short`: `file:line[:col]:kind message`."
   def dialyzer_failures(out) do

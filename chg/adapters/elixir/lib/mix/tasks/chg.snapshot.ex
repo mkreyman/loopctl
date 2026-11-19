@@ -1,7 +1,8 @@
 defmodule Mix.Tasks.Chg.Snapshot do
   @shortdoc "Builds the artifacts of a chg snapshot (contract command `snapshot`)"
   @moduledoc """
-  Brings `deps`, `_build/{dev,test}`, the dialyzer PLT and the test reference cache up to
+  Brings `deps`, `_build/{dev,test}`, the dialyzer PLTs (dialyxir's classic one and the
+  incremental one `mix chg.dialyzer` checks against) and the test reference cache up to
   date with the commit the tree holds, incrementally from whatever is already there. chg
   names that commit in `CHG_SHA`, since a snapshot tree has no `.git`; run by hand in a
   checkout, it is git's HEAD (`ChgAdapter.head!/0`).
@@ -118,9 +119,30 @@ defmodule Mix.Tasks.Chg.Snapshot do
 
     if env = ChgAdapter.dep_env(:dialyxir) do
       step!("mix", ["dialyzer", "--plt"], [{"MIX_ENV", env}])
+      incremental_plt(env)
     end
 
     step!("mix", ["chg.refs"], [{"MIX_ENV", "test"}])
+  end
+
+  # The incremental PLT `mix chg.static` checks against. Never fatal: without it a check
+  # runs `mix dialyzer` against the classic PLT built above, so a failed build removes the
+  # file rather than leave one that no longer matches the tree.
+  defp incremental_plt(env) do
+    IO.puts(:standard_error, "chg: MIX_ENV=#{env} mix chg.dialyzer --build")
+
+    case ChgAdapter.stream("mix", ["chg.dialyzer", "--build"], [{"MIX_ENV", env}]) do
+      0 ->
+        :ok
+
+      status ->
+        File.rm(Mix.Tasks.Chg.Dialyzer.iplt(env))
+
+        IO.puts(
+          :standard_error,
+          "chg: mix chg.dialyzer --build exited #{status}; checks run mix dialyzer instead"
+        )
+    end
   end
 
   defp step!(cmd, args, env) do

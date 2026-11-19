@@ -285,6 +285,104 @@ defmodule ChgAdapter.IntegrationTest do
     assert {"compile", "lib/sample/reports.ex"} in checks
   end
 
+  # mkreyman/chg#47. Fetches dialyxir from Hex and builds both PLTs from scratch, so it
+  # is the slowest test here.
+  @tag timeout: 1_200_000
+  test "incremental dialyzer judges a change exactly as mix dialyzer does", ctx do
+    edit!(ctx, "mix.exs", fn mix ->
+      mix
+      |> String.replace(
+        ~s|deps: [{:shared, path: "apps/shared"}]|,
+        ~s|deps: [{:shared, path: "apps/shared"}, | <>
+          ~s|{:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}],\n| <>
+          ~s|      dialyzer: [plt_core_path: "_build/\#{Mix.env()}", plt_add_apps: [:ex_unit]]|
+      )
+    end)
+
+    # A contract the compiler does not check and dialyzer does, committed before the
+    # snapshot, so the incremental PLT caches its warning.
+    plant_contract!(ctx, "lib/sample/billing.ex")
+    {_, 0} = sh("mix", ["deps.get"], ctx.dir, [{"MIX_ARCHIVES", ctx.archives}])
+    git!(ctx.dir, ["add", "mix.exs", "mix.lock", "lib/sample/billing.ex"])
+    git!(ctx.dir, ["commit", "-qm", "dialyxir"])
+
+    snapshot!(ctx)
+    assert File.regular?(Path.join(ctx.dir, "_build/chg/dialyzer-test.iplt"))
+
+    # A check runs in a workspace cloned from the snapshot at another path, where the
+    # incremental PLT's cached warnings carry the snapshot's paths: all of it below.
+    ws = %{ctx | dir: Path.join(ctx.root, "moved-#{System.unique_integer([:positive])}")}
+    File.cp_r!(ctx.dir, ws.dir)
+
+    # The cached warning of an unchanged module: printed, and filtered, as mix dialyzer does.
+    assert_same_judgement(ws, 2, ["lib/sample/billing.ex"])
+    File.write!(Path.join(ws.dir, ".dialyzer_ignore.exs"), ~s|[{"lib/sample/billing.ex"}]\n|)
+    assert_same_judgement(ws, 0, [])
+    File.rm!(Path.join(ws.dir, ".dialyzer_ignore.exs"))
+
+    # A warning in a changed module, which the check re-analyses.
+    plant_contract!(ws, "lib/sample/reports.ex")
+    assert_same_judgement(ws, 2, ["lib/sample/billing.ex", "lib/sample/reports.ex"])
+
+    assert {%{"ok" => false, "failures" => failures}, 1} =
+             chg(ws, ["chg.static", "--base", "HEAD"])
+
+    assert Enum.sort(Enum.map(failures, &{&1["check"], &1["file"]})) == [
+             {"dialyzer", "lib/sample/billing.ex"},
+             {"dialyzer", "lib/sample/reports.ex"}
+           ]
+
+    # A PLT dialyzer cannot read (truncated, or another OTP's) is a dialyzer error: exit
+    # 3, and the check falls back to mix dialyzer rather than failing the commit.
+    File.write!(Path.join(ws.dir, "_build/chg/dialyzer-test.iplt"), "not a PLT")
+    assert {_, 3} = dialyzer(ws, ["chg.dialyzer"])
+
+    assert {%{"ok" => false, "failures" => [_, _] = failures}, 1} =
+             chg(ws, ["chg.static", "--base", "HEAD"])
+
+    assert Enum.all?(
+             failures,
+             &(&1["file"] in ["lib/sample/billing.ex", "lib/sample/reports.ex"])
+           )
+
+    # Without the incremental PLT a check never builds one: it falls back to mix dialyzer.
+    File.rm!(Path.join(ws.dir, "_build/chg/dialyzer-test.iplt"))
+    assert {_, 3} = dialyzer(ws, ["chg.dialyzer"])
+
+    assert {%{"ok" => false, "failures" => [_, _]}, 1} =
+             chg(ws, ["chg.static", "--base", "HEAD"])
+  end
+
+  defp plant_contract!(ctx, path) do
+    edit!(
+      ctx,
+      path,
+      &String.replace(
+        &1,
+        ~r/\nend\s*\z/,
+        ~s|\n\n  @spec label() :: integer()\n  def label, do: "x"\nend\n|
+      )
+    )
+  end
+
+  # `mix dialyzer --format short` and `mix chg.dialyzer` exit with `status` and print the
+  # same warning lines, one in each of `files`, each relative to the project.
+  defp assert_same_judgement(ctx, status, files) do
+    {classic, ^status} = dialyzer(ctx, ["dialyzer", "--format", "short"])
+    {incremental, ^status} = dialyzer(ctx, ["chg.dialyzer"])
+    assert warning_lines(incremental) == warning_lines(classic)
+    assert Enum.map(warning_lines(incremental), &hd(String.split(&1, ":"))) == files
+  end
+
+  # Both outputs merged: `mix dialyzer` prints its warnings on stderr.
+  defp dialyzer(ctx, args) do
+    env = [{"MIX_BUILD_PATH", nil}, {"MIX_ARCHIVES", ctx.archives}, {"MIX_ENV", "test"}]
+    System.cmd("mix", args, cd: ctx.dir, env: @isolated_git ++ env, stderr_to_stdout: true)
+  end
+
+  defp warning_lines(out),
+    do: out |> String.split("\n") |> Enum.filter(&(&1 =~ ~r/^\S+\.exs?:\d+/)) |> Enum.sort()
+
   test "a recorded run selects by compiled code: a comment selects nothing, a behaviour change its tests",
        ctx do
     snapshot!(ctx)
