@@ -45,6 +45,10 @@ pub const MAX_BODY: usize = 900_000;
 pub const MAX_BATCHES: usize = 40;
 /// loopctl's `Loopctl.Changes.Ledger` `@max_row_bytes`: one row, canonically encoded.
 pub const MAX_ROW_BYTES: usize = 16_384;
+/// loopctl's `Loopctl.Changes.Findings` `@max_failure_names`.
+pub const MAX_FAILURE_NAMES: usize = 50;
+/// loopctl's `Loopctl.Changes.Findings` `@evidence_value_chars`.
+const MAX_FAILURE_CHARS: usize = 200;
 /// A row unsent for longer than this fails `chg doctor`.
 pub const STALE_MS: u64 = 24 * 3600 * 1000;
 const BACKOFF_BASE_MS: u64 = 30_000;
@@ -419,21 +423,65 @@ fn lines_from(path: &Path, offset: u64, max: usize) -> Result<Vec<Line>, String>
 /// `owner/name` (the shadow log names the repo by its key). Deterministic, so a resend
 /// hashes the same.
 ///
-/// A row over loopctl's `MAX_ROW_BYTES` is refused there as `invalid_row`. The only field that
-/// grows that large is a `chg` row's `selected` test list (a selection of thousands of files),
-/// and loopctl does not read it, so on the wire it becomes `selected_count`. The shadow log
-/// keeps the full list for `chg shadow report`.
+/// A row over loopctl's `MAX_ROW_BYTES` is refused there as `invalid_row`. Two fields grow
+/// that large, and the shadow log keeps both in full for `chg shadow report`:
+/// - a `chg` row's `selected` test list (thousands of files), which loopctl does not read; on
+///   the wire it becomes `selected_count`;
+/// - then, if still too large, `failures` (a run where thousands of tests failed). The wire
+///   keeps the names loopctl keeps (`Loopctl.Changes.Findings.failure_names/1`: a string or an
+///   object's `id`, non-empty, at most 200 characters, unique, sorted, the first 50), plus
+///   `failures_count` and `failures_sha256`, the sha256 of the full list in the form loopctl's
+///   `failures_digest/1` hashes, so runs that differ only past the 50th stay distinguishable.
 pub fn wire_row(line: &str, repo: &str) -> Option<Value> {
     let mut v: Value = serde_json::from_str(line.trim()).ok()?;
     v.as_object_mut()?
         .insert("repo".into(), Value::String(repo.to_string()));
-    let too_big = serde_json::to_vec(&v).is_ok_and(|b| b.len() > MAX_ROW_BYTES);
-    let obj = v.as_object_mut()?;
-    if too_big && let Some(n) = obj.get("selected").and_then(Value::as_array).map(Vec::len) {
-        obj.remove("selected");
-        obj.insert("selected_count".into(), Value::from(n));
+    let too_big = |v: &Value| serde_json::to_vec(v).is_ok_and(|b| b.len() > MAX_ROW_BYTES);
+    if too_big(&v) {
+        let obj = v.as_object_mut()?;
+        if let Some(n) = obj.get("selected").and_then(Value::as_array).map(Vec::len) {
+            obj.remove("selected");
+            obj.insert("selected_count".into(), Value::from(n));
+        }
+    }
+    if too_big(&v) {
+        let obj = v.as_object_mut()?;
+        if let Some(Value::Array(all)) = obj.remove("failures") {
+            let count = all.len();
+            let digest = failures_sha256(&all);
+            obj.insert("failures".into(), Value::from(failure_names(&all)));
+            obj.insert("failures_count".into(), Value::from(count));
+            obj.insert("failures_sha256".into(), Value::from(digest));
+        }
     }
     Some(v)
+}
+
+/// What loopctl's `Findings.failure_names/1` keeps of a failures list.
+fn failure_names(all: &[Value]) -> Vec<String> {
+    let mut names: Vec<String> = all
+        .iter()
+        .filter_map(|f| match f {
+            Value::String(s) => Some(s.as_str()),
+            Value::Object(o) => o.get("id").and_then(Value::as_str),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_FAILURE_CHARS).collect())
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(MAX_FAILURE_NAMES);
+    names
+}
+
+/// sha256 hex over the list as loopctl's `Findings.failures_digest/1` hashes it: each failure
+/// JSON-encoded, sorted, joined by newlines.
+fn failures_sha256(all: &[Value]) -> String {
+    let mut encoded: Vec<String> = all.iter().map(Value::to_string).collect();
+    encoded.sort();
+    let digest = <Sha256 as sha2::Digest>::digest(encoded.join("\n").as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn reject_locally(src: &Source, file: &Path, reason: &str, row: &str) {
@@ -1193,6 +1241,68 @@ mod tests {
         assert_eq!(r["repo"], "mkreyman/home_care_billing");
         assert!(wire_row("not json", "a/b").is_none());
         assert!(wire_row("[1]", "a/b").is_none());
+    }
+
+    #[test]
+    fn wire_row_keeps_the_first_failures_loopctl_would_keep() {
+        let failures: Vec<String> = (0..2700)
+            .rev()
+            .map(|i| format!("test/archetype/case_{i:04}_test.exs:{i}"))
+            .collect();
+        let line = serde_json::json!({"v":1,"kind":"chg","repo":"r","sha":"s","verdict":"fail",
+                                      "ms":1,"failures":failures,"selected":["test/a_test.exs"]})
+        .to_string();
+        let r = wire_row(&line, "a/r").unwrap();
+        assert!(serde_json::to_vec(&r).unwrap().len() <= MAX_ROW_BYTES);
+        assert_eq!(r["failures_count"], 2700);
+        let kept = r["failures"].as_array().unwrap();
+        assert_eq!(kept.len(), MAX_FAILURE_NAMES);
+        assert_eq!(
+            kept[0], "test/archetype/case_0000_test.exs:0",
+            "sorted, lowest first"
+        );
+        assert!(r.get("selected").is_none(), "selected goes first");
+        assert_eq!(r["failures_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(wire_row(&line, "a/r"), Some(r.clone()), "deterministic");
+
+        // Two runs with the same first 50 but different tails keep distinct digests.
+        let mut other = failures.clone();
+        other[0] = "test/zzz_test.exs:1".into();
+        let line2 = serde_json::json!({"v":1,"kind":"gate","sha":"s","verdict":"fail","ms":1,
+                                       "failures":other})
+        .to_string();
+        let r2 = wire_row(&line2, "a/r").unwrap();
+        assert_eq!(r2["failures"], r["failures"]);
+        assert_ne!(r2["failures_sha256"], r["failures_sha256"]);
+
+        // The names loopctl keeps: empty and non-name entries dropped, `id` objects read.
+        let mut odd: Vec<Value> = vec![
+            Value::from(""),
+            Value::from(7),
+            json!({"id": "test/0_id_test.exs:1"}),
+        ];
+        odd.extend(failures.iter().map(|f| Value::from(f.as_str())));
+        let names = failure_names(&odd);
+        assert_eq!(names[0], "test/0_id_test.exs:1");
+        assert_eq!(names.len(), MAX_FAILURE_NAMES);
+        assert!(!names.iter().any(String::is_empty));
+        let long = "t".repeat(250);
+        assert_eq!(
+            failure_names(&[Value::from(long.as_str()), Value::from(long.as_str())]).len(),
+            1
+        );
+        assert_eq!(
+            failure_names(&[Value::from(long.as_str())])[0].len(),
+            MAX_FAILURE_CHARS
+        );
+
+        let small = r#"{"v":1,"kind":"gate","failures":["test/b_test.exs:1","test/a_test.exs:2"]}"#;
+        let s = wire_row(small, "a/r").unwrap();
+        assert_eq!(
+            s["failures"][0], "test/b_test.exs:1",
+            "a row under the cap is untouched"
+        );
+        assert!(s.get("failures_count").is_none());
     }
 
     #[test]
