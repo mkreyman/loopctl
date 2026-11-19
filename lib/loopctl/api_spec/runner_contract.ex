@@ -1359,7 +1359,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # nothing loopctl records is cut on the way out. THIS OBJECT IS `additionalProperties:
     # false`, so a runner vendoring an older version refuses a dispatch carrying the field:
     # loopctl sends it only to a runner that JOINED declaring 1.33.0 or later
-    # (`verify_loop_finding_supported?/1`).
+    # (`fit_dispatch/2`, called by `Loopctl.Runners.dispatch/3`).
     @max_failures 50
     @max_failure_length 200
 

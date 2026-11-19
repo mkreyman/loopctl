@@ -31,10 +31,13 @@ defmodule Loopctl.Delivery.TriagePayloadLoopFindingTest do
           state: :filed,
           occurrences: 3,
           fix_attempts: 1,
+          # The shape `Findings.flaky_tests` records: the finding's own facts at the top level
+          # and the ledger row's scalars nested under `row`.
           evidence: %{
+            "repo" => "mkreyman/home_care_billing",
+            "host" => "minis",
             "test" => "test/a_test.exs:12",
-            "runs" => 7,
-            "flaky" => true,
+            "row" => %{"runs" => 7, "flaky" => true, "nested" => %{"too" => "deep"}},
             "failures" => ["not", "a", "scalar"]
           },
           first_seen_at: now,
@@ -92,14 +95,41 @@ defmodule Loopctl.Delivery.TriagePayloadLoopFindingTest do
              occurrences: 3,
              fix_attempts: 1,
              evidence: [
-               %{key: "flaky", value: "true"},
-               %{key: "runs", value: "7"},
-               %{key: "test", value: "test/a_test.exs:12"}
+               %{key: "host", value: "minis"},
+               %{key: "repo", value: "mkreyman/home_care_billing"},
+               %{key: "test", value: "test/a_test.exs:12"},
+               %{key: "row.flaky", value: "true"},
+               %{key: "row.runs", value: "7"}
              ]
            }
 
     assert ByteRule.bytes(triage) <= RunnerTriage.max_bytes()
     assert {:ok, %{triage: %{loop_finding: %{kind: "flaky_test"}}}} = wire(triage)
+  end
+
+  test "a selection_miss's two full rows never crowd out its own facts", %{tenant: tenant} do
+    row = fn prefix -> Map.new(1..16, &{"#{prefix}#{&1}", &1}) end
+
+    finding =
+      finding!(tenant.id, %{
+        kind: "selection_miss",
+        evidence: %{
+          "repo" => "mkreyman/chg",
+          "host" => "minis",
+          "sha" => String.duplicate("a", 40),
+          "chg_row" => row.("c"),
+          "gate_row" => row.("g"),
+          "failures" => ["test/a_test.exs:12"]
+        }
+      })
+
+    assert {:ok, triage} = TriagePayload.build(record(tenant.id, finding.id))
+    keys = Enum.map(triage.loop_finding.evidence, & &1.key)
+
+    assert length(keys) == RunnerTriage.max_evidence()
+    assert Enum.take(keys, 3) == ["host", "repo", "sha"]
+    assert Enum.all?(Enum.drop(keys, 3), &String.starts_with?(&1, "chg_row."))
+    assert {:ok, _} = wire(triage)
   end
 
   test "another tenant's finding id carries nothing", %{tenant: tenant, other: other} do
