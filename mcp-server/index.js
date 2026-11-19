@@ -91,7 +91,7 @@ import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.j
 import { changeBindingGet as changeBindingGetRequest } from "./lib/change-bindings.js";
 import { agentOutcomes } from "./lib/agent-outcomes.js";
 import { chgLedgerSummary } from "./lib/chg-ledger-summary.js";
-import { chgFindings, chgFindingClear } from "./lib/chg-findings.js";
+import { chgFindings, chgFindingClear, chgFindingDismiss } from "./lib/chg-findings.js";
 import {
   clearGithubCredential as clearGithubCredentialRequest,
   githubCredential as githubCredentialRequest,
@@ -3528,6 +3528,10 @@ async function chgFindingsRead(args) {
       apiCall: (method, path, body) => apiCall(method, path, body, key),
     }),
   );
+}
+
+async function chgFindingDismissCall(args) {
+  return toContent(await chgFindingDismiss(args, runnerDeps()));
 }
 
 async function chgFindingClearCall(args) {
@@ -9077,6 +9081,32 @@ const TOOLS = [
     },
   },
   {
+    name: "chg_finding_dismiss",
+    description:
+      "CLOSE A CHG FINDING FILED IN ERROR (POST /api/v1/chg_findings/:id/dismiss, loopctl " +
+      "#1064). A queued, filed or escalated finding whose premise was wrong goes to `closed` " +
+      "with `dismissed_at` and your `reason`; its pending forge actions are abandoned and, " +
+      "when it has an issue, loopctl comments the reason and closes it. A later sighting of " +
+      "the same signal is counted and never reopens it. Audited as `chg_finding_dismissed`. " +
+      "REFUSES: 422 invalid_reason for a missing or overlong reason (1..500 characters); 409 " +
+      "not_dismissible for a fixed or closed finding; 409 filing_in_flight while its issue is " +
+      "being opened (retry once chg_findings shows the issue number); 404 for a finding the " +
+      "tenant does not hold; 403 for any key that is not user-role; 403 custody_tier_required " +
+      "on a tenant with no human anchor. Requires LOOPCTL_USER_KEY (user role), used exactly; " +
+      "refused locally when it is not set.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        finding_id: { type: "string", description: "The finding's id, from chg_findings." },
+        reason: {
+          type: "string",
+          description: "Why it is not a real problem, 1..500 characters. Posted on the issue.",
+        },
+      },
+      required: ["finding_id", "reason"],
+    },
+  },
+  {
     name: "change_binding_get",
     description:
       "THE CHG CHANGES BOUND TO A STORY (GET /api/v1/stories/:id/changes, loopctl US-47.7): " +
@@ -10852,6 +10882,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await chgFindingsRead(args);
     case "chg_finding_clear":
       return await chgFindingClearCall(args);
+    case "chg_finding_dismiss":
+      return await chgFindingDismissCall(args);
 
     case "resolve_escalation":
       return await resolveEscalation(args);

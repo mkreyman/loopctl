@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.18.0 — 2026-11-19
+
+### Added
+
+- **`chg_finding_dismiss`** (loopctl #1064): closes a chg finding filed in error with a
+  reason, closes its issue with a comment, and keeps a later sighting from reopening it.
+  `LOOPCTL_USER_KEY`, used exactly.
+
+### Changed
+
+- **`escalation_playbook` take-over steps** name the escalation handoff loopctl now posts on
+  the story's repo channel (loopctl #1065): claim it, resolve, then `channel_done` it, and
+  say that the resolving session's own operator key is the intended path.
+
 ## 3.17.1 — 2026-11-19
 
 ### Changed

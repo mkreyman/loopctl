@@ -6,6 +6,18 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Every escalated delivery story becomes a claimable handoff (2026-11-19, #1065).** A new
+  five-minute cron, `EscalationHandoffWorker`, posts `handoff:<repo>:escalation-<story>-g<N>`
+  on the story's project channel as the reserved `system:escalation-handoff` agent, re-posts
+  it as STALLED once a day when it has sat unclaimed past 24 h, posts a new generation when
+  its claim is finished while the story is still escalated, and marks its claim done once the
+  story leaves `escalated`. The body never carries `escalation_reason`. No migration, no env
+  var.
+- **`POST /api/v1/chg_findings/:id/dismiss` (2026-11-19, #1064).** Closes a chg finding
+  filed in error, with a required `reason`; user key on a human-anchored tenant. Migration
+  `20261119180000` adds the nullable `chg_findings.dismissed_at` and `dismissed_reason`
+  columns with a CHECK that they are set together and only on a closed finding. A dismissed
+  finding is never reopened by a later sighting. MCP tool `chg_finding_dismiss` (3.18.0).
 - **A missing forge credential never abandons a revert issue or an issue closure (2026-11-19,
   #1058).** Both drainers now wait hourly without an attempt bound, as the finding filer
   already did. Migration `20261119170000` returns to `pending` the rows of

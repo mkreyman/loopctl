@@ -8,6 +8,9 @@ defmodule LoopctlWeb.ChgFindingController do
   - `POST /api/v1/chg_findings/:id/clear` sends an ESCALATED finding round the loop again.
     `role: :user` on a human-anchored tenant: escalation is the loop handing a problem to a
     person, and the loop must not be able to take it back by itself.
+  - `POST /api/v1/chg_findings/:id/dismiss` closes a finding filed in error (#1064). The
+    same gate, for the mirror reason: a dismissal takes a problem away from the loop, and an
+    agent that could dismiss could hide the findings about its own work.
   """
 
   use LoopctlWeb, :controller
@@ -20,9 +23,9 @@ defmodule LoopctlWeb.ChgFindingController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:clear]
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:clear, :dismiss]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index]
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:clear]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:clear, :dismiss]
 
   tags(["chg findings"])
 
@@ -52,7 +55,13 @@ defmodule LoopctlWeb.ChgFindingController do
       filed_at: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true},
       fixed_at: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true},
       closed_at: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true},
-      escalated_at: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true}
+      escalated_at: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true},
+      dismissed_at: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true},
+      dismissed_reason: %OpenApiSpex.Schema{
+        type: :string,
+        nullable: true,
+        description: "Why a person dismissed the finding as filed in error."
+      }
     }
   }
 
@@ -158,6 +167,95 @@ defmodule LoopctlWeb.ChgFindingController do
     end
   end
 
+  @reason_max Findings.dismiss_reason_max()
+
+  operation(:dismiss,
+    summary: "Dismiss a chg finding filed in error",
+    description:
+      "Closes a `queued`, `filed` or `escalated` finding whose premise was wrong, recording " <>
+        "`dismissed_at` and `dismissed_reason`. Its pending forge actions are abandoned, " <>
+        "and when it has an issue a `close` comments the reason and closes it. A later " <>
+        "sighting of the same fingerprint is counted and never reopens it. Audited as " <>
+        "`chg_finding_dismissed`. Needs a `:user` key on a human-anchored tenant (403 " <>
+        "`insufficient_role` or `custody_tier_required` otherwise). 422 `invalid_reason` for " <>
+        "a `reason` that is not 1..#{@reason_max} characters; 404 for no such finding in the " <>
+        "tenant; 409 `not_dismissible` for a `fixed` or `closed` finding; 409 " <>
+        "`filing_in_flight` while its issue is being opened (retry once it is filed).",
+    parameters: [id: [in: :path, type: :string, required: true, description: "The finding id."]],
+    request_body:
+      {"Dismissal", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:reason],
+         properties: %{
+           reason: %OpenApiSpex.Schema{
+             type: :string,
+             minLength: 1,
+             maxLength: @reason_max,
+             description: "Why the finding is not a real problem; posted on its issue."
+           }
+         }
+       }},
+    responses: %{
+      200 =>
+        {"Dismissed finding", "application/json",
+         %OpenApiSpex.Schema{type: :object, properties: %{data: @finding_schema}}},
+      401 => {"Unauthenticated", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Not a user key, or tenant not human-anchored", "application/json",
+         Schemas.ErrorResponse},
+      404 => {"No such finding", "application/json", Schemas.ErrorResponse},
+      409 => {"Not dismissible, or filing in flight", "application/json", Schemas.ErrorResponse},
+      422 => {"Missing or overlong reason", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc "POST /api/v1/chg_findings/:id/dismiss"
+  def dismiss(conn, %{"id" => id} = params) do
+    api_key = conn.assigns.current_api_key
+    actor = %{api_key_id: api_key.id, label: LoopctlWeb.ActorLabel.of(api_key)}
+
+    with {:ok, tenant_id} <- CurrentTenant.fetch_id(conn) do
+      case Findings.dismiss(tenant_id, id, params["reason"], actor) do
+        {:ok, finding} ->
+          json(conn, %{data: finding_json(finding)})
+
+        {:error, :not_found} ->
+          {:error, :not_found}
+
+        {:error, :invalid_reason} ->
+          refusal(
+            conn,
+            422,
+            "invalid_reason",
+            "`reason` is required: 1 to #{@reason_max} characters."
+          )
+
+        {:error, :not_dismissible} ->
+          refusal(
+            conn,
+            409,
+            "not_dismissible",
+            "A fixed or closed finding cannot be dismissed; the loop closes a fixed one itself."
+          )
+
+        {:error, :filing_in_flight} ->
+          refusal(
+            conn,
+            409,
+            "filing_in_flight",
+            "The finding's issue is being opened. Retry once chg_findings shows its issue number."
+          )
+      end
+    end
+  end
+
+  defp refusal(conn, status, code, message) when is_integer(status) do
+    conn
+    |> put_status(status)
+    |> json(%{error: %{status: status, code: code, message: message}})
+  end
+
   @doc false
   # Public for the controller test; the parsing has no other caller.
   @spec list_opts(map()) :: {:ok, keyword()} | {:error, :unprocessable_entity, String.t()}
@@ -228,7 +326,9 @@ defmodule LoopctlWeb.ChgFindingController do
       filed_at: f.filed_at,
       fixed_at: f.fixed_at,
       closed_at: f.closed_at,
-      escalated_at: f.escalated_at
+      escalated_at: f.escalated_at,
+      dismissed_at: f.dismissed_at,
+      dismissed_reason: f.dismissed_reason
     }
   end
 

@@ -787,6 +787,11 @@ defmodule Loopctl.ObanConfig do
            # project per UTC day. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"0 14 * * *", Loopctl.Workers.EscalationDigestWorker},
+           # #1065: every escalated story becomes a claimable handoff on its project's
+           # channel within five minutes; a stalled one is re-posted, a resolved one closed.
+           # HARDCODED, keyed slots make a retry post nothing twice. Keep in sync with the
+           # crontab assertion in oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.EscalationHandoffWorker},
            # PARKED (see `@parked_crons`) — DECLARED here, filtered out of the live
            # crontab by `reject_parked/2` unless an operator names it in
            # `OBAN_UNPARK_CRONS`. Its action is `archive`, which is TERMINAL, and an

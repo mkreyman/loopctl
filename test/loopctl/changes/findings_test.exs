@@ -545,6 +545,84 @@ defmodule Loopctl.Changes.FindingsTest do
     Enum.find(actions(tenant_id), &(&1.action == kind))
   end
 
+  describe "dismiss/4 (#1064)" do
+    test "closes with the reason, abandons pending acts, closes the issue, and never recurs",
+         ctx do
+      id = fixed_flaky!(ctx, 61, @sha)
+
+      # As a finding a recurrence reopened: filed, with an earlier fix on record, and its
+      # reopen still pending.
+      AdminRepo.update_all(from(f in Finding, where: f.id == ^id),
+        set: [state: :filed, fixed_at: @now, fix_attempts: 1]
+      )
+
+      AdminRepo.insert!(%FindingAction{
+        tenant_id: ctx.tenant_id,
+        finding_id: id,
+        source_id: ctx.hcb.id,
+        action: :reopen,
+        generation: 1,
+        cycle: 0,
+        repo_full_name: "mkreyman/home_care_billing",
+        body: "did not hold",
+        issue_number: 61,
+        status: :pending,
+        attempts: 0
+      })
+
+      assert {:ok, %Finding{state: :closed, dismissed_reason: "hook row, not a test"}} =
+               Findings.dismiss(ctx.tenant_id, id, " hook row, not a test ", %{})
+
+      assert %FindingAction{status: :abandoned, abandoned_reason: "finding_dismissed"} =
+               action_of(ctx.tenant_id, :reopen)
+
+      close = action_of(ctx.tenant_id, :close)
+      assert %FindingAction{status: :pending, issue_number: 61, generation: 1} = close
+      assert close.body =~ "hook row, not a test"
+
+      # The same signal again, after the earlier fix: counted, never a recurrence.
+      day2 = DateTime.add(@now, 86_400, :second)
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(day2, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, day2, opts())
+
+      assert %Finding{state: :closed, fix_attempts: 1, occurrences: 2} =
+               AdminRepo.get(Finding, id)
+
+      assert Enum.count(actions(ctx.tenant_id), &(&1.status == :pending)) == 1
+    end
+
+    test "an open that started and recorded no issue blocks it; one never claimed does not",
+         ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      [finding] = findings(ctx.tenant_id)
+      [open] = actions(ctx.tenant_id)
+
+      AdminRepo.update_all(from(a in FindingAction, where: a.id == ^open.id), set: [attempts: 1])
+
+      assert {:error, :filing_in_flight} = Findings.dismiss(ctx.tenant_id, finding.id, "x", %{})
+      assert %Finding{state: :filed} = AdminRepo.get(Finding, finding.id)
+
+      AdminRepo.update_all(from(a in FindingAction, where: a.id == ^open.id), set: [attempts: 0])
+
+      assert {:ok, %Finding{state: :closed, issue_number: nil}} =
+               Findings.dismiss(ctx.tenant_id, finding.id, "x", %{})
+
+      # Abandoned, and no close: there is no issue to close.
+      assert [%FindingAction{action: :open, status: :abandoned}] = actions(ctx.tenant_id)
+    end
+
+    test "another tenant's finding is not found", ctx do
+      flaky!(ctx.hcb, "t1")
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      [finding] = findings(ctx.tenant_id)
+      other = fixture(:tenant, %{})
+
+      assert {:error, :not_found} = Findings.dismiss(other.id, finding.id, "x", %{})
+      assert %Finding{state: :filed} = AdminRepo.get(Finding, finding.id)
+    end
+  end
+
   describe "the fix lifecycle (US-51.2)" do
     test "a merged loop story moves its finding to fixed", ctx do
       id = fixed_flaky!(ctx, 51, @sha)

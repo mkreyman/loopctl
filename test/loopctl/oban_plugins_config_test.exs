@@ -973,6 +973,18 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "#1065: EscalationHandoffWorker crontab entry" do
+    test "runs every five minutes and is not parked" do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+      {Oban.Plugins.Cron, cron_opts} = Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      assert {"*/5 * * * *", Loopctl.Workers.EscalationHandoffWorker} in cron_opts[:crontab],
+             "without it an escalated story waits for a person nobody tells"
+
+      refute Loopctl.Workers.EscalationHandoffWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "US-35.3: sth_sweep_cron/0 (config-based DI, runtime-tunable)" do
     test "defaults to a 5-minute sweep when STH_SWEEP_CRON is unset" do
       # STH_SWEEP_CRON is not set in the test environment, so the default applies.

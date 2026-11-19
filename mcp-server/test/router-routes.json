@@ -75,6 +75,7 @@
     ["GET","/api/v1/channel/posts/quarantined","LoopctlWeb.ChannelPostController",":quarantined"],
     ["GET","/api/v1/chg_findings","LoopctlWeb.ChgFindingController",":index"],
     ["POST","/api/v1/chg_findings/:id/clear","LoopctlWeb.ChgFindingController",":clear"],
+    ["POST","/api/v1/chg_findings/:id/dismiss","LoopctlWeb.ChgFindingController",":dismiss"],
     ["POST","/api/v1/chg_ledger/:source_id","LoopctlWeb.ChgLedgerController",":create"],
     ["GET","/api/v1/chg_ledger/summary","LoopctlWeb.ChgLedgerSummaryController",":show"],
     ["GET","/api/v1/corpora","LoopctlWeb.CorpusController",":index"],
