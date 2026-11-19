@@ -445,6 +445,8 @@ defmodule Loopctl.Changes.FindingsTest do
                actions(ctx.tenant_id)
 
       assert row.last_error =~ "credential_unavailable"
+      # The wait hands back the attempt its claim counted, so the bound is not spent.
+      assert row.attempts == ForgeOutbox.max_attempts()
       assert DateTime.diff(row.next_attempt_at, DateTime.utc_now()) > 3_000
       assert [%Finding{state: :filed, issue_number: nil}] = findings(ctx.tenant_id)
     end

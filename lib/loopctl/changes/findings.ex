@@ -1281,12 +1281,16 @@ defmodule Loopctl.Changes.Findings do
       when is_integer(wait_seconds) and wait_seconds > 0 do
     now = DateTime.utc_now()
 
+    # The claim that led here counted an attempt (`ForgeOutbox.claim_attempt/3`); a wait made
+    # no forge call, so it is handed back, or a long wait would leave the first real forge
+    # error past the bound and abandon the row the wait existed to keep.
     ForgeOutbox.update_pending(FindingAction, tenant_id, action.id,
       set: [
         next_attempt_at: DateTime.add(now, wait_seconds, :second),
         last_error: ForgeOutbox.error_text(reason),
         updated_at: now
-      ]
+      ],
+      inc: [attempts: -1]
     )
   end
 

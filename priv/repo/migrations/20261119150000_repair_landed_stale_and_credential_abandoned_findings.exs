@@ -6,7 +6,8 @@ defmodule Loopctl.Repo.Migrations.RepairLandedStaleAndCredentialAbandonedFinding
      and `merged` is not terminal, so every LANDED chg change was flagged `stale` six hours after
      it landed. A flag clears only on the change's next event, and a landed change sends none,
      so the flag would stand for good and, a day later, file a `stuck_change` finding. This
-     clears `stale` on every cursor whose change has an applied, routed `landed` event.
+     clears `stale` on every cursor whose change has an applied, routed `landed` event that no
+     applied `reverted` or `submitted` follows.
 
   2. `Loopctl.Changes.FindingFiler` abandoned an `open` action after six hourly waits for a
      missing forge credential, leaving its finding `:filed` with no issue. This returns such
@@ -29,6 +30,13 @@ defmodule Loopctl.Repo.Migrations.RepairLandedStaleAndCredentialAbandonedFinding
               WHERE e.tenant_id = c.tenant_id AND e.repo = c.repo
                 AND e.change_id = c.change_id AND e.kind = 'landed'
                 AND e.applied_at IS NOT NULL AND e.routed
+                AND NOT EXISTS (
+                      SELECT 1 FROM change_events r
+                       WHERE r.tenant_id = e.tenant_id AND r.repo = e.repo
+                         AND r.change_id = e.change_id
+                         AND r.kind IN ('reverted', 'submitted')
+                         AND r.applied_at IS NOT NULL AND r.event_seq > e.event_seq
+                    )
            )
     """)
 

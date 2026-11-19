@@ -160,13 +160,30 @@ defmodule Loopctl.Changes.Reconcile do
     end
   end
 
-  # An applied, routed `landed` event of the change bound as `:cursor`: chg's last word on it.
+  # An applied, routed `landed` event of the change bound as `:cursor` that no applied
+  # `reverted` or `submitted` follows. `deployed` and `verified` may follow a landing without
+  # reopening it; a revert sends the story back to work and a new revision starts a new
+  # submission, and either one puts the change back under watch.
   defp landed_subquery do
+    reopened = reopened_subquery()
+
     from e in Event,
+      as: :landed,
       where:
         e.tenant_id == parent_as(:cursor).tenant_id and e.repo == parent_as(:cursor).repo and
           e.change_id == parent_as(:cursor).change_id and e.kind == "landed" and
           not is_nil(e.applied_at) and e.routed,
+      where: not exists(subquery(reopened)),
+      select: 1
+  end
+
+  # An applied `reverted` or `submitted` after the landing bound as `:landed`.
+  defp reopened_subquery do
+    from r in Event,
+      where:
+        r.tenant_id == parent_as(:landed).tenant_id and r.repo == parent_as(:landed).repo and
+          r.change_id == parent_as(:landed).change_id and r.kind in ["reverted", "submitted"] and
+          not is_nil(r.applied_at) and r.event_seq > parent_as(:landed).event_seq,
       select: 1
   end
 

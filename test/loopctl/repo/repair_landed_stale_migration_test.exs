@@ -48,7 +48,7 @@ defmodule Loopctl.Repo.RepairLandedStaleMigrationTest do
     })
   end
 
-  defp event!(%Cursor{} = cursor, kind, applied?) do
+  defp event!(%Cursor{} = cursor, kind, applied?, seq \\ 4) do
     now = DateTime.utc_now()
 
     AdminRepo.insert!(%Event{
@@ -56,7 +56,7 @@ defmodule Loopctl.Repo.RepairLandedStaleMigrationTest do
       source_id: cursor.source_id,
       repo: cursor.repo,
       change_id: cursor.change_id,
-      event_seq: 4,
+      event_seq: seq,
       kind: kind,
       revision: 1,
       sha: String.duplicate("a", 40),
@@ -123,8 +123,13 @@ defmodule Loopctl.Repo.RepairLandedStaleMigrationTest do
     gapped = cursor!(ctx, "gap")
     event!(gapped, "landed", true)
 
+    reverted = cursor!(ctx, "stale")
+    event!(reverted, "landed", true)
+    event!(reverted, "reverted", true, 5)
+
     migrate_up()
 
+    assert attention(reverted) == "stale"
     assert attention(landed) == nil
     assert attention(held) == "stale"
     assert attention(quiet) == "stale"
