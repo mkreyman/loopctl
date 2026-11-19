@@ -83,6 +83,7 @@ defmodule Loopctl.Delivery.Escalations do
   """
 
   alias Loopctl.Delivery.Claimant
+  alias Loopctl.Delivery.EscalationHandoffs
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -92,6 +93,8 @@ defmodule Loopctl.Delivery.Escalations do
   alias Loopctl.WorkBreakdown.Story
 
   import Ecto.Query
+
+  require Logger
 
   @type error ::
           :not_found
@@ -467,8 +470,30 @@ defmodule Loopctl.Delivery.Escalations do
          {:ok, resolved} <-
            Stages.advance(tenant_id, story_id, transition, [claim_epoch: epoch] ++ advance_opts),
          {:ok, _story} <- recontract(tenant_id, released, Keyword.get(opts, :actor_label)) do
+      close_handoffs(tenant_id, story_id)
       {:ok, resolved}
     end
+  end
+
+  # The story's escalation handoff leaves the coordination channel WITH the resolve (#1067),
+  # not up to five minutes later when `EscalationHandoffWorker` next runs. After the commit and
+  # best-effort: the resolution has already happened, so a failure here is logged and left to
+  # the sweep, which closes the handoff of every story no longer escalated.
+  defp close_handoffs(tenant_id, story_id) do
+    case EscalationHandoffs.close_story(tenant_id, story_id, DateTime.utc_now()) do
+      :ok -> :ok
+      {:error, reason} -> handoff_close_failed(tenant_id, story_id, inspect(reason))
+    end
+  rescue
+    error -> handoff_close_failed(tenant_id, story_id, Exception.message(error))
+  end
+
+  defp handoff_close_failed(tenant_id, story_id, detail) do
+    Logger.warning(
+      "Escalations: could not close the escalation handoff of story #{story_id} on " <>
+        "resolve; the next sweep will: #{detail}",
+      tenant_id: tenant_id
+    )
   end
 
   # SENDING A STORY BACK TO `queued` HAS TO MAKE IT PLACEABLE, or it is a stage row that says

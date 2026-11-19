@@ -165,8 +165,154 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
     assert %{reposted: 1} = EscalationHandoffs.sweep_tenant(story.tenant_id, now)
     assert [%{key: k}] = open_handoffs(story)
     assert k == key(story, 2)
-    assert [_, second] = posts(story.tenant_id)
+    assert [first, second] = posts(story.tenant_id)
     assert second.body =~ "STILL ESCALATED"
+    # The earlier generation's instructions are retired by the new one (#1067).
+    assert first.superseded_by == second.id
+  end
+
+  describe "the channel (#1067)" do
+    # The chg-delivery shape: the work project has NO repo_url, its intake source names the
+    # repo, and the repo resolves to a kb scope a session in it reads and claims on.
+    defp repo_channel!(story) do
+      AdminRepo.update_all(from(p in Project, where: p.id == ^story.project_id),
+        set: [repo_url: nil]
+      )
+
+      scope =
+        fixture(:project, %{
+          tenant_id: story.tenant_id,
+          kind: :kb,
+          slug: "chg",
+          repo_url: "git@github.com:mkreyman/chg.git"
+        })
+
+      fixture(:intake_source, %{
+        tenant_id: story.tenant_id,
+        project_id: story.project_id,
+        repo_full_name: "mkreyman/chg"
+      })
+
+      scope
+    end
+
+    test "the handoff is posted on the channel the story's repo resolves to" do
+      story = escalated!()
+      scope = repo_channel!(story)
+
+      assert %{posted: 1, errors: []} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, DateTime.utc_now())
+
+      assert [post] = posts(story.tenant_id)
+      assert post.project_id == scope.id
+      assert post.key == key(story, 1)
+      assert [%{key: k}] = Coordination.directed_handoffs(story.tenant_id, scope.id)
+      assert k == key(story, 1)
+      assert open_handoffs(story) == []
+    end
+
+    test "a handoff already on the work project is closed there and moved to the repo's" do
+      story = escalated!()
+
+      AdminRepo.update_all(from(p in Project, where: p.id == ^story.project_id),
+        set: [slug: "chg-delivery"]
+      )
+
+      now = DateTime.utc_now()
+
+      # Posted before the repo had a channel: on the work project.
+      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+      assert [%{project_id: work}] = posts(story.tenant_id)
+      assert work == story.project_id
+
+      scope = repo_channel!(story)
+
+      assert %{moved: 1, errors: []} = EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+      assert open_handoffs(story) == []
+      assert [%{key: k}] = Coordination.directed_handoffs(story.tenant_id, scope.id)
+      assert k == key(story, 2)
+
+      # Settled: a rerun moves nothing and posts nothing.
+      assert %{moved: 0, posted: 0, reposted: 0} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+
+      assert length(posts(story.tenant_id)) == 2
+    end
+
+    test "close_story/3 closes the story's handoff at once, on whichever channel holds it" do
+      story = escalated!()
+      scope = repo_channel!(story)
+      now = DateTime.utc_now()
+      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+
+      assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
+      assert Coordination.directed_handoffs(story.tenant_id, scope.id) == []
+
+      assert %ChannelClaim{done_at: %DateTime{}} =
+               AdminRepo.get_by(ChannelClaim, tenant_id: story.tenant_id, ref: key(story, 1))
+
+      # Nothing left to close; idempotent.
+      assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
+    end
+
+    test "a resolve that lands mid-sweep does not leave a new generation behind" do
+      story = escalated!()
+      now = DateTime.utc_now()
+      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+
+      # This sweep read the escalated list...
+      {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
+      assert [_] = rows
+
+      # ...then the resolve committed and closed g1.
+      AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
+        set: [stage: :done]
+      )
+
+      assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
+
+      # The sweep's g2 is withdrawn the moment it is written.
+      assert %{reposted: 0, closed: 1, errors: []} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
+
+      assert open_handoffs(story) == []
+    end
+
+    test "a story resolved mid-sweep before its FIRST handoff gets none left open" do
+      story = escalated!()
+      now = DateTime.utc_now()
+      {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
+
+      # Resolved after the read; `close_story/3` found nothing to close.
+      AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
+        set: [stage: :done]
+      )
+
+      assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
+
+      assert %{posted: 0, closed: 1, errors: []} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
+
+      assert open_handoffs(story) == []
+    end
+
+    test "a pre-#1067 handoff of a story resolved mid-sweep leaves nothing open anywhere" do
+      story = escalated!()
+      now = DateTime.utc_now()
+      EscalationHandoffs.sweep_tenant(story.tenant_id, now)
+      {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
+      scope = repo_channel!(story)
+
+      AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
+        set: [stage: :done]
+      )
+
+      assert %{moved: 0, errors: []} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
+
+      assert open_handoffs(story) == []
+      assert Coordination.directed_handoffs(story.tenant_id, scope.id) == []
+    end
   end
 
   test "an unclaimed handoff escalated past the bound is re-posted as stalled once a day" do

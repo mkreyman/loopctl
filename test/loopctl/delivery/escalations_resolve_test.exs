@@ -17,6 +17,8 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.Coordination
+  alias Loopctl.Delivery.EscalationHandoffs
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
@@ -117,6 +119,25 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       story = reload(ctx)
       assert story.claim_epoch == @epoch
       assert story.agent_status == :implementing
+    end
+  end
+
+  describe "the story's escalation handoff (#1067)" do
+    test "is closed by the resolve itself, not by the next sweep", ctx do
+      assert %{posted: 1} = EscalationHandoffs.sweep_tenant(ctx.tenant.id, DateTime.utc_now())
+      assert [_open] = Coordination.directed_handoffs(ctx.tenant.id, ctx.story.project_id)
+
+      assert {:ok, %{stage: :done}} = resolve(ctx, :done)
+
+      assert Coordination.directed_handoffs(ctx.tenant.id, ctx.story.project_id) == []
+    end
+
+    test "stays open when the resolve is refused", ctx do
+      EscalationHandoffs.sweep_tenant(ctx.tenant.id, DateTime.utc_now())
+
+      assert {:error, _} = resolve(ctx, :done, actor_lineage: [Ecto.UUID.generate()])
+
+      assert [_open] = Coordination.directed_handoffs(ctx.tenant.id, ctx.story.project_id)
     end
   end
 
