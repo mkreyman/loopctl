@@ -283,6 +283,111 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  Opens a story's stage row at `implementing`, inside the caller's `Loopctl.Repo.with_tenant/2`
+  transaction, for a change-protocol story that a session claimed and started outside the
+  runner (US-47.8): chg's `submitted` is the first thing the delivery machine hears of it, and
+  without a row no event of the change can move the story (`no_stage_row`).
+
+  `implementing` and not `detected`, because the work it names is already being done: the
+  story's own `agent_status` says so, and the caller checks that before calling. The row is
+  bound to `epoch`, the story's current `claim_epoch`, read under the caller's story lock
+  (`lock_for_control_in_tenant_transaction/2`). The `opened` stage event carries `event_data`.
+
+  Returns `{:ok, row}` with the row locked, the row that already exists included (a replay
+  finds it and writes nothing).
+  """
+  @spec open_for_change_in_tenant_transaction(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          non_neg_integer(),
+          keyword()
+        ) :: {:ok, StoryStage.t()}
+  def open_for_change_in_tenant_transaction(tenant_id, story_id, epoch, opts) do
+    unless Repo.in_transaction?(),
+      do:
+        raise(
+          ArgumentError,
+          "open_for_change_in_tenant_transaction/4 needs a Loopctl.Repo transaction"
+        )
+
+    now = DateTime.utc_now()
+    id = Ecto.UUID.generate()
+
+    Repo.insert_all(
+      StoryStage,
+      [
+        %{
+          id: id,
+          tenant_id: tenant_id,
+          story_id: story_id,
+          stage: :implementing,
+          claim_epoch: epoch,
+          attempts: %{},
+          lock_version: 0,
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing,
+      conflict_target: [:tenant_id, :story_id]
+    )
+
+    row = lock_row(tenant_id, story_id)
+
+    if row.id == id do
+      insert_event(
+        Repo,
+        row,
+        "opened",
+        nil,
+        nil,
+        Keyword.get(opts, :actor_label),
+        Keyword.get(opts, :event_data, %{})
+      )
+    end
+
+    {:ok, row}
+  end
+
+  # The stages a story waits in before anyone holds it: triage and the queue. A runner-held
+  # row (`claimed`, `worktree`) is the runner's to move, and every later stage has an edge of
+  # its own.
+  @pre_claim_stages [:detected, :triaged, :queued]
+
+  @doc """
+  `open_for_change_in_tenant_transaction/4` for a story whose row EXISTS but still waits in
+  triage or the queue (#{inspect(@pre_claim_stages)}), because a session claimed the story by
+  hand (`follow_claim/4` keeps the stage and takes the new epoch). Moves the row to
+  `implementing` with a `rebound` stage event from its old stage, carrying `event_data`.
+
+  Only a row on `epoch`: one behind its story's epoch is fenced, and the caller says so.
+  Returns `{:ok, row}` — moved, or unchanged when it is at any other stage.
+  """
+  @spec start_for_change_in_tenant_transaction(StoryStage.t(), non_neg_integer(), keyword()) ::
+          {:ok, StoryStage.t()}
+  def start_for_change_in_tenant_transaction(%StoryStage{} = row, epoch, opts) do
+    if row.stage in @pre_claim_stages and row.claim_epoch == epoch do
+      now = DateTime.utc_now()
+
+      {1, [moved]} =
+        Repo.update_all(
+          from(s in StoryStage,
+            where: s.id == ^row.id and s.stage == ^row.stage and s.claim_epoch == ^epoch,
+            select: s
+          ),
+          set: [stage: :implementing, updated_at: now],
+          inc: [lock_version: 1]
+        )
+
+      data = Map.put(Keyword.get(opts, :event_data, %{}), "started_by", "change_submitted")
+      insert_event(Repo, moved, "rebound", row.stage, nil, Keyword.get(opts, :actor_label), data)
+      {:ok, moved}
+    else
+      {:ok, row}
+    end
+  end
+
+  @doc """
   The encoded size of the `:event_data` a transition may carry, in bytes.
 
   Public so a CALLER that composes `event_data` can fit it rather than discover the bound as
@@ -632,7 +737,7 @@ defmodule Loopctl.Delivery.Stages do
   holds is a deadlock; taking the stronger lock first is not.
   """
   @spec lock_for_control_in_tenant_transaction(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, %{claim_epoch: non_neg_integer(), row: StoryStage.t() | nil}}
+          {:ok, %{claim_epoch: non_neg_integer(), started: boolean(), row: StoryStage.t() | nil}}
           | {:error, :not_found}
   def lock_for_control_in_tenant_transaction(tenant_id, story_id) do
     unless Repo.in_transaction?(),
@@ -645,12 +750,15 @@ defmodule Loopctl.Delivery.Stages do
     from(s in Story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
       lock: "FOR NO KEY UPDATE",
-      select: s.claim_epoch
+      select: %{
+        claim_epoch: s.claim_epoch,
+        started: s.agent_status == :implementing and not is_nil(s.assigned_agent_id)
+      }
     )
     |> Repo.one()
     |> case do
       nil -> {:error, :not_found}
-      epoch -> {:ok, %{claim_epoch: epoch, row: lock_row(tenant_id, story_id)}}
+      story -> {:ok, Map.put(story, :row, lock_row(tenant_id, story_id))}
     end
   end
 

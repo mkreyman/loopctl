@@ -32,7 +32,7 @@
     },
     {
       "id": "AC-47.8.5",
-      "description": "The pilot's implementing session reports the story done (report_story) when it runs chg submit, before chg dispatches review: review_complete requires reported_done (PRD section 9, US-47.5), so a review chg records before the report is refused 422 story_not_reported_done and the landing then escalates review_missing. The pilot measures how many landings escalate review_missing and why."
+      "description": "The story is reported done by the submitted event that moves it to reviewing, as the system actor, before chg dispatches review: review_complete requires reported_done (PRD section 9, US-47.5), the implementer cannot report its own story (self_report_blocked) and a chg-rooted key may not report (chg_root_review_only). A story claimed and started outside the runner gets its stage row opened at implementing by that same event. The pilot measures how many landings escalate review_missing and why."
     }
   ],
   "test_cases": [
