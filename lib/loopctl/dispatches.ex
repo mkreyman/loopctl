@@ -19,6 +19,7 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.HeavyRead
+  alias Loopctl.Intake.Source
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants
 
@@ -68,6 +69,61 @@ defmodule Loopctl.Dispatches do
   @doc "The longest a dispatch (and its key) may live, in seconds."
   @spec max_expires_seconds() :: pos_integer()
   def max_expires_seconds, do: @max_expires_seconds
+
+  @doc """
+  Inserts a chg ROOT for an intake source (`Loopctl.Intake`'s `mint_chg_root`): a parentless
+  `:orchestrator` dispatch with id `root_id`, `lineage_path == [root_id]`, and NO key and NO
+  agent.
+
+  A chg root is a lineage anchor, never a held credential: the only thing ever minted under it
+  is a review child, server-side (`mint_chg_reviewer/4`). Minting it through `create_dispatch/3`
+  gave it a key nobody used, and that key took its agent's `api_keys_one_role_per_agent_idx`
+  slot, so the fleet's agent, which already held a live orchestrator key, could not have a root
+  at all. With no agent there is no slot to take.
+
+  Its `expires_at` is the usual ceiling and means nothing while a live source names it:
+  `Loopctl.Workers.RevokeExpiredDispatchesWorker` never revokes such a row.
+
+  Runs inside the caller's transaction (the source write), so a root never outlives a refused
+  enrolment. Only `Loopctl.Intake` calls it, behind the intake-source controller's operator-key
+  ceiling.
+  """
+  @spec mint_chg_root(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Dispatch.t()} | {:error, term()}
+  def mint_chg_root(tenant_id, root_id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(root_id) do
+    now = DateTime.utc_now()
+
+    AdminRepo.transaction(fn ->
+      with {:ok, dispatch} <-
+             %Dispatch{id: root_id, tenant_id: tenant_id}
+             |> Dispatch.changeset(%{
+               role: :orchestrator,
+               lineage_path: [root_id],
+               expires_at: DateTime.add(now, @max_expires_seconds, :second),
+               created_at: now
+             })
+             |> AdminRepo.insert(),
+           {:ok, _entry} <-
+             AuditChain.append(tenant_id, %{
+               action: "dispatch_created",
+               actor_lineage: Keyword.get(opts, :actor_lineage, []),
+               entity_type: "dispatch",
+               entity_id: dispatch.id,
+               payload: %{
+                 "lineage_path" => dispatch.lineage_path,
+                 "role" => "orchestrator",
+                 "expires_at" => DateTime.to_iso8601(dispatch.expires_at),
+                 "chg_root" => true,
+                 "keyless" => true
+               }
+             }) do
+        dispatch
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+  end
 
   @doc """
   Mints one chg review dispatch (US-50.3): an `:orchestrator` child of the source's chg root
@@ -1023,15 +1079,26 @@ defmodule Loopctl.Dispatches do
     end
   end
 
+  # A chg ROOT is never a verifier: it is a lineage anchor (a minted one holds no key at all),
+  # and its whole subtree is refused verify (`chg_root_cannot_verify`). The exclusion reads the
+  # same set that refusal does: any source of the tenant naming it, live or revoked.
   defp candidate_query(tenant_id) do
     now = DateTime.utc_now()
 
+    chg_roots =
+      from(s in Source,
+        where:
+          s.tenant_id == parent_as(:d).tenant_id and s.chg_root_dispatch_id == parent_as(:d).id
+      )
+
     from(d in Dispatch,
+      as: :d,
       where:
         d.tenant_id == ^tenant_id and
           is_nil(d.revoked_at) and
           d.expires_at > ^now and
-          d.role in [:orchestrator, :agent],
+          d.role in [:orchestrator, :agent] and
+          not exists(chg_roots),
       order_by: [asc: d.created_at],
       limit: @verifier_pool_limit
     )

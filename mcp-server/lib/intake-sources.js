@@ -90,6 +90,12 @@
  * `chg_root_dispatch_id`, the parentless orchestrator-role dispatch chg-server's key was minted
  * from (`422 chg_root_invalid` for anything else, another tenant's included).
  *
+ * `mint_chg_root: true` in place of a root id has loopctl insert the root itself, keyless and
+ * agentless, in the source's own write. It is the way to get one: a root minted with `dispatch`
+ * takes its agent's one orchestrator-key slot (422 when the agent already holds a live key),
+ * and the expiry sweep keeps the ROW of a root a live source names, whichever way it was made.
+ * A named root must have more than 300 s left before it expires.
+ *
  * The secret is WRITE-ONLY on both sides: the server never serialises it, and `publicSource`
  * below never names it, so no tool result carries it. A tool INPUT is recorded in the
  * transcript too, so `change_events_secret_file` is offered beside it: the tool reads the
@@ -248,6 +254,32 @@ export async function chgCredentials(args, { clearable, fs = defaultFs, homedir 
     }
   }
 
+  // `mint_chg_root: true` has loopctl insert a keyless, agentless root in the same write. It is
+  // the way to get a root: one minted with `dispatch` takes its agent's one orchestrator-key
+  // slot. Only `true` is sent; `false` is the same as leaving it out.
+  const mint = args.mint_chg_root;
+
+  if (mint !== undefined) {
+    if (typeof mint !== "boolean") {
+      return {
+        refusal: refuse("`mint_chg_root` must be true (mint a root in this write) or left out."),
+      };
+    }
+
+    if (mint === true) {
+      if (root !== undefined) {
+        return {
+          refusal: refuse(
+            "Send `chg_root_dispatch_id` OR `mint_chg_root: true`, not both; the server " +
+              "answers 422. Prefer `mint_chg_root`.",
+          ),
+        };
+      }
+
+      fields.mint_chg_root = true;
+    }
+  }
+
   return { fields };
 }
 
@@ -295,18 +327,19 @@ async function readSecretFile(secretFile, { fs, homedir }) {
 function chgEnrolmentRefusal(mode, fields) {
   if (!CREDENTIALED_MODES.includes(mode)) return null;
 
-  const missing = ["change_events_secret", "chg_root_dispatch_id"].filter(
-    (field) => fields[field] === undefined,
-  );
+  const missing = [];
+  if (fields.change_events_secret === undefined) missing.push("`change_events_secret`");
+  if (fields.chg_root_dispatch_id === undefined && fields.mint_chg_root !== true) {
+    missing.push("`mint_chg_root: true` (or `chg_root_dispatch_id`)");
+  }
 
   if (missing.length === 0) return null;
 
   return refuse(
-    `\`mode: ${mode}\` needs ${missing.map((f) => `\`${f}\``).join(" and ")} in the same call; ` +
-      "the server answers 422 without them. `chg_root_dispatch_id` is the parentless " +
-      "orchestrator-role dispatch chg-server's key was minted from (the operator mints it " +
-      "with `dispatch`, no parent), and the secret is the HMAC key chg-server signs its " +
-      "events with (`change_events_secret_file` keeps it out of the transcript).",
+    `\`mode: ${mode}\` needs ${missing.join(" and ")} in the same call; the server answers ` +
+      "422 without them. `mint_chg_root: true` has loopctl mint the source's root, keyless, " +
+      "in the same write. The secret is the HMAC key the sender signs with " +
+      "(`change_events_secret_file` keeps it out of the transcript).",
   );
 }
 
@@ -426,6 +459,7 @@ export async function enrollIntakeSource(
     change_events_secret,
     change_events_secret_file,
     chg_root_dispatch_id,
+    mint_chg_root,
   } = {},
   { userKey, apiCall, baseUrl, fs = defaultFs, homedir = os.homedir() } = {},
 ) {
@@ -487,7 +521,7 @@ export async function enrollIntakeSource(
 
   // The `chg` credentials (US-47.2), resolved and judged before a secret file is reserved.
   const chg = await chgCredentials(
-    { change_events_secret, change_events_secret_file, chg_root_dispatch_id },
+    { change_events_secret, change_events_secret_file, chg_root_dispatch_id, mint_chg_root },
     { clearable: false, fs, homedir },
   );
   if (chg.refusal) return chg.refusal;
@@ -762,7 +796,8 @@ export async function updateIntakeSource(
       "Nothing to update. Name at least one of `target_epic_id` (null clears it), " +
         "`base_branch`, `mode`, `required_checks`, `triage_requires_ticket`, " +
         "`change_events_secret` (or " +
-        "`change_events_secret_file`) or `chg_root_dispatch_id`. A body carrying none of them " +
+        "`change_events_secret_file`), `chg_root_dispatch_id` or `mint_chg_root`. A body " +
+        "carrying none of them " +
         "is refused 422 `nothing_to_update`, because a field you do not send is left exactly " +
         "as it was.",
     );

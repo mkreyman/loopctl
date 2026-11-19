@@ -792,6 +792,77 @@ describe("mode chg (US-47.2)", () => {
     }
   });
 
+  test("mint_chg_root: true stands in for the root id on enrolment and on update", async () => {
+    const { calls, apiCall } = fakeApi(chgCreated());
+
+    const result = await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        secret_file: secretFileIn("mint.secret"),
+        mode: "chg",
+        change_events_secret: CHG_SECRET,
+        mint_chg_root: true,
+      },
+      deps({ apiCall }),
+    );
+
+    assert.ok(!result.error, JSON.stringify(result));
+    assert.deepEqual(calls[0].body, {
+      repo_full_name: REPO,
+      project_id: PROJECT_ID,
+      mode: "chg",
+      change_events_secret: CHG_SECRET,
+      mint_chg_root: true,
+    });
+
+    const update = fakeApi({ source: chgCreated().source });
+    await updateIntakeSource(
+      { source_id: SOURCE_ID, change_events_secret: CHG_SECRET, mint_chg_root: true },
+      deps({ apiCall: update.apiCall }),
+    );
+    assert.deepEqual(update.calls[0].body, { change_events_secret: CHG_SECRET, mint_chg_root: true });
+  });
+
+  test("mint_chg_root with a root id, a non-boolean, or false-as-the-only-root is refused", async () => {
+    for (const [i, extra] of [
+      { change_events_secret: CHG_SECRET, chg_root_dispatch_id: ROOT_ID, mint_chg_root: true },
+      { change_events_secret: CHG_SECRET, mint_chg_root: "true" },
+      { change_events_secret: CHG_SECRET, mint_chg_root: false },
+    ].entries()) {
+      const { calls, apiCall } = fakeApi(chgCreated());
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          secret_file: secretFileIn(`mint-refused-${i}.secret`),
+          mode: "chg",
+          ...extra,
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true, JSON.stringify(extra));
+      assert.equal(calls.length, 0);
+    }
+
+    const update = fakeApi({ source: chgCreated().source });
+    const refused = await updateIntakeSource(
+      { source_id: SOURCE_ID, chg_root_dispatch_id: ROOT_ID, mint_chg_root: true },
+      deps({ apiCall: update.apiCall }),
+    );
+    assert.equal(refused.error, true);
+    assert.equal(update.calls.length, 0);
+
+    // false on update sends nothing, so alone it is nothing to update.
+    const nothing = await updateIntakeSource(
+      { source_id: SOURCE_ID, mint_chg_root: false },
+      deps({ apiCall: update.apiCall }),
+    );
+    assert.equal(nothing.error, true);
+    assert.match(nothing.body, /Nothing to update/);
+  });
+
   test("a malformed chg_root_dispatch_id is refused before any call", async () => {
     const { calls, apiCall } = fakeApi(chgCreated());
     const result = await enrollIntakeSource(
@@ -886,9 +957,15 @@ describe("mode chg (US-47.2)", () => {
     for (const name of ["intake_source_enroll", "intake_source_update"]) {
       const tool = loadTools().find((t) => t.name === name);
       const props = tool.inputSchema.properties;
-      for (const field of ["change_events_secret", "change_events_secret_file", "chg_root_dispatch_id"]) {
+      for (const field of [
+        "change_events_secret",
+        "change_events_secret_file",
+        "chg_root_dispatch_id",
+        "mint_chg_root",
+      ]) {
         assert.ok(props[field], `${name} does not declare ${field}`);
       }
+      assert.equal(props.mint_chg_root.type, "boolean", name);
       assert.match(props.chg_root_dispatch_id.description, /chg_root_invalid/, name);
       assert.match(tool.description, /chg_root_invalid/, name);
       assert.match(tool.description, /change_protocol_enrolled/, name);
@@ -898,6 +975,7 @@ describe("mode chg (US-47.2)", () => {
         README.split("\n").find((line) => line.startsWith(`| \`${name}\` |`)) ?? "";
       assert.match(readmeRow, /chg/, `${name}'s README row does not mention chg`);
       assert.match(readmeRow, /chg_root_invalid/, `${name}'s README row`);
+      assert.match(readmeRow, /mint_chg_root/, `${name}'s README row`);
     }
 
     const update = loadTools().find((t) => t.name === "intake_source_update");

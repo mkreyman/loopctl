@@ -6,6 +6,16 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A chg root is minted by loopctl and no longer expires (2026-11-18).** `POST` and
+  `PATCH /api/v1/intake/sources` take `mint_chg_root: true`: loopctl inserts a parentless,
+  keyless, agentless `:orchestrator` root in the source's own transaction and names it
+  (`422` beside a `chg_root_dispatch_id`; the operator key only, as for the credentials).
+  `RevokeExpiredDispatchesWorker` no longer revokes the ROW of a root an unrevoked source
+  names; its key, if it has one, is still revoked. Before this a root expired after 4 h and
+  every ledger post and change event from its source answered 401. A named root must now have
+  more than 300 s left (`422 chg_root_invalid`). Operator step after deploy: every source that
+  holds chg credentials with no live root gets `mint_chg_root: true`
+  (`intake_source_update`). No migration.
 - **The chg feedback loop (2026-11-19, Epic 51).**
   - **The nightly sweep:** `ChgFindingSweepWorker` (04:10 UTC) derives findings from the chg ledger: selection misses, unquarantined flaky tests, merges with no review, stuck changes, and silent senders. It files each finding as a GitHub issue on the owning repository's live intake source, through an outbox drained by `ChgFindingActionWorker`. It closes a finding that stayed quiet for 7 days after its fix, reopens one that recurs, and escalates the second recurrence or a loop depth of 2.
   - **Env vars:** `CHG_FINDINGS_DAILY_CAP` (default 5 new issues per repository per day) and `CHG_FINDINGS_REPO` (default `mkreyman/chg`, where chg's own selection misses are filed).

@@ -9396,9 +9396,11 @@ const TOOLS = [
       "number. `chg` (Epic 47): the change protocol lands the repository's changes with " +
       "`chg submit`, and merge_precondition refuses every story on the source with 409 " +
       "`change_protocol_enrolled`. A `chg` enrolment needs `change_events_secret` (or " +
-      "`change_events_secret_file`) AND `chg_root_dispatch_id` in the same call — refused " +
-      "here, and 422 at the server, without them — and a root that is not a parentless, " +
-      "unrevoked, orchestrator-role dispatch of this tenant is 422 `chg_root_invalid`. The " +
+      "`change_events_secret_file`) AND a root in the same call — `mint_chg_root: true` " +
+      "(preferred: loopctl mints a keyless root in the same write) or `chg_root_dispatch_id` " +
+      "— refused here, and 422 at the server, without them; a named root that is not a " +
+      "parentless, unrevoked, orchestrator-role dispatch of this tenant with more than 300 s " +
+      "left is 422 `chg_root_invalid`. The " +
       "change-events secret is write-only: no response and no tool result ever carries it. " +
       "Any other mode, null included, is refused.\n\n" +
       "SENDING IS NOT ROUTING (loopctl #1047). The two chg credentials authenticate the " +
@@ -9478,12 +9480,21 @@ const TOOLS = [
         chg_root_dispatch_id: {
           type: "string",
           description:
-            "Required with `mode: chg` or `mode: ledger`, and with the secret on a `pr` source " +
-            "(a signed request is refused without both). The dispatch (UUID) chg's key was minted from: " +
-            "a PARENTLESS, UNREVOKED, ORCHESTRATOR-role dispatch of this tenant, minted by the " +
-            "operator key with `dispatch` and no parent. Anything else — a child, a revoked " +
-            "or agent-role dispatch, another tenant's or an unknown id — is refused 422 " +
-            "`chg_root_invalid`, all alike.",
+            "Alternative to `mint_chg_root` (prefer that). With `mode: chg` or `mode: ledger`, " +
+            "and with the secret on a `pr` source, a root is required (a signed request is " +
+            "refused without both). A PARENTLESS, UNREVOKED, ORCHESTRATOR-role dispatch (UUID) " +
+            "of this tenant with more than 300 s left before it expires. Anything else — a " +
+            "child, a revoked or agent-role dispatch, another tenant's or an unknown id — is " +
+            "refused 422 `chg_root_invalid`, all alike. Not with `mint_chg_root`.",
+        },
+        mint_chg_root: {
+          type: "boolean",
+          description:
+            "true: loopctl mints the source's chg root in this write, keyless and agentless, " +
+            "and returns its id as `chg_root_dispatch_id`. The way to get a root: one minted " +
+            "with `dispatch` takes its agent's one orchestrator-key slot (422 when the agent " +
+            "already holds one). The expiry sweep never revokes a root a live source names. " +
+            "Not with `chg_root_dispatch_id` (422). Needs the operator key, like the secret.",
         },
         required_checks: {
           type: "array",
@@ -9583,7 +9594,8 @@ const TOOLS = [
       "write that leaves the source `chg` — a secret rotation or a base-branch edit included " +
       "— and whenever one is named (422 `chg_root_invalid` unless it is a parentless, " +
       "unrevoked, orchestrator-role dispatch of this tenant; a revoked root blocks every such " +
-      "write until a live one is named, while switching to `pr` is never blocked). Switching " +
+      "write until a live one is named or `mint_chg_root: true` mints one, while switching " +
+      "to `pr` is never blocked). Switching " +
       "to `pr` KEEPS both and they stay LIVE: the sender's ledger and its new changes' events " +
       "are still accepted (recorded, routing nothing), while an event for a change the `chg` " +
       "route already acted on is 401 until the source is `chg` again. Send an explicit null " +
@@ -9659,7 +9671,17 @@ const TOOLS = [
             "The parentless, unrevoked, orchestrator-role dispatch of this tenant chg-server's " +
             "key was minted from; anything else is 422 `chg_root_invalid`, and the root a `chg` " +
             "or `ledger` source keeps is re-checked on every write to it. Null clears it on a " +
-            "`pr` source (422 on a `chg` or `ledger` one). Omit to leave it alone.",
+            "`pr` source (422 on a `chg` or `ledger` one). Omit to leave it alone. A named " +
+            "root needs more than 300 s left before it expires. Prefer `mint_chg_root`.",
+        },
+        mint_chg_root: {
+          type: "boolean",
+          description:
+            "true: loopctl mints a NEW keyless, agentless chg root in this write and the source " +
+            "names it from then on (the result's `chg_root_dispatch_id`). The fix for a source " +
+            "with no root, or with a revoked one. A root minted with `dispatch` takes its " +
+            "agent's one orchestrator-key slot. The expiry sweep never revokes a root a live " +
+            "source names. Not with `chg_root_dispatch_id` (422). Needs the operator key.",
         },
         required_checks: {
           type: "array",
