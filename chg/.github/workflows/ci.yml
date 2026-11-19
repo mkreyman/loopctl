@@ -274,6 +274,8 @@ jobs:
       - run: python3 adapters/generic/test/test_adapter.py -v
       - name: chg-loop on fixtures (no GitHub)
         run: python3 tests/loop-test.py
+      - name: chg-replay-selection on fake builds (no cargo, no network)
+        run: python3 tests/replay-selection-test.py
       # Only master saves, only when nothing under the base key was restored, after the
       # tests, at most 3 minutes and never fatally: a slow upload once ran a green job into
       # its timeout. The job's own timeout carries 4 minutes for this step.
