@@ -191,7 +191,7 @@ is bound to `docs/design-system.md`:
 | `GET /docs/delivery-loop` (new) | renders `docs/agent-delivery-loop.md` with the docs page's nav and WikiShowLive's prose classes, its pre classes set to section 5's Code Blocks | 2 Color Palette (dark only), 3 Typography, 4 Layout Principles, 5 Navigation (Landing Page) and Code Blocks | 52.65 |
 | landing and docs navs (top and mobile) and footers | the GitHub link becomes the npm package link, labelled npm, in the templates and in the design system's nav drawing | 5 Navigation (Landing Page) | 52.65 |
 | landing hero and closing CTA | the secondary 'View on GitHub' CTA becomes 'View on npm' to the npm package, in the template and in the design system's hero drawing and its two-CTA rule | 7 Hero Section | 52.65 |
-| terms and privacy Contact sections | the operator address replaces GitHub issues | 3 Typography | 52.65 |
+| terms and privacy Contact sections | support@ecommercefriendly.com replaces GitHub issues | 3 Typography | 52.65 |
 
 ## What "done" means, for every story
 

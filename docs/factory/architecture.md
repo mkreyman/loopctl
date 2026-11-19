@@ -201,12 +201,11 @@ well as moving in and out at any stage -- at my will, not at agent's whim!!!"
   not need his attention.
 - Until release 7 builds the boundary, an interactive session's item whose lease lapses is
   released through the normal paths, as every claim is today.
-- This is the one action reserved for Mark, and it is reserved because he asked for it. R4's "nothing
-  reserved for Mark" covers everything else, with one collision this document cannot settle:
-  SOUL.md and claude-config's CLAUDE.md (delivery loop step 4) reserve for him whether a PR at the
-  review-round cap gets a redesign, because a redesign spends his token budget. Release 8 carries
-  that rule into server policy unchanged (`review_rounds.cap_pause`); only that one item waits,
-  shown in `factory_overview`, and Mark decides whether the rule stays.
+- The interactive-boundary move is the only act reserved for Mark, and it is reserved because he
+  asked for it. R4's "nothing reserved for Mark" covers everything else, including whether a PR
+  at the review-round ceiling gets a redesign (Mark, 2026-11-19: "let the loop decid[e]"). At the
+  ceiling the session decides whether to dispatch a redesign or narrow what merges; nothing waits
+  and nothing messages Mark.
 
 ### R3. Location independence and one identity per session
 
@@ -522,8 +521,10 @@ code."
   repo. They move to the self-hosted `fleet-ci` pool, or are measured against the free allowance
   first. npm refuses `--provenance` from a private repo, so the publish workflows
   (`mcp-autopublish.yml:65`, `npm-publish.yml:56`) drop the flag.
-- **Branch protection needs a paid plan.** A private repo on GitHub Free loses branch protection,
-  so the switch to private is refused unless the account's plan keeps it.
+- **Branch protection stays.** Mark's GitHub plan is paid, so master's protection keeps applying
+  on a private repo (`gh api repos/mkreyman/loopctl/branches/master/protection` answers, read
+  2026-11-19). The flip script reads protection again after the flip and sets the repo back to
+  public if it is gone.
 - **Installs authenticate.** Once runner and chg live in a private repo, their installers fetch
   release artifacts with a token, and a future cloud session needs a deploy token.
 - **Self-hosted runners become safer.** A public repo's fork PRs can reach self-hosted runners;
@@ -532,8 +533,8 @@ code."
   (`lib/loopctl_web/router.ex:69,162,231-232`) are served by the running app, which repo privacy
   does not touch, so they stay and remain the API reference. Everything that points readers into
   the repo moves out of it: the MCP usage now read from the repo's README goes to the npm
-  package's README, and template links, `/.well-known/loopctl`'s `repository_url` and the terms
-  and privacy contact point at the app or the package.
+  package's README; template links and `/.well-known/loopctl`'s `repository_url` point at the app
+  or the package; and the terms and privacy contact is support@ecommercefriendly.com.
 
 ## 7. Failure design
 
