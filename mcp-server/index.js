@@ -98,6 +98,7 @@ import {
   setGithubCredential as setGithubCredentialRequest,
 } from "./lib/github-credential.js";
 import { updateProject as updateProjectRequest } from "./lib/project-update.js";
+import { mergeProject as mergeProjectRequest } from "./lib/project-merge.js";
 import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
@@ -977,6 +978,17 @@ async function deleteProject({ project_id }) {
 async function restoreProject({ project_id }) {
   const result = await apiCall("POST", `/api/v1/projects/${project_id}/restore`, {});
   return toContent(result);
+}
+
+// US-52.2: user role, so LOOPCTL_USER_KEY verbatim when set, as deleteProject does.
+async function mergeProject(args) {
+  const key = process.env.LOOPCTL_USER_KEY;
+  const userApiCall = key
+    ? (method, path, body) =>
+        apiCall(method, path, body, key, { exactKey: true, keyHint: "LOOPCTL_USER_KEY" })
+    : apiCall;
+
+  return toContent(await mergeProjectRequest(args, { apiCall: userApiCall }));
 }
 
 async function updateProject(args) {
@@ -4367,9 +4379,29 @@ const TOOLS = [
     },
   },
   {
+    name: "merge_project",
+    description:
+      "MERGE one project into another (POST /api/v1/projects/:id/merge_into, US-52.2): every row of project_id (stories, epics, intake sources, channel posts and claims, articles, memories and the rest) moves to target_project_id in one transaction, project_id is archived with metadata.merged_into, and a kb target becomes a work project when project_id was one. The audit log and search telemetry keep naming project_id. Use it when a repo has two projects (a kb scope holding the repo_url and a '-delivery' work project): merge the work project INTO the kb scope, which keeps the channel id sessions already use. Run with dry_run: true first: it returns per-table counts and conflicts and writes nothing. A repeat call on an already-merged project returns already_merged. Sent with LOOPCTL_USER_KEY verbatim, else the default key. Refusals: 409 merge_conflicts when both projects hold a row under one per-project unique key (a story or epic number, a claim ref, a keyed channel post), with error.conflicts listing each; nothing moves. 422 for the same project twice, an archived target, or an archived project_id not merged into this target. 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant, 404 for an id not in your tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the project to merge away (it is archived)." },
+        target_project_id: {
+          type: "string",
+          description: "UUID of the project that keeps everything (the repo's kb scope or work project).",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "true: report per-table counts and conflicts, write nothing. Default false.",
+        },
+      },
+      required: ["project_id", "target_project_id"],
+    },
+  },
+  {
     name: "update_project",
     description:
-      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. A slug change renames the project's channel (kb scope or work project); when no name is sent and the name equaled the old slug, the name follows. A kb name different from its slug is 422, and a slug another project holds (archived included) is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project, so it must be the ONLY active project carrying that URL: a second one makes every lookup for the repo 409 ambiguous_resolution fleet-wide. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field. " +
+      "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. A slug change renames the project's channel (kb scope or work project); when no name is sent and the name equaled the old slug, the name follows. A kb name different from its slug is 422, and a slug another project holds (archived included) is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field. " +
       "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too).",
     inputSchema: {
       type: "object",
@@ -10513,6 +10545,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await updateProject(args);
     case "restore_project":
       return await restoreProject(args);
+    case "merge_project":
+      return await mergeProject(args);
 
     case "get_progress":
       return await getProgress(args);

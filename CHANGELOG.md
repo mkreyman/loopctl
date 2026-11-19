@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`POST /api/v1/projects/:id/merge_into` merges one project into another (2026-11-19,
+  US-52.2).** Every row of the source's `project_id` tables moves to `target_project_id` in one
+  transaction; the source is archived with `metadata.merged_into`, and a kb target becomes a
+  work project when the source was one. `audit_log` and `search_events` keep naming the
+  source. `dry_run: true` reports per-table counts and conflicts; 409 `merge_conflicts` lists
+  rows both projects hold under one per-project unique key, and nothing moves. User key on a
+  human-anchored tenant. MCP tool `merge_project` (3.19.0). No migration, no env var.
 - **A repo has one project: a second is refused 409 `repo_already_has_project` (2026-11-19,
   US-52.1).** Migration `20261119190000` adds `projects.repo_key` (the lowercased
   `host/owner/repo` of `repo_url`) and the partial unique index

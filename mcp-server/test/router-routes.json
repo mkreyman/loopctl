@@ -191,6 +191,7 @@
     ["GET","/api/v1/projects/:id/epic_dependencies","LoopctlWeb.EpicDependencyController",":index"],
     ["GET","/api/v1/projects/:id/export","LoopctlWeb.ImportExportController",":export_project"],
     ["POST","/api/v1/projects/:id/import","LoopctlWeb.ImportExportController",":import_project"],
+    ["POST","/api/v1/projects/:id/merge_into","LoopctlWeb.ProjectController",":merge_into"],
     ["GET","/api/v1/projects/:id/progress","LoopctlWeb.ProjectController",":progress"],
     ["POST","/api/v1/projects/:id/restore","LoopctlWeb.ProjectController",":restore"],
     ["GET","/api/v1/projects/:project_id/articles","LoopctlWeb.ArticleController",":index"],
