@@ -12,7 +12,7 @@ defmodule Loopctl.Changes.Findings do
 
   | kind | from | fingerprint | filed on |
   |---|---|---|---|
-  | `selection_miss` | a selecting `chg` row that passed on a sha whose `gate` row failed | repo + sha | the chg repository (`chg_repo/1`) |
+  | `selection_miss` | a selecting `chg` row that passed on a sha whose `gate` row failed (never a `source: "hook"` row, `LedgerRow.failing_test_gates/1`) | repo + sha | the chg repository (`chg_repo/1`) |
   | `flaky_test` | a `flaky` row with no quarantine | repo + test | the row's repository |
   | `missing_review` | a merged PR at least `review_grace_hours/0` old with no counted review round (`PrReviewOutcomes`); OFF unless `missing_reviews?/1` | repo + PR | the PR's repository |
   | `stuck_change` | a cursor flagged `gap` or `stale` for more than `stuck_after_hours/0` | source + change | the cursor's repository |

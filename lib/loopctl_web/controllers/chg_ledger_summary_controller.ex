@@ -43,7 +43,8 @@ defmodule LoopctlWeb.ChgLedgerSummaryController do
       "The aggregates the /chg dashboard shows (US-50.6), from the chg ledger rows the " <>
         "fleet's outboxes sent: gate outcomes per day and kind, the fallback rate and its " <>
         "reasons, selection quality and misses (a chg check that passed on a commit whose " <>
-        "gate failed), time per gate phase, flaky tests, runner samples, merged-PR review " <>
+        "gate failed its tests; the pre-push hook's own decision is not a gate verdict), " <>
+        "time per gate phase, flaky tests, runner samples, merged-PR review " <>
         "outcomes, and changes the reconcile sweep flagged gap or stale. Lists are capped at " <>
         "#{Dashboard.list_limit()} rows. Any authenticated key (agent role and up); scoped " <>
         "to the key's tenant. 422 when `since`/`until` is not an ISO 8601 timestamp, when " <>
