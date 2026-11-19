@@ -9,8 +9,11 @@ defmodule Loopctl.Changes.Reconcile do
     `gap_after_seconds/0` (10 min) means the event before it was lost or is stuck.
   - **A quiet change.** A gap only reveals a lost event when a LATER one arrives, so it cannot
     catch a dropped final event or a bad secret. A change bound to a story (its current
-    binding) whose story is not at a terminal stage, and that has had no event for
-    `stale_after_seconds/0` (6 h), is flagged too.
+    binding) whose story is not at a terminal stage, that has not landed, and that has had no
+    event for `stale_after_seconds/0` (6 h), is flagged too. A landed change is quiet by
+    design: `landed` is chg's last word on it, and its story waits at `merged` for a deploy
+    that no chg event reports, so judging it by its stage alone flagged every landing six
+    hours later and, a day after that, filed each as a `stuck_change` finding.
 
   ## Why loopctl does not pull
 
@@ -84,16 +87,19 @@ defmodule Loopctl.Changes.Reconcile do
 
   @doc """
   Changes CURRENTLY bound to a story that is not at a terminal stage (a story with no stage
-  row yet is not terminal), with no event for `stale_after_seconds/0` and not flagged at all.
-  Fleet-wide on `AdminRepo`, tenant predicate on every join; active tenants only.
+  row yet is not terminal), with no applied `landed` event, with no event for
+  `stale_after_seconds/0` and not flagged at all. Fleet-wide on `AdminRepo`, tenant predicate
+  on every join; active tenants only.
   """
   @spec stale_candidates(DateTime.t(), pos_integer()) :: [candidate()]
   def stale_candidates(%DateTime{} = now, limit) when is_integer(limit) and limit > 0 do
     cutoff = DateTime.add(now, -@stale_after_seconds, :second)
     terminal = StageMachine.terminal_stages()
+    landed = landed_subquery()
 
     AdminRepo.all(
       from c in Cursor,
+        as: :cursor,
         join: b in Binding,
         on:
           b.tenant_id == c.tenant_id and b.repo == c.repo and b.change_id == c.change_id and
@@ -105,6 +111,7 @@ defmodule Loopctl.Changes.Reconcile do
         where: c.last_event_at < ^cutoff and t.status == :active,
         where: is_nil(c.attention),
         where: is_nil(st.id) or st.stage not in ^terminal,
+        where: not exists(subquery(landed)),
         order_by: [asc: c.last_event_at],
         limit: ^limit,
         select: %{tenant_id: c.tenant_id, repo: c.repo, change_id: c.change_id}
@@ -151,6 +158,33 @@ defmodule Loopctl.Changes.Reconcile do
     else
       :unchanged
     end
+  end
+
+  # An applied, routed `landed` event of the change bound as `:cursor` that no applied
+  # `reverted` or `submitted` follows. `deployed` and `verified` may follow a landing without
+  # reopening it; a revert sends the story back to work and a new revision starts a new
+  # submission, and either one puts the change back under watch.
+  defp landed_subquery do
+    reopened = reopened_subquery()
+
+    from e in Event,
+      as: :landed,
+      where:
+        e.tenant_id == parent_as(:cursor).tenant_id and e.repo == parent_as(:cursor).repo and
+          e.change_id == parent_as(:cursor).change_id and e.kind == "landed" and
+          not is_nil(e.applied_at) and e.routed,
+      where: not exists(subquery(reopened)),
+      select: 1
+  end
+
+  # An applied `reverted` or `submitted` after the landing bound as `:landed`.
+  defp reopened_subquery do
+    from r in Event,
+      where:
+        r.tenant_id == parent_as(:landed).tenant_id and r.repo == parent_as(:landed).repo and
+          r.change_id == parent_as(:landed).change_id and r.kind in ["reverted", "submitted"] and
+          not is_nil(r.applied_at) and r.event_seq > parent_as(:landed).event_seq,
+      select: 1
   end
 
   defp unflagged_for(:gap), do: dynamic([c], is_nil(c.attention) or c.attention != "gap")

@@ -29,8 +29,14 @@ defmodule Loopctl.Changes.FindingFiler do
   ## Transient versus permanent
 
   `Loopctl.Delivery.MergePrecondition.transient?/1`, the classification every forge drainer
-  shares: transient backs the row off, permanent abandons on the first occurrence, a missing
-  credential waits an hour per attempt within the same budget.
+  shares: transient backs the row off and permanent abandons on the first occurrence. A
+  missing credential waits an hour per attempt with NO budget (`Findings.mark_configuration_wait/4`),
+  unlike the other drainers: a credential is configuration whose fix happens outside loopctl,
+  and the outbox row is the only thing that will ever tell anyone about the finding. Bounded,
+  six hourly attempts abandoned the row and left its finding `:filed` with no issue for good,
+  which is what happened to the first `selection_miss` (2026-11-19) while its repository was
+  waiting for the operator token. The wait costs no forge call: the credential is resolved
+  locally before anything is sent.
 
   No database transaction is open across a forge call.
   """
@@ -188,8 +194,7 @@ defmodule Loopctl.Changes.FindingFiler do
         defer(action, reason, nil)
 
       Credential.configuration?(reason) ->
-        {outcome, _wait} = defer(action, reason, Credential.configuration_retry_seconds())
-        {outcome, nil}
+        wait_for_credential(action, reason)
 
       true ->
         abandon(action, "permanent_forge_failure", reason)
@@ -207,6 +212,20 @@ defmodule Loopctl.Changes.FindingFiler do
 
       {:error, :not_pending} ->
         {:skipped, retry_after}
+    end
+  end
+
+  # The `nil` is deliberate: the wait is loopctl's own, not a forge rate limit that should halt
+  # the rest of the batch.
+  defp wait_for_credential(%FindingAction{} = action, reason) do
+    case Findings.mark_configuration_wait(
+           action.tenant_id,
+           action,
+           reason,
+           Credential.configuration_retry_seconds()
+         ) do
+      {:ok, _row} -> {:deferred, nil}
+      {:error, :not_pending} -> {:skipped, nil}
     end
   end
 

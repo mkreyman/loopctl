@@ -54,6 +54,35 @@ defmodule Loopctl.Changes.ReconcileTest do
     )
   end
 
+  # A `landed` row stored as the event path stores one. Pushed through Events instead, a
+  # landing with no chg review escalates its stage to a terminal one, which would keep the
+  # change out of the stale read for a reason other than the landing.
+  defp insert_landed(ctx, change_id, opts) do
+    now = DateTime.utc_now()
+    applied? = Keyword.fetch!(opts, :applied?)
+
+    AdminRepo.insert_all(Loopctl.Changes.Event, [
+      %{
+        id: Ecto.UUID.generate(),
+        tenant_id: ctx.tenant_id,
+        source_id: ctx.source.id,
+        repo: @repo,
+        change_id: change_id,
+        event_seq: Keyword.get(opts, :seq, 99),
+        kind: Keyword.get(opts, :kind, "landed"),
+        revision: 1,
+        sha: String.duplicate("a", 40),
+        occurred_at: now,
+        data: %{"merge_sha" => String.duplicate("b", 40)},
+        received_via: "push",
+        applied_at: if(applied?, do: now),
+        routed: true,
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+  end
+
   defp candidate(ctx, change_id),
     do: %{tenant_id: ctx.tenant_id, repo: @repo, change_id: change_id}
 
@@ -110,6 +139,35 @@ defmodule Loopctl.Changes.ReconcileTest do
       fixture(:story_stage, %{tenant_id: ctx.tenant_id, story_id: ctx.story.id, stage: :reviewing})
 
       assert [_] = mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id)
+    end
+
+    test "a landed change waiting at merged is not flagged", ctx do
+      fixture(:story_stage, %{tenant_id: ctx.tenant_id, story_id: ctx.story.id, stage: :merged})
+      assert [_] = mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id)
+
+      insert_landed(ctx, "C1", applied?: true)
+      assert mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id) == []
+    end
+
+    test "a landed event still held ahead of a gap does not end the watch", ctx do
+      fixture(:story_stage, %{tenant_id: ctx.tenant_id, story_id: ctx.story.id, stage: :merged})
+      insert_landed(ctx, "C1", applied?: false)
+
+      assert [%{change_id: "C1"}] =
+               mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id)
+    end
+
+    test "a revert or a new submission after the landing puts the change back under watch",
+         ctx do
+      fixture(:story_stage, %{tenant_id: ctx.tenant_id, story_id: ctx.story.id, stage: :merged})
+      insert_landed(ctx, "C1", applied?: true)
+      insert_landed(ctx, "C1", applied?: true, kind: "deployed", seq: 100)
+      assert mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id) == []
+
+      insert_landed(ctx, "C1", applied?: true, kind: "reverted", seq: 101)
+
+      assert [%{change_id: "C1"}] =
+               mine(Reconcile.stale_candidates(later(7 * 3_600), 100), ctx.tenant_id)
     end
 
     test "an unbound change is not flagged for staleness", ctx do
