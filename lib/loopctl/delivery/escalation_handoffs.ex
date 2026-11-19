@@ -104,7 +104,7 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
     open =
       from(p in ChannelPost,
         as: :post,
-        where: like(p.key, "handoff:%:escalation-%") and p.session_id == ^@session,
+        where: like(p.key, "handoff:%:escalation-%") and like(p.session_id, ^"#{@session}%"),
         where: p.expires_at > ^now,
         where: not exists(done_claim(:post)),
         distinct: true,
@@ -324,33 +324,37 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
     """
   end
 
-  # Open escalation handoffs (no done claim) whose story is no longer escalated.
+  # Open escalation handoffs (no done claim) whose story is no longer escalated. Every live
+  # pointer counts, the stalled re-posts included: the original post may have expired while
+  # its re-posts still surface the key. The still-escalated stories are excluded IN the query,
+  # before the limit, so they cannot fill every page and starve a resolved one.
   defp close_resolved(tenant_id, escalated_ids, now, acc) do
+    escalated_ids = Enum.to_list(escalated_ids)
+
     from(p in ChannelPost,
       as: :post,
-      where: p.tenant_id == ^tenant_id and p.session_id == ^@session,
+      where: p.tenant_id == ^tenant_id and like(p.session_id, ^"#{@session}%"),
       where: like(p.key, "handoff:%:escalation-%"),
       where: p.expires_at > ^now,
       where: not exists(done_claim(:post)),
+      where:
+        fragment(
+          "coalesce(substring(? from ':escalation-([0-9a-f-]{36})-g[0-9]+$'), '') <> ALL(?)",
+          p.key,
+          type(^escalated_ids, {:array, :string})
+        ),
       distinct: true,
+      order_by: [asc: p.key],
       limit: @close_limit,
       select: {p.project_id, p.key}
     )
     |> AdminRepo.all()
-    |> Enum.reject(fn {_project, key} -> MapSet.member?(escalated_ids, story_of(key)) end)
     |> Enum.reduce(acc, fn {project_id, key}, acc ->
       case close(tenant_id, project_id, key, now) do
         :ok -> %{acc | closed: acc.closed + 1}
         {:error, reason} -> %{acc | errors: [{key, reason} | acc.errors]}
       end
     end)
-  end
-
-  defp story_of(key) do
-    case Regex.run(~r/:escalation-([0-9a-f-]{36})-g\d+$/, key) do
-      [_, id] -> id
-      _ -> nil
-    end
   end
 
   defp done_claim(binding) do

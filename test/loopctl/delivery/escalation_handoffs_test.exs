@@ -107,6 +107,44 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
     assert EscalationHandoffs.tenants(now) |> Enum.member?(tenant_id) == false
   end
 
+  test "only the resolved story's handoff closes; a still-escalated sibling's stays open" do
+    open = escalated!()
+    resolved = escalated!(%{sibling_of: open})
+    now = DateTime.utc_now()
+    EscalationHandoffs.sweep_tenant(open.tenant_id, now)
+
+    AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^resolved.id),
+      set: [stage: :done]
+    )
+
+    assert %{closed: 1} = EscalationHandoffs.sweep_tenant(open.tenant_id, now)
+    assert [%{key: k}] = open_handoffs(open)
+    assert k == key(open, 1)
+  end
+
+  test "a resolved story is closed through its stalled re-post once the original expired" do
+    story = escalated!(%{escalated_at: DateTime.add(DateTime.utc_now(), -30 * 3_600)})
+    EscalationHandoffs.sweep_tenant(story.tenant_id, DateTime.utc_now())
+    later = DateTime.add(DateTime.utc_now(), 25 * 3_600)
+    assert %{refreshed: 1} = EscalationHandoffs.sweep_tenant(story.tenant_id, later)
+
+    # The original pointer's retention ends; only the stalled re-post is live.
+    AdminRepo.update_all(
+      from(p in ChannelPost,
+        where: p.tenant_id == ^story.tenant_id and p.session_id == "loopctl:escalation-handoff"
+      ),
+      set: [expires_at: DateTime.add(DateTime.utc_now(), -60)]
+    )
+
+    AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
+      set: [stage: :done]
+    )
+
+    assert story.tenant_id in EscalationHandoffs.tenants(later)
+    assert %{closed: 1} = EscalationHandoffs.sweep_tenant(story.tenant_id, later)
+    assert open_handoffs(story) == []
+  end
+
   test "a handoff finished while the story is still escalated is replaced by generation 2" do
     story = escalated!()
     now = DateTime.utc_now()

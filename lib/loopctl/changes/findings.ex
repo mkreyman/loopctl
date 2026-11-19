@@ -1521,7 +1521,9 @@ defmodule Loopctl.Changes.Findings do
   defp dismiss_reason(reason) when is_binary(reason) do
     trimmed = String.trim(reason)
 
-    if trimmed != "" and String.length(trimmed) <= @dismiss_reason_max,
+    # Code points, as the column's CHECK counts them (`char_length`); graphemes would let a
+    # decomposed or ZWJ-joined reason pass here and fail the CHECK as a 500.
+    if trimmed != "" and length(String.to_charlist(trimmed)) <= @dismiss_reason_max,
       do: {:ok, trimmed},
       else: {:error, :invalid_reason}
   end
@@ -1548,15 +1550,20 @@ defmodule Loopctl.Changes.Findings do
   end
 
   # An `open` that a drainer has claimed at least once and that recorded no issue: the attempt
-  # may have created one, which only its own retry (the marker search) can find.
+  # may have created one, which only its own retry (the marker search) can find. The pending
+  # open rows are LOCKED, so a drainer's claim cannot commit between this read and the abandon
+  # below: a claim that committed first is seen here, and one that comes after finds the row
+  # abandoned and stands down (`:not_pending`).
   defp filing_in_flight?(%Finding{} = finding) do
-    AdminRepo.exists?(
-      from a in FindingAction,
-        where:
-          a.tenant_id == ^finding.tenant_id and a.finding_id == ^finding.id and
-            a.action == :open and a.status == :pending and a.attempts > 0 and
-            is_nil(a.issue_number)
+    from(a in FindingAction,
+      where:
+        a.tenant_id == ^finding.tenant_id and a.finding_id == ^finding.id and
+          a.action == :open and a.status == :pending,
+      lock: "FOR UPDATE",
+      select: {a.attempts, a.issue_number}
     )
+    |> AdminRepo.all()
+    |> Enum.any?(fn {attempts, issue} -> attempts > 0 and is_nil(issue) end)
   end
 
   defp close_dismissed(%Finding{} = finding, reason) do

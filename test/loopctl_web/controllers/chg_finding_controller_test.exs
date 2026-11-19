@@ -173,7 +173,16 @@ defmodule LoopctlWeb.ChgFindingControllerTest do
       f = finding!(ctx.tenant.id, %{})
       long = String.duplicate("x", Findings.dismiss_reason_max() + 1)
 
-      for params <- [%{}, %{"reason" => "   "}, %{"reason" => long}, %{"reason" => 5}] do
+      # 300 graphemes but 600 code points: the CHECK counts code points, so must the guard.
+      decomposed = String.duplicate("é", 300)
+
+      for params <- [
+            %{},
+            %{"reason" => "   "},
+            %{"reason" => long},
+            %{"reason" => 5},
+            %{"reason" => decomposed}
+          ] do
         assert %{"error" => %{"code" => "invalid_reason"}} =
                  ctx.user_key
                  |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/dismiss", params)
