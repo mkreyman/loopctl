@@ -342,7 +342,24 @@ defmodule Loopctl.Intake do
   defp put_target_epic(changeset, _tenant_id, nil),
     do: Ecto.Changeset.put_change(changeset, :target_epic_id, nil)
 
+  # A `ledger` source routes nothing (it refuses every GitHub delivery), so no record is ever
+  # triaged into its target, and the target's FK would still block deleting that epic. On a
+  # kb scope that was unreachable (a kb scope has no epics); a ledger source on a work project
+  # made it reachable, so it is refused here, on the one path every writer takes. The mode is
+  # read from the changeset: a switch across `ledger` is refused anyway, so the row's
+  # ledger-ness never changes under it.
   defp put_target_epic(changeset, tenant_id, epic_id) do
+    if binding_mode?(Ecto.Changeset.get_field(changeset, :mode)),
+      do: put_binding_target_epic(changeset, tenant_id, epic_id),
+      else:
+        Ecto.Changeset.add_error(
+          changeset,
+          :target_epic_id,
+          "a ledger source routes nothing and takes no target epic"
+        )
+  end
+
+  defp put_binding_target_epic(changeset, tenant_id, epic_id) do
     project_id = Ecto.Changeset.get_field(changeset, :project_id)
 
     case epic_in_project(tenant_id, project_id, epic_id) do

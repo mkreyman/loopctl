@@ -391,6 +391,42 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
       assert AdminRepo.get!(Source, ctx.source.id).mode == :ledger
     end
 
+    # A ledger source routes nothing, so a target epic would only block that epic's delete.
+    test "takes no target epic, at enrolment, update or repoint", ctx do
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.work.id})
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Intake.create_source(
+                 ctx.tenant.id,
+                 Map.merge(
+                   %{
+                     repo_full_name: "mkreyman/cron_books",
+                     project_id: ctx.work.id,
+                     mode: "ledger",
+                     target_epic_id: epic.id
+                   },
+                   chg_credentials(ctx.tenant.id)
+                 )
+               )
+
+      assert %{target_epic_id: [message]} = errors_on(changeset)
+      assert message =~ "a ledger source routes nothing"
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Intake.update_source(ctx.tenant.id, ctx.source.id, %{target_epic_id: epic.id})
+
+      assert %{target_epic_id: [_]} = errors_on(changeset)
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Intake.repoint_source(ctx.tenant.id, ctx.source.id, epic.id)
+
+      assert %{target_epic_id: [_]} = errors_on(changeset)
+      assert AdminRepo.get!(Source, ctx.source.id).target_epic_id == nil
+
+      # Clearing it stays allowed: nil is the only value a ledger source can hold.
+      assert {:ok, _} = Intake.update_source(ctx.tenant.id, ctx.source.id, %{target_epic_id: nil})
+    end
+
     test "a pr or chg source on a work project cannot be switched to ledger", ctx do
       for mode <- [:pr, :chg] do
         {_ws, source} =
