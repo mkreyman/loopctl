@@ -148,6 +148,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # Mix keeps its build-lock files in $TMPDIR, and a job killed mid-compile leaves one
+      # behind that a later job on this slot can wait on for its whole timeout (#119).
+      # RUNNER_TEMP is emptied at the start of every job.
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: erlef/setup-beam@v1
         if: ${{ !matrix.elixir }}
         with:

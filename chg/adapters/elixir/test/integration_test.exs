@@ -9,7 +9,14 @@ defmodule ChgAdapter.IntegrationTest do
   @fixture Path.expand("../fixtures/sample", __DIR__)
 
   setup_all do
-    root = Path.join(System.tmp_dir!(), "chg-adapter-it-#{System.unique_integer([:positive])}")
+    # A root no earlier run used (#119). Mix keys its build lock by the build path and a
+    # process killed mid-compile leaves that lock's file behind; System.unique_integer
+    # restarts small in every VM, so a later run on the same host reused a dead run's
+    # paths, found the stale lock answered by whatever now held its port, and waited
+    # 600 s. The OS pid and random bytes make each run's build paths, and keys, new.
+    suffix = "#{System.pid()}-#{Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)}"
+    root = Path.join(System.tmp_dir!(), "chg-adapter-it-#{suffix}")
+    sweep_stale_roots()
     archives = Path.join(root, "archives")
     ez = Path.join(root, "chg_adapter.ez")
     File.mkdir_p!(archives)
@@ -46,6 +53,17 @@ defmodule ChgAdapter.IntegrationTest do
 
     git!(dir, ["commit", "-qm", "fixture"])
     %{dir: dir, root: root, archives: archives, base: git!(dir, ["rev-parse", "HEAD"])}
+  end
+
+  # A run killed before on_exit leaves its root; with unique names nothing reuses it, so
+  # roots older than a day are removed (no run lasts that long).
+  defp sweep_stale_roots do
+    cutoff = System.os_time(:second) - 86_400
+
+    for dir <- Path.wildcard(Path.join(System.tmp_dir!(), "chg-adapter-it-*")),
+        {:ok, %{mtime: mtime}} <- [File.stat(dir, time: :posix)],
+        mtime < cutoff,
+        do: File.rm_rf(dir)
   end
 
   # The machine's git config stays out of the fixture's repos, for this test's git calls
