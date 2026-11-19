@@ -438,20 +438,33 @@ defmodule Loopctl.Changes.Findings do
 
   # The gate's failing tests, as a short digest of their sorted JSON: two misses on one sha
   # with different failures are two problems. Empty when the gate row names none.
-  defp failures_digest(%{"failures" => [_ | _] = failures}) do
+  #
+  # chg cuts `failures` to the first 50 names on a row still over 16 KB (chg #107) and sends
+  # `failures_sha256`: the same hash, taken over the FULL list. Hashing the cut list would
+  # merge two runs that differ only past the 50th failure, so the sent hash wins when it is
+  # well formed. Being the same form, it leaves every untruncated row's fingerprint unchanged.
+  defp failures_digest(%{"failures" => [_ | _] = failures} = raw) do
     digest =
-      failures
-      |> Enum.map(&Jason.encode!/1)
-      |> Enum.sort()
-      |> Enum.join("\n")
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
-      |> binary_part(0, 12)
+      case raw["failures_sha256"] do
+        <<_::binary-size(64)>> = sent -> if sha256_hex?(sent), do: sent, else: digest_of(failures)
+        _absent_or_malformed -> digest_of(failures)
+      end
 
-    ":" <> digest
+    ":" <> binary_part(digest, 0, 12)
   end
 
   defp failures_digest(_raw), do: ""
+
+  defp digest_of(failures) do
+    failures
+    |> Enum.map(&Jason.encode!/1)
+    |> Enum.sort()
+    |> Enum.join("\n")
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp sha256_hex?(value), do: String.match?(value, ~r/\A[0-9a-f]{64}\z/)
 
   @max_failure_names 50
 

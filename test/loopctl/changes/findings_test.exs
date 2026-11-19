@@ -125,6 +125,44 @@ defmodule Loopctl.Changes.FindingsTest do
       assert s.evidence["failures"] == ["test/a_test.exs:1", "test/b_test.exs:2"]
     end
 
+    # chg #107: a row over 16 KB arrives with `failures` cut to 50 and the full list's hash.
+    test "a cut failures list is fingerprinted by the hash chg sent for the full list", ctx do
+      full = for n <- 1..60, do: "test/t_test.exs:#{n}"
+      cut = Enum.take(full, 50)
+      digest = fn list -> list |> Enum.map(&Jason.encode!/1) |> Enum.sort() |> Enum.join("\n") end
+      sha_of = fn list -> :crypto.hash(:sha256, digest.(list)) |> Base.encode16(case: :lower) end
+
+      fingerprint = fn sha, raw ->
+        ledger!(ctx.hcb, "chg", %{sha: sha, verdict: "pass", raw: %{"mode" => "affected"}})
+        ledger!(ctx.hcb, "gate", %{sha: sha, verdict: "fail", raw: raw})
+
+        Findings.derive(ctx.tenant_id, @now, opts())
+        |> Enum.find(&String.starts_with?(&1.fingerprint, "home_care_billing@#{sha}"))
+        |> Map.fetch!(:fingerprint)
+      end
+
+      sent = sha_of.(full)
+      a = String.duplicate("a", 40)
+
+      assert fingerprint.(a, %{"failures" => cut, "failures_sha256" => sent}) ==
+               "home_care_billing@#{a}:" <> binary_part(sent, 0, 12)
+
+      # Same form: an untruncated row fingerprints identically with or without the hash.
+      b = String.duplicate("b", 40)
+      c = String.duplicate("c", 40)
+
+      suffix = fn fp -> fp |> String.split(":") |> List.last() end
+
+      assert suffix.(fingerprint.(b, %{"failures" => cut})) ==
+               suffix.(fingerprint.(c, %{"failures" => cut, "failures_sha256" => sha_of.(cut)}))
+
+      # A malformed hash is ignored, never trusted into the fingerprint.
+      e = String.duplicate("e", 40)
+
+      assert fingerprint.(e, %{"failures" => cut, "failures_sha256" => String.upcase(sent)}) ==
+               "home_care_billing@#{e}:" <> binary_part(sha_of.(cut), 0, 12)
+    end
+
     test "a full run, a passing gate, or a row outside the window is not a miss", ctx do
       selection_miss!(ctx.hcb, %{mode: "all"})
       selection_miss!(ctx.hcb, %{sha: String.duplicate("b", 40), gate: "pass"})
