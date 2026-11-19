@@ -551,7 +551,7 @@ defmodule Loopctl.Delivery.EscalationInbox do
 
   # The system agent is resolved only once something qualifies, so a quiet tenant gains no row.
   defp post_counted(tenant_id, counts, filters, now) do
-    case digest_agent(tenant_id) do
+    case system_agent(tenant_id, @digest_agent_name) do
       {:ok, agent_id} ->
         for {project_id, by_class} <- counts do
           {:ok, %{data: rows}} =
@@ -664,11 +664,16 @@ defmodule Loopctl.Delivery.EscalationInbox do
 
   defp changeset_errors(%Ecto.Changeset{errors: errors}), do: Keyword.keys(errors)
 
-  # The per-tenant system agent the digest is attributed to. Its name is in the reserved
-  # `system:` prefix, which no key can register or rename into, so whichever row carries it was
-  # written here. `ON CONFLICT DO NOTHING` and then a read keep two concurrent first runs from
-  # failing each other.
-  defp digest_agent(tenant_id) do
+  @doc """
+  The id of `tenant_id`'s system agent called `name`, created on first use. The name must be
+  in the reserved `system:` prefix, which no key can register or rename into, so whichever row
+  carries it was written here. `ON CONFLICT DO NOTHING` and then a read keep two concurrent
+  first runs from failing each other. Used by the digest and by
+  `Loopctl.Delivery.EscalationHandoffs`.
+  """
+  @spec system_agent(Ecto.UUID.t(), String.t()) ::
+          {:ok, Ecto.UUID.t()} | {:error, :system_agent_not_resolved}
+  def system_agent(tenant_id, "system:" <> _ = name) do
     now = DateTime.utc_now()
 
     AdminRepo.insert_all(
@@ -677,7 +682,7 @@ defmodule Loopctl.Delivery.EscalationInbox do
         %{
           id: Ecto.UUID.generate(),
           tenant_id: tenant_id,
-          name: @digest_agent_name,
+          name: name,
           agent_type: :orchestrator,
           status: :active,
           last_seen_at: now,
@@ -692,10 +697,10 @@ defmodule Loopctl.Delivery.EscalationInbox do
 
     case AdminRepo.one(
            from a in Agent,
-             where: a.tenant_id == ^tenant_id and a.name == ^@digest_agent_name,
+             where: a.tenant_id == ^tenant_id and a.name == ^name,
              select: a.id
          ) do
-      nil -> {:error, :digest_agent_not_resolved}
+      nil -> {:error, :system_agent_not_resolved}
       id -> {:ok, id}
     end
   end

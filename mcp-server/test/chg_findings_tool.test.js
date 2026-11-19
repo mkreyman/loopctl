@@ -15,7 +15,13 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { chgFindings, chgFindingClear, LIST_CAP } from "../lib/chg-findings.js";
+import {
+  chgFindings,
+  chgFindingClear,
+  chgFindingDismiss,
+  DISMISS_REASON_MAX,
+  LIST_CAP,
+} from "../lib/chg-findings.js";
 import { stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -107,11 +113,41 @@ describe("chg_finding_clear (US-51.6)", () => {
   });
 });
 
+describe("chg_finding_dismiss (#1064)", () => {
+  test("POSTs the reason to the finding's dismiss path with the user key", async () => {
+    const api = fakeApi({ data: { state: "closed" } }, { userKey: "user-key" });
+
+    assert.deepEqual(await chgFindingDismiss({ finding_id: ID, reason: "hook row" }, api), {
+      data: { state: "closed" },
+    });
+    assert.deepEqual(api.calls, [
+      { method: "POST", path: `/api/v1/chg_findings/${ID}/dismiss`, body: { reason: "hook row" } },
+    ]);
+  });
+
+  test("refuses locally without a user key, a UUID, or a 1..500 character reason", async () => {
+    const api = fakeApi({}, { userKey: "user-key" });
+    const noKey = fakeApi();
+
+    assert.equal((await chgFindingDismiss({ finding_id: ID, reason: "x" }, noKey)).error, true);
+    assert.equal((await chgFindingDismiss({ finding_id: "nope", reason: "x" }, api)).error, true);
+    assert.equal((await chgFindingDismiss({ finding_id: ID }, api)).error, true);
+    assert.equal((await chgFindingDismiss({ finding_id: ID, reason: "  " }, api)).error, true);
+    assert.equal(
+      (await chgFindingDismiss({ finding_id: ID, reason: "x".repeat(DISMISS_REASON_MAX + 1) }, api))
+        .error,
+      true,
+    );
+    assert.equal(api.calls.length + noKey.calls.length, 0);
+  });
+});
+
 describe("chg findings wiring in index.js", () => {
-  test("both tools are declared, dispatched to their own handlers, and given README rows", () => {
+  test("the tools are declared, dispatched to their own handlers, and given README rows", () => {
     for (const [tool, fn] of [
       ["chg_findings", "chgFindingsRead"],
       ["chg_finding_clear", "chgFindingClearCall"],
+      ["chg_finding_dismiss", "chgFindingDismissCall"],
     ]) {
       assert.ok(INDEX_SRC.includes(`name: "${tool}"`), `${tool} is not declared`);
       assert.match(
@@ -143,6 +179,24 @@ describe("chg findings wiring in index.js", () => {
     const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
 
     for (const word of ["not_escalated", "404", "403", "custody_tier_required", "LOOPCTL_USER_KEY"]) {
+      assert.ok(declaration.includes(word), `the description does not name ${word}`);
+    }
+  });
+
+  test("dismiss goes through runnerDeps() and its description names its refusals", () => {
+    assert.match(handler("chgFindingDismissCall"), /chgFindingDismiss\(args, runnerDeps\(\)\)/);
+
+    const start = INDEX_SRC.indexOf('name: "chg_finding_dismiss"');
+    const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+    for (const word of [
+      "invalid_reason",
+      "not_dismissible",
+      "filing_in_flight",
+      "404",
+      "custody_tier_required",
+      "LOOPCTL_USER_KEY",
+    ]) {
       assert.ok(declaration.includes(word), `the description does not name ${word}`);
     }
   });

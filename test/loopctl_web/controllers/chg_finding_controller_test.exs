@@ -9,6 +9,7 @@ defmodule LoopctlWeb.ChgFindingControllerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Changes.Finding
+  alias Loopctl.Changes.Findings
 
   setup :verify_on_exit!
 
@@ -144,6 +145,98 @@ defmodule LoopctlWeb.ChgFindingControllerTest do
 
       ctx.user_key |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/clear") |> json_response(404)
       assert %Finding{state: :escalated} = AdminRepo.get(Finding, f.id)
+    end
+  end
+
+  # #1064: closing a finding filed in error.
+  describe "dismiss" do
+    test "a user key dismisses a filed or escalated finding with its reason", ctx do
+      for state <- [:filed, :escalated, :queued] do
+        f = finding!(ctx.tenant.id, %{state: state})
+
+        body =
+          ctx.user_key
+          |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/dismiss", %{"reason" => "  hook row  "})
+          |> json_response(200)
+
+        assert %{
+                 "state" => "closed",
+                 "dismissed_reason" => "hook row",
+                 "escalated_reason" => nil
+               } = body["data"]
+
+        assert body["data"]["dismissed_at"]
+      end
+    end
+
+    test "no reason, a blank one or an overlong one is 422 and changes nothing", ctx do
+      f = finding!(ctx.tenant.id, %{})
+      long = String.duplicate("x", Findings.dismiss_reason_max() + 1)
+
+      # 300 graphemes but 600 code points: the CHECK counts code points, so must the guard.
+      decomposed = String.duplicate("é", 300)
+
+      for params <- [
+            %{},
+            %{"reason" => "   "},
+            %{"reason" => long},
+            %{"reason" => 5},
+            %{"reason" => decomposed}
+          ] do
+        assert %{"error" => %{"code" => "invalid_reason"}} =
+                 ctx.user_key
+                 |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/dismiss", params)
+                 |> json_response(422)
+      end
+
+      assert %Finding{state: :filed, dismissed_at: nil} = AdminRepo.get(Finding, f.id)
+    end
+
+    test "a fixed or closed finding is 409 not_dismissible; an unknown one is 404", ctx do
+      for state <- [:fixed, :closed] do
+        f = finding!(ctx.tenant.id, %{state: state})
+
+        assert %{"error" => %{"code" => "not_dismissible"}} =
+                 ctx.user_key
+                 |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/dismiss", %{"reason" => "x"})
+                 |> json_response(409)
+      end
+
+      ctx.user_key
+      |> call(:post, ~p"/api/v1/chg_findings/#{Ecto.UUID.generate()}/dismiss", %{"reason" => "x"})
+      |> json_response(404)
+    end
+
+    test "an agent key, or a user key on an agent-rooted tenant, is 403", ctx do
+      f = finding!(ctx.tenant.id, %{})
+
+      ctx.agent_key
+      |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/dismiss", %{"reason" => "x"})
+      |> json_response(403)
+
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {user_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      g = finding!(tenant.id, %{})
+
+      body =
+        user_key
+        |> call(:post, ~p"/api/v1/chg_findings/#{g.id}/dismiss", %{"reason" => "x"})
+        |> json_response(403)
+
+      assert body["error"]["code"] == "custody_tier_required"
+      assert %Finding{state: :filed} = AdminRepo.get(Finding, f.id)
+      assert %Finding{state: :filed} = AdminRepo.get(Finding, g.id)
+    end
+
+    test "another tenant's finding is 404 and stays filed", ctx do
+      other = fixture(:tenant, %{})
+      f = finding!(other.id, %{})
+
+      ctx.user_key
+      |> call(:post, ~p"/api/v1/chg_findings/#{f.id}/dismiss", %{"reason" => "x"})
+      |> json_response(404)
+
+      assert %Finding{state: :filed} = AdminRepo.get(Finding, f.id)
     end
   end
 end

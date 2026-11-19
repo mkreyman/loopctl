@@ -552,6 +552,7 @@ defmodule LoopctlWeb.Router do
     # escalated finding sends it round the loop again, so it is user-role and human-anchored.
     get "/chg_findings", ChgFindingController, :index
     post "/chg_findings/:id/clear", ChgFindingController, :clear
+    post "/chg_findings/:id/dismiss", ChgFindingController, :dismiss
 
     # US-48.13: the improvement loop's drafts, and the operator's record that one landed in a
     # pull request. User-role both: traces carry ticket text, and `landed` certifies a person

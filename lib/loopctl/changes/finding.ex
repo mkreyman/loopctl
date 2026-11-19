@@ -9,7 +9,9 @@ defmodule Loopctl.Changes.Finding do
     the owning repository.
   - `:filed` — an `open` action is decided; `issue_number` is set once it ran.
   - `:fixed` — the story the delivery loop made from the issue merged (US-51.2).
-  - `:closed` — the signal stayed quiet for the quiet period after the fix (US-51.2).
+  - `:closed` — the signal stayed quiet for the quiet period after the fix (US-51.2), or a
+    person dismissed the finding as filed in error (#1064): `dismissed_at` and
+    `dismissed_reason` say so, and a later sighting never reopens it.
   - `:escalated` — a person must look: depth 2, or two fixes that did not hold.
     `escalated_reason` says which.
 
@@ -48,6 +50,8 @@ defmodule Loopctl.Changes.Finding do
     field :closed_at, :utc_datetime_usec
     field :escalated_at, :utc_datetime_usec
     field :escalated_reason, :string
+    field :dismissed_at, :utc_datetime_usec
+    field :dismissed_reason, :string
 
     timestamps()
   end

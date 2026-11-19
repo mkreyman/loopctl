@@ -1,6 +1,9 @@
 /**
- * `chg_findings` and `chg_finding_clear` (loopctl US-51.6): the chg feedback loop's findings —
- * `GET /api/v1/chg_findings` and `POST /api/v1/chg_findings/:id/clear`.
+ * `chg_findings`, `chg_finding_clear` (loopctl US-51.6) and `chg_finding_dismiss` (#1064): the chg
+ * feedback loop's findings —
+ * `GET /api/v1/chg_findings`, `POST /api/v1/chg_findings/:id/clear` and
+ * `POST /api/v1/chg_findings/:id/dismiss`. Dismissing closes a finding filed in error and is
+ * gated like clear: a user key, used exactly.
  *
  * A finding is a problem the nightly sweep derived from the chg ledger (a selection miss, a
  * flaky test, a merge with no review, a stuck change, a silent ledger sender), filed as a
@@ -73,4 +76,26 @@ export async function chgFindingClear({ finding_id } = {}, { userKey, apiCall } 
   }
 
   return apiCall("POST", `/api/v1/chg_findings/${encodeURIComponent(finding_id)}/clear`, {});
+}
+
+export const DISMISS_REASON_MAX = 500;
+
+/** `POST /api/v1/chg_findings/:id/dismiss` with the exact user key and a reason (loopctl #1064). */
+export async function chgFindingDismiss({ finding_id, reason } = {}, { userKey, apiCall } = {}) {
+  if (!userKey) return refuse(MISSING_USER_KEY);
+
+  if (typeof finding_id !== "string" || !UUID.test(finding_id)) {
+    return refuse("`finding_id` is required: the finding's UUID, from chg_findings.");
+  }
+  if (
+    typeof reason !== "string" ||
+    reason.trim() === "" ||
+    reason.trim().length > DISMISS_REASON_MAX
+  ) {
+    return refuse(`\`reason\` is required: 1 to ${DISMISS_REASON_MAX} characters.`);
+  }
+
+  return apiCall("POST", `/api/v1/chg_findings/${encodeURIComponent(finding_id)}/dismiss`, {
+    reason,
+  });
 }

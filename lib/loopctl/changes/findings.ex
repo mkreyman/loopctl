@@ -672,6 +672,10 @@ defmodule Loopctl.Changes.Findings do
     if counted == 1 and recurred?(finding, fresh), do: recur(finding, fresh, now)
   end
 
+  # A dismissed finding was filed in error (#1064): a person said the signal is not a problem,
+  # so seeing it again is not a fix that failed.
+  defp recurred?(%Finding{dismissed_at: %DateTime{}}, _fresh), do: false
+
   # A fixed or closed finding seen again AFTER its fix merged: the fix did not hold.
   defp recurred?(%Finding{state: state, fixed_at: %DateTime{} = fixed_at}, fresh)
        when state in [:fixed, :closed],
@@ -1471,6 +1475,149 @@ defmodule Loopctl.Changes.Findings do
       actor_id: Map.get(actor, :api_key_id),
       actor_label: Map.get(actor, :label),
       metadata: %{"kind" => finding.kind, "repo" => finding.repo_full_name}
+    })
+  end
+
+  # -- dismissal (#1064) ------------------------------------------------------------------
+
+  @dismissible [:queued, :filed, :escalated]
+  @dismiss_reason_max 500
+
+  @doc "The longest dismissal reason accepted, in characters."
+  @spec dismiss_reason_max() :: pos_integer()
+  def dismiss_reason_max, do: @dismiss_reason_max
+
+  @doc """
+  A person dismisses a finding filed in error (#1064): a `:queued`, `:filed` or `:escalated`
+  finding goes to `:closed` with `dismissed_at` and `dismissed_reason`, in one transaction
+  under the finding's row lock that also abandons its pending forge actions
+  (`finding_dismissed`) and, when it has an issue, enqueues a `close` that comments the reason.
+  A later sighting of the same fingerprint counts as an occurrence and never reopens it
+  (`recurred?/2`). Audited as `chg_finding_dismissed`.
+
+  `{:error, :invalid_reason}` for a reason that is not 1..#{@dismiss_reason_max} characters
+  after trimming; `{:error, :not_found}` for no such finding in the tenant;
+  `{:error, :not_dismissible}` for a `:fixed` or `:closed` one (the loop closes a fixed
+  finding itself); `{:error, :filing_in_flight}` while an `open` action has started and not
+  recorded an issue, because that attempt may have created one this could not close. The
+  caller is a `:user` key on a human-anchored tenant; that gate is the controller's.
+  """
+  @spec dismiss(Ecto.UUID.t(), Ecto.UUID.t(), term(), map()) ::
+          {:ok, Finding.t()}
+          | {:error, :invalid_reason | :not_found | :not_dismissible | :filing_in_flight}
+  def dismiss(tenant_id, finding_id, reason, %{} = actor) do
+    with {:ok, reason} <- dismiss_reason(reason),
+         {:ok, id} <- cast_id(finding_id),
+         {:ok, {:ok, finding}} <-
+           AdminRepo.transaction(fn -> dismiss_locked(tenant_id, id, reason) end) do
+      audit_dismiss(tenant_id, finding, actor)
+      {:ok, finding}
+    else
+      {:ok, {:error, why}} -> {:error, why}
+      {:error, why} -> {:error, why}
+    end
+  end
+
+  defp dismiss_reason(reason) when is_binary(reason) do
+    trimmed = String.trim(reason)
+
+    # Code points, as the column's CHECK counts them (`char_length`); graphemes would let a
+    # decomposed or ZWJ-joined reason pass here and fail the CHECK as a 500.
+    if trimmed != "" and length(String.to_charlist(trimmed)) <= @dismiss_reason_max,
+      do: {:ok, trimmed},
+      else: {:error, :invalid_reason}
+  end
+
+  defp dismiss_reason(_reason), do: {:error, :invalid_reason}
+
+  defp dismiss_locked(tenant_id, id, reason) do
+    case AdminRepo.one(
+           from f in Finding,
+             where: f.tenant_id == ^tenant_id and f.id == ^id,
+             lock: "FOR UPDATE"
+         ) do
+      nil ->
+        {:error, :not_found}
+
+      %Finding{state: state} when state not in @dismissible ->
+        {:error, :not_dismissible}
+
+      %Finding{} = finding ->
+        if filing_in_flight?(finding),
+          do: {:error, :filing_in_flight},
+          else: close_dismissed(finding, reason)
+    end
+  end
+
+  # An `open` that a drainer has claimed at least once and that recorded no issue: the attempt
+  # may have created one, which only its own retry (the marker search) can find. The pending
+  # open rows are LOCKED, so a drainer's claim cannot commit between this read and the abandon
+  # below: a claim that committed first is seen here, and one that comes after finds the row
+  # abandoned and stands down (`:not_pending`).
+  defp filing_in_flight?(%Finding{} = finding) do
+    from(a in FindingAction,
+      where:
+        a.tenant_id == ^finding.tenant_id and a.finding_id == ^finding.id and
+          a.action == :open and a.status == :pending,
+      lock: "FOR UPDATE",
+      select: {a.attempts, a.issue_number}
+    )
+    |> AdminRepo.all()
+    |> Enum.any?(fn {attempts, issue} -> attempts > 0 and is_nil(issue) end)
+  end
+
+  defp close_dismissed(%Finding{} = finding, reason) do
+    now = DateTime.utc_now()
+
+    AdminRepo.update_all(
+      from(a in FindingAction,
+        where:
+          a.tenant_id == ^finding.tenant_id and a.finding_id == ^finding.id and
+            a.status == :pending
+      ),
+      set: [
+        status: :abandoned,
+        abandoned_reason: "finding_dismissed",
+        next_attempt_at: nil,
+        updated_at: now
+      ]
+    )
+
+    {:ok, dismissed} =
+      finding
+      |> Ecto.Changeset.change(
+        state: :closed,
+        closed_at: now,
+        dismissed_at: now,
+        dismissed_reason: reason,
+        escalated_at: nil,
+        escalated_reason: nil
+      )
+      |> AdminRepo.update()
+
+    if is_integer(dismissed.issue_number) do
+      text =
+        "Dismissed by a person as filed in error. loopctl stops tracking it.\n\n> #{reason}\n"
+
+      enqueue(dismissed, :close, dismissed.fix_attempts, text, now)
+    end
+
+    {:ok, dismissed}
+  end
+
+  defp audit_dismiss(tenant_id, finding, actor) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "chg_finding",
+      entity_id: finding.id,
+      action: "chg_finding_dismissed",
+      actor_type: "api_key",
+      actor_id: Map.get(actor, :api_key_id),
+      actor_label: Map.get(actor, :label),
+      metadata: %{
+        "kind" => finding.kind,
+        "repo" => finding.repo_full_name,
+        "reason" => finding.dismissed_reason
+      }
     })
   end
 end
