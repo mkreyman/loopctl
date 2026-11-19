@@ -9383,7 +9383,7 @@ const TOOLS = [
       "on). 422 when the repository is not `owner/name`, when an ACTIVE source already binds " +
       "that repository (revoke it first — the uniqueness is partial on not-yet-revoked), when " +
       "the project is missing, archived or the wrong kind for the mode (a work project for " +
-      "`pr`/`chg`, a KB scope for `ledger`), or when `target_epic_id` names " +
+      "`pr`/`chg`; a KB scope or a work project for `ledger`), or when `target_epic_id` names " +
       "an epic outside that project. 429 when rate limited.\n\n" +
       "NAME `base_branch` AT ENROLMENT for a repository whose trunk is not `master`. It is the " +
       "branch every dispatch for this repository is cut FROM, it defaults to `master` when the " +
@@ -9407,11 +9407,12 @@ const TOOLS = [
       "ledger (POST /api/v1/chg_ledger/:source_id) and change-event endpoints in EVERY mode. " +
       "A `pr` source that holds them stays `pr`: its merge precondition still reads the PR, " +
       "and its change events are recorded without binding or moving any story. `ledger` " +
-      "enrols a repository that has NO work project for the ledger alone: `project_id` must " +
-      "then be an active KB scope (create_kb_scope), both credentials are required as for " +
-      "`chg`, the source is never a dispatch binding (place_dispatch and candidate selection " +
-      "skip it), and GitHub deliveries to it are refused. `ledger` on a work project, or " +
-      "`pr`/`chg` on a kb scope, is 422 at the server.",
+      "enrols a repository for the ledger alone: `project_id` is its active KB scope " +
+      "(create_kb_scope), or its active work project when that project has no intake route " +
+      "(reportex, cron_books). Both credentials are required as for `chg`, the source is " +
+      "never a dispatch binding (place_dispatch and candidate selection skip it), so the " +
+      "project's stories stay unbound, and GitHub deliveries to it are refused. `pr`/`chg` " +
+      "on a kb scope is 422 at the server.",
     inputSchema: {
       type: "object",
       properties: {
@@ -9425,8 +9426,8 @@ const TOOLS = [
           type: "string",
           description:
             "The ACTIVE WORK project (UUID) whose queue this repository's issues feed — or, " +
-            "with `mode: ledger`, the active KB scope the ledger-only source belongs to. The " +
-            "wrong kind for the mode, or an archived project, is a 422.",
+            "with `mode: ledger`, the active KB scope or work project the ledger-only source " +
+            "belongs to. A kb scope for `pr`/`chg`, or an archived project, is a 422.",
         },
         target_epic_id: {
           type: "string",
@@ -9456,8 +9457,8 @@ const TOOLS = [
             "Optional. How this repository's changes reach its base branch: `pr` (the " +
             "default; the merge gate reads a pull request by number) or `chg` (the change " +
             "protocol lands them and the PR route is closed, 409 `change_protocol_enrolled`; " +
-            "needs the two fields below). `ledger` routes nothing: a KB scope's ledger-only " +
-            "source, which also needs the two fields below. Not nullable.",
+            "needs the two fields below). `ledger` routes nothing: a ledger-only source on a KB " +
+            "scope or a work project, which also needs the two fields below. Not nullable.",
         },
         change_events_secret: {
           type: "string",
@@ -9567,13 +9568,14 @@ const TOOLS = [
       "SET WHERE A SOURCE'S WORK LANDS (PATCH /api/v1/intake/sources/:id): `target_epic_id`, " +
       "the epic triaged stories are created in, `base_branch`, the branch every dispatch " +
       "for this repository is cut FROM and carries, `mode`, the merge route (`pr` or `chg`, " +
-      "or `ledger` on a KB scope), and the `change_events_secret` and `chg_root_dispatch_id` " +
+      "or `ledger` on a KB scope or a work project), and the `change_events_secret` and " +
+      "`chg_root_dispatch_id` " +
       "that authenticate a source's chg ledger and change events.\n\n" +
       "LEDGER FROM A `pr` SOURCE (loopctl #1047): naming both credentials on a `pr` source " +
       "lets chg send its ledger and change events for that repository while the source STAYS " +
       "`pr` — the merge precondition still reads the PR, and the events move no story. Do not " +
-      "switch to `chg` for that. A mode change between a work project's modes (`pr`, `chg`) " +
-      "and `ledger` is 422: a source never moves between a work project and a KB scope.\n\n" +
+      "switch to `chg` for that. A mode change into or out of `ledger` is 422: a ledger " +
+      "source is a credential, `pr`/`chg` its project's merge route; revoke and enrol anew.\n\n" +
       "PRESENCE DECIDES, AND A FIELD YOU DO NOT NAME IS LEFT EXACTLY AS IT WAS. Naming " +
       "none of them is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
       "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
@@ -9645,8 +9647,8 @@ const TOOLS = [
           enum: ["pr", "chg", "ledger"],
           description:
             "`pr` (the merge gate reads a pull request) or `chg` (the change protocol lands " +
-            "changes; the PR route is closed) on a work project; `ledger` on a KB scope. A " +
-            "switch across project kinds is 422. Not nullable. Omit to leave the current " +
+            "changes; the PR route is closed) on a work project; `ledger` on either kind. A " +
+            "switch into or out of `ledger` is 422. Not nullable. Omit to leave the current " +
             "value alone.",
         },
         change_events_secret: {

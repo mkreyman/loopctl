@@ -229,8 +229,8 @@ defmodule Loopctl.Intake do
   defaulting to `"pr"`; a `"chg"` or `"ledger"` source also needs `:change_events_secret` and
   `:chg_root_dispatch_id`, see `Loopctl.Intake.Source` and `chg_root_invalid` below; a `pr`
   source MAY carry both, and then sends its chg ledger and events too). A `"ledger"` source
-  binds an ACTIVE `:kb` SCOPE instead of a work project (issue #1047): a repository with no
-  work project gets a ledger credential and nothing else,
+  binds an ACTIVE `:kb` SCOPE or an ACTIVE work project (issue #1047): a repository whose
+  changes should not route through loopctl gets a ledger credential and nothing else,
   `:target_epic_id` (optional, and `nil` means "not answered") and
   `:base_branch` (optional, and read by PRESENCE: omit it for the `master` default, or name
   the branch this repository's dispatches are cut from — `main` for a repository created on
@@ -314,15 +314,16 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # The project a source binds must be of the kind its mode requires (`Source.project_kind/1`):
-  # a `:work` project for `pr` and `chg`, a `:kb` scope for `ledger` (issue #1047). The kb
-  # half is what lets a repository with no work project hold a ledger credential WITHOUT a
-  # work project — and the work half is what keeps a `:kb` scope from ever becoming a dispatch
-  # binding or a merge route through a `pr`/`chg` source.
+  # The project a source binds must be of a kind its mode allows (`Source.project_kinds/1`):
+  # only a `:work` project for `pr` and `chg`, either kind for `ledger` (issue #1047). The work
+  # half is what keeps a `:kb` scope from ever becoming a dispatch binding or a merge route
+  # through a `pr`/`chg` source. `ledger` takes both because it binds nothing: a repository
+  # with only a kb scope, and one whose work project has no intake route, each get a ledger
+  # credential and nothing else.
   defp put_project(changeset, tenant_id, project_id) do
-    kind = Source.project_kind(Ecto.Changeset.get_field(changeset, :mode))
+    kinds = Source.project_kinds(Ecto.Changeset.get_field(changeset, :mode))
 
-    case active_project(tenant_id, project_id, kind) do
+    case active_project(tenant_id, project_id, kinds) do
       {:ok, project} ->
         Ecto.Changeset.put_change(changeset, :project_id, project.id)
 
@@ -385,24 +386,24 @@ defmodule Loopctl.Intake do
 
   defp epic_in_project(_tenant_id, _project_id, _epic_id), do: :project_invalid
 
-  defp active_project(tenant_id, project_id, kind) when is_binary(project_id) do
+  defp active_project(tenant_id, project_id, kinds) when is_binary(project_id) do
     with {:ok, id} <- Ecto.UUID.cast(project_id),
          %Project{} = project <- AdminRepo.get_by(Project, id: id, tenant_id: tenant_id) do
-      if project.kind == kind and project.status == :active,
+      if project.kind in kinds and project.status == :active,
         do: {:ok, project},
-        else: {:error, project_kind_message(kind)}
+        else: {:error, project_kind_message(kinds)}
     else
       _ -> {:error, "project not found"}
     end
   end
 
-  defp active_project(_tenant_id, _project_id, _kind), do: {:error, "can't be blank"}
+  defp active_project(_tenant_id, _project_id, _kinds), do: {:error, "can't be blank"}
 
-  defp project_kind_message(:work),
+  defp project_kind_message([:work]),
     do: "must be an active work project"
 
-  defp project_kind_message(:kb),
-    do: "must be an active kb scope: mode ledger is a kb scope's ledger-only credential"
+  defp project_kind_message(_ledger_kinds),
+    do: "must be an active kb scope or work project"
 
   defp valid(%Ecto.Changeset{valid?: true} = changeset), do: {:ok, changeset}
   defp valid(changeset), do: {:error, changeset}
@@ -631,7 +632,7 @@ defmodule Loopctl.Intake do
             changeset,
             Map.take(attrs, [:mode, :change_events_secret, :chg_root_dispatch_id])
           )
-          |> check_mode_kind(tenant_id),
+          |> check_mode_switch(),
         else: changeset
 
     changeset =
@@ -646,34 +647,30 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # A mode switch never changes the kind of project a source sits on (issue #1047): `ledger`
-  # stays on its `:kb` scope and `pr`/`chg` on their work project. Without this a kb scope's
-  # ledger credential could be switched to `pr` and become the dispatch binding and merge
-  # route the kb scope is barred from, and a work project's source could be switched to
-  # `ledger` and silently stop binding its project's stories.
-  defp check_mode_kind(%Ecto.Changeset{valid?: true} = changeset, tenant_id) do
-    if Ecto.Changeset.changed?(changeset, :mode) do
-      wanted = Source.project_kind(Ecto.Changeset.get_field(changeset, :mode))
-      project_id = Ecto.Changeset.get_field(changeset, :project_id)
+  # No mode switch crosses the ledger boundary (issue #1047). A `ledger` source is a credential
+  # and nothing else; a `pr` or `chg` source is its project's dispatch binding and merge route.
+  # Switching a ledger source to `pr` would make a binding nobody enrolled (on a kb scope, the
+  # binding a kb scope is barred from), and switching a `pr`/`chg` source to `ledger` would
+  # silently stop binding its project's stories. With the crossing refused the project kind
+  # needs no re-check: a `pr`/`chg` source was enrolled on a work project and stays on it.
+  defp check_mode_switch(%Ecto.Changeset{valid?: true, data: %Source{mode: from}} = changeset) do
+    to = Ecto.Changeset.get_field(changeset, :mode)
 
-      case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
-        %Project{kind: ^wanted} ->
-          changeset
-
-        _other ->
-          Ecto.Changeset.add_error(
-            changeset,
-            :mode,
-            "cannot move a source between a work project and a kb scope: " <>
-              "ledger is a kb scope's mode, pr and chg a work project's"
-          )
-      end
+    if Ecto.Changeset.changed?(changeset, :mode) and ledger?(from) != ledger?(to) do
+      Ecto.Changeset.add_error(
+        changeset,
+        :mode,
+        "cannot switch a source into or out of ledger: a ledger source is a credential, " <>
+          "pr and chg are its project's merge route; revoke it and enrol a new one"
+      )
     else
       changeset
     end
   end
 
-  defp check_mode_kind(changeset, _tenant_id), do: changeset
+  defp check_mode_switch(changeset), do: changeset
+
+  defp ledger?(mode), do: mode == :ledger
 
   defp cast_required_checks(changeset, attrs) do
     changeset
@@ -1110,9 +1107,9 @@ defmodule Loopctl.Intake do
   by the triage gate screen (on `Loopctl.Repo`, alongside every other read that module makes),
   so the two gates cannot resolve a story to two different repositories (US-44.2).
 
-  A `ledger` source is never chosen and never counted (issue #1047): it is a `:kb` scope's
-  ledger-only credential, so it is no project's repository for a dispatch, and it does not
-  make a project's one real source `ambiguous` either.
+  A `ledger` source is never chosen and never counted (issue #1047): it is a ledger-only
+  credential, on a kb scope or a work project, so it is no project's repository for a
+  dispatch, and it does not make a project's one real source `ambiguous` either.
   """
   @spec select_project_source([Source.t()], Ecto.UUID.t()) ::
           {:ok, Source.t()}
@@ -1504,9 +1501,9 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # A `ledger` source is refused like an unknown one (issue #1047): it is a `:kb` scope's
-  # ledger credential, and a GitHub delivery to it would put outside text into the intake
-  # queue of a scope that may never carry work.
+  # A `ledger` source is refused like an unknown one (issue #1047): it is a ledger credential
+  # only, and a GitHub delivery to it would put outside text into an intake queue its project
+  # never asked for (a kb scope never carries work at all).
   defp authenticate(source_id, raw_body, signature) do
     case active_source(source_id) do
       %Source{mode: mode, webhook_secret: secret} = source

@@ -1017,17 +1017,39 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
                Intake.source_for_project(ctx.tenant.id, kb.id)
     end
 
-    test "a ledger enrolment naming a work project is 422", %{conn: conn} do
+    test "a ledger enrolment on a work project with no intake route binds nothing", %{
+      conn: conn
+    } do
       ctx = operator_ctx()
       root_id = mint_root(build_conn(), ctx)
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", ledger_params(ctx.project, root_id))
+        |> json_response(201)
+
+      assert body["source"]["mode"] == "ledger"
+      assert body["source"]["project_id"] == ctx.project.id
+
+      project_id = ctx.project.id
+
+      assert {:error, {:no_intake_source, ^project_id}} =
+               Intake.source_for_project(ctx.tenant.id, ctx.project.id)
+    end
+
+    test "a ledger enrolment on a kb scope of another tenant is 422", %{conn: conn} do
+      ctx = operator_ctx()
+      root_id = mint_root(build_conn(), ctx)
+      other_kb = fixture(:project, %{kind: :kb})
 
       refused =
         conn
         |> auth(ctx.operator_key)
-        |> post(~p"/api/v1/intake/sources", ledger_params(ctx.project, root_id))
+        |> post(~p"/api/v1/intake/sources", ledger_params(other_kb, root_id))
         |> json_response(422)
 
-      assert inspect(refused) =~ "must be an active kb scope"
+      assert inspect(refused) =~ "project not found"
     end
 
     test "an agent-rooted tenant cannot enrol one: the human anchor gate is unchanged", %{

@@ -1,7 +1,7 @@
 defmodule Loopctl.Changes.LedgerSourcesTest do
   @moduledoc """
   Issue #1047: sending is not routing. A `pr` source holding the chg credentials, and a
-  `ledger` source on a `:kb` scope, authenticate on the chg ledger and change-event endpoints;
+  `ledger` source on a kb scope or a work project, authenticate on the chg ledger and change-event endpoints;
   only a `chg` source's events move anything. The merge precondition's half (a `pr` source's
   story still answers from the pull request) is in
   `Loopctl.Delivery.MergePreconditionIntegrationTest`, and the review-dispatch half in
@@ -269,15 +269,27 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
           repo_full_name: "mkreyman/home_care_billing"
         })
 
-      # Enrolment cannot put a ledger source on a work project, so the rule is pinned on the
-      # list itself: a ledger row naming the same project is neither chosen nor counted.
-      stray = %{ctx.source | project_id: work.id}
+      # A ledger source ENROLLED on the same work project (another repository of it) is
+      # neither chosen nor counted.
+      {:ok, %{source: ledger}} =
+        Intake.create_source(
+          ctx.source.tenant_id,
+          Map.merge(
+            %{repo_full_name: "mkreyman/reportex", project_id: work.id, mode: "ledger"},
+            chg_credentials(ctx.source.tenant_id)
+          )
+        )
+
+      pr_id = pr_source.id
       work_id = work.id
 
-      assert {:ok, ^pr_source} = Intake.select_project_source([stray, pr_source], work.id)
+      assert {:ok, %Source{id: ^pr_id}} = Intake.source_for_project(ctx.source.tenant_id, work.id)
+
+      assert {:ok, %Source{id: ^pr_id}} =
+               Intake.select_project_source([ledger, pr_source], work.id)
 
       assert {:error, {:no_intake_source, ^work_id}} =
-               Intake.select_project_source([stray], work.id)
+               Intake.select_project_source([ledger], work.id)
     end
 
     test "refuses every GitHub delivery", ctx do
@@ -302,7 +314,7 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
                  Intake.update_source(ctx.source.tenant_id, ctx.source.id, %{mode: mode})
 
         assert %{mode: [message]} = errors_on(changeset)
-        assert message =~ "cannot move a source between a work project and a kb scope"
+        assert message =~ "cannot switch a source into or out of ledger"
       end
 
       assert AdminRepo.get!(Source, ctx.source.id).mode == :ledger
@@ -330,13 +342,93 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
     end
   end
 
+  describe "a ledger source on a work project (reportex, cron_books)" do
+    setup do
+      tenant = fixture(:tenant)
+      work = fixture(:project, %{tenant_id: tenant.id})
+      creds = chg_credentials(tenant.id)
+
+      {:ok, %{source: source}} =
+        Intake.create_source(
+          tenant.id,
+          Map.merge(
+            %{repo_full_name: "mkreyman/reportex", project_id: work.id, mode: "ledger"},
+            creds
+          )
+        )
+
+      %{tenant: tenant, work: work, source: source, secret: creds.change_events_secret}
+    end
+
+    test "enrols, and sends its ledger", ctx do
+      assert ctx.source.mode == :ledger
+      assert ctx.source.project_id == ctx.work.id
+
+      assert {:ok, %{inserted: 1}} =
+               Ledger.receive_batch(ctx.source.id, signed(ctx.secret, batch("mkreyman/reportex")))
+    end
+
+    test "binds none of the project's stories", ctx do
+      work_id = ctx.work.id
+
+      assert {:error, {:no_intake_source, ^work_id}} =
+               Intake.source_for_project(ctx.tenant.id, ctx.work.id)
+
+      refute ctx.source.id in AdminRepo.all(
+               from(s in Intake.binding_sources_query(ctx.tenant.id), select: s.id)
+             )
+    end
+
+    test "cannot be switched to pr or chg", ctx do
+      for mode <- ["pr", "chg"] do
+        assert {:error, %Ecto.Changeset{} = changeset} =
+                 Intake.update_source(ctx.tenant.id, ctx.source.id, %{mode: mode})
+
+        assert %{mode: [message]} = errors_on(changeset)
+        assert message =~ "cannot switch a source into or out of ledger"
+      end
+
+      assert AdminRepo.get!(Source, ctx.source.id).mode == :ledger
+    end
+
+    test "a pr or chg source on a work project cannot be switched to ledger", ctx do
+      for mode <- [:pr, :chg] do
+        {_ws, source} =
+          fixture(:intake_source, %{
+            tenant_id: ctx.tenant.id,
+            project_id: ctx.work.id,
+            repo_full_name: "mkreyman/#{mode}-repo"
+          })
+
+        {:ok, source} =
+          Intake.update_source(
+            ctx.tenant.id,
+            source.id,
+            Map.merge(%{mode: Atom.to_string(mode)}, chg_credentials(ctx.tenant.id))
+          )
+
+        assert source.mode == mode
+
+        assert {:error, %Ecto.Changeset{} = changeset} =
+                 Intake.update_source(ctx.tenant.id, source.id, %{mode: "ledger"})
+
+        assert %{mode: [message]} = errors_on(changeset)
+        assert message =~ "cannot switch a source into or out of ledger"
+        assert AdminRepo.get!(Source, source.id).mode == mode
+      end
+    end
+  end
+
   describe "ledger enrolment refusals" do
     setup do
       %{tenant: fixture(:tenant)}
     end
 
-    test "a ledger source on a work project is refused", %{tenant: tenant} do
-      work = fixture(:project, %{tenant_id: tenant.id})
+    test "a ledger source on an archived work project is refused", %{tenant: tenant} do
+      work =
+        fixture(:project, %{tenant_id: tenant.id})
+        |> Ecto.Changeset.change(status: :archived)
+        |> AdminRepo.update!()
 
       assert {:error, %Ecto.Changeset{} = changeset} =
                Intake.create_source(
@@ -347,8 +439,7 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
                  )
                )
 
-      assert %{project_id: [message]} = errors_on(changeset)
-      assert message =~ "must be an active kb scope"
+      assert %{project_id: ["must be an active kb scope or work project"]} = errors_on(changeset)
     end
 
     test "a pr or chg source on a kb scope is refused", %{tenant: tenant} do

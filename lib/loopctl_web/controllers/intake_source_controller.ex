@@ -19,14 +19,16 @@ defmodule LoopctlWeb.IntakeSourceController do
   stint — registering them again without naming them. `mode: ledger` is held to it for the
   same reason.
 
-  ## A ledger credential for a kb scope (issue #1047)
+  ## A ledger credential (issue #1047)
 
-  `mode: ledger` enrols a repository that has only a `:kb` scope: `project_id` names the kb
-  scope, and the source holds the chg credentials and nothing else — no dispatch binding, no
-  merge route, no GitHub delivery. It goes through the SAME gates as any enrolment (user role,
-  human-anchored tenant, unlineaged caller, and a root only the operator key can mint), so it
-  opens no surface a kb scope did not already have: the kb carve-out (`create_kb_scope`) is
-  untouched, and a kb scope still cannot carry work.
+  `mode: ledger` enrols a repository whose changes should not route through loopctl:
+  `project_id` names its kb scope, or its work project when that project has no intake route
+  (reportex, cron_books), and the source holds the chg credentials and nothing else — no
+  dispatch binding, no merge route, no GitHub delivery. It goes through the SAME gates as any
+  enrolment (user role, human-anchored tenant, unlineaged caller, and a root only the operator
+  key can mint), so it opens no surface the project did not already have: the kb carve-out
+  (`create_kb_scope`) is untouched, a kb scope still cannot carry work, and a work project's
+  stories stay unbound, as they were with no source at all.
   """
 
   use LoopctlWeb, :controller
@@ -96,11 +98,11 @@ defmodule LoopctlWeb.IntakeSourceController do
               "write that leaves the " <>
               "source `chg` re-checks the root. A switch to `chg` is 409 " <>
               "`pr_route_in_flight` while a story of the project holds a merge allow it has " <>
-              "not merged on. `ledger` (issue #1047): a kb scope's ledger-only credential — " <>
-              "`project_id` names an active KB SCOPE, both credentials are required as for " <>
-              "`chg`, and the source is never a dispatch binding, never a merge route, and " <>
-              "refuses every GitHub delivery. `pr` and `chg` need a work project and `ledger` a " <>
-              "kb scope, so a switch between `ledger` and the other two is a 422. Sending is " <>
+              "not merged on. `ledger` (issue #1047): a ledger-only credential — " <>
+              "`project_id` names an active kb scope or work project, both credentials are " <>
+              "required as for `chg`, and the source is never a dispatch binding, never a " <>
+              "merge route, and refuses every GitHub delivery. `pr` and `chg` need a work " <>
+              "project, and a switch into or out of `ledger` is a 422. Sending is " <>
               "not routing: a source in ANY mode that holds both credentials authenticates on " <>
               "the chg ledger and change-event endpoints, and only a `chg` source's events " <>
               "move a stage or bind a change; a `pr` or `ledger` source's are recorded with " <>
@@ -238,8 +240,8 @@ defmodule LoopctlWeb.IntakeSourceController do
         "orchestrator-role dispatch of this tenant with more than " <>
         "#{Source.chg_root_naming_margin_seconds()} s left is 422 `chg_root_invalid`. " <>
         "Enrolling in " <>
-        "mode `ledger` (issue #1047) takes an ACTIVE KB SCOPE as `project_id` (422 otherwise; " <>
-        "`pr` and `chg` take a work project) and both chg credentials: the source sends the " <>
+        "mode `ledger` (issue #1047) takes an active kb scope or work project as `project_id` " <>
+        "(`pr` and `chg` take only a work project) and both chg credentials: the source sends the " <>
         "repository's chg ledger and change events and is never a dispatch binding or a merge " <>
         "route, and its webhook refuses every GitHub delivery, so do not configure one.",
     request_body:
