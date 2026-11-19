@@ -33,4 +33,24 @@ defmodule Loopctl.Changes.LedgerRow do
 
     timestamps(updated_at: false)
   end
+
+  @doc """
+  The failing `gate` rows that are a gate's verdict on the TESTS: the rows a selection miss
+  pairs with a passing selecting `chg` row (`Loopctl.Changes.Findings`, and
+  `Loopctl.Changes.Dashboard`'s miss list).
+
+  A row with `source: "hook"` is left out. It is the pre-push hook's final decision on a push
+  (`chg shadow record --source hook`), and it fails a push chg passed for reasons outside the
+  selection: a walk lane, a moved tree. chg's own report never pairs it (`cli/src/shadow.rs`
+  `report/2`), #1061. A NULL source is an older local row and stays in.
+  """
+  @spec failing_test_gates(Ecto.UUID.t()) :: Ecto.Query.t()
+  def failing_test_gates(tenant_id) do
+    import Ecto.Query
+
+    from g in __MODULE__,
+      where:
+        g.tenant_id == ^tenant_id and g.kind == "gate" and g.verdict == "fail" and
+          fragment("coalesce(?->>'source', '') <> 'hook'", g.raw)
+  end
 end

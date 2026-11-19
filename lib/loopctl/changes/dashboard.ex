@@ -311,13 +311,12 @@ defmodule Loopctl.Changes.Dashboard do
 
     # A miss is judged on rows that SELECTED: a `mode = all` row ran the whole suite, so its pass
     # against a failing gate is a flaky or environmental difference, not a selection that left
-    # a test out.
+    # a test out. A hook-sourced gate row judges the push, not the tests, so it never makes a
+    # miss (#1061, `LedgerRow.failing_test_gates/1`).
     misses =
       from r in selecting,
-        join: g in LedgerRow,
-        on:
-          g.tenant_id == ^tenant_id and g.repo == r.repo and g.sha == r.sha and g.kind == "gate" and
-            g.verdict == "fail",
+        join: g in subquery(LedgerRow.failing_test_gates(tenant_id)),
+        on: g.tenant_id == ^tenant_id and g.repo == r.repo and g.sha == r.sha,
         where: r.verdict == "pass",
         distinct: [desc: r.at, asc: r.id],
         order_by: [desc: r.at, asc: r.id],

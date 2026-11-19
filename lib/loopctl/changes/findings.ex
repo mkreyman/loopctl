@@ -317,12 +317,11 @@ defmodule Loopctl.Changes.Findings do
     |> Map.new()
   end
 
+  # Paired only with a gate's verdict on the tests, never the pre-push hook's (#1061).
   defp selection_misses(tenant_id, since, chg_repo) do
     from(r in LedgerRow,
-      join: g in LedgerRow,
-      on:
-        g.tenant_id == r.tenant_id and g.repo == r.repo and g.sha == r.sha and g.kind == "gate" and
-          g.verdict == "fail",
+      join: g in subquery(LedgerRow.failing_test_gates(tenant_id)),
+      on: g.tenant_id == r.tenant_id and g.repo == r.repo and g.sha == r.sha,
       where:
         r.tenant_id == ^tenant_id and r.kind == "chg" and r.verdict == "pass" and
           r.at >= ^since and

@@ -224,6 +224,32 @@ defmodule Loopctl.Changes.FindingsTest do
       assert Findings.derive(ctx.tenant_id, @now, opts()) == []
     end
 
+    # #1061: the pre-push hook's decision ("walk lane failed") judges the push, not the tests,
+    # so a failing hook row never pairs; a local or ci gate row, or one with no source, does.
+    test "a failing hook-sourced gate row is not a miss; other gate sources are", ctx do
+      hook = String.duplicate("d", 40)
+      ledger!(ctx.hcb, "chg", %{sha: hook, verdict: "pass", raw: %{"mode" => "subset"}})
+
+      ledger!(ctx.hcb, "gate", %{
+        sha: hook,
+        verdict: "fail",
+        raw: %{"source" => "hook", "reason" => "walk lane failed"}
+      })
+
+      assert Findings.derive(ctx.tenant_id, @now, opts()) == []
+
+      for {source, n} <- [{"local", "1"}, {"ci", "2"}, {nil, "3"}] do
+        sha = String.duplicate(n, 40)
+        ledger!(ctx.hcb, "chg", %{sha: sha, verdict: "pass", raw: %{"mode" => "subset"}})
+
+        raw = if source, do: %{"source" => source}, else: %{}
+        ledger!(ctx.hcb, "gate", %{sha: sha, verdict: "fail", raw: raw})
+      end
+
+      shas = ctx.tenant_id |> Findings.derive(@now, opts()) |> Enum.map(& &1.sha) |> Enum.sort()
+      assert shas == Enum.map(~w(1 2 3), &String.duplicate(&1, 40))
+    end
+
     test "an unquarantined flaky test is a finding on its source's repository", ctx do
       flaky!(ctx.hcb, "test/a_test.exs:12")
       flaky!(ctx.hcb, "test/b_test.exs:3", %{raw: %{"quarantine" => "#99"}})
