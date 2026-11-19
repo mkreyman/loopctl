@@ -15,6 +15,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   use Loopctl.DataCase, async: true
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Changes.Events
+  alias Loopctl.Changes.Ledger
+  alias Loopctl.Changes.ReviewCustody
+  alias Loopctl.Changes.Signature
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.GateAInput
@@ -560,6 +564,70 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end
   end
 
+  # Issue #1047: sending is not routing. The pr source gains the chg credentials and sends its
+  # ledger and its change events, and the merge precondition still answers from the pull
+  # request — including after events that, on a `chg` source, would bind the story and land it.
+  describe "a pr source holding the chg credentials (issue #1047)" do
+    setup ctx do
+      root = fixture(:chg_root_dispatch, %{tenant_id: ctx.tenant_id})
+      secret = String.duplicate("c", 32)
+      [source] = Loopctl.Intake.list_sources(ctx.tenant_id)
+
+      {:ok, %{mode: :pr}} =
+        Loopctl.Intake.update_source(ctx.tenant_id, source.id, %{
+          change_events_secret: secret,
+          chg_root_dispatch_id: root.id
+        })
+
+      %{source: source, secret: secret}
+    end
+
+    test "accepts a signed ledger batch and the precondition still reads the PR", ctx do
+      raw =
+        Jason.encode!(%{
+          rows: [%{"v" => 1, "kind" => "runner", "repo" => @repo, "host" => "x1", "at_ms" => 5}]
+        })
+
+      assert {:ok, %{inserted: 1}} =
+               Ledger.receive_batch(ctx.source.id, signed(ctx.secret, raw))
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+      assert {:ok, %Verdict{decision: :allow, pr_number: 4242}} = evaluate(ctx)
+    end
+
+    test "its submitted and landed events neither bind the story nor move its stage", ctx do
+      for {kind, seq, data} <- [
+            {"submitted", 1, %{"story_id" => ctx.story_id}},
+            {"review_approved", 2, %{"by" => "model"}},
+            {"check_passed", 3, %{}},
+            {"landed", 4, %{"merge_sha" => String.duplicate("d", 40)}}
+          ] do
+        raw =
+          Jason.encode!(
+            build(:chg_event, %{
+              repo: @repo,
+              change_id: "C1",
+              event_seq: seq,
+              kind: kind,
+              sha: @head,
+              data: data
+            })
+          )
+
+        assert {:ok, %{outcome: :applied}} =
+                 Events.receive_push(ctx.source.id, signed(ctx.secret, raw))
+      end
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert ReviewCustody.chg_story(ctx.tenant_id, ctx.story_id) == :not_chg
+      assert Loopctl.Intake.pr_route?(AdminRepo, ctx.tenant_id, ctx.story_id)
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+    end
+  end
+
   describe "an allow recorded on the PR route survives no switch to chg (US-47.2 finding 1)" do
     test "a switch to chg is refused while a story holds an unmerged allow", ctx do
       stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
@@ -660,6 +728,15 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         change_events_secret: String.duplicate("c", 32),
         chg_root_dispatch_id: root.id
       })
+  end
+
+  defp signed(secret, raw) do
+    ts = Integer.to_string(System.os_time(:second))
+
+    sig =
+      Signature.header(secret, Signature.delivery_string(ts, raw))
+
+    %{raw_body: raw, timestamp: ts, signature: sig}
   end
 
   defp evaluate(ctx), do: MergePrecondition.evaluate(ctx.tenant_id, ctx.story_id, opts())

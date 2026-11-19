@@ -11,7 +11,9 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
     `Loopctl.Changes.ReviewFindings`. `record/3` stores the result; a re-run replaces the row.
   - Rounds are chg ledger rows (US-50.1) of kind `review_round` for the same repository whose
     `raw` carries `"pr"`, the PR number (posted as an overrulable default on the chg channel).
-    A merged PR with no such row is `merged_without_counted_round`.
+    A round is not counted when a `review_round_void` row of the same repository carries its
+    `round_id` (review-round-counter voided that launch; chg sends both kinds, either order).
+    A merged PR with no counted round is `merged_without_counted_round`.
 
   The body is UNTRUSTED forge text. The parser never fails on it, and nothing reads a stored
   finding as an instruction.
@@ -29,6 +31,7 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
   alias Loopctl.Repo
 
   @round_kind "review_round"
+  @void_kind "review_round_void"
 
   @type outcome :: %{
           repo: String.t(),
@@ -137,10 +140,12 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
 
     counted =
       from r in LedgerRow,
+        as: :round,
         where:
           r.tenant_id == ^tenant_id and r.kind == @round_kind and
             r.repo == parent_as(:outcome).repo and
-            fragment("(?->>'pr')", r.raw) == fragment("(?)::text", parent_as(:outcome).pr_number),
+            fragment("(?->>'pr')", r.raw) == fragment("(?)::text", parent_as(:outcome).pr_number) and
+            not exists(subquery(voided(tenant_id))),
         select: 1
 
     merged =
@@ -194,7 +199,25 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
     HeavyRead.all(tenant_id, query, Keyword.put(HeavyRead.opts(:enumeration), :on_overload, :tag))
   end
 
-  # One grouped read of every listed PR's review_round rows, keyed {repo, pr_number}. A `pr`
+  # The `review_round_void` rows that cancel the enclosing query's `:round` row: same tenant,
+  # same repository, same `round_id`. Order of arrival does not matter, since a void that
+  # landed before its round still matches it. A round whose `round_id` is missing OR empty is
+  # never cancelled: `nullif` turns "" into NULL, and NULL never equals NULL, so one void
+  # carrying "" cannot cancel every round that also carries "". The expression matches the
+  # partial index `chg_ledger_rows_void_round_id_idx`, so each probe is one index lookup.
+  # The tenant is pinned here because `HeavyRead`'s guard walks only `from` and joins, never
+  # a WHERE subquery.
+  defp voided(tenant_id) do
+    from v in LedgerRow,
+      where:
+        v.tenant_id == ^tenant_id and v.kind == @void_kind and
+          v.repo == parent_as(:round).repo and
+          fragment("nullif(?->>'round_id', '')", v.raw) ==
+            fragment("nullif(?->>'round_id', '')", parent_as(:round).raw),
+      select: 1
+  end
+
+  # One grouped read of every listed PR's counted review_round rows, keyed {repo, pr_number}. A `pr`
   # that is not a canonical decimal is not counted: the cast is guarded so a malformed row from
   # a fleet machine can never fail the read.
   defp rounds(_tenant_id, []), do: %{}
@@ -204,9 +227,11 @@ defmodule Loopctl.Changes.PrReviewOutcomes do
     numbers = outcomes |> Enum.map(&Integer.to_string(&1.pr_number)) |> Enum.uniq()
 
     from(r in LedgerRow,
+      as: :round,
       where:
         r.tenant_id == ^tenant_id and r.kind == @round_kind and r.repo in ^repos and
-          fragment("(?->>'pr')", r.raw) in ^numbers,
+          fragment("(?->>'pr')", r.raw) in ^numbers and
+          not exists(subquery(voided(tenant_id))),
       group_by: [r.repo, fragment("(?->>'pr')", r.raw)],
       select: {r.repo, fragment("(?->>'pr')", r.raw), count(r.id)}
     )

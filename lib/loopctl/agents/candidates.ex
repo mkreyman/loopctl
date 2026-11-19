@@ -363,9 +363,10 @@ defmodule Loopctl.Agents.Candidates do
   # `bool_or/1` over a group of exactly one row is that row's flag: the aggregate is only how a
   # grouped query is allowed to name it.
   defp apply_predicate(:single_active_source, query, _kind) do
+    # A `ledger` source binds nothing (issue #1047; `Loopctl.Intake.binding_sources_query/1`).
     bound_projects =
       from src in Source,
-        where: is_nil(src.revoked_at),
+        where: is_nil(src.revoked_at) and src.mode != ^:ledger,
         group_by: [src.tenant_id, src.project_id],
         having: count(src.id) == 1,
         select: %{

@@ -228,6 +228,30 @@ defmodule Loopctl.Changes.TrunkEvidenceTest do
       unverified!(story)
     end
 
+    # Issue #1047: a revert counts whether or not it was routed — it is evidence AGAINST
+    # verification. A push can no longer produce an unrouted event for a change the chg route
+    # acted on (`Events` refuses it), so the row is seeded: the reader must not depend on that.
+    test "an unrouted revert still refuses", ctx do
+      story = landed_and_reviewed(ctx, ctx.story, "C1", sha("a"), sha("c"))
+
+      fixture(:change_event, %{
+        tenant_id: ctx.tenant_id,
+        source_id: ctx.source.id,
+        repo: Events.repo_key(ctx.source.repo_full_name),
+        change_id: "C1",
+        event_seq: 3,
+        kind: "reverted",
+        sha: sha("a"),
+        data: %{"landed_sha" => sha("c")},
+        routed: false
+      })
+
+      no_forge_call()
+
+      assert {:error, :chg_landing_reverted} = verify(ctx, story)
+      unverified!(story)
+    end
+
     test "a re-landing after the revert is a NEW landing, judged afresh", ctx do
       story = landed_and_reviewed(ctx, ctx.story, "C1", sha("a"), sha("c"))
 

@@ -40,7 +40,9 @@ defmodule Loopctl.Changes.ReviewDispatches do
 
   ## Refusals
 
-  Every authentication refusal is the change-events 401 (`Loopctl.Changes.Events.signed/4`). A
+  Every authentication refusal is the change-events 401 (`Loopctl.Changes.Events.signed/4`),
+  and so is a source that is not `chg`: a `pr` or `ledger` source holding the chg credentials
+  sends its ledger and events but mints no reviewer (issue #1047). A
   revision with no applied `submitted` event from this source is `422 revision_not_submitted`.
   A body other than `{change_id, revision}` is `400 invalid_request`. A tenant under a custody
   halt mints nothing: `503 tenant_halted`, as every other dispatch mint answers during a halt.
@@ -88,6 +90,8 @@ defmodule Loopctl.Changes.ReviewDispatches do
   def request(source_id, %{raw_body: raw_body} = input, opts \\ []) when is_binary(raw_body) do
     source_id
     |> Events.signed(input, opts, fn held ->
+      chg_only!(held)
+
       case decode(raw_body) do
         {:ok, change_id, revision} -> mint(held, change_id, revision)
         :error -> Repo.rollback({:bad_request, "invalid_request"})
@@ -106,6 +110,16 @@ defmodule Loopctl.Changes.ReviewDispatches do
         error
     end
   end
+
+  # A reviewer key is minted only for a `chg` source (issue #1047). `Events.signed/4` now
+  # authenticates a `pr` or `ledger` source that holds the chg credentials, so it can send its
+  # ledger and events; minting a key under its root is a different act. On a `pr` source the
+  # pull request route and its verify@1 verifier judge the work, and a `ledger` source has no
+  # work at all, so neither has a chg review for a minted key to record. Refused like any other
+  # authentication failure: the same 401, judged on the HELD row, so a switch away from `chg`
+  # that commits first refuses the mint.
+  defp chg_only!(%Source{mode: :chg}), do: :ok
+  defp chg_only!(%Source{}), do: Repo.rollback({:refused, :not_chg_source})
 
   # Outside every transaction now, so the revoke's own audit append takes the chain lock freely.
   defp revoke_unrecorded(tenant_id, dispatch_id, reason) do
@@ -244,7 +258,7 @@ defmodule Loopctl.Changes.ReviewDispatches do
            where:
              e.tenant_id == ^source.tenant_id and e.source_id == ^source.id and e.repo == ^repo and
                e.change_id == ^change_id and e.kind == "submitted" and e.revision == ^revision and
-               not is_nil(e.applied_at)
+               not is_nil(e.applied_at) and e.routed
        ),
        do: :ok,
        else: not_submitted()

@@ -19,8 +19,8 @@ defmodule Loopctl.Changes.Events do
   ## Authentication: one refusal for everything
 
   `receive_push/3` answers `{:error, :unauthorized}` — one answer, one 401 body — for an
-  unknown source id, another tenant's or a revoked source, a suspended tenant, a `pr`-mode
-  source or one holding no `change_events_secret`, a missing or wrong `X-Chg-Signature`, an
+  unknown source id, another tenant's or a revoked source, a suspended tenant, a source
+  holding no `change_events_secret`, a missing or wrong `X-Chg-Signature`, an
   `X-Chg-Timestamp` outside the window (`Loopctl.Changes.Signature`), an envelope naming
   another repository, and a source whose `chg_root_dispatch_id` is no longer a valid chg root
   (AC-47.3.7). Every refusal writes nothing, and is logged and counted (`event_refused/3`)
@@ -37,6 +37,40 @@ defmodule Loopctl.Changes.Events do
   AGAIN against the HELD row's `change_events_secret`. So a secret rotation, a revoke, a mode
   switch or a tenant suspension that commits between the two reads refuses the event with the
   same 401, writing nothing, rather than letting an event signed with the old secret apply.
+
+  ## Sending is not routing (issue #1047)
+
+  A source in ANY mode that holds both chg credentials authenticates here: `chg`, a `pr`
+  source whose repository merges through pull requests, and a `ledger` source on a `:kb` scope.
+  What its events DO is decided by the mode of the source HELD in the transaction that applies
+  them:
+
+  - under `chg`, an event goes through `Loopctl.Changes.EventEffects` — it binds a change,
+    moves a stage, escalates `:review_missing` — and is stored `routed: true`;
+  - under any other mode it is stored, ordered, cursored and audited exactly the same, but
+    applied with NO effect (`%{"effect" => "recorded", "routed" => false}`) and stored
+    `routed: false`.
+
+  This is what keeps a `pr` repository's events from bypassing its own route. A `landed` event
+  would otherwise move a pull-request story `ci -> merged` around the merge precondition and
+  the verify@1 verifier, a `submitted` event would bind the story to a change and make it a
+  chg story whose reviews a chg root's children may record, and a `review_approved` +
+  `check_passed` pair would move it to `ci`. None of that runs, and every reader that treats an
+  applied event as EVIDENCE — the landed revision (`Loopctl.Changes.Landings`), the bound
+  revision a chg review must name and a minted reviewer's revision
+  (`Loopctl.Changes.ReviewCustody`), the revision a review dispatch is minted for
+  (`Loopctl.Changes.ReviewDispatches`) and the earlier events a stage move pairs with
+  (`EventEffects`) — reads `routed` events only, so an unrouted one cannot stand in for a routed
+  one after a later switch to `chg`. The one exception is evidence AGAINST a gate: a `reverted`
+  event counts in every mode (`Loopctl.Changes.TrunkEvidence`), because ignoring it would
+  verify a landing that is no longer on trunk.
+
+  The mode is read at APPLICATION, not at receipt: an event held behind a gap is applied under
+  whatever mode the source has when the gap fills. A switch to `chg` is the deliberate act that
+  opens the route, so an event applied after it is routed. A switch away does not move a change
+  the route has already acted on: while the source is not `chg`, an event for a change with any
+  applied routed event is refused with the same 401, writing nothing, so the sender keeps it
+  until the source is `chg` again. Only a change that began off the route is recorded unrouted.
 
   ## Idempotency
 
@@ -381,7 +415,7 @@ defmodule Loopctl.Changes.Events do
     signature = input[:signature]
 
     case Intake.delivery_source(source_id) do
-      %Source{mode: :chg, change_events_secret: secret} = source when is_binary(secret) ->
+      %Source{change_events_secret: secret} = source when is_binary(secret) ->
         case Signature.verify(secret, timestamp, input.raw_body, signature, now) do
           :ok -> {:ok, source}
           {:error, reason} -> refuse(source_id, source, reason)
@@ -495,6 +529,11 @@ defmodule Loopctl.Changes.Events do
     }
 
     cursor = lock_cursor(source, key, now)
+    # The HELD source's mode, read FOR SHARE in this transaction: a switch commits first and is
+    # seen, or waits for this event.
+    routed = routed?(source)
+    unless routed, do: refuse_routed_change!(key)
+    effects_opts = Keyword.put(effects_opts, :routed, routed)
 
     case insert_event(source, key, envelope, via, now) do
       :inserted ->
@@ -598,13 +637,14 @@ defmodule Loopctl.Changes.Events do
   end
 
   defp apply_event(%Event{tenant_id: tenant_id} = event, effects_opts) do
-    {:ok, effect, effects} = EventEffects.apply_event(tenant_id, event, effects_opts)
+    {routed, effects_opts} = Keyword.pop(effects_opts, :routed, false)
+    {:ok, effect, effects} = effect_of(routed, tenant_id, event, effects_opts)
     now = DateTime.utc_now()
 
     {1, _} =
       Repo.update_all(
         from(e in Event, where: e.id == ^event.id and e.tenant_id == ^tenant_id),
-        set: [applied_at: now, effect: effect, updated_at: now]
+        set: [applied_at: now, effect: effect, routed: routed, updated_at: now]
       )
 
     case AuditChain.append_in_tenant_transaction(tenant_id, %{
@@ -626,6 +666,34 @@ defmodule Loopctl.Changes.Events do
       {:ok, entry} -> [{:effects, effects}, {:entry, entry}]
       {:error, reason} -> Repo.rollback(reason)
     end
+  end
+
+  # Only a `chg` source routes its events (see "Sending is not routing" above). Any other mode's
+  # event is recorded and does nothing: no binding, no stage, no escalation.
+  defp effect_of(true, tenant_id, event, effects_opts),
+    do: EventEffects.apply_event(tenant_id, event, effects_opts)
+
+  defp effect_of(false, _tenant_id, _event, _effects_opts),
+    do: {:ok, %{"effect" => "recorded", "routed" => false}, []}
+
+  defp routed?(%Source{mode: :chg}), do: true
+  defp routed?(%Source{}), do: false
+
+  # A change the `chg` route has already acted on stays on that route. While its source is not
+  # `chg` (a temporary switch to `pr`, or one made before this deploy that kept the
+  # credentials), its next event is refused with the 401 it got before a `pr` source could send
+  # at all, writing nothing, so the sender keeps it and redelivers it once the source is `chg`
+  # again. Applying it unrouted instead would move the cursor past it, and no later reader
+  # counts an unrouted event: a `landed` would never land the story. Judged under the change's
+  # cursor lock, so it cannot race the change's own events.
+  defp refuse_routed_change!(key) do
+    if Repo.exists?(
+         from e in Event,
+           where:
+             e.tenant_id == ^key.tenant_id and e.repo == ^key.repo and
+               e.change_id == ^key.change_id and not is_nil(e.applied_at) and e.routed
+       ),
+       do: Repo.rollback({:refused, :change_on_chg_route})
   end
 
   # What of a caller's `opts` reaches `EventEffects.apply_event/3`.

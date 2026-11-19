@@ -323,6 +323,40 @@ defmodule LoopctlWeb.ChgReviewDispatchControllerTest do
              |> json_response(401) == @unauthorized
     end
 
+    # Issue #1047: a change that BEGAN during a `pr` stint was applied unrouted, so once the
+    # source is `chg` again its revision is still not one a reviewer can be minted for. (A
+    # change the chg route already acted on is refused off it instead, see LedgerSourcesTest.)
+    test "a revision submitted while the source was pr is 422 revision_not_submitted",
+         %{conn: conn} = ctx do
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "pr"})
+      submit!(ctx, "C9", 1, 1, sha("b"))
+      {:ok, _} = Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "chg"})
+
+      assert %{"error" => %{"code" => "revision_not_submitted"}} =
+               conn |> request(ctx, %{change_id: "C9", revision: 1}) |> json_response(422)
+    end
+
+    # Issue #1047: a `pr` source holding the chg credentials sends its ledger and events, but a
+    # reviewer key is minted under a `chg` source's root only. The revision here was submitted
+    # (and routed) while the source was `chg`, so nothing but the mode refuses the mint.
+    test "a source switched to pr is the 401 and mints nothing", %{conn: conn} = ctx do
+      {:ok, %{mode: :pr}} =
+        Loopctl.Intake.update_source(ctx.tenant_id, ctx.source.id, %{mode: "pr"})
+
+      before =
+        AdminRepo.aggregate(from(d in Dispatch, where: d.tenant_id == ^ctx.tenant_id), :count)
+
+      assert conn
+             |> request(ctx, %{change_id: "C1", revision: 1})
+             |> json_response(401) == @unauthorized
+
+      assert AdminRepo.aggregate(
+               from(d in Dispatch, where: d.tenant_id == ^ctx.tenant_id),
+               :count
+             ) ==
+               before
+    end
+
     test "a malformed body is 400 invalid_request", %{conn: conn} = ctx do
       for body <- [
             %{change_id: "C1"},
