@@ -271,31 +271,47 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
 
       assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
 
-      assert %{reposted: 0, posted: 0, errors: []} =
+      # The sweep's g2 is withdrawn the moment it is written.
+      assert %{reposted: 0, closed: 1, errors: []} =
                EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
 
-      assert length(posts(story.tenant_id)) == 1
+      assert open_handoffs(story) == []
     end
 
-    test "a pre-#1067 handoff of a story resolved mid-sweep is closed, not moved" do
+    test "a story resolved mid-sweep before its FIRST handoff gets none left open" do
+      story = escalated!()
+      now = DateTime.utc_now()
+      {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
+
+      # Resolved after the read; `close_story/3` found nothing to close.
+      AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
+        set: [stage: :done]
+      )
+
+      assert :ok = EscalationHandoffs.close_story(story.tenant_id, story.id, now)
+
+      assert %{posted: 0, closed: 1, errors: []} =
+               EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
+
+      assert open_handoffs(story) == []
+    end
+
+    test "a pre-#1067 handoff of a story resolved mid-sweep leaves nothing open anywhere" do
       story = escalated!()
       now = DateTime.utc_now()
       EscalationHandoffs.sweep_tenant(story.tenant_id, now)
       {:ok, %{data: rows}} = EscalationInbox.list(story.tenant_id, limit: 100)
-      repo_channel!(story)
+      scope = repo_channel!(story)
 
       AdminRepo.update_all(from(s in StoryStage, where: s.story_id == ^story.id),
         set: [stage: :done]
       )
 
-      assert %{moved: 0, posted: 0, errors: []} =
+      assert %{moved: 0, errors: []} =
                EscalationHandoffs.sweep_tenant(story.tenant_id, now, escalated: rows)
 
-      assert length(posts(story.tenant_id)) == 1
-
-      # The next sweep reads the story as resolved and closes the old handoff where it is.
-      assert %{closed: 1} = EscalationHandoffs.sweep_tenant(story.tenant_id, now)
       assert open_handoffs(story) == []
+      assert Coordination.directed_handoffs(story.tenant_id, scope.id) == []
     end
   end
 

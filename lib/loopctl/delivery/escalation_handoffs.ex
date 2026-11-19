@@ -52,9 +52,10 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
   The sweep's close runs up to five minutes after the resolve, so `close_story/3` is also
   called by `Loopctl.Delivery.Escalations.resolve/3` right after `:human_resolution` commits:
   a session that resolves the story sees its handoff gone at once. It is best-effort; a
-  failure is logged and the next sweep closes the handoff. Before posting a NEW generation the
-  sweep re-reads the story's stage, so a resolve that lands while a sweep is running does not
-  leave a fresh "still escalated" handoff behind it.
+  failure is logged and the next sweep closes the handoff. After every post the sweep re-reads
+  the story's stage and withdraws the post (closes it) when the story has left `escalated`, so
+  a resolve that lands while a sweep is running does not leave a fresh handoff behind it:
+  whichever of the two closes second sees the other's write.
 
   ## What the body carries, and what it does not
 
@@ -222,8 +223,14 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
   defp channel(tenant_id, project_id, url, slug, sources),
     do: work_project(tenant_id, project_id, url, slug, {:active_intake_sources, length(sources)})
 
+  # No intake source is an expected shape (a work project that is its own repo's channel), so
+  # it logs at info; every five minutes at warning it would bury the cases that are failures:
+  # a repo that resolves to nothing or to two projects, or a project with several sources.
   defp work_project(tenant_id, project_id, url, slug, why) do
-    Logger.warning(
+    level = if why == {:active_intake_sources, 0}, do: :info, else: :warning
+
+    Logger.log(
+      level,
       "EscalationHandoffs: no repo channel for project #{project_id} (#{inspect(why)}); " <>
         "posting its escalation handoffs on the work project",
       tenant_id: tenant_id
@@ -287,38 +294,33 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
   # The newest generation is on another channel (posted before #1067, or the repo's source
   # moved): close it there and post the next generation where the repo's sessions read.
   defp move(tenant_id, agent_id, row, target, latest, now, acc) do
-    if still_escalated?(tenant_id, row.story_id) do
-      case close(tenant_id, latest.project_id, latest.key, now) do
-        :ok ->
-          post(tenant_id, agent_id, row, target, latest.generation + 1, @session, :new, now)
-          |> tally(:moved, acc)
+    case close(tenant_id, latest.project_id, latest.key, now) do
+      :ok ->
+        post(tenant_id, agent_id, row, target, latest.generation + 1, @session, :new, now)
+        |> tally(:moved, acc)
 
-        {:error, reason} ->
-          %{acc | errors: [{latest.key, reason} | acc.errors]}
-      end
-    else
-      acc
+      {:error, reason} ->
+        %{acc | errors: [{latest.key, reason} | acc.errors]}
     end
   end
 
   defp replace(tenant_id, agent_id, row, target, g, now, acc) do
-    if still_escalated?(tenant_id, row.story_id) do
-      Logger.warning(
-        "EscalationHandoffs: handoff #{handoff_key(target.repo, row.story_id, g)} was " <>
-          "finished while its story is still escalated; posting generation #{g + 1}",
-        tenant_id: tenant_id
-      )
+    Logger.warning(
+      "EscalationHandoffs: handoff #{handoff_key(target.repo, row.story_id, g)} was " <>
+        "finished while its story is still escalated; posting generation #{g + 1}",
+      tenant_id: tenant_id
+    )
 
-      post(tenant_id, agent_id, row, target, g + 1, @session, :reposted, now)
-      |> tally(:reposted, acc)
-    else
-      acc
-    end
+    post(tenant_id, agent_id, row, target, g + 1, @session, :reposted, now)
+    |> tally(:reposted, acc)
   end
 
-  # Re-read before a NEW generation is posted: the escalated list was read at the start of the
-  # sweep, and a resolve landing since then has already closed the handoff (`close_story/3`).
-  # Posting "still escalated" on top of it would reopen what the resolve just closed.
+  # The escalated list was read at the start of the sweep, so a resolve may have committed
+  # since. The stage is therefore read AFTER the post is written, never before: `resolve/3`
+  # closes the story's handoffs after ITS commit, so whichever of the two runs second sees the
+  # other's write — a resolve that commits before this read is seen here and the post is
+  # withdrawn; one that commits after it finds the post and closes it. A read before the post
+  # would leave a window between the read and the insert.
   defp still_escalated?(tenant_id, story_id) do
     AdminRepo.exists?(
       from s in StoryStage,
@@ -400,7 +402,7 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
     case Coordination.create_post(tenant_id, target.project_id, agent_id, attrs) do
       {:ok, post} ->
         if why == :reposted, do: supersede_earlier(post, row.story_id)
-        :posted
+        withdraw_if_resolved(tenant_id, post, row.story_id, now)
 
       {:error, %Ecto.Changeset{errors: errors}} ->
         if slot_taken?(errors), do: :already, else: {:error, {key, Keyword.keys(errors)}}
@@ -410,6 +412,18 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
 
       {:error, reason} ->
         {:error, {key, reason}}
+    end
+  end
+
+  # See `still_escalated?/2` for why this runs after the post rather than before it.
+  defp withdraw_if_resolved(tenant_id, %ChannelPost{} = post, story_id, now) do
+    if still_escalated?(tenant_id, story_id) do
+      :posted
+    else
+      case close(tenant_id, post.project_id, post.key, now) do
+        :ok -> :withdrawn
+        {:error, reason} -> {:error, {post.key, reason}}
+      end
     end
   end
 
@@ -434,6 +448,7 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
 
   defp tally(:posted, field, acc), do: Map.update!(acc, field, &(&1 + 1))
   defp tally(:already, _field, acc), do: acc
+  defp tally(:withdrawn, _field, acc), do: %{acc | closed: acc.closed + 1}
   defp tally({:error, reason}, _field, acc), do: %{acc | errors: [reason | acc.errors]}
 
   @doc false
