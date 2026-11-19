@@ -142,6 +142,58 @@ defmodule Loopctl.Agents.VerifyFlowTest do
       assert {:ok, _} = RunnerContract.cast_dispatch(payload)
     end
 
+    # US-51.7: the miss a selection_miss fix must cover rides the verify object, as loopctl
+    # recorded it on the finding the story's intake record names.
+    defp link_finding(ctx, kind, evidence) do
+      now = DateTime.utc_now()
+
+      finding =
+        AdminRepo.insert!(%Loopctl.Changes.Finding{
+          tenant_id: ctx.tenant.id,
+          kind: kind,
+          repo_full_name: "mkreyman/chg",
+          fingerprint: "fp-#{System.unique_integer([:positive])}",
+          state: :filed,
+          evidence: evidence,
+          first_seen_at: now,
+          last_seen_at: now
+        })
+
+      record = fixture(:intake_record, %{tenant_id: ctx.tenant.id, repo: AdminRepo})
+
+      AdminRepo.update_all(
+        from(r in Loopctl.Intake.Record, where: r.id == ^record.id),
+        set: [loop_finding_id: finding.id]
+      )
+
+      AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
+        set: [intake_record_id: record.id]
+      )
+    end
+
+    test "a selection_miss story's verify object carries the finding's miss", ctx do
+      sha = String.duplicate("c", 40)
+      failures = ["test/a_test.exs:12", "test/b_test.exs:3"]
+      link_finding(ctx, "selection_miss", %{"sha" => sha, "failures" => failures})
+
+      payload = placed!(ctx)
+
+      assert payload["verify"]["loop_finding"] == %{"sha" => sha, "failures" => failures}
+
+      assert {:ok, %{verify: %{loop_finding: %{sha: ^sha, failures: ^failures}}}} =
+               RunnerContract.cast_dispatch(payload)
+    end
+
+    test "any other finding, or a miss with no failures, sends no loop_finding", ctx do
+      link_finding(ctx, "selection_miss", %{"sha" => String.duplicate("c", 40), "failures" => []})
+      refute Map.has_key?(placed!(ctx)["verify"], "loop_finding")
+    end
+
+    test "a flaky_test finding sends no loop_finding", ctx do
+      link_finding(ctx, "flaky_test", %{"test" => "test/a_test.exs:12"})
+      refute Map.has_key?(placed!(ctx)["verify"], "loop_finding")
+    end
+
     test "a refused push revokes B", ctx do
       assert {:error, :runner_not_connected} =
                VerifierPlacement.place(ctx.tenant.id, ctx.story.id, @budgets,

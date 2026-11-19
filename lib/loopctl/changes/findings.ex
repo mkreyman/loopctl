@@ -574,6 +574,34 @@ defmodule Loopctl.Changes.Findings do
     )
   end
 
+  @doc """
+  The finding an intake record was admitted for (`intake_records.loop_finding_id`), in the
+  record's own tenant, or nil. `loop_finding_id` is written at admission on EVERY source
+  (`Loopctl.Delivery.TriageTrigger`), and it is the one link a clear cannot break: a clear
+  drops the finding's issue number, so a lookup by issue number would lose a cleared finding.
+  Both tenant columns are compared, so an id naming another tenant's finding yields nil.
+  """
+  @spec for_record(Record.t()) :: Finding.t() | nil
+  def for_record(%Record{loop_finding_id: nil}), do: nil
+
+  def for_record(%Record{tenant_id: tenant_id, loop_finding_id: finding_id}) do
+    AdminRepo.one(from f in Finding, where: f.tenant_id == ^tenant_id and f.id == ^finding_id)
+  end
+
+  @doc "The finding the intake record `record_id` of `tenant_id` was admitted for, or nil."
+  @spec for_intake_record(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: Finding.t() | nil
+  def for_intake_record(_tenant_id, nil), do: nil
+
+  def for_intake_record(tenant_id, record_id) do
+    AdminRepo.one(
+      from r in Record,
+        join: f in Finding,
+        on: f.id == r.loop_finding_id and f.tenant_id == r.tenant_id,
+        where: r.tenant_id == ^tenant_id and r.id == ^record_id,
+        select: f
+    )
+  end
+
   defp insert_finding(tenant_id, group, now) do
     newest = Enum.max_by(group, & &1.at, DateTime)
     oldest = Enum.min_by(group, & &1.at, DateTime)

@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Runner contract 1.33.0: `loop_finding` on triage and verify dispatches (2026-11-19, US-51.7).**
+  Minor, additive; re-vendor `priv/runner_contract/v1.json`. A triage dispatch for a loop-filed
+  issue carries `triage.loop_finding` (`finding_id`, `kind`, `fingerprint`, `occurrences`,
+  `fix_attempts`, and scalar `evidence` as `{key, value}` strings), read from loopctl's own
+  finding row and never from the issue text; it is omitted when the object would pass the
+  48_000-byte triage cap. A verify dispatch for a story whose finding is a `selection_miss`
+  carries `verify.loop_finding` (`sha`, `failures`), the miss the fix must cover. `RunnerVerify`
+  refuses unknown properties, so loopctl strips `verify.loop_finding` for a runner that joined
+  declaring a contract older than 1.33.0. No migration, no env var.
 - **`missing_review` findings are off unless `CHG_MISSING_REVIEWS=true` (2026-11-19).** The
   nightly chg sweep filed a "merged with no review" issue for every merged PR with no counted
   review round, but chg does not yet send a round run before `gh pr create`, so every

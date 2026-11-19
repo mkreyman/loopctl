@@ -624,6 +624,7 @@ defmodule Loopctl.Runners do
          {:ok, meta} <- single_live_socket(tenant_id, runner_id),
          :ok <- kind_supported(tenant_id, runner_id, meta, dispatch.kind),
          :ok <- not_exhausted(tenant_id, runner_id, dispatch.dispatch_id),
+         dispatch = RunnerContract.fit_dispatch(dispatch, Map.get(meta, :contract_version)),
          {:ok, _record} <-
            DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
       broadcast_dispatch(tenant_id, runner_id, dispatch)
