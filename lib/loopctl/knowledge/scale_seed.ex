@@ -156,7 +156,12 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       AdminRepo.insert_all("article_embeddings", rows, on_conflict: :nothing)
     end)
 
-    AdminRepo.query!("ANALYZE article_embeddings")
+    # BOTH relations the gates join. The gate EXPLAINs queries that read `articles` as well
+    # (the distant-pairs candidate set scans it by tenant), and this seed inserted those rows
+    # too. Analyzing only the side table left `articles`' statistics to whenever autovacuum
+    # next reached the table: on a run where it had not, the planner estimated 1 row for the
+    # tenant against 30000 actual and chose the full tenant scan the gate exists to refuse.
+    analyze!(["articles", "article_embeddings"])
 
     {:ok, %{rows: count}}
   end
@@ -202,10 +207,15 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       AdminRepo.insert_all("memory_embeddings", rows, on_conflict: :nothing)
     end)
 
-    AdminRepo.query!("ANALYZE memory_embeddings")
+    # Both relations, for the reason `seed_embedding_side_table/3` gives.
+    analyze!(["memories", "memory_embeddings"])
 
     {:ok, %{rows: count, subject_id: subject_id}}
   end
+
+  # A seed establishes the statistics its gate reads, for every relation it wrote, rather
+  # than leaving them to autovacuum's timing. The names are this module's own literals.
+  defp analyze!(tables), do: Enum.each(tables, &AdminRepo.query!("ANALYZE #{&1}"))
 
   defp seed_plan_gate_memories(tenant_id, subject_id, count, now) do
     existing = plan_gate_memory_ids(tenant_id, subject_id, count)
