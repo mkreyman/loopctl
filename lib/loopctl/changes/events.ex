@@ -41,7 +41,7 @@ defmodule Loopctl.Changes.Events do
   ## Sending is not routing (issue #1047)
 
   A source in ANY mode that holds both chg credentials authenticates here: `chg`, a `pr`
-  source whose repository merges through pull requests, and a `ledger` source on a `:kb` scope.
+  source whose repository merges through pull requests, and a `ledger` source on a kb scope or a work project.
   What its events DO is decided by the mode of the source HELD in the transaction that applies
   them:
 

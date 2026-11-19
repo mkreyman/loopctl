@@ -1074,6 +1074,9 @@ describe("mode ledger, and the ledger from a pr source (loopctl #1047)", () => {
       for (const text of [tool.description, readmeRow]) {
         assert.match(text, /ledger/, name);
         assert.match(text, /KB scope/i, name);
+        // A ledger source may sit on a work project too (reportex, cron_books).
+        assert.match(text, /`ledger`[^|]*work project/i, name);
+        if (name === "intake_source_update") assert.match(text, /into or out of `ledger`/i, name);
         assert.match(text, /stays `pr`/i, name);
       }
     }

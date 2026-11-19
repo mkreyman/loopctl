@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A `ledger` intake source may sit on a work project (2026-11-19).** `POST
+  /api/v1/intake/sources` with `mode: ledger` now takes an active work project as well as a
+  kb scope. This is for a repository like reportex or cron_books, whose channel is a work
+  project with no intake route: it gets a ledger credential without a second same-URL kb
+  scope, which would break `resolve_project` fleet-wide. The source binds none of the
+  project's stories and still refuses every GitHub delivery. A mode switch into or out of
+  `ledger` is now `422` on either kind ("cannot switch a source into or out of ledger"),
+  replacing the kind-based message. `pr` and `chg` still need a work project. No migration.
 - **A chg root is minted by loopctl and no longer expires (2026-11-18).** `POST` and
   `PATCH /api/v1/intake/sources` take `mint_chg_root: true`: loopctl inserts a parentless,
   keyless, agentless `:orchestrator` root in the source's own transaction and names it

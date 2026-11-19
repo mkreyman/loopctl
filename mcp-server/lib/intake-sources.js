@@ -108,10 +108,10 @@
  * The two credentials authenticate the ledger and change-event endpoints in EVERY mode, so a
  * `pr` source that holds them sends its ledger rows and change events too: it stays `pr`, its
  * merge precondition still answers from the PR, and its events are recorded without moving
- * any story. `mode: "ledger"` is the same credential pair on a KB scope (a repo with no work
- * project): enrolled for the ledger alone, never a dispatch binding, and refused every GitHub
- * delivery. Its enrolment needs both credentials in the same call, like `chg`; a mode change
- * between a work project's modes and `ledger` is a 422.
+ * any story. `mode: "ledger"` is the same credential pair on a KB scope or on a work project
+ * with no intake route: enrolled for the ledger alone, never a dispatch binding, and refused
+ * every GitHub delivery. Its enrolment needs both credentials in the same call, like `chg`; a
+ * mode change into or out of `ledger` is a 422.
  *
  * ## `repo_full_name` IS NOT SHAPE-CHECKED HERE, AND THAT IS A DECISION
  *
@@ -180,7 +180,7 @@ function epicRefusal(value, { clearable }) {
 /**
  * The modes a source may take: `pr`, the default, and `chg` (US-47.2), where the change
  * protocol lands the repository's changes and the PR route is closed — both on a WORK project
- * — and `ledger` (issue #1047), a KB scope's ledger-only credential that routes nothing. NOT
+ * — and `ledger` (issue #1047), a ledger-only credential, on either kind, that routes nothing. NOT
  * nullable — the server answers 422 — so a null is refused here where the reason can be
  * stated.
  */
@@ -194,8 +194,8 @@ export function modeRefusal(mode) {
 
   return refuse(
     "`mode` must be `pr`, `chg` or `ledger`, or must be left out entirely (enrolment then " +
-      "takes `pr`, and an update keeps the current value). It cannot be null. `ledger` is a " +
-      "kb scope's mode; `pr` and `chg` belong to a work project.",
+      "takes `pr`, and an update keeps the current value). It cannot be null. `pr` and `chg` " +
+      "belong to a work project; `ledger` sits on a kb scope or a work project.",
   );
 }
 

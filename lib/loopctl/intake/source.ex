@@ -44,10 +44,11 @@ defmodule Loopctl.Intake.Source do
 
   ## Mode `ledger` (issue #1047)
 
-  The mode of a source on a `:kb` scope: a repository that has no work project gets a ledger
-  credential and nothing else. It REQUIRES both credentials, as `chg` does, and a `:kb`
-  project; `pr` and `chg` require a `:work` project, so a source never changes kind of project
-  by switching mode (`Loopctl.Intake`). A `ledger` source is never a dispatch binding
+  A ledger credential and nothing else, for a repository whose changes should not route
+  through loopctl: one with only a `:kb` scope, or one whose work project has no intake route
+  (reportex, cron_books). It REQUIRES both credentials, as `chg` does, and sits on either kind
+  of project; `pr` and `chg` require a `:work` project, and no mode switch crosses into or out
+  of `ledger` (`Loopctl.Intake`). A `ledger` source is never a dispatch binding
   (`Loopctl.Intake.select_project_source/2`), never a merge route, and every GitHub delivery to
   it is refused.
 
@@ -120,8 +121,8 @@ defmodule Loopctl.Intake.Source do
 
     # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE. `:pr`: the merge gate reads a pull request by
     # number. `:chg` (US-47.2): the change protocol lands them, and the merge gate refuses the
-    # PR route outright. `:ledger` (issue #1047): a `:kb` scope's ledger-only credential, which
-    # routes nothing. NOT NULL, default `:pr`; `intake_sources_mode` is the database's copy.
+    # PR route outright. `:ledger` (issue #1047): a ledger-only credential, on a kb scope or a work
+    # project, which routes nothing. NOT NULL, default `:pr`; `intake_sources_mode` is the database's copy.
     field :mode, Ecto.Enum, values: [:pr, :chg, :ledger], default: :pr
 
     # THE CHECKS STORY VERIFICATION JUDGES A STORY'S COMMIT BY (US-26.4.6): GitHub Actions JOB
@@ -281,12 +282,14 @@ defmodule Loopctl.Intake.Source do
   def credentials_required?(mode), do: mode in [:chg, :ledger]
 
   @doc """
-  The project kind a source in `mode` must be enrolled on: `:kb` for `ledger`, `:work` for
-  `pr` and `chg`. `Loopctl.Intake` checks it at enrolment and on every mode switch.
+  The project kinds a source in `mode` may be enrolled on: only `:work` for `pr` and `chg`
+  (each is its project's dispatch binding and merge route, which a kb scope must never get),
+  either kind for `ledger` (it binds nothing). `Loopctl.Intake` checks it at enrolment and
+  refuses every mode switch into or out of `ledger`, so a source keeps what it was judged on.
   """
-  @spec project_kind(atom()) :: :work | :kb
-  def project_kind(:ledger), do: :kb
-  def project_kind(_routing_mode), do: :work
+  @spec project_kinds(atom()) :: [:work | :kb, ...]
+  def project_kinds(:ledger), do: [:kb, :work]
+  def project_kinds(_routing_mode), do: [:work]
 
   defp check_secret(:change_events_secret, secret) when is_binary(secret) do
     if byte_size(secret) in @min_change_events_secret_bytes..@max_change_events_secret_bytes,

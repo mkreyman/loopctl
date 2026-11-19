@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.17.1 — 2026-11-19
+
+### Changed
+
+- **`intake_source_enroll` / `intake_source_update` descriptions:** `mode: ledger` takes a
+  work project with no intake route as well as a kb scope, and a switch into or out of
+  `ledger` is 422 on either kind. The local mode refusal says the same. No schema change.
+
 ## 3.17.0 — 2026-11-19
 
 ### Added
