@@ -372,7 +372,8 @@ defmodule Loopctl.Intake do
   # sources that way throughout, and the refusal is tracked as its own issue.
   # A `ledger` source binds nothing, so it changes nothing here.
   #
-  # Returns `{:ok, promoted?}`.
+  # Returns `{:ok, claim}`: `nil` when nothing changed, else the project as it was and the
+  # fields written, which `audit_claim/4` records once the source exists.
   defp prepare_project(tenant_id, changeset) do
     mode = Ecto.Changeset.get_field(changeset, :mode)
     repo = Ecto.Changeset.get_field(changeset, :repo_full_name)
@@ -392,14 +393,14 @@ defmodule Loopctl.Intake do
         {:error, Ecto.Changeset.add_error(changeset, :project_id, project_kind_message(kinds))}
 
       mode == :ledger ->
-        {:ok, false}
+        {:ok, nil}
 
       true ->
-        claim_repo(project, repo)
+        claim_repo(tenant_id, project, repo)
     end
   end
 
-  defp claim_repo(project, repo) do
+  defp claim_repo(tenant_id, project, repo) do
     changes =
       [kind: :work]
       |> then(&if(project.kind == :kb, do: [{:open_channel, true} | &1], else: &1))
@@ -412,30 +413,39 @@ defmodule Loopctl.Intake do
         end
       end)
 
-    project
-    |> Ecto.Changeset.change(changes)
-    |> Ecto.Changeset.unique_constraint(:repo_key,
-      name: Project.repo_key_index(),
-      message: "already has a project in this tenant"
-    )
-    |> AdminRepo.update()
-    |> case do
-      {:ok, _} -> {:ok, project.kind == :kb}
-      {:error, changeset} -> {:error, changeset}
+    update =
+      project
+      |> Ecto.Changeset.change(changes)
+      |> Ecto.Changeset.unique_constraint(:repo_key,
+        name: Project.repo_key_index(),
+        message: "already has a project in this tenant"
+      )
+
+    if update.changes == %{}, do: {:ok, nil}, else: write_claim(tenant_id, project, update)
+  end
+
+  defp write_claim(tenant_id, project, update) do
+    case AdminRepo.update(update) do
+      {:ok, _} -> {:ok, %{project: project, changes: update.changes}}
+      # The loser of an enrolment race for one repo gets the same 409 the pre-check gives.
+      {:error, failed} -> Projects.changeset_or_refusal(tenant_id, failed)
     end
   end
 
-  defp audit_promotion(_tenant_id, _source, false, _opts), do: :ok
+  # One audit entry for whatever the enrolment wrote on the project: `kind_promoted` when a kb
+  # scope became a work project, `repo_claimed` when only the repo was taken. Both states carry
+  # every field written, so the log shows when and why the project took the repo.
+  defp audit_claim(_tenant_id, _source, nil, _opts), do: :ok
 
-  defp audit_promotion(tenant_id, source, true, opts) do
-    case do_audit_promotion(tenant_id, source, opts) do
-      {:ok, _} -> :ok
-      {:error, _step, reason, _changes} -> {:error, {:promotion_audit_failed, reason}}
-    end
-  end
+  defp audit_claim(tenant_id, source, %{project: project, changes: changes}, opts) do
+    fields = Map.keys(changes)
+    old = project |> Map.take(fields) |> stringify()
+    new = stringify(changes)
+    promoted = Map.has_key?(changes, :kind)
 
-  defp do_audit_promotion(tenant_id, source, opts) do
-    project = %{id: source.project_id}
+    metadata =
+      %{"intake_source_id" => source.id}
+      |> then(&if(promoted, do: Map.merge(&1, %{"from" => "kb", "to" => "work"}), else: &1))
 
     Ecto.Multi.new()
     |> Audit.log_in_multi(:audit, fn _ ->
@@ -443,17 +453,27 @@ defmodule Loopctl.Intake do
         tenant_id: tenant_id,
         entity_type: "project",
         entity_id: project.id,
-        action: "kind_promoted",
+        action: if(promoted, do: "kind_promoted", else: "repo_claimed"),
         actor_type: Keyword.get(opts, :actor_type, "api_key"),
         actor_id: Keyword.get(opts, :actor_id),
         actor_label: Keyword.get(opts, :actor_label),
-        metadata: %{"from" => "kb", "to" => "work", "intake_source_id" => source.id},
-        old_state: %{"kind" => "kb"},
-        new_state: %{"kind" => "work"}
+        metadata: metadata,
+        old_state: old,
+        new_state: new
       }
     end)
     |> AdminRepo.transaction()
+    |> case do
+      {:ok, _} -> :ok
+      {:error, _step, reason, _changes} -> {:error, {:promotion_audit_failed, reason}}
+    end
   end
+
+  defp stringify(map), do: Map.new(map, fn {k, v} -> {to_string(k), audit_value(v)} end)
+
+  defp audit_value(v) when is_boolean(v) or is_nil(v), do: v
+  defp audit_value(v) when is_atom(v), do: to_string(v)
+  defp audit_value(v), do: v
 
   # OPTIONAL, and an absent value is not an error: see the schema. What IS an error is naming
   # an epic that is not this tenant's or does not belong to this source's project — a source
@@ -602,9 +622,9 @@ defmodule Loopctl.Intake do
       with :ok <- mint_root(tenant_id, opts),
            :ok <- check_chg_root(tenant_id, changeset),
            :ok <- close_pr_route(tenant_id, changeset),
-           {:ok, promoted?} <- prepare_project(tenant_id, changeset),
+           {:ok, claim} <- prepare_project(tenant_id, changeset),
            {:ok, source} <- AdminRepo.insert(changeset),
-           :ok <- audit_promotion(tenant_id, source, promoted?, opts),
+           :ok <- audit_claim(tenant_id, source, claim, opts),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
                action: "intake_source_created",

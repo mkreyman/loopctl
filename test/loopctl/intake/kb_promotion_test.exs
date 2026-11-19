@@ -163,6 +163,21 @@ defmodule Loopctl.Intake.KbPromotionTest do
     assert {:ok, %{id: id}} = Projects.repo_holder(t.id, "github.com/mkreyman/other")
     assert id == bare.id
     assert %{open_channel: false} = AdminRepo.get!(Project, bare.id)
+
+    assert [entry] =
+             AdminRepo.all(
+               from a in AuditLog, where: a.entity_id == ^bare.id and a.action == "repo_claimed"
+             )
+
+    assert entry.old_state["repo_url"] == nil
+    assert entry.new_state["repo_url"] == "https://github.com/mkreyman/other"
+  end
+
+  test "the promotion audit records every field it wrote", %{tenant: t, kb: kb} do
+    {:ok, _} = Intake.create_source(t.id, %{repo_full_name: "mkreyman/chg", project_id: kb.id})
+    assert [entry] = promotions(t.id, kb.id)
+    assert entry.old_state == %{"kind" => "kb", "open_channel" => false}
+    assert entry.new_state == %{"kind" => "work", "open_channel" => true}
   end
 
   test "a work project that was never a kb scope keeps the membership gate", %{tenant: t} do
