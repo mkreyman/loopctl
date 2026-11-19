@@ -337,7 +337,9 @@ defmodule LoopctlWeb.IntakeSourceController do
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`pr_route_in_flight`, with `story_ids`, for a `chg` enrolment: " <>
+        {"`repo_already_has_project`, with `existing_project_id`, when another active " <>
+           "project of the tenant holds this repo (US-52.1: bind the source to that project). " <>
+           "`pr_route_in_flight`, with `story_ids`, for a `chg` enrolment: " <>
            Intake.pr_route_in_flight_message(), "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}

@@ -437,6 +437,25 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-52.1: a repo has one project. Every write that would give a repo a second ACTIVE project
+  # (create, kb-scope create, PATCH, restore, an intake source bound elsewhere) answers this,
+  # naming the project to use instead. The holder is read in the caller's tenant only.
+  def call(conn, {:error, {:repo_has_project, project_id}}) do
+    {:ok, holder} =
+      Loopctl.Projects.get_project(conn.assigns.current_api_key.tenant_id, project_id)
+
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "repo_already_has_project",
+        existing_project_id: holder.id,
+        message: Loopctl.Projects.repo_has_project_message(holder.slug, holder.id)
+      }
+    })
+  end
+
   # US-47.2: a switch to `chg` would strand an unconsumed PR-route allow (`Intake.update_source/4`).
   # 409: the request is well-formed; the source's stories are in a state that forbids it now.
   def call(conn, {:error, {:pr_route_in_flight, story_ids}}) when is_list(story_ids) do

@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A repo has one project: a second is refused 409 `repo_already_has_project` (2026-11-19,
+  US-52.1).** Migration `20261119190000` adds `projects.repo_key` (the lowercased
+  `host/owner/repo` of `repo_url`) and the partial unique index
+  `projects_tenant_repo_key_active_uidx` on active projects. The migration RAISES, naming the
+  colliding project ids, when two active projects of one tenant already share a repo; archive
+  or merge one and re-run it. `POST /api/v1/projects`, `POST /api/v1/kb-scopes`,
+  `PATCH /api/v1/projects/:id`, both restore routes and `POST /api/v1/intake/sources` now answer
+  409 with `error.existing_project_id` when another active project holds the repo. An intake
+  source binds only to the project that holds its repo. No env var.
 - **Every escalated delivery story becomes a claimable handoff (2026-11-19, #1065).** A new
   five-minute cron, `EscalationHandoffWorker`, posts `handoff:<repo>:escalation-<story>-g<N>`
   on the story's project channel as the reserved `system:escalation-handoff` agent, re-posts

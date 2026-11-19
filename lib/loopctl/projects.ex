@@ -15,6 +15,7 @@ defmodule Loopctl.Projects do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Projects.Project
+  alias Loopctl.Projects.RepoUrl
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -40,7 +41,9 @@ defmodule Loopctl.Projects do
   - `{:error, :project_limit_reached}` when tenant limit exceeded
   """
   @spec create_project(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Project.t()} | {:error, Ecto.Changeset.t() | :project_limit_reached}
+          {:ok, Project.t()}
+          | {:error,
+             Ecto.Changeset.t() | :project_limit_reached | {:repo_has_project, Ecto.UUID.t()}}
   def create_project(tenant_id, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -62,6 +65,7 @@ defmodule Loopctl.Projects do
 
         if count < max, do: {:ok, count}, else: {:error, :project_limit_reached}
       end)
+      |> Multi.run(:repo_free, fn _repo, _changes -> repo_free(tenant_id, changeset) end)
       |> Multi.insert(:project, changeset)
       |> Audit.log_in_multi(:audit, fn %{project: project} ->
         %{
@@ -89,8 +93,11 @@ defmodule Loopctl.Projects do
       {:error, :check_limit, :project_limit_reached, _changes} ->
         {:error, :project_limit_reached}
 
+      {:error, :repo_free, refusal, _changes} ->
+        {:error, refusal}
+
       {:error, :project, changeset, _changes} ->
-        {:error, changeset}
+        changeset_or_refusal(tenant_id, changeset)
     end
   end
 
@@ -233,7 +240,7 @@ defmodule Loopctl.Projects do
 
   defp repo_basename(url) when is_binary(url) do
     url
-    |> normalize_repo_url()
+    |> RepoUrl.normalize()
     |> String.split(~r{[/:]}, trim: true)
     |> List.last()
   end
@@ -248,7 +255,7 @@ defmodule Loopctl.Projects do
   1. `:slug`, exact first, then FOLDED (`home_care_billing` and `home-care-billing`
      reach the same project; the fold resolves only a single ACTIVE match and
      otherwise falls through)
-  2. normalized `:repo_url` (see `normalize_repo_url/1` — matches across
+  2. normalized `:repo_url` (see `Loopctl.Projects.RepoUrl.normalize/1` — matches across
      `git@github.com:owner/repo.git`, `https://github.com/owner/repo`, and the
      bare `owner/repo`)
   3. case-insensitive exact `:name`
@@ -334,7 +341,7 @@ defmodule Loopctl.Projects do
   - `{:error, changeset}` on validation failure
   """
   @spec update_project(Ecto.UUID.t(), Project.t(), map(), keyword()) ::
-          {:ok, Project.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Project.t()} | {:error, Ecto.Changeset.t() | {:repo_has_project, Ecto.UUID.t()}}
   def update_project(tenant_id, %Project{} = project, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -345,6 +352,7 @@ defmodule Loopctl.Projects do
 
     multi =
       Multi.new()
+      |> Multi.run(:repo_free, fn _repo, _changes -> repo_free(tenant_id, changeset) end)
       |> Multi.update(:project, changeset)
       |> Audit.log_in_multi(:audit, fn %{project: updated} ->
         %{
@@ -373,8 +381,11 @@ defmodule Loopctl.Projects do
       {:ok, %{project: updated}} ->
         {:ok, updated}
 
+      {:error, :repo_free, refusal, _changes} ->
+        {:error, refusal}
+
       {:error, :project, changeset, _changes} ->
-        {:error, changeset}
+        changeset_or_refusal(tenant_id, changeset)
     end
   end
 
@@ -449,7 +460,9 @@ defmodule Loopctl.Projects do
   the same transaction.
   """
   @spec unarchive_project(Ecto.UUID.t(), Project.t(), keyword()) ::
-          {:ok, Project.t()} | {:error, Ecto.Changeset.t() | :project_limit_reached}
+          {:ok, Project.t()}
+          | {:error,
+             Ecto.Changeset.t() | :project_limit_reached | {:repo_has_project, Ecto.UUID.t()}}
   def unarchive_project(tenant_id, project, opts \\ [])
 
   def unarchive_project(_tenant_id, %Project{status: :active} = project, _opts) do
@@ -472,6 +485,7 @@ defmodule Loopctl.Projects do
 
         if count < max, do: {:ok, count}, else: {:error, :project_limit_reached}
       end)
+      |> Multi.run(:repo_free, fn _repo, _changes -> repo_free(tenant_id, changeset) end)
       |> Multi.update(:project, changeset)
       |> Audit.log_in_multi(:audit, fn %{project: activated} ->
         %{
@@ -495,8 +509,77 @@ defmodule Loopctl.Projects do
       {:error, :check_limit, :project_limit_reached, _changes} ->
         {:error, :project_limit_reached}
 
+      {:error, :repo_free, refusal, _changes} ->
+        {:error, refusal}
+
       {:error, :project, changeset, _changes} ->
-        {:error, changeset}
+        changeset_or_refusal(tenant_id, changeset)
+    end
+  end
+
+  @doc """
+  The ACTIVE project of the tenant that holds `repo_key` (US-52.1), other than `except_id`.
+
+  A repo has at most one active project, held by `projects_tenant_repo_key_active_uidx`; this
+  is the read every refusal names the holder with.
+  """
+  @spec repo_holder(Ecto.UUID.t(), String.t() | nil, Ecto.UUID.t() | nil) ::
+          {:ok, Project.t()} | :error
+  def repo_holder(tenant_id, repo_key, except_id \\ nil)
+
+  def repo_holder(_tenant_id, nil, _except_id), do: :error
+
+  def repo_holder(tenant_id, repo_key, except_id) do
+    Project
+    |> where([p], p.tenant_id == ^tenant_id and p.repo_key == ^repo_key)
+    |> where([p], p.status == :active)
+    |> exclude_id(except_id)
+    |> limit(1)
+    |> AdminRepo.one()
+    |> case do
+      nil -> :error
+      project -> {:ok, project}
+    end
+  end
+
+  @doc "The 409 message for a repo that already has a project (US-52.1)."
+  @spec repo_has_project_message(String.t(), Ecto.UUID.t()) :: String.t()
+  def repo_has_project_message(slug, id) do
+    "This repo already has a project: #{slug} (#{id}). A repo has one project and one " <>
+      "channel; use that project instead of creating another."
+  end
+
+  defp exclude_id(query, nil), do: query
+  defp exclude_id(query, id), do: where(query, [p], p.id != ^id)
+
+  # The pre-check that names the holder. Only an ACTIVE result can collide, so an archived
+  # row (an edit of an archived project) is never refused; the index decides a race this
+  # read loses, and `changeset_or_refusal/2` turns that into the same answer.
+  defp repo_free(tenant_id, changeset) do
+    with :active <- Ecto.Changeset.get_field(changeset, :status),
+         {:ok, holder} <-
+           repo_holder(
+             tenant_id,
+             Ecto.Changeset.get_field(changeset, :repo_key),
+             changeset.data.id
+           ) do
+      {:error, {:repo_has_project, holder.id}}
+    else
+      _ -> {:ok, :free}
+    end
+  end
+
+  defp changeset_or_refusal(tenant_id, changeset) do
+    with true <- Keyword.has_key?(changeset.errors, :repo_key),
+         {:ok, holder} <-
+           repo_holder(
+             tenant_id,
+             Ecto.Changeset.get_field(changeset, :repo_key),
+             changeset.data.id
+           ) do
+      {:error, {:repo_has_project, holder.id}}
+    else
+      _ -> {:error, changeset}
     end
   end
 
@@ -737,8 +820,8 @@ defmodule Loopctl.Projects do
   defp resolve_by_repo_url(_tenant_id, nil), do: :error
 
   defp resolve_by_repo_url(tenant_id, repo_url) do
-    target_norm = normalize_repo_url(repo_url)
-    target_ref = repo_ref(repo_url)
+    target_norm = RepoUrl.normalize(repo_url)
+    target_ref = RepoUrl.ref(repo_url)
 
     # A repo_url that normalizes to "" (e.g. ".git", "/", "/.git") or has no
     # derivable "host?/owner/repo" path is not a usable identifier -- treat the
@@ -779,13 +862,12 @@ defmodule Loopctl.Projects do
       |> order_by([p], asc: p.inserted_at)
       |> limit(@resolve_candidate_limit)
       |> AdminRepo.all()
-      |> Enum.map(fn project -> {project, repo_ref(project.repo_url)} end)
+      |> Enum.map(fn project -> {project, RepoUrl.ref(project.repo_url)} end)
       |> Enum.reject(fn {_project, ref} -> is_nil(ref) end)
 
     # Two-pass over active candidates (oldest-first for determinism):
     #   1. an EXACT normalized-URL match wins outright (so an exact host beats a
-    #      same-path match on a different host). Two active projects sharing the
-    #      exact same repo_url are :ambiguous, not "oldest wins".
+    #      same-path match on a different host).
     #   2. otherwise a same-namespace-path match, host-gated so a query carrying
     #      an explicit host never crosses to a different-host project. Two or
     #      more distinct same-path matches (e.g. the same repo mirrored on
@@ -793,15 +875,14 @@ defmodule Loopctl.Projects do
     #      :ambiguous rather than silently resolving to the oldest mirror.
     exact_matches =
       Enum.filter(candidates, fn {project, _ref} ->
-        normalize_repo_url(project.repo_url) == target_norm
+        RepoUrl.normalize(project.repo_url) == target_norm
       end)
 
+    # At most one exact match: equal normalized URLs give equal `repo_key`s, and
+    # `projects_tenant_repo_key_active_uidx` holds one ACTIVE project per key (US-52.1).
     case exact_matches do
-      [{project, _ref}] ->
+      [{project, _ref} | _] ->
         {:ok, project, :repo_url}
-
-      [_ | _] ->
-        {:error, :ambiguous}
 
       [] ->
         candidates
@@ -830,72 +911,6 @@ defmodule Loopctl.Projects do
   defp host_compatible?(nil, _chost), do: true
   defp host_compatible?(_target_host, nil), do: true
   defp host_compatible?(target_host, chost), do: target_host == chost
-
-  # Lowercase, strip a trailing "/" then a trailing ".git" (then any residual "/").
-  defp normalize_repo_url(nil), do: nil
-
-  defp normalize_repo_url(url) when is_binary(url) do
-    url
-    |> String.trim()
-    |> String.downcase()
-    |> String.trim_trailing("/")
-    |> String.replace_suffix(".git", "")
-    |> String.trim_trailing("/")
-  end
-
-  # Parses a repo URL / ssh spec / bare "owner/repo" into `{host, path}` so the
-  # ssh, https, and bare forms compare equal while preserving the FULL namespace
-  # path. `host` is nil for bare input; `path` keeps every segment after the
-  # host (so GitLab subgroups group-a/team/api and group-b/team/api stay
-  # distinct). Returns nil when no "owner/repo"-shaped path (>= 2 segments) can
-  # be derived.
-  defp repo_ref(nil), do: nil
-
-  defp repo_ref(url) when is_binary(url) do
-    without_scheme =
-      url
-      |> normalize_repo_url()
-      # strip a URL scheme (https://, http://, git://, ssh://, ...)
-      |> String.replace(~r{^[a-z][a-z0-9+.\-]*://}, "")
-      # strip a leading userinfo (git@, user@) so scp-like specs parse
-      |> String.replace(~r{^[^/@]+@}, "")
-      # drop an explicit host :port (https://host:443/..., ssh://host:22/...) so
-      # a port-carrying URL still compares equal to the same repo stored without
-      # the port. Only a numeric :<digits> right after the host is a port.
-      |> String.replace(~r{^([^/:]+):\d+(/|$)}, "\\1\\2")
-      # scp-like "host:owner/repo" -> "host/owner/repo". Convert only the FIRST
-      # colon (the host/path separator) so a colon later in the path is intact.
-      |> String.replace(":", "/", global: false)
-
-    case String.split(without_scheme, "/", trim: true) do
-      [first | rest] = segments when rest != [] ->
-        # Treat the leading segment as a host ONLY when it looks like a hostname
-        # (contains a dot) AND the segments after it still form a >= 2-segment
-        # "owner/repo" path. This stops a bare, host-less "owner.with.dot/repo"
-        # from being misread as host="owner.with.dot" with a single remaining
-        # segment (which would drop an otherwise-valid path and return nil).
-        {host, path_segments} =
-          if host_segment?(first) and match?([_, _ | _], rest) do
-            {first, rest}
-          else
-            {nil, segments}
-          end
-
-        case path_segments do
-          [_, _ | _] -> {host, Enum.join(path_segments, "/")}
-          _ -> nil
-        end
-
-      _ ->
-        nil
-    end
-  end
-
-  # A leading segment LOOKS like a hostname when it contains a dot (github.com,
-  # gitlab.com, git.example.com). The caller additionally requires a >= 2-segment
-  # remaining path before treating it as a host, so a dotted bare owner does not
-  # get misclassified.
-  defp host_segment?(segment), do: String.contains?(segment, ".")
 
   # Escape LIKE metacharacters so an "owner/repo" containing `%` or `_` is
   # matched literally rather than as a wildcard in the ILIKE pre-filter.

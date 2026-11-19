@@ -1,0 +1,52 @@
+{
+  "id": "US-52.1",
+  "title": "A repo has one project: the server refuses a second",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_1",
+  "story": {"as_a": "session working in a repo", "i_want_to": "have loopctl refuse a second project for a repo that already has one, and name the existing one", "so_that": "every tool and every session on that repo uses one project and one channel"},
+  "rationale": "Mark, 2026-11-19 (docs/factory/architecture.md R5): 'somebody/something continues to create additional channels instead of reusing the same single channel per repo'. Nothing stops it today: Project.create_changeset/2 (lib/loopctl/projects/project.ex:83) checks slug uniqueness only, so four repos carry a kb scope with the repo_url plus a repo_url-less work project that an intake source binds instead, and loopctl#1067 was the cost. The fix is a server-side identity for a repo and a unique index on it, so no client hook is needed.",
+  "acceptance_criteria": [
+    {"id": "AC-52.1.1", "description": "Projects carry a repo_key column: the lowercased host/owner/repo derived from repo_url by the same normalization Projects.resolve_project/2 uses (https and ssh forms, a trailing .git and a trailing slash all give one key); nil when repo_url is nil or blank. It is set in the changeset from repo_url, never cast."},
+    {"id": "AC-52.1.2", "description": "A partial unique index projects_tenant_repo_key_active_uidx on (tenant_id, repo_key) WHERE status = 'active' AND repo_key IS NOT NULL; its migration backfills repo_key for every existing row and fails loudly, naming the colliding project ids, if two active projects of one tenant share a key."},
+    {"id": "AC-52.1.3", "description": "Projects.create_project/3, for kind :work and :kb alike, returns {:error, {:repo_has_project, existing_project_id}} when an active project of the tenant already has the same repo_key; the index's constraint error is mapped to the same tuple, so two concurrent creates yield one project and one refusal."},
+    {"id": "AC-52.1.4", "description": "Projects.update_project/4 and the restore of an archived project return the same refusal when the new or restored repo_key is held by another active project of the tenant."},
+    {"id": "AC-52.1.5", "description": "POST /api/v1/projects, POST /api/v1/kb-scopes, PATCH /api/v1/projects/:id and POST /api/v1/projects/:id/restore answer the refusal with 409, error.code repo_already_has_project, error.existing_project_id, and a message naming the existing project's slug and telling the caller to use it."},
+    {"id": "AC-52.1.6", "description": "Intake.create_source/3 refuses binding repo R to project P when another active project of the tenant has the repo_key of R: {:error, {:repo_has_project, existing_project_id}}, rendered by the intake source controller as the same 409. (update_source/4 cannot change a source's repo or project: @updatable_fields, lib/loopctl/intake.ex:585.)"},
+    {"id": "AC-52.1.7", "description": "Another tenant holding a project for the same repo does not block the create: the index and the check are tenant-scoped."},
+    {"id": "AC-52.1.8", "description": "The MCP tools create_project, create_kb_scope, update_project and intake_source_enroll say in their descriptions that a repo already held by a project is refused with 409 repo_already_has_project naming that project's id."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.1.1", "verifies": ["AC-52.1.1"], "name": "repo_key normalization", "type": "unit", "preconditions": ["Project.repo_key/1 (or the changeset) on several URL spellings"], "steps": ["https://github.com/mkreyman/chg, git@github.com:mkreyman/chg.git, https://github.com/MKreyman/chg/ and nil"], "expected_results": ["the first three give \"github.com/mkreyman/chg\"; nil gives nil"]},
+    {"id": "TC-52.1.2", "verifies": ["AC-52.1.2", "AC-52.1.3"], "name": "a second project on one repo is refused, either kind (DataCase)", "type": "integration", "preconditions": ["tenant = fixture(:tenant); fixture(:project, %{tenant_id: tenant.id, kind: :kb, slug: \"chg\", repo_url: \"git@github.com:mkreyman/chg.git\"})"], "steps": ["Projects.create_project(tenant.id, %{name: \"chg2\", slug: \"chg2\", repo_url: \"https://github.com/mkreyman/chg\"})", "the same with kind: :kb"], "expected_results": ["both {:error, {:repo_has_project, kb_scope.id}}"]},
+    {"id": "TC-52.1.3", "verifies": ["AC-52.1.3"], "name": "the index decides a race: an insert bypassing the pre-check maps the constraint to the refusal (DataCase)", "type": "integration", "preconditions": ["an active project holding the repo_key"], "steps": ["insert a second changeset straight through AdminRepo.insert with the same repo_key"], "expected_results": ["{:error, {:repo_has_project, first.id}}, not a raised constraint error"]},
+    {"id": "TC-52.1.4", "verifies": ["AC-52.1.4"], "name": "update and restore onto a held repo are refused; an archived holder does not block (DataCase)", "type": "integration", "preconditions": ["project A active on repo R; project B active with no repo_url; project C archived on repo R"], "steps": ["Projects.update_project(tenant.id, b, %{repo_url: R})", "restore C", "archive A, then restore C"], "expected_results": ["refused, refused, then C restored"]},
+    {"id": "TC-52.1.5", "verifies": ["AC-52.1.5"], "name": "409 body on each project route (ConnCase)", "type": "integration", "preconditions": ["a human-anchored tenant with an active project on repo R; a user key and an orchestrator key"], "steps": ["POST /api/v1/projects with repo_url R", "POST /api/v1/kb-scopes with repo_url R", "PATCH another project to repo R", "restore an archived project on R"], "expected_results": ["each 409 with code repo_already_has_project and existing_project_id of the holder"]},
+    {"id": "TC-52.1.6", "verifies": ["AC-52.1.6"], "name": "an intake source cannot bind a repo to a project that does not hold it (DataCase + ConnCase)", "type": "integration", "preconditions": ["kb scope K holds repo mkreyman/chg; work project W has no repo_url"], "steps": ["Intake.create_source(tenant.id, %{repo_full_name: \"mkreyman/chg\", project_id: W.id})", "POST /api/v1/intake/sources with the same body", "the same source on K"], "expected_results": ["{:error, {:repo_has_project, K.id}}; 409 repo_already_has_project; {:ok, _} on K"]},
+    {"id": "TC-52.1.7", "verifies": ["AC-52.1.7"], "name": "tenant isolation: another tenant's project on the repo does not block (DataCase)", "type": "integration", "preconditions": ["tenant A holds repo R; tenant B holds none"], "steps": ["Projects.create_project(tenant_b.id, %{... repo_url: R})"], "expected_results": ["{:ok, project} in tenant B"]},
+    {"id": "TC-52.1.8", "verifies": ["AC-52.1.8"], "name": "tool descriptions name the refusal", "type": "unit", "preconditions": ["mcp-server tool list"], "steps": ["read the four tools' descriptions in node --test"], "expected_results": ["each contains repo_already_has_project"]}
+  ],
+  "technical_notes": [
+    "Project schema: lib/loopctl/projects/project.ex:59-72; create_changeset/2 at :83, update_changeset at ~:105; slug_unique_constraint/1 at :120 is the pattern for the new unique_constraint.",
+    "Normalization exists privately in Projects: normalize_repo_url/1 at lib/loopctl/projects.ex:835 and repo_ref/1 at :852. Move the key derivation into one public function (Projects.repo_key/1 or Project.repo_key/1) and have resolve_by_repo_url/2 (:739) and the changeset both call it, so the index and the resolver can never disagree.",
+    "create_project/3 at lib/loopctl/projects.ex:44 (kind set on the struct at :51-54); update_project/4 at :338; restore is ProjectController.restore/2 at lib/loopctl_web/controllers/project_controller.ex:509; create/2 at :268, create_kb_scope/2 at :305, update/2 at :470.",
+    "Intake.create_source/3 at lib/loopctl/intake.ex:259 builds the changeset through put_project/3 (:323); add the repo check there, reading the source's repo_full_name against Projects.repo_key/1 of github.com/<repo_full_name>. update_source/4 is at :603.",
+    "The 409 is rendered in FallbackController (lib/loopctl_web/fallback_controller.ex) from {:error, {:repo_has_project, id}}, and added to each route's operation/2 responses (CLAUDE.md, Doc hygiene: new API constraint).",
+    "Existing production data has no active duplicate repo_url (list_projects, 2026-11-19): the four duplicate pairs hold their repo on the kb scope only, so the backfill and index succeed; 52.3 merges the pairs.",
+    "MCP: tool declarations in mcp-server/index.js (create_project at ~:3866, create_kb_scope at ~:3897); the handoff tool (~:3949) resolves before creating a kb scope, so it already reuses the existing project.",
+    "Migration: name it after git fetch origin (README Lanes rule 3); the backfill runs in the migration in Elixir with the same repo_key function, and raises with the colliding ids rather than skipping."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Merging the existing duplicate pairs: US-52.2 (the operation) and US-52.3 (running it).",
+    "Promoting a kb scope to a work project when delivery starts: US-52.3.",
+    "Any client-side hook change in claude-config: the server is the only enforcement."
+  ],
+  "failure_modes": {"partition": "n/a: every check is a read and an insert against loopctl's own database inside one request; no second service holds a project.", "state": "AC-52.1.2: the repo's owner is decided by projects.repo_key under a unique index, so a restart or deploy loses nothing and no cache can disagree.", "retry": "AC-52.1.3: a retried create meets the index and gets the same refusal naming the same project, so a retry never makes a second project.", "slow": "n/a: one indexed lookup per create; no network call.", "reach": "n/a: runs inline in the request process; nothing is queued."},
+  "definition_of_done": [
+    "On production after deploy: SELECT tenant_id, repo_key, count(*) FROM projects WHERE status = 'active' AND repo_key IS NOT NULL GROUP BY 1, 2 HAVING count(*) > 1 returns no rows.",
+    "create_kb_scope for git@github.com:mkreyman/chg.git from an MCP session returns 409 repo_already_has_project with existing_project_id eba0b4df-e9ab-4908-a316-f55c698fe8bd."
+  ],
+  "expected_size": {"insertions": 260, "files": 9},
+  "estimated_tokens": 350000
+}

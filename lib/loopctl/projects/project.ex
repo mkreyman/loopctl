@@ -17,6 +17,8 @@ defmodule Loopctl.Projects.Project do
   A `kind: :kb` scope is a repo's coordination channel, and its `name` must equal its
   `slug` (#1038): two strings made by two rules drifted apart on 17 of 29 projects.
   - `repo_url` -- GitHub/GitLab repository URL
+  - `repo_key` -- the repo's identity, derived from `repo_url` (`Loopctl.Projects.RepoUrl.key/1`);
+    at most one ACTIVE project of a tenant holds a given key (US-52.1)
   - `description` -- freeform text description
   - `tech_stack` -- e.g., "elixir/phoenix", "typescript/fastify"
   - `status` -- `:active` or `:archived`
@@ -28,6 +30,8 @@ defmodule Loopctl.Projects.Project do
   """
 
   use Loopctl.Schema
+
+  alias Loopctl.Projects.RepoUrl
 
   @type t :: %__MODULE__{}
 
@@ -60,6 +64,10 @@ defmodule Loopctl.Projects.Project do
     field :name, :string
     field :slug, :string
     field :repo_url, :string
+    # The repo's identity (US-52.1), derived from `repo_url` by `RepoUrl.key/1` in every
+    # changeset and never cast. One ACTIVE project per (tenant, repo_key) is held by
+    # `projects_tenant_repo_key_active_uidx`, so a repo has one project and one channel.
+    field :repo_key, :string
     field :description, :string
     field :tech_stack, :string
     field :status, Ecto.Enum, values: @statuses, default: :active
@@ -88,6 +96,7 @@ defmodule Loopctl.Projects.Project do
     |> validate_kb_name_equals_slug()
     |> validate_mission()
     |> validate_metadata()
+    |> put_repo_key()
     |> slug_unique_constraint()
   end
 
@@ -114,7 +123,25 @@ defmodule Loopctl.Projects.Project do
     |> validate_kb_name_equals_slug()
     |> validate_mission()
     |> validate_metadata()
+    |> put_repo_key()
     |> slug_unique_constraint()
+  end
+
+  @doc "The name of the index that holds one active project per repo (US-52.1)."
+  @spec repo_key_index() :: atom()
+  def repo_key_index, do: :projects_tenant_repo_key_active_uidx
+
+  # Derived from whatever `repo_url` the changeset ends with, so a create, an edit that sets,
+  # changes or clears it, all keep the key in step. The constraint maps a race the caller's
+  # pre-check lost to a changeset error on :repo_key, which `Projects` turns into the
+  # `{:repo_has_project, id}` refusal.
+  defp put_repo_key(changeset) do
+    changeset
+    |> put_change(:repo_key, RepoUrl.key(get_field(changeset, :repo_url)))
+    |> unique_constraint(:repo_key,
+      name: repo_key_index(),
+      message: "already has a project in this tenant"
+    )
   end
 
   defp slug_unique_constraint(changeset) do
@@ -194,7 +221,12 @@ defmodule Loopctl.Projects.Project do
   """
   @spec activate_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
   def activate_changeset(project) do
-    change(project, status: :active)
+    project
+    |> change(status: :active)
+    |> unique_constraint(:repo_key,
+      name: repo_key_index(),
+      message: "already has a project in this tenant"
+    )
   end
 
   @doc """

@@ -179,21 +179,21 @@ defmodule Loopctl.Delivery.EscalationHandoffsTest do
         set: [repo_url: nil]
       )
 
-      scope =
-        fixture(:project, %{
-          tenant_id: story.tenant_id,
-          kind: :kb,
-          slug: "chg",
-          repo_url: "git@github.com:mkreyman/chg.git"
-        })
-
+      # The pre-US-52.1 production shape: the source was bound to the work project before
+      # the kb scope took the repo_url. A source can no longer be bound that way round, so it
+      # is enrolled first, while no project holds the repo.
       fixture(:intake_source, %{
         tenant_id: story.tenant_id,
         project_id: story.project_id,
         repo_full_name: "mkreyman/chg"
       })
 
-      scope
+      fixture(:project, %{
+        tenant_id: story.tenant_id,
+        kind: :kb,
+        slug: "chg",
+        repo_url: "git@github.com:mkreyman/chg.git"
+      })
     end
 
     test "the handoff is posted on the channel the story's repo resolves to" do

@@ -79,12 +79,18 @@ defmodule LoopctlWeb.ProjectController do
 
   tags(["Projects"])
 
+  # US-52.1: one response, cited by every route that can give a repo a second active project.
+  @repo_conflict {"repo_already_has_project: another active project of the tenant holds this " <>
+                    "repo_url; error.existing_project_id names it. A repo has one project.",
+                  "application/json", Schemas.ErrorResponse}
+
   operation(:create,
     summary: "Create project",
     description: "Creates a new project. Requires user+ role.",
     request_body: {"Project params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       201 => {"Project created", "application/json", Schemas.ProjectResponse},
+      409 => @repo_conflict,
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -100,6 +106,7 @@ defmodule LoopctlWeb.ProjectController do
     request_body: {"KB scope params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       201 => {"KB scope created", "application/json", Schemas.ProjectResponse},
+      409 => @repo_conflict,
       422 =>
         {"Validation error or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -134,6 +141,7 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Restored KB scope", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => @repo_conflict,
       422 =>
         {"Not a KB scope, or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -191,6 +199,7 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Updated project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => @repo_conflict,
       422 =>
         {"Validation error, or status in the body", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -210,6 +219,7 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Restored project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => @repo_conflict,
       422 => {"A kb scope, or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -288,8 +298,8 @@ defmodule LoopctlWeb.ProjectController do
       {:error, :project_limit_reached} ->
         {:error, :unprocessable_entity, "Project limit reached for this tenant"}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -325,8 +335,8 @@ defmodule LoopctlWeb.ProjectController do
       {:error, :project_limit_reached} ->
         {:error, :unprocessable_entity, "Project limit reached for this tenant"}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -383,8 +393,8 @@ defmodule LoopctlWeb.ProjectController do
       {:error, :project_limit_reached} ->
         {:error, :unprocessable_entity, "Project limit reached for this tenant"}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -491,8 +501,8 @@ defmodule LoopctlWeb.ProjectController do
         {:ok, updated} ->
           json(conn, %{project: project_json(updated)})
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
+        {:error, _reason} = error ->
+          error
       end
     end
   end

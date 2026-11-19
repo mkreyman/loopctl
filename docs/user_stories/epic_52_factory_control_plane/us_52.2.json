@@ -1,0 +1,49 @@
+{
+  "id": "US-52.2",
+  "title": "Merge a project into its repo's project",
+  "epic": {"id": "epic_52", "name": "Factory control plane"},
+  "priority": "high",
+  "phase": "factory_release_1",
+  "story": {"as_a": "operator session", "i_want_to": "move everything a duplicate project holds into the repo's project in one call", "so_that": "the repo has one project and one channel without losing a story, post, claim or article"},
+  "rationale": "docs/factory/architecture.md R5 asks for today's duplicates to be merged: chg-delivery into chg, ads_for_care-delivery into ads_for_care, claude-config-delivery into claude-config, infra-pilot into infra. No operation does that: a project's rows are spread over every table with a project_id (stories, epics, intake sources, channel posts and claims, articles, memories, orchestrator state and more, see technical_notes), and moving them by hand on production is how a row gets left behind on an archived project.",
+  "acceptance_criteria": [
+    {"id": "AC-52.2.1", "description": "Loopctl.Projects.Merge.merge_into(tenant_id, source_id, target_id, opts) moves every row of every table in its @project_tables list from project_id = source to project_id = target in one AdminRepo transaction, then archives the source with metadata.merged_into = target_id; the target keeps its id, slug and repo_url."},
+    {"id": "AC-52.2.2", "description": "A test reads information_schema for every column named project_id with a foreign key to projects and fails, naming the table, when @project_tables does not list exactly that set."},
+    {"id": "AC-52.2.3", "description": "Before moving anything, the merge checks each per-project unique key (epics and stories by number, orchestrator_states by state_key, channel_claims by ref, channel_posts by their keyed-slot and idempotency indexes) for a value present under both projects, and returns {:error, {:merge_conflicts, conflicts}} with table, key and both row ids for each, writing nothing."},
+    {"id": "AC-52.2.4", "description": "With dry_run: true it returns {:ok, %{dry_run: true, counts: %{table => n}, conflicts: [...]}} and writes nothing."},
+    {"id": "AC-52.2.5", "description": "When the source is kind :work and the target kind :kb, the target becomes kind :work in the same transaction; a :kb source never changes the target's kind."},
+    {"id": "AC-52.2.6", "description": "A repeat call whose source is already archived with metadata.merged_into equal to the target returns {:ok, %{already_merged: true}} and moves nothing; a source equal to the target, an archived target, or an id outside the tenant is refused (:same_project, :target_not_active, :not_found)."},
+    {"id": "AC-52.2.7", "description": "One audit entry, action merged_into, entity the source, metadata holding the target id and the per-table counts, is written in the merge's transaction."},
+    {"id": "AC-52.2.8", "description": "POST /api/v1/projects/:id/merge_into {target_project_id, dry_run} is gated role: :user and RequireHumanAnchor, answers 200 with the result, 409 merge_conflicts with the list, and 403 to an orchestrator or agent key; the MCP tool merge_project calls it, with a wiring test and a mcp-server/README.md row."}
+  ],
+  "test_cases": [
+    {"id": "TC-52.2.1", "verifies": ["AC-52.2.1", "AC-52.2.5"], "name": "a work project merges into a kb scope: rows move, kind becomes work, source archived (DataCase)", "type": "integration", "preconditions": ["tenant; kb scope K with repo_url and one article; work project W with an epic, a story, an intake source, a channel post and claim, an orchestrator state"], "steps": ["Merge.merge_into(tenant.id, W.id, K.id, [])"], "expected_results": ["every listed row has project_id K.id; K.kind == :work; W.status == :archived with metadata[\"merged_into\"] == K.id"]},
+    {"id": "TC-52.2.2", "verifies": ["AC-52.2.2"], "name": "@project_tables matches the schema's project_id foreign keys (DataCase)", "type": "integration", "preconditions": ["the test database"], "steps": ["query information_schema.key_column_usage joined to referential constraints for project_id -> projects"], "expected_results": ["the set equals Merge.project_tables()"]},
+    {"id": "TC-52.2.3", "verifies": ["AC-52.2.3"], "name": "a story number held by both projects refuses the merge and writes nothing (DataCase)", "type": "integration", "preconditions": ["two work projects each with a story numbered \"1.1\""], "steps": ["merge_into(tenant.id, a.id, b.id, [])"], "expected_results": ["{:error, {:merge_conflicts, [%{table: \"stories\", ...}]}}; every row still under its own project"]},
+    {"id": "TC-52.2.4", "verifies": ["AC-52.2.4"], "name": "dry run reports counts and writes nothing (DataCase)", "type": "integration", "preconditions": ["as TC-52.2.1"], "steps": ["merge_into(tenant.id, W.id, K.id, dry_run: true)"], "expected_results": ["counts per table; W still active; no row moved"]},
+    {"id": "TC-52.2.5", "verifies": ["AC-52.2.6"], "name": "repeat and invalid merges (DataCase)", "type": "integration", "preconditions": ["W already merged into K; another tenant's project X"], "steps": ["merge_into again", "merge_into(K, K)", "merge_into(W2, archived)", "merge_into(tenant.id, W2.id, X.id, [])"], "expected_results": ["{:ok, %{already_merged: true}}; :same_project; :target_not_active; :not_found"]},
+    {"id": "TC-52.2.6", "verifies": ["AC-52.2.7"], "name": "the merge writes one merged_into audit entry (DataCase)", "type": "integration", "preconditions": ["as TC-52.2.1"], "steps": ["merge, then read audit_log for entity W"], "expected_results": ["one entry, action merged_into, metadata target_id K.id and counts"]},
+    {"id": "TC-52.2.7", "verifies": ["AC-52.2.8"], "name": "route gates and bodies (ConnCase)", "type": "integration", "preconditions": ["human-anchored tenant; user, orchestrator and agent keys"], "steps": ["POST /api/v1/projects/W/merge_into with each key", "with a conflicting pair on the user key"], "expected_results": ["200 for the user key; 403 for orchestrator and agent; 409 merge_conflicts"]},
+    {"id": "TC-52.2.8", "verifies": ["AC-52.2.8"], "name": "merge_project tool is declared, dispatched and sends the route's body", "type": "unit", "preconditions": ["mcp-server"], "steps": ["node --test mcp-server/test"], "expected_results": ["merge_project declared and handled; POST /api/v1/projects/<id>/merge_into with target_project_id and dry_run"]}
+  ],
+  "technical_notes": [
+    "Schemas with project_id (grep 'field :project_id\\|belongs_to :project' in lib/): work_breakdown/story.ex, epic.ex, intake/source.ex, intake/record.ex, coordination/channel_post.ex, channel_claim.ex, knowledge/article.ex, search_event.ex, article_access_event.ex, memory/memory.ex, session_memory.ex, orchestrator/orchestrator_state.ex, quality_assurance/ui_test_run.ex, webhooks/webhook.ex, reply_drafts/reply_draft.ex, corpus/corpus.ex, token_usage/report.ex, egress/blocked_decision.ex, scope_marking.ex, skills/skill.ex, audit/audit_log.ex, agents/tuning_draft.ex, run_outcome.ex. The authority is the information_schema test (AC-52.2.2), not this list; a table without an FK (audit_log, if so) is decided there and written into the module.",
+    "Per-project unique indexes: epics (tenant_id, project_id, number) priv/repo/migrations/20260327160720_create_epics.exs:24; stories (tenant_id, project_id, number) 20260327161318_create_stories.exs:37; orchestrator_states (tenant_id, project_id, state_key) 20260327171615_create_orchestrator_states.exs:21; channel_claims (tenant_id, project_id, ref) 20260719140000_create_channel_claims.exs:46; channel_posts slot 20260718000000_harden_channel_posts_slot_and_ordering.exs:22 and idempotency 20260719150000_add_idempotency_key_to_channel_posts.exs:42.",
+    "Kind is never cast (Projects.create_project/3, lib/loopctl/projects.ex:49-54); the merge sets it with Ecto.Changeset.change/2 on the target struct.",
+    "Archive with Projects.archive_project/3 (lib/loopctl/projects.ex:408) inside the merge's Multi, or its update inlined, so the archive and the moves commit together.",
+    "Controller: a merge_into action on LoopctlWeb.ProjectController (lib/loopctl_web/controllers/project_controller.ex) with RequireHumanAnchor and RequireRole role: :user for it, mirroring :delete at :60 and :66; route next to the other project member routes in lib/loopctl_web/router.ex:524.",
+    "MCP: declaration and case in mcp-server/index.js beside restore_project (~:4353), a lib/ request module, and a test under mcp-server/test (CLAUDE.md, 'An operator-facing endpoint is NOT DONE until an MCP tool calls it')."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Running the merges on production: US-52.3.",
+    "Un-merging: a merge is undone by merging back only where no row was created since; not offered.",
+    "Merging projects of two tenants."
+  ],
+  "failure_modes": {"partition": "AC-52.2.1: the merge is one transaction, so a client that loses the connection mid-call finds either everything moved or nothing, and AC-52.2.6 tells it which on retry.", "state": "AC-52.2.1: rows keep living in their own tables under the target id; the source row stays, archived, recording merged_into, so the history is inspectable.", "retry": "AC-52.2.6: a repeat call on an already-merged source answers already_merged and moves nothing.", "slow": "AC-52.2.4: a dry run reports the row counts first; the transaction runs with AdminRepo's default timeout and either commits or rolls back whole.", "reach": "n/a: runs inline in the request process; nothing is queued."},
+  "definition_of_done": [
+    "merge_project with dry_run: true for chg-delivery into chg on production returns non-zero counts for stories and channel_posts and an empty conflicts list."
+  ],
+  "expected_size": {"insertions": 420, "files": 8},
+  "estimated_tokens": 450000
+}

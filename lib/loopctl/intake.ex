@@ -151,7 +151,9 @@ defmodule Loopctl.Intake do
   alias Loopctl.Intake.Source
   alias Loopctl.Intake.TicketFacts
   alias Loopctl.LocalGuc
+  alias Loopctl.Projects
   alias Loopctl.Projects.Project
+  alias Loopctl.Projects.RepoUrl
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -271,8 +273,21 @@ defmodule Loopctl.Intake do
       |> refuse_root_and_mint(mint)
 
     with {:ok, changeset} <- valid(changeset),
+         :ok <- repo_belongs_to(tenant_id, repo, Ecto.Changeset.get_field(changeset, :project_id)),
          {:ok, source} <- insert_source(tenant_id, changeset, root_mint_opts(mint, opts)) do
       {:ok, %{source: source, webhook_secret: secret}}
+    end
+  end
+
+  # A repo has one project (US-52.1): a source for repo R binds only to the project that holds
+  # R, or to a project when NO active project holds R. Binding R to a second project is how
+  # four repos came to carry a kb scope plus a `-delivery` work project, and two channels.
+  # `update_source/4` cannot change a source's repo or project, so this is the one path.
+  defp repo_belongs_to(tenant_id, repo, project_id) do
+    case Projects.repo_holder(tenant_id, RepoUrl.key(repo)) do
+      {:ok, %{id: ^project_id}} -> :ok
+      {:ok, holder} -> {:error, {:repo_has_project, holder.id}}
+      :error -> :ok
     end
   end
 
