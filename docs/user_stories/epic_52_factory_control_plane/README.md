@@ -181,13 +181,16 @@ How the lanes share one branch:
 
 ## Design coverage
 
-Releases 1-10 add no screen. Release 11 adds one public page and changes the public pages'
-links; each is bound to `docs/design-system.md`:
+No release adds a screen except release 11, which adds one public page. Release 4 removes a
+section from the public docs page, and release 11 changes the public pages' links; each change
+is bound to `docs/design-system.md`:
 
 | screen | change | design-system sections | story |
 |---|---|---|---|
-| `GET /docs/delivery-loop` (new) | renders `docs/agent-delivery-loop.md` with the docs page's nav and WikiShowLive's prose classes | 2 Color Palette (dark only), 3 Typography, 4 Layout Principles, 5 Navigation (Landing Page) and Code Blocks | 52.65 |
-| landing and docs top nav | the GitHub link becomes the npm package link, labelled npm, in the template and in the design system's drawing | 5 Navigation (Landing Page) | 52.65 |
+| docs page (`docs.html.heex`) | the orchestrator_state section is removed with its routes; nothing is restyled | none: a content removal | 52.17 |
+| `GET /docs/delivery-loop` (new) | renders `docs/agent-delivery-loop.md` with the docs page's nav and WikiShowLive's prose classes, its pre classes set to section 5's Code Blocks | 2 Color Palette (dark only), 3 Typography, 4 Layout Principles, 5 Navigation (Landing Page) and Code Blocks | 52.65 |
+| landing and docs navs (top and mobile) and footers | the GitHub link becomes the npm package link, labelled npm, in the templates and in the design system's nav drawing | 5 Navigation (Landing Page) | 52.65 |
+| landing hero and closing CTA | the secondary 'View on GitHub' CTA becomes 'View on npm' to the npm package, in the template and in the design system's hero drawing and its two-CTA rule | 7 Hero Section | 52.65 |
 | terms and privacy Contact sections | the operator address replaces GitHub issues | 3 Typography | 52.65 |
 
 ## What "done" means, for every story
@@ -383,7 +386,7 @@ links; each is bound to `docs/design-system.md`:
   - `Loopctl.Workers.EscalationSweepWorker`, which replaces `EscalationDigestWorker`;
   - `Loopctl.Workers.ChgIndependentPathsWorker` (52.31a).
 - **Stage machine:**
-  - the edges `:holder_resolution`, `:retriage`, `:cancelled`, `:closed`, `:holders_exhausted` and `:independent_unverified` (52.31a);
+  - the edges `:holder_resolution`, `:retriage`, `:cancelled`, `:closed`, `:holders_exhausted`, `:independent_unverified` and `:independent_verified` (52.31a);
   - the release cause `:intervention`.
 - **Error codes:** `self_resolve_blocked`, `holder_required`, `review_missing_unreviewed`, `self_intervention_blocked`, `not_requeueable`, `already_landed`, `no_intake_source` and `independent_verification`.
 - **Columns and indexes:**
@@ -391,6 +394,7 @@ links; each is bound to `docs/design-system.md`:
   - `intervention_id`, with the index `story_stage_events_intervention_uidx`;
   - the index `story_stage_events_tenant_to_stage_inserted_idx`.
 - **Config and payloads:** `STRONGER_HOLDER_MODEL`, Gate B document v2 (`independent_paths`, `independent_checks`), the Gate B outcome `:independent` and the dispatch payload field `model`.
+- **Runner contract:** 1.37.0 (52.34), one bump carrying the dispatch field `model` and the review dispatch kind.
 
 **Deleted:** `StoryHistoryController` and the `/stories/:id/history` route, the digest functions in `EscalationInbox`, and `EscalationDigestWorker`.
 
@@ -399,13 +403,14 @@ links; each is bound to `docs/design-system.md`:
 | hub file | owner story | other stories that edit it |
 |---|---|---|
 | `router.ex` | 52.29 | 52.30, 52.32, 52.33 |
-| `mcp-server/index.js`, `mcp-server/README.md` | 52.29 | 52.30-52.33 |
+| `mcp-server/index.js`, `mcp-server/README.md` | 52.29 | 52.30-52.33, 52.31a |
 | `stage_machine.ex` | 52.31 | 52.31a, 52.32, 52.34 |
 | `escalations.ex` | 52.31 | 52.31a, 52.32 |
 | CLAUDE.md trust-model section | 52.31 | 52.32 |
-| `CHANGELOG.md` | 52.31 | 52.32-52.34 |
+| `CHANGELOG.md` | 52.31 | 52.31a, 52.32-52.34 |
 | `docs/agent-delivery-loop.md` | 52.31 | 52.34 |
 | `FLY_SECRETS.md` | 52.34 | — |
+| `runner_contract.ex` | 52.34 | — |
 
 **API parity:**
 
@@ -430,7 +435,7 @@ links; each is bound to `docs/design-system.md`:
 - **Modules and events:** `Loopctl.Delivery.IntakeRecheck`, the event `rechecked`, and the candidate predicates `:rechecked` and `:intake_not_paused`.
 - **Stage machine:** the edges `:recheck_fixed`, `:recheck_duplicate` and `:recheck_stale`; the verdicts `:already_fixed`, `:duplicate` and `:no_longer_reproduces`.
 - **Evidence:** `issue_closures.evidence` and `PullRequestSource.closing_references/3`.
-- **Dispatch:** the spec `recheck@1` (message `recheck_result`, payload `:recheck_payload`), with `RECHECK_WALL_CLOCK_SECONDS` and `RECHECK_MAX_TURNS`, and runner contract 1.37.0, which adds the recheck kind.
+- **Dispatch:** the spec `recheck@1` (message `recheck_result`, payload `:recheck_payload`), with `RECHECK_WALL_CLOCK_SECONDS` and `RECHECK_MAX_TURNS`, and runner contract 1.38.0, which adds the recheck kind.
 
 **Hub files, with their owner story:**
 
@@ -468,7 +473,7 @@ links; each is bound to `docs/design-system.md`:
 - **Host daemon:** `LoopctlRunner.HostReport`, `LoopctlRunner.CiPool`, `runner/ci/` and `PLACEMENT_MAX_LOAD_PER_CORE` (1.0).
 - **Handoff migration:** `Loopctl.Factory.MigrateHandoffs`.
 - **Measurements:** `docs/factory/measurements/release-7.md` (`bound_bytes`, `grant_rule`).
-- **Runner contract:** 1.38.0 (52.44), then 1.39.0 (52.47), in that order: 52.47 depends on 52.44 so two lanes never claim one version.
+- **Runner contract:** 1.39.0 (52.44), then 1.40.0 (52.47), in that order: 52.47 depends on 52.44 so two lanes never claim one version.
 
 **Hub files, with their owner story:**
 
