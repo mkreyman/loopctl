@@ -2593,7 +2593,9 @@ defmodule LoopctlRunner.Control do
 
   # --- Observed stages (US-48.16): a pr-mode session's pull request, as the forge reported it ---
   #
-  # A pr-mode session opens and merges its own pull request, and nothing else tells loopctl. So
+  # A pr-mode session opens its pull request, or on a rework pushes to the one the dispatch names,
+  # and stops at green CI (it never merges: loopctl does, through `MergeRun`). Nothing the session
+  # says tells loopctl how far that pull request got. So
   # once it is over the run asks the forge (`DispatchRun.observe/4`) and the stages that answer
   # shows arrive here as `{:observed, stages}`, ahead of the run's end. Each is an ORDINARY stage
   # report over `forward` in this dispatch's stream — sent in order, one at a time, held across a

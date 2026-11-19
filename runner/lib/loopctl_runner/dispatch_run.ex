@@ -265,9 +265,13 @@ defmodule LoopctlRunner.DispatchRun do
 
   Only a `pr`-mode session gets any, read as `prompt/4` reads it: `.loopctl/mode` in the commit the
   worktree was cut from, never the working tree the session could write. In `pr` mode the session
-  opens its pull request with `gh pr create --base <base>` and merges it into that base, and
-  nothing else tells loopctl it did — so the runner asks the forge about the dispatch's own repo,
-  branch and base and nothing else, and `LoopctlRunner.PrStages` says what that answer shows.
+  opens its pull request with `gh pr create --base <base>` (on a rework dispatch, contract
+  1.31.0, it pushes to the pull request the dispatch names instead) and stops at green CI; it
+  never merges (US-48.17). loopctl merges it later, through a `merge` instruction
+  (`LoopctlRunner.MergeRun`), once an independent verifier passed the head and the merge gate
+  allowed it. Nothing the session says tells loopctl how far its pull request got, so the runner
+  asks the forge about the dispatch's own repo, branch and base and nothing else, and
+  `LoopctlRunner.PrStages` says what that answer shows.
   Every value reported is the forge's; none comes from session text or a file the session wrote.
 
   `forge` is `(repo, head, base, timeout_ms) -> {:ok, list} | {:error, reason}` —
