@@ -243,11 +243,16 @@ defmodule LoopctlWeb.ChgLiveTest do
     } do
       finding!(tenant_id, %{state: :filed, kind: "flaky_test"})
       finding!(tenant_id, %{state: :escalated, kind: "selection_miss", issue_number: 77})
+      finding!(tenant_id, %{state: :filed, kind: "flaky_test"})
 
       {:ok, view, _html} = live(conn, ~p"/chg")
 
-      assert has_element?(view, "#findings-by-state", "filed")
-      assert has_element?(view, "#findings-by-kind", "selection_miss")
+      # The counts themselves, not the labels: each label renders whatever the tally holds.
+      assert view |> element("#findings-state-filed") |> render() =~ ~r/>\s*2\s*</
+      assert view |> element("#findings-state-escalated") |> render() =~ ~r/>\s*1\s*</
+      assert view |> element("#findings-state-queued") |> render() =~ ~r/>\s*0\s*</
+      assert view |> element("#findings-kind-flaky_test") |> render() =~ ~r/>\s*2\s*</
+      assert view |> element("#findings-kind-selection_miss") |> render() =~ ~r/>\s*1\s*</
       assert has_element?(view, "#escalated-list", "#77")
       assert has_element?(view, "#escalated-list", "fix_attempts_2")
     end

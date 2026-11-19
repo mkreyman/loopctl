@@ -728,10 +728,18 @@ defmodule Loopctl.Changes.Findings do
   end
 
   # `{finding_id, merge_sha}` for each filed finding whose issue became a story that merged.
+  # Repositories compare case-folded, as filing and intake admission do. A finding reopened by
+  # a recurrence keeps its issue and its earlier `fix_merge_sha`, and that merge is the fix
+  # that already failed: an issue has one story and one stage (`stories_intake_record_uidx`),
+  # so a new fix is that stage merging on ANOTHER sha. Without this a recurrence re-credited
+  # the failed fix on the next sweep, and the sighting after it escalated a fix nobody
+  # attempted.
   defp merged_fixes(tenant_id) do
     from(f in Finding,
       join: src in Source,
-      on: src.tenant_id == f.tenant_id and src.repo_full_name == f.repo_full_name,
+      on:
+        src.tenant_id == f.tenant_id and
+          fragment("lower(?) = lower(?)", src.repo_full_name, f.repo_full_name),
       join: r in Record,
       on:
         r.tenant_id == f.tenant_id and r.source_id == src.id and
@@ -747,7 +755,16 @@ defmodule Loopctl.Changes.Findings do
       order_by: [asc: f.id, desc: st.updated_at],
       select: {f.id, st.merge_sha}
     )
+    |> not_the_failed_fix()
   end
+
+  defp not_the_failed_fix(query),
+    do:
+      where(
+        query,
+        [f, _src, _r, _s, st],
+        is_nil(f.fix_merge_sha) or st.merge_sha != f.fix_merge_sha
+      )
 
   @doc """
   Closes the issue of each `:fixed` finding not seen since its fix for `quiet_days/0`: the
@@ -877,7 +894,7 @@ defmodule Loopctl.Changes.Findings do
       join: f in Finding,
       on:
         f.tenant_id == r.tenant_id and f.issue_number == r.issue_number and
-          f.repo_full_name == src.repo_full_name,
+          fragment("lower(?) = lower(?)", f.repo_full_name, src.repo_full_name),
       where: st.tenant_id == ^tenant_id and st.merge_sha in ^shas,
       select: max(f.loop_depth)
     )
@@ -1131,38 +1148,41 @@ defmodule Loopctl.Changes.Findings do
 
   @doc """
   Records the issue an `open` action created, before anything else is done to it, so a retry
-  after a crash labels that issue rather than searching for it.
+  after a crash labels that issue rather than searching for it. The FINDING takes the number
+  in the same transaction: the issue exists from this moment whatever becomes of the label
+  step, and US-51.3's intake admission, the fix lifecycle and the closing comment all read the
+  finding's number. Copying it only when the action was done left a finding with no issue
+  whenever the label step was abandoned after the create.
   """
   @spec record_issue(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) ::
           {:ok, FindingAction.t()} | {:error, :not_pending}
   def record_issue(tenant_id, id, issue_number) when is_integer(issue_number) do
-    ForgeOutbox.update_pending(FindingAction, tenant_id, id,
-      set: [issue_number: issue_number, updated_at: DateTime.utc_now()]
-    )
+    now = DateTime.utc_now()
+
+    AdminRepo.transaction(fn ->
+      case ForgeOutbox.update_pending(FindingAction, tenant_id, id,
+             set: [issue_number: issue_number, updated_at: now]
+           ) do
+        {:ok, recorded} -> record_on_finding(recorded, now)
+        {:error, :not_pending} -> AdminRepo.rollback(:not_pending)
+      end
+    end)
   end
 
-  @doc """
-  Marks the action done. For an `open`, the finding takes the issue number in the same
-  transaction, which is what US-51.3's intake admission reads.
-  """
+  @doc "Marks the action done."
   @spec mark_done(FindingAction.t()) :: {:ok, FindingAction.t()} | {:error, :not_pending}
   def mark_done(%FindingAction{} = action) do
     now = DateTime.utc_now()
 
-    AdminRepo.transaction(fn ->
-      case ForgeOutbox.update_pending(FindingAction, action.tenant_id, action.id,
-             set: [
-               status: :done,
-               done_at: now,
-               last_error: nil,
-               next_attempt_at: nil,
-               updated_at: now
-             ]
-           ) do
-        {:ok, done} -> record_on_finding(done, now)
-        {:error, :not_pending} -> AdminRepo.rollback(:not_pending)
-      end
-    end)
+    ForgeOutbox.update_pending(FindingAction, action.tenant_id, action.id,
+      set: [
+        status: :done,
+        done_at: now,
+        last_error: nil,
+        next_attempt_at: nil,
+        updated_at: now
+      ]
+    )
   end
 
   defp record_on_finding(%FindingAction{action: :open} = done, now) do

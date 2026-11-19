@@ -92,7 +92,8 @@
   ],
   "technical_notes": [
     "Runner and chg side: the verify@1 template runs chg's replay of the head against the base over a commit corpus (and the finding's miss commit) and reports it as the optional selection_replay field of its agent_result. Handed off on the loopctl-runner and chg channels.",
-    "Mark said on 2026-11-18 to let chg's own fixes merge without him, because chg should keep improving its own practices. This narrows the KB 4a86157b floor for selection code only; update that article when this ships."
+    "Mark said on 2026-11-18 to let chg's own fixes merge without him, because chg should keep improving its own practices. This narrows the KB 4a86157b floor for selection code only; update that article when this ships.",
+    "AC-51.5.1 is not code in this repository: the mkreyman/chg entry lives in the DELIVERY_GATES_CONFIG Fly secret (with DELIVERY_GATES_CONFIG_SHA256 and a check_drift run against chg's file list), set by the operator after the epic deploys. CHANGELOG.md names the step. Until it is set, chg selection files are not :prove_effect and every chg selection fix escalates to a person."
   ],
   "dependencies": [
     "US-51.1"

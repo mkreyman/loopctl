@@ -493,13 +493,15 @@ defmodule LoopctlWeb.ChgLive do
             <dl id="findings-by-state" class="flex flex-wrap gap-x-4 gap-y-1 text-xs">
               <div :for={state <- ~w(queued filed fixed closed escalated)} class="flex gap-1">
                 <dt class="font-mono text-slate-500">{state}</dt>
-                <dd class="font-mono text-slate-200">{Map.get(@findings.by_state, state, 0)}</dd>
+                <dd id={"findings-state-#{state}"} class="font-mono text-slate-200">
+                  {Map.get(@findings.by_state, state, 0)}
+                </dd>
               </div>
             </dl>
             <dl id="findings-by-kind" class="flex flex-wrap gap-x-4 gap-y-1 text-xs">
               <div :for={{kind, n} <- Enum.sort(@findings.by_kind)} class="flex gap-1">
                 <dt class="font-mono text-slate-500">{kind}</dt>
-                <dd class="font-mono text-slate-200">{n}</dd>
+                <dd id={"findings-kind-#{kind}"} class="font-mono text-slate-200">{n}</dd>
               </div>
             </dl>
             <ul id="escalated-list" phx-update="stream" class="divide-y divide-slate-800/60">

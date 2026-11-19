@@ -17,6 +17,8 @@ defmodule Loopctl.Changes.FindingsTest do
   alias Loopctl.Changes.Findings
   alias Loopctl.Changes.LedgerRow
   alias Loopctl.Delivery.ForgeRepo
+  alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.ChgFindingActionWorker
@@ -259,7 +261,8 @@ defmodule Loopctl.Changes.FindingsTest do
         tenant_id: ctx.tenant_id,
         kind: "selection_miss",
         fingerprint: "earlier",
-        repo_full_name: @chg_repo,
+        # Differs from the source's only by case: repositories compare case-folded.
+        repo_full_name: String.upcase(@chg_repo),
         state: :fixed,
         first_seen_at: @now,
         last_seen_at: @now,
@@ -322,6 +325,18 @@ defmodule Loopctl.Changes.FindingsTest do
       [pending] = actions(ctx.tenant_id)
       assert {:done, nil} = FindingFiler.perform(pending)
       assert [%Finding{issue_number: 77}] = findings(ctx.tenant_id)
+    end
+
+    test "an issue created before the label step failed for good stays on the finding", ctx do
+      expect(Loopctl.MockPullRequestSource, :create_issue, fn _r, _t, _b -> {:ok, 40} end)
+
+      expect(Loopctl.MockPullRequestSource, :label_issue, fn _r, 40, "chg-loop" ->
+        {:error, {:github_api_error, 422}}
+      end)
+
+      assert {:abandoned, _} = FindingFiler.perform(ctx.action)
+      assert [%FindingAction{status: :abandoned, issue_number: 40}] = actions(ctx.tenant_id)
+      assert [%Finding{issue_number: 40, state: :filed}] = findings(ctx.tenant_id)
     end
 
     test "a revoked source abandons without a forge call", ctx do
@@ -402,6 +417,17 @@ defmodule Loopctl.Changes.FindingsTest do
                AdminRepo.get(Finding, id)
     end
 
+    test "a finding whose repository differs from its source's only by case is fixed too", ctx do
+      id = fixed_flaky!(ctx, 56, @sha)
+
+      AdminRepo.update_all(from(f in Finding, where: f.id == ^id),
+        set: [repo_full_name: "MKreyman/Home_Care_Billing"]
+      )
+
+      assert %{fixed: 1} = Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+      assert %Finding{state: :fixed, fix_merge_sha: @sha} = AdminRepo.get(Finding, id)
+    end
+
     test "a fixed finding quiet for the period closes, with a comment", ctx do
       id = fixed_flaky!(ctx, 52, @sha)
       Findings.sweep_tenant(ctx.tenant_id, @now, opts())
@@ -460,6 +486,37 @@ defmodule Loopctl.Changes.FindingsTest do
       end)
 
       assert {:done, nil} = FindingFiler.perform(escalate)
+    end
+
+    test "a reopened finding is not re-credited to the fix that failed; a new merge is", ctx do
+      id = fixed_flaky!(ctx, 55, @sha)
+      Findings.sweep_tenant(ctx.tenant_id, @now, opts())
+
+      day2 = DateTime.add(@now, 86_400, :second)
+      flaky!(ctx.hcb, "t1", %{at: DateTime.add(day2, -60, :second)})
+      Findings.sweep_tenant(ctx.tenant_id, day2, opts())
+      assert %Finding{state: :filed, fix_attempts: 1} = AdminRepo.get(Finding, id)
+
+      # The next night: the old story's merge is still there, and it is the failed fix.
+      day3 = DateTime.add(day2, 86_400, :second)
+      assert %{fixed: 0} = Findings.sweep_tenant(ctx.tenant_id, day3, opts())
+      assert %Finding{state: :filed, fix_merge_sha: @sha} = AdminRepo.get(Finding, id)
+
+      # The issue's one story is worked again and merges on another sha.
+      new_sha = String.duplicate("b", 40)
+      [record] = AdminRepo.all(from(r in Record, where: r.issue_number == 55))
+
+      AdminRepo.update_all(
+        from(st in StoryStage,
+          join: s in Story,
+          on: s.id == st.story_id,
+          where: s.intake_record_id == ^record.id
+        ),
+        set: [merge_sha: new_sha]
+      )
+
+      assert %{fixed: 1} = Findings.sweep_tenant(ctx.tenant_id, day3, opts())
+      assert %Finding{state: :fixed, fix_merge_sha: ^new_sha} = AdminRepo.get(Finding, id)
     end
 
     test "a sighting before the fix merged does not count against the fix", ctx do

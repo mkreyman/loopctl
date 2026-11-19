@@ -78,7 +78,9 @@ defmodule LoopctlWeb.ChgFindingControllerTest do
             %{"state" => "open"},
             %{"kind" => "bug"},
             %{"limit" => "0"},
-            %{"limit" => "x"}
+            %{"limit" => "x"},
+            %{"limit" => %{"a" => "1"}},
+            %{"state" => %{"a" => "filed"}}
           ] do
         assert ctx.agent_key
                |> call(:get, ~p"/api/v1/chg_findings", params)

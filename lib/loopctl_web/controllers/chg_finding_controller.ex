@@ -192,12 +192,19 @@ defmodule LoopctlWeb.ChgFindingController do
 
   defp limit_opt(blank) when blank in [nil, ""], do: {:ok, 50}
 
-  defp limit_opt(raw) do
-    case Integer.parse(to_string(raw)) do
+  # Only a string is parsed: a nested query param (`limit[a]=1`) arrives as a map, and
+  # `to_string/1` on it raised, answering 500 where the spec promises 422.
+  defp limit_opt(raw) when is_binary(raw) do
+    case Integer.parse(raw) do
       {n, ""} when n in 1..@list_cap -> {:ok, n}
-      _ -> {:error, :unprocessable_entity, "limit must be an integer from 1 to #{@list_cap}"}
+      _ -> limit_refused()
     end
   end
+
+  defp limit_opt(_other), do: limit_refused()
+
+  defp limit_refused,
+    do: {:error, :unprocessable_entity, "limit must be an integer from 1 to #{@list_cap}"}
 
   defp text(value) when is_binary(value) and value != "", do: String.slice(value, 0, 200)
   defp text(_), do: nil
