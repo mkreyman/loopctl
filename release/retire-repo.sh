@@ -3,7 +3,14 @@
 # mkreyman/loopctl, the repo is archived, its history is imported a last time, and
 # release/imports.toml marks the entry archived.
 #
-#   release/retire-repo.sh <owner/name> <stories.json>
+#   release/retire-repo.sh <owner/name> <stories.json> [--copy-private-to-public]
+#
+# A PRIVATE repo's issues cannot be transferred to a PUBLIC target (GitHub refuses), so they
+# are copied instead, and copying PUBLISHES their bodies and comments. That happens only with
+# --copy-private-to-public, passed after reading the issues; without it such a repo is refused
+# (exit 2) naming its open issues, before any write. A copy's bare #N references are rewritten
+# to <owner/name>#N so they keep pointing at the source, and its @mentions are put in code
+# spans so nobody is notified a second time.
 #
 # <stories.json> is the repo's loopctl project as `list_stories` returns it ({"data": [...]}),
 # saved by the session that runs this: loopctl is reached through its MCP tools, never from a
@@ -12,11 +19,12 @@
 #
 # Exit: 0 retired (or already retired, printing 'retired: <owner/name>' and writing nothing);
 # 1 a GitHub step failed (re-run: every step checks before it writes); 2 refused, naming each
-# blocker (an open pull request, a story in flight, no imports.toml entry, a dirty tree).
+# blocker (an open pull request, a story in flight, no imports.toml entry, a dirty tree, a
+# private repo's issues without --copy-private-to-public).
 #
-# Order, and why: each open issue is labelled from:<name> in the OLD repo, then transferred;
-# a transfer keeps a label the target also has, so an interrupted run never leaves a moved
-# issue unlabelled. The repo is archived only once no open issue remains. The final import
+# Order, and why: each open issue is labelled from:<name> in the OLD repo, then transferred
+# (or copied and closed); a transfer keeps a label the target also has and a copy is created
+# with it, so an interrupted run never leaves a moved issue unlabelled. The repo is archived only once no open issue remains. The final import
 # runs after the archive, so imported_sha is the archived tip and nothing can land after it.
 #
 # Inputs a test varies (never a global it edits): RETIRE_GH (gh), RETIRE_TARGET
@@ -25,11 +33,18 @@
 set -uo pipefail
 unset CDPATH
 
+usage="usage: release/retire-repo.sh <owner/name> <stories.json> [--copy-private-to-public]"
 repo=${1:-}
 stories=${2:-}
+allow_copy=false
+case ${3:-} in
+  "") ;;
+  --copy-private-to-public) allow_copy=true ;;
+  *) echo "$usage" >&2; exit 2 ;;
+esac
 case $repo in
   */*) ;;
-  *) echo "usage: release/retire-repo.sh <owner/name> <stories.json>" >&2; exit 2 ;;
+  *) echo "$usage" >&2; exit 2 ;;
 esac
 [ -f "$stories" ] || { echo "retire: $stories not found (save list_stories for the repo's project)" >&2; exit 2; }
 
@@ -110,6 +125,21 @@ fi
 if [ -n "$dirty" ]; then
   blockers+=("the working tree has uncommitted changes (the final import commits)")
 fi
+# GitHub refuses to transfer an issue from a private repository to a public one ("Old issue
+# cannot be transferred from private repository to public repository"), so there each issue
+# is COPIED, which publishes it: refused here, before any write, unless the operator read the
+# issues and passed --copy-private-to-public.
+copy=false
+if [ -n "$issues" ]; then
+  src_vis=$($gh repo view "$repo" --json visibility --jq .visibility) ||
+    { echo "retire: cannot read $repo's visibility" >&2; exit 1; }
+  tgt_vis=$($gh repo view "$target" --json visibility --jq .visibility) ||
+    { echo "retire: cannot read $target's visibility" >&2; exit 1; }
+  [ "$src_vis" != PUBLIC ] && [ "$tgt_vis" = PUBLIC ] && copy=true
+  if [ "$copy" = true ] && [ "$allow_copy" != true ]; then
+    blockers+=("$repo is private and $target public: its open issues ($(echo $issues)) would be copied and so published; read them, then re-run with --copy-private-to-public")
+  fi
+fi
 if [ "${#blockers[@]}" -gt 0 ]; then
   echo "retire: $repo is not retired:" >&2
   printf '  - %s\n' "${blockers[@]}" >&2
@@ -121,13 +151,57 @@ fi
 if [ -n "$issues" ]; then
   for r in "$repo" "$target"; do
     $gh label create "$label" -R "$r" --color BFD4F2 \
-      --description "transferred from $repo" --force >/dev/null ||
+      --description "moved from $repo" --force >/dev/null ||
       { echo "retire: cannot create label $label in $r" >&2; exit 1; }
   done
+  # A copy is a new issue in the target carrying the title, the body, the comments and a
+  # marker naming the original; the original is then closed with a link to the copy. The
+  # marker makes a re-run safe: a copy whose original failed to close is found by it (listed
+  # by label, which reads the repository, not the lagging search index) and only the close is
+  # retried. Bare #N references become <repo>#N, so they keep naming the source's issues,
+  # and @mentions go in code spans, so the copy notifies nobody again.
+  copy_jq='
+    def relink:
+      gsub("(?<![\\w/`])#(?<n>[0-9]+)"; "\($repo)#\(.n)")
+      | gsub("(?<![\\w`])@(?<u>[A-Za-z0-9][A-Za-z0-9-]*)"; "`@\(.u)`");
+    ((.body // "") | relink)
+    + "\n\n---\nCopied from " + .url + " when " + $repo
+    + " was retired: GitHub does not transfer an issue from a private repository to a public one.\n"
+    + ([.comments[] | "\n**" + .author.login + "** commented:\n\n" + ((.body // "") | relink)] | join("\n"))
+    + "\n\n" + $marker'
+
+  # copy_issue <n>: copies $repo#<n> into $target unless a copy exists; prints its URL.
+  copy_issue() {
+    local n=$1 marker existing title body
+    marker="<!-- retired-from: $repo#$n -->"
+    existing=$($gh issue list -R "$target" --label "$label" --state all --limit 1000 \
+      --json url,body --jq ".[] | select(.body | contains(\"$marker\")) | .url") || return 1
+    if [ -n "$existing" ]; then
+      printf '%s\n' "$existing" | head -1
+      return 0
+    fi
+    title=$($gh issue view "$n" -R "$repo" --json title --jq .title) || return 1
+    body=$($gh issue view "$n" -R "$repo" --json body,comments,url |
+      jq -r --arg repo "$repo" --arg marker "$marker" "$copy_jq") || return 1
+    $gh issue create -R "$target" --title "$title" --label "$label" --body "$body"
+  }
+
   failed=0
   for n in $issues; do
-    if $gh issue edit "$n" -R "$repo" --add-label "$label" >/dev/null &&
-      $gh issue transfer "$n" "$target" -R "$repo" >/dev/null; then
+    $gh issue edit "$n" -R "$repo" --add-label "$label" >/dev/null || {
+      echo "retire: $repo#$n did not move; re-run to retry" >&2
+      failed=1
+      continue
+    }
+    if [ "$copy" = true ]; then
+      if url=$(copy_issue "$n") && [ -n "$url" ] &&
+        $gh issue close "$n" -R "$repo" --comment "Moved to $url" >/dev/null; then
+        echo "retire: $repo#$n copied to $url"
+      else
+        echo "retire: $repo#$n did not move; re-run to retry" >&2
+        failed=1
+      fi
+    elif $gh issue transfer "$n" "$target" -R "$repo" >/dev/null; then
       echo "retire: $repo#$n moved to $target"
     else
       echo "retire: $repo#$n did not move; re-run to retry" >&2

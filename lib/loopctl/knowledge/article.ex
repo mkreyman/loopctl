@@ -906,9 +906,13 @@ defmodule Loopctl.Knowledge.Article do
       |> String.replace(~r/[^a-z0-9\s-]/, "")
       |> String.replace(~r/\s+/, "-")
       |> String.trim("-")
-      |> String.slice(0, 56)
+      |> String.slice(0, 51)
 
-    suffix = :crypto.strong_rand_bytes(3) |> Base.encode16(case: :lower)
+    # 48 random bits. Titles that differ only in punctuation or case share one base, and with
+    # the 24-bit suffix this had, 60 such titles in one tenant collided often enough to fail an
+    # insert with `slug has already been taken` (CI, 2026-11-20). 51 + "-" + 12 stays within
+    # the 64-character slug limit.
+    suffix = :crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)
     slug = if base != "", do: "#{base}-#{suffix}", else: suffix
 
     if Regex.match?(@slug_format, slug) do
