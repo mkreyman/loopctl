@@ -8,7 +8,8 @@ defmodule LoopctlE2e.Stages do
   passes) or `{:fail, last_state}` (the story left the main line, so waiting cannot help).
 
   Every read is an existing one: the story list filtered by issue number, the story's stage
-  row, the escalation inbox, and GitHub's pulls, check runs, reviews, deployments and issues.
+  row, the escalation inbox, and GitHub's pulls, the PR branch's push workflow runs, reviews, deployments and
+  issues.
   The factory's state is read, never written (US-52.9 failure_modes.state).
 
   Stage names follow `Loopctl.Delivery.StageMachine`'s main line. `review_recorded` reads the
@@ -104,28 +105,43 @@ defmodule LoopctlE2e.Stages do
     end
   end
 
+  # The push workflow runs of the PR's branch at its head: the evidence loopctl's merge gate
+  # counts, read with Actions permission. Check runs need a Checks permission a fine-grained
+  # token cannot hold (#913), so on the private sandbox that call 403s.
   defp ci_green(client, ctx) do
-    with {:ok, %{"head" => %{"sha" => sha}}} <- pull(client, ctx),
-         {:ok, 200, %{"check_runs" => [_ | _] = runs}} <-
-           Client.get(client, :github, "/repos/#{ctx.repo}/commits/#{sha}/check-runs",
+    with {:ok, %{"head" => %{"sha" => sha, "ref" => ref}}} <- pull(client, ctx),
+         {:ok, 200, %{"workflow_runs" => [_ | _] = runs}} <-
+           Client.get(client, :github, "/repos/#{ctx.repo}/actions/runs",
+             head_sha: sha,
+             branch: ref,
+             event: "push",
              per_page: 100
            ) do
-      judge_checks(runs, ctx)
+      runs |> newest_per_workflow() |> judge_runs(ctx)
     else
-      {:ok, 200, %{"check_runs" => []}} -> {:wait, "no check runs yet"}
+      {:ok, 200, %{"workflow_runs" => []}} -> {:wait, "no push runs of the head yet"}
       other -> {:wait, describe(other)}
     end
   end
 
-  defp judge_checks(runs, ctx) do
-    failed =
-      Enum.filter(runs, &(&1["conclusion"] in ~w(failure cancelled timed_out action_required)))
+  # As `Loopctl.Delivery.CiEvidence` judges: only each workflow's newest run counts, and a
+  # completed run passes only with `success`, `skipped` or `neutral` (`dead_run?/1`); any other
+  # conclusion (`startup_failure`, `stale`, ...) is a failure.
+  @passing_conclusions ~w(success skipped neutral)
 
+  defp newest_per_workflow(runs) do
+    runs
+    |> Enum.group_by(& &1["workflow_id"])
+    |> Enum.map(fn {_workflow, group} -> Enum.max_by(group, & &1["id"]) end)
+  end
+
+  defp judge_runs(runs, ctx) do
     pending = Enum.reject(runs, &(&1["status"] == "completed"))
+    failed = Enum.reject(runs -- pending, &(&1["conclusion"] in @passing_conclusions))
 
     cond do
-      failed != [] -> {:fail, "checks failed: #{names(failed)}"}
-      pending != [] -> {:wait, "checks running: #{names(pending)}"}
+      failed != [] -> {:fail, "push runs failed: #{names(failed)}"}
+      pending != [] -> {:wait, "push runs running: #{names(pending)}"}
       true -> {:done, ctx}
     end
   end

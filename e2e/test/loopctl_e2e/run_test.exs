@@ -39,12 +39,23 @@ defmodule LoopctlE2e.RunTest do
         {:ok, 200, Map.put(pr, "state", "open")},
         {:ok, 200, %{"state" => "closed", "merged" => true, "merge_commit_sha" => "m1"}}
       ],
-      {:github, :get, "/repos/#{@repo}/commits/h1/check-runs"} => [
-        {:ok, 200, %{"check_runs" => [%{"name" => "chg", "status" => "in_progress"}]}},
+      {:github, :get, "/repos/#{@repo}/actions/runs"} => [
         {:ok, 200,
          %{
-           "check_runs" => [
-             %{"name" => "chg", "status" => "completed", "conclusion" => "success"}
+           "workflow_runs" => [
+             %{"id" => 1, "workflow_id" => 10, "name" => "CI", "status" => "in_progress"}
+           ]
+         }},
+        {:ok, 200,
+         %{
+           "workflow_runs" => [
+             %{
+               "id" => 1,
+               "workflow_id" => 10,
+               "name" => "CI",
+               "status" => "completed",
+               "conclusion" => "success"
+             }
            ]
          }}
       ],
@@ -81,6 +92,12 @@ defmodule LoopctlE2e.RunTest do
 
     assert {{:loopctl, :get, "/api/v1/stories"},
             [project_id: "p-1", issue_number: 5, repo: @repo]} in StubClient.calls(client)
+
+    # CI is the push runs of the PR's branch at its head, the evidence the merge gate counts.
+    assert {{:github, :get, "/repos/#{@repo}/actions/runs"},
+            [head_sha: "h1", branch: "loopctl/story-7-abcdef12", event: "push", per_page: 100]} in StubClient.calls(
+             client
+           )
   end
 
   test "a stage not reached within its budget fails the run naming it, with backoff to 120 s" do

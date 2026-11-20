@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Moves THIS machine to factory set <set> (US-52.10): one checkout of mkreyman/loopctl at tag
 # factory-<set>, the runner and chg built from it, and proof the runner joined loopctl at it.
+# A machine with no runner.json (no runner, e.g. nuc) gets the checkout and chg only, and
+# reports runner_version null.
 #
 #   release/install-machine.sh <set>
 #
@@ -8,7 +10,8 @@
 # status ok or unchanged, 75 for busy (another install holds the lock), 1 otherwise.
 #
 #   ok           the set is installed, chg reports its version and commit, and the runner
-#                joined loopctl after the restart naming release_set <set>
+#                joined loopctl after the restart naming release_set <set>; on a machine
+#                with no runner.json, only the set and chg (runner_version null)
 #   unchanged    current already is <set> and verifies; nothing was restarted
 #   runner_busy  the runner did not drain within LOOPCTL_FACTORY_DRAIN_S; it was undrained
 #                and nothing changed
@@ -64,6 +67,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 host=$(hostname -s 2>/dev/null || hostname)
 runner_bin="$runner_prefix/current/bin/loopctl_runner"
 set_dir="$home/sets/$set_id"
+# A machine with no runner.json runs no runner (nuc, beelink): it gets the set's checkout and
+# chg, and nothing installs a runner there or waits for one to join.
+has_runner=false
+[ -f "$runner_config" ] && has_runner=true
 
 runner_version=null
 chg_version=null
@@ -190,6 +197,20 @@ print(j.get("runner_version") or "")
 PY
 }
 
+# read_joined_file: where the runner writes joined.json; read only where it is needed, since
+# the install rewrites runner.json.
+read_joined_file() {
+  [ "$has_runner" = true ] || return 0
+  jf=$(joined_file) || fail "cannot read runs_dir from $runner_config"
+}
+
+# runner_joined <after-epoch>: the runner joined at the server's set after <after>; prints the
+# version it names. A machine with no runner has nothing to join and passes.
+runner_joined() {
+  [ "$has_runner" = true ] || return 0
+  joined_at_set "$jf" "$server_set" "$1"
+}
+
 # US-52.11: a retired repo's chg sources go, once their queued rows are sent. Run on every
 # path that reports success, so a machine already at the set is cleaned too. A failed send
 # leaves the sources in place and fails the run; the next run retries.
@@ -219,9 +240,9 @@ PY
 if [ -L "$home/current" ] && [ "$(readlink "$home/current")" = "sets/$set_id" ] && [ -d "$set_dir" ]; then
   want_chg=$(manifest_version "$set_dir" chg) || fail "cannot read the set's manifest"
   sha=$(git -C "$set_dir" rev-parse --short=12 HEAD) || fail "cannot read the set's commit"
-  jf=$(joined_file) || fail "cannot read runs_dir from $runner_config"
-  if chg_matches "$want_chg" "$sha" && rv=$(joined_at_set "$jf" "$server_set" 0); then
-    runner_version=$rv
+  read_joined_file
+  if chg_matches "$want_chg" "$sha" && rv=$(runner_joined 0); then
+    [ "$has_runner" = true ] && runner_version=$rv
     chg_version=$want_chg
     drop_retired_sources "$set_dir"
     report unchanged "" 0
@@ -274,17 +295,16 @@ fi
 
 # --- install ---
 
-if [ -f "$runner_config" ]; then
-  python3 "$here/lib/rewrite_runner_config.py" "$runner_config" "$checkout" >/dev/null ||
-    fail "cannot rewrite $runner_config"
-fi
-
 restart=$(date +%s)
 
-(cd "$set_dir/runner" && LOOPCTL_RUNNER_PREFIX="$runner_prefix" rel/install.sh) >&2 ||
-  fail "the runner install failed (runner/rel/install.sh)"
-# The new runner is up and starts undrained; nothing is left to undo.
-drained=false
+if [ "$has_runner" = true ]; then
+  python3 "$here/lib/rewrite_runner_config.py" "$runner_config" "$checkout" >/dev/null ||
+    fail "cannot rewrite $runner_config"
+  (cd "$set_dir/runner" && LOOPCTL_RUNNER_PREFIX="$runner_prefix" rel/install.sh) >&2 ||
+    fail "the runner install failed (runner/rel/install.sh)"
+  # The new runner is up and starts undrained; nothing is left to undo.
+  drained=false
+fi
 
 (cd "$set_dir/chg" && scripts/install.sh --dest "$(dirname "$chg_dest")") >&2 ||
   fail "chg's install failed (chg/scripts/install.sh)"
@@ -311,16 +331,16 @@ chg_matches "$want_chg" "$sha" ||
   fail "chg --version does not name $want_chg commit $sha: $(chg_versions | tr '\n' ';')"
 chg_version=$want_chg
 
-jf=$(joined_file) || fail "cannot read runs_dir from $runner_config"
+read_joined_file
 waited=0
-until rv=$(joined_at_set "$jf" "$server_set" "$restart"); do
+until rv=$(runner_joined "$restart"); do
   if [ "$waited" -ge "$join_s" ]; then
     fail "the runner did not join loopctl at release_set $server_set within ${join_s}s ($jf)"
   fi
   sleep "$poll_s"
   waited=$((waited + poll_s))
 done
-runner_version=$rv
+[ "$has_runner" = true ] && runner_version=$rv
 
 drop_retired_sources "$set_dir"
 report ok "" 0
