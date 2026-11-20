@@ -354,6 +354,28 @@ defmodule Loopctl.ReleaseInstallMachineTest do
     end
   end
 
+  describe "a machine with no runner.json runs no runner" do
+    setup ctx do
+      File.rm!(ctx.config)
+      :ok
+    end
+
+    test "installs the set and chg, installs no runner and waits for no join", ctx do
+      {out, 0} = install(ctx, 2)
+
+      assert %{"status" => "ok", "chg_version" => "2.0.0", "runner_version" => nil} = out
+      assert File.read_link!(Path.join(ctx.factory, "current")) == "sets/2"
+      refute File.exists?(Path.join(ctx.stub, "runner_installs"))
+      refute File.exists?(ctx.config)
+    end
+
+    test "a second run at the set is unchanged", ctx do
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+
+      assert {%{"status" => "unchanged", "runner_version" => nil}, 0} = install(ctx, 2)
+    end
+  end
+
   describe "TC-52.11.4: a retired repo's chg sources go once their rows are sent" do
     @sources """
     [[source]]
