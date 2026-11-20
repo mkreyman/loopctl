@@ -6,6 +6,7 @@
 #   priv/runner_contract/       the runner's check and the fleet hook: the runner compiles
 #                               the contract in, and the server exports it
 #   chg/ but the adapters below cargo fmt --all --check, cargo clippy, cargo test in chg/
+#   chg/bin/, chg/tests/        also python3 tests/loop-test.py and replay-selection-test.py
 #   chg/adapters/elixir/        mix format --check-formatted, compile, test there
 #   chg/adapters/typescript/    node --test of its unit and integration tests there
 #   chg/adapters/generic/       python3 adapters/generic/test/test_adapter.py from chg/
@@ -25,7 +26,8 @@ set -uo pipefail
 
 root=$(git rev-parse --show-toplevel) || exit 1
 
-runner=false chg=false elixir_adapter=false ts_adapter=false generic_adapter=false e2e=false
+runner=false chg=false chg_py=false elixir_adapter=false ts_adapter=false generic_adapter=false
+e2e=false
 outside=false staged=false
 # Every arm sets at least one flag, so no staged path passes with no check at all.
 while IFS= read -r -d '' path; do
@@ -37,6 +39,9 @@ while IFS= read -r -d '' path; do
     chg/adapters/elixir/*) elixir_adapter=true ;;
     chg/adapters/typescript/*) ts_adapter=true ;;
     chg/adapters/generic/*) generic_adapter=true ;;
+    # chg's Python: the loop and its replay tests, as chg-ci's generic-adapter job runs them.
+    # cargo runs too, since the Rust tests drive these scripts.
+    chg/bin/* | chg/tests/*) chg=true chg_py=true ;;
     # Any other chg/ path, an adapter directory none of the arms above claims included.
     chg/*) chg=true ;;
     e2e/*) e2e=true ;;
@@ -68,6 +73,11 @@ if $chg; then
   check chg chg cargo fmt --all --check
   check chg chg cargo clippy --all-targets --locked -- -D warnings
   check chg chg cargo test --locked
+fi
+
+if $chg_py; then
+  check chg chg python3 tests/loop-test.py
+  check chg chg python3 tests/replay-selection-test.py
 fi
 
 if $elixir_adapter; then

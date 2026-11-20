@@ -8,7 +8,7 @@ All notable changes to loopctl are documented here.
 
 - **CI runs on push of every branch, never on `pull_request`, and every workflow ends in
   an `area gate` job (2026-11-20, US-52.12 review).** The merge gate trusts only push runs
-  of a story's branch, so `ci.yml`, `runner-ci.yml`, `chg-ci.yml` and `e2e.yml` push-trigger
+  of a story's branch, so `ci.yml`, `runner-ci.yml`, `chg-ci.yml`, `e2e.yml` and `mcp-server-ci.yml` push-trigger
   on `**`; a same-repo pull request's required checks are satisfied by the push run on its
   head. A non-master push is judged on the whole branch, from its merge base with master.
   `area gate` (one name in all four) is green only when every job of its workflow succeeded

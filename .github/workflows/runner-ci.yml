@@ -90,17 +90,22 @@ jobs:
             done
             [ "$installed" = true ] || { echo "mix local.$tool failed after 3 attempts" >&2; exit 1; }
           done
+      # Keyed per runner slot, with the core (Erlang/Elixir) PLT beside the project PLT: a PLT
+      # records beam paths under the slot whose setup-beam built it, so a PLT restored on
+      # another slot fails with "File not found: .../erl_bif_types.beam".
       - name: Cache the dialyzer PLT
         uses: actions/cache@v4
         with:
           path: runner/_build/test/*.plt*
-          key: runner-plt-${{ runner.os }}-${{ hashFiles('.tool-versions', 'runner/mix.lock') }}
+          key: runner-plt-${{ runner.os }}-${{ runner.environment }}-${{ runner.name }}-${{ hashFiles('.tool-versions', 'runner/mix.lock') }}
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix deps.unlock --check-unused
       - run: mix format --check-formatted
       - run: mix credo --strict --config-file .credo.exs
       - run: mix dialyzer
+        env:
+          DIALYZER_PLT_CORE_PATH: _build/test
       - run: mix test
 
   # THE AREA GATE, the one check the merge gate's independent_checks names for this repository:

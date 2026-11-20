@@ -11,7 +11,13 @@ defmodule LoopctlRunner.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
-      dialyzer: [plt_add_apps: [:mix, :ex_unit]],
+      # CI puts the core PLT beside the project PLT (DIALYZER_PLT_CORE_PATH), which runner-ci
+      # caches per runner slot; the default MIX_HOME is shared by every slot on a host and
+      # records beam paths under the slot that built it.
+      dialyzer: [
+        plt_add_apps: [:mix, :ex_unit],
+        plt_core_path: System.get_env("DIALYZER_PLT_CORE_PATH")
+      ],
       releases: [
         loopctl_runner: [include_executables_for: [:unix], strip_beams: false]
       ]

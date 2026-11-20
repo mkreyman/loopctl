@@ -61,6 +61,24 @@ defmodule Loopctl.GithooksPreCommitRoutingTest do
            ]
   end
 
+  test "chg's Python runs its loop and replay tests from chg/, after cargo", ctx do
+    for path <- ["chg/bin/chg-loop.py", "chg/tests/loop-test.py"] do
+      File.rm_rf!(ctx.log)
+      git!(ctx.repo, ["reset", "-q"])
+      stage!(ctx.repo, path)
+
+      assert {_, 0} = hook(ctx)
+
+      assert calls(ctx) |> Enum.take(-2) == [
+               "python3 #{ctx.physical}/chg tests/loop-test.py",
+               "python3 #{ctx.physical}/chg tests/replay-selection-test.py"
+             ],
+             path
+
+      assert "cargo #{ctx.physical}/chg test --locked" in calls(ctx), path
+    end
+  end
+
   test "the Elixir adapter runs format, compile and test there, and no cargo", ctx do
     stage!(ctx.repo, "chg/adapters/elixir/lib/x.ex")
     dir = "#{ctx.physical}/chg/adapters/elixir"
@@ -117,6 +135,7 @@ defmodule Loopctl.GithooksPreCommitRoutingTest do
           "chg/adapters/elixir/mix.exs",
           "chg/adapters/typescript/lib/git.mjs",
           "chg/x",
+          "chg/bin/x",
           "runner/x",
           "e2e/x",
           "priv/runner_contract/x",

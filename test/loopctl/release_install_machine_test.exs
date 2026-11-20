@@ -153,6 +153,31 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       refute File.exists?(Path.join(ctx.factory, "current"))
     end
 
+    test "an old pidless lock recreated by another run before the takeover is put back", ctx do
+      lock = Path.join(ctx.factory, ".install.lock")
+      File.mkdir_p!(lock)
+      File.touch!(lock, System.os_time(:second) - 600)
+
+      # Between this run judging the pidless lock stale and renaming it, another run took it
+      # over and made a fresh lock, which has no pid yet either.
+      bin = Path.join(ctx.stub, "racebin")
+      File.mkdir_p!(bin)
+      real_path = System.get_env("PATH")
+
+      script!(Path.join(bin, "mv"), """
+      #!/bin/sh
+      case "$1" in
+        *.install.lock) [ -f "$STUB/raced" ] || { touch "$STUB/raced"; rm -rf "$1"; mkdir "$1"; } ;;
+      esac
+      PATH="#{real_path}" exec mv "$@"
+      """)
+
+      {out, 75} = install(ctx, 2, env: %{"PATH" => "#{bin}:#{real_path}"})
+      assert out["status"] == "busy"
+      assert File.dir?(lock)
+      refute File.exists?(Path.join(ctx.factory, "current"))
+    end
+
     test "a fresh lock with no pid yet is busy, not a dead owner", ctx do
       # The window between the owner's mkdir and its pid write.
       lock = Path.join(ctx.factory, ".install.lock")

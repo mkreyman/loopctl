@@ -120,11 +120,14 @@ if ! mkdir "$lock" 2>/dev/null; then
   fi
   # Take it over by RENAMING it aside, never by deleting it in place: a rename is atomic, so
   # of two runs that both judged it stale only one moves it. The mover then checks that what
-  # it moved is still the lock it judged (same pid, or still none); if another run had already
-  # replaced it with a live lock, that lock is put back and this run is busy.
+  # it moved is still stale by the same test it judged: the same pid, and with no pid, still
+  # older than the bound. A lock another run recreated in between has a new pid or is fresh,
+  # so it is put back and this run is busy.
   aside="$lock.stale.$$"
   mv "$lock" "$aside" 2>/dev/null || report busy "could not take $lock" 75
-  if [ "$(cat "$aside/pid" 2>/dev/null || true)" != "$owner" ]; then
+  moved_owner=$(cat "$aside/pid" 2>/dev/null || true)
+  if [ "$moved_owner" != "$owner" ] ||
+    { [ -z "$owner" ] && [ -z "$(find "$aside" -maxdepth 0 -mmin +"$lock_grace_m" 2>/dev/null)" ]; }; then
     mv "$aside" "$lock" 2>/dev/null || true
     report busy "$lock was taken over by another install" 75
   fi

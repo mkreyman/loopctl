@@ -16,6 +16,7 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   @runner_ci ".github/workflows/runner-ci.yml"
   @chg_ci ".github/workflows/chg-ci.yml"
   @e2e ".github/workflows/e2e.yml"
+  @mcp_ci ".github/workflows/mcp-server-ci.yml"
   # The jobs the area gate does not wait on: scale-nightly is dispatch-only, live is nightly
   # and dispatch-only, and deploy and smoke ship master rather than check a change (smoke
   # gates nothing by design).
@@ -150,7 +151,7 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   end
 
   describe "every factory workflow" do
-    for file <- [@ci, @runner_ci, @chg_ci, @e2e] do
+    for file <- [@ci, @runner_ci, @chg_ci, @e2e, @mcp_ci] do
       test "#{file} runs on a push of every branch and never on a pull request" do
         on = workflow(unquote(file))["on"]
 
@@ -186,8 +187,8 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
       end
     end
 
-    test "the area gate is the same step in all four workflows" do
-      [first | rest] = for file <- [@ci, @runner_ci, @chg_ci, @e2e], do: gate_step(file)
+    test "the area gate is the same step in every factory workflow" do
+      [first | rest] = for file <- [@ci, @runner_ci, @chg_ci, @e2e, @mcp_ci], do: gate_step(file)
 
       for step <- rest, do: assert(step == first)
     end
