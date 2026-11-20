@@ -237,7 +237,14 @@ are willing to have picked up unattended.
 #### Agent delivery loop: Gate B triggers
 
 Gate B (`Loopctl.DeliveryGates`) decides from these which paths a delivery-loop change may
-merge through without a human. Set both as SECRETS, together, in one command — the document
+merge through without a human. The document is version 2 (US-52.12): each repository entry
+has exactly `effect_paths`, `independent_paths`, `independent_checks` and `limits`.
+`independent_paths` names the paths a change may touch only when it is independently
+verified (the verifier dispatch passed custody at the head, on another runner machine than
+the implementer, with every `independent_checks` job green at the head);
+`independent_checks` is a non-empty list of CI job names, never `local-gate`. A version 1
+document, or a `human_paths` key, is refused, so every change escalates until the document
+is re-pinned. Set both as SECRETS, together, in one command — the document
 is a map of which paths skip human review and does not belong in `fly.toml` or the public
 source tree. Hash exactly the bytes you set, from the same shell variable:
 
@@ -255,7 +262,7 @@ Linux's 128 KiB per environment string, against a few kilobytes per repository.
 
 | Variable                        | Default | Description |
 |---------------------------------|---------|-------------|
-| `DELIVERY_GATES_CONFIG`         | unset   | The Gate B trigger JSON document, inline. Read verbatim at call time (restart to apply; no deploy). **Unset, empty, not valid JSON, or not the documented shape: every delivery-loop change escalates to a human.** That is the intended fail-closed behaviour, never a silently empty trigger set, so a wrong value costs human confirmations rather than unguarded merges. A pattern that no longer matches any file in its repository escalates too, naming the pattern |
+| `DELIVERY_GATES_CONFIG`         | unset   | The Gate B trigger JSON document, inline, version 2: per repository `effect_paths`, `independent_paths`, `independent_checks` (a non-empty list of CI job names, never `local-gate`) and `limits`. Read verbatim at call time (restart to apply; no deploy). **Unset, empty, not valid JSON, version 1, a `human_paths` key, an empty `independent_checks`, or otherwise not the documented shape: every delivery-loop change escalates to a human.** That is the intended fail-closed behaviour, never a silently empty trigger set, so a wrong value costs human confirmations rather than unguarded merges. A pattern that no longer matches any file in its repository escalates too, naming the pattern |
 | `DELIVERY_GATES_CONFIG_SHA256`  | unset   | Hex SHA-256 (64 characters, either case) of the EXACT bytes of `DELIVERY_GATES_CONFIG`. Verified before the document is decoded, so an unpinned edit is never interpreted. **Unset, malformed, or computed over different bytes: every delivery-loop change escalates to a human**, by design. The commonest way to get different bytes is hashing the FILE (`sha256sum triggers.json`, newline included) after setting the variable from `$(cat triggers.json)` (newline stripped); hash the value as set, per the recipe above. Update it in the same `fly secrets set` as the document, or the rolling restart runs a window with a mismatched pair |
 
 #### CLI client (`loopctl` command, not the server)

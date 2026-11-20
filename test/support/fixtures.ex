@@ -789,11 +789,12 @@ defmodule Loopctl.Fixtures do
   def build(:delivery_gates_config, attrs) do
     Map.merge(
       %{
-        "version" => 1,
+        "version" => 2,
         "repos" => %{
           "acme/claims-app" => %{
             "effect_paths" => ["priv/rates/**", "lib/app/payments/**", "config/runtime.exs"],
-            "human_paths" => ["lib/app_web/router.ex", "lib/**/data_migrations/**"],
+            "independent_paths" => ["lib/app_web/router.ex", "lib/**/data_migrations/**"],
+            "independent_checks" => ["e2e"],
             "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
           }
         }
@@ -2647,7 +2648,9 @@ defmodule Loopctl.Fixtures do
       # (`nil` for a story verified before the column existed, another sha for a stale one).
       verified_head_sha: Map.get(attrs, :verified_head_sha, Map.fetch!(attrs, :head_sha)),
       # US-48.17: the runner holding the claim, when the test needs one (default none).
-      runner_id: Map.get(attrs, :runner_id)
+      runner_id: Map.get(attrs, :runner_id),
+      # US-52.12: the branch independent checks are read on (default none).
+      branch: Map.get(attrs, :branch)
     })
 
     fixture(:triage_verdict, %{tenant_id: tenant_id, story_id: story.id})
@@ -2678,7 +2681,8 @@ defmodule Loopctl.Fixtures do
         tenant_id: tenant.id,
         repo: repo,
         head_sha: head,
-        runner_id: runner.id
+        runner_id: runner.id,
+        branch: Map.get(attrs, :branch)
       })
 
     ledger =

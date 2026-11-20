@@ -302,7 +302,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
         do: {outcome, Map.get(counts, outcome, 0)}
   end
 
-  # Results carrying at least one reason of each KIND, so a change touching four human paths
+  # Results carrying at least one reason of each KIND, so a change touching four independent paths
   # counts once. Kinds only — a reason's payload is a path or a pattern, and neither belongs in
   # a committed artifact. It is also the first thing to read when a run escalates everything:
   # a single dominant kind is usually the harness feeding the gate a malformed input.

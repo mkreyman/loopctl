@@ -8,6 +8,9 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
   - Every other verdict of the gate, the once-per-head record and its bounds, a refused push.
   - AC-48.17.3: the claim is held open while the runner is live, never past the implement
     dispatch's credential; a runner that is gone escalates the story instead of re-queueing it.
+  - TC-52.12.7 (US-52.12): a control-plane merge the runner made but never reported, because
+    the deploy dropped its socket, is adopted by the adopt job the sweep enqueues for the
+    absent runner, then carried to verified by `PostDeployVerificationWorker`.
   - Custody: a halted tenant writes nothing, a tenant that is not human-anchored is skipped,
     and another tenant's sweep or job reaches none of these rows.
 
@@ -24,6 +27,7 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.MergeExecution
+  alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
@@ -35,6 +39,7 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.MergeInstructionWorker
+  alias Loopctl.Workers.PostDeployVerificationWorker
 
   setup :verify_on_exit!
 
@@ -493,6 +498,152 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
     end
   end
 
+  describe "TC-52.12.7: a control-plane merge the runner never reported" do
+    setup ctx do
+      # Independent verification holds: the verifier dispatch ran on another machine than the
+      # implementer's, and the repository's independent check `e2e` is green at the head.
+      verifier_runner = fixture(:stage_runner, %{tenant_id: ctx.tenant.id})
+      story = AdminRepo.get!(Story, ctx.story_id)
+
+      fixture(:accepted_dispatch, %{
+        tenant_id: ctx.tenant.id,
+        runner: verifier_runner,
+        story_id: ctx.story_id,
+        kind: "verify",
+        dispatch_id: story.verifier_dispatch_id
+      })
+
+      set_stage(ctx, branch: "loop/us-52-12")
+
+      Mox.stub(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                          @head,
+                                                          "loop/us-52-12" ->
+        {:ok,
+         %{
+           jobs: [%{name: "e2e", status: "completed", conclusion: "success", run_id: 1}],
+           statuses: []
+         }}
+      end)
+
+      # `acme/widgets` stands in for a control-plane repository through the gate's own option,
+      # so no test registers a source for mkreyman/loopctl (`intake_sources_active_repo_uidx`
+      # is global) and no global is touched.
+      control_plane = fn tenant_id, story_id, opts ->
+        MergePrecondition.enforce(
+          tenant_id,
+          story_id,
+          opts ++ [control_plane_repos: [@repo]]
+        )
+      end
+
+      Map.put(ctx, :control_plane, control_plane)
+    end
+
+    test "is adopted by the resend after the restart, then deployed and verified", ctx do
+      allow_source()
+      t0 = DateTime.utc_now()
+
+      assert [:instruction_enqueued] = sweep(ctx, t0)
+      assert_received {:enqueued, args}
+      assert {:ok, :pushed} = instruct(args, t0, enforce: ctx.control_plane)
+      assert_received {:instructed, _tenant, _runner, %{"head_sha" => @head}}
+      assert Stages.get(ctx.tenant.id, ctx.story_id).merge_gate_allowed_sha == @head
+
+      # The runner merges. The deploy that merge triggers restarts loopctl and drops the
+      # runner's socket before its `ci -> merged` report is sent, so control never hears it.
+      stub_merged(@merge_sha)
+      gone = fn _tenant, _runner -> false end
+      after_restart = DateTime.add(t0, 30)
+
+      assert [:runner_absent_adopt_enqueued] = sweep(ctx, after_restart, live?: gone)
+      assert_received {:enqueued, %{"mode" => "adopt", "head_sha" => @head} = adopt}
+
+      assert {:ok, :adopted_merge} = instruct(adopt, after_restart)
+
+      row = Stages.get(ctx.tenant.id, ctx.story_id)
+      assert row.stage == :merged
+      assert row.merge_sha == @merge_sha
+      refute_received {:instructed, _, _, _}
+
+      # Inside the runner-gone bound the story is no longer at ci, so nothing escalates it.
+      within_bound = DateTime.add(after_restart, MergeExecution.runner_gone_after_seconds() - 1)
+      assert [] = sweep(ctx, within_bound, live?: gone)
+      assert events(ctx, "transitioned") |> Enum.all?(&(&1.to_stage != "escalated"))
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn %ForgeRepo{full_name: @repo},
+                                                             _env,
+                                                             _since ->
+        {:ok,
+         %{
+           deployments: [
+             %{
+               id: 91,
+               sha: @merge_sha,
+               state: :success,
+               succeeded?: true,
+               created_at: DateTime.utc_now()
+             }
+           ],
+           incomplete: nil
+         }}
+      end)
+
+      assert :ok = PostDeployVerificationWorker.perform(%Oban.Job{args: %{}})
+
+      row = Stages.get(ctx.tenant.id, ctx.story_id)
+      assert row.stage == :verified
+      assert row.release_id == "91"
+    end
+
+    test "the gate refuses the same control-plane merge without independent verification",
+         ctx do
+      # The positive control for the push above: the allow there was the hold being cleared.
+      allow_source()
+
+      Mox.stub(MockPullRequestSource, :check_evidence, fn _repo, _sha, _branch ->
+        {:ok, %{jobs: [], statuses: []}}
+      end)
+
+      t0 = DateTime.utc_now()
+      assert [:instruction_enqueued] = sweep(ctx, t0)
+      assert_received {:enqueued, args}
+      assert {:ok, :refused} = instruct(args, t0, enforce: ctx.control_plane)
+      refute_received {:instructed, _, _, _}
+
+      row = Stages.get(ctx.tenant.id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ "independent"
+    end
+
+    test "an absent runner whose pull request is NOT merged: the adopt job writes nothing",
+         ctx do
+      allow_source()
+      t0 = DateTime.utc_now()
+      assert [:instruction_enqueued] = sweep(ctx, t0)
+      assert_received {:enqueued, args}
+      assert {:ok, :pushed} = instruct(args, t0, enforce: ctx.control_plane)
+      assert_received {:instructed, _tenant, _runner, %{"head_sha" => @head}}
+      before = Stages.get(ctx.tenant.id, ctx.story_id)
+
+      gone = fn _tenant, _runner -> false end
+      assert [:runner_absent_adopt_enqueued] = sweep(ctx, DateTime.add(t0, 30), live?: gone)
+      assert_received {:enqueued, %{"mode" => "adopt"} = adopt}
+
+      assert {:ok, :not_merged} = instruct(adopt, DateTime.add(t0, 30))
+      refute_received {:instructed, _, _, _}
+
+      row = Stages.get(ctx.tenant.id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.merge_instruction == before.merge_instruction
+    end
+
+    test "an absent runner never instructed at this head gets no adopt job", ctx do
+      gone = fn _tenant, _runner -> false end
+      assert [:runner_absent] = sweep(ctx, DateTime.utc_now(), live?: gone)
+      refute_received {:enqueued, _}
+    end
+  end
+
   describe "custody" do
     test "a halted tenant: the sweep writes nothing and the job snoozes", ctx do
       halt(ctx.tenant.id)
@@ -559,15 +710,18 @@ defmodule Loopctl.Delivery.MergeExecutionTest do
     )
   end
 
-  defp instruct(args, now) do
+  defp instruct(args, now, opts \\ []) do
     test = self()
 
-    MergeExecution.instruct(args,
-      now: now,
-      instruct: fn tenant_id, runner_id, payload ->
-        send(test, {:instructed, tenant_id, runner_id, payload})
-        :ok
-      end
+    MergeExecution.instruct(
+      args,
+      [
+        now: now,
+        instruct: fn tenant_id, runner_id, payload ->
+          send(test, {:instructed, tenant_id, runner_id, payload})
+          :ok
+        end
+      ] ++ opts
     )
   end
 

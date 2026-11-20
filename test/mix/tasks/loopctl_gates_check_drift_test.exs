@@ -15,7 +15,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
   @coverage [
     %{kind: :effect, index: 0, pattern: "priv/rates/**", matches: 5},
     %{kind: :effect, index: 1, pattern: "lib/app/gone/**", matches: 0},
-    %{kind: :human, index: 0, pattern: "lib/app_web/router.ex", matches: 1}
+    %{kind: :independent, index: 0, pattern: "lib/app_web/router.ex", matches: 1}
   ]
 
   # The meta the TASK actually builds, key for key. A trimmed stub is why the first redaction
@@ -39,7 +39,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       assert report.patterns == [
                %{kind: :effect, index: 0, matched: true},
                %{kind: :effect, index: 1, matched: false},
-               %{kind: :human, index: 0, matched: true}
+               %{kind: :independent, index: 0, matched: true}
              ]
     end
 
@@ -159,7 +159,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       assert report.totals == %{
                patterns: 3,
                effect_patterns: 2,
-               human_patterns: 1,
+               independent_patterns: 1,
                unmatched: 1
              }
     end
@@ -456,11 +456,12 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       File.write!(
         triggers,
         Jason.encode!(%{
-          "version" => 1,
+          "version" => 2,
           "repos" => %{
             "acme/app" => %{
               "effect_paths" => [""],
-              "human_paths" => ["config/runtime.exs"],
+              "independent_paths" => ["config/runtime.exs"],
+              "independent_checks" => ["e2e"],
               "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
             }
           }
@@ -602,11 +603,12 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
     File.write!(
       path,
       Jason.encode!(%{
-        "version" => 1,
+        "version" => 2,
         "repos" => %{
           repo_name => %{
             "effect_paths" => effect,
-            "human_paths" => human,
+            "independent_paths" => human,
+            "independent_checks" => ["e2e"],
             "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
           }
         }

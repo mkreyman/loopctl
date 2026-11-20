@@ -10,20 +10,36 @@ defmodule Loopctl.DeliveryGates.Triggers do
   ## Document shape
 
       {
-        "version": 1,
+        "version": 2,
         "repos": {
           "owner/repo": {
             "effect_paths": ["priv/rates/**", "lib/app/payments/**"],
-            "human_paths": ["lib/app_web/router.ex", "lib/**/data_migrations/**"],
+            "independent_paths": ["lib/app_web/router.ex", "lib/**/data_migrations/**"],
+            "independent_checks": ["e2e"],
             "limits": {"max_files": 12, "max_changed_lines": 1000}
           }
         }
       }
 
   Every key is required, no other key is accepted, both pattern lists must be non-empty,
-  and both limits must be positive integers. An unknown key is an error rather than
-  something to ignore, because a misspelled `"efect_paths"` beside a correct one would
-  otherwise be a trigger list nobody reads.
+  `independent_checks` must be a non-empty list of check names, and both limits must be
+  positive integers. An unknown key is an error rather than something to ignore, because a
+  misspelled `"efect_paths"` beside a correct one would otherwise be a trigger list nobody
+  reads.
+
+  `independent_checks` names the CI jobs that must be green at a pull request's head before
+  a change touching an `independent_paths` pattern (or any change to a control-plane
+  repository) merges (US-52.12, `Loopctl.Delivery.MergePrecondition.independent_verification/3`).
+  `local-gate` is refused there: it is a status whoever pushed can post, and
+  `Loopctl.Delivery.CiEvidence` never looks it up, so naming it would be a list that judges
+  nothing.
+
+  ## Only version 2
+
+  Version 2 is the only version read (US-52.12). Any other version is
+  `{:unsupported_version, v}`, and a repository key this module does not name is
+  `{:unknown_key, ["repos", repo, key]}`, so a document written for another version's
+  meaning is refused rather than read under this one.
 
   The checksum is verified against the raw bytes BEFORE the document is decoded, so a
   document that does not match what the operator pinned is never interpreted at all.
@@ -31,10 +47,11 @@ defmodule Loopctl.DeliveryGates.Triggers do
 
   alias Loopctl.DeliveryGates.Glob
   alias Loopctl.DeliveryGates.RepoTriggers
+  alias Loopctl.Intake.Source
 
-  @supported_versions [1]
+  @supported_versions [2]
   @top_keys ~w(version repos)
-  @repo_keys ~w(effect_paths human_paths limits)
+  @repo_keys ~w(effect_paths independent_paths independent_checks limits)
   @limit_keys ~w(max_files max_changed_lines)
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
   @sha256_hex ~r/\A[0-9a-f]{64}\z/
@@ -64,6 +81,8 @@ defmodule Loopctl.DeliveryGates.Triggers do
           | {:empty_patterns, key_path()}
           | {:invalid_patterns, key_path()}
           | {:invalid_pattern, key_path(), term()}
+          | {:empty_checks, key_path()}
+          | {:invalid_checks, key_path()}
           | {:invalid_limit, key_path()}
 
   @doc """
@@ -156,7 +175,9 @@ defmodule Loopctl.DeliveryGates.Triggers do
     with :ok <- repo_name(name),
          :ok <- exact_keys(entry, @repo_keys, path),
          {:ok, effect} <- patterns(entry["effect_paths"], path ++ ["effect_paths"]),
-         {:ok, human} <- patterns(entry["human_paths"], path ++ ["human_paths"]),
+         {:ok, independent} <-
+           patterns(entry["independent_paths"], path ++ ["independent_paths"]),
+         {:ok, checks} <- checks(entry["independent_checks"], path ++ ["independent_checks"]),
          :ok <- exact_keys(entry["limits"], @limit_keys, path ++ ["limits"]),
          {:ok, max_files} <- limit(entry["limits"]["max_files"], path ++ ["limits", "max_files"]),
          {:ok, max_lines} <-
@@ -164,7 +185,8 @@ defmodule Loopctl.DeliveryGates.Triggers do
       {:ok,
        %RepoTriggers{
          effect_paths: effect,
-         human_paths: human,
+         independent_paths: independent,
+         independent_checks: checks,
          max_files: max_files,
          max_changed_lines: max_lines
        }}
@@ -191,6 +213,22 @@ defmodule Loopctl.DeliveryGates.Triggers do
   end
 
   defp patterns(_value, path), do: {:error, {:invalid_patterns, path}}
+
+  # A non-empty list of non-empty check names, never `local-gate` (see the moduledoc).
+  defp checks([], path), do: {:error, {:empty_checks, path}}
+
+  defp checks(list, path) when is_list(list) do
+    if Enum.all?(list, &check_name?/1),
+      do: {:ok, Enum.uniq(list)},
+      else: {:error, {:invalid_checks, path}}
+  end
+
+  defp checks(_value, path), do: {:error, {:invalid_checks, path}}
+
+  defp check_name?(name) when is_binary(name),
+    do: String.trim(name) != "" and name != Source.local_gate()
+
+  defp check_name?(_name), do: false
 
   defp limit(value, _path) when is_integer(value) and value > 0, do: {:ok, value}
   defp limit(_value, path), do: {:error, {:invalid_limit, path}}

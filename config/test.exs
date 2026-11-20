@@ -985,8 +985,8 @@ config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Simi
 # without the other fails the loader test, which is the point.
 config :loopctl, Loopctl.DeliveryGates.Config,
   document:
-    ~s({"version":1,"repos":{"acme/widgets":{"effect_paths":["priv/rates/**"],"human_paths":["lib/widgets_web/router.ex"],"limits":{"max_files":12,"max_changed_lines":1000}}}}),
-  sha256: "2f3c86e749445d6820a406d7e3dc2127f452179b4c7f31e565a5c2d01bcc27a2"
+    ~s({"version":2,"repos":{"acme/widgets":{"effect_paths":["priv/rates/**"],"independent_paths":["lib/widgets_web/router.ex"],"independent_checks":["e2e"],"limits":{"max_files":12,"max_changed_lines":1000}}}}),
+  sha256: "3e8a671dd385a02a60ae03d7b8673e07ff5edc0c314031f124607a2a9b467a00"
 
 # #803: the merge precondition's pull-request source. A Mox mock, so no test reaches
 # GitHub; the DataCase default stub answers `{:error, :not_stubbed}`, which is the

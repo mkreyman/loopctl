@@ -9,8 +9,11 @@ defmodule Loopctl.Workers.MergeInstructionWorker do
   on the stage row before it pushes, so a completed job's successor (the next sweep's resend
   after the answer window) pushes only when the record says one is due.
 
-  Args carry ids only: `tenant_id`, `story_id`, `head_sha`. Every value the instruction names
-  is read from control's own rows when the job runs.
+  Args carry ids only: `tenant_id`, `story_id`, `head_sha`, and `"mode" => "adopt"` on the job
+  the sweep enqueues for an ABSENT runner already instructed at that head (US-52.12), which only
+  records a merge it finds and pushes nothing. It shares the uniqueness keys, so while either
+  job is pending the other is not inserted; both adopt a merge they find. Every value the
+  instruction names is read from control's own rows when the job runs.
 
   `{:snooze, seconds}` when the forge could not be read (its own `Retry-After`) or the tenant
   is halted; `{:cancel, reason}` for an answer no retry changes (a tenant not human-anchored,

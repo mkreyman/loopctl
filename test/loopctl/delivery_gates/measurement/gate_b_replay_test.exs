@@ -37,7 +37,11 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplayTest do
       result = replay(files: ["lib/app_web/router.ex"])
 
       assert result.outcome == :human
-      assert Enum.any?(result.reasons, &match?({:human_path, "lib/app_web/router.ex", _}, &1))
+
+      assert Enum.any?(
+               result.reasons,
+               &match?({:independent_path, "lib/app_web/router.ex", _}, &1)
+             )
     end
 
     test "a human path BEATS an effect path in the same change" do
@@ -109,7 +113,8 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplayTest do
           "repos" => %{
             @repo => %{
               "effect_paths" => ["priv/rates/**"],
-              "human_paths" => ["lib/app_web/router.ex"],
+              "independent_paths" => ["lib/app_web/router.ex"],
+              "independent_checks" => ["e2e"],
               "limits" => %{"max_files" => 500, "max_changed_lines" => 100_000}
             }
           }

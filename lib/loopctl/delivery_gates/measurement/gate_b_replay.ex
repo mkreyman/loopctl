@@ -21,12 +21,13 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplay do
   - `:prove_effect` — an effect path was touched. Not scored as pass or fail: the proof step
     regenerates 837P output from a fixed fixture set on a deployed branch, which cannot be
     replayed over history
-  - `:human` — a human path, an unreadable input, a stale trigger, or a configuration failure
+  - `:human` — an independent path (held for independent verification, so never cleared on
+    Gate B alone), an unreadable input, a stale trigger, or a configuration failure
   - `:size_bound` — refused ONLY on size: the configured `max_files` / `max_changed_lines`, the
     design's 12-file / 1,000-line ceiling, or both. Reported apart from `:human` because the two
-    say different things about the gate — a human path is the gate finding something, a size
-    refusal is the gate declining to look. A change over the bound that ALSO touches a human
-    path is `:human`, and one that also touches an EFFECT path is `:prove_effect`: what the gate
+    say different things about the gate — an independent path is the gate finding something,
+    a size refusal is the gate declining to look. A change over the bound that ALSO touches an
+    independent path is `:human`, and one that also touches an EFFECT path is `:prove_effect`: what the gate
     found beats what it declined to look at, in both cases
   - `:unreadable` — the change could not be read at all. Counted, never dropped
 
@@ -177,7 +178,7 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplay do
     reasons = result.reasons ++ hard_bound
     non_size = Enum.reject(reasons, &size_reason?/1)
 
-    # PRECEDENCE, strongest signal first, the same rule that puts a human path above a size
+    # PRECEDENCE, strongest signal first, the same rule that puts an independent path above a size
     # refusal: what the gate FOUND beats what it declined to look at. Ordering `:size_bound`
     # above the effect signal lost it on any change that was also over the bound — inert at
     # today's limits and live for any looser configuration.

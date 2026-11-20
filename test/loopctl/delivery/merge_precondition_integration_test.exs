@@ -221,7 +221,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :escalated
       assert row.escalation_reason =~ "merge_gate"
-      assert row.escalation_reason =~ "human_path"
+      assert row.escalation_reason =~ "independent_path"
       assert row.attempts["merge_gate"] == 1
     end
 

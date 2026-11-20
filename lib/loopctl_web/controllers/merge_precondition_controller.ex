@@ -136,18 +136,22 @@ defmodule LoopctlWeb.MergePreconditionController do
               "The design's ceiling, applied on top of the configured limits: a " <>
                 "configuration may tighten it and may not loosen it."
           },
-          self_deploy_excluded_repos: %OpenApiSpex.Schema{
+          control_plane_repos: %OpenApiSpex.Schema{
             type: :array,
             items: %OpenApiSpex.Schema{type: :string},
             description:
-              "Repositories this loop refuses to merge, as `owner/name`, lowercased " <>
-                "(issue #803 correction 11). loopctl deploys on every push to master and " <>
-                "IS the control plane, so merging it restarts the node holding the story's " <>
-                "own state and drops every runner socket, the asking session's included; " <>
-                "claude-config is symlinked into every machine's ~/.claude. A refusal names " <>
-                "`self_deploy_excluded` and a human merges it instead. Decided before " <>
-                "every other part of the verdict, including a forge outage, because no " <>
-                "retry clears it. (A story on a `chg` source gets no verdict at all: 409 " <>
+              "The control-plane repositories, as `owner/name`, lowercased (US-52.12). " <>
+                "loopctl deploys on every push to master and IS the control plane; " <>
+                "claude-config is symlinked into every machine's ~/.claude. Every merge " <>
+                "into one carries `independent_path` (`{:independent_path, :control_plane, " <>
+                "repo}`) and is allowed only when it is independently verified: the " <>
+                "story's verifier dispatch passed custody at the recorded head, ran on a " <>
+                "machine other than the implementer's, and the repository's " <>
+                "`independent_checks` are green at the head. Otherwise the refusal names " <>
+                "`independent_verification` with the reason (`not_independently_verified`, " <>
+                "`same_host`, `host_unattested`, `independent_checks_not_passed`, ...). The " <>
+                "same rule holds a change touching a Gate B `independent_paths` pattern in " <>
+                "any repository. (A story on a `chg` source gets no verdict at all: 409 " <>
                 "`change_protocol_enrolled`, decided before this.)"
           },
           custody: %OpenApiSpex.Schema{type: :string, nullable: true},
@@ -394,9 +398,9 @@ defmodule LoopctlWeb.MergePreconditionController do
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),
       # SHOWN rather than left to be discovered by refusal, exactly as `hard_bound` is: a
-      # session that reads a `self_deploy_excluded` refusal and cannot see the list has no
-      # way to tell a policy from a bug.
-      self_deploy_excluded_repos: MergePrecondition.self_deploy_excluded_repos(),
+      # session held for `{:independent_path, :control_plane, repo}` that cannot see the list
+      # has no way to tell a policy from a bug.
+      control_plane_repos: MergePrecondition.control_plane_repos(),
       custody: verdict.custody,
       gate_a_inputs: verdict.gate_a_inputs,
       trio_outputs_ignored: verdict.trio_outputs_ignored,

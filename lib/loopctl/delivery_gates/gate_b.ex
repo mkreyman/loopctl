@@ -1,6 +1,6 @@
 defmodule Loopctl.DeliveryGates.GateB do
   @moduledoc """
-  Gate B — "a human confirms". Effect-shaped and mechanical.
+  Gate B. Effect-shaped and mechanical.
 
   It asks one question of a change: can it cause an irreversible external effect? A revert
   does not un-submit a claim file, so reversibility of the EFFECT, not of the diff, is what
@@ -8,9 +8,16 @@ defmodule Loopctl.DeliveryGates.GateB do
 
   ## Outcomes, in precedence order
 
-  - `:human` — a human path was touched, the size bound was exceeded, or the gate could not
-    evaluate at all: no or bad configuration, an unknown repository, a stale trigger, missing
-    or malformed input. Also any escalation an agent signalled
+  - `:human` — the size bound was exceeded, or the gate could not evaluate at all: no or bad
+    configuration, an unknown repository, a stale trigger, missing or malformed input. Also
+    any escalation an agent signalled. An independent path touched ALONGSIDE any of these is
+    `:human` too, and its `{:independent_path, file, pattern}` is among the reasons
+  - `:independent` — every reason is `{:independent_path, file, pattern}`: the change touches
+    an `independent_paths` pattern and nothing else refused it. The merge precondition clears
+    it only on independent verification (US-52.12,
+    `Loopctl.Delivery.MergePrecondition.independent_verification/3`). An effect path touched as
+    well is still in `effect_matches`, and the merge precondition judges it as it judges a
+    `:prove_effect` outcome
   - `:prove_effect` — an effect path was touched. The change must prove its effect with
     `judge_proof/4` before it merges
   - `:clear` — none of the above
@@ -88,9 +95,10 @@ defmodule Loopctl.DeliveryGates.GateB do
 
     outcome =
       cond do
-        reasons != [] -> :human
-        effect_matches != [] -> :prove_effect
-        true -> :clear
+        reasons == [] and effect_matches != [] -> :prove_effect
+        reasons == [] -> :clear
+        Enum.all?(reasons, &independent_path?/1) -> :independent
+        true -> :human
       end
 
     %Result{
@@ -103,16 +111,32 @@ defmodule Loopctl.DeliveryGates.GateB do
   end
 
   @doc """
+  `{:independent_path, file, pattern}`, the one reason an `:independent` outcome carries.
+  Public so the merge precondition reads the outcome's reasons with the same predicate the
+  outcome was decided by.
+  """
+  @spec independent_path?(term()) :: boolean()
+  def independent_path?({:independent_path, file, pattern})
+      when is_binary(file) and is_binary(pattern),
+      do: true
+
+  def independent_path?(_reason), do: false
+
+  @doc """
   The TRIAGE SCREEN (epic 44, US-44.2): Gate B's trigger matching over a triage session's
   PREDICTED touches, before a story is queued. `[]` means nothing guarded was predicted.
 
   Not `evaluate(:triage, …)`, which would escalate every story: that adds a stale-trigger
   reason without the repository's file list, and a missing-files reason for a draft that
   predicted none — neither of which triage can supply. So this is deliberately narrower. It
-  can only ADD an escalation, on a POSITIVE signal: a predicted touch matching a `human_paths`
-  or `effect_paths` trigger, or
-  trigger configuration that cannot be read for the repository, which fails closed exactly as
-  the merge run does. The merge run remains the gate.
+  can only ADD an escalation, on a POSITIVE signal: a predicted touch matching an
+  `effect_paths` trigger, or trigger configuration that cannot be read for the repository,
+  which fails closed exactly as the merge run does. The merge run remains the gate.
+
+  A predicted touch of an `independent_paths` pattern does NOT escalate here (US-52.12). Such a
+  change is dispatched like any other and is held at the merge gate until it is independently
+  verified; escalating it at triage would send it to a person, which is the step independent
+  verification replaced.
 
   An effect-path match escalates here although `evaluate(:merge, ...)` answers `:prove_effect`
   for it rather than refusing outright: the merge precondition turns EVERY `:prove_effect` into
@@ -125,15 +149,8 @@ defmodule Loopctl.DeliveryGates.GateB do
   def triage_screen(triggers, repo, touches) when is_list(touches) do
     case repo_triggers(triggers, repo) do
       {:ok, repo_triggers} ->
-        human =
-          for {file, pattern} <- matches(repo_triggers.human_paths, touches),
-              do: {:human_path, file, pattern}
-
-        effect =
-          for {file, pattern} <- matches(repo_triggers.effect_paths, touches),
-              do: {:effect_path, file, pattern}
-
-        human ++ effect
+        for {file, pattern} <- matches(repo_triggers.effect_paths, touches),
+            do: {:effect_path, file, pattern}
 
       {:escalate, reason} ->
         [reason]
@@ -185,7 +202,7 @@ defmodule Loopctl.DeliveryGates.GateB do
         stale_trigger_reasons(repo_triggers, Map.get(input, :repo_files)) ++
           file_reasons(files) ++
           rename_reasons ++
-          human_path_reasons(repo_triggers, touched) ++
+          independent_path_reasons(repo_triggers, touched) ++
           limit_reasons(phase, repo_triggers, files, Map.get(input, :diffstat))
 
       {reasons, matches(repo_triggers.effect_paths, touched)}
@@ -253,7 +270,13 @@ defmodule Loopctl.DeliveryGates.GateB do
 
   # `parse/2` never builds an empty trigger set, but a struct can be built by hand. Checked
   # again here so that no path, however the value was made, turns into "no triggers".
-  defp usable(%RepoTriggers{effect_paths: [_ | _], human_paths: [_ | _]} = repo_triggers)
+  defp usable(
+         %RepoTriggers{
+           effect_paths: [_ | _],
+           independent_paths: [_ | _],
+           independent_checks: [_ | _]
+         } = repo_triggers
+       )
        when is_integer(repo_triggers.max_files) and repo_triggers.max_files > 0 and
               is_integer(repo_triggers.max_changed_lines) and repo_triggers.max_changed_lines > 0,
        do: {:ok, repo_triggers}
@@ -280,9 +303,9 @@ defmodule Loopctl.DeliveryGates.GateB do
   defp file_reasons({:error, {:unreadable_diff, _reason} = reason}), do: [reason]
   defp file_reasons(_files), do: [:missing_files]
 
-  defp human_path_reasons(repo_triggers, files) do
-    for {file, pattern} <- matches(repo_triggers.human_paths, files),
-        do: {:human_path, file, pattern}
+  defp independent_path_reasons(repo_triggers, files) do
+    for {file, pattern} <- matches(repo_triggers.independent_paths, files),
+        do: {:independent_path, file, pattern}
   end
 
   defp limit_reasons(:merge, repo_triggers, files, %{files: file_count, changed_lines: lines})

@@ -1151,6 +1151,56 @@ defmodule Loopctl.Runners.DispatchLedger do
     found
   end
 
+  @doc """
+  The MACHINES a story's work ran on, for the merge gate's host separation (US-52.12,
+  `Loopctl.Delivery.MergePrecondition.independent_verification/3`): the `runners.name` of every
+  ledger row of the story, split in two.
+
+  - `implementers` — every claim-holding row (`where_holds_claim/1`'s kinds), at ANY epoch and in
+    any status but `refused`. Every machine that may have run an implement session for the story
+    counts, so a verifier on any of them is the same host. A `refused` row is the one status that
+    is certain never to have run.
+  - `verifier` — the row whose `dispatch_id` is `verifier_dispatch_id` (a `verify` dispatch's id
+    IS its verifier dispatch's, `Loopctl.Agents.VerifierPlacement`), and only while `accepted`:
+    the runner took the session, so its verdict came from that machine.
+
+  `runners.name` is the attested machine: `LoopctlWeb.RunnerChannel` refuses a join under any
+  name but the runner row's own. Names are returned lowercased and deduplicated; an empty list
+  means the ledger attests no machine for that side. Read without a lock: every value is
+  written with the row and never changes.
+  """
+  @spec story_hosts(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) :: %{
+          implementers: [String.t()],
+          verifier: [String.t()]
+        }
+  def story_hosts(tenant_id, story_id, verifier_dispatch_id) do
+    {:ok, rows} =
+      in_tenant(tenant_id, fn ->
+        Repo.all(
+          from(r in DispatchRecord,
+            join: rn in Loopctl.Runners.Runner,
+            on: rn.id == r.runner_id and rn.tenant_id == ^tenant_id,
+            where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+            select: %{dispatch_id: r.dispatch_id, kind: r.kind, status: r.status, name: rn.name}
+          )
+        )
+      end)
+
+    %{
+      implementers: hosts(rows, &(Spec.holds_claim?(&1.kind) and &1.status != "refused")),
+      verifier:
+        hosts(
+          rows,
+          &(not is_nil(verifier_dispatch_id) and &1.dispatch_id == verifier_dispatch_id and
+              &1.status == "accepted")
+        )
+    }
+  end
+
+  defp hosts(rows, keep?) do
+    rows |> Enum.filter(keep?) |> Enum.map(&String.downcase(&1.name)) |> Enum.uniq()
+  end
+
   defp session_of(%DispatchRecord{} = record) do
     %{
       kind: record.kind,

@@ -25,7 +25,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   1. **Gate A** (`Loopctl.DeliveryGates.gate_a/1`) over the triage trio's outputs —
      `:proceed`, on a unanimous `story` verdict. A `reject` verdict is not something to
      merge, and anything malformed escalates by construction.
-  2. **Gate B** (`Loopctl.DeliveryGates.gate_b/3`) at `:merge` — `:clear`. A
+  2. **Gate B** (`Loopctl.DeliveryGates.gate_b/3`) at `:merge` — `:clear`, or
+     `:independent` with independent verification (below). A
      `:prove_effect` outcome REFUSES today whatever proof the call carried: the proof is a
      caller assertion by the same principal that drives the merge, so accepting it would
      wave through exactly the changes the gate exists for. It is judged
@@ -45,10 +46,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
      row recorded, which is the head CI ran on and the story was verified at. A push after
      either is ordinary work rather than an escalation, so it goes back to `implementing`
      on `:base_moved`; it does not merge, because no CI run and no verifier saw it.
-  6. **The repository is not one the loop deploys itself from** — issue #803's correction
-     11, and the only precondition of the VERDICT decided before every other, including a
-     forge outage. See below. (A `chg` source is refused earlier still, but that is not a
-     verdict: no verdict is produced at all — next section.)
+  6. **Independent verification** where the change needs it — a change touching an
+     `independent_paths` pattern, and EVERY change to a control-plane repository. See below.
+     (A `chg` source is refused earlier still, but that is not a verdict: no verdict is
+     produced at all — next section.)
 
   ## A `chg` repository has no PR route (US-47.2)
 
@@ -67,38 +68,40 @@ defmodule Loopctl.Delivery.MergePrecondition do
   story still holds an allow it has not merged on — the `ci -> merged` edge that consumes an
   allow does not read the mode, so an allow recorded before the switch must not exist after it.
 
-  ## The loop may not merge its own control plane
+  ## Independent verification (US-52.12)
 
-  loopctl deploys on every push to master AND IS the control plane: a story that changes
-  loopctl restarts the node holding its own `DurableServer`, and a rolling deploy drops
-  every runner socket — including the socket of the session that asked for the merge. So a
-  merge of this repository is not a merge that went wrong afterwards; it is one that cannot
-  report its own outcome. `claude-config` is excluded on the same ground one layer up: it is
-  symlinked into `~/.claude` on every machine in the fleet, so a change there rewrites the
-  instructions every session is running under, this one included.
+  Two kinds of change are held for it. A change Gate B answers `:independent` for — every
+  reason an `{:independent_path, file, pattern}`, the repository's self-modification code —
+  and every change to a CONTROL-PLANE repository (`control_plane_repos/0`, default
+  `mkreyman/loopctl` and `mkreyman/claude-config`), whatever paths it touches, which carries
+  `{:independent_path, :control_plane, repo}`. loopctl deploys on every push to master and IS
+  the control plane; claude-config is symlinked into `~/.claude` on every machine of the
+  fleet. A merge into either rewrites what judges and runs the loop, so every one is held.
 
-  This is `{:self_deploy_excluded, repo}`. It OVERRIDES the decision and replaces no part of
-  the analysis: every other gate still runs and every reason it finds is still reported, so
-  an ungated merge of this repository — the byzantine event correction 11 is actually about —
-  still names its sha, and the human who now has to merge by hand still sees which head and
-  how large a diff. What it does override is the decision itself, `:unevaluated` included,
-  and it clears `retry_after`: no retry can clear an exclusion, and leaving one tells a
-  session to come back for a decision that cannot change until
-  `max_consecutive_unevaluated` escalates it naming the forge rather than the policy.
+  Such a change merges only when the fact `:independent_verification` is `:ok`, which
+  `independent_verification/3` decides from recorded rows and the forge, never from a caller:
 
-  The list reaches `judge/1` as a FACT (`:self_deploy_excluded`), resolved by `gather/3`
-  alongside the triggers, so `judge/1` stays the pure function this moduledoc promises.
+  1. the story's recorded verifier dispatch passed `Loopctl.Progress.merge_custody_status/1`
+     AT the recorded head (`verified_head_sha == head_sha`, the same `custody_at_head/2` the
+     custody precondition runs) — whose `verify_lineage_separated/4` refuses a verifier
+     sharing a lineage root with the implementer. There is no second lineage comparison here.
+     Otherwise `:not_independently_verified`;
+  2. that dispatch ran on a machine (`runners.name`, server-attested) other than every machine
+     an implement dispatch of the story ran on (`Loopctl.Runners.DispatchLedger.story_hosts/3`).
+     `:same_host` otherwise, and `:host_unattested` when either side has no ledger row;
+  3. every one of the repository's `independent_checks` passed at the head, judged by
+     `Loopctl.Delivery.CiEvidence.judge/2` over `PullRequestSource.check_evidence/3` for the
+     stage row's branch and head: `{:independent_checks_not_passed, names}` otherwise.
 
-  The list is CONFIGURABLE (`:self_deploy_excluded_repos`) and defaults to the two repos
-  above, because "the repository this control plane deploys from" is the real invariant and
-  a hardcoded `mkreyman/loopctl` is simply wrong for anyone else running loopctl — a guard
-  that names one owner's slug is off by default for every other deployment, which is worse
-  than one that can be set. Matching is case-insensitive, as GitHub's own names are.
+  Anything else refuses, naming the independent reasons AND `{:independent_verification,
+  reason}`, and escalates like any other refusal. A transient forge fault reading the checks
+  is `:unevaluated`, retried, as every other forge read is. The fact is resolved by
+  `gather/4` only when an independent reason exists, so no other story pays the forge call.
 
-  It is a REFUSAL rather than a silent skip: the story escalates to a human, who merges it
-  themselves. Nothing here can merge anything — this module returns a verdict and the
-  session acts on it — so refusing is the whole of the enforcement available, and that is
-  precisely why it must never be reachable past a branch that reports `:allow`.
+  It is a precondition of the ALLOW. An already-merged pull request is judged, as before, by
+  the allow recorded for its head, and an allow is recorded only when this held, so a
+  control-plane merge the runner made but could not report — the deploy restarted loopctl and
+  dropped its socket — is adopted by `Loopctl.Delivery.MergeExecution`'s next resend.
 
   ## Gate A's inputs come from the database, never the caller (US-44.1)
 
@@ -198,20 +201,26 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   alias Loopctl.Changes.Findings
   alias Loopctl.Changes.SelectionProof
+  alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.DeliveryGates
   alias Loopctl.DeliveryGates.DiffNames
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.DeliveryGates.GateB
+  alias Loopctl.DeliveryGates.RepoTriggers
+  alias Loopctl.DeliveryGates.Triggers
   alias Loopctl.Intake
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
+  alias Loopctl.WorkBreakdown.Story
 
   # US-52.5: chg's source inside this repository. The selection proof measures only it.
   @chg_prefix "chg/"
@@ -243,7 +252,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
           # OPTIONAL, and the fallback behind it is deliberate: a caller of `judge/1` that
           # omits it gets the configured list, because a guard that disappears when a fact is
           # missing is the failure this key exists to prevent.
-          optional(:self_deploy_excluded) => [String.t()]
+          optional(:control_plane_repos) => [String.t()],
+          # Resolved only when an independent reason exists. ABSENT reads as
+          # `{:error, :not_independently_verified}`, never as verified.
+          optional(:independent_verification) => :ok | {:error, term()}
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage | :change_protocol_enrolled
@@ -275,11 +287,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # escalating is a story nobody ever hears about again.
   @max_consecutive_unevaluated 5
 
-  # Issue #803, correction 11. loopctl IS the control plane and deploys on every push to
-  # master; claude-config is symlinked into ~/.claude on every machine in the fleet. See the
-  # moduledoc. Overridable with `config :loopctl, :self_deploy_excluded_repos, [...]`,
-  # because another deployment's control plane is not at this slug.
-  @default_self_deploy_excluded ["mkreyman/loopctl", "mkreyman/claude-config"]
+  # US-52.12. loopctl IS the control plane and deploys on every push to master; claude-config
+  # is symlinked into ~/.claude on every machine in the fleet. See the moduledoc. Overridable
+  # with `config :loopctl, :control_plane_repos, [...]`, because another deployment's control
+  # plane is not at this slug.
+  @default_control_plane_repos ["mkreyman/loopctl", "mkreyman/claude-config"]
 
   @doc "The hard bound the design fixes, whatever the configuration says."
   @spec hard_bound() :: %{max_files: pos_integer(), max_changed_lines: pos_integer()}
@@ -317,42 +329,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # Computed ONCE, from the facts, and handed to every step that turns on it.
     moved = moved_reasons(facts)
 
-    base
-    |> undecided(unevaluated_reasons(facts, moved), input_reasons(facts), carried, {facts, moved})
-    |> exclude_self_deploy(facts)
-  end
-
-  # THE EXCLUSION OVERRIDES THE DECISION AND REPLACES NOTHING ELSE, which is the correction
-  # of the worst thing this guard did in its first form.
-  #
-  # It used to refuse from `base` before `decide/4` ran at all. That silenced
-  # `{:ungated_merge, sha, why}` and `:merged_without_sha` — this module's own comment calls
-  # the first "the loudest signal this module produces" and forbids suppressing it — on
-  # EXACTLY the repositories where it matters most. A merge of loopctl's own pull request
-  # with no recorded allow is the byzantine event correction 11 exists to catch, and the
-  # escalation would have read "we refuse to merge this repository" instead of "a merge
-  # nobody authorised landed at sha c…". It also left `head_sha`, `merge_sha`,
-  # `merge_base_sha` and `diffstat` nil, so the human who now has to merge by hand was told
-  # neither which head was refused nor how big the change is.
-  #
-  # Running the whole analysis and then overriding keeps every reason and every field. The
-  # decision is still unreachable-by-construction: `:allow`, `:already_merged`, `:head_moved`
-  # and `:unevaluated` all become `:refuse` here, and `retry_after` is cleared because no
-  # retry can clear an exclusion — `max_consecutive_unevaluated` would otherwise escalate it
-  # naming the forge rather than the policy.
-  defp exclude_self_deploy(verdict, facts) do
-    case self_deploy_reasons(facts) do
-      [] ->
-        verdict
-
-      excluded ->
-        %{
-          verdict
-          | decision: :refuse,
-            retry_after: nil,
-            reasons: Enum.uniq(excluded ++ verdict.reasons)
-        }
-    end
+    undecided(
+      base,
+      unevaluated_reasons(facts, moved),
+      input_reasons(facts),
+      carried,
+      {facts, moved}
+    )
   end
 
   defp undecided(base, transient, other, carried, {facts, moved}) do
@@ -378,60 +361,53 @@ defmodule Loopctl.Delivery.MergePrecondition do
   end
 
   @doc """
-  The repositories this loop will not merge, lowercased and validated. See the moduledoc.
+  The control-plane repositories (US-52.12), lowercased and validated: every merge into one
+  carries `{:independent_path, :control_plane, repo}` and needs independent verification. See
+  the moduledoc.
 
-  Public so `GET`-ing a verdict can SHOW the list rather than leaving a caller to discover
-  it by being refused, the way `hard_bound/0` already does for the size bound.
+  Public so `GET`-ing a verdict can SHOW the list rather than leaving a caller to discover it
+  by being held, the way `hard_bound/0` already does for the size bound.
 
-  NON-BINARY ENTRIES ARE DROPPED rather than mapped over. `String.downcase/1` raises on an
-  atom, on `nil`, and on a list that is not one — so a typo in the config turned every
-  merge-precondition call into a 500, and in one ordering a 500 AFTER the escalation had
-  already been written: an unreadable repo refuses `:repository_unresolved`, `enforce/3`
-  writes the transition, and only then does rendering the verdict raise. A guard whose
-  misconfiguration takes down the endpoint that reports it is worse than no guard.
+  NON-BINARY ENTRIES ARE DROPPED rather than mapped over: `String.downcase/1` raises on an
+  atom or `nil`, and a typo in the config must not turn every merge-precondition call into a
+  500.
   """
-  @spec self_deploy_excluded_repos() :: [String.t()]
-  def self_deploy_excluded_repos,
+  @spec control_plane_repos() :: [String.t()]
+  def control_plane_repos,
     do:
-      normalise_excluded(
-        Application.get_env(:loopctl, :self_deploy_excluded_repos, @default_self_deploy_excluded)
+      normalise_repos(
+        Application.get_env(:loopctl, :control_plane_repos, @default_control_plane_repos)
       )
 
   @doc """
-  The normalisation `self_deploy_excluded_repos/0` applies to a configured value.
-
-  Public and PURE so the misconfiguration cases can be tested without `Application.put_env`,
-  which this repo forbids in tests — the rule exists because VM-global state is not isolated
-  between async tests, and a guard's own test must not be the thing that breaks others.
+  The normalisation `control_plane_repos/0` applies to a configured value. Public and PURE so
+  the misconfiguration cases are tested without `Application.put_env`.
   """
-  @spec normalise_excluded(term()) :: [String.t()]
-  def normalise_excluded(configured) do
+  @spec normalise_repos(term()) :: [String.t()]
+  def normalise_repos(configured) do
     configured
     |> List.wrap()
     |> Enum.filter(&is_binary/1)
     |> Enum.map(&String.downcase/1)
   end
 
-  # A FACT, not a read of the application environment, and that is what keeps `judge/1`'s
-  # documented purity true — "no database, no forge, no application environment" is a claim
-  # this function was quietly falsifying. It also made the configurability UNTESTABLE: the
-  # list is set in no config file, this repo forbids `Application.put_env` in tests, so every
-  # test saw the default and deleting the `Application.get_env` call entirely left the suite
-  # green. Reaching it through the facts means a test names its own list, and an operator's
-  # list is exercised by the same code path as ours.
+  # A FACT, not a read of the application environment, so `judge/1` stays pure and a test
+  # names its own list. A caller of `judge/1` that omits it gets the configured list: a hold
+  # that disappears when a fact is missing would be no hold.
   #
-  # `gather/3` resolves it; a caller of `judge/1` that omits it gets the configured list,
-  # because a guard that silently disappears when a fact is missing is the failure this whole
-  # PR is about.
-  defp self_deploy_reasons(facts) do
-    excluded = Map.get_lazy(facts, :self_deploy_excluded, &self_deploy_excluded_repos/0)
+  # An UNREADABLE repo is not judged here: it is already `:repository_unresolved` from
+  # `input_reasons/1`.
+  defp control_plane_reasons(facts) do
+    control_plane =
+      facts
+      |> Map.get_lazy(:control_plane_repos, &control_plane_repos/0)
+      |> normalise_repos()
 
-    # An UNREADABLE repo is not judged here: it is already `:repository_unresolved` from
-    # `input_reasons/1`, and answering "not excluded" for a repository nobody could read
-    # would be the cap-that-cannot-bind shape this guard exists to avoid.
     case value(facts, :repo) do
       repo when is_binary(repo) ->
-        if String.downcase(repo) in excluded, do: [{:self_deploy_excluded, repo}], else: []
+        if String.downcase(repo) in control_plane,
+          do: [{:independent_path, :control_plane, repo}],
+          else: []
 
       _unreadable ->
         []
@@ -448,6 +424,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
     database by `Loopctl.Delivery.GateAInput`
   - `:effect_proof` — `%{intent: _, fixture_set: _, fixture_results: _, coverage: _}` for a
     change that touches an effect path. Absent, a `:prove_effect` outcome is a refusal
+  - `:control_plane_repos` — the control-plane repositories (US-52.12). Default
+    `control_plane_repos/0`
   - `:selection_proof_repos` — the repositories whose `:prove_effect` outcome is cleared by
     `Loopctl.Changes.SelectionProof`, the measured selection-widening proof (US-51.5). Default
     `[Loopctl.Changes.Findings.chg_repo()]`. On those repositories the measured proof is the
@@ -522,10 +500,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
     {:pull_request, :pull_request_unavailable}
   ]
 
+  # `:independent_verification` is read only for a TRANSIENT forge fault (the check read):
+  # every other value of it is decided in `gated/4`, and an absent fact is not transient.
   @forge_facts [
     {:pull_request, :pull_request_unavailable},
     {:head_files, :head_files_unavailable},
-    {:base_files, :base_files_unavailable}
+    {:base_files, :base_files_unavailable},
+    {:independent_verification, :independent_verification_unavailable}
   ]
 
   # Only the pull request is consumed when it could not be read at all, and when it says the
@@ -681,18 +662,46 @@ defmodule Loopctl.Delivery.MergePrecondition do
     own =
       hard_bound_reasons(Map.get(pr, :diffstat)) ++ open_reasons(pr) ++ carried
 
+    control_plane = control_plane_reasons(facts)
+
     case gate_b_verdict(facts, pr) do
       {:ok, gate_b} ->
         proof = proof(gate_b, Map.get(facts, :effect_proof))
         verdict = %{verdict | gate_b: gate_b, proof: proof}
+        independent = independent_reasons(gate_b) ++ control_plane
 
-        case own ++ gate_b_reasons(gate_b, proof, Map.get(facts, :selection_proof)) do
+        reasons =
+          own ++
+            gate_b_reasons(gate_b, proof, Map.get(facts, :selection_proof)) ++
+            verification_reasons(independent, facts)
+
+        case reasons do
           [] -> %{verdict | decision: :allow, reasons: []}
           reasons -> refuse(verdict, reasons)
         end
 
       {:refuse, reasons} ->
-        refuse(verdict, reasons ++ own)
+        refuse(verdict, reasons ++ own ++ verification_reasons(control_plane, facts))
+    end
+  end
+
+  # The reasons independent verification clears (US-52.12): an `:independent` outcome's paths.
+  # A `:human` outcome's independent paths are refused with the rest of its reasons by
+  # `gate_b_reasons/3`, whatever the verification says.
+  defp independent_reasons(%GateB.Result{outcome: :independent, reasons: reasons}),
+    do: Enum.map(reasons, &{:gate_b, &1})
+
+  defp independent_reasons(_gate_b), do: []
+
+  # Cleared only by `:ok`. An ABSENT fact is `:not_independently_verified`: a hold that lifted
+  # when the fact was missing would be no hold.
+  defp verification_reasons([], _facts), do: []
+
+  defp verification_reasons(independent, facts) do
+    case Map.get(facts, :independent_verification, {:error, :not_independently_verified}) do
+      :ok -> []
+      {:error, reason} -> independent ++ [{:independent_verification, reason}]
+      other -> independent ++ [{:independent_verification, {:unreadable, shape(other)}}]
     end
   end
 
@@ -821,6 +830,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp gate_b_reasons(%GateB.Result{outcome: :clear}, _proof, _selection), do: []
 
+  # US-52.12: the independent paths are `independent_reasons/1`'s, cleared by verification. An
+  # effect path touched alongside them is judged exactly as a `:prove_effect` outcome is:
+  # verification proves who judged the change, never what its effect is.
+  defp gate_b_reasons(%GateB.Result{outcome: :independent, effect_matches: []}, _proof, _sel),
+    do: []
+
+  defp gate_b_reasons(%GateB.Result{outcome: :independent} = gate_b, proof, selection),
+    do: gate_b_reasons(%{gate_b | outcome: :prove_effect}, proof, selection)
+
   defp gate_b_reasons(%GateB.Result{outcome: :human, reasons: reasons}, _proof, _selection),
     do: Enum.map(reasons, &{:gate_b, &1})
 
@@ -866,7 +884,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
        }),
        do: Enum.map(failures, &{:effect_proof, &1})
 
-  defp proof(%GateB.Result{outcome: :prove_effect}, effect_proof) do
+  defp proof(%GateB.Result{outcome: outcome, effect_matches: matches}, effect_proof)
+       when outcome == :prove_effect or (outcome == :independent and matches != []) do
     case effect_proof do
       %{intent: intent, fixture_set: set, fixture_results: results, coverage: coverage} ->
         DeliveryGates.judge_proof(intent, set, results, coverage)
@@ -1006,6 +1025,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp worst(a, b) do
     cond do
       :human in [a, b] -> :human
+      :independent in [a, b] -> :independent
       :prove_effect in [a, b] -> :prove_effect
       true -> :clear
     end
@@ -1032,7 +1052,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # Resolved HERE, with the other configured facts, so `judge/1` stays the pure function
       # its moduledoc says it is and a test can name a different list without touching
       # VM-global state.
-      self_deploy_excluded: self_deploy_excluded_repos(),
+      control_plane_repos:
+        opts
+        |> Keyword.get_lazy(:control_plane_repos, &control_plane_repos/0)
+        |> normalise_repos(),
       custody: custody_at_head(story, stage),
       # The head CI ran on and the story was verified at, and the head a previous allow was
       # granted for. Both are read from the stage row, never from the caller.
@@ -1070,14 +1093,134 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # verdict at the stage row's head. Never from the caller. US-52.5: and only for the effect
     # matches under chg/, which is all the replay measures; it is decided after the file lists
     # because the matches come from Gate B over them.
-    Map.put(facts, :selection_proof, selection_proof(story, stage, facts, opts))
+    facts = Map.put(facts, :selection_proof, selection_proof(story, stage, facts, opts))
+
+    # US-52.12: read only when the decision will consume it — an open pull request at the
+    # recorded head with an independent reason — so no other story pays the check read.
+    if not skip? and independent_needed?(facts) do
+      verification =
+        independent_verification(story.tenant_id, story,
+          stage: stage,
+          triggers: facts.triggers,
+          repo: facts.repo
+        )
+
+      Map.put(facts, :independent_verification, verification)
+    else
+      facts
+    end
   end
+
+  defp independent_needed?(facts) do
+    case value(facts, :pull_request) do
+      %{merged?: false} = pr ->
+        control_plane_reasons(facts) != [] or
+          match?({:ok, %GateB.Result{outcome: :independent}}, gate_b_verdict(facts, pr))
+
+      _merged_or_unreadable ->
+        false
+    end
+  end
+
+  @doc """
+  Whether `story` is INDEPENDENTLY VERIFIED at its stage row's head (US-52.12). See the
+  moduledoc for the three facts, checked in order.
+
+  `:ok`, or `{:error, reason}` where `reason` is `:not_independently_verified`, `:same_host`,
+  `:host_unattested`, `{:independent_checks_not_passed, names}`,
+  `:independent_checks_unconfigured`, `:branch_not_recorded`, `{:repository_unresolved, why}`,
+  `:credential_unavailable`, or the forge's own error from the check read (which
+  `transient?/1` classifies).
+
+  ## Options
+
+  `:stage` (default: the story's stage row), `:triggers` (default
+  `Loopctl.DeliveryGates.load_triggers/0`), `:repo` (default `repo_for_story/1`). Each is the
+  value `gather/4` already resolved, passed so one evaluation reads each once.
+  """
+  @spec independent_verification(Ecto.UUID.t(), Story.t(), keyword()) :: :ok | {:error, term()}
+  def independent_verification(tenant_id, story, opts \\ [])
+
+  def independent_verification(tenant_id, %Story{tenant_id: tenant_id} = story, opts) do
+    stage = Keyword.get_lazy(opts, :stage, fn -> Stages.get(tenant_id, story.id) end)
+
+    with :ok <- verified_at_head(story, stage),
+         :ok <- separate_hosts(tenant_id, story) do
+      checks_at_head(tenant_id, story, stage, opts)
+    end
+  end
+
+  def independent_verification(_tenant_id, _story, _opts),
+    do: {:error, :not_independently_verified}
+
+  # The custody precondition's own fact — `merge_custody_status/1` bound to the head — so the
+  # lineage half is the L4 comparison `verify` runs, and nothing here compares lineages.
+  defp verified_at_head(story, %StoryStage{} = stage) do
+    case custody_at_head(story, stage) do
+      :ok -> :ok
+      _refused -> {:error, :not_independently_verified}
+    end
+  end
+
+  defp verified_at_head(_story, _no_stage), do: {:error, :not_independently_verified}
+
+  defp separate_hosts(tenant_id, story) do
+    %{implementers: implementers, verifier: verifier} =
+      DispatchLedger.story_hosts(tenant_id, story.id, story.verifier_dispatch_id)
+
+    cond do
+      implementers == [] or verifier == [] -> {:error, :host_unattested}
+      Enum.any?(verifier, &(&1 in implementers)) -> {:error, :same_host}
+      true -> :ok
+    end
+  end
+
+  defp checks_at_head(tenant_id, story, stage, opts) do
+    triggers = Keyword.get_lazy(opts, :triggers, &DeliveryGates.load_triggers/0)
+    repo = Keyword.get_lazy(opts, :repo, fn -> repo_for_story(story) end)
+
+    with {:ok, name} <- resolved_repo(repo),
+         {:ok, checks} <- independent_checks(triggers, name),
+         {:ok, branch} <- recorded_branch(stage),
+         {:ok, forge} <- Credential.repo(tenant_id, name),
+         {:ok, evidence} <- source().check_evidence(forge, stage.head_sha, branch) do
+      result = CiEvidence.judge(checks, evidence)
+
+      case Enum.reject(checks, &(&1 in result.passed)) do
+        [] -> :ok
+        not_passed -> {:error, {:independent_checks_not_passed, not_passed}}
+      end
+    end
+  end
+
+  defp resolved_repo({:ok, name}) when is_binary(name), do: {:ok, name}
+  defp resolved_repo({:error, reason}), do: {:error, {:repository_unresolved, reason}}
+  defp resolved_repo(other), do: {:error, {:repository_unresolved, shape(other)}}
+
+  # The names `CiEvidence` will look up. An empty list would judge nothing and pass, so it is
+  # refused here as well as by `Triggers.parse/2`.
+  defp independent_checks({:ok, %Triggers{} = triggers}, repo) do
+    with {:ok, %RepoTriggers{independent_checks: checks}} <- Triggers.fetch_repo(triggers, repo),
+         [_ | _] = names <- CiEvidence.lookup_names(checks) do
+      {:ok, names}
+    else
+      _unconfigured -> {:error, :independent_checks_unconfigured}
+    end
+  end
+
+  defp independent_checks(_triggers, _repo), do: {:error, :independent_checks_unconfigured}
+
+  defp recorded_branch(%StoryStage{branch: branch}) when is_binary(branch) and branch != "",
+    do: {:ok, branch}
+
+  defp recorded_branch(_stage), do: {:error, :branch_not_recorded}
 
   defp selection_proof(story, stage, %{repo: {:ok, repo}} = facts, opts) do
     repos = Keyword.get_lazy(opts, :selection_proof_repos, fn -> [Findings.chg_repo()] end)
 
     with true <- Enum.any?(repos, &(String.downcase(&1) == String.downcase(repo))),
-         {:ok, %GateB.Result{outcome: :prove_effect, effect_matches: matches}} <-
+         {:ok, %GateB.Result{outcome: outcome, effect_matches: [_ | _] = matches}}
+         when outcome in [:prove_effect, :independent] <-
            gate_b_verdict(facts, value(facts, :pull_request) || %{}) do
       case selection_scope(matches) do
         :chg_only -> SelectionProof.judge(story, stage.head_sha)

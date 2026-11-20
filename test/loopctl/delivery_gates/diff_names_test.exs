@@ -11,11 +11,12 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
 
   # Synthetic triggers: one effect path, one human path.
   @triggers_doc Jason.encode!(%{
-                  "version" => 1,
+                  "version" => 2,
                   "repos" => %{
                     @repo => %{
                       "effect_paths" => ["priv/rates/**"],
-                      "human_paths" => ["guarded/human/**"],
+                      "independent_paths" => ["guarded/human/**"],
+                      "independent_checks" => ["e2e"],
                       "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
                     }
                   }
@@ -139,7 +140,7 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
       refute "guarded/human/moved.ex" in files
     end
 
-    test "fed to Gate B, a file moved out of a guarded path and a deleted one are :human",
+    test "fed to Gate B, a file moved out of a guarded path and a deleted one are :independent",
          ctx do
       %{dir: dir, base: base} = ctx
 
@@ -150,11 +151,11 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
 
       input = merge_input(dir, head, DiffNames.parse(diff_names(dir, base, head)))
 
-      assert %Result{outcome: :human, reasons: reasons} =
+      assert %Result{outcome: :independent, reasons: reasons} =
                DeliveryGates.gate_b(:merge, input, triggers())
 
-      assert {:human_path, "guarded/human/moved.ex", "guarded/human/**"} in reasons
-      assert {:human_path, "guarded/human/gone.ex", "guarded/human/**"} in reasons
+      assert {:independent_path, "guarded/human/moved.ex", "guarded/human/**"} in reasons
+      assert {:independent_path, "guarded/human/gone.ex", "guarded/human/**"} in reasons
       assert length(reasons) == 2
     end
 

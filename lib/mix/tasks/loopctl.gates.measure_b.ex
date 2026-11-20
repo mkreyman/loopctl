@@ -224,7 +224,7 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
       version: version,
       repos: map_size(repos),
       effect_patterns: Enum.sum(for {_name, r} <- repos, do: length(r.effect_paths)),
-      human_patterns: Enum.sum(for {_name, r} <- repos, do: length(r.human_paths))
+      independent_patterns: Enum.sum(for {_name, r} <- repos, do: length(r.independent_paths))
     }
   end
 

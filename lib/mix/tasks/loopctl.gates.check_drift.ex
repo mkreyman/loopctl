@@ -155,7 +155,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
       totals: %{
         patterns: length(coverage),
         effect_patterns: Enum.count(coverage, &(&1.kind == :effect)),
-        human_patterns: Enum.count(coverage, &(&1.kind == :human)),
+        independent_patterns: Enum.count(coverage, &(&1.kind == :independent)),
         unmatched: Enum.count(coverage, &(&1.matches == 0))
       },
       patterns: Enum.map(coverage, &row(&1, detail))

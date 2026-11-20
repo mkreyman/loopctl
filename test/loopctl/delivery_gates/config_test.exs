@@ -19,9 +19,9 @@ defmodule Loopctl.DeliveryGates.ConfigTest do
     test "returns the configured document, verified against the configured checksum" do
       # config/test.exs pins a synthetic document for acme/widgets and its checksum.
       assert {:ok, %Triggers{} = triggers} = Config.triggers()
-      assert triggers.sha256 == "2f3c86e749445d6820a406d7e3dc2127f452179b4c7f31e565a5c2d01bcc27a2"
+      assert triggers.sha256 == "3e8a671dd385a02a60ae03d7b8673e07ff5edc0c314031f124607a2a9b467a00"
       assert {:ok, repo} = Triggers.fetch_repo(triggers, "acme/widgets")
-      assert Enum.map(repo.human_paths, & &1.source) == ["lib/widgets_web/router.ex"]
+      assert Enum.map(repo.independent_paths, & &1.source) == ["lib/widgets_web/router.ex"]
     end
 
     test "through the facade" do
@@ -46,8 +46,8 @@ defmodule Loopctl.DeliveryGates.ConfigTest do
     repos =
       Map.new(triggers.repos, fn {name, repo} ->
         {name,
-         {Enum.map(repo.effect_paths, & &1.source), Enum.map(repo.human_paths, & &1.source),
-          repo.max_files, repo.max_changed_lines}}
+         {Enum.map(repo.effect_paths, & &1.source), Enum.map(repo.independent_paths, & &1.source),
+          repo.independent_checks, repo.max_files, repo.max_changed_lines}}
       end)
 
     {:ok, triggers.version, triggers.sha256, repos}

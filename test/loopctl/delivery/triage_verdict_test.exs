@@ -267,11 +267,11 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     # `max_event_data_bytes/0` measured on the ENCODED payload — refusing the triage step itself.
     defp encoded(codes), do: byte_size(Jason.encode!(%{"gate_screen" => codes}))
 
-    defp path(pattern), do: {:human_path, "any/file", pattern}
+    defp path(pattern), do: {:effect_path, "any/file", pattern}
 
     test "codes that fit are recorded exactly, with no sentinel" do
       assert TriageVerdict.screen_codes([{:gate_a, :gate_a_inputs_missing}, path("priv/**")]) ==
-               ["gate_a:gate_a_inputs_missing", "human_path:priv/**"]
+               ["gate_a:gate_a_inputs_missing", "effect_path:priv/**"]
     end
 
     test "an oversized code is SKIPPED, not a stop: the codes after it are still recorded" do
@@ -280,7 +280,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       codes =
         TriageVerdict.screen_codes([{:gate_a, :disagreement}, path(huge), path("lib/after/**")])
 
-      assert codes == ["gate_a:disagreement", "human_path:lib/after/**", "screen_overflow"]
+      assert codes == ["gate_a:disagreement", "effect_path:lib/after/**", "screen_overflow"]
       assert encoded(codes) <= Stages.max_event_data_bytes()
     end
 
@@ -307,7 +307,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       codes = TriageVerdict.screen_codes(for i <- 1..30, do: path("p#{i}/**"))
 
       assert length(codes) == 21
-      assert hd(codes) == "human_path:p1/**"
+      assert hd(codes) == "effect_path:p1/**"
       assert List.last(codes) == "screen_overflow"
     end
   end
@@ -399,7 +399,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     test "the gate screen escalates a predicted touch on a guarded path (US-44.2)" do
       %{story: story, runner: runner, record: record} = session()
 
-      for touch <- ["priv/rates/2026.csv", "lib/widgets_web/router.ex"] do
+      for touch <- ["priv/rates/2026.csv"] do
         %{story: story, runner: runner, record: record} = session()
         verdict = story_verdict(%{touches: [touch]})
 
@@ -408,6 +408,20 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
         assert stage_of(story) == :escalated, "#{touch} was queued"
       end
+
+      # TC-52.12.5: an independent path is judged at MERGE, by independent verification, so
+      # triage queues it rather than parking it on a human.
+      %{story: independent, runner: runner2, record: record2} = session()
+      verdict = story_verdict(%{touches: ["lib/widgets_web/router.ex"]})
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 independent.tenant_id,
+                 runner2.id,
+                 verdict_message(record2, verdict)
+               )
+
+      assert stage_of(independent) == :queued
 
       verdict = story_verdict(%{touches: ["lib/widgets/thing.ex"]})
 

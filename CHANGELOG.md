@@ -31,6 +31,24 @@ All notable changes to loopctl are documented here.
   the sandbox's project) and `E2E_GITHUB_TOKEN` (issues, pull requests and deployments on the
   sandbox); without them the live job fails at its first read. Provision the sandbox with
   `e2e/sandbox/provision.sh`.
+- **Gate B `human_paths` became `independent_paths`; the self-deploy refusal is gone
+  (2026-11-19, US-52.12).** `DELIVERY_GATES_CONFIG` is read only as document version 2:
+  each repository entry carries `effect_paths`, `independent_paths`, `independent_checks`
+  (a non-empty list of CI job names, never `local-gate`) and `limits`. A version 1 document
+  is refused `{:unsupported_version, 1}` and a `human_paths` key `{:unknown_key, ...}`, so
+  every delivery-loop change escalates until the document is replaced. **Deploy ordering:
+  re-pin the production document to version 2, with its `DELIVERY_GATES_CONFIG_SHA256`, in
+  the same `fly secrets set` as this deploy** (rename `human_paths` to `independent_paths`,
+  add `independent_checks`, set `"version": 2`; recipe in `deploy/FLY_SECRETS.md`). A change
+  touching an independent path, and every merge into a control-plane repository
+  (`mkreyman/loopctl`, `mkreyman/claude-config`; `config :loopctl, :control_plane_repos`),
+  now merges without a human when it is independently verified: the verifier dispatch passed
+  custody at the head, ran on another runner machine than the implementer, and every
+  `independent_checks` job is green at the head. Otherwise the merge gate refuses naming
+  `independent_verification`. The merge-precondition verdict's `self_deploy_excluded_repos`
+  field is replaced by `control_plane_repos`, and the refusal reason `self_deploy_excluded`
+  no longer exists. Triage no longer escalates an independent path.
+
 - **A factory client older than the release set is refused with 426 (2026-11-19, US-52.8).**
   A request carrying `x-loopctl-client: <component>/<version>` for `runner`, `chg` or `mcp`
   is answered `426 incompatible_client_version` (`component`, `sent`, `minimum`) on every

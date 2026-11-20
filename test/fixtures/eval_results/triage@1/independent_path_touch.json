@@ -1,7 +1,7 @@
 {
   "format": 1,
   "spec": {"id": "triage", "version": 1},
-  "case": "human_path_touch",
+  "case": "independent_path_touch",
   "machine": "synthetic",
   "recorded_at": "2026-11-07T00:00:00Z",
   "input": {
@@ -43,5 +43,5 @@
     ]
   },
   "runner_outcome": "ok",
-  "expected": {"screens": ["gate_b"]}
+  "expected": {"screens": []}
 }

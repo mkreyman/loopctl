@@ -1475,7 +1475,6 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp screen_code({:gate_a, reason}), do: "gate_a:" <> kind(reason)
   defp screen_code({:trio_verdict, verdict}), do: "trio_verdict:#{verdict}"
-  defp screen_code({:human_path, _file, pattern}), do: "human_path:" <> pattern
   defp screen_code({:effect_path, _file, pattern}), do: "effect_path:" <> pattern
   defp screen_code({:repository_unresolved, reason}), do: "repository_unresolved:" <> kind(reason)
   defp screen_code(reason), do: kind(reason)
