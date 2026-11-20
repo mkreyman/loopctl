@@ -43,6 +43,14 @@ defmodule Loopctl.ReleaseRolloutTest do
   printf '{"release":{"set":%s}}' "$(cat "$STUB/served")"
   """
 
+  # ls-remote prints the tag's line only while the stub's tag file exists.
+  @git """
+  #!/bin/sh
+  echo "$*" >> "$STUB/git.log"
+  [ -f "$STUB/tag" ] && echo "c5288a6d	refs/tags/$(cat "$STUB/tag")"
+  exit 0
+  """
+
   @moduletag :tmp_dir
 
   setup %{tmp_dir: tmp} do
@@ -51,7 +59,9 @@ defmodule Loopctl.ReleaseRolloutTest do
     File.write!(Path.join(stub, "e2e"), "0")
     File.write!(Path.join(stub, "served"), to_string(@set))
     File.write!(Path.join(stub, "npm_exit"), "0")
+    File.write!(Path.join(stub, "tag"), "factory-#{@set}")
 
+    stub!(stub, "git", @git)
     stub!(stub, "ssh", @ssh)
     stub!(stub, "gh", @gh)
     stub!(stub, "npm", @npm)
@@ -65,6 +75,8 @@ defmodule Loopctl.ReleaseRolloutTest do
       "ROLLOUT_GH" => Path.join(stub, "gh"),
       "ROLLOUT_NPM" => Path.join(stub, "npm"),
       "ROLLOUT_CURL" => Path.join(stub, "curl"),
+      "ROLLOUT_GIT" => Path.join(stub, "git"),
+      "LOOPCTL_FACTORY_REPO" => "git@example.test:acme/factory.git",
       "ROLLOUT_RUN_WAIT_S" => "3"
     }
 
@@ -94,6 +106,17 @@ defmodule Loopctl.ReleaseRolloutTest do
     {out, 2} = rollout(ctx)
     assert out =~ "npm has no loopctl-mcp-server@#{@mcp}"
     assert installs(ctx) == []
+  end
+
+  test "a set whose factory tag is not pushed yet stops before any host", ctx do
+    File.rm!(Path.join(ctx.stub, "tag"))
+
+    {out, 2} = rollout(ctx)
+    assert out =~ "tag factory-#{@set} is not in git@example.test:acme/factory.git yet"
+    assert installs(ctx) == []
+
+    assert File.read!(Path.join(ctx.stub, "git.log")) =~
+             "ls-remote --tags git@example.test:acme/factory.git refs/tags/factory-#{@set}"
   end
 
   test "an unreachable host is reported, the rest still run, e2e is skipped", ctx do

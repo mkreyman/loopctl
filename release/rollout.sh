@@ -5,8 +5,9 @@
 #   release/rollout.sh
 #
 # 1. Preflight: loopctl's /.well-known/loopctl release.set equals the manifest's set (the
-#    server deploys from master on its own), and npm has loopctl-mcp-server at the set's mcp
-#    version (machines launch it through claude-config's bin/loopctl-mcp.sh).
+#    server deploys from master on its own), npm has loopctl-mcp-server at the set's mcp
+#    version (machines launch it through claude-config's bin/loopctl-mcp.sh), and the repo has
+#    the tag factory-<set> every host checks out.
 # 2. Each host of FLEET_MACHINES in turn, niced, over ssh (the host this runs on, in place):
 #    release/install-machine.sh <set>
 #    from that host's own factory checkout, bootstrapped from this tree's copy on first use.
@@ -25,6 +26,9 @@
 #   ROLLOUT_GH            the gh command (default: gh)
 #   ROLLOUT_NPM           the npm command (default: npm)
 #   ROLLOUT_CURL          the curl command (default: curl)
+#   ROLLOUT_GIT           the git command for the tag check (default: git)
+#   LOOPCTL_FACTORY_REPO  the repo the hosts clone (default: git@github.com:mkreyman/loopctl.git;
+#                         install-machine.sh reads the same variable)
 #   ROLLOUT_RUN_WAIT_S    how long the dispatched e2e run may take to appear (default: 120)
 set -uo pipefail
 unset CDPATH
@@ -36,6 +40,8 @@ ssh_cmd=${ROLLOUT_SSH:-ssh -o BatchMode=yes -o ConnectTimeout=10}
 gh_cmd=${ROLLOUT_GH:-gh}
 npm_cmd=${ROLLOUT_NPM:-npm}
 curl_cmd=${ROLLOUT_CURL:-curl}
+git_cmd=${ROLLOUT_GIT:-git}
+repo_url=${LOOPCTL_FACTORY_REPO:-git@github.com:mkreyman/loopctl.git}
 
 fleet="$HOME/workspace/claude-config/hooks/lib/fleet-name.sh"
 if [ -n "${ROLLOUT_HOSTS:-}" ]; then
@@ -77,6 +83,13 @@ if [ "$served" != "$set_id" ]; then
 fi
 if ! $npm_cmd view "loopctl-mcp-server@$mcp_version" version >/dev/null 2>&1; then
   echo "rollout: npm has no loopctl-mcp-server@$mcp_version yet; wait for its publish" >&2
+  exit 2
+fi
+# factory-release.yml tags the set after master's CI passes, which can be after the deploy.
+# Without this check, the hosts that run before the tag fail and the ones after succeed,
+# leaving the fleet split across two sets (2026-11-20, set 3).
+if [ -z "$($git_cmd ls-remote --tags "$repo_url" "refs/tags/factory-$set_id" 2>/dev/null)" ]; then
+  echo "rollout: tag factory-$set_id is not in $repo_url yet; wait for factory-release.yml" >&2
   exit 2
 fi
 
