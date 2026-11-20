@@ -3,8 +3,9 @@
 #
 #   scripts/install.sh [--dest DIR] [--release TAG] [--no-elixir-adapter]
 #
-# --release TAG  download the release artifact (Linux x86_64 only; needs `gh` with access
-#                to mkreyman/chg) and check its sha256; without it, build from this checkout.
+# --release TAG  download the artifact of factory release TAG (factory-<n>, US-52.7; Linux
+#                x86_64 only; needs `gh` with access to mkreyman/loopctl) and refuse it unless
+#                its sha256 matches; without it, build from this checkout.
 # --dest DIR     where `chg` goes (default: ~/.local/bin).
 # --no-elixir-adapter
 #                skip the Elixir adapter. Otherwise, where asdf has Elixir installed, the
@@ -35,7 +36,7 @@ while [ $# -gt 0 ]; do
     --dest) dest=$2; shift 2 ;;
     --release) tag=$2; shift 2 ;;
     --no-elixir-adapter) elixir_adapter=false; shift ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -49,15 +50,23 @@ esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# Releases carry no macOS artifact (release.yml has no macOS runner): Macs build from source.
+# Releases carry no macOS artifact (factory-release.yml builds Linux only): Macs build from
+# source.
 if [ -n "$tag" ] && [ "$target" != x86_64-unknown-linux-musl ]; then
   echo "install.sh: releases carry no $target build; run without --release to build it" >&2
   exit 1
 fi
 if [ -n "$tag" ]; then
-  gh release download "$tag" -R mkreyman/chg -D "$work" \
+  case $tag in
+    factory-[1-9]*) ;;
+    *) echo "install.sh: --release takes a factory release tag (factory-<n>), not $tag" >&2; exit 2 ;;
+  esac
+  gh release download "$tag" -R mkreyman/loopctl -D "$work" \
     -p "chg-$target" -p "chg-$target.sha256"
-  (cd "$work" && shasum -a 256 -c "chg-$target.sha256" >/dev/null)
+  if ! (cd "$work" && shasum -a 256 -c "chg-$target.sha256" >/dev/null 2>&1); then
+    echo "install.sh: chg-$target from $tag does not match its .sha256; nothing installed" >&2
+    exit 1
+  fi
   bin="$work/chg-$target"
 else
   root=$(cd "$(dirname "$0")/.." >/dev/null && pwd -P)

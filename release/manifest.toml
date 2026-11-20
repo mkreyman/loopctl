@@ -1,0 +1,41 @@
+# The factory release set (US-52.7): one compatible set of every component this repository
+# ships. A component is compatible from its minimum up. Each version is read from its source
+# file; `mix loopctl.release_set --check` fails when one differs, and `--bump` moves the set.
+# Written by `mix loopctl.release_set --bump`; edit by hand only to change a minimum.
+
+set = 1
+
+[components.server]
+version = "1.0.0"
+minimum = "1.0.0"
+source = "mix.exs"
+
+[components.runner]
+version = "0.1.0"
+minimum = "unreported"
+source = "runner/mix.exs"
+
+[components.chg]
+version = "0.1.0"
+minimum = "0.1.0"
+source = "chg/cli/Cargo.toml"
+
+[components.chg_adapter_elixir]
+version = "1.0.0"
+minimum = "1.0.0"
+source = "chg/adapters/elixir/mix.exs"
+
+[components.chg_adapter_typescript]
+version = "0.1.0"
+minimum = "0.1.0"
+source = "chg/cli/Cargo.toml"
+
+[components.chg_adapter_generic]
+version = "0.1.0"
+minimum = "0.1.0"
+source = "chg/cli/Cargo.toml"
+
+[components.mcp]
+version = "3.19.1"
+minimum = "3.19.1"
+source = "mcp-server/package.json"

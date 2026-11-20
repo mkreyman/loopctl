@@ -33,6 +33,26 @@ defmodule LoopctlWeb.WellKnownControllerTest do
       assert is_binary(body["contact"])
     end
 
+    test "carries the release set the server was built from (US-52.7)" do
+      body = Phoenix.ConnTest.build_conn() |> get("/.well-known/loopctl") |> json_response(200)
+
+      assert body["release"]["set"] == Loopctl.ReleaseSet.set()
+
+      for {name, %{version: version, minimum: minimum}} <- Loopctl.ReleaseSet.components() do
+        assert body["release"]["components"][name] == %{
+                 "version" => version,
+                 "minimum" => minimum
+               }
+      end
+
+      assert body["release"]["components"]["mcp"]["version"] == body["mcp_server"]["npm_version"]
+
+      schema = Phoenix.ConnTest.build_conn() |> get("/.well-known/loopctl/schema.json")
+      schema = Jason.decode!(schema.resp_body)
+      assert "release" in schema["required"]
+      assert schema["properties"]["release"]["required"] == ["set", "components"]
+    end
+
     test "advertises the LCP-1 §2.1 custody-profile discovery fields", %{conn: _conn} do
       conn = Phoenix.ConnTest.build_conn()
       conn = get(conn, "/.well-known/loopctl")

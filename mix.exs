@@ -192,6 +192,10 @@ defmodule Loopctl.MixProject do
       # YAML frontmatter parsing for OKF (Open Knowledge Format) interchange (#110)
       {:yaml_elixir, "~> 2.11"},
 
+      # release/manifest.toml, the factory release set (US-52.7): read at compile time by
+      # Loopctl.ReleaseSet and by mix loopctl.release_set.
+      {:toml, "~> 0.7"},
+
       # Testing
       {:mox, "~> 1.2", only: :test},
       # 0.1.13 and later: EEF-CVE-2026-92106 (mutation XSS through unescaped SVG/MathML text).
@@ -294,6 +298,7 @@ defmodule Loopctl.MixProject do
         "credo --strict",
         "loopctl.check_skill_citations",
         "loopctl.check_env_docs",
+        "loopctl.release_set --check",
         # NB (#556): the AGENTS.md usage-rules drift check is deliberately NOT here. This
         # alias runs under `preferred_envs: [precommit: :test]` and `usage_rules` is
         # `only: :dev`, so `mix usage_rules.sync --check` would fail with "task could not

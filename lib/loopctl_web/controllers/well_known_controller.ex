@@ -112,6 +112,10 @@ defmodule LoopctlWeb.WellKnownController do
     # offline verifier keying off `signed` does not assume ALL claims carry a
     # signature.
     |> Map.put(:custody_enforcement, custody_enforcement())
+    # US-52.7: the factory release set this server was built from (release/manifest.toml,
+    # compiled in). mcp_server.npm_version stays and equals release.components.mcp.version:
+    # `mix loopctl.release_set --check` fails the build when they differ.
+    |> Map.put(:release, Loopctl.ReleaseSet.discovery())
   end
 
   # `enrolled_only` while the profile is `signed`: enrolled dispatches MUST sign,
@@ -188,9 +192,32 @@ defmodule LoopctlWeb.WellKnownController do
                    "custody_gates",
                    "audit_leaf_hash_version",
                    "system_articles_endpoint",
-                   "signup_endpoint"
+                   "signup_endpoint",
+                   "release"
                  ],
                  properties: %{
+                   release: %{
+                     type: "object",
+                     description:
+                       "The factory release set this server was built from (release/manifest.toml). " <>
+                         "A component is compatible from its minimum up; \"unreported\" admits a " <>
+                         "client that reports no version.",
+                     required: ["set", "components"],
+                     properties: %{
+                       set: %{type: "integer", minimum: 1},
+                       components: %{
+                         type: "object",
+                         additionalProperties: %{
+                           type: "object",
+                           required: ["version", "minimum"],
+                           properties: %{
+                             version: %{type: "string"},
+                             minimum: %{type: "string"}
+                           }
+                         }
+                       }
+                     }
+                   },
                    spec_version: %{type: "string"},
                    custody_profile: %{type: "string", enum: ["bearer", "signed"]},
                    custody_enforcement: %{

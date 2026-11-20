@@ -19,6 +19,13 @@ defmodule Loopctl.Agents.TuningNoSelfEditTest do
   # The spec fields that carry a template's identity or the spec's own version.
   @spec_fields [:prompt, :version, :result_schema]
 
+  # {file, field}: an update of a field by that name on a value that is not an agent spec.
+  @not_a_spec [
+    # A release-set component's version (US-52.7), bumped by `mix loopctl.release_set --bump`
+    # into the manifest file a person commits; it never reaches an agent spec.
+    {"lib/loopctl/release_set/manifest.ex", :version}
+  ]
+
   defp sources, do: Path.wildcard("lib/**/*.ex")
 
   # The keys of a map update's pairs; string-keyed updates carry no spec field.
@@ -76,7 +83,11 @@ defmodule Loopctl.Agents.TuningNoSelfEditTest do
               end),
             do: {path, hit}
 
-      assert rewrites == []
+      {exempt, offenders} = Enum.split_with(rewrites, &(&1 in @not_a_spec))
+      assert offenders == []
+
+      # Each exemption must still match, so a stale entry cannot hide a later rewrite there.
+      assert Enum.sort(Enum.uniq(exempt)) == Enum.sort(@not_a_spec)
     end
 
     test "the detector above sees a rewrite when one is there" do

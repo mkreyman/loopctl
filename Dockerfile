@@ -44,6 +44,8 @@ COPY priv priv
 COPY lib lib
 COPY assets assets
 COPY mcp-server/package.json mcp-server/package.json
+# Loopctl.ReleaseSet compiles the release set in (US-52.7); /.well-known/loopctl reports it.
+COPY release/manifest.toml release/manifest.toml
 
 # Compile the release
 RUN mix compile

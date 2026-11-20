@@ -1,0 +1,109 @@
+name: Factory release
+
+# Tags and publishes each factory release set (US-52.7). When CI completes green on a master
+# commit, release/manifest.toml's `set` names the set that commit belongs to:
+#
+#   no tag factory-<set>              tag this commit and publish release factory-<set>
+#   factory-<set> on this commit      a re-run: rebuild and upload with --clobber, no new tag
+#   factory-<set> on another commit   the set did not move; nothing to do
+#
+# The release carries the Linux fleet artifact of chg (chg-x86_64-unknown-linux-musl, static,
+# so no glibc to keep in step across machines), its .sha256 and the manifest, which is also
+# the release body. No macOS artifact: the Macs build chg from source (chg/scripts/install.sh).
+# Every job runs on the fleet-ci pool, never on GitHub-hosted minutes.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: factory-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: [self-hosted, fleet-ci]
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      action: ${{ steps.plan.outputs.action }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - id: plan
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: .github/scripts/factory-release-plan.sh
+
+  build:
+    name: build (x86_64-unknown-linux-musl)
+    needs: [plan]
+    if: needs.plan.outputs.action != 'none'
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: chg
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      # The musl target links with its self-contained CRT through the host cc: no musl-tools.
+      - name: Toolchain from .tool-versions
+        run: scripts/ci-rust-toolchain.sh --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p chg
+      - name: Smoke the artifact
+        run: |
+          out=target/x86_64-unknown-linux-musl/release/chg
+          "$out" --version | grep -q "(adapter contract "
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$out" "$GITHUB_WORKSPACE/dist/chg-x86_64-unknown-linux-musl"
+          (cd "$GITHUB_WORKSPACE/dist" && shasum -a 256 chg-x86_64-unknown-linux-musl > chg-x86_64-unknown-linux-musl.sha256)
+          cp "$GITHUB_WORKSPACE/release/manifest.toml" "$GITHUB_WORKSPACE/dist/manifest.toml"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factory-release
+          path: dist/*
+
+  publish:
+    name: publish
+    needs: [plan, build]
+    runs-on: [self-hosted, fleet-ci]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: factory-release
+          path: dist
+      - name: Tag and publish, or re-upload on a re-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        # A release cut off between its tag and its assets is completed by a re-run: the tag
+        # exists on this commit (upload), and the release is created here if it is missing.
+        run: |
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$SHA" \
+              --title "$TAG" --notes-file dist/manifest.toml
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
