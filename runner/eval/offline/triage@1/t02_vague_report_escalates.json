@@ -1,0 +1,13 @@
+{
+  "verdict": {
+    "outcome": "escalate",
+    "confidence": "low",
+    "missing_information": ["which function fails", "the input used", "the result expected and the result seen"],
+    "escalation_reasons": ["the report names no function, input or result, so there is nothing to reproduce"],
+    "lens_verdicts": [
+      {"lens": "analyst", "outcome": "escalate", "confidence": "low", "escalation_reasons": []},
+      {"lens": "architect", "outcome": "escalate", "confidence": "low", "escalation_reasons": []},
+      {"lens": "engineer", "outcome": "escalate", "confidence": "low", "escalation_reasons": []}
+    ]
+  }
+}

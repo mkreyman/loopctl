@@ -26,7 +26,7 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
       binary = Jason.encode!(build(:delivery_gates_config))
       assert {:ok, %Triggers{} = triggers} = Triggers.parse(binary, sha256(binary))
 
-      assert triggers.version == 1
+      assert triggers.version == 2
       assert triggers.sha256 == sha256(binary)
 
       assert {:ok, %RepoTriggers{} = repo} = Triggers.fetch_repo(triggers, @repo)
@@ -34,10 +34,11 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
       assert Enum.map(repo.effect_paths, & &1.source) ==
                ["priv/rates/**", "lib/app/payments/**", "config/runtime.exs"]
 
-      assert Enum.map(repo.human_paths, & &1.source) ==
+      assert Enum.map(repo.independent_paths, & &1.source) ==
                ["lib/app_web/router.ex", "lib/**/data_migrations/**"]
 
-      assert Enum.all?(repo.effect_paths ++ repo.human_paths, &match?(%Glob{}, &1))
+      assert Enum.all?(repo.effect_paths ++ repo.independent_paths, &match?(%Glob{}, &1))
+      assert repo.independent_checks == ["e2e"]
       assert repo.max_files == 12
       assert repo.max_changed_lines == 1000
     end
@@ -72,7 +73,7 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
 
     test "a checksum that does not match the bytes" do
       binary = Jason.encode!(build(:delivery_gates_config))
-      other = Jason.encode!(build(:delivery_gates_config, %{"version" => 2}))
+      other = Jason.encode!(build(:delivery_gates_config, %{"version" => 3}))
       assert Triggers.parse(binary, sha256(other)) == {:error, :checksum_mismatch}
     end
 
@@ -96,12 +97,15 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
   end
 
   describe "fails closed on a malformed document" do
-    test "unknown or unsupported version" do
-      assert parse_doc(build(:delivery_gates_config, %{"version" => 2})) ==
-               {:error, {:unsupported_version, 2}}
+    test "TC-52.12.1: version 1 is refused, as is any version but 2" do
+      assert parse_doc(build(:delivery_gates_config, %{"version" => 1})) ==
+               {:error, {:unsupported_version, 1}}
 
-      assert parse_doc(build(:delivery_gates_config, %{"version" => "1"})) ==
-               {:error, {:unsupported_version, "1"}}
+      assert parse_doc(build(:delivery_gates_config, %{"version" => 3})) ==
+               {:error, {:unsupported_version, 3}}
+
+      assert parse_doc(build(:delivery_gates_config, %{"version" => "2"})) ==
+               {:error, {:unsupported_version, "2"}}
 
       assert parse_doc(build(:delivery_gates_config, %{"version" => nil})) ==
                {:error, {:unsupported_version, nil}}
@@ -136,11 +140,40 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
     end
 
     test "a missing key in a repository entry" do
-      for key <- ~w(effect_paths human_paths limits) do
+      for key <- ~w(effect_paths independent_paths independent_checks limits) do
         config = build(:delivery_gates_config)
         {_, config} = pop_in(config, ["repos", @repo, key])
         assert parse_doc(config) == {:error, {:missing_key, ["repos", @repo, key]}}
       end
+    end
+
+    test "TC-52.12.1: a human_paths key is unknown, beside or instead of independent_paths" do
+      assert parse_doc(put_repo_key("human_paths", ["lib/app_web/router.ex"])) ==
+               {:error, {:unknown_key, ["repos", @repo, "human_paths"]}}
+
+      config = build(:delivery_gates_config)
+      {paths, config} = pop_in(config, ["repos", @repo, "independent_paths"])
+      config = put_in(config, ["repos", @repo, "human_paths"], paths)
+
+      assert parse_doc(config) ==
+               {:error, {:missing_key, ["repos", @repo, "independent_paths"]}}
+    end
+
+    test "TC-52.12.1: independent_checks is a non-empty list of check names, never local-gate" do
+      path = ["repos", @repo, "independent_checks"]
+
+      assert parse_doc(put_repo_key("independent_checks", [])) == {:error, {:empty_checks, path}}
+
+      for bad <- ["e2e", nil, %{}, [""], ["  "], [42], ["e2e", nil], ["local-gate"]] do
+        assert parse_doc(put_repo_key("independent_checks", bad)) ==
+                 {:error, {:invalid_checks, path}}
+      end
+
+      assert {:ok, triggers} =
+               parse_doc(put_repo_key("independent_checks", ["e2e", "e2e", "test"]))
+
+      assert {:ok, %RepoTriggers{independent_checks: ["e2e", "test"]}} =
+               Triggers.fetch_repo(triggers, @repo)
     end
 
     test "an unknown key in a repository entry, such as a misspelling" do
@@ -152,8 +185,8 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
       assert parse_doc(put_repo_key("effect_paths", [])) ==
                {:error, {:empty_patterns, ["repos", @repo, "effect_paths"]}}
 
-      assert parse_doc(put_repo_key("human_paths", [])) ==
-               {:error, {:empty_patterns, ["repos", @repo, "human_paths"]}}
+      assert parse_doc(put_repo_key("independent_paths", [])) ==
+               {:error, {:empty_patterns, ["repos", @repo, "independent_paths"]}}
     end
 
     test "a pattern list that is not a list" do
@@ -162,8 +195,8 @@ defmodule Loopctl.DeliveryGates.TriggersTest do
     end
 
     test "an invalid pattern inside a list" do
-      assert parse_doc(put_repo_key("human_paths", ["lib/app_web/router.ex", ""])) ==
-               {:error, {:invalid_pattern, ["repos", @repo, "human_paths"], ""}}
+      assert parse_doc(put_repo_key("independent_paths", ["lib/app_web/router.ex", ""])) ==
+               {:error, {:invalid_pattern, ["repos", @repo, "independent_paths"], ""}}
 
       assert parse_doc(put_repo_key("effect_paths", [42])) ==
                {:error, {:invalid_pattern, ["repos", @repo, "effect_paths"], 42}}

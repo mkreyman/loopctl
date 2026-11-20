@@ -21,11 +21,12 @@ defmodule Loopctl.DeliveryGates.TriggerHoleClassesTest do
 
   defp triggers(effect_paths, human_paths) do
     config = %{
-      "version" => 1,
+      "version" => 2,
       "repos" => %{
         @repo => %{
           "effect_paths" => effect_paths,
-          "human_paths" => human_paths,
+          "independent_paths" => human_paths,
+          "independent_checks" => ["e2e"],
           "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
         }
       }

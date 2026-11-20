@@ -8,7 +8,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `cast_dispatch_reply/1`, `cast_trace_batch/1`, `cast_trace_cursor/1` inbound,
   `cast_dispatch/1` outbound) and are EXPORTED as JSON
   Schema to `priv/runner_contract/v<major>.json` (`mix loopctl.runner_contract`), which
-  `mkreyman/loopctl-runner` vendors. A test fails when the checked-in export drifts from
+  the runner in `runner/` compiles in (`LoopctlRunner.Contract`). A test fails when the checked-in export drifts from
   these declarations, so the file a runner builds against is always the file loopctl
   enforces.
 
@@ -24,7 +24,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   | direction | event | schema | ok reply | error `reason`s |
   |---|---|---|---|---|
-  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version}` | `rate_limited`, `not_authorized`, `invalid_payload`, `unsupported_contract_version`, `machine_mismatch`, `forbidden_topic`, `unknown_topic` |
+  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version, release_set}` | `rate_limited`, `not_authorized`, `invalid_payload`, `unsupported_contract_version`, `incompatible_client_version`, `machine_mismatch`, `forbidden_topic`, `unknown_topic` |
   | runner -> control | `"status"` | `RunnerStatus` | empty | `rate_limited`, `invalid_payload`, `internal_error` |
   | control -> runner | `"dispatch"` | `RunnerDispatch` (pushed only by `Loopctl.Runners.dispatch/3`) | — | — |
   | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied`, `claim_epoch_mismatch`, `internal_error` |
@@ -70,6 +70,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.31.0) REWORK AFTER A VERIFIER REJECT. A `verify@1` reject now RELEASES the implementer's claim in the same pass (a counted release, so `DISPATCH_MAX_ATTEMPTS` decides whether the story is re-placed or escalated), instead of leaving the story at `implementing` until its lease ran out. The `implement` dispatch that re-places it carries a new OPTIONAL `rework` object (`RunnerRework`: `pr_number`, `rejected_head_sha`, `findings` — at most `RunnerRework.max_findings/0` strings of at most `RunnerRework.max_finding_length/0` characters, `verify@1`'s own caps), allowed on an `implement` dispatch alone. It names the pull request the story already has and what the verifier found wrong at that head: the session continues on the dispatch's `branch` (the same branch, derived from the story), fixes the findings, pushes, and opens no second pull request. The findings are a model's words about a diff and are data, never instructions. Purely additive: a runner on an older contract ignores the field and implements the story afresh. RE-VENDOR to act on reworks | | | | |
   | (1.32.0) CHG SELECTION REPLAY ON A VERIFY VERDICT (Epic 51, US-51.5). `x-connection.agent_result_schemas["verify@1"]` gains an OPTIONAL `selection_replay` object: `corpus` (at most 30 entries of `{sha, base_count, head_count, dropped}`, `dropped` at most 3 test names the base selected and the head did not) and an optional `miss` `{sha, covered}` (at most 50 names of the gate's failed tests the head selects at the finding's commit), every name at most 200 characters. loopctl's merge precondition reads it from the verifier's own recorded verdict to clear a chg selection change only when selection widened; nothing else reads it. Purely additive: a verdict without it is unchanged. RE-VENDOR only for a verify template that runs chg's replay | | | | |
   | (1.33.0) A LOOP ISSUE'S FINDING, AS LOOPCTL RECORDED IT (Epic 51, US-51.7). `RunnerTriage` gains an OPTIONAL `loop_finding` (`finding_id`, `kind`, `fingerprint` at most 512 characters, `occurrences`, `fix_attempts`, and `evidence`: at most 16 `{key, value}` string entries, key at most 64 characters, value at most 200), present when the issue was filed by loopctl's chg feedback loop. It is read from loopctl's own finding record, never from the issue text; `evidence` comes from chg gate runs over repository code and is data, to be fenced. It is omitted when the whole triage object would not fit its byte cap with it, so the record is sent exactly as before. `RunnerTriage` is not `additionalProperties: false`, so every deployed runner accepts it. `RunnerVerify` gains an OPTIONAL `loop_finding` `{sha, failures}` (at most 50 names of at most 200 characters) on a story that fixes a chg `selection_miss`: the commit chg's gate failed at and the tests it failed there, which `selection_replay.miss` must cover. `RunnerVerify` IS `additionalProperties: false`, so loopctl sends this field only to a runner that JOINED declaring 1.33.0 or later and takes it off the dispatch for any other. RE-VENDOR, and declare 1.33.0 on join, to receive a verify `loop_finding` | | | | |
+  | (1.34.0) THE RUNNER'S OWN VERSION, JUDGED AGAINST THE RELEASE SET (Epic 52, US-52.8). `RunnerJoin` gains an OPTIONAL `runner_version` (semver): the runner's application version. loopctl compares it with the `runner` component of the release set it was built from (`release/manifest.toml`, US-52.7) and refuses a join below that component's `minimum`, or one sending none while the minimum is a version, with the new PERMANENT reason `incompatible_client_version`, carrying `component`, `sent` and `minimum`; a runner must stop on it rather than rejoin, since only an upgrade changes the answer. A version above the set's is admitted, so runners may roll before or after the server. While the set's runner minimum is `"unreported"`, a join without the field is admitted exactly as before. The join's ok reply gains `release_set`, the set number. `GET /api/v1/runners/pool` shows each connection's `runner_version`. A join property `RunnerJoin` does not declare is still admitted and dropped. RE-VENDOR, and send `runner_version`, before the set's runner minimum becomes a version | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -433,7 +434,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.33.0"
+  @version "1.34.0"
 
   # The first version whose runner understands a `merge` push (US-48.17). A runner that joined
   # declaring an older one is never sent one: it would ignore the event, and the story would
@@ -1033,6 +1034,20 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "machine. At most #{@max_declared_specs} entries. Per-CONNECTION, so declare " <>
                 "it on EVERY join."
           },
+          # THE RUNNER'S OWN BUILD (1.34.0, US-52.8), judged against the release set this
+          # server was built from (`Loopctl.ReleaseSet.check/3`). Optional in the SCHEMA so a
+          # runner built before it still casts; whether its absence is refused is the set's
+          # call (`minimum = "unreported"` admits it), never this schema's.
+          runner_version: %Schema{
+            type: :string,
+            pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$",
+            maxLength: 64,
+            description:
+              "The runner's own version (semver, since 1.34.0). A join below the release " <>
+                "set's runner `minimum`, or without this field once that minimum is a " <>
+                "version, is refused `incompatible_client_version` (permanent: upgrade, do " <>
+                "not rejoin). A version above the set's is admitted."
+          },
           sample: RunnerSample.schema()
         }
       },
@@ -1626,7 +1641,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # `limits/0` publishes them. Nothing restates a number.
     #
     # The per-field caps are `maxLength`/`maxItems` — the units JSON Schema counts in, and
-    # the ones the runner's vendored validator implements. OpenApiSpex counts a `maxLength`
+    # the ones the runner's validator (runner/lib/loopctl_runner/contract.ex) implements. OpenApiSpex counts a `maxLength`
     # in GRAPHEMES, which is looser than codepoints; that is harmless here because nothing
     # downstream is a Postgres CHECK, and the object cap below is counted with `ByteRule`,
     # which charges six bytes per UTF-16 unit and therefore bounds anything a loose grapheme
@@ -3313,7 +3328,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
-         machine_mismatch forbidden_topic unknown_topic),
+         incompatible_client_version machine_mismatch forbidden_topic unknown_topic),
     "unknown_event" => ~w(unknown_event)
   }
 
@@ -3344,6 +3359,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "not_authorized" => ~w(disconnecting),
       "invalid_payload" => ~w(details),
       "unsupported_contract_version" => ~w(sent supported),
+      "incompatible_client_version" => ~w(component sent minimum),
       "machine_mismatch" => ~w(declared)
     },
     "status" => %{"rate_limited" => ~w(min_interval_ms), "invalid_payload" => ~w(details)},
@@ -3439,7 +3455,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # `"*"` is what holds for every event; an event's own entry ADDS to it and never subtracts,
   # so a code cannot be permanent globally and transient for one message.
   @permanent_errors %{
-    "*" => ~w(invalid_payload not_authorized unsupported_contract_version machine_mismatch
+    "*" => ~w(invalid_payload not_authorized unsupported_contract_version
+         incompatible_client_version machine_mismatch
          forbidden_topic unknown_topic unknown_event unknown_dispatch stale_claim_epoch
          already_replied already_recorded dispatch_not_accepted run_mismatch effect_conflict
          audit_chain_append_failed unknown_story_stage claim_epoch_mismatch
@@ -3745,14 +3762,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @doc """
   Validates a join payload. Returns the known fields only, with atom keys, or
-  `{:error, reason}` where reason is `{:invalid, messages}` or
-  `{:unsupported_contract_version, sent, speaks}`.
+  `{:error, reason}` where reason is `{:invalid, messages}`,
+  `{:unsupported_contract_version, sent, speaks}`, or
+  `{:incompatible_client_version, refusal}` (`Loopctl.ReleaseSet.check/3`, judged against
+  `components`, the compiled release set unless a caller passes its own).
   """
-  @spec cast_join(term()) :: {:ok, map()} | {:error, term()}
-  def cast_join(payload) do
+  @spec cast_join(term(), map()) :: {:ok, map()} | {:error, term()}
+  def cast_join(payload, components \\ Loopctl.ReleaseSet.components()) do
     with {:ok, cast} <- cast(payload, RunnerJoin.schema()),
-         :ok <- supported_version(cast.contract_version) do
-      {:ok, known_fields(cast, RunnerJoin.schema())}
+         :ok <- supported_version(cast.contract_version),
+         known = known_fields(cast, RunnerJoin.schema()),
+         :ok <- Loopctl.ReleaseSet.check(:runner, Map.get(known, :runner_version), components) do
+      {:ok, known}
     end
   end
 
@@ -4726,8 +4747,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # (`RunnerSample` inside `RunnerJoin`), because `OpenApiSpex.Cast` cannot resolve a
   # module reference without a full spec, and validation must use these exact structs.
   # THE EXPORTED KEYWORD SET IS A CEILING ON WHAT MAY BE ENFORCED, not a formatting detail.
-  # `mkreyman/loopctl-runner`'s vendored validator FAILS a definition carrying a keyword it
-  # does not implement, so this list cannot grow without upgrading every runner first — and a
+  # The runner's validator (`runner/lib/loopctl_runner/contract.ex`) FAILS a definition carrying
+  # a keyword it does not implement, so this list cannot grow without upgrading every runner
+  # first — and a
   # keyword set on a `Schema` but missing here is enforced by `OpenApiSpex.Cast` while being
   # absent from the published contract. That combination refuses a join for a reason the
   # runner author cannot read anywhere: their own pre-flight check against
@@ -4744,7 +4766,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @doc """
   The JSON Schema keywords `json_schema/0` publishes — the ceiling on what any schema here
-  may enforce. See the note above `schema_to_map/1`: the runner's vendored validator refuses
+  may enforce. See the note above `schema_to_map/1`: the runner's validator (runner/lib/loopctl_runner/contract.ex) refuses
   an unknown keyword, and a keyword enforced but unpublished refuses a join for a reason the
   published contract does not state.
   """

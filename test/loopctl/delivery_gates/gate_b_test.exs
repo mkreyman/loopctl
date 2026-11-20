@@ -79,27 +79,55 @@ defmodule Loopctl.DeliveryGates.GateBTest do
     end
   end
 
-  describe ":human" do
-    test "each human path, in both phases" do
+  describe ":independent (US-52.12)" do
+    test "each independent path, in both phases" do
       for {file, pattern} <- [
             {"lib/app_web/router.ex", "lib/app_web/router.ex"},
             {"lib/app/data_migrations/backfill_rates.ex", "lib/**/data_migrations/**"},
             {"lib/data_migrations/new_one.ex", "lib/**/data_migrations/**"}
           ],
           phase <- [:triage, :merge] do
-        assert %Result{outcome: :human, reasons: [{:human_path, ^file, ^pattern}]} =
+        assert %Result{outcome: :independent, reasons: [{:independent_path, ^file, ^pattern}]} =
                  evaluate(phase, %{files: [file]})
       end
     end
 
-    test "beats :prove_effect, and still records the effect matches" do
+    test "TC-52.12.2: beats :prove_effect, and still records the effect matches" do
       result = evaluate(:merge, %{files: ["priv/rates/2026.csv", "lib/app_web/router.ex"]})
 
-      assert result.outcome == :human
-      assert result.reasons == [{:human_path, "lib/app_web/router.ex", "lib/app_web/router.ex"}]
+      assert result.outcome == :independent
+
+      assert result.reasons == [
+               {:independent_path, "lib/app_web/router.ex", "lib/app_web/router.ex"}
+             ]
+
       assert result.effect_matches == [{"priv/rates/2026.csv", "priv/rates/**"}]
     end
 
+    test "TC-52.12.2: an independent path beside ANY other reason is :human, naming both" do
+      result =
+        evaluate(:merge, %{
+          files: ["lib/app_web/router.ex"],
+          diffstat: %{files: 13, changed_lines: 10}
+        })
+
+      assert result.outcome == :human
+
+      assert result.reasons == [
+               {:independent_path, "lib/app_web/router.ex", "lib/app_web/router.ex"},
+               {:max_files_exceeded, 13, 12}
+             ]
+    end
+
+    test "only the independent-path reason shape is one" do
+      assert GateB.independent_path?({:independent_path, "a.ex", "a.ex"})
+      refute GateB.independent_path?({:independent_path, :control_plane, "acme/x"})
+      refute GateB.independent_path?({:effect_path, "a.ex", "a.ex"})
+      refute GateB.independent_path?(:no_files)
+    end
+  end
+
+  describe ":human" do
     test "a path that is not one git would print" do
       for bad <- [
             "/lib/app.ex",
@@ -141,16 +169,16 @@ defmodule Loopctl.DeliveryGates.GateBTest do
   end
 
   describe "renames: both sides are matched" do
-    test "moving a file OUT of a human path escalates, though its new name is unguarded" do
+    test "moving a file OUT of an independent path is held, though its new name is unguarded" do
       result =
         evaluate(:merge, %{
           files: ["lib/app/backfill_rates.ex"],
           renames: [{"lib/app/data_migrations/backfill_rates.ex", "lib/app/backfill_rates.ex"}]
         })
 
-      assert result.outcome == :human
+      assert result.outcome == :independent
 
-      assert {:human_path, "lib/app/data_migrations/backfill_rates.ex",
+      assert {:independent_path, "lib/app/data_migrations/backfill_rates.ex",
               "lib/**/data_migrations/**"} in result.reasons
     end
 
@@ -204,9 +232,9 @@ defmodule Loopctl.DeliveryGates.GateBTest do
       assert {:rename_not_in_files, "lib/app/new_name.ex"} in result.reasons
     end
 
-    test "a deleted guarded path listed in files escalates" do
+    test "a deleted guarded path listed in files is held" do
       result = evaluate(:merge, %{files: ["lib/app/data_migrations/backfill_rates.ex"]})
-      assert result.outcome == :human
+      assert result.outcome == :independent
     end
   end
 
@@ -315,30 +343,34 @@ defmodule Loopctl.DeliveryGates.GateBTest do
       for repo_triggers <- [
             %RepoTriggers{
               effect_paths: [],
-              human_paths: [glob],
+              independent_paths: [glob],
+              independent_checks: ["e2e"],
               max_files: 12,
               max_changed_lines: 1000
             },
             %RepoTriggers{
               effect_paths: [glob],
-              human_paths: [],
+              independent_paths: [],
+              independent_checks: ["e2e"],
               max_files: 12,
               max_changed_lines: 1000
             },
             %RepoTriggers{
               effect_paths: [glob],
-              human_paths: [glob],
+              independent_paths: [glob],
+              independent_checks: ["e2e"],
               max_files: 0,
               max_changed_lines: 1000
             },
             %RepoTriggers{
               effect_paths: [glob],
-              human_paths: [glob],
+              independent_paths: [glob],
+              independent_checks: ["e2e"],
               max_files: 12,
               max_changed_lines: nil
             }
           ] do
-        forged = {:ok, %Triggers{version: 1, sha256: "", repos: %{@repo => repo_triggers}}}
+        forged = {:ok, %Triggers{version: 2, sha256: "", repos: %{@repo => repo_triggers}}}
 
         assert %Result{outcome: :human, reasons: [{:config_error, :empty_trigger_set}]} =
                  evaluate(:merge, %{}, forged)
@@ -401,6 +433,13 @@ defmodule Loopctl.DeliveryGates.GateBTest do
   end
 
   describe "agents may only add an escalation" do
+    test "an agent escalation beside an independent path is :human, never :independent" do
+      result = evaluate(:merge, %{files: ["lib/app_web/router.ex"], agent_escalations: ["x"]})
+
+      assert result.outcome == :human
+      assert {:agent_escalation, "x"} in result.reasons
+    end
+
     test "an agent escalation turns a :clear change into :human" do
       assert %Result{outcome: :human, reasons: [{:agent_escalation, "suspects rate change"}]} =
                evaluate(:triage, %{agent_escalations: ["suspects rate change"]})
@@ -415,7 +454,7 @@ defmodule Loopctl.DeliveryGates.GateBTest do
 
     test "an empty or absent agent list, or an agent's all-clear, cannot clear a computed trigger" do
       computed = [
-        {%{files: ["lib/app_web/router.ex"]}, :human},
+        {%{files: ["lib/app_web/router.ex"]}, :independent},
         {%{files: ["priv/rates/2026.csv"]}, :prove_effect},
         {%{diffstat: %{files: 1, changed_lines: 5000}}, :human}
       ]
@@ -424,7 +463,7 @@ defmodule Loopctl.DeliveryGates.GateBTest do
         %{agent_escalations: []},
         %{agent_escalations: nil},
         %{agent_escalations: [], agent_verdict: "no escalation needed", escalate: false},
-        %{agent_escalations: [], override: :clear, suppress: [:human_path]}
+        %{agent_escalations: [], override: :clear, suppress: [:independent_path]}
       ]
 
       for {change, expected} <- computed, all_clear <- agent_all_clear do

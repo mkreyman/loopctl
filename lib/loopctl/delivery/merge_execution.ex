@@ -55,6 +55,12 @@ defmodule Loopctl.Delivery.MergeExecution do
     incomplete states, and each job re-reads the record before pushing.
   - Every resend runs the gate again, so a pull request the runner merged but never reported
     is found `:already_merged` and adopted rather than instructed twice.
+  - A runner with NO live socket, once an instruction was pushed for the head, gets an ADOPT
+    job on every sweep (`"mode" => "adopt"`): a control-plane merge redeploys loopctl and
+    drops the merging runner's socket before it can report, and the adoption needs only
+    Postgres and the forge (US-52.12). The job reads the verdict and records only a merge at
+    the allowed head; it pushes nothing and escalates nothing, so it runs at once rather than
+    after the answer window, ahead of the `:runner_gone` bound.
 
   ## The lease, and a runner that is gone (AC-48.17.3)
 
@@ -101,7 +107,7 @@ defmodule Loopctl.Delivery.MergeExecution do
   ## Inputs
 
   The clock (`:now`), the runner liveness read (`:live?`), the push (`:instruct`), the gate
-  (`:enforce`), the enqueue (`:enqueue`) and the instruction switch (`:enabled?`) are options
+  (`:enforce`, and `:evaluate` for the adopt job), the enqueue (`:enqueue`) and the instruction switch (`:enabled?`) are options
   whose defaults are the production calls, so a test passes its own instead of touching a
   global.
   """
@@ -201,6 +207,9 @@ defmodule Loopctl.Delivery.MergeExecution do
   - `:held` — the runner is live; the claim was held open if it needed to be
   - `:instruction_enqueued` — as `:held`, and a merge instruction job was enqueued
   - `:runner_absent` — the runner has no live socket; the clock runs
+  - `:runner_absent_adopt_enqueued` — as `:runner_absent`, and an instruction for this head
+    was pushed, so an adopt job was enqueued: a merge the runner made before its socket
+    dropped is recorded from the forge, ahead of the `:runner_gone` bound (US-52.12)
   - `:runner_gone` — the clock passed its bound and the story was escalated
   - `:moved_on` — the clock passed its bound, but the locked row no longer named that runner
     (or had left `ci`), so nothing was escalated
@@ -356,12 +365,46 @@ defmodule Loopctl.Delivery.MergeExecution do
       {:ok, since} ->
         if DateTime.diff(now, since) >= @runner_gone_after_seconds,
           do: escalate_runner_gone(row, since),
-          else: :runner_absent
+          else: absent_resend(row, opts)
 
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  # A runner that lost its socket AFTER it was instructed may have merged and never reported:
+  # the merge of a control-plane repository redeploys loopctl and drops every socket, the
+  # merging runner's included (US-52.12, AC-52.12.7). So while the runner is absent and an
+  # instruction for the row's head was pushed, every sweep enqueues an ADOPT job: it reads the
+  # verdict (no writes) and, when the pull request is merged at the allowed head, records the
+  # merge. It does not wait for the answer window, because the absence clock starts AFTER the
+  # push and both bounds are the same length, so a window-gated resend could fall after the
+  # `:runner_gone` escalation. Never pushed for this head, nothing to adopt: the runner was
+  # never told to merge it.
+  defp absent_resend(row, opts) do
+    if enabled?(opts) and verified_at_head?(row) and
+         pushed_for_head?(row.merge_instruction, row.head_sha) do
+      args = %{
+        "tenant_id" => row.tenant_id,
+        "story_id" => row.story_id,
+        "head_sha" => row.head_sha,
+        "mode" => "adopt"
+      }
+
+      case enqueue(opts).(args) do
+        :ok -> :runner_absent_adopt_enqueued
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      :runner_absent
+    end
+  end
+
+  defp pushed_for_head?(%{"head_sha" => head, "sends" => sends}, head)
+       when is_binary(head) and is_integer(sends) and sends > 0,
+       do: true
+
+  defp pushed_for_head?(_record, _head), do: false
 
   defp escalate_runner_gone(row, since) do
     reason =
@@ -506,6 +549,8 @@ defmodule Loopctl.Delivery.MergeExecution do
   - `{:ok, :merge_unanswered}` — the bound was reached and the story was escalated
   - `{:ok, :not_due | :not_ready}` — an instruction for this head is outstanding, or the row
     is no longer a story verified at `ci` at this head; nothing to do
+  - `{:ok, :not_merged}` — an ADOPT job (`"mode" => "adopt"`, enqueued for an absent runner)
+    found no merge at the allowed head; it writes nothing either way except the merge
   - `{:snooze, seconds}` — the forge could not be read, or the tenant is halted
   - `{:cancel, reason}` — the tenant is not human-anchored, or its route is `chg`
   - `{:error, reason}` — a write was refused; Oban retries
@@ -513,11 +558,27 @@ defmodule Loopctl.Delivery.MergeExecution do
   ## Options
 
   `:now`, `:instruct` (`(tenant_id, runner_id, payload) -> :ok | {:error, reason}`, default
-  `Loopctl.Runners.instruct_merge/3`), `:enforce` (default `MergePrecondition.enforce/3`).
+  `Loopctl.Runners.instruct_merge/3`), `:enforce` (default `MergePrecondition.enforce/3`),
+  `:evaluate` (the adopt job's read, default `MergePrecondition.evaluate/3`).
   """
   @spec instruct(map(), deps()) ::
           {:ok, term()} | {:snooze, pos_integer()} | {:cancel, term()} | {:error, term()}
   def instruct(args, opts \\ [])
+
+  def instruct(
+        %{
+          "tenant_id" => tenant_id,
+          "story_id" => story_id,
+          "head_sha" => head,
+          "mode" => "adopt"
+        },
+        opts
+      ) do
+    with :ok <- custody_open(tenant_id),
+         {:ok, %StoryStage{} = stage} <- ready_stage(tenant_id, story_id, head) do
+      adopt_if_merged(stage, opts)
+    end
+  end
 
   def instruct(%{"tenant_id" => tenant_id, "story_id" => story_id, "head_sha" => head}, opts) do
     now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
@@ -564,6 +625,21 @@ defmodule Loopctl.Delivery.MergeExecution do
   end
 
   defp exhausted?(_record, _head), do: false
+
+  # The adopt job (`absent_resend/2`): the verdict read WITHOUT acting on it, because the runner
+  # is absent and a refusal or a push is the next live resend's to make. Only a merge at the
+  # allowed head is recorded; anything else waits for the next sweep.
+  defp adopt_if_merged(stage, opts) do
+    evaluate = Keyword.get(opts, :evaluate, &MergePrecondition.evaluate/3)
+
+    case evaluate.(stage.tenant_id, stage.story_id, claim_epoch: stage.claim_epoch) do
+      {:ok, %Verdict{decision: :already_merged, merge_sha: sha}} -> adopt_merge(stage, sha)
+      {:ok, %Verdict{}} -> {:ok, :not_merged}
+      {:error, :change_protocol_enrolled} -> {:cancel, :change_protocol_enrolled}
+      {:error, reason} when reason in [:not_found, :no_stage, :wrong_stage] -> {:ok, :not_ready}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp gate(stage, now, opts) do
     enforce = Keyword.get(opts, :enforce, &MergePrecondition.enforce/3)

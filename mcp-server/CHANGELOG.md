@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 3.20.0 — 2026-11-19
+
+### Added
+
+- **`x-loopctl-client: mcp/<version>` on every keyed request** (loopctl US-52.8). loopctl
+  answers `426 incompatible_client_version` to a package below the `mcp` minimum of its
+  release set; the tool returns that as an error naming the minimum and the remedy (reconnect
+  with `/mcp`, or restart the session, once that version is on npm).
+- **`runner_pool` names `runner_version`**, the version each runner joined with.
+- **`list_stories` takes `issue_number`** (loopctl US-52.9): the stories an intake issue with
+  that number produced.
+
 ## 3.18.0 — 2026-11-19
 
 ### Added

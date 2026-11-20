@@ -1,0 +1,24 @@
+# chg-loop's thresholds (bin/chg-loop.py; story S14a, #97). A fingerprint with no issue is
+# filed once it has `threshold` occurrences within the last `window_days` days.
+
+[sensor.revert]      # a merged auto-revert PR; key: the directories the culprit touched
+threshold = 1
+window_days = 14
+
+[sensor.flaky]       # a verifier run that saw the test flake
+threshold = 2
+window_days = 30
+
+[sensor.review]      # a merged PR whose Review findings flag the file
+threshold = 4
+window_days = 14
+
+[sensor.harness]     # a red harness-selftest check or a failed fleet-sync
+threshold = 1
+window_days = 14
+
+[guards]
+daily_cap = 3              # new chg-loop issues per owning repo per UTC day
+reopen_days = 14           # a recurrence this soon after a close reopens the issue
+escalate_after_closes = 2  # closed this often and still recurring: chg-loop-escalated, for Mark
+quiet_days = 14            # the closure test written into each issue

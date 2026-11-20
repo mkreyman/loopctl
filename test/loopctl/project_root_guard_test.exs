@@ -30,7 +30,10 @@ defmodule Loopctl.ProjectRootGuardTest do
     # nothing keeps the path. Mix records the @external_resource relative to the
     # project (Mix.Compilers.Elixir, process_external_resources/2), so a moved
     # build still recompiles this module when that file changes.
-    {"lib/loopctl_web/controllers/well_known_controller.ex", "File.cwd!/0 at compile time"}
+    {"lib/loopctl_web/controllers/well_known_controller.ex", "File.cwd!/0 at compile time"},
+    # Reads release/manifest.toml into the literal @manifest while compiling (US-52.7); @path
+    # is used only by @external_resource and that read, so nothing keeps it for run time.
+    {"lib/loopctl/release_set.ex", "File.cwd!/0 at compile time"}
   ]
 
   @scanned_roots ["lib", "test/support"]

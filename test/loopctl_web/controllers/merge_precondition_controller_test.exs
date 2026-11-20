@@ -95,6 +95,8 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert data["custody"] == "ok"
       assert data["gate_a_inputs"] == "persisted_triage"
       assert data["hard_bound"] == %{"max_files" => 12, "max_changed_lines" => 1000}
+      assert data["control_plane_repos"] == ["mkreyman/loopctl", "mkreyman/claude-config"]
+      refute Map.has_key?(data, "self_deploy_excluded_repos")
       assert data["gate_a"]["decision"] == "proceed"
       assert data["gate_b"]["outcome"] == "clear"
       assert data["gate_b"]["merge_precondition"] == true

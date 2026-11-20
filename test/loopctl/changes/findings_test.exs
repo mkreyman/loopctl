@@ -92,6 +92,16 @@ defmodule Loopctl.Changes.FindingsTest do
     AdminRepo.all(from a in FindingAction, where: a.tenant_id == ^tenant_id)
   end
 
+  describe "chg_repo/1 (US-52.5)" do
+    test "defaults to mkreyman/loopctl, where chg lives under chg/, and the option wins" do
+      assert Findings.chg_repo([]) == "mkreyman/loopctl"
+      assert Findings.chg_repo(chg_repo: "acme/x") == "acme/x"
+
+      assert File.read!("deploy/FLY_SECRETS.md") =~
+               "| `CHG_FINDINGS_REPO` | `mkreyman/loopctl` |"
+    end
+  end
+
   describe "derive/3 missing reviews" do
     # The round reaches the ledger after the merge (review-round-counter links the PR, chg's
     # outbox sends on its own cadence), so a fresh merge with no round yet is not a finding.

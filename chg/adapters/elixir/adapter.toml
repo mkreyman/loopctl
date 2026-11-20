@@ -1,0 +1,28 @@
+# .chg/adapter.toml for a Phoenix/Mix project (chg adapter contract v1).
+# Copy into the product repo and adjust the globs; `chg adapter validate` checks it.
+[adapter]
+kind = "elixir"
+version = "1"
+# A project that keeps its dialyzer PLT outside _build (dialyxir `plt_local_path`)
+# adds that directory here.
+artifacts = ["deps", "_build"]
+inputs = ["lib/**", "test/**", "config/**", "priv/**", "mix.exs", "mix.lock", ".tool-versions"]
+always_all = [
+  "mix.exs",
+  "mix.lock",
+  "config/**",
+  "priv/repo/migrations/**",
+  "test/test_helper.exs",
+  "test/support/**",
+  ".tool-versions",
+  ".chg/**",
+]
+isolation_env = { MIX_TEST_PARTITION = "{workspace_slot}" }
+
+[commands]
+snapshot = "mix chg.snapshot"
+# MIX_ENV=test spares each task re-running itself in the test env.
+static   = "MIX_ENV=test mix chg.static --base {base}"
+affected = "MIX_ENV=test mix chg.affected --base {base}"
+run      = "MIX_ENV=test mix chg.run --tests {file}"
+shard    = "MIX_ENV=test mix chg.shard --of {n} --index {i}"

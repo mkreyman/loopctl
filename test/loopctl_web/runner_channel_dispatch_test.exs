@@ -153,7 +153,11 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       log =
         capture_log(fn ->
           {reply, _channel} = join_pool(socket, name, %{"max_sessions" => 0})
-          assert reply == %{contract_version: RunnerContract.version()}
+
+          assert reply == %{
+                   contract_version: RunnerContract.version(),
+                   release_set: Loopctl.ReleaseSet.set()
+                 }
         end)
 
       assert held_capacity(runner).max_sessions == 1

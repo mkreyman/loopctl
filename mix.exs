@@ -192,6 +192,10 @@ defmodule Loopctl.MixProject do
       # YAML frontmatter parsing for OKF (Open Knowledge Format) interchange (#110)
       {:yaml_elixir, "~> 2.11"},
 
+      # release/manifest.toml, the factory release set (US-52.7): read at compile time by
+      # Loopctl.ReleaseSet and by mix loopctl.release_set.
+      {:toml, "~> 0.7"},
+
       # Testing
       {:mox, "~> 1.2", only: :test},
       # 0.1.13 and later: EEF-CVE-2026-92106 (mutation XSS through unescaped SVG/MathML text).
@@ -277,6 +281,9 @@ defmodule Loopctl.MixProject do
       # to the fleet's hooks).
       setup: ["cmd bash .githooks/install.sh", "deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
+      # US-52.9: the end-to-end suite, its own mix project under e2e/. Its live test runs only
+      # with LOOPCTL_E2E_ORCH_KEY set (e2e/test/test_helper.exs), as the e2e workflow sets it.
+      e2e: ["cmd --cd e2e mix test"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       # Run ONLY the cross-context journey tests (test/e2e/*, tagged :e2e). `--only`
@@ -294,6 +301,7 @@ defmodule Loopctl.MixProject do
         "credo --strict",
         "loopctl.check_skill_citations",
         "loopctl.check_env_docs",
+        "loopctl.release_set --check",
         # NB (#556): the AGENTS.md usage-rules drift check is deliberately NOT here. This
         # alias runs under `preferred_envs: [precommit: :test]` and `usage_rules` is
         # `only: :dev`, so `mix usage_rules.sync --check` would fail with "task could not

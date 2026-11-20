@@ -1,0 +1,13 @@
+[adapter]
+kind = "pnpm"
+version = "1"
+artifacts = ["node_modules", "apps/*/node_modules", "packages/*/node_modules"]
+inputs = ["apps/**", "packages/**", "e2e/**", "package.json", "pnpm-lock.yaml"]
+always_all = ["pnpm-lock.yaml", "pnpm-workspace.yaml", "**/package.json", "**/tsconfig*.json", "**/vitest*.config.ts", "playwright.config.ts", "eslint.config.js", ".chg/**"]
+
+[commands]
+snapshot = "node \"$CHG_TS_ADAPTER\" snapshot"
+static   = "node \"$CHG_TS_ADAPTER\" static --base {base}"
+affected = "node \"$CHG_TS_ADAPTER\" affected --base {base} --ignore '**/*.md' --e2e-grep @smoke"
+run      = "node \"$CHG_TS_ADAPTER\" run --tests {file}"
+shard    = "node \"$CHG_TS_ADAPTER\" shard --of {n} --index {i} --e2e"

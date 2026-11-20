@@ -1,0 +1,48 @@
+# .chg/adapter.toml for a pnpm workspace of TypeScript packages (chg adapter contract v1),
+# shaped for fleet-holding: apps/* and packages/*, Vitest projects at the root, Playwright
+# specs in e2e/. Copy into the product repo and adjust; `chg adapter validate` checks it.
+# scripts/install-typescript-adapter.sh puts the adapter where the commands below run it.
+[adapter]
+kind = "pnpm"
+version = "1"
+# node_modules holds hard links into pnpm's store; dist/ is what the snapshot's build produces.
+artifacts = ["node_modules", "apps/*/node_modules", "packages/*/node_modules", "packages/*/dist"]
+inputs = ["apps/**", "packages/**", "e2e/**", "scripts/**", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".tool-versions"]
+# What the module graphs cannot see: dependency and toolchain pins, compiler and runner
+# settings, and test setup no test imports. Vitest's --changed follows its projects'
+# setupFiles and globalSetup; Playwright's --only-changed does not follow globalSetup,
+# so e2e/global-setup.ts is listed. A hit selects everything without running the adapter.
+always_all = [
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "**/package.json",
+  "**/tsconfig*.json",
+  "**/vitest*.config.ts",
+  "vitest.provided.d.ts",
+  "**/vite.config.ts",
+  "playwright.config.ts",
+  "e2e/fixtures/**",
+  "e2e/global-setup.ts",
+  "eslint.config.js",
+  "eslint/**",
+  "scripts/job-share.ts",
+  ".tool-versions",
+  ".chg/**",
+]
+
+[commands]
+# The adapter is the per-user copy unless CHG_TS_ADAPTER_DIR names another: a CI runner
+# user sets it to /usr/local/share/chg/typescript, where scripts/install-system.sh puts it.
+# --generate runs before the warm typecheck and before every static run:
+# apps/web's routeTree.gen.ts is gitignored, and tsc fails without it.
+snapshot = "node \"${CHG_TS_ADAPTER_DIR:-$HOME/.local/share/chg/typescript}/chg-adapter.mjs\" snapshot --generate 'pnpm --filter @fh/web exec tsr generate' --tsconfig e2e --tsconfig scripts --tsconfig scripts/image"
+# Each --check is name=shell command, run with CHG_BASE and CHG_HEAD set; a non-zero
+# exit is a failure carrying the command's output.
+static   = "node \"${CHG_TS_ADAPTER_DIR:-$HOME/.local/share/chg/typescript}/chg-adapter.mjs\" static --base {base} --generate 'pnpm --filter @fh/web exec tsr generate' --tsconfig e2e --tsconfig scripts --tsconfig scripts/image --check 'hygiene=node scripts/check-pr-hygiene.mjs --base \"$CHG_BASE\" --head \"$CHG_HEAD\"' --check 'secrets=node scripts/scan-secrets.mjs \"$CHG_BASE\" \"$CHG_HEAD\"'"
+# A path outside the packages and e2e/ selects everything. --ignore drops a path that
+# no test reads; fleet-holding has none to drop: its tests read docs/**, README.md and
+# .github/workflows/ci.yml. --e2e-grep adds the tagged Playwright specs whenever an app
+# changes (fleet-holding tags none yet, so it is left off).
+affected = "node \"${CHG_TS_ADAPTER_DIR:-$HOME/.local/share/chg/typescript}/chg-adapter.mjs\" affected --base {base}"
+run      = "node \"${CHG_TS_ADAPTER_DIR:-$HOME/.local/share/chg/typescript}/chg-adapter.mjs\" run --tests {file}"
+shard    = "node \"${CHG_TS_ADAPTER_DIR:-$HOME/.local/share/chg/typescript}/chg-adapter.mjs\" shard --of {n} --index {i} --e2e"

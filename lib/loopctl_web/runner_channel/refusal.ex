@@ -47,6 +47,14 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   def for_join({:unsupported_contract_version, sent, speaks}, _opts),
     do: %{reason: "unsupported_contract_version", sent: sent, supported: speaks}
 
+  def for_join({:incompatible_client_version, refusal}, _opts),
+    do: %{
+      reason: "incompatible_client_version",
+      component: refusal.component,
+      sent: refusal.sent,
+      minimum: refusal.minimum
+    }
+
   def for_join({:machine_mismatch, declared}, _opts),
     do: %{reason: "machine_mismatch", declared: declared}
 

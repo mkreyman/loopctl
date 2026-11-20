@@ -533,6 +533,36 @@ defmodule Loopctl.WorkBreakdown.Stories do
     |> filter_by_agent_status(Keyword.get(opts, :agent_status))
     |> filter_by_verified_status(Keyword.get(opts, :verified_status))
     |> filter_by_epic_id(Keyword.get(opts, :epic_id))
+    |> filter_by_intake(Keyword.get(opts, :issue_number), Keyword.get(opts, :repo))
+  end
+
+  # US-52.9: the stories an intake issue produced, through `stories.intake_record_id`. The
+  # joins carry the tenant as well as the id, so a record of another tenant never matches
+  # even on the AdminRepo (BYPASSRLS) path. An issue number is unique only within one
+  # source's repository, so `repo` (owner/name, case-insensitive) narrows it to one; without
+  # it every source's issue of that number answers.
+  defp filter_by_intake(query, nil, nil), do: query
+
+  defp filter_by_intake(query, issue_number, repo) do
+    query =
+      from s in query,
+        join: r in Loopctl.Intake.Record,
+        as: :intake_record,
+        on: r.id == s.intake_record_id and r.tenant_id == s.tenant_id
+
+    query =
+      if is_integer(issue_number),
+        do: from([intake_record: r] in query, where: r.issue_number == ^issue_number),
+        else: query
+
+    if is_binary(repo) do
+      from [intake_record: r] in query,
+        join: src in Loopctl.Intake.Source,
+        on: src.id == r.source_id and src.tenant_id == r.tenant_id,
+        where: fragment("lower(?)", src.repo_full_name) == ^String.downcase(repo)
+    else
+      query
+    end
   end
 
   defp filter_by_epic_id(query, nil), do: query

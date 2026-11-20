@@ -683,6 +683,12 @@
           "maxItems": 50,
           "type": "array"
         },
+        "runner_version": {
+          "description": "The runner's own version (semver, since 1.34.0). A join below the release set's runner `minimum`, or without this field once that minimum is a version, is refused `incompatible_client_version` (permanent: upgrade, do not rejoin). A version above the set's is admitted.",
+          "maxLength": 64,
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$",
+          "type": "string"
+        },
         "sample": {
           "description": "A self-measured health sample. Connected is not able-to-build: a wedged machine still answers heartbeats, so the control plane treats a stale sample as a breached threshold.",
           "properties": {
@@ -2692,6 +2698,11 @@
       },
       "join": {
         "forbidden_topic": [],
+        "incompatible_client_version": [
+          "component",
+          "sent",
+          "minimum"
+        ],
         "invalid_payload": [
           "details"
         ],
@@ -2842,6 +2853,7 @@
         "not_authorized",
         "invalid_payload",
         "unsupported_contract_version",
+        "incompatible_client_version",
         "machine_mismatch",
         "forbidden_topic",
         "unknown_topic"
@@ -3153,6 +3165,7 @@
         "invalid_payload",
         "not_authorized",
         "unsupported_contract_version",
+        "incompatible_client_version",
         "machine_mismatch",
         "forbidden_topic",
         "unknown_topic",
@@ -3284,5 +3297,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.33.0"
+  "x-contract-version": "1.34.0"
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Repo-local pre-push (#985): the fleet's pre-push exactly as before, then chg's
-# shadow phase (mkreyman/chg docs/shadow.md). For every commit the push carries
+# shadow phase (chg/docs/shadow.md). For every commit the push carries
 # (up to the newest 100 per ref) that local-gate.sh attests, it records the
 # gate's pass; for each pushed ref TIP it queues one chg check. Nothing chg does
 # here blocks a push or changes the fleet hook's verdict: every call into chg or

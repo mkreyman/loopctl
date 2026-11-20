@@ -4,6 +4,8 @@ defmodule LoopctlWeb.StoryByProjectControllerTest do
   """
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query, only: [from: 2]
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -212,6 +214,114 @@ defmodule LoopctlWeb.StoryByProjectControllerTest do
 
       # user role has :agent capability, should succeed
       assert json_response(conn, 200)
+    end
+  end
+
+  # TC-52.9.1 (US-52.9): the e2e harness finds the story its issue produced.
+  describe "GET /api/v1/stories?project_id=X&issue_number=N" do
+    setup do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      linked = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.1"})
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.2"})
+      link!(linked, tenant.id, project.id, 41)
+
+      %{tenant: tenant, raw_key: raw_key, project: project, linked: linked}
+    end
+
+    test "returns only the stories intake issue N produced", ctx do
+      body = index(ctx.conn, ctx.raw_key, "project_id=#{ctx.project.id}&issue_number=41")
+
+      assert [%{"id" => id}] = body["data"]
+      assert id == ctx.linked.id
+      assert body["meta"]["total_count"] == 1
+    end
+
+    test "an issue number no intake record carries returns nothing", ctx do
+      body = index(ctx.conn, ctx.raw_key, "project_id=#{ctx.project.id}&issue_number=42")
+      assert body["data"] == []
+    end
+
+    test "another tenant's record with the same issue number is not seen", ctx do
+      other = fixture(:tenant)
+      {other_key, _} = fixture(:api_key, %{tenant_id: other.id, role: :agent})
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_epic = fixture(:epic, %{tenant_id: other.id, project_id: other_project.id})
+      theirs = fixture(:story, %{tenant_id: other.id, epic_id: other_epic.id, number: "1.1"})
+      link!(theirs, other.id, other_project.id, 41)
+
+      mine = index(ctx.conn, ctx.raw_key, "project_id=#{ctx.project.id}&issue_number=41")
+      assert Enum.map(mine["data"], & &1["id"]) == [ctx.linked.id]
+
+      # The other tenant's key cannot read this tenant's project at all.
+      crossed = index(build_conn(), other_key, "project_id=#{ctx.project.id}&issue_number=41")
+      assert crossed["data"] == []
+    end
+
+    test "repo narrows the issue number to one repository's issue", ctx do
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+      other = fixture(:story, %{tenant_id: ctx.tenant.id, epic_id: epic.id, number: "2.1"})
+      link!(other, ctx.tenant.id, ctx.project.id, 41, "acme/other")
+      link!(ctx.linked, ctx.tenant.id, ctx.project.id, 41, "Acme/Mine")
+
+      both = index(ctx.conn, ctx.raw_key, "project_id=#{ctx.project.id}&issue_number=41")
+      assert Enum.sort(Enum.map(both["data"], & &1["id"])) == Enum.sort([ctx.linked.id, other.id])
+
+      mine =
+        index(
+          ctx.conn,
+          ctx.raw_key,
+          "project_id=#{ctx.project.id}&issue_number=41&repo=acme/mine"
+        )
+
+      assert Enum.map(mine["data"], & &1["id"]) == [ctx.linked.id]
+    end
+
+    for bad <- ["0", "-3", "abc", "4.5", "2147483648", "3000000000"] do
+      test "issue_number=#{bad} is a 400", ctx do
+        conn =
+          ctx.conn
+          |> auth_conn(ctx.raw_key)
+          |> get("/api/v1/stories?project_id=#{ctx.project.id}&issue_number=#{unquote(bad)}")
+
+        assert json_response(conn, 400)["error"]["message"] =~ "issue_number"
+      end
+    end
+
+    test "the largest int4 issue number is accepted", ctx do
+      body = index(ctx.conn, ctx.raw_key, "project_id=#{ctx.project.id}&issue_number=2147483647")
+      assert body["data"] == []
+    end
+
+    test "a repo that is not owner/name is a 400", ctx do
+      conn =
+        ctx.conn
+        |> auth_conn(ctx.raw_key)
+        |> get("/api/v1/stories?project_id=#{ctx.project.id}&issue_number=41&repo=nope")
+
+      assert json_response(conn, 400)["error"]["message"] =~ "repo"
+    end
+
+    defp index(conn, raw_key, query) do
+      conn |> auth_conn(raw_key) |> get("/api/v1/stories?#{query}") |> json_response(200)
+    end
+
+    defp link!(story, tenant_id, project_id, issue_number, repo \\ nil) do
+      {_source, record} =
+        fixture(:intake_pair, %{
+          tenant_id: tenant_id,
+          project_id: project_id,
+          issue_number: issue_number,
+          repo_full_name: repo || "mkreyman/sandbox-#{System.unique_integer([:positive])}"
+        })
+
+      Loopctl.AdminRepo.update_all(
+        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+        set: [intake_record_id: record.id]
+      )
     end
   end
 end

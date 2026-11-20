@@ -62,7 +62,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :refuse, reasons: plain}} = evaluate(ctx)
       assert :effect_proof_required in plain
 
-      # A selection-proof repository (case-insensitive): the story has no recorded replay.
+      # A selection-proof repository (case-insensitive), but the only effect match lies outside
+      # chg/ (US-52.5): the replay measures nothing here, so it is not read and the change is
+      # judged exactly as on the repository above.
       assert {:ok, %Verdict{decision: :refuse, reasons: measured}} =
                MergePrecondition.evaluate(
                  ctx.tenant_id,
@@ -70,8 +72,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
                  opts() ++ [selection_proof_repos: [String.upcase(@repo)]]
                )
 
-      assert {:selection_proof, :selection_replay_missing} in measured
-      refute :effect_proof_required in measured
+      assert measured == plain
+      refute {:selection_proof, :selection_replay_missing} in measured
     end
 
     test "resolves the repository from the story's intake source, never from the caller", ctx do
@@ -219,7 +221,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :escalated
       assert row.escalation_reason =~ "merge_gate"
-      assert row.escalation_reason =~ "human_path"
+      assert row.escalation_reason =~ "independent_path"
       assert row.attempts["merge_gate"] == 1
     end
 

@@ -6,6 +6,78 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **CI runs on push of every branch, never on `pull_request`, and every workflow ends in
+  an `area gate` job (2026-11-20, US-52.12 review).** The merge gate trusts only push runs
+  of a story's branch, so `ci.yml`, `runner-ci.yml`, `chg-ci.yml`, `e2e.yml` and `mcp-server-ci.yml` push-trigger
+  on `**`; a same-repo pull request's required checks are satisfied by the push run on its
+  head. A non-master push is judged on the whole branch, from its merge base with master.
+  `area gate` (one name in all four) is green only when every job of its workflow succeeded
+  or was skipped by area. **Fork pull requests get no CI run** (every job already skipped
+  them, which GitHub counted as passing; they now cannot satisfy required checks). **Setup:**
+  loopctl's `DELIVERY_GATES_CONFIG` entry lists `independent_checks: ["area gate"]`, and a
+  pull request that touches `.github/workflows/`, `.github/actions/` or `.github/scripts/`
+  is never merged by the loop. The live e2e job reads the repository variable
+  `LOOPCTL_E2E_PROJECT_ID` (`gh variable set`) and refuses to start without it.
+- **`GET /api/v1/stories` takes `repo` (owner/name) beside `issue_number` (2026-11-20).** An
+  issue number is unique only within one repository; `issue_number` above 2147483647 is now
+  `400` rather than `500`.
+- **mkreyman/chg and mkreyman/loopctl-runner are retired into this repository (2026-11-19,
+  US-52.11).** `release/manifest.toml` gains `[retired] repos`. Each `install-machine.sh` run
+  sends chg's outbox and then removes those repos' `[[source]]` blocks from
+  `~/.chg/loopctl.toml` (`LOOPCTL_FACTORY_CHG_CONFIG`). A failed send leaves the blocks in place
+  and fails that host's install. `release/retire-repo.sh` transfers a repo's open issues here,
+  archives it, imports it a last time and marks its `release/imports.toml` entry
+  `archived = true`; `import-history.sh` then refuses that prefix. **Deploy ordering:** retire
+  only after the set-2 rollout is green.
+- **One command moves the fleet to a release set (2026-11-19, US-52.10).**
+  `release/rollout.sh` checks that loopctl serves the manifest's set and npm has its MCP
+  version, runs `release/install-machine.sh <set>` on each host of `FLEET_MACHINES` over ssh,
+  then dispatches the e2e workflow and rolls the hosts it moved back one set if that fails.
+  On each machine the set's checkout lives at `~/.local/share/loopctl-factory/sets/<set>`
+  behind the `current` symlink; the runner is drained (up to 60 minutes) before it is
+  replaced, `runner.json` is moved from `mkreyman/chg` to `mkreyman/loopctl`, and the install
+  is `ok` only once chg names the set's commit and the runner has rejoined at the set.
+  **Deploy ordering:** run it after the master deploy and the MCP publish of the set.
+- **`GET /api/v1/stories` takes `issue_number`, and an end-to-end suite runs nightly
+  (2026-11-19, US-52.9).** `?project_id=P&issue_number=N` lists the stories intake issue N
+  produced; an `issue_number` that is not a positive integer is `400`. `.github/workflows/e2e.yml`
+  files an issue in the sandbox repo `mkreyman/loopctl-e2e-sandbox` at 07:00 UTC and follows it
+  to done. **Setup:** the repository secrets `LOOPCTL_E2E_ORCH_KEY` (an orchestrator key for
+  the sandbox's project) and `E2E_GITHUB_TOKEN` (issues, pull requests and deployments on the
+  sandbox); without them the live job fails at its first read. Provision the sandbox with
+  `e2e/sandbox/provision.sh`.
+- **Gate B `human_paths` became `independent_paths`; the self-deploy refusal is gone
+  (2026-11-19, US-52.12).** `DELIVERY_GATES_CONFIG` is read only as document version 2:
+  each repository entry carries `effect_paths`, `independent_paths`, `independent_checks`
+  (a non-empty list of CI job names, never `local-gate`) and `limits`. A version 1 document
+  is refused `{:unsupported_version, 1}` and a `human_paths` key `{:unknown_key, ...}`, so
+  every delivery-loop change escalates until the document is replaced. **Deploy ordering:
+  re-pin the production document to version 2, with its `DELIVERY_GATES_CONFIG_SHA256`, as
+  STAGED secrets before the merge (`fly secrets set --stage`), so the deploy that ships this
+  code is the restart that applies them** (the old code reads only version 1 and the new
+  only version 2, so an unstaged set on either side leaves a window where every merge
+  escalates) (rename `human_paths` to `independent_paths`,
+  add `independent_checks`, set `"version": 2`; recipe in `deploy/FLY_SECRETS.md`). A change
+  touching an independent path, and every merge into a control-plane repository
+  (`mkreyman/loopctl`, `mkreyman/claude-config`; `config :loopctl, :control_plane_repos`),
+  now merges without a human when it is independently verified: the verifier dispatch passed
+  custody at the head, ran on another runner machine than the implementer, and every
+  `independent_checks` job is green at the head. Otherwise the merge gate refuses naming
+  `independent_verification`. The merge-precondition verdict's `self_deploy_excluded_repos`
+  field is replaced by `control_plane_repos`, and the refusal reason `self_deploy_excluded`
+  no longer exists. Triage no longer escalates an independent path.
+
+- **A factory client older than the release set is refused with 426 (2026-11-19, US-52.8).**
+  A request carrying `x-loopctl-client: <component>/<version>` for `runner`, `chg` or `mcp`
+  is answered `426 incompatible_client_version` (`component`, `sent`, `minimum`) on every
+  authenticated and change-event route, before the API key is read, when that version is
+  below the component's `minimum` in `release/manifest.toml`. A request without the header,
+  or naming another component, is unchanged. Runner contract 1.34.0: a runner join is refused
+  the same way, judged on its new `runner_version` field, and the join reply carries
+  `release_set`; `GET /api/v1/runners/pool` shows each connection's `runner_version`.
+  **Deploy ordering:** raise a component's `minimum` only after its clients send their version
+  (the runner, chg and the MCP package from this release on); a client sending none is refused
+  once the minimum is a version.
 - **A `pr` or `chg` intake source on a kb scope promotes it to a work project (2026-11-19,
   US-52.3).** `POST /api/v1/intake/sources` on an active `kind: kb` project used to be 422
   ("must be an active work project"); it now enrols and turns the scope into a work project in

@@ -1,0 +1,45 @@
+{
+  "runs_dir": "~/.local/state/loopctl-runner/runs",
+  "claude_projects_dir": "~/.claude/projects",
+  "claude_launcher": "~/workspace/claude-config/bin/claude-headless.sh",
+  "repos": {
+    "home_care_billing": "~/workspace/home_care_billing"
+  },
+  "branch_prefixes": [
+    "loop/"
+  ],
+  "max_wall_clock_s": 3600,
+  "max_turns": 200,
+  "park_after_s": 600,
+  "liveness_interval_s": 30,
+  "kill_grace_s": 10,
+  "tree_poll_s": 1,
+  "agents_probe_timeout_s": 20,
+  "min_session_s": 60,
+  "control": {
+    "url": "wss://loopctl.com/runner/socket/websocket",
+    "runner_id": "<runner.id returned by runner_enroll>",
+    "machine": "minis",
+    "token_file": "~/.config/loopctl-runner/token",
+    "repos": [
+      "mkreyman/home_care_billing"
+    ],
+    "max_sessions": 2,
+    "status_interval_s": 30,
+    "accepts_dispatches": false,
+    "min_free_disk_mb": 10240,
+    "max_token_budget": null
+  },
+  "session_env": {
+    "home_care_billing": {
+      "TEST_DB_BASE": "hcb_loop_{story}"
+    }
+  },
+  "selection_replay": {
+    "chg": {
+      "product": "home_care_billing",
+      "paths": ["cli/src/cover.rs", "adapters/*/lib/**"],
+      "corpus": 5
+    }
+  }
+}

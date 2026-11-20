@@ -194,7 +194,7 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 |-----------------------------|---------|-------------|
 | `STORY_CLAIM_LEASE_SECONDS` | `86400` | How long a story claim lives without a renewal (`POST /api/v1/stories/:id/renew-claim`). Past it, `ReclaimExpiredClaimsWorker` (every 5 minutes) releases the story back to `pending` and bumps its `claim_epoch`. Positive integer seconds; unset, blank or malformed leaves the 24h default rather than failing boot. **Too SHORT releases stories agents are still working** — the duplicate-work race a claim exists to prevent, and it fires on long HEALTHY sessions, not on crashed ones. Too long only delays reopening a story whose session is already gone. Bias long, and have claimants renew well inside the window. Applies to leases granted or renewed after a restart; existing `claimed_until` values are not rewritten. Also the renewal grace granted when a custody halt is cleared or a tenant is re-activated: every live lease is extended to at least one lease from the clear |
 | `CHG_FINDINGS_DAILY_CAP` | `5` | How many NEW chg feedback-loop issues (US-51.1) the nightly `ChgFindingSweepWorker` may file per repository per UTC day. A finding over the cap stays `queued` and is filed on a later night, the most-seen first. Positive integer; unset, blank or malformed leaves the default. **Too HIGH** spends a runner session on every issue filed on a bad day; **too LOW** leaves real problems queued for days. |
-| `CHG_FINDINGS_REPO` | `mkreyman/chg` | The `owner/name` the feedback loop files chg's own selection misses on (US-51.1). It must have a live intake source in the tenant, or those findings stay `queued`. **Wrong** files chg's misses on a repository that cannot fix them, or on none. |
+| `CHG_FINDINGS_REPO` | `mkreyman/loopctl` | The `owner/name` the feedback loop files chg's own selection misses on (US-51.1); chg lives under `chg/` there since US-52.5. It is also the repository whose chg/ changes are cleared by the selection proof. It must have a live intake source in the tenant, or those findings stay `queued`. **Wrong** files chg's misses on a repository that cannot fix them, or on none. |
 | `CHG_MISSING_REVIEWS` | unset (off) | `true` turns on the feedback loop's `missing_review` findings (`Loopctl.Changes.Findings.missing_reviews?/1`): a merged PR at least 24 h old with no counted review round files an issue on its repository. Off by default because chg does not yet send a round reviewed before `gh pr create`, so every ordinary merge read as unreviewed. Any other value leaves it off. **On too early** files a false "merged with no review" issue for every reviewed merge; **left off** means a genuinely unreviewed merge files nothing. |
 | `DISPATCH_LEASE_GRACE_SECONDS` | `900` | Seconds past a dispatch's wall clock before the claim a PLACEMENT takes (`Loopctl.Delivery.Placement`, the dispatch driver and `place_dispatch`) is capped (#879). That claim's lease is `placed_at + wall_clock_seconds + this`, sent to the runner as the dispatch's `deadline_at`, which the runner stops the session by — so this is also how much start-up time a session absorbs before its deadline shortens it. It moves forward to the runner's `replied_at + wall_clock_seconds + this` when the runner accepts while the claim is live, never earlier, and no renewal ever moves it later — so a killed session releases its story within minutes of its wall clock instead of holding it for `STORY_CLAIM_LEASE_SECONDS`. Every other claim keeps the global lease. **Below `Loopctl.Runners.Capacity.release_grace_seconds/0` (300) THE APP REFUSES TO BOOT**, naming both values: capacity presumes the session running until `replied_at + wall_clock_seconds` + that grace, and a claim released earlier lets the story be placed again under a live session. Above the floor, a shorter value only narrows the margin between a session's end and its story's release; too long only delays reopening a story whose session is gone. Integer seconds; unset or blank leaves the default, and **any other non-integer (`15m`, `1800s`, `120.0`) REFUSES THE BOOT** naming the variable. Applies to claims placed after a restart; existing caps are not rewritten |
 
@@ -237,13 +237,26 @@ are willing to have picked up unattended.
 #### Agent delivery loop: Gate B triggers
 
 Gate B (`Loopctl.DeliveryGates`) decides from these which paths a delivery-loop change may
-merge through without a human. Set both as SECRETS, together, in one command — the document
+merge through without a human. The document is version 2 (US-52.12): each repository entry
+has exactly `effect_paths`, `independent_paths`, `independent_checks` and `limits`.
+`independent_paths` names the paths a change may touch only when it is independently
+verified (the verifier dispatch passed custody at the head, on another runner machine than
+the implementer, with every `independent_checks` job green at the head);
+`independent_checks` is a non-empty list of CI job names, never `local-gate`, judged only from
+push runs of the story's branch; for loopctl and claude-config it is `["area gate"]`, the
+always-run last job of each of their workflows, and a pull request that touches a CI definition
+(`.github/workflows/`, `.github/actions/`, `.github/scripts/`) is refused before it is read. A version 1
+document, or a `human_paths` key, is refused, so every change escalates until the document
+is re-pinned. Set both as SECRETS, together, in one command — the document
 is a map of which paths skip human review and does not belong in `fly.toml` or the public
 source tree. Hash exactly the bytes you set, from the same shell variable:
 
 ```bash
 DOC="$(cat triggers.json)"
-fly secrets set DELIVERY_GATES_CONFIG="$DOC" \
+# --stage when the document's version changes with a deploy (version 1 -> 2): the deploy is
+# the restart that applies it, so no image ever reads a version it does not know. Without
+# --stage when only the content changes: that set restarts the machines itself.
+fly secrets set --stage DELIVERY_GATES_CONFIG="$DOC" \
   DELIVERY_GATES_CONFIG_SHA256="$(printf '%s' "$DOC" | sha256sum | cut -d' ' -f1)"
 ```
 
@@ -255,7 +268,7 @@ Linux's 128 KiB per environment string, against a few kilobytes per repository.
 
 | Variable                        | Default | Description |
 |---------------------------------|---------|-------------|
-| `DELIVERY_GATES_CONFIG`         | unset   | The Gate B trigger JSON document, inline. Read verbatim at call time (restart to apply; no deploy). **Unset, empty, not valid JSON, or not the documented shape: every delivery-loop change escalates to a human.** That is the intended fail-closed behaviour, never a silently empty trigger set, so a wrong value costs human confirmations rather than unguarded merges. A pattern that no longer matches any file in its repository escalates too, naming the pattern |
+| `DELIVERY_GATES_CONFIG`         | unset   | The Gate B trigger JSON document, inline, version 2: per repository `effect_paths`, `independent_paths`, `independent_checks` (a non-empty list of CI job names, never `local-gate`) and `limits`. Read verbatim at call time (restart to apply; no deploy). **Unset, empty, not valid JSON, version 1, a `human_paths` key, an empty `independent_checks`, or otherwise not the documented shape: every delivery-loop change escalates to a human.** That is the intended fail-closed behaviour, never a silently empty trigger set, so a wrong value costs human confirmations rather than unguarded merges. A pattern that no longer matches any file in its repository escalates too, naming the pattern |
 | `DELIVERY_GATES_CONFIG_SHA256`  | unset   | Hex SHA-256 (64 characters, either case) of the EXACT bytes of `DELIVERY_GATES_CONFIG`. Verified before the document is decoded, so an unpinned edit is never interpreted. **Unset, malformed, or computed over different bytes: every delivery-loop change escalates to a human**, by design. The commonest way to get different bytes is hashing the FILE (`sha256sum triggers.json`, newline included) after setting the variable from `$(cat triggers.json)` (newline stripped); hash the value as set, per the recipe above. Update it in the same `fly secrets set` as the document, or the rolling restart runs a window with a mismatched pair |
 
 #### CLI client (`loopctl` command, not the server)

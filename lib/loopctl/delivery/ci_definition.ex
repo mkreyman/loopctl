@@ -13,7 +13,10 @@ defmodule Loopctl.Delivery.CiDefinition do
   workflow file is caught too, and on any composite action's `action.yml`, wherever it sits.
   """
 
-  @ci_definition_prefixes [".github/workflows/", ".github/actions/"]
+  # `.github/scripts/` too: the workflows run those scripts to decide which jobs run
+  # (`changed-areas.sh` prints the areas every job's `if:` reads), so editing one can skip a
+  # required job as surely as editing the workflow.
+  @ci_definition_prefixes [".github/workflows/", ".github/actions/", ".github/scripts/"]
 
   @doc """
   The refusal a diff earns, as a list so a caller can append it to others:

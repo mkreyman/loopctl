@@ -89,7 +89,11 @@ defmodule LoopctlWeb.RunnerChannelTest do
       {:ok, socket} = connect_runner_socket(raw)
 
       {reply, _channel} = join_pool(socket, "minis")
-      assert reply == %{contract_version: RunnerContract.version()}
+
+      assert reply == %{
+               contract_version: RunnerContract.version(),
+               release_set: Loopctl.ReleaseSet.set()
+             }
 
       assert %{"minis" => %{metas: [meta]}} = Runners.pool(runner.tenant_id)
       assert meta.runner_id == runner.id
@@ -252,6 +256,57 @@ defmodule LoopctlWeb.RunnerChannelTest do
                    :runner_join_payload,
                    Map.put(%{"contract_version" => "2.0.0"}, "machine", "minis")
                  )
+               )
+    end
+
+    # TC-52.8.3 (US-52.8): the release set's runner minimum is injected through the socket's
+    # assigns, so the test never depends on the committed manifest's numbers.
+    test "refuses a runner below the release set's minimum and admits one at it" do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
+
+      socket =
+        Phoenix.Socket.assign(socket, :release_set_components, %{
+          "runner" => %{minimum: "0.2.0", version: "0.3.0"}
+        })
+
+      join = fn version ->
+        subscribe_and_join(
+          socket,
+          runner_topic(socket),
+          build(:runner_join_payload, %{"machine" => "minis", "runner_version" => version})
+        )
+      end
+
+      assert {:error,
+              %{
+                reason: "incompatible_client_version",
+                component: "runner",
+                sent: "0.1.0",
+                minimum: "0.2.0"
+              }} = join.("0.1.0")
+
+      assert {:ok, reply, _channel} = join.("0.2.0")
+      assert reply.release_set == Loopctl.ReleaseSet.set()
+
+      assert %{"minis" => %{metas: [meta]}} = Runners.pool(runner.tenant_id)
+      assert meta.runner_version == "0.2.0"
+    end
+
+    test "refuses a runner sending no version once the set's minimum is one" do
+      {raw, _runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
+
+      socket =
+        Phoenix.Socket.assign(socket, :release_set_components, %{
+          "runner" => %{minimum: "0.2.0", version: "0.3.0"}
+        })
+
+      assert {:error, %{reason: "incompatible_client_version", sent: nil}} =
+               subscribe_and_join(
+                 socket,
+                 runner_topic(socket),
+                 build(:runner_join_payload, %{"machine" => "minis"})
                )
     end
 

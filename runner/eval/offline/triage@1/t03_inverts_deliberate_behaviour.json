@@ -1,0 +1,14 @@
+{
+  "verdict": {
+    "outcome": "escalate",
+    "confidence": "high",
+    "evidence": ["lib/tiny_app.ex:5"],
+    "contradicts": [{"kind": "code", "ref": "lib/tiny_app.ex", "why": "greet/1 trims names on purpose (story TA-12), and the code says to keep it"}],
+    "escalation_reasons": ["inverts_or_removes_deliberate_behaviour", "the request removes the trimming story TA-12 added deliberately, which is a product decision"],
+    "lens_verdicts": [
+      {"lens": "analyst", "outcome": "escalate", "confidence": "high", "escalation_reasons": ["inverts_or_removes_deliberate_behaviour"]},
+      {"lens": "architect", "outcome": "escalate", "confidence": "high", "escalation_reasons": ["inverts_or_removes_deliberate_behaviour"], "contradicts": [{"kind": "code", "ref": "lib/tiny_app.ex", "why": "greet/1 trims on purpose (TA-12)"}]},
+      {"lens": "engineer", "outcome": "escalate", "confidence": "medium", "escalation_reasons": []}
+    ]
+  }
+}

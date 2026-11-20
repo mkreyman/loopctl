@@ -1,0 +1,8 @@
+/_build/
+/deps/
+/cover/
+# ExUnit tmp_dir output.
+/tmp/
+erl_crash.dump
+# A run's stage log; CI uploads it as an artifact on failure (AC-52.9.7).
+/stage-log/

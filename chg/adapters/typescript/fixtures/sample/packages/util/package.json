@@ -1,0 +1,6 @@
+{
+  "name": "@s/util",
+  "private": true,
+  "type": "module",
+  "exports": { "./*": "./src/*.ts" }
+}

@@ -1,0 +1,74 @@
+# Adapter contract, version 1
+
+`chg` talks to a repo's build through `.chg/adapter.toml` (design §3.13). `chg --version` prints the contract version it implements; the manifest declares the version the adapter implements in `adapter.version`, and a mismatch is an error naming both.
+
+## Manifest
+
+| Key | Type | Rule |
+|---|---|---|
+| `adapter.kind` | string | `elixir`, `pnpm` or `generic` (a repo with no build, [adapters/generic](../adapters/generic/README.md)) |
+| `adapter.version` | string | must equal the contract version |
+| `adapter.artifacts` | non-empty list; for `generic`, optional and may be empty | repo-relative paths/globs cloned from a snapshot into a workspace |
+| `adapter.inputs` | non-empty list | repo-relative globs hashed into a check's input fingerprint |
+| `adapter.always_all` | non-empty list | repo-relative globs; touching one selects the whole suite |
+| `adapter.read_at_runtime` | list, optional | repo-relative globs of files tests read at run time; touching one selects the tests a coverage record says read it, or the whole suite without one (`CHG_READ`) |
+| `adapter.not_read_by` | list of executable names, optional | commands (by basename, no `/`) that read no `read_at_runtime` path, so starting one is not taken as reading them (`CHG_NOT_READ_BY`) |
+| `adapter.isolation_env` | table of strings, optional | exported to every command; may use `{workspace_slot}` |
+| `commands.snapshot` | string | may use `{workspace_slot}` |
+| `commands.static` | string | must use `{base}` |
+| `commands.affected` | string | must use `{base}` |
+| `commands.run` | string | must use `{file}` |
+| `commands.shard` | string | must use `{n}` and `{i}` |
+
+Paths in `inputs`, `always_all` and `read_at_runtime` are globs anchored at the repo root: a `**` segment matches zero or more whole segments, and within a segment `*` matches any run of characters and `?` one character, neither crossing a `/`. So `mix.exs` is only the root file, `config/**` everything under `config/`, and `**/vitest*.config.ts` a Vitest config at any depth. `artifacts` name directories with the same syntax minus `**`, and there a `*` skips names starting with `.`.
+
+Unknown keys, unknown placeholders, a missing or empty command, an empty list, and a path that is absolute or contains `..` are all errors. `chg adapter validate` reports every problem in one pass (exit 0 valid, 1 invalid).
+
+A placeholder is `{` + lowercase letters or underscores + `}`. Anything else in braces is literal shell text: `${HOME}` (a `$` before the brace) and `awk '{print $1}'` pass through, and `{{` writes a literal `{`. Substitution is one pass over the template, so a value is never re-scanned.
+
+Commands run under `sh -c` from the repo root with stdin closed. Substituted values are shell-quoted. `chg` resolves the repo path canonically before use. `{workspace_slot}` is a stable id derived from the workspace path, so two workspaces on one machine never share a test database.
+
+`snapshot` runs in a plain tree with no `.git`, so `chg` exports `CHG_SHA`, the commit that tree holds. An adapter that keys its work on the commit reads `CHG_SHA` and asks git only when it is unset (`chg adapter exec snapshot` in a checkout). `chg` removes an inherited `CHG_SHA`, `CHG_COVER`, `CHG_READ`, `CHG_NOT_READ_BY`, `CHG_RECORD` or `CHG_SHARD_BY` before every command, so each one is set only where this contract says.
+
+## Output
+
+Each command prints one JSON document as the **last non-empty line of stdout**. Earlier stdout lines (`mix` prints `Compiling …` there) are passed through to stderr. Every schema rejects unknown fields.
+
+| Command | Document |
+|---|---|
+| `snapshot` | `{"work":"none"\|"incremental"\|"full","ms":N}` |
+| `static` | `{"ok":bool,"failures":[{"check":S,"file":S?,"line":N?,"message":S}]}`; `ok` must agree with `failures` |
+| `affected` | `{"mode":"subset","reason":S,"tests":[repo-relative path],"read":bool?}` or `{"mode":"all","reason":S}`; `read` (default false) says a subset accounts for `CHG_READ` |
+| `run`, `shard` | `{"results":[{"id":S,"status":"pass"\|"fail"\|"skip"\|"error","ms":N}],"junit":S?}`; `run` must report at least one result, a `shard` may be empty |
+
+Shards are 1-based: `chg adapter exec shard --n N --i I` requires `1 <= I <= N`.
+
+## Coverage records (optional)
+
+An adapter may keep a coverage record per verified commit, for selection by coverage and time-balanced shards. The format is the adapter's own; `chg` only stores, moves and picks the files. Five environment variables carry it:
+
+| Variable | Set on | Meaning |
+|---|---|---|
+| `CHG_COVER` | `affected`, when a usable record exists | the record to judge the change by: the nearest on the base's first-parent line within `CHG_COVER_MAX_AGE` (default 100) commits, with no `always_all` path changed since it. Without it, select from the base |
+| `CHG_RECORD` | the verifier's whole-suite `shard 1/1` | the file to write this commit's record to; write nothing when the tree is not exactly the commit |
+| `CHG_SHARD_BY` | `shard`, on `chg adapter exec shard --balance-by <rev>` | the record whose test times the shard splits by |
+| `CHG_READ` | `affected`, when a changed path matches `read_at_runtime` | those paths, one per line, sorted: changed since the base, and since the record when `CHG_COVER` is set. The adapter selects every test its record says read one (or listed a directory above one, or started a subprocess), and the whole suite when it has no record that says, or does not record reads |
+| `CHG_NOT_READ_BY` | `affected`, with `CHG_READ`, when the manifest has `not_read_by` | those executable names, one per line: a subprocess of one of them does not count as reading a path in `CHG_READ` |
+
+An adapter that ignores all five is still a valid v1 adapter. A subset it returns while `CHG_READ` is set must say it accounted for those paths, with `"read":true`; without it, `chg` turns the subset into `{"mode":"all","reason":"failed closed: …"}`, so an adapter that predates `read_at_runtime` cannot leave out the tests that read a changed path. Writing the record must never change the run's verdict: a failure to record goes to stderr only.
+
+## `chg adapter exec <command>` exit codes
+
+- 0: a valid document reporting success.
+- 1: a valid document reporting failure (`static.ok` false, or a `fail`/`error` result), from an adapter that exited non-zero.
+- 2: the adapter broke the contract: no document, a malformed one, a timeout, or an exit status that disagrees with the document (non-zero with success, zero with failure).
+
+`{file}` (for `run`) is the path of a file listing the tests to run, one repo-relative `path` or `path:line` per line: the list `affected` returned.
+
+A result `id` starts with the test's repo-relative file. What follows is nothing (the whole file, e.g. one that failed to load), `:<line>`, or ` > <name>`. `chg culprit` turns an id back into a `run` entry by dropping any ` > <name>`, and matches the results it gets by id.
+
+Before running `affected`, `chg` compares the changed paths against `always_all` and, on a hit, prints `{"mode":"all","reason":"<path> matches always_all `<glob>`"}` without calling the adapter. The changed paths are those differing between `--base` and the working tree, tracked or untracked, with renames split into the deleted and the added path (`git diff --no-renames --name-only <base>` plus `git ls-files --others --exclude-standard`). An adapter selects within the same set and does not apply `always_all` itself. A `--base` that is not a commit fails closed.
+
+`affected` never exits 2. Any of those failures **fails closed**: it prints `{"mode":"all","reason":"failed closed: …"}` and the reason on stderr, and exits 0, so the caller runs the whole suite.
+
+Wall-clock caps (override with `--timeout-secs` on `chg adapter exec` and `chg snapshot build`, and `--snapshot-timeout-secs` on `chg culprit`): snapshot 30 min, static 15, affected 5, run 15, shard 20. Stdout is relayed to stderr as it arrives (minus the newest line, held back as the candidate document), so a hung command still shows how far it got. When the command exits or times out, `chg` kills its whole process group, so no helper it started outlives it.

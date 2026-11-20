@@ -1,0 +1,45 @@
+name: cargo cache restore
+description: >
+  Restores a job's Cargo registry and the target dir of the Cargo workspace in `dir`. Never
+  saves: master saves through cargo-cache-save, a separate bounded step.
+inputs:
+  key:
+    description: What separates this job's cache from the others' (runner environment, matrix leg).
+    required: true
+  dir:
+    description: The Cargo workspace, relative to the repository root.
+    default: chg
+outputs:
+  base:
+    description: The base key, the toolchain and Cargo.lock this cache was built for.
+    value: ${{ steps.base.outputs.base }}
+  matched:
+    description: The key restored from, empty when nothing was.
+    value: ${{ steps.restore.outputs.cache-matched-key }}
+runs:
+  using: composite
+  steps:
+    # Every save is keyed <base>-<run id>-<attempt>, unique, so nothing restores by exact
+    # key: a run takes the newest entry under a prefix. Master takes only its own base
+    # key's entries, so what it saves holds the current dependencies and nothing older; a
+    # PR may fall back to any base (an older lockfile or toolchain still saves compiles).
+    - id: base
+      shell: bash
+      run: |
+        echo "base=cargo-${{ runner.os }}-${{ inputs.key }}-${{ hashFiles(format('{0}/.tool-versions', inputs.dir), format('{0}/Cargo.lock', inputs.dir)) }}" >> "$GITHUB_OUTPUT"
+        echo "any=cargo-${{ runner.os }}-${{ inputs.key }}-" >> "$GITHUB_OUTPUT"
+    # Paths are relative to the workspace and CARGO_HOME lives inside it
+    # (chg/scripts/ci-rust-toolchain.sh): actions/cache versions an entry by its path strings,
+    # so an absolute, per-slot path would miss on every other slot.
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          .ci-cargo-home/registry/index
+          .ci-cargo-home/registry/cache
+          .ci-cargo-home/git/db
+          ${{ inputs.dir }}/target
+        key: ${{ steps.base.outputs.base }}-
+        restore-keys: |
+          ${{ steps.base.outputs.base }}-
+          ${{ github.ref != 'refs/heads/master' && steps.base.outputs.any || steps.base.outputs.base }}

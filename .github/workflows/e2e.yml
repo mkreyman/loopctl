@@ -1,0 +1,142 @@
+name: E2E
+
+# US-52.9. Two jobs with two triggers:
+#   check  the e2e/ area check (AC-52.9.8): compile, format, credo and the harness's unit
+#          tests, on every push that touches e2e/ (US-52.6's changed-areas.sh area e2e), and
+#          on the nightly and manual runs, which count as every area.
+#   live   one issue through the real factory on the sandbox (AC-52.9.7), nightly at 07:00
+#          UTC (after ci.yml's 02:00 run) and on workflow_dispatch, one at a time.
+#
+# Push of every branch, and no pull_request: the merge gate trusts only push runs of a
+# story's branch at its head, and a same-repo pull request's checks are the push run's check
+# runs on its head sha (ci.yml says more).
+on:
+  push:
+    branches: ["**"]
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: changes
+    runs-on: [self-hosted, fleet-ci]
+    outputs:
+      e2e: ${{ steps.areas.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - id: areas
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: .github/scripts/areas-output.sh
+
+  check:
+    name: e2e
+    needs: [changes]
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 20
+    env:
+      MIX_ENV: test
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix credo --strict --config-file .credo.exs
+      - run: mix test --exclude live
+
+  live:
+    name: e2e live
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, fleet-ci]
+    # Inside the harness's own 120-minute run budget, plus setup.
+    timeout-minutes: 140
+    # One at a time and never cancelled: a re-run takes a new run_id, so two runs never
+    # share an issue (US-52.9 failure_modes.retry).
+    concurrency:
+      group: e2e
+      cancel-in-progress: false
+    env:
+      MIX_ENV: test
+      LOOPCTL_E2E_ORCH_KEY: ${{ secrets.LOOPCTL_E2E_ORCH_KEY }}
+      E2E_GITHUB_TOKEN: ${{ secrets.E2E_GITHUB_TOKEN }}
+      # The sandbox's :work project (an id, not a secret); without it the run refuses to start.
+      LOOPCTL_E2E_PROJECT_ID: ${{ vars.LOOPCTL_E2E_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - name: mix e2e
+        run: |
+          (cd e2e && mix deps.get)
+          mix e2e
+      - name: Upload the stage log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-stage-log
+          path: e2e/stage-log/
+          if-no-files-found: warn
+
+  # THE AREA GATE, the one check the merge gate's independent_checks names for this repository:
+  # the same job, under the same name, ends ci.yml, runner-ci.yml, chg-ci.yml and e2e.yml. It
+  # needs every job a push can run (live is nightly and manual only), and passes only when
+  # changes succeeded and every other need succeeded or was skipped by area; a failed or
+  # cancelled need fails it. always(), so a need that failed or was skipped never skips the
+  # gate itself. Hosted and checkout-free: it reads only the needs' results.
+  area-gate:
+    name: area gate
+    needs: [changes, check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded or was skipped by area
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$(jq -r '.changes.result' <<<"$NEEDS")" != success ]; then
+            echo "::error::changes did not succeed, so no area was judged"
+            exit 1
+          fi
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi

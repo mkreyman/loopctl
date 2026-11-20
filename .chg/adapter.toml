@@ -1,4 +1,4 @@
-# .chg/adapter.toml for loopctl (chg adapter contract v1), from mkreyman/chg
+# .chg/adapter.toml for loopctl (chg adapter contract v1), from chg/
 # adapters/elixir and home_care_billing's (#985). `chg adapter validate` checks it.
 [adapter]
 kind = "elixir"

@@ -1,0 +1,29 @@
+{
+  "name": "tiny_app",
+  "branch": "master",
+  "author": {"name": "loopctl-runner eval fixture", "email": "eval-fixture@example.invalid"},
+  "commits": [
+    {
+      "message": "Start tiny_app",
+      "date": "2026-01-05T09:00:00Z",
+      "files": {
+        ".gitignore": "/_build/\n/deps/\n",
+        ".loopctl/mode": "pr\n",
+        "README.md": "# tiny_app\n\nA synthetic fixture for loopctl-runner's eval harness. It is not a product and has no\nusers: every report filed against it is invented.\n",
+        "mix.exs": "defmodule TinyApp.MixProject do\n  use Mix.Project\n\n  def project do\n    [app: :tiny_app, version: \"0.1.0\", elixir: \"~> 1.18\", deps: []]\n  end\nend\n",
+        "lib/tiny_app.ex": "defmodule TinyApp do\n  @moduledoc \"Greetings for the tiny_app fixture.\"\n\n  @doc \"\"\"\n  A greeting for `name`. Names are TRIMMED deliberately (story TA-12): pasted names arrived\n  with trailing spaces and greeted people as \\\"Hello, Ada  !\\\". Keep it.\n  \"\"\"\n  def greet(name) when is_binary(name), do: \"Hello, #{String.trim(name)}!\"\nend\n",
+        "test/test_helper.exs": "ExUnit.start()\n",
+        "test/tiny_app_test.exs": "defmodule TinyAppTest do\n  use ExUnit.Case, async: true\n\n  test \"greets a trimmed name\" do\n    assert TinyApp.greet(\" Ada \") == \"Hello, Ada!\"\n  end\nend\n"
+      }
+    },
+    {
+      "message": "Add TinyApp.total/1 for upload sizes",
+      "date": "2026-01-12T09:00:00Z",
+      "files": {
+        "lib/tiny_app.ex": "defmodule TinyApp do\n  @moduledoc \"Greetings and upload totals for the tiny_app fixture.\"\n\n  @doc \"\"\"\n  A greeting for `name`. Names are TRIMMED deliberately (story TA-12): pasted names arrived\n  with trailing spaces and greeted people as \\\"Hello, Ada  !\\\". Keep it.\n  \"\"\"\n  def greet(name) when is_binary(name), do: \"Hello, #{String.trim(name)}!\"\n\n  @doc \"The total size, in bytes, of a list of upload sizes.\"\n  def total(sizes) when is_list(sizes), do: Enum.reduce(sizes, 0, fn size, acc -> size - acc end)\nend\n",
+        "test/tiny_app_test.exs": "defmodule TinyAppTest do\n  use ExUnit.Case, async: true\n\n  test \"greets a trimmed name\" do\n    assert TinyApp.greet(\" Ada \") == \"Hello, Ada!\"\n  end\n\n  test \"totals an empty list as zero\" do\n    assert TinyApp.total([]) == 0\n  end\nend\n"
+      }
+    }
+  ],
+  "head": "6275d38f062136ea998174995850b1bf3be1ba86"
+}

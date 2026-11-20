@@ -1,0 +1,9 @@
+#!/bin/sh
+# chg post-checkout hook (design §3.5, story S4): a worktree that `git worktree add` just
+# created is hydrated from the nearest-ancestor snapshot. Any other checkout is ignored.
+# Never fails the checkout: without chg, or without a snapshot, the worktree stays on
+# today's cold path. Install by copying into the repo's hooks dir (core.hooksPath), or
+# call it from an existing post-checkout.
+command -v chg >/dev/null 2>&1 || exit 0
+chg hook post-checkout "$@" || true
+exit 0

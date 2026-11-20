@@ -21,7 +21,8 @@ defmodule Loopctl.DeliveryGates.TriggerDriftTest do
   defp triggers(effect, human) do
     %RepoTriggers{
       effect_paths: globs(effect),
-      human_paths: globs(human),
+      independent_paths: globs(human),
+      independent_checks: ["e2e"],
       max_files: 12,
       max_changed_lines: 1000
     }
@@ -101,7 +102,7 @@ defmodule Loopctl.DeliveryGates.TriggerDriftTest do
                 [
                   %{kind: :effect, index: 0, pattern: "priv/rates/**", matches: 2},
                   %{kind: :effect, index: 1, pattern: "lib/app/gone/**", matches: 0},
-                  %{kind: :human, index: 0, pattern: "lib/app_web/router.ex", matches: 1}
+                  %{kind: :independent, index: 0, pattern: "lib/app_web/router.ex", matches: 1}
                 ]}
     end
   end
@@ -109,11 +110,12 @@ defmodule Loopctl.DeliveryGates.TriggerDriftTest do
   describe "the gate and the checker are one implementation" do
     test "Gate B's stale-trigger reasons are exactly the checker's unmatched patterns" do
       config = %{
-        "version" => 1,
+        "version" => 2,
         "repos" => %{
           "acme/app" => %{
             "effect_paths" => ["priv/rates/**", "lib/app/gone/**"],
-            "human_paths" => ["lib/app_web/router.ex"],
+            "independent_paths" => ["lib/app_web/router.ex"],
+            "independent_checks" => ["e2e"],
             "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
           }
         }
@@ -151,11 +153,12 @@ defmodule Loopctl.DeliveryGates.TriggerDriftTest do
 
     test "Gate B still escalates on an unreadable file list rather than clearing" do
       config = %{
-        "version" => 1,
+        "version" => 2,
         "repos" => %{
           "acme/app" => %{
             "effect_paths" => ["priv/rates/**"],
-            "human_paths" => ["lib/app_web/router.ex"],
+            "independent_paths" => ["lib/app_web/router.ex"],
+            "independent_checks" => ["e2e"],
             "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
           }
         }

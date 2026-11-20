@@ -145,14 +145,15 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
         result(
           outcome: :human,
           reasons: [
-            {:human_path, "a.ex", "p"},
-            {:human_path, "b.ex", "p"},
+            {:independent_path, "a.ex", "p"},
+            {:independent_path, "b.ex", "p"},
             {:max_files_exceeded, 13, 12}
           ]
         )
       ]
 
-      assert %{human_path: 1, max_files_exceeded: 1} = Report.gate_b(results, %{}).reason_kinds
+      assert %{independent_path: 1, max_files_exceeded: 1} =
+               Report.gate_b(results, %{}).reason_kinds
     end
 
     test "reason kinds are also cross-tabulated BY OUTCOME" do
@@ -163,14 +164,14 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
         result(outcome: :prove_effect, reasons: [{:max_files_exceeded, 40, 12}]),
         result(outcome: :prove_effect, reasons: []),
         result(outcome: :size_bound, reasons: [{:max_changed_lines_exceeded, 2000, 1000}]),
-        result(outcome: :human, reasons: [{:human_path, "a.ex", "p"}])
+        result(outcome: :human, reasons: [{:independent_path, "a.ex", "p"}])
       ]
 
       by_outcome = Report.gate_b(results, %{}).reason_kinds_by_outcome
 
       assert by_outcome[:prove_effect] == %{max_files_exceeded: 1}
       assert by_outcome[:size_bound] == %{max_changed_lines_exceeded: 1}
-      assert by_outcome[:human] == %{human_path: 1}
+      assert by_outcome[:human] == %{independent_path: 1}
     end
 
     test "size_bounded_by_outcome is the UNION the per-kind cross-tab cannot give" do
@@ -184,7 +185,7 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
         ),
         result(outcome: :prove_effect, reasons: [{:max_files_exceeded, 40, 12}]),
         result(outcome: :prove_effect, reasons: []),
-        result(outcome: :human, reasons: [{:human_path, "a.ex", "p"}])
+        result(outcome: :human, reasons: [{:independent_path, "a.ex", "p"}])
       ]
 
       report = Report.gate_b(results, %{})
@@ -203,7 +204,7 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
           outcome: :clear,
           oracle: effect_bearing(),
           subject: "Stop offering a resubmission (#1411)",
-          reasons: [{:human_path, "lib/secret/guarded.ex", "lib/secret/**"}]
+          reasons: [{:independent_path, "lib/secret/guarded.ex", "lib/secret/**"}]
         )
       ]
 
@@ -336,7 +337,7 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       meta = %{
         gate: "B",
         limit: 40,
-        trigger_shape: %{effect_patterns: 7, human_patterns: 3},
+        trigger_shape: %{effect_patterns: 7, independent_patterns: 3},
         trigger_status: %{status: "parsed"}
       }
 
@@ -344,7 +345,7 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
 
       assert published.gate == "B"
       assert published.limit == 40
-      assert published.trigger_shape == %{effect_patterns: 7, human_patterns: 3}
+      assert published.trigger_shape == %{effect_patterns: 7, independent_patterns: 3}
       assert published.trigger_status == %{status: "parsed"}
     end
 
@@ -593,12 +594,15 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
 
     test "the summary's inspected maps are sorted too — the .md is a compared artifact" do
       results = [
-        result(outcome: :human, reasons: [{:stale_trigger, "p"}, {:human_path, "a.ex", "p"}])
+        result(
+          outcome: :human,
+          reasons: [{:stale_trigger, "p"}, {:independent_path, "a.ex", "p"}]
+        )
       ]
 
       summary = Report.summarize(Report.gate_b(results, %{}))
 
-      assert summary =~ "reason kinds: [human_path: 1, stale_trigger: 1]"
+      assert summary =~ "reason kinds: [independent_path: 1, stale_trigger: 1]"
     end
   end
 

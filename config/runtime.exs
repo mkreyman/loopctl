@@ -161,7 +161,7 @@ end
 # US-51.1: the chg feedback loop. CHG_FINDINGS_DAILY_CAP caps new loop issues per repository
 # per UTC day (positive integer; anything else leaves the default of 5 in
 # Loopctl.Changes.Findings.daily_cap/1). CHG_FINDINGS_REPO is the `owner/name` chg's own
-# selection misses are filed on (default mkreyman/chg).
+# selection misses are filed on (default mkreyman/loopctl, where chg lives under chg/).
 case System.get_env("CHG_FINDINGS_DAILY_CAP") &&
        Integer.parse(System.get_env("CHG_FINDINGS_DAILY_CAP")) do
   {cap, ""} when cap > 0 -> config :loopctl, :chg_findings_daily_cap, cap

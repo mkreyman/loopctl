@@ -846,7 +846,6 @@ defmodule Loopctl.Delivery.TriageVerdictSpecTest do
 
   defp old_screen_code({:gate_a, reason}), do: "gate_a:" <> old_kind(reason)
   defp old_screen_code({:trio_verdict, verdict}), do: "trio_verdict:#{verdict}"
-  defp old_screen_code({:human_path, _file, pattern}), do: "human_path:" <> pattern
   defp old_screen_code({:effect_path, _file, pattern}), do: "effect_path:" <> pattern
 
   defp old_screen_code({:repository_unresolved, reason}),

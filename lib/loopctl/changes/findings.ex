@@ -85,7 +85,7 @@ defmodule Loopctl.Changes.Findings do
   @silent_active_days 3
   @label "chg-loop"
   @escalated_label "chg-loop-escalated"
-  @default_chg_repo "mkreyman/chg"
+  @default_chg_repo "mkreyman/loopctl"
 
   # Bounds on what a ledger row may contribute to a finding's evidence: the row's scalar
   # fields only, a bounded number of them, each bounded. The ledger accepts a row of up to

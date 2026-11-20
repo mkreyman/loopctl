@@ -3,9 +3,15 @@ name: MCP Server CI
 # The main ci.yml is Elixir-only and never touches mcp-server/, so the npm
 # package's own test suite was never run in CI — and the auto-publish workflow
 # ships it to npm on a version bump WITHOUT testing. This workflow closes that
-# gap: it runs the deterministic node --test unit suite on every push/PR that
+# gap: it runs the deterministic node --test unit suite on every push that
 # touches mcp-server/**, so a red suite is caught before merge (and, via the
 # publish gates in mcp-autopublish.yml / npm-publish.yml, before an npm release).
+#
+# PUSH ONLY, on every branch, like ci.yml, runner-ci.yml, chg-ci.yml and e2e.yml: the merge
+# gate trusts only push runs of a story's branch at its head, and a same-repo pull request's
+# required checks are met by the push run on its head sha. A non-master push is judged on the
+# whole branch, from its merge base with origin/master, so a cancelled earlier push leaves
+# nothing unchecked. The workflow ends in the shared `area gate` job.
 #
 # WHY THE TRIGGER HAS NO paths: FILTER ANY MORE (and the per-job filter instead).
 # "Node unit tests" was never a REQUIRED status check, so a red suite showed up
@@ -13,16 +19,14 @@ name: MCP Server CI
 # it. It could not simply be added to the required contexts either: a path-filtered
 # workflow never reports at all on a PR that misses the filter, so every unrelated
 # PR would sit on "Expected — waiting for status" forever. The fix is the standard
-# one: fire the workflow on EVERY PR, decide inside it whether the suite needs to
+# one: fire the workflow on EVERY push, decide inside it whether the suite needs to
 # run, and expose a single always-reporting job ("MCP Server Gate") as the required
 # context. That job is the one to add to branch protection — NOT "Node unit tests",
 # which stays path-conditional and therefore still skippable.
 
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    branches: ["**"]
 
 jobs:
   # Cheap path probe. `test` keys off this instead of a workflow-level paths:
@@ -32,15 +36,34 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       mcp: ${{ steps.filter.outputs.mcp }}
+      base: ${{ steps.filter.outputs.base }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            mcp:
-              - 'mcp-server/**'
-              - '.github/workflows/mcp-server-ci.yml'
+          fetch-depth: 0
+      # master is judged from its before-sha; any other branch from its merge base with
+      # origin/master. A base that cannot be read counts as a change, so nothing is skipped
+      # blind.
+      - id: filter
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [ "$GITHUB_REF" = refs/heads/master ]; then
+            base=${EVENT_BEFORE:-$zero}
+          else
+            base=$(git merge-base origin/master "$GITHUB_SHA" 2>/dev/null) || base=$zero
+          fi
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          if [ "$base" = "$zero" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            mcp=true
+          elif git diff --name-only "$base" "$GITHUB_SHA" -- mcp-server .github/workflows/mcp-server-ci.yml | grep -q .; then
+            mcp=true
+          else
+            mcp=false
+          fi
+          echo "base=$base mcp=$mcp"
+          echo "mcp=$mcp" >>"$GITHUB_OUTPUT"
 
   # A published-file change with no version bump never reaches npm. mcp-autopublish.yml
   # fires on `mcp-server/package.json` changing, so editing index.js alone is silently a
@@ -60,17 +83,21 @@ jobs:
   version-bump:
     name: Published files require a version bump
     needs: changes
-    if: needs.changes.outputs.mcp == 'true' && github.event_name == 'pull_request'
+    # A branch is compared with its merge base, so the whole branch must carry the bump. A
+    # master push is skipped: what reaches master was already judged on its branch.
+    if: needs.changes.outputs.mcp == 'true' && github.ref != 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # The merge commit and its parents: HEAD^1 is master as GitHub merged it, the
-          # base the script compares against.
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Fail if a shipped file changed without a version bump
-        run: node mcp-server/scripts/check-version-bump.mjs
+        env:
+          BASE: ${{ needs.changes.outputs.base }}
+        run: |
+          if [ "$BASE" = 0000000000000000000000000000000000000000 ]; then BASE=origin/master; fi
+          node mcp-server/scripts/check-version-bump.mjs "$BASE" HEAD
 
   test:
     name: Node unit tests
@@ -129,13 +156,40 @@ jobs:
           fi
           case "$suite" in
             success) echo "mcp-server unit suite green." ;;
-            skipped) echo "No mcp-server change in this PR — nothing to test." ;;
+            skipped) echo "No mcp-server change on this branch — nothing to test." ;;
             *)       echo "mcp-server unit suite is $suite."; exit 1 ;;
           esac
-          # `skipped` is legitimate here and only here: the guard is PR-only (it needs a base
-          # SHA to diff against), so a push to master skips it by design.
+          # `skipped` is legitimate here and only here: the guard judges a branch against
+          # its merge base, so a push to master skips it by design.
           case "$bump" in
             success) echo "version-bump guard green." ;;
-            skipped) echo "version-bump guard not applicable (push, or no mcp-server change)." ;;
+            skipped) echo "version-bump guard not applicable (master push, or no mcp-server change)." ;;
             *)       echo "version-bump guard is $bump."; exit 1 ;;
           esac
+
+  # THE AREA GATE, the one check the merge gate's independent_checks names for this repository:
+  # the same job, under the same name, ends ci.yml, runner-ci.yml, chg-ci.yml, e2e.yml and this
+  # file. It needs every job a push can run, and passes only when changes succeeded and every
+  # other need succeeded or was skipped by area. MCP Server Gate stays as master's required
+  # context.
+  area-gate:
+    name: area gate
+    needs: [changes, mcp-gate, test, version-bump]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded or was skipped by area
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$(jq -r '.changes.result' <<<"$NEEDS")" != success ]; then
+            echo "::error::changes did not succeed, so no area was judged"
+            exit 1
+          fi
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi

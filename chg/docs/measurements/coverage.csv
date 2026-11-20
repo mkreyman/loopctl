@@ -1,0 +1,201 @@
+sha,mode,why,altered,selected,total,frac_ms,est_s,est_4shard_s,est_8shard_s
+3b2fcddf61,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+6c836aa2b7,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+c98e11dfd1,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+19b2fb6e98,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+7101445e85,subset,"coverage of d661ead83a8c (0 commit(s) behind): 217 altered module(s), 1617 of 1619 test file(s)",217,1617,1619,1.0,1959.9,490.0,245.0
+d661ead83a,subset,"coverage of a4f1d10df171 (0 commit(s) behind): 274 altered module(s), 1617 of 1619 test file(s)",274,1617,1619,1.0,1959.9,490.0,245.0
+a4f1d10df1,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+3090f6832d,subset,"coverage of 9038f13e92bf (0 commit(s) behind): 291 altered module(s), 1617 of 1619 test file(s)",291,1617,1619,1.0,1959.9,490.0,245.0
+9038f13e92,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+47753b1287,subset,"coverage of d48c6760ad6e (0 commit(s) behind): 255 altered module(s), 1619 of 1619 test file(s)",255,1619,1619,1.0,1959.9,490.0,245.0
+d48c6760ad,subset,"coverage of a5cbe6d5f250 (0 commit(s) behind): 279 altered module(s), 1617 of 1619 test file(s)",279,1617,1619,1.0,1959.9,490.0,245.0
+a5cbe6d5f2,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+5dcc9e0698,subset,"coverage of 3cf9f113a0cb (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+3cf9f113a0,subset,"coverage of 0843fb228b38 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+0843fb228b,subset,"coverage of 8d2361f600b8 (0 commit(s) behind): 238 altered module(s), 1617 of 1619 test file(s)",238,1617,1619,1.0,1959.9,490.0,245.0
+8d2361f600,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+64df4415a3,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+aeba23f904,subset,"coverage of 3fe30ed811a7 (0 commit(s) behind): 279 altered module(s), 1618 of 1619 test file(s)",279,1618,1619,1.0,1959.9,490.0,245.0
+3fe30ed811,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+f9d5a3c605,subset,"coverage of 09d35b2ac242 (0 commit(s) behind): 288 altered module(s), 1618 of 1619 test file(s)",288,1618,1619,1.0,1959.9,490.0,245.0
+09d35b2ac2,subset,"coverage of fc0d4ace4a5c (0 commit(s) behind): 366 altered module(s), 1617 of 1619 test file(s)",366,1617,1619,1.0,1959.9,490.0,245.0
+fc0d4ace4a,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+dac9beee15,subset,"coverage of 1471560c003a (0 commit(s) behind): 265 altered module(s), 1618 of 1619 test file(s)",265,1618,1619,1.0,1959.9,490.0,245.0
+1471560c00,subset,"coverage of ce72e5950810 (0 commit(s) behind): 265 altered module(s), 1618 of 1619 test file(s)",265,1618,1619,1.0,1959.9,490.0,245.0
+ce72e59508,subset,"coverage of 9d07c313ba6d (0 commit(s) behind): 238 altered module(s), 1618 of 1619 test file(s)",238,1618,1619,1.0,1959.9,490.0,245.0
+9d07c313ba,subset,"coverage of 36f8915dfd33 (0 commit(s) behind): 271 altered module(s), 1617 of 1619 test file(s)",271,1617,1619,1.0,1959.9,490.0,245.0
+36f8915dfd,subset,"coverage of a671307d0d47 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+a671307d0d,subset,"coverage of 616d845394e2 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+616d845394,subset,"coverage of ccff6922d130 (0 commit(s) behind): 257 altered module(s), 1618 of 1619 test file(s)",257,1618,1619,1.0,1959.9,490.0,245.0
+ccff6922d1,all,"always_all: mix.exs",,1619,1619,1.0,1959.9,490.0,245.0
+15538753ff,all,"always_all: .tool-versions",,1619,1619,1.0,1959.9,490.0,245.0
+5a00496cb1,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+83390c09f1,subset,"coverage of 3d995380c88e (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+3d995380c8,subset,"coverage of cf64677ad370 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+cf64677ad3,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+ea15301d03,subset,"coverage of 73fbe8136140 (0 commit(s) behind): 253 altered module(s), 1617 of 1619 test file(s)",253,1617,1619,1.0,1959.9,490.0,245.0
+73fbe81361,subset,"coverage of 969d9047f7a1 (0 commit(s) behind): 275 altered module(s), 1619 of 1619 test file(s)",275,1619,1619,1.0,1959.9,490.0,245.0
+969d9047f7,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+fbe928facd,subset,"coverage of 90f97243b549 (0 commit(s) behind): 293 altered module(s), 1617 of 1619 test file(s)",293,1617,1619,1.0,1959.9,490.0,245.0
+90f97243b5,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+c4611c82cf,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+755717863b,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+b8bebf2465,subset,"coverage of cae8fae2348b (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+cae8fae234,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+7d17265da7,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+4566e34f12,subset,"coverage of 48482a770350 (0 commit(s) behind): 256 altered module(s), 1617 of 1619 test file(s)",256,1617,1619,1.0,1959.9,490.0,245.0
+48482a7703,subset,"coverage of bfd5a0a2e24f (0 commit(s) behind): 256 altered module(s), 1617 of 1619 test file(s)",256,1617,1619,1.0,1959.9,490.0,245.0
+bfd5a0a2e2,subset,"coverage of 739ef7299b93 (0 commit(s) behind): 291 altered module(s), 1619 of 1619 test file(s)",291,1619,1619,1.0,1959.9,490.0,245.0
+739ef7299b,subset,"coverage of b4ad105fa585 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+b4ad105fa5,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+c866dff1ce,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+b161f00d76,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+efcab89106,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+9e99f5dd31,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+c888d4708b,subset,"coverage of f370d92da080 (0 commit(s) behind): 244 altered module(s), 1617 of 1619 test file(s)",244,1617,1619,1.0,1959.9,490.0,245.0
+f370d92da0,all,"selector: Mix.Tasks.Hcb.SetupTestDb changed, and it ran outside any one test file (the record's global)",,1619,1619,1.0,1959.9,490.0,245.0
+a524fa0bda,all,"always_all: mix.exs",,1619,1619,1.0,1959.9,490.0,245.0
+0dee4587f5,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+9cc2800bba,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+a79990e2a6,subset,"coverage of 21c45c7e7ef1 (0 commit(s) behind): 0 altered module(s), 3 of 1619 test file(s)",0,3,1619,0.0098,19.3,13.1,13.1
+21c45c7e7e,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+2c01214019,subset,"coverage of 1fc99cd233e7 (0 commit(s) behind): 256 altered module(s), 1617 of 1619 test file(s)",256,1617,1619,1.0,1959.9,490.0,245.0
+1fc99cd233,subset,"coverage of 3b3804220858 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+3b38042208,subset,"coverage of 1401e82ca908 (0 commit(s) behind): 282 altered module(s), 1617 of 1619 test file(s)",282,1617,1619,1.0,1959.9,490.0,245.0
+1401e82ca9,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+89a5869717,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+9f6d0969aa,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+4db8d15293,subset,"coverage of dbe20c6e516b (0 commit(s) behind): 247 altered module(s), 1617 of 1619 test file(s)",247,1617,1619,1.0,1959.9,490.0,245.0
+dbe20c6e51,subset,"coverage of 12b92f5c7f7a (0 commit(s) behind): 0 altered module(s), 3 of 1619 test file(s)",0,3,1619,0.0016,3.1,2.8,2.8
+12b92f5c7f,subset,"coverage of d145caf90981 (0 commit(s) behind): 282 altered module(s), 1617 of 1619 test file(s)",282,1617,1619,1.0,1959.9,490.0,245.0
+2ad8ae29d2,subset,"coverage of 5860ee84e612 (0 commit(s) behind): 1 altered module(s), 32 of 1619 test file(s)",1,32,1619,0.1416,277.5,77.9,77.9
+5860ee84e6,subset,"coverage of f5a51213aaa5 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+f5a51213aa,subset,"coverage of dd4170360754 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+dd41703607,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+1cd0d355d8,subset,"coverage of 3ca3399187bb (0 commit(s) behind): 283 altered module(s), 1618 of 1619 test file(s)",283,1618,1619,1.0,1959.9,490.0,245.0
+3ca3399187,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+30aa3a3229,subset,"coverage of e36e0e95e696 (0 commit(s) behind): 255 altered module(s), 1617 of 1619 test file(s)",255,1617,1619,1.0,1959.9,490.0,245.0
+e36e0e95e6,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.MeNotification",,1619,1619,1.0,1959.9,490.0,245.0
+3d74bb6f47,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.VisitWriteResult",,1619,1619,1.0,1959.9,490.0,245.0
+ec0ff20518,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.UnmatchedCall",,1619,1619,1.0,1959.9,490.0,245.0
+51e06ee05e,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.MeSignature",,1619,1619,1.0,1959.9,490.0,245.0
+812a18e63f,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.MeClockEvents",,1619,1619,1.0,1959.9,490.0,245.0
+9e386204c0,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.RefusedClock",,1619,1619,1.0,1959.9,490.0,245.0
+1b69dc0e2f,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+a0d3ffebb0,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+3409e14079,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+71821c7553,subset,"coverage of aa2d203bc096 (0 commit(s) behind): 209 altered module(s), 1617 of 1619 test file(s)",209,1617,1619,1.0,1959.9,490.0,245.0
+aa2d203bc0,subset,"coverage of 781ce464593c (0 commit(s) behind): 237 altered module(s), 1617 of 1619 test file(s)",237,1617,1619,1.0,1959.9,490.0,245.0
+781ce46459,subset,"coverage of 3a11553885ba (0 commit(s) behind): 225 altered module(s), 1617 of 1619 test file(s)",225,1617,1619,1.0,1959.9,490.0,245.0
+3a11553885,subset,"coverage of c040cd44490b (0 commit(s) behind): 206 altered module(s), 1617 of 1619 test file(s)",206,1617,1619,1.0,1959.9,490.0,245.0
+c040cd4449,subset,"coverage of b2ec25139387 (0 commit(s) behind): 235 altered module(s), 1619 of 1619 test file(s)",235,1619,1619,1.0,1959.9,490.0,245.0
+b2ec251393,subset,"coverage of d695e16a5def (0 commit(s) behind): 271 altered module(s), 1617 of 1619 test file(s)",271,1617,1619,1.0,1959.9,490.0,245.0
+d695e16a5d,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+d0ea6294c9,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+c0f5ab1af3,subset,"coverage of 222a2e82eefb (0 commit(s) behind): 241 altered module(s), 1617 of 1619 test file(s)",241,1617,1619,1.0,1959.9,490.0,245.0
+222a2e82ee,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+46bb011a9d,subset,"coverage of b7f8d1f8fea0 (0 commit(s) behind): 206 altered module(s), 1617 of 1619 test file(s)",206,1617,1619,1.0,1959.9,490.0,245.0
+b7f8d1f8fe,subset,"coverage of e6c048c0f2c6 (0 commit(s) behind): 230 altered module(s), 1617 of 1619 test file(s)",230,1617,1619,1.0,1959.9,490.0,245.0
+e6c048c0f2,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+5057bd7d31,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.VisitSandataException",,1619,1619,1.0,1959.9,490.0,245.0
+e9619c0682,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+5069efaa21,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+cec07208d2,subset,"coverage of ba583b9730c9 (0 commit(s) behind): 258 altered module(s), 1617 of 1619 test file(s)",258,1617,1619,1.0,1959.9,490.0,245.0
+ba583b9730,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+532d2d1f3b,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+07e596191a,subset,"coverage of b5e3c2fc05ad (0 commit(s) behind): 224 altered module(s), 1617 of 1619 test file(s)",224,1617,1619,1.0,1959.9,490.0,245.0
+b5e3c2fc05,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+d9e051dc15,all,"selector: test/fixtures/edi/005010X221A1/sample_835_multi_st.x12 is under the test paths and is not a test: test data changed",,1619,1619,1.0,1959.9,490.0,245.0
+4abe48199d,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+e125687f8f,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.CloseDocument",,1619,1619,1.0,1959.9,490.0,245.0
+744bb8c6ae,subset,"coverage of 43f4fb9ff301 (0 commit(s) behind): 241 altered module(s), 1617 of 1619 test file(s)",241,1617,1619,1.0,1959.9,490.0,245.0
+43f4fb9ff3,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+621a50384f,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.AssignmentSchedule",,1619,1619,1.0,1959.9,490.0,245.0
+285dc014bb,subset,"coverage of dc855f9f2380 (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+dc855f9f23,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+d4441db9bf,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.MeClockResult",,1619,1619,1.0,1959.9,490.0,245.0
+c20738ea74,subset,"coverage of aa4d7827bc8e (0 commit(s) behind): 207 altered module(s), 1617 of 1619 test file(s)",207,1617,1619,1.0,1959.9,490.0,245.0
+aa4d7827bc,subset,"coverage of 571ee938e86d (0 commit(s) behind): 0 altered module(s), 2 of 1619 test file(s)",0,2,1619,0.002,4.0,2.8,2.8
+571ee938e8,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.PlanOfCare",,1619,1619,1.0,1959.9,490.0,245.0
+08f48912a6,subset,"coverage of a210b93bd8bc (0 commit(s) behind): 245 altered module(s), 1617 of 1619 test file(s)",245,1617,1619,1.0,1959.9,490.0,245.0
+01ba1113f1,subset,"coverage of a9db3d1e58e3 (0 commit(s) behind): 215 altered module(s), 1617 of 1619 test file(s)",215,1617,1619,1.0,1959.9,490.0,245.0
+a9db3d1e58,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+79c96e248b,all,"selector: test/e2e/epic_64_playwright_scripts.md is under the test paths and is not a test: test data changed",,1619,1619,1.0,1959.9,490.0,245.0
+f063dad117,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.AgencyProfileUpdate",,1619,1619,1.0,1959.9,490.0,245.0
+0e9129cd1b,subset,"coverage of 4babacfb37f3 (0 commit(s) behind): 217 altered module(s), 1617 of 1619 test file(s)",217,1617,1619,1.0,1959.9,490.0,245.0
+4babacfb37,subset,"coverage of 5bfdf1c65c2a (0 commit(s) behind): 1 altered module(s), 31 of 1619 test file(s)",1,31,1619,0.1789,350.7,87.7,77.9
+5bfdf1c65c,subset,"coverage of 458b61dfe8ad (0 commit(s) behind): 211 altered module(s), 1617 of 1619 test file(s)",211,1617,1619,1.0,1959.9,490.0,245.0
+458b61dfe8,subset,"coverage of 8465731e0f0d (0 commit(s) behind): 240 altered module(s), 1617 of 1619 test file(s)",240,1617,1619,1.0,1959.9,490.0,245.0
+8465731e0f,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+cac6093626,subset,"coverage of 287c3dc7b8c8 (0 commit(s) behind): 2 altered module(s), 111 of 1619 test file(s)",2,111,1619,0.3263,639.5,159.9,80.0
+287c3dc7b8,subset,"coverage of fb00f10ccb60 (0 commit(s) behind): 217 altered module(s), 1618 of 1619 test file(s)",217,1618,1619,1.0,1959.9,490.0,245.0
+fb00f10ccb,subset,"coverage of 1cc331198567 (0 commit(s) behind): 210 altered module(s), 1617 of 1619 test file(s)",210,1617,1619,1.0,1959.9,490.0,245.0
+1cc3311985,subset,"coverage of b7cba6720c5c (0 commit(s) behind): 217 altered module(s), 1617 of 1619 test file(s)",217,1617,1619,1.0,1959.9,490.0,245.0
+b7cba6720c,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+2d189e034c,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+fe9083f1ff,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+78efe36b5e,subset,"coverage of ace7453b9753 (0 commit(s) behind): 202 altered module(s), 1617 of 1619 test file(s)",202,1617,1619,1.0,1959.9,490.0,245.0
+ace7453b97,subset,"coverage of 3dee5fd3b99d (0 commit(s) behind): 192 altered module(s), 1617 of 1619 test file(s)",192,1617,1619,1.0,1959.9,490.0,245.0
+3dee5fd3b9,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.MeVisitDetail",,1619,1619,1.0,1959.9,490.0,245.0
+0959b704f4,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+4ce898031e,subset,"coverage of a807655faf2d (0 commit(s) behind): 200 altered module(s), 1617 of 1619 test file(s)",200,1617,1619,1.0,1959.9,490.0,245.0
+a807655faf,all,"selector: new protocol implementation Jason.Encoder.HomeCareBillingWeb.Api.V1.Schemas.CaregiverSession",,1619,1619,1.0,1959.9,490.0,245.0
+0a929b02a2,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+1f0f0cfa3f,subset,"coverage of a3fb24dc03ec (0 commit(s) behind): 212 altered module(s), 1619 of 1619 test file(s)",212,1619,1619,1.0,1959.9,490.0,245.0
+a3fb24dc03,subset,"coverage of 1db5249b9cd9 (0 commit(s) behind): 211 altered module(s), 1617 of 1619 test file(s)",211,1617,1619,1.0,1959.9,490.0,245.0
+1db5249b9c,subset,"coverage of 0745ff1e5bd4 (0 commit(s) behind): 208 altered module(s), 1617 of 1619 test file(s)",208,1617,1619,1.0,1959.9,490.0,245.0
+0745ff1e5b,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+0f2597330e,subset,"coverage of a5048aa6b91f (0 commit(s) behind): 210 altered module(s), 1617 of 1619 test file(s)",210,1617,1619,1.0,1959.9,490.0,245.0
+a5048aa6b9,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+78db914cb0,subset,"coverage of 4ce6e060a69c (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+4ce6e060a6,subset,"coverage of 0a19fcc2a4e7 (0 commit(s) behind): 197 altered module(s), 1617 of 1619 test file(s)",197,1617,1619,1.0,1959.9,490.0,245.0
+0a19fcc2a4,all,"always_all: mix.exs",,1619,1619,1.0,1959.9,490.0,245.0
+316cabed15,subset,"coverage of 9b2ecfb7ce7e (0 commit(s) behind): 0 altered module(s), 1 of 1619 test file(s)",0,1,1619,0.0011,2.1,2.1,2.1
+9b2ecfb7ce,subset,"coverage of 658348e47c77 (0 commit(s) behind): 200 altered module(s), 1617 of 1619 test file(s)",200,1617,1619,1.0,1959.9,490.0,245.0
+658348e47c,subset,"coverage of b04e22a5d4fe (0 commit(s) behind): 217 altered module(s), 1617 of 1619 test file(s)",217,1617,1619,1.0,1959.9,490.0,245.0
+b04e22a5d4,subset,"coverage of 70cb7fa22e9a (0 commit(s) behind): 216 altered module(s), 1617 of 1619 test file(s)",216,1617,1619,1.0,1959.9,490.0,245.0
+70cb7fa22e,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+25e6e88311,subset,"coverage of 558813306bb1 (0 commit(s) behind): 201 altered module(s), 1617 of 1619 test file(s)",201,1617,1619,1.0,1959.9,490.0,245.0
+558813306b,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+bd11fdd61c,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+d58f942a27,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+18eda2b000,subset,"coverage of dba5272354e3 (0 commit(s) behind): 0 altered module(s), 2 of 1619 test file(s)",0,2,1619,0.0126,24.6,22.6,22.6
+dba5272354,all,"always_all: mix.exs",,1619,1619,1.0,1959.9,490.0,245.0
+eff34d7a7c,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+0cab8c9c8d,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+9918ead34d,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+2b61ac8f28,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+0d325ccd2a,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+0c13ed3a99,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+b19910f47c,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+3aa4e593d1,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+c18722ac60,subset,"coverage of 17bb2b3557d8 (0 commit(s) behind): 210 altered module(s), 1617 of 1619 test file(s)",210,1617,1619,1.0,1959.9,490.0,245.0
+17bb2b3557,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+27f475fe29,subset,"coverage of 27e433fc5809 (0 commit(s) behind): 205 altered module(s), 1617 of 1619 test file(s)",205,1617,1619,1.0,1959.9,490.0,245.0
+27e433fc58,subset,"coverage of 26ec1bdb333d (0 commit(s) behind): 210 altered module(s), 1617 of 1619 test file(s)",210,1617,1619,1.0,1959.9,490.0,245.0
+26ec1bdb33,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+952c0c8141,subset,"coverage of bd826bc07324 (0 commit(s) behind): 215 altered module(s), 1617 of 1619 test file(s)",215,1617,1619,1.0,1959.9,490.0,245.0
+bd826bc073,subset,"coverage of f4b849a911bc (0 commit(s) behind): 201 altered module(s), 1619 of 1619 test file(s)",201,1619,1619,1.0,1959.9,490.0,245.0
+f4b849a911,subset,"coverage of 3efb5055ae95 (0 commit(s) behind): 193 altered module(s), 1617 of 1619 test file(s)",193,1617,1619,1.0,1959.9,490.0,245.0
+3efb5055ae,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+ffd7b642cf,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+6a28753f44,subset,"coverage of 4a92c44d2aa5 (0 commit(s) behind): 0 altered module(s), 1 of 1619 test file(s)",0,1,1619,0.0006,1.2,1.2,1.2
+4a92c44d2a,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+fe36820157,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+04a1690a5c,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+c203f63be9,subset,"coverage of 1d82a87586e4 (0 commit(s) behind): 207 altered module(s), 1619 of 1619 test file(s)",207,1619,1619,1.0,1959.9,490.0,245.0
+1d82a87586,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+7b0bf02275,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+f341a2a27b,subset,"coverage of d7ef34b1de8d (0 commit(s) behind): 0 altered module(s), 1 of 1619 test file(s)",0,1,1619,0.0001,0.1,0.1,0.1
+d7ef34b1de,subset,"coverage of 4771b5c3b475 (0 commit(s) behind): 212 altered module(s), 1617 of 1619 test file(s)",212,1617,1619,1.0,1959.9,490.0,245.0
+4771b5c3b4,subset,"coverage of 6863d692402d (0 commit(s) behind): 0 altered module(s), 0 of 1619 test file(s)",0,0,1619,0.0,0.0,0.0,0.0
+6863d69240,subset,"coverage of 1910a43d4a56 (0 commit(s) behind): 231 altered module(s), 1617 of 1619 test file(s)",231,1617,1619,1.0,1959.9,490.0,245.0
+1910a43d4a,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+e619a4d1ee,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+79016bb78d,subset,"coverage of e5e4ff9247d6 (0 commit(s) behind): 205 altered module(s), 1617 of 1619 test file(s)",205,1617,1619,1.0,1959.9,490.0,245.0
+e5e4ff9247,subset,"coverage of 61aa6ebeb924 (0 commit(s) behind): 282 altered module(s), 1617 of 1619 test file(s)",282,1617,1619,1.0,1959.9,490.0,245.0
+61aa6ebeb9,all,"always_all: test/support/**",,1619,1619,1.0,1959.9,490.0,245.0
+6612917e39,all,"always_all: config/**",,1619,1619,1.0,1959.9,490.0,245.0
+0d92f80562,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0
+ae06560b2c,all,"always_all: priv/repo/migrations/**",,1619,1619,1.0,1959.9,490.0,245.0

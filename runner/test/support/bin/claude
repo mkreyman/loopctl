@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# A stand-in for the Claude Code CLI, reached through the REAL claude-headless.sh by
+# putting this directory first on PATH. Behaviour is chosen by environment:
+#
+#   FAKE_STATE_DIR     where it records what it saw (required)
+#   FAKE_CLAUDE_MODE   stream | max_turns | hang | exit_leaving_child | ...
+#   FAKE_EXIT          exit code for stream mode (default 0)
+#   FAKE_AGENTS        busy | idle | fail — what `claude agents --json` reports
+#   FAKE_RESULT_LINE   stream mode's final `result` line, replacing the default
+#   FAKE_RESULT_LINE_FILE  the same, read from this file (a line over a session_env value's cap)
+#   FAKE_SWITCH_TEXT   with FAKE_SWITCH_VERDICT / FAKE_SWITCH_RESULT_LINE: what to state instead
+#                      when the prompt contains this text
+#
+# LOOPCTL_TEST_STRAGGLERS, inherited from the suite, is where every process this file
+# detaches is recorded so the suite can end it (test/support/test_stragglers.ex).
+
+set -u
+state=${FAKE_STATE_DIR:?FAKE_STATE_DIR required}
+
+if [ "${1:-}" = "agents" ]; then
+    case "${FAKE_AGENTS:-busy}" in
+        fail) echo "agents probe exploded" >&2; exit 3 ;;
+        slow_absent) sleep 2; echo '[]'; exit 0 ;;
+        # Recorded as it starts, so a test can tell a probe that was in flight from one never sent.
+        hang) : > "$state/agents_probe_started"; sleep 30; exit 0 ;;
+    esac
+    sid=$(cat "$state/session_id" 2>/dev/null || echo none)
+    status=${FAKE_AGENTS:-busy}
+    printf '[{"pid":1,"kind":"interactive","sessionId":"%s","status":"%s"}]\n' "$sid" "$status"
+    exit 0
+fi
+
+sid=none
+prev=
+for arg in "$@"; do
+    [ "$prev" = "--session-id" ] && sid=$arg
+    prev=$arg
+done
+printf '%s' "$sid" > "$state/session_id"
+printf '%s' "$PPID" > "$state/launcher_pid"
+# Whether the runner armed the grant that lets a DISPATCHED agent commit. Recorded from inside a
+# live session because that is the only moment the answer means anything: the file is removed at
+# teardown, so a test looking afterwards can only ever see it gone. The path is read, never
+# written, and the name is a fixed literal.
+# Read from the environment rather than reconstructed from $HOME: the runner tells a session
+# where its grant is, and a test's grant directory is not the operator's.
+# The runner arms it just AFTER the fork, with the launcher's pid in it. A real session's first
+# tool call is seconds away; this stub looks at once, so it waits up to five seconds for the write.
+if [ -n "${LOOP_GIT_GRANT:-}" ]; then
+    tries=0
+    while [ ! -f "$LOOP_GIT_GRANT" ] && [ "$tries" -lt 50 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+fi
+if [ -n "${LOOP_GIT_GRANT:-}" ] && [ -f "$LOOP_GIT_GRANT" ]; then
+    echo "GIT_GRANT PRESENT" > "$state/git_grant"
+    # Its first line, which is the runner's stamp and the owner the sweep keys on: no credential.
+    head -n 1 "$LOOP_GIT_GRANT" > "$state/git_grant_stamp"
+else
+    echo "GIT_GRANT ABSENT" > "$state/git_grant"
+fi
+# Whether the variable is in the environment AT ALL, never its value: a session with no grant must
+# not inherit the runner's, and one set to an unusable value would pass the file test above.
+if [ -n "${LOOP_GIT_GRANT+set}" ]; then
+    echo "LOOP_GIT_GRANT SET" > "$state/git_grant_env"
+else
+    echo "LOOP_GIT_GRANT UNSET" > "$state/git_grant_env"
+fi
+here=$(realpath .)
+printf '%s\n' "$here" > "$state/cwd"
+# What Claude Code does for every cwd it runs in: a project directory under the projects dir,
+# named by mangling the cwd, holding this session's transcript. Only when asked, and recorded, so
+# a test can say which directory a run's cwd made.
+if [ -n "${FAKE_PROJECTS_DIR:-}" ]; then
+    project="$FAKE_PROJECTS_DIR/$(printf '%s' "$here" | sed 's/[^A-Za-z0-9]/-/g')"
+    mkdir -p "$project" && : > "$project/$sid.jsonl"
+    printf '%s\n' "$project" > "$state/project_dir"
+fi
+# A test's own probe of the tree, run in the session's cwd while the session holds it, and what it
+# prints recorded. The command is the TEST's, so what it prints is never an environment value.
+if [ -n "${FAKE_PROBE_CMD:-}" ]; then
+    sh -c "$FAKE_PROBE_CMD" > "$state/probe" 2>&1
+fi
+# Names only for the key, never values: a failing assertion prints this file, and the
+# real environment carries credentials.
+# Matched by CATEGORY and by SHAPE, never by the individual name, so a name added to Session's
+# unset lists cannot go unrecorded here — an unrecorded name turns a test's `refute ... PRESENT`
+# into an assertion that passes whether or not the unset happened. The claim is only as good as
+# its coverage, which is why `test/credential_recording_canary_test.exs` runs THIS FILE against
+# every name Session unsets and fails when one of them comes back unrecorded.
+env | awk -F= '
+  $1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ || $1 ~ /^SSH_/ || $1 ~ /^(GH|GITHUB|GPG)_/ ||
+  $1 ~ /^RELEASE_/ || $1 == "EMU" ||
+  toupper($1) ~ /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|API_KEY|PRIVATE_KEY|_KEY$|_KEY_/ {
+      print $1 " PRESENT"; next
+  }
+  $1 ~ /^LOOP_[A-Z_]*$/ || $1 == "RUNNER_ENV_PROBE"' > "$state/env"
+case ":$PATH:" in *loopctl-release-canary*) echo "RELEASE_PATH PRESENT" >> "$state/env" ;; esac
+printf '%s\n' "$@" > "$state/argv"
+# claude-config's loop mode needs LOOP_STORY_FILE to be a regular, fresh file when hooks run.
+if [ -f "${LOOP_STORY_FILE:-}" ]; then echo regular > "$state/story_file"; else echo missing > "$state/story_file"; fi
+
+# Every process this file detaches outlives a test that fails before the assertion which
+# would have ended it, so each one is recorded for the suite's own sweep: pid and start
+# time, written here because here is the only place the start time still belongs to the
+# process meant and not to whatever later reuses the pid. Silent when unset — the fixture
+# is also run by hand.
+note_straggler() {
+    [ -n "${LOOPCTL_TEST_STRAGGLERS:-}" ] || return 0
+    local start
+    start=$(ps -o lstart= -p "$1" 2>/dev/null)
+    # A line with no start time is worse than no line: the sweep compares the real start
+    # time against the empty string, drops the line, and the process is invisible to it for
+    # ever — and on macOS the ledger is the whole mechanism, not a fallback. Said out loud
+    # instead, since a loss you can see beats one you cannot.
+    if [ -z "$start" ]; then
+        echo "note_straggler: no start time for $1, not recorded" >&2
+        return 0
+    fi
+    printf '%s %s\n' "$1" "$start" >> "$LOOPCTL_TEST_STRAGGLERS" 2>/dev/null
+}
+
+# What Claude Code's Bash tool does with every command (measured on 2.1.270): a NEW
+# session, so neither the launcher's group signal nor a parent walk reaches it once
+# its parent is gone. Only the inherited LOOP_SESSION_ID marker does.
+detach() {
+    perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "1001"' >/dev/null 2>&1 &
+    local pid=$!
+    # setsid makes it a group leader; `ps -o sid` is Linux-only, pgid is portable.
+    while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+    note_straggler "$pid"
+    # Published only once detached: tests wait on this file, then signal the group.
+    printf '%s' "$pid" > "$state/detached_pid.tmp" && mv "$state/detached_pid.tmp" "$state/detached_pid"
+}
+
+init='{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake","cwd":"'"$here"'","permissionMode":"auto"}'
+
+# FAKE_SWITCH_TEXT: when the PROMPT (the last argument) contains this literal text, the session
+# states FAKE_SWITCH_VERDICT / FAKE_SWITCH_RESULT_LINE instead of FAKE_VERDICT / FAKE_RESULT_LINE.
+# The one way an offline eval run tells a proposed template revision from the current one.
+if [ -n "${FAKE_SWITCH_TEXT:-}" ]; then
+    case "${*: -1}" in
+        *"$FAKE_SWITCH_TEXT"*)
+            echo switched > "$state/switched"
+            [ -n "${FAKE_SWITCH_VERDICT:-}" ] && FAKE_VERDICT=$FAKE_SWITCH_VERDICT
+            [ -n "${FAKE_SWITCH_RESULT_LINE:-}" ] && FAKE_RESULT_LINE=$FAKE_SWITCH_RESULT_LINE
+            ;;
+    esac
+fi
+
+# A triage run's session states its verdict by running the verdict command with the token its
+# PROMPT carries — which is the whole point of the token, so the fake finds it the same way a
+# session would: in the prompt it was given, never in the environment.
+if [ -n "${FAKE_VERDICT:-}" ]; then
+    prompt=${*: -1}
+    token=$(printf '%s' "$prompt" | grep -oE 'loop-verdict [A-Za-z0-9_-]+' | head -1 | cut -d' ' -f2)
+    script=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-verdict' | head -1)
+    printf '%s' "$FAKE_VERDICT" | "$script" "$token" > /dev/null 2>&1 || true
+fi
+
+# An IO failure at the verdict path that the session cannot cause and the runner cannot parse
+# around: a DIRECTORY where the file goes. The runner must report it, not raise it.
+# Two ways a verdict path refuses to read, and the runner must tell them apart: a DIRECTORY,
+# which loop-verdict cannot create, so nothing was written; and a regular file it cannot open,
+# which only loop-verdict puts there.
+case "${FAKE_VERDICT_UNREADABLE:-}" in
+    dir) mkdir -p "$LOOP_RUN_DIR/verdict.json" ;;
+    chmod) : > "$LOOP_RUN_DIR/verdict.json"; chmod 000 "$LOOP_RUN_DIR/verdict.json" ;;
+esac
+
+if [ -n "${FAKE_ESCALATE:-}" ]; then
+    prompt=${*: -1}
+    escalate=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-escalate [A-Za-z0-9_-]+' | head -1)
+    printf '%s' "$FAKE_ESCALATE" | $escalate > /dev/null 2>&1 || true
+fi
+
+case "${FAKE_CLAUDE_MODE:-stream}" in
+    stream)
+        echo "$init"
+        echo '{"type":"assistant","parent_tool_use_id":null,"session_id":"'"$sid"'","message":{"content":[{"type":"text","text":"dispatching"},{"type":"tool_use","id":"toolu_A","name":"Agent","input":{}}]}}'
+        echo '{"type":"assistant","parent_tool_use_id":"toolu_A","session_id":"'"$sid"'","message":{"content":[{"type":"tool_use","id":"toolu_B","name":"Read","input":{}}]}}'
+        echo '{"type":"user","parent_tool_use_id":"toolu_B","session_id":"'"$sid"'","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_B"}]}}'
+        echo '{"type":"user","parent_tool_use_id":null,"session_id":"'"$sid"'","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A"}]}}'
+        echo "this line is not json"
+        # FAKE_RESULT_LINE: the whole final result line, JSON the TEST encoded, for a session whose
+        # final message is its output (a draft's fenced json block rides its `result` text).
+        # FAKE_RESULT_LINE_FILE: the same line read from a file, for one longer than a session_env
+        # value may be (a tuning session's proposal carries whole eval cases).
+        if [ -n "${FAKE_RESULT_LINE_FILE:-}" ]; then
+            cat "$FAKE_RESULT_LINE_FILE"
+        elif [ -n "${FAKE_RESULT_LINE:-}" ]; then
+            printf '%s' "$FAKE_RESULT_LINE"
+        else
+            printf '%s' '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"'"$sid"'"}'
+        fi
+        exit "${FAKE_EXIT:-0}"
+        ;;
+    max_turns)
+        # What the CLI prints when --max-turns runs out (the subtype 2.1.283 emits), then exits 1.
+        echo "$init"
+        echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":5,"session_id":"'"$sid"'"}'
+        exit 1
+        ;;
+    quiet_then_result)
+        # Silent past the park window, then finishes WHILE the runner's agents probe runs.
+        echo "$init"
+        sleep 2.5
+        echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"'"$sid"'"}'
+        exit 0
+        ;;
+    escalate_and_continue)
+        echo "$init"
+        "$LOOP_ESCALATE" <<'ESCALATION'
+Should the billing total include voided visits? It changes $5 or $10 per `visit` — a business call.
+ESCALATION
+        # Keeps working after asking: the runner must stop it.
+        sleep 1000 >/dev/null 2>&1 &
+        note_straggler "$!"
+        wait
+        ;;
+    escalate_later_and_exit)
+        echo "$init"
+        sleep 1
+        "$LOOP_ESCALATE" "Escalated while a park stop was under way"
+        exit 0
+        ;;
+    escalate_and_exit)
+        echo "$init"
+        "$LOOP_ESCALATE" "The story contradicts an existing KB decision."
+        exit 0
+        ;;
+    delete_run_dir)
+        # Pulls the run directory out from under the runner: its next state write raises. Only once
+        # the runner has recorded this session (its pgid), so the run is past its start and the
+        # outcome under test is the session's end, whatever the machine's load.
+        echo "$init"
+        recorded=
+        for _ in $(seq 1 400); do
+            grep -q '"pgid"' "$LOOP_RUN_DIR/state.json" 2>/dev/null && { recorded=1; break; }
+            sleep 0.05
+        done
+        if [ -z "$recorded" ]; then
+            echo "fake claude: the runner never recorded this session's pgid" >&2
+            exit 3
+        fi
+        # Until it is really gone: a state write that lands WHILE rm -rf runs (the runner records
+        # stream events as this session prints) recreates an entry after rm listed the directory,
+        # so its rmdir fails and the directory survives holding a fresh state.json. That is a
+        # deletion that did not happen, not the outcome under test. Once the directory is gone no
+        # write can bring it back (AtomicFile creates no parent).
+        for _ in $(seq 1 40); do
+            rm -rf "$LOOP_RUN_DIR"
+            [ -e "$LOOP_RUN_DIR" ] || break
+            sleep 0.05
+        done
+        exit 0
+        ;;
+    write_file)
+        # Leaves uncommitted work in the worktree.
+        echo "$init"
+        echo "draft" > wip.txt
+        exit 0
+        ;;
+    lock_worktree)
+        # A worktree git refuses to remove: teardown must record the failure.
+        echo "$init"
+        git worktree lock "$here" >/dev/null 2>&1
+        exit 0
+        ;;
+    hang)
+        echo "$init"
+        sleep 1000 >/dev/null 2>&1 &
+        grandchild=$!
+        note_straggler "$grandchild"
+        printf '%s' "$grandchild" > "$state/grandchild_pid"
+        detach
+        wait
+        ;;
+    hang_named)
+        # A detached command whose own command line mentions the launcher's name: it must
+        # still be ended, so nothing may exclude processes by name.
+        echo "$init"
+        # Loops, so killing its current `sleep` does not end it: only a signal to it does.
+        # Counted rather than endless: the suite's sweep cannot run when the BEAM is killed
+        # outright, and this is the one fixture that would otherwise outlive the machine's day.
+        perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c 'i=0; while [ $i -lt 1000 ]; do sleep 1; i=$((i+1)); done' session-launcher.sh >/dev/null 2>&1 &
+        pid=$!
+        while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+        note_straggler "$pid"
+        printf '%s' "$pid" > "$state/named_pid.tmp" && mv "$state/named_pid.tmp" "$state/named_pid"
+        wait
+        ;;
+    exit_leaving_stubborn_child)
+        # A detached child that ignores TERM: the launcher's exit cleanup cannot end it, so
+        # the runner's KILL escalation has to find it — on macOS only through the tree file.
+        echo "$init"
+        perl -MPOSIX -e '$SIG{TERM} = "IGNORE"; POSIX::setsid(); exec "sleep", "1002"' >/dev/null 2>&1 &
+        pid=$!
+        while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+        note_straggler "$pid"
+        printf '%s' "$pid" > "$state/stubborn_pid.tmp" && mv "$state/stubborn_pid.tmp" "$state/stubborn_pid"
+        sleep 2
+        exit 0
+        ;;
+    exit_leaving_child)
+        echo "$init"
+        # Inherits stdout on purpose: a straggler holding the Port's pipe.
+        sleep 1000 &
+        grandchild=$!
+        note_straggler "$grandchild"
+        printf '%s' "$grandchild" > "$state/grandchild_pid"
+        detach
+        # Live long enough for the launcher's tree recorder to see the detached child.
+        sleep 2
+        exit 0
+        ;;
+esac

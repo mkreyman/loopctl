@@ -1,0 +1,137 @@
+name: Runner CI
+
+# The runner (runner/, US-52.4), gated only when a change touches it (US-52.6). Every job but
+# the area gate runs on the fleet-ci pool. A job skipped by
+# its `if:` reports skipped, which branch protection accepts for a required check; a workflow
+# filtered by on.paths would leave the check pending, so this workflow uses no paths filter.
+#
+# Push of every branch, and no pull_request: the merge gate trusts only push runs of a
+# story's branch at its head, and a same-repo pull request's checks are the push run's check
+# runs on its head sha (ci.yml says more). The nightly run counts as every area, as ci.yml's
+# does, so a runner that stops building on an unchanged tree is found the next morning.
+on:
+  push:
+    branches: ["**"]
+  schedule:
+    - cron: "0 2 * * *"
+
+# A later push on a branch cancels the earlier push's run; areas-output.sh judges a branch
+# push from its merge base with master, so the later run covers the cancelled run's areas.
+concurrency:
+  group: runner-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: changes
+    runs-on: [self-hosted, fleet-ci]
+    outputs:
+      runner: ${{ steps.areas.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      - id: areas
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: .github/scripts/areas-output.sh
+
+  runner:
+    name: runner
+    needs: [changes]
+    if: needs.changes.outputs.runner == 'true'
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 30
+    env:
+      MIX_ENV: test
+      # The CI account carries no claude-config, so the suite drives the byte-identical copy
+      # of its claude-headless.sh (runner/test/support/test_support.ex, headless_fixture_test).
+      LOOPCTL_RUNNER_HEADLESS: fixture
+    defaults:
+      run:
+        working-directory: runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      # Mix keeps build-lock files in $TMPDIR; RUNNER_TEMP is emptied at the start of each job.
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # The root pin: runner/ has no .tool-versions of its own.
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+          install-hex: false
+          install-rebar: false
+      # Retried, unconditional: the reason is at the same step in ci.yml.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then installed=true; break; fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            [ "$installed" = true ] || { echo "mix local.$tool failed after 3 attempts" >&2; exit 1; }
+          done
+      # Keyed per runner slot, with the core (Erlang/Elixir) PLT beside the project PLT: a PLT
+      # records beam paths under the slot whose setup-beam built it, so a PLT restored on
+      # another slot fails with "File not found: .../erl_bif_types.beam".
+      - name: Cache the dialyzer PLT
+        uses: actions/cache@v4
+        with:
+          path: runner/_build/test/*.plt*
+          key: runner-plt-${{ runner.os }}-${{ runner.environment }}-${{ runner.name }}-${{ hashFiles('.tool-versions', 'runner/mix.lock') }}
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix deps.unlock --check-unused
+      - run: mix format --check-formatted
+      - run: mix credo --strict --config-file .credo.exs
+      - run: mix dialyzer
+        env:
+          DIALYZER_PLT_CORE_PATH: _build/test
+      - run: mix test
+
+  # THE AREA GATE, the one check the merge gate's independent_checks names for this repository:
+  # the same job, under the same name, ends ci.yml, runner-ci.yml, chg-ci.yml and e2e.yml. It
+  # needs every job a push can run, and passes only when changes succeeded and every other
+  # need succeeded or was skipped by area; a failed or cancelled need fails it. always(), so
+  # a need that failed or was skipped never skips the gate itself. Hosted and checkout-free:
+  # it reads only the needs' results.
+  area-gate:
+    name: area gate
+    needs: [changes, runner]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded or was skipped by area
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$(jq -r '.changes.result' <<<"$NEEDS")" != success ]; then
+            echo "::error::changes did not succeed, so no area was judged"
+            exit 1
+          fi
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi

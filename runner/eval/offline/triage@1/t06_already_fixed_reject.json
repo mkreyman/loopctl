@@ -1,0 +1,13 @@
+{
+  "verdict": {
+    "outcome": "reject",
+    "confidence": "high",
+    "evidence": ["lib/tiny_app.ex:8", "test/tiny_app_test.exs:4"],
+    "escalation_reasons": [],
+    "lens_verdicts": [
+      {"lens": "analyst", "outcome": "reject", "confidence": "high", "escalation_reasons": ["already_implemented_at_head"]},
+      {"lens": "architect", "outcome": "reject", "confidence": "high", "escalation_reasons": ["already_implemented_at_head"]},
+      {"lens": "engineer", "outcome": "reject", "confidence": "high", "escalation_reasons": ["already_implemented_at_head"]}
+    ]
+  }
+}

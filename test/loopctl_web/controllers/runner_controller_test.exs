@@ -244,6 +244,31 @@ defmodule LoopctlWeb.RunnerControllerTest do
       assert entry["machine_id"] == "d8d9e2a1"
     end
 
+    # TC-52.8.3 / TC-52.8.4 (US-52.8).
+    test "shows each connection's runner_version, null when none was sent, own tenant only",
+         %{conn: conn} do
+      ctx = operator_ctx()
+      other = operator_ctx()
+      {_raw, minis} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "minis"})
+      {_raw, x1} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "x1"})
+      {_raw, theirs} = fixture(:runner, %{tenant_id: other.tenant.id, name: "blockit"})
+
+      track_runner(minis, %{runner_version: "0.2.0"})
+      track_runner(x1)
+      track_runner(theirs, %{runner_version: "9.9.9"})
+
+      assert %{"runners" => entries} =
+               conn
+               |> auth(ctx.operator_key)
+               |> get(~p"/api/v1/runners/pool")
+               |> json_response(200)
+
+      assert Map.new(entries, &{&1["machine"], &1["runner_version"]}) == %{
+               "minis" => "0.2.0",
+               "x1" => nil
+             }
+    end
+
     test "is empty when no runner is connected, and a sample is null until reported",
          %{conn: conn} do
       ctx = operator_ctx()

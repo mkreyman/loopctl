@@ -30,7 +30,7 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
   alias Loopctl.DeliveryGates.Glob
   alias Loopctl.DeliveryGates.RepoTriggers
 
-  @type kind :: :effect | :human
+  @type kind :: :effect | :independent
 
   @type pattern_coverage :: %{
           kind: kind(),
@@ -102,7 +102,7 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
 
   @doc """
   The sources of every configured pattern that matches none of `repo_files`, in configuration
-  order (`effect_paths` then `human_paths`).
+  order (`effect_paths` then `independent_paths`).
 
   `{:ok, []}` is the clean answer. `{:ok, [_ | _]}` names the drifted patterns.
 
@@ -117,7 +117,7 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
       # counts because the artifact wants the number; the two would otherwise be one function
       # doing the expensive half of the work for the caller that does not need it.
       drifted =
-        for glob <- triggers.effect_paths ++ triggers.human_paths,
+        for glob <- triggers.effect_paths ++ triggers.independent_paths,
             not Enum.any?(repo_files, &Glob.match?(glob, &1)),
             do: glob.source
 
@@ -140,7 +140,7 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
     with :ok <- usable(repo_files) do
       {:ok,
        tagged(triggers.effect_paths, :effect, repo_files) ++
-         tagged(triggers.human_paths, :human, repo_files)}
+         tagged(triggers.independent_paths, :independent, repo_files)}
     end
   end
 

@@ -1,6 +1,6 @@
 # Delivery-gate measurements
 
-Build order steps 2 and 3 of the agent delivery loop design (`mkreyman/loopctl-runner`,
+Build order steps 2 and 3 of the agent delivery loop design (`runner/`,
 `docs/agent-delivery-loop.md` §12) require Gate B's false-negative rate and Gate A's escalation
 rate to be measured before step 7 — auto-merge — may run. Issue #828 is the tracking issue.
 
