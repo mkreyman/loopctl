@@ -919,7 +919,11 @@ defmodule LoopctlRunner.TriageRunTest do
 
     own = own_tree(ctx, result.run_id)
     assert {:incomplete, "no_verdict_written", detail} = result.outcome
-    assert detail =~ "could not be removed"
+    # The detail is fit to the contract's length and starts with the tree's path, so how much
+    # of the tail survives depends on TMPDIR (a CI slot's is long enough to cut "removed").
+    # That the removal failed is asserted on the run state below, which no path shortens.
+    assert detail =~ "cannot mark #{own}"
+    assert String.length(detail) <= LoopctlRunner.TriageRun.max_detail()
     refute File.exists?(Path.join(ctx.state, "argv"))
     assert File.dir?(own)
 
