@@ -18,6 +18,7 @@ defmodule Loopctl.ReleaseRolloutTest do
   set_id=$(printf '%s' "$*" | grep -oE 'install-machine.sh" [0-9]+' | grep -oE '[0-9]+$')
   server=$(printf '%s' "$*" | grep -oE 'LOOPCTL_FACTORY_SERVER_SET=[0-9]+' | cut -d= -f2)
   echo "$host $set_id $server" >> "$STUB/installs"
+  printf '%s' "$*" | grep -oE 'LOOPCTL_FACTORY_REPO=[^ ]+' >> "$STUB/$host.repo"
   status=$(cat "$STUB/$host.status" 2>/dev/null || echo ok)
   printf '{"host":"%s","set":%s,"status":"%s","runner_version":"0.9","chg_version":"1.0"}\\n' "$host" "$set_id" "$status"
   """
@@ -43,12 +44,17 @@ defmodule Loopctl.ReleaseRolloutTest do
   printf '{"release":{"set":%s}}' "$(cat "$STUB/served")"
   """
 
-  # ls-remote prints the tag's line only while the stub's tag file exists.
+  # ls-remote --exit-code: the tag's line while the stub's tag file exists, else exit 2; a
+  # git_down file makes it fail the way an unreachable remote does.
   @git """
   #!/bin/sh
   echo "$*" >> "$STUB/git.log"
-  [ -f "$STUB/tag" ] && echo "c5288a6d	refs/tags/$(cat "$STUB/tag")"
-  exit 0
+  if [ -f "$STUB/git_down" ]; then
+    echo "fatal: Could not read from remote repository." >&2
+    exit 128
+  fi
+  [ -f "$STUB/tag" ] || exit 2
+  echo "c5288a6d	refs/tags/$(cat "$STUB/tag")"
   """
 
   @moduletag :tmp_dir
@@ -116,7 +122,27 @@ defmodule Loopctl.ReleaseRolloutTest do
     assert installs(ctx) == []
 
     assert File.read!(Path.join(ctx.stub, "git.log")) =~
-             "ls-remote --tags git@example.test:acme/factory.git refs/tags/factory-#{@set}"
+             "ls-remote --exit-code --tags git@example.test:acme/factory.git refs/tags/factory-#{@set}"
+  end
+
+  test "a remote git cannot read stops before any host, saying so rather than 'not pushed'",
+       ctx do
+    File.write!(Path.join(ctx.stub, "git_down"), "")
+
+    {out, 2} = rollout(ctx)
+    assert out =~ "cannot read tags from git@example.test:acme/factory.git (git exit 128)"
+    assert out =~ "Could not read from remote repository"
+    refute out =~ "not in git@example.test"
+    assert installs(ctx) == []
+  end
+
+  test "every host is told to clone the repo the tag check read", ctx do
+    {_out, 0} = rollout(ctx)
+
+    for host <- ["alpha", "beta"] do
+      assert File.read!(Path.join(ctx.stub, "#{host}.repo")) =~
+               "LOOPCTL_FACTORY_REPO=git@example.test:acme/factory.git"
+    end
   end
 
   test "an unreachable host is reported, the rest still run, e2e is skipped", ctx do

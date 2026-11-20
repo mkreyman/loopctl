@@ -213,7 +213,18 @@ defmodule LoopctlE2e.RunTest do
   test "the seeded module is valid Elixir whose value contradicts its own doc" do
     {path, source} = Run.seed("r1")
     assert path == "lib/sandbox/runs/rr1.ex"
-    assert {:ok, _ast} = Code.string_to_quoted(source)
+    assert {:ok, ast} = Code.string_to_quoted(source)
+
+    {_ast, found} =
+      Macro.prewalk(ast, %{}, fn
+        {:@, _, [{:doc, _, [doc]}]} = node, acc -> {node, Map.put(acc, :doc, doc)}
+        {:def, _, [{:value, _, _}, [do: body]]} = node, acc -> {node, Map.put(acc, :value, body)}
+        node, acc -> {node, acc}
+      end)
+
+    assert found.doc =~ ~s("r1")
+    assert found.value == "unset"
+    refute found.value == "r1"
     assert Code.format_string!(source) |> IO.iodata_to_binary() == String.trim_trailing(source)
   end
 
