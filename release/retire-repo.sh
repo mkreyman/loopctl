@@ -124,10 +124,53 @@ if [ -n "$issues" ]; then
       --description "transferred from $repo" --force >/dev/null ||
       { echo "retire: cannot create label $label in $r" >&2; exit 1; }
   done
+  # GitHub refuses to transfer an issue from a private repository to a public one
+  # ("Old issue cannot be transferred from private repository to public repository"), so
+  # there the issue is COPIED: a new issue in the target carrying the title, the body, the
+  # comments and a marker naming the original, then the original is closed with a link to
+  # the copy. The marker makes a re-run safe: a copy whose original failed to close is
+  # found by it (listed by label, which reads the repository, not the lagging search index)
+  # and only the close is retried.
+  src_vis=$($gh repo view "$repo" --json visibility --jq .visibility) ||
+    { echo "retire: cannot read $repo's visibility" >&2; exit 1; }
+  tgt_vis=$($gh repo view "$target" --json visibility --jq .visibility) ||
+    { echo "retire: cannot read $target's visibility" >&2; exit 1; }
+  copy=false
+  [ "$src_vis" != PUBLIC ] && [ "$tgt_vis" = PUBLIC ] && copy=true
+
+  # copy_issue <n>: copies $repo#<n> into $target unless a copy exists; prints its URL.
+  copy_issue() {
+    local n=$1 marker existing title body
+    marker="<!-- retired-from: $repo#$n -->"
+    existing=$($gh issue list -R "$target" --label "$label" --state all --limit 1000 \
+      --json url,body --jq ".[] | select(.body | contains(\"$marker\")) | .url") || return 1
+    if [ -n "$existing" ]; then
+      printf '%s\n' "$existing" | head -1
+      return 0
+    fi
+    title=$($gh issue view "$n" -R "$repo" --json title --jq .title) || return 1
+    body=$($gh issue view "$n" -R "$repo" --json body,comments,url --jq \
+      "(.body // \"\") + \"\n\n---\nCopied from \" + .url + \" when $repo was retired (a private repository's issue cannot be transferred to a public one).\n\" + ([.comments[] | \"\n**\" + .author.login + \"** commented:\n\n\" + .body] | join(\"\n\")) + \"\n\n$marker\"") ||
+      return 1
+    $gh issue create -R "$target" --title "$title" --label "$label" --body "$body"
+  }
+
   failed=0
   for n in $issues; do
-    if $gh issue edit "$n" -R "$repo" --add-label "$label" >/dev/null &&
-      $gh issue transfer "$n" "$target" -R "$repo" >/dev/null; then
+    $gh issue edit "$n" -R "$repo" --add-label "$label" >/dev/null || {
+      echo "retire: $repo#$n did not move; re-run to retry" >&2
+      failed=1
+      continue
+    }
+    if [ "$copy" = true ]; then
+      if url=$(copy_issue "$n") && [ -n "$url" ] &&
+        $gh issue close "$n" -R "$repo" --comment "Moved to $url" >/dev/null; then
+        echo "retire: $repo#$n copied to $url"
+      else
+        echo "retire: $repo#$n did not move; re-run to retry" >&2
+        failed=1
+      fi
+    elif $gh issue transfer "$n" "$target" -R "$repo" >/dev/null; then
       echo "retire: $repo#$n moved to $target"
     else
       echo "retire: $repo#$n did not move; re-run to retry" >&2

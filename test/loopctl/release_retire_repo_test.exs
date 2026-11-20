@@ -12,11 +12,43 @@ defmodule Loopctl.ReleaseRetireRepoTest do
   @drop Path.expand("../../release/lib/drop_retired_sources.py", __DIR__)
 
   # Open issues, PRs and the archived flag are files under $STUB; every write is logged.
+  # A repository's visibility is $STUB/private_<name> (PRIVATE) or PUBLIC. Copies made in
+  # the target live in $STUB/copies.json, and the reads that carry --jq run real jq on the
+  # JSON gh would return, so the script's filters are exercised as written.
   @gh """
   #!/usr/bin/env bash
+  jqf=""; prev=""
+  for a in "$@"; do [ "$prev" = "--jq" ] && jqf=$a; prev=$a; done
+  [ -f "$STUB/copies.json" ] || echo '[]' > "$STUB/copies.json"
   case "$1 $2" in
-    "issue list") cat "$STUB/issues" 2>/dev/null || true ;;
-    "repo view") [ -f "$STUB/archived" ] && echo true || echo false ;;
+    "issue list")
+      if [[ " $* " == *" --label "* ]]; then jq -r "$jqf" "$STUB/copies.json"
+      else cat "$STUB/issues" 2>/dev/null || true; fi ;;
+    "repo view")
+      if [[ "$*" == *visibility* ]]; then
+        [ -f "$STUB/private_${3#*/}" ] && echo PRIVATE || echo PUBLIC
+      else [ -f "$STUB/archived" ] && echo true || echo false; fi ;;
+    "issue view")
+      printf '{"title":"title %s","body":"body %s","url":"https://github.com/mkreyman/chg/issues/%s","comments":[{"author":{"login":"ann"},"body":"comment %s"}]}' \\
+        "$3" "$3" "$3" "$3" | jq -r "$jqf" ;;
+    "issue create")
+      title=""; body=""; prev=""
+      for a in "$@"; do
+        [ "$prev" = "--title" ] && title=$a
+        [ "$prev" = "--body" ] && body=$a
+        prev=$a
+      done
+      echo "create $title" >> "$STUB/writes"
+      [ -f "$STUB/fail_create" ] && exit 1
+      n=$(( $(jq length "$STUB/copies.json") + 100 ))
+      url="https://github.com/mkreyman/loopctl/issues/$n"
+      jq --arg u "$url" --arg b "$body" '. + [{url: $u, body: $b}]' "$STUB/copies.json" > "$STUB/c.new"
+      mv "$STUB/c.new" "$STUB/copies.json"
+      echo "$url" ;;
+    "issue close")
+      echo "close $3 $7" >> "$STUB/writes"
+      [ "$3" = "$(cat "$STUB/fail_close" 2>/dev/null)" ] && exit 1
+      grep -vx "$3" "$STUB/issues" > "$STUB/issues.new"; mv "$STUB/issues.new" "$STUB/issues" ;;
     "pr list") cat "$STUB/prs" 2>/dev/null || true ;;
     "label create") echo "label $*" >> "$STUB/writes" ;;
     "issue edit") echo "edit $3" >> "$STUB/writes" ;;
@@ -141,6 +173,58 @@ defmodule Loopctl.ReleaseRetireRepoTest do
       assert {_, 0} = retire(ctx)
       assert "archive" in writes(ctx)
     end
+  end
+
+  describe "a private repository's issues are copied, since GitHub will not transfer them" do
+    setup ctx do
+      File.write!(Path.join(ctx.stub, "private_chg"), "")
+      File.write!(Path.join(ctx.stub, "issues"), "3\n5\n")
+      :ok
+    end
+
+    test "each issue is copied with its body, comments and marker, then closed", ctx do
+      {out, 0} = retire(ctx)
+      assert out =~ "mkreyman/chg#3 copied to https://github.com/mkreyman/loopctl/issues/100"
+
+      writes = writes(ctx)
+      refute Enum.any?(writes, &String.starts_with?(&1, "transfer"))
+      assert "create title 3" in writes and "create title 5" in writes
+      assert "close 3 Moved to https://github.com/mkreyman/loopctl/issues/100" in writes
+      assert "close 5 Moved to https://github.com/mkreyman/loopctl/issues/101" in writes
+
+      assert Enum.find_index(writes, &(&1 =~ "close 5")) <
+               Enum.find_index(writes, &(&1 == "archive"))
+
+      [copy | _] = copies(ctx)
+      assert copy["body"] =~ "body 3"
+      assert copy["body"] =~ "**ann** commented:\n\ncomment 3"
+      assert copy["body"] =~ "Copied from https://github.com/mkreyman/chg/issues/3"
+      assert copy["body"] =~ "<!-- retired-from: mkreyman/chg#3 -->"
+    end
+
+    test "a copy whose original did not close is not made twice on the next run", ctx do
+      File.write!(Path.join(ctx.stub, "fail_close"), "5")
+
+      {out, 1} = retire(ctx)
+      assert out =~ "mkreyman/chg#5 did not move"
+      refute "archive" in writes(ctx)
+
+      File.rm!(Path.join(ctx.stub, "fail_close"))
+      assert {_, 0} = retire(ctx)
+
+      assert Enum.count(writes(ctx), &(&1 == "create title 5")) == 1
+      assert length(copies(ctx)) == 2
+      assert "archive" in writes(ctx)
+    end
+
+    test "a public source still transfers", ctx do
+      File.rm!(Path.join(ctx.stub, "private_chg"))
+      assert {_, 0} = retire(ctx)
+      assert "transfer 3 mkreyman/loopctl" in writes(ctx)
+      assert copies(ctx) == []
+    end
+
+    defp copies(ctx), do: Jason.decode!(File.read!(Path.join(ctx.stub, "copies.json")))
   end
 
   describe "the tree the final import needs, checked before the archive" do
