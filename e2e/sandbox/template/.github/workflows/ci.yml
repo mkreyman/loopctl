@@ -1,10 +1,10 @@
 name: CI
 
+# Push on every branch, never pull_request: story verification and loopctl's merge gate count
+# only a push run of the story's branch at its head, so a pull_request run would never count.
 on:
-  pull_request:
-    branches: [master]
   push:
-    branches: [master]
+    branches: ["**"]
 
 permissions:
   contents: read

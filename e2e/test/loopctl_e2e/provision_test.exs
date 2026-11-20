@@ -126,6 +126,19 @@ defmodule LoopctlE2e.ProvisionTest do
       assert File.read!(Path.join(@template, ".github/workflows/ci.yml")) =~ "mix test"
     end
 
+    # The runner refuses a repository with no .loopctl/mode, and only `pr` runs.
+    test "the sandbox opts into the pull-request delivery mode" do
+      assert File.read!(Path.join(@template, ".loopctl/mode")) |> String.trim() == "pr"
+    end
+
+    # Verification and the merge gate count only push runs of the story's branch at its head.
+    test "the sandbox CI runs on a push of every branch and never on a pull request" do
+      ci = File.read!(Path.join(@template, ".github/workflows/ci.yml"))
+
+      assert ci =~ ~s(branches: ["**"])
+      refute ci =~ ~r/^\s*pull_request:/m
+    end
+
     test "e2e.yml runs nightly at 07:00 and on dispatch, one at a time on fleet-ci" do
       yml = File.read!(Path.expand("../.github/workflows/e2e.yml"))
 
