@@ -845,8 +845,14 @@ defmodule LoopctlRunner.Control do
         joined_at: now_iso()
       })
 
-    case AtomicFile.write(joined_file(config), body) do
-      :ok -> :ok
+    file = joined_file(config)
+
+    # A runner that has run nothing yet has no state directory: runs_dir is created by the first
+    # run, and the join comes first (blockit, 2026-11-20).
+    with :ok <- File.mkdir_p(Path.dirname(file)),
+         :ok <- AtomicFile.write(file, body) do
+      :ok
+    else
       {:error, reason} -> Logger.warning("could not record the join in joined.json: #{reason}")
     end
   rescue

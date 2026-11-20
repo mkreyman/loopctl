@@ -18,6 +18,8 @@
 # Inputs (each a value the test passes, never a global it edits):
 #   LOOPCTL_SERVER        https://loopctl.com
 #   ROLLOUT_HOSTS         the hosts, space separated (default: FLEET_MACHINES from claude-config)
+#   ROLLOUT_LOCAL_HOST    the host installed here, without ssh (default: this machine's fleet
+#                         name from claude-config's fleet-name.sh, else its hostname)
 #   ROLLOUT_SSH           the ssh command (default: ssh -o BatchMode=yes -o ConnectTimeout=10)
 #   ROLLOUT_GH            the gh command (default: gh)
 #   ROLLOUT_NPM           the npm command (default: npm)
@@ -34,15 +36,28 @@ gh_cmd=${ROLLOUT_GH:-gh}
 npm_cmd=${ROLLOUT_NPM:-npm}
 curl_cmd=${ROLLOUT_CURL:-curl}
 
+fleet="$HOME/workspace/claude-config/hooks/lib/fleet-name.sh"
 if [ -n "${ROLLOUT_HOSTS:-}" ]; then
   hosts=$ROLLOUT_HOSTS
 else
-  fleet="$HOME/workspace/claude-config/hooks/lib/fleet-name.sh"
   [ -f "$fleet" ] || { echo "rollout: $fleet not found; set ROLLOUT_HOSTS" >&2; exit 2; }
   hosts=$(bash -c ". '$fleet' >/dev/null 2>&1; echo \"\$FLEET_MACHINES\"")
 fi
 
-read -r set_id mcp_version < <(python3 - "$root/release/manifest.toml" <<'PY'
+# The host this runs on installs in place, not over ssh: a machine is not set up to ssh to
+# itself (minis, 2026-11-20).
+if [ -n "${ROLLOUT_LOCAL_HOST+x}" ]; then
+  local_host=$ROLLOUT_LOCAL_HOST
+else
+  me=$(hostname -s 2>/dev/null || hostname)
+  local_host=$me
+  [ -f "$fleet" ] && local_host=$(bash -c ". '$fleet' >/dev/null 2>&1; fleet_name_for_host '$me'")
+fi
+
+. "$here/lib/pick_python.sh"
+py=$(pick_python) || { echo "rollout: no Python 3.11+ (tomllib) found" >&2; exit 2; }
+
+read -r set_id mcp_version < <("$py" - "$root/release/manifest.toml" <<'PY'
 import sys, tomllib
 with open(sys.argv[1], "rb") as f:
     m = tomllib.load(f)
@@ -53,7 +68,7 @@ PY
 # --- preflight ---
 
 served=$($curl_cmd -fsS --max-time 30 "$server/.well-known/loopctl" |
-  python3 -c 'import json,sys; print(json.load(sys.stdin)["release"]["set"])' 2>/dev/null) ||
+  "$py" -c 'import json,sys; print(json.load(sys.stdin)["release"]["set"])' 2>/dev/null) ||
   { echo "rollout: cannot read release.set from $server/.well-known/loopctl" >&2; exit 2; }
 if [ "$served" != "$set_id" ]; then
   echo "rollout: $server serves set $served, the manifest names $set_id; deploy first" >&2
@@ -66,11 +81,20 @@ fi
 
 # --- one host ---
 
+# on_host <host> <command>: runs a shell command on <host>, here when it is this machine.
+on_host() {
+  if [ "$1" = "$local_host" ]; then
+    bash -c "$2"
+  else
+    $ssh_cmd "$1" "$2"
+  fi
+}
+
 # install_on <host> <set>: prints the host's JSON line (or an unreachable one). The runner
 # joins naming the SERVER's set, so a rollback to <set> still waits for $set_id there.
 install_on() {
   local host=$1 target=$2
-  if ! $ssh_cmd "$host" true >/dev/null 2>&1; then
+  if ! on_host "$host" true >/dev/null 2>&1; then
     printf '{"host":"%s","set":%s,"status":"unreachable","runner_version":null,"chg_version":null}\n' \
       "$host" "$target"
     return
@@ -80,20 +104,35 @@ install_on() {
   # WHOLE lib directory goes with it, as one tar on ssh's stdin; a helper added there later
   # cannot be left behind. COPYFILE_DISABLE keeps macOS tar from adding ._ files.
   COPYFILE_DISABLE=1 tar -C "$here" --exclude=__pycache__ -cf - install-machine.sh lib |
-    $ssh_cmd "$host" "d=\$(mktemp -d) && tar -C \"\$d\" -xf - &&
+    on_host "$host" "d=\$(mktemp -d) && tar -C \"\$d\" -xf - &&
 LOOPCTL_FACTORY_SERVER_SET=$set_id nice -n 10 bash \"\$d/install-machine.sh\" $target; rc=\$?; rm -rf \"\$d\"; exit \$rc" |
     tail -1
 }
 
-status_of() { python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status",""))' "$1" 2>/dev/null; }
+status_of() { "$py" -c 'import json,sys; print(json.loads(sys.argv[1]).get("status",""))' "$1" 2>/dev/null; }
+
+# as_host <line> <host> <set>: the line under the fleet name it was installed as (a Mac reports its
+# Computer Name), or a failed line when the host printed no JSON.
+as_host() {
+  "$py" - "$1" "$2" "$3" <<'PY'
+import json, sys
+line, host, set_id = sys.argv[1:4]
+try:
+    j = json.loads(line)
+except ValueError:
+    j = {"set": int(set_id), "status": "failed", "runner_version": None, "chg_version": None,
+         "detail": "no result line: " + line[:200]}
+j["host"] = host
+print(json.dumps(j))
+PY
+}
 
 results=()
 moved=()
 all_good=true
 
 for host in $hosts; do
-  line=$(install_on "$host" "$set_id")
-  [ -n "$line" ] || line="{\"host\":\"$host\",\"set\":$set_id,\"status\":\"failed\",\"runner_version\":null,\"chg_version\":null}"
+  line=$(as_host "$(install_on "$host" "$set_id")" "$host" "$set_id")
   results+=("$line")
   case $(status_of "$line") in
     ok) moved+=("$host") ;;
@@ -106,10 +145,12 @@ summary() {
   printf '%-10s %-5s %-12s %-10s %s\n' HOST SET STATUS RUNNER CHG
   local l
   for l in "$@"; do
-    python3 -c '
+    "$py" -c '
 import json, sys
 j = json.loads(sys.argv[1])
 print("%-10s %-5s %-12s %-10s %s" % (j["host"], j["set"], j["status"], j.get("runner_version") or "-", j.get("chg_version") or "-"))
+if j.get("detail"):
+    print("           " + j["detail"])
 ' "$l"
   done
 }
@@ -152,7 +193,7 @@ previous=$((set_id - 1))
 echo "rollout: e2e failed ($url); rolling ${moved[*]:-no host} back to set $previous" >&2
 back=()
 for host in "${moved[@]}"; do
-  back+=("$(install_on "$host" "$previous")")
+  back+=("$(as_host "$(install_on "$host" "$previous")" "$host" "$previous")")
 done
 [ "${#back[@]}" -gt 0 ] && summary "${back[@]}"
 exit 1

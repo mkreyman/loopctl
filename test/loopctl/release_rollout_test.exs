@@ -60,6 +60,7 @@ defmodule Loopctl.ReleaseRolloutTest do
     env = %{
       "STUB" => stub,
       "ROLLOUT_HOSTS" => "alpha beta",
+      "ROLLOUT_LOCAL_HOST" => "none",
       "ROLLOUT_SSH" => Path.join(stub, "ssh"),
       "ROLLOUT_GH" => Path.join(stub, "gh"),
       "ROLLOUT_NPM" => Path.join(stub, "npm"),
@@ -169,6 +170,49 @@ defmodule Loopctl.ReleaseRolloutTest do
       shipped = ctx.stub |> Path.join("#{host}.shipped") |> File.read!() |> String.split()
       assert shipped == expected
     end
+  end
+
+  # A `nice` that records the local install instead of running it.
+  @local_nice """
+  #!/usr/bin/env bash
+  # nice -n 10 bash <dir>/install-machine.sh <set>
+  echo "local $5" >> "$STUB/local_installs"
+  printf '{"host":"Some-Computer-Name","set":%s,"status":"failed","runner_version":null,"chg_version":null,"detail":"why it failed"}\\n' "$5"
+  """
+
+  test "the host this runs on installs in place, without ssh, under its fleet name", ctx do
+    File.mkdir_p!(Path.join(ctx.stub, "bin"))
+    stub!(Path.join(ctx.stub, "bin"), "nice", @local_nice)
+
+    env =
+      Map.merge(ctx.env, %{
+        "ROLLOUT_LOCAL_HOST" => "alpha",
+        "PATH" => "#{Path.join(ctx.stub, "bin")}:#{System.get_env("PATH")}"
+      })
+
+    {out, 1} = System.cmd("bash", [@script], env: env, stderr_to_stdout: true)
+
+    assert File.read!(Path.join(ctx.stub, "local_installs")) == "local #{@set}\n"
+    assert installs(ctx) == [["beta", "#{@set}", "#{@set}"]]
+    # The summary names the fleet host, not the machine's own name, and says why it failed.
+    assert out =~ ~r/alpha\s+#{@set}\s+failed/
+    refute out =~ "Some-Computer-Name"
+    assert out =~ "why it failed"
+  end
+
+  test "a host that prints no JSON is a failed host", ctx do
+    File.write!(Path.join(ctx.stub, "beta.status"), "ok")
+
+    stub!(
+      ctx.stub,
+      "ssh",
+      ~s(#!/usr/bin/env bash\n[ "$2" = true ] && exit 0\necho "bash: garbage"\n)
+    )
+
+    {out, 1} = rollout(ctx)
+    assert out =~ ~r/alpha\s+#{@set}\s+failed/
+    assert out =~ "no result line: bash: garbage"
+    refute File.exists?(Path.join(ctx.stub, "dispatched"))
   end
 
   defp rollout(ctx), do: System.cmd("bash", [@script], env: ctx.env, stderr_to_stdout: true)

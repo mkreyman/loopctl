@@ -310,6 +310,26 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       assert out["detail"] =~ "did not join loopctl at release_set 2"
     end
 
+    test "a runner with no state directory yet joins once the install creates it", ctx do
+      File.rm_rf!(Path.join(ctx.stub, "state"))
+
+      {out, 0} = install(ctx, 2)
+      assert out["status"] == "ok"
+      assert File.exists?(Path.join([ctx.stub, "state", "joined.json"]))
+    end
+
+    test "a python3 without tomllib is passed over for one that has it", ctx do
+      bin = Path.join(ctx.tmp, "pybin")
+      File.mkdir_p!(bin)
+      # macOS's /usr/bin/python3 is 3.9: first on PATH, and no tomllib.
+      File.write!(Path.join(bin, "python3"), "#!/bin/sh\nexit 1\n")
+      File.chmod!(Path.join(bin, "python3"), 0o755)
+      File.ln_s!(System.find_executable("python3"), Path.join(bin, "python3.11"))
+
+      {out, 0} = install(ctx, 2, env: %{"PATH" => "#{bin}:#{System.get_env("PATH")}"})
+      assert out["status"] == "ok"
+    end
+
     test "a join naming another set is not the set", ctx do
       {out, 1} = install(ctx, 2, server_set: 7)
 
