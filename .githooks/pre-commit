@@ -1,13 +1,80 @@
 #!/bin/bash
-# The fleet's pre-commit, unchanged (#985). This repo points core.hooksPath at its
-# own .githooks so that .githooks/pre-push can add chg's shadow check (see that
-# file's header for how and why); every other hook git looks for here hands
-# straight back to claude-config's git-hooks/pre-commit, which is what ran before.
+# The commit gate for one repository holding three projects (US-52.6). Each area is judged
+# by its own checks, and only when a staged path lies in it:
 #
-# exec keeps the path in $0: the fleet hook resolves its own lib directory from
-# it. Without the fleet hook, git would have run no pre-commit at all, so this says
-# so and lets git go on, rather than stopping every commit on a machine that has
-# not synced claude-config.
+#   runner/                     mix precommit in runner/
+#   chg/ outside chg/adapters/  cargo fmt --all --check, cargo clippy, cargo test in chg/
+#   chg/adapters/elixir/        mix format --check-formatted, compile, test there
+#   chg/adapters/typescript/    node --test of its unit and integration tests there
+#   anything else but e2e/      the fleet's pre-commit ($HOME/.git-hooks/pre-commit), which
+#                               gates the root mix project as it always has
+#
+# e2e/ has no commit gate (its CI job is US-52.9). A commit staging only runner/ or chg/
+# paths never runs the root mix precommit, which knows nothing about either.
+#
+# The fleet hook runs last, through exec, so it keeps its own path in $0 (it resolves its
+# lib directory from it). Without the fleet hook, git would have run no pre-commit at all,
+# so this says so and lets git go on rather than stopping every commit on a machine that
+# has not synced claude-config.
+set -uo pipefail
+
+root=$(git rev-parse --show-toplevel) || exit 1
+
+runner=false chg=false elixir_adapter=false ts_adapter=false outside=false staged=false
+while IFS= read -r -d '' path; do
+  staged=true
+  case $path in
+    runner/*) runner=true ;;
+    chg/adapters/elixir/*) elixir_adapter=true ;;
+    chg/adapters/typescript/*) ts_adapter=true ;;
+    chg/adapters/*) ;;
+    chg/*) chg=true ;;
+    e2e/*) ;;
+    *) outside=true ;;
+  esac
+done < <(git diff --cached --name-only -z --diff-filter=ACMRD)
+
+# check <area> <dir> <command...>: runs the command in <dir>, and on failure names the area
+# and stops the commit. A commit that deletes the whole area leaves nothing to check.
+check() {
+  local area=$1 dir=$2
+  shift 2
+  if [ ! -d "$root/$dir" ]; then
+    echo "▷ $area: $dir/ is gone in this commit; nothing to check"
+    return 0
+  fi
+  echo "▶ $area: $*"
+  if ! (cd "$root/$dir" && "$@"); then
+    echo "❌ $area: '$*' failed in $dir/; the commit is stopped" >&2
+    exit 1
+  fi
+}
+
+if $runner; then
+  check runner runner mix precommit
+fi
+
+if $chg; then
+  check chg chg cargo fmt --all --check
+  check chg chg cargo clippy --all-targets --locked -- -D warnings
+  check chg chg cargo test --locked
+fi
+
+if $elixir_adapter; then
+  check chg/adapters/elixir chg/adapters/elixir mix format --check-formatted
+  check chg/adapters/elixir chg/adapters/elixir mix compile --warnings-as-errors
+  check chg/adapters/elixir chg/adapters/elixir mix test
+fi
+
+if $ts_adapter; then
+  check chg/adapters/typescript chg/adapters/typescript \
+    node --test test/unit.test.mjs test/integration.test.mjs
+fi
+
+# A commit staging nothing (an --allow-empty, a message-only amend) is the fleet hook's to
+# judge, as it was before this file routed anything.
+$outside || ! $staged || exit 0
+
 fleet="$HOME/.git-hooks/pre-commit"
 if [ ! -x "$fleet" ]; then
   echo "⚠️  $fleet not found: the fleet's pre-commit did not run; re-sync claude-config" >&2

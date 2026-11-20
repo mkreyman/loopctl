@@ -131,6 +131,36 @@ env:
 # core PLT records beam paths under the slot that built it (see the Dialyzer job).
 
 jobs:
+  # WHICH AREAS THIS CHANGE TOUCHES (US-52.6). This repository holds the server, the runner
+  # (runner/, runner-ci.yml) and chg (chg/, chg-ci.yml); every job below but deploy and smoke
+  # runs only when .github/scripts/changed-areas.sh prints `server`. Gated by `if:`, never by
+  # on.paths: a job skipped by its `if:` reports skipped, which a required check accepts,
+  # while a workflow filtered out by paths leaves the check pending for ever. A schedule or a
+  # manual run counts as every area. Self-hosted under the fork-PR guard like the jobs it
+  # gates, so on a fork PR it is skipped and so is every job that needs it, the two hosted
+  # ones (pgbouncer-e2e, smoke-preflight) included.
+  changes:
+    name: changes
+    runs-on: [self-hosted, fleet-ci]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      server: ${{ steps.areas.outputs.server }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          # See KEEPING THE COMPILED TREE at the top of this file.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - id: areas
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/areas-output.sh
+
   lint:
     name: Lint
     runs-on: [self-hosted, fleet-ci]
@@ -139,7 +169,8 @@ jobs:
     # slots' live JIT config and secrets. On a fork PR this job is SKIPPED (a skipped job
     # reports success, so required checks still pass); the human backstop is the fork-PR
     # approval policy, all_external_contributors. Same guard on every self-hosted job here.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -168,7 +199,7 @@ jobs:
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
           # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -305,7 +336,8 @@ jobs:
     name: Test
     runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
     # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
@@ -363,7 +395,7 @@ jobs:
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
           # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -515,7 +547,8 @@ jobs:
     name: Retrieval Eval
     runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -566,7 +599,7 @@ jobs:
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
           # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -746,7 +779,8 @@ jobs:
     name: Security
     runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -775,7 +809,7 @@ jobs:
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
           # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -836,7 +870,8 @@ jobs:
     name: Dialyzer
     runs-on: [self-hosted, fleet-ci]
     # Fork-PR guard — see the Lint job's comment (#881).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -865,7 +900,7 @@ jobs:
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
           # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -939,7 +974,9 @@ jobs:
     # never touch the CI Postgres the Test job runs against.
     runs-on: [self-hosted, fleet-ci]
     timeout-minutes: 30
+    needs: [changes]
     if: >
+      needs.changes.outputs.server == 'true' &&
       (github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       github.event_name == 'pull_request') &&
@@ -990,7 +1027,7 @@ jobs:
       # here: keep _build and deps warm for the slot's other jobs, drop everything else.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -1141,6 +1178,8 @@ jobs:
     # with sign-off — a test failure and an infra failure are different signals.
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true'
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -1332,7 +1371,8 @@ jobs:
     # The fork-PR guard rides along so the Lint comment's "every self-hosted job" stays
     # true and a future trigger widening (e.g. adding pull_request as a pre-merge gate)
     # can never run fork code on the shared pool.
-    if: github.event_name == 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && github.event_name == 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       # scale-nightly derives its own database per matrix file (loopctl_test_sn_<file>)
       # and drops it again at the end, so it never shared a name with anything. What it
@@ -1411,7 +1451,7 @@ jobs:
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
           # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
-          git clean -ffdx -e /_build -e /deps || {
+          git clean -ffdx -e /_build -e /deps -e /runner/_build -e /runner/deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
@@ -1621,6 +1661,8 @@ jobs:
   smoke-preflight:
     name: Pre-deploy Smoke (current release)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -1658,8 +1700,16 @@ jobs:
     # pgbouncer-e2e gates deploy (US-27.13): it is the only check that exercises the pgbouncer
     # layer, so a reintroduced pgbouncer-incompatible config must block the deploy, not just
     # go red advisorily.
-    needs: [lint, test, security, dialyzer, pgbouncer-e2e, retrieval-eval, smoke-preflight]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    #
+    # A job skipped by area (US-52.6) leaves its dependents skipped by default, so this `if:`
+    # starts with always() and then refuses any failed or cancelled need: every green merge to
+    # master deploys, whatever area it touched (KB 4d3fd7bb). `changes` is a need too, so a
+    # change set that could not be judged (and so skipped every server job) never deploys.
+    needs: [changes, lint, test, security, dialyzer, pgbouncer-e2e, retrieval-eval, smoke-preflight]
+    if: >
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     steps:
       - uses: actions/checkout@v4
 
@@ -1696,7 +1746,9 @@ jobs:
     # back (see docs/runbooks/post-deploy-smoke.md). Only on a real master push;
     # never on PRs (no live release to probe) or the nightly schedule.
     needs: [deploy]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # always() for the same reason as deploy's: a job skipped by area further up would
+    # otherwise skip this one even after deploy succeeded.
+    if: always() && needs.deploy.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
 

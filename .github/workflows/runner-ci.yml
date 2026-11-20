@@ -1,0 +1,97 @@
+name: Runner CI
+
+# The runner (runner/, US-52.4), gated only when a change touches it (US-52.6). A job skipped by
+# its `if:` reports skipped, which branch protection accepts for a required check; a workflow
+# filtered by on.paths would leave the check pending, so this workflow uses no paths filter.
+on:
+  push:
+    branches: [master, "epic/**"]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: runner-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: changes
+    runs-on: [self-hosted, fleet-ci]
+    # The fork-PR guard every self-hosted job carries (ci.yml, #881).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      runner: ${{ steps.areas.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      - id: areas
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/areas-output.sh
+
+  runner:
+    name: runner
+    needs: [changes]
+    if: needs.changes.outputs.runner == 'true'
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 30
+    env:
+      MIX_ENV: test
+    defaults:
+      run:
+        working-directory: runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      # Mix keeps build-lock files in $TMPDIR; RUNNER_TEMP is emptied at the start of each job.
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # The root pin: runner/ has no .tool-versions of its own.
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+          install-hex: false
+          install-rebar: false
+      # Retried, unconditional: the reason is at the same step in ci.yml.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then installed=true; break; fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            [ "$installed" = true ] || { echo "mix local.$tool failed after 3 attempts" >&2; exit 1; }
+          done
+      - name: Cache the dialyzer PLT
+        uses: actions/cache@v4
+        with:
+          path: runner/_build/test/*.plt*
+          key: runner-plt-${{ runner.os }}-${{ hashFiles('.tool-versions', 'runner/mix.lock') }}
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix deps.unlock --check-unused
+      - run: mix format --check-formatted
+      - run: mix credo --strict --config-file .credo.exs
+      - run: mix dialyzer
+      - run: mix test
