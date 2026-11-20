@@ -49,6 +49,9 @@ jobs:
     timeout-minutes: 30
     env:
       MIX_ENV: test
+      # The CI account carries no claude-config, so the suite drives the byte-identical copy
+      # of its claude-headless.sh (runner/test/support/test_support.ex, headless_fixture_test).
+      LOOPCTL_RUNNER_HEADLESS: fixture
     defaults:
       run:
         working-directory: runner

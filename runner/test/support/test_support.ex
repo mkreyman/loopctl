@@ -3,9 +3,25 @@ defmodule LoopctlRunner.TestSupport do
 
   alias LoopctlRunner.Config
 
-  @headless Path.expand("~/workspace/claude-config/bin/claude-headless.sh")
+  @fleet_headless Path.expand("~/workspace/claude-config/bin/claude-headless.sh")
+  @fixture_headless Path.expand("headless/claude-headless.sh", __DIR__)
 
-  def headless_launcher, do: @headless
+  @doc """
+  The launcher the suite drives: claude-config's own `claude-headless.sh` on a fleet machine,
+  or, where `LOOPCTL_RUNNER_HEADLESS=fixture` says so (runner-ci.yml; the CI account carries
+  no claude-config), the copy beside this file, which `headless_fixture_test.exs` holds byte
+  for byte to claude-config's wherever that file exists. Never a silent fallback: without the
+  variable a machine with no claude-config fails the way a misconfigured runner would.
+  """
+  def headless_launcher(env \\ System.get_env()) do
+    case Map.get(env, "LOOPCTL_RUNNER_HEADLESS") do
+      "fixture" -> @fixture_headless
+      _ -> @fleet_headless
+    end
+  end
+
+  def fleet_headless_launcher, do: @fleet_headless
+  def fixture_headless_launcher, do: @fixture_headless
 
   def fake_bin_dir, do: Path.expand("bin", __DIR__)
 
@@ -83,7 +99,7 @@ defmodule LoopctlRunner.TestSupport do
         # the production path. The after-suite canary in test_helper.exs is what notices if this
         # stops being true.
         "grant_dir" => Path.join(root, "grants"),
-        "claude_launcher" => @headless,
+        "claude_launcher" => headless_launcher(),
         "repos" => %{"fixture" => Path.join(root, "repo")},
         "branch_prefixes" => ["loop/"],
         "max_wall_clock_s" => 60,
