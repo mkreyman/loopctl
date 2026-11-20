@@ -3,7 +3,7 @@ defmodule Mix.Tasks.Loopctl.RunnerContract do
 
   @moduledoc """
   Writes `Loopctl.ApiSpec.RunnerContract` as JSON Schema to
-  `priv/runner_contract/v<major>.json`, the file `mkreyman/loopctl-runner` vendors.
+  `priv/runner_contract/v<major>.json`, the file the runner in `runner/` compiles in.
 
       mix loopctl.runner_contract
 

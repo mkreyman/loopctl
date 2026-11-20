@@ -61,8 +61,8 @@ in the `x-loopctl-runner-token` header on the websocket upgrade to `/runner/sock
 never as a query parameter. Rotating that key through `/api_keys` is refused; rotate by
 `DELETE /api/v1/runners/:id` and re-enrolling.
 
-**Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
-(`contract_version` 1.33.0), vendored into this repo rather than re-typed. The join payload must
+**Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` at the loopctl
+repository root, which the runner compiles in directly (no copy). The join payload must
 declare `machine` exactly equal to the enrolled name. It SHOULD also declare `kinds`, the
 dispatch kinds this machine runs: the field is optional, and since 1.6.0 a PRESENT AND NON-EMPTY
 one is the only thing loopctl consults for that runner. Absent or empty is read as

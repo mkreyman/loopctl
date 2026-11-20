@@ -1,10 +1,10 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
-  The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.33.0).
+  The loopctl runner wire contract: the repository root's `priv/runner_contract/v1.json`
+  (JSON Schema 2020-12), the file the server exports. Its version is `version/0`.
 
-  The file is copied, never re-typed: the server casts every payload against the same
-  document, drops unknown fields at every depth, and refuses a mismatched major version.
+  The runner compiles the server's own export, never a copy: the server casts every payload
+  against the same document, drops unknown fields at every depth, and refuses a mismatched major version.
   Validating outgoing payloads here turns a refusal the server would log into a test
   failure on this side.
 
@@ -17,7 +17,8 @@ defmodule LoopctlRunner.Contract do
   casts ids as UUIDs, and a malformed one passing here would only surface as a refusal there.
   """
 
-  @external_resource Path.expand("../../priv/runner_contract/v1.json", __DIR__)
+  # The repository root's export (Loopctl.ApiSpec.RunnerContract.export_path/0), compiled in.
+  @external_resource Path.expand("../../../priv/runner_contract/v1.json", __DIR__)
   @schema @external_resource |> File.read!() |> Jason.decode!()
 
   # A keyword is implemented here BEFORE loopctl can publish it: an unimplemented one fails

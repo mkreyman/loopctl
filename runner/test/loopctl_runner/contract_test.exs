@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.33.0",
+        "contract_version" => Contract.version(),
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,9 +20,40 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.33.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.33.0"
+  @root Path.expand("../../..", __DIR__)
 
+  test "the runner compiles the repository root's export, and no copy exists under runner/" do
+    root_version =
+      Path.join(@root, "priv/runner_contract/v1.json")
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.fetch!("x-contract-version")
+
+    assert Contract.version() == root_version
+    assert Path.wildcard(Path.join(@root, "runner/**/v1.json")) == []
+  end
+
+  test "no runner prose states the contract version, and the server no longer calls it vendored" do
+    statement = ~r/on runner contract \d|`contract_version` \d|`x-contract-version` \d/
+
+    for rel <- [
+          "runner/README.md",
+          "runner/docs/agent-delivery-loop.md",
+          "runner/lib/loopctl_runner/contract.ex"
+        ] do
+      refute File.read!(Path.join(@root, rel)) =~ statement, "#{rel} states a contract version"
+    end
+
+    for rel <- [
+          "lib/loopctl/api_spec/runner_contract.ex",
+          "lib/mix/tasks/loopctl.runner_contract.ex"
+        ] do
+      refute File.read!(Path.join(@root, rel)) =~ "loopctl-runner` vendors",
+             "#{rel} says vendored"
+    end
+  end
+
+  test "the contract names the socket and header the client uses" do
     assert %{
              "credential_header" => "x-loopctl-runner-token",
              "socket_path" => "/runner/socket/websocket",
@@ -584,7 +615,9 @@ defmodule LoopctlRunner.ContractTest do
   end
 
   defp vendored do
-    Path.expand("../../priv/runner_contract/v1.json", __DIR__) |> File.read!() |> Jason.decode!()
+    Path.expand("../../../priv/runner_contract/v1.json", __DIR__)
+    |> File.read!()
+    |> Jason.decode!()
   end
 
   # A value that visits every branch of `schema`: every property of an object, one item of an
@@ -632,7 +665,7 @@ defmodule LoopctlRunner.ContractTest do
     # top level of each definition: `properties` descends into a key the VALUE carries, so this
     # says nothing about nested schemas. The probe test above is what covers those.
     schema =
-      Path.expand("../../priv/runner_contract/v1.json", __DIR__)
+      Path.expand("../../../priv/runner_contract/v1.json", __DIR__)
       |> File.read!()
       |> Jason.decode!()
 

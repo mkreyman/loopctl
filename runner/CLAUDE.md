@@ -71,11 +71,10 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   drives the production path, and an after-suite check (`test/support/grant_canary.ex`) fails the
   run on any grant or pending file in the real directory owned by the test BEAM, and on any grant
   present at the start that is gone at the end while its owner and launcher still live.
-- **Every payload sent to loopctl is validated against the vendored contract**
-  (`priv/runner_contract/v1.json`, copied from mkreyman/loopctl, never re-typed). When loopctl
-  bumps the contract, copy the file again from loopctl MASTER, once it is merged AND deployed;
-  a branch or an unmerged master is the same trap in the other direction. Do not edit it here.
-  **A version that names a schema it does not define is not vendorable yet**, and the fix is
+- **Every payload sent to loopctl is validated against the server's contract**, the repository
+  root's `priv/runner_contract/v1.json`, compiled in by `LoopctlRunner.Contract`. There is no
+  copy under `runner/`: a server change and the runner change it needs land in one commit.
+  **A version that names a schema it does not define is not usable yet**, and the fix is
   never to write the missing definition on this side: an envelope transcribed out of loopctl's
   commit message is the re-typing this rule forbids, and the two enums then drift with nothing
   able to see it. Ask loopctl for the definition and vendor the version that carries it.

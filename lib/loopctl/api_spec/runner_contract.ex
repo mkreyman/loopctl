@@ -8,7 +8,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `cast_dispatch_reply/1`, `cast_trace_batch/1`, `cast_trace_cursor/1` inbound,
   `cast_dispatch/1` outbound) and are EXPORTED as JSON
   Schema to `priv/runner_contract/v<major>.json` (`mix loopctl.runner_contract`), which
-  `mkreyman/loopctl-runner` vendors. A test fails when the checked-in export drifts from
+  the runner in `runner/` compiles in (`LoopctlRunner.Contract`). A test fails when the checked-in export drifts from
   these declarations, so the file a runner builds against is always the file loopctl
   enforces.
 
@@ -1626,7 +1626,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # `limits/0` publishes them. Nothing restates a number.
     #
     # The per-field caps are `maxLength`/`maxItems` — the units JSON Schema counts in, and
-    # the ones the runner's vendored validator implements. OpenApiSpex counts a `maxLength`
+    # the ones the runner's validator (runner/lib/loopctl_runner/contract.ex) implements. OpenApiSpex counts a `maxLength`
     # in GRAPHEMES, which is looser than codepoints; that is harmless here because nothing
     # downstream is a Postgres CHECK, and the object cap below is counted with `ByteRule`,
     # which charges six bytes per UTF-16 unit and therefore bounds anything a loose grapheme
@@ -4726,8 +4726,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # (`RunnerSample` inside `RunnerJoin`), because `OpenApiSpex.Cast` cannot resolve a
   # module reference without a full spec, and validation must use these exact structs.
   # THE EXPORTED KEYWORD SET IS A CEILING ON WHAT MAY BE ENFORCED, not a formatting detail.
-  # `mkreyman/loopctl-runner`'s vendored validator FAILS a definition carrying a keyword it
-  # does not implement, so this list cannot grow without upgrading every runner first — and a
+  # The runner's validator (`runner/lib/loopctl_runner/contract.ex`) FAILS a definition carrying
+  # a keyword it does not implement, so this list cannot grow without upgrading every runner
+  # first — and a
   # keyword set on a `Schema` but missing here is enforced by `OpenApiSpex.Cast` while being
   # absent from the published contract. That combination refuses a join for a reason the
   # runner author cannot read anywhere: their own pre-flight check against
@@ -4744,7 +4745,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @doc """
   The JSON Schema keywords `json_schema/0` publishes — the ceiling on what any schema here
-  may enforce. See the note above `schema_to_map/1`: the runner's vendored validator refuses
+  may enforce. See the note above `schema_to_map/1`: the runner's validator (runner/lib/loopctl_runner/contract.ex) refuses
   an unknown keyword, and a keyword enforced but unpublished refuses a join for a reason the
   published contract does not state.
   """
