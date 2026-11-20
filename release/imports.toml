@@ -4,6 +4,7 @@
 repo = "mkreyman/loopctl-runner"
 prefix = "runner"
 imported_sha = "e7c7f6dc815a1f1389446da7dfaf2fee4696cc87"
+archived = true
 
 [[import]]
 repo = "mkreyman/chg"
