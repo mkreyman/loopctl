@@ -64,6 +64,8 @@ chg_config=${LOOPCTL_FACTORY_CHG_CONFIG:-$HOME/.chg/loopctl.toml}
 # still joins naming the server's current one; rollout.sh passes it then.
 server_set=${LOOPCTL_FACTORY_SERVER_SET:-$set_id}
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib/pick_python.sh"
+py=$(pick_python) || py=""
 host=$(hostname -s 2>/dev/null || hostname)
 runner_bin="$runner_prefix/current/bin/loopctl_runner"
 set_dir="$home/sets/$set_id"
@@ -77,7 +79,7 @@ chg_version=null
 
 # report <status> [detail] [exit]: the one JSON line, then exit.
 report() {
-  python3 - "$host" "$set_id" "$1" "$runner_version" "$chg_version" "${2:-}" <<'PY'
+  "${py:-python3}" - "$host" "$set_id" "$1" "$runner_version" "$chg_version" "${2:-}" <<'PY'
 import json, sys
 host, set_id, status, rv, cv, detail = sys.argv[1:7]
 out = {"host": host, "set": int(set_id), "status": status,
@@ -91,6 +93,8 @@ PY
 }
 
 fail() { report failed "$1" 1; }
+
+[ -n "$py" ] || fail "no Python 3.11+ (tomllib) on PATH, /opt/homebrew/bin or /usr/local/bin"
 
 mkdir -p "$home/sets" || fail "cannot create $home"
 
@@ -169,7 +173,7 @@ chg_matches() {
 
 # The joined.json the runner writes beside its runs directory (US-52.8).
 joined_file() {
-  python3 - "$runner_config" <<'PY'
+  "$py" - "$runner_config" <<'PY'
 import json, os, sys
 try:
     runs = json.load(open(sys.argv[1]))["runs_dir"]
@@ -182,7 +186,7 @@ PY
 # joined_at_set <file> <set> <after-epoch>: written after <after> and naming <set>; prints
 # the runner version it names.
 joined_at_set() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  "$py" - "$1" "$2" "$3" <<'PY'
 import json, os, sys
 path, want, after = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 try:
@@ -217,18 +221,18 @@ runner_joined() {
 drop_retired_sources() {
   local tree=$1 state
   [ -f "$chg_config" ] || return 0
-  state=$(python3 "$here/lib/drop_retired_sources.py" --check "$chg_config" "$tree/release/manifest.toml") ||
+  state=$("$py" "$here/lib/drop_retired_sources.py" --check "$chg_config" "$tree/release/manifest.toml") ||
     fail "cannot read $chg_config or the set's [retired] list"
   [ "$state" = pending ] || return 0
   "$chg_dest" outbox send >&2 ||
     fail "chg outbox send failed; the retired repos' sources stay in $chg_config until it succeeds"
-  python3 "$here/lib/drop_retired_sources.py" "$chg_config" "$tree/release/manifest.toml" >/dev/null ||
+  "$py" "$here/lib/drop_retired_sources.py" "$chg_config" "$tree/release/manifest.toml" >/dev/null ||
     fail "cannot rewrite $chg_config"
 }
 
 manifest_version() {
   # manifest_version <tree> <component>
-  python3 - "$1/release/manifest.toml" "$2" <<'PY'
+  "$py" - "$1/release/manifest.toml" "$2" <<'PY'
 import sys, tomllib
 with open(sys.argv[1], "rb") as f:
     print(tomllib.load(f)["components"][sys.argv[2]]["version"])
@@ -298,8 +302,12 @@ fi
 restart=$(date +%s)
 
 if [ "$has_runner" = true ]; then
-  python3 "$here/lib/rewrite_runner_config.py" "$runner_config" "$checkout" >/dev/null ||
+  "$py" "$here/lib/rewrite_runner_config.py" "$runner_config" "$checkout" >/dev/null ||
     fail "cannot rewrite $runner_config"
+  # A runner that has run nothing has no state directory, and a set-2 runner cannot record its
+  # join without one (blockit, 2026-11-20).
+  read_joined_file
+  mkdir -p "$(dirname "$jf")" || fail "cannot create $(dirname "$jf")"
   (cd "$set_dir/runner" && LOOPCTL_RUNNER_PREFIX="$runner_prefix" rel/install.sh) >&2 ||
     fail "the runner install failed (runner/rel/install.sh)"
   # The new runner is up and starts undrained; nothing is left to undo.

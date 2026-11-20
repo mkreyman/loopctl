@@ -121,6 +121,19 @@ defmodule LoopctlRunner.ControlTest do
     assert %{joined: true} = Control.info(pid)
   end
 
+  test "a runner with no state directory yet still records its join", ctx do
+    runs_dir = Path.join([ctx.root, "fresh", "state", "runs"])
+    config = %{ctx.config | runs_dir: runs_dir}
+    refute File.exists?(Path.dirname(runs_dir))
+
+    TestLoopctl.script_joins([{:ok, %{release_set: 2}}])
+    {_pid, _ref} = start_control(config)
+
+    file = Control.joined_file(config)
+    assert wait_until(fn -> File.exists?(file) end) == :ok
+    assert %{"release_set" => 2} = file |> File.read!() |> Jason.decode!()
+  end
+
   test "a release set refusing this build stops the client without rejoining", ctx do
     TestLoopctl.script_joins([
       {:error,
