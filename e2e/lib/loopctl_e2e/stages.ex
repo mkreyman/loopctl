@@ -104,15 +104,21 @@ defmodule LoopctlE2e.Stages do
     end
   end
 
+  # The push workflow runs of the PR's branch at its head: the evidence loopctl's merge gate
+  # counts, read with Actions permission. Check runs need a Checks permission a fine-grained
+  # token cannot hold (#913), so on the private sandbox that call 403s.
   defp ci_green(client, ctx) do
-    with {:ok, %{"head" => %{"sha" => sha}}} <- pull(client, ctx),
-         {:ok, 200, %{"check_runs" => [_ | _] = runs}} <-
-           Client.get(client, :github, "/repos/#{ctx.repo}/commits/#{sha}/check-runs",
+    with {:ok, %{"head" => %{"sha" => sha, "ref" => ref}}} <- pull(client, ctx),
+         {:ok, 200, %{"workflow_runs" => [_ | _] = runs}} <-
+           Client.get(client, :github, "/repos/#{ctx.repo}/actions/runs",
+             head_sha: sha,
+             branch: ref,
+             event: "push",
              per_page: 100
            ) do
       judge_checks(runs, ctx)
     else
-      {:ok, 200, %{"check_runs" => []}} -> {:wait, "no check runs yet"}
+      {:ok, 200, %{"workflow_runs" => []}} -> {:wait, "no push runs of the head yet"}
       other -> {:wait, describe(other)}
     end
   end
