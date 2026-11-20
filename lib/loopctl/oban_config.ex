@@ -626,6 +626,12 @@ defmodule Loopctl.ObanConfig do
            # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
            {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
            {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
+           # Revokes an implement session's key once its story has left that session (it
+           # escalated, finished, was released or re-placed). Without it the key held its
+           # RUNNER agent's one-key-per-role slot for its whole ~4h TTL and the dispatch driver
+           # could place nothing on that machine. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.RevokeEndedSessionDispatchesWorker},
            # Revokes api_keys whose TTL has passed. The sibling above only reaches keys a
            # DISPATCH minted; a key minted directly at POST /api/v1/api_keys with an
            # expires_at has no dispatch row, so nothing revoked it and it held its agent's
