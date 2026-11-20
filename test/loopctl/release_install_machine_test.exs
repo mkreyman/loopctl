@@ -373,6 +373,40 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       assert File.read!(Path.join(ctx.stub, "system_installs")) == "system\n"
     end
 
+    test "a system chg already at the set is not reinstalled (its sudo may need a terminal)",
+         ctx do
+      {sha, 0} =
+        System.cmd("git", ["rev-parse", "--short=12", "factory-2^{commit}"],
+          cd: Path.join(ctx.tmp, "work")
+        )
+
+      system = ctx.env["LOOPCTL_FACTORY_CHG_SYSTEM"]
+      File.mkdir_p!(Path.dirname(system))
+
+      File.write!(
+        system,
+        "#!/bin/sh\necho 'chg 2.0.0 (adapter contract 1, commit #{String.trim(sha)})'\n"
+      )
+
+      File.chmod!(system, 0o755)
+
+      {out, 0} = install(ctx, 2)
+      assert out["status"] == "ok"
+      refute File.exists?(Path.join(ctx.stub, "system_installs"))
+    end
+
+    test "a failed system install says how to run its sudo step by hand", ctx do
+      system = ctx.env["LOOPCTL_FACTORY_CHG_SYSTEM"]
+      File.mkdir_p!(Path.dirname(system))
+      File.write!(system, "#!/bin/sh\necho 'chg 0.0.1 (adapter contract 1, commit 0)'\n")
+      File.chmod!(system, 0o755)
+      File.write!(Path.join(ctx.stub, "system_install_fails"), "")
+
+      {out, 1} = install(ctx, 2)
+      assert out["detail"] =~ "ssh -t <host> 'PATH=$HOME/.asdf/shims:"
+      assert out["detail"] =~ "scripts/install-system.sh'"
+    end
+
     test "runner.json moves from mkreyman/chg to mkreyman/loopctl", ctx do
       {%{"status" => "ok"}, 0} = install(ctx, 2)
       config = ctx.config |> File.read!() |> Jason.decode!()
@@ -481,7 +515,7 @@ defmodule Loopctl.ReleaseInstallMachineTest do
     # Refreshes nothing, so a stale system install stays stale and verification must catch it.
     script!(
       Path.join([work, "chg", "scripts", "install-system.sh"]),
-      "#!/bin/sh\necho system >> \"$STUB/system_installs\"\n"
+      "#!/bin/sh\n[ -f \"$STUB/system_install_fails\" ] && exit 1\necho system >> \"$STUB/system_installs\"\n"
     )
 
     git!(work, ["add", "SET", "release", "runner", "chg"])

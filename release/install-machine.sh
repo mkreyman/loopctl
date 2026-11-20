@@ -322,9 +322,17 @@ fi
 
 (cd "$set_dir/chg" && scripts/install.sh --dest "$(dirname "$chg_dest")") >&2 ||
   fail "chg's install failed (chg/scripts/install.sh)"
+# The system install runs sudo, which asks for a password on some hosts (mac-mini). A system
+# chg that already names the set is left alone, so running that step once by hand unblocks
+# every later run.
 if [ -x "$chg_system" ]; then
-  (cd "$set_dir/chg" && scripts/install-system.sh) >&2 ||
-    fail "chg's system install failed (chg/scripts/install-system.sh). It runs sudo, so where sudo asks for a password, run it once in a terminal: ssh -t <host> 'cd $set_dir/chg && scripts/install-system.sh'"
+  case $("$chg_system" --version 2>/dev/null | head -1) in
+    "chg $want_chg "*"commit $sha"*) ;;
+    *)
+      (cd "$set_dir/chg" && scripts/install-system.sh) >&2 ||
+        fail "chg's system install failed (chg/scripts/install-system.sh). It runs sudo, so where sudo asks for a password, run it once in a terminal, then run the install again: ssh -t <host> 'PATH=\$HOME/.asdf/shims:/opt/homebrew/bin:/usr/local/bin:\$PATH; cd $set_dir/chg && scripts/install-system.sh'"
+      ;;
+  esac
 fi
 
 # The swap: a new symlink renamed over the old one, so `current` is never missing.
