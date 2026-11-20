@@ -739,6 +739,12 @@ defmodule Loopctl.Runners.Capacity do
     # transition (verify, merge, deploy) no runner message carries its dispatch id, so nothing
     # released it before the wall clock ran out: about two hours of a runner taking no work
     # (2026-11-20, the e2e verifier found no free runner).
+    #
+    # IMPLEMENT dispatches only: the implement session is the one the stage row tracks, the
+    # one `session_over?/2` judges. Other kinds run while the story already sits at such a
+    # stage — `reply_draft@1` drafts for a story triage left at `failed` or `escalated`, under
+    # that same claim epoch — so for them a session-ending stage says nothing about whether
+    # their session is over, and this rule would free a slot still in use.
     session_ended_stage =
       from s in StoryStage,
         where: s.tenant_id == parent_as(:dispatch).tenant_id,
@@ -762,7 +768,7 @@ defmodule Loopctl.Runners.Capacity do
       where:
         d.status in ["refused", "superseded"] or
           (not is_nil(d.story_id) and not exists(claim_current)) or
-          (not is_nil(d.story_id) and exists(session_ended_stage)) or
+          (d.kind == "implement" and exists(session_ended_stage)) or
           not exists(runner_active) or undelivered_too_long(d, ^now) or
           unanswered_too_long(d, ^now) or wall_clock_over(d, ^now),
       select: d.id

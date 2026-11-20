@@ -800,7 +800,7 @@ defmodule Loopctl.Runners.CapacityTest do
     end
 
     test "releases a session whose story reached a session-ending stage under its claim, and only that" do
-      runner = runner(%{max_sessions: 4})
+      runner = runner(%{max_sessions: 6})
       tid = runner.tenant_id
 
       at = fn stage, stage_epoch ->
@@ -812,7 +812,8 @@ defmodule Loopctl.Runners.CapacityTest do
           tenant_id: tid,
           story_id: s.id,
           stage: stage,
-          claim_epoch: stage_epoch
+          claim_epoch: stage_epoch,
+          escalation_reason: if(stage == :escalated, do: "escalated in test")
         )
 
         d
@@ -823,11 +824,21 @@ defmodule Loopctl.Runners.CapacityTest do
       deployed = at.(:deployed, d_epoch)
       other_claim = at.(:done, d_epoch + 1)
 
-      assert heal(runner) == {:ok, %{released: 2, in_flight: 2}}
+      # reply_draft@1 runs while triage's verdict holds the story at failed/escalated under
+      # this same epoch: its session is live, whatever the stage says.
+      drafting =
+        for stage <- [:failed, :escalated] do
+          d = at.(stage, d_epoch)
+          force_dispatch(runner, d.dispatch_id, kind: "reply_draft")
+          d
+        end
+
+      assert heal(runner) == {:ok, %{released: 2, in_flight: 4}}
       assert record(runner, done.dispatch_id).released_at
       assert record(runner, deployed.dispatch_id).released_at
       assert record(runner, waiting.dispatch_id).released_at == nil
       assert record(runner, other_claim.dispatch_id).released_at == nil
+      for d <- drafting, do: assert(record(runner, d.dispatch_id).released_at == nil)
     end
 
     test "releases a dispatch whose story is gone" do
