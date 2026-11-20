@@ -97,13 +97,20 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
 
       assert 5 == Enum.count(all_enqueued(worker: WebhookDeliveryWorker))
 
-      drained = Oban.drain_queue(queue: :webhooks)
+      # One job per fetch (#1070). An unlimited drain marks all five `executing` at once
+      # and runs them in RETURNING order, which Postgres does not fix; a higher-id job
+      # run first then sees >= 3 lower-id executing peers, and FairShare's rank gate
+      # (cap 3 on :webhooks) snoozes it. The gate is right to: that is co-fetch
+      # tie-breaking. Fetching one at a time keeps each job at rank 0, so the result
+      # cannot depend on order. with_scheduled stays off, so a snooze is still counted.
+      drained = Oban.drain_queue(queue: :webhooks, with_limit: 1, with_recursion: true)
+      seen = "drained #{inspect(drained)}, states #{inspect(job_states("webhooks", tenant.id))}"
 
       # Blocked is TERMINAL and CLEAN: the job succeeded at doing the right thing
       # (recording the refusal), so it neither fails nor snoozes.
-      assert Map.get(drained, :success, 0) == 5
-      assert Map.get(drained, :failure, 0) == 0
-      assert Map.get(drained, :snoozed, 0) == 0
+      assert Map.get(drained, :success, 0) == 5, seen
+      assert Map.get(drained, :failure, 0) == 0, seen
+      assert Map.get(drained, :snoozed, 0) == 0, seen
 
       states = job_states("webhooks", tenant.id)
       assert Map.get(states, "retryable", 0) == 0

@@ -624,7 +624,9 @@ defmodule Loopctl.Projects do
 
     projects =
       base_query
-      |> order_by([p], asc: p.name)
+      # Names are not unique, so `id` breaks ties: without it, offset pages over tied
+      # names have no stable order and a reader can skip a project or see one twice.
+      |> order_by([p], asc: p.name, asc: p.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()

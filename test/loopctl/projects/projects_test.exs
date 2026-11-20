@@ -1287,6 +1287,36 @@ defmodule Loopctl.ProjectsTest do
       assert names == ["alpha-project", "zeta-project"]
     end
 
+    test "pages over tied names return every project exactly once, ordered by id" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+
+      tied =
+        for i <- 1..7 do
+          fixture(:project, %{tenant_id: tenant.id, name: "same-name", slug: "same-#{i}"})
+        end
+
+      first = fixture(:project, %{tenant_id: tenant.id, name: "aaa", slug: "aaa"})
+      last = fixture(:project, %{tenant_id: tenant.id, name: "zzz", slug: "zzz"})
+      fixture(:project, %{tenant_id: other.id, name: "same-name", slug: "same-other"})
+
+      pages =
+        for page <- 1..3 do
+          {:ok, result} = Projects.list_projects(tenant.id, page: page, page_size: 3)
+          Enum.map(result.data, & &1.id)
+        end
+
+      ids = List.flatten(pages)
+      expected = [first.id | tied |> Enum.map(& &1.id) |> Enum.sort()] ++ [last.id]
+
+      assert ids == expected
+      assert ids == Enum.uniq(ids)
+
+      # The same page asked twice answers the same rows in the same order.
+      {:ok, again} = Projects.list_projects(tenant.id, page: 2, page_size: 3)
+      assert Enum.map(again.data, & &1.id) == Enum.at(pages, 1)
+    end
+
     test "caps page_size at 100" do
       tenant = fixture(:tenant)
       fixture(:project, %{tenant_id: tenant.id})
