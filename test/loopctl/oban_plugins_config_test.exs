@@ -767,6 +767,28 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "RevokeEndedSessionDispatchesWorker crontab entry" do
+    test "the ended-session sweep is scheduled every minute and not parked" do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+      {Oban.Plugins.Cron, cron_opts} = Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.RevokeEndedSessionDispatchesWorker} -> true
+          {_schedule, Loopctl.Workers.RevokeEndedSessionDispatchesWorker, _opts} -> true
+          _ -> false
+        end)
+
+      assert entry,
+             "without it an ended implement session's key holds its runner agent's " <>
+               "one-key-per-role slot for its whole TTL, and nothing is placed on that runner"
+
+      assert elem(entry, 0) == "* * * * *"
+
+      refute Loopctl.Workers.RevokeEndedSessionDispatchesWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "#803: ReclaimExpiredClaimsWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
