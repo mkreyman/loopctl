@@ -215,7 +215,65 @@ defmodule Loopctl.Knowledge.ScaleSeed do
 
   # A seed establishes the statistics its gate reads, for every relation it wrote, rather
   # than leaving them to autovacuum's timing. The names are this module's own literals.
-  defp analyze!(tables), do: Enum.each(tables, &AdminRepo.query!("ANALYZE #{&1}"))
+  defp analyze!(tables), do: analyze_and_confirm!(tables)
+
+  @doc """
+  Runs `ANALYZE` on each table and raises unless every table's
+  `pg_stat_user_tables.last_analyze` moved past the value read before it (story
+  100.38). An `ANALYZE` that never reached the statistics leaves the planner on the old
+  estimate, and the plan gate then fails on a plan rather than on its cause.
+
+  The statistics view is refreshed asynchronously, so the read retries with backoff. `opts`
+  inject the seams a unit test replaces: `:analyze` (table -> any), `:last_analyze`
+  (table -> `DateTime.t() | NaiveDateTime.t() | nil`), `:sleep` (ms -> any) and
+  `:attempts` (default 6).
+  """
+  @spec analyze_and_confirm!([String.t()], keyword()) :: :ok
+  def analyze_and_confirm!(tables, opts \\ []) do
+    analyze = Keyword.get(opts, :analyze, &AdminRepo.query!("ANALYZE #{&1}"))
+    read = Keyword.get(opts, :last_analyze, &last_analyze_of/1)
+    sleep = Keyword.get(opts, :sleep, &Process.sleep/1)
+    attempts = Keyword.get(opts, :attempts, 6)
+
+    before = Map.new(tables, &{&1, read.(&1)})
+    Enum.each(tables, analyze)
+
+    case await_analyzed(tables, before, read, sleep, attempts, 100) do
+      [] ->
+        :ok
+
+      stale ->
+        raise "ANALYZE did not reach pg_stat_user_tables.last_analyze for " <>
+                Enum.map_join(stale, ", ", &"#{&1} (still #{inspect(before[&1])})") <>
+                "; the planner is still on the earlier statistics"
+    end
+  end
+
+  defp await_analyzed(tables, before, read, sleep, attempts, delay_ms) do
+    stale = Enum.reject(tables, &advanced?(read.(&1), before[&1]))
+
+    if stale == [] or attempts <= 1 do
+      stale
+    else
+      sleep.(delay_ms)
+      await_analyzed(stale, before, read, sleep, attempts - 1, delay_ms * 2)
+    end
+  end
+
+  defp advanced?(nil, _before), do: false
+  defp advanced?(_now, nil), do: true
+  defp advanced?(%DateTime{} = now, %DateTime{} = was), do: DateTime.compare(now, was) == :gt
+  defp advanced?(now, was), do: NaiveDateTime.compare(now, was) == :gt
+
+  defp last_analyze_of(table) do
+    case AdminRepo.query!(
+           "SELECT last_analyze FROM pg_stat_user_tables WHERE relname = $1",
+           [table]
+         ) do
+      %{rows: [[ts]]} -> ts
+      _ -> nil
+    end
+  end
 
   defp seed_plan_gate_memories(tenant_id, subject_id, count, now) do
     existing = plan_gate_memory_ids(tenant_id, subject_id, count)
