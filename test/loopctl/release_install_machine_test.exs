@@ -14,6 +14,8 @@ defmodule Loopctl.ReleaseInstallMachineTest do
   #!/usr/bin/env bash
   set -eu
   [ -f "$STUB/runner_install_fails" ] && exit 1
+  # A Mac's non-interactive ssh: mix only through asdf's shims under HOME.
+  [ -f "$STUB/needs_shim_mix" ] && [ "$(command -v mix)" != "$HOME/.asdf/shims/mix" ] && exit 1
   mkdir -p "$LOOPCTL_RUNNER_PREFIX/current/bin"
   cat > "$LOOPCTL_RUNNER_PREFIX/current/bin/loopctl_runner" <<'BIN'
   #!/usr/bin/env bash
@@ -330,6 +332,17 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       assert out["status"] == "ok"
     end
 
+    test "asdf's shims under HOME are on PATH for the runner build", ctx do
+      shims = Path.join([ctx.env["HOME"], ".asdf", "shims"])
+      File.mkdir_p!(shims)
+      File.write!(Path.join(shims, "mix"), "#!/bin/sh\nexit 0\n")
+      File.chmod!(Path.join(shims, "mix"), 0o755)
+      File.write!(Path.join(ctx.stub, "needs_shim_mix"), "")
+
+      {out, 0} = install(ctx, 2)
+      assert out["status"] == "ok"
+    end
+
     test "a join naming another set is not the set", ctx do
       {out, 1} = install(ctx, 2, server_set: 7)
 
@@ -358,6 +371,40 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       assert out["status"] == "failed"
       assert out["detail"] =~ "chg --version does not name 2.0.0"
       assert File.read!(Path.join(ctx.stub, "system_installs")) == "system\n"
+    end
+
+    test "a system chg already at the set is not reinstalled (its sudo may need a terminal)",
+         ctx do
+      {sha, 0} =
+        System.cmd("git", ["rev-parse", "--short=12", "factory-2^{commit}"],
+          cd: Path.join(ctx.tmp, "work")
+        )
+
+      system = ctx.env["LOOPCTL_FACTORY_CHG_SYSTEM"]
+      File.mkdir_p!(Path.dirname(system))
+
+      File.write!(
+        system,
+        "#!/bin/sh\necho 'chg 2.0.0 (adapter contract 1, commit #{String.trim(sha)})'\n"
+      )
+
+      File.chmod!(system, 0o755)
+
+      {out, 0} = install(ctx, 2)
+      assert out["status"] == "ok"
+      refute File.exists?(Path.join(ctx.stub, "system_installs"))
+    end
+
+    test "a failed system install says how to run its sudo step by hand", ctx do
+      system = ctx.env["LOOPCTL_FACTORY_CHG_SYSTEM"]
+      File.mkdir_p!(Path.dirname(system))
+      File.write!(system, "#!/bin/sh\necho 'chg 0.0.1 (adapter contract 1, commit 0)'\n")
+      File.chmod!(system, 0o755)
+      File.write!(Path.join(ctx.stub, "system_install_fails"), "")
+
+      {out, 1} = install(ctx, 2)
+      assert out["detail"] =~ "ssh -t <host> 'PATH=$HOME/.asdf/shims:"
+      assert out["detail"] =~ "scripts/install-system.sh'"
     end
 
     test "runner.json moves from mkreyman/chg to mkreyman/loopctl", ctx do
@@ -468,7 +515,7 @@ defmodule Loopctl.ReleaseInstallMachineTest do
     # Refreshes nothing, so a stale system install stays stale and verification must catch it.
     script!(
       Path.join([work, "chg", "scripts", "install-system.sh"]),
-      "#!/bin/sh\necho system >> \"$STUB/system_installs\"\n"
+      "#!/bin/sh\n[ -f \"$STUB/system_install_fails\" ] && exit 1\necho system >> \"$STUB/system_installs\"\n"
     )
 
     git!(work, ["add", "SET", "release", "runner", "chg"])
