@@ -16,6 +16,7 @@ defmodule LoopctlE2e.Client do
 
   @callback get(conn :: term(), service(), path :: String.t(), params :: keyword()) :: result()
   @callback post(conn :: term(), service(), path :: String.t(), body :: map()) :: result()
+  @callback put(conn :: term(), service(), path :: String.t(), body :: map()) :: result()
 
   @doc "GET `path` on `service` through `client`."
   @spec get(t(), service(), String.t(), keyword()) :: result()
@@ -25,4 +26,8 @@ defmodule LoopctlE2e.Client do
   @doc "POST `body` to `path` on `service` through `client`."
   @spec post(t(), service(), String.t(), map()) :: result()
   def post({module, conn}, service, path, body), do: module.post(conn, service, path, body)
+
+  @doc "PUT `body` to `path` on `service` through `client`."
+  @spec put(t(), service(), String.t(), map()) :: result()
+  def put({module, conn}, service, path, body), do: module.put(conn, service, path, body)
 end

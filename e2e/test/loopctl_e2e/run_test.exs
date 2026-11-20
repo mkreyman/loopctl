@@ -23,10 +23,16 @@ defmodule LoopctlE2e.RunTest do
 
   defp stage(name), do: {:ok, 200, %{"stage" => %{"stage" => name, "escalation_reason" => nil}}}
 
+  @long_id "20261120010203abcdef"
+
+  defp seed_path(run_id), do: "/repos/#{@repo}/contents/lib/sandbox/runs/r#{run_id}.ex"
+
   defp happy_script do
     pr = %{"number" => 3, "head" => %{"ref" => "loopctl/story-7-abcdef12", "sha" => "h1"}}
 
     %{
+      {:github, :put, seed_path("r1")} => [{:ok, 201, %{}}],
+      {:github, :put, seed_path(@long_id)} => [{:ok, 201, %{}}],
       {:github, :post, "/repos/#{@repo}/issues"} => [{:ok, 201, %{"number" => 5}}],
       {:loopctl, :get, "/api/v1/stories"} => [
         {:ok, 200, %{"data" => []}},
@@ -75,16 +81,25 @@ defmodule LoopctlE2e.RunTest do
     client = StubClient.start(happy_script())
     {opts, sleeps} = clock()
 
-    assert {:ok, ctx} = Run.execute(client, @sandbox, "20261120010203abcdef", opts)
+    assert {:ok, ctx} = Run.execute(client, @sandbox, @long_id, opts)
     assert ctx.story == @story
     assert ctx.pr == 3
     assert ctx.merge_sha == "m1"
 
-    [{{:github, :post, _}, issue} | _] = StubClient.calls(client)
+    # The defect is on master before the issue reporting it exists.
+    [{{:github, :put, put_path}, seed}, {{:github, :post, _}, issue} | _] =
+      StubClient.calls(client)
+
+    assert put_path == seed_path(@long_id)
+    source = Base.decode64!(seed.content)
+    assert source =~ "defmodule Sandbox.Runs.R#{@long_id} do"
+    assert source =~ ~s(def value, do: "unset")
+    assert source =~ ~s(Returns this run's id, `\\"#{@long_id}\\"`)
 
     assert issue.title ==
-             "e2e 20261120010203abcdef: add Sandbox.Runs.R20261120010203abcdef.value/0 returning 20261120010203abcdef"
+             "e2e #{@long_id}: Sandbox.Runs.R#{@long_id}.value/0 returns \"unset\" instead of #{@long_id}"
 
+    assert issue.body =~ "lib/sandbox/runs/r#{@long_id}.ex"
     assert issue.labels == ["loopctl"]
 
     # One wait for the story and one for the checks, each the first poll interval.
@@ -180,6 +195,26 @@ defmodule LoopctlE2e.RunTest do
       assert StubClient.calls(client) == [], inspect(project_id)
       assert sleeps.() == []
     end
+  end
+
+  test "a seed GitHub refuses fails the run before any issue is opened" do
+    client =
+      StubClient.start(%{happy_script() | {:github, :put, seed_path("r1")} => [{:ok, 409, %{}}]})
+
+    {opts, _sleeps} = clock()
+
+    assert {:error, %{stage: :seeded, story_id: nil, last_state: state}} =
+             Run.execute(client, @sandbox, "r1", opts)
+
+    assert state =~ "409"
+    refute Enum.any?(StubClient.calls(client), &match?({{:github, :post, _}, _}, &1))
+  end
+
+  test "the seeded module is valid Elixir whose value contradicts its own doc" do
+    {path, source} = Run.seed("r1")
+    assert path == "lib/sandbox/runs/rr1.ex"
+    assert {:ok, _ast} = Code.string_to_quoted(source)
+    assert Code.format_string!(source) |> IO.iodata_to_binary() == String.trim_trailing(source)
   end
 
   test "a transport failure is one failed poll, and the next poll goes on" do

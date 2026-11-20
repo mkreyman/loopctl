@@ -39,15 +39,42 @@ defmodule LoopctlE2e.Run do
       Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)
   end
 
-  @doc "The issue a run opens (AC-52.9.3)."
+  @doc """
+  The defect a run seeds on the sandbox's master before it files the issue (AC-52.9.3):
+  `{path, contents}` of a module whose `value/0` returns `"unset"` while its `@doc` says it
+  returns the run id.
+
+  The issue reports a DEFECT, never a request to add something: the triage trio classifies a
+  request for a capability the system never had as a workflow change, and Gate A escalates every
+  workflow change to a person by design, so an "add" issue could never reach done unattended.
+  A wrong value is a defect fix by the trio's own operational test.
+  """
+  @spec seed(String.t()) :: {String.t(), String.t()}
+  def seed(run_id) do
+    {"lib/sandbox/runs/r#{run_id}.ex",
+     """
+     defmodule Sandbox.Runs.R#{run_id} do
+       @moduledoc "Seeded by loopctl's e2e run #{run_id} (US-52.9)."
+
+       @doc "Returns this run's id, `\\"#{run_id}\\"`."
+       @spec value() :: String.t()
+       def value, do: "unset"
+     end
+     """}
+  end
+
+  @doc "The issue a run opens about its seeded defect (AC-52.9.3)."
   @spec issue(String.t(), String.t()) :: map()
   def issue(run_id, label) do
+    {path, _contents} = seed(run_id)
+
     %{
-      title: "e2e #{run_id}: add Sandbox.Runs.R#{run_id}.value/0 returning #{run_id}",
+      title:
+        ~s(e2e #{run_id}: Sandbox.Runs.R#{run_id}.value/0 returns "unset" instead of #{run_id}),
       body:
-        "Add `lib/sandbox/runs/r#{run_id}.ex` defining `Sandbox.Runs.R#{run_id}` with " <>
-          "`value/0` returning the string `\"#{run_id}\"`, and a test asserting it.\n\n" <>
-          "Opened by loopctl's nightly e2e run (US-52.9).",
+        ~s(`Sandbox.Runs.R#{run_id}.value/0` in `#{path}` returns `"unset"`, but its `@doc` ) <>
+          ~s(says it returns this run's id, `"#{run_id}"`. Make it return `"#{run_id}"` and ) <>
+          "add a test asserting it.\n\nOpened by loopctl's nightly e2e run (US-52.9).",
       labels: [label]
     }
   end
@@ -81,6 +108,21 @@ defmodule LoopctlE2e.Run do
   end
 
   defp open_and_walk(client, sandbox, run_id, opts) do
+    {path, contents} = seed(run_id)
+
+    case Client.put(client, :github, "/repos/#{sandbox.repo}/contents/#{path}", %{
+           message: "e2e #{run_id}: seed the defect the run's issue reports",
+           content: Base.encode64(contents)
+         }) do
+      {:ok, 201, _} ->
+        open_issue(client, sandbox, run_id, opts)
+
+      other ->
+        {:error, %{stage: :seeded, story_id: nil, last_state: inspect(other, limit: 5)}}
+    end
+  end
+
+  defp open_issue(client, sandbox, run_id, opts) do
     log = Keyword.get(opts, :log, fn _ -> :ok end)
 
     case Client.post(
