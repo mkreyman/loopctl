@@ -7,7 +7,8 @@
 # 1. Preflight: loopctl's /.well-known/loopctl release.set equals the manifest's set (the
 #    server deploys from master on its own), and npm has loopctl-mcp-server at the set's mcp
 #    version (machines launch it through claude-config's bin/loopctl-mcp.sh).
-# 2. Each host of FLEET_MACHINES in turn, niced, over ssh: release/install-machine.sh <set>
+# 2. Each host of FLEET_MACHINES in turn, niced, over ssh (the host this runs on, in place):
+#    release/install-machine.sh <set>
 #    from that host's own factory checkout, bootstrapped from this tree's copy on first use.
 #    An unreachable host is reported and skipped.
 # 3. Every host ok or unchanged: dispatch .github/workflows/e2e.yml and wait for it. A failed
@@ -101,7 +102,7 @@ install_on() {
   fi
   # The machine runs install-machine.sh from this tree: its own factory checkout may not exist
   # yet, and the script fetches the set's tree itself. It runs helpers from "$here/lib/", so the
-  # WHOLE lib directory goes with it, as one tar on ssh's stdin; a helper added there later
+  # WHOLE lib directory goes with it, as one tar on the command's stdin; a helper added there later
   # cannot be left behind. COPYFILE_DISABLE keeps macOS tar from adding ._ files.
   COPYFILE_DISABLE=1 tar -C "$here" --exclude=__pycache__ -cf - install-machine.sh lib |
     on_host "$host" "d=\$(mktemp -d) && tar -C \"\$d\" -xf - &&
@@ -112,7 +113,7 @@ LOOPCTL_FACTORY_SERVER_SET=$set_id nice -n 10 bash \"\$d/install-machine.sh\" $t
 status_of() { "$py" -c 'import json,sys; print(json.loads(sys.argv[1]).get("status",""))' "$1" 2>/dev/null; }
 
 # as_host <line> <host> <set>: the line under the fleet name it was installed as (a Mac reports its
-# Computer Name), or a failed line when the host printed no JSON.
+# Computer Name), or a failed line when the host printed no JSON object.
 as_host() {
   "$py" - "$1" "$2" "$3" <<'PY'
 import json, sys
@@ -120,6 +121,8 @@ line, host, set_id = sys.argv[1:4]
 try:
     j = json.loads(line)
 except ValueError:
+    j = None
+if not isinstance(j, dict):
     j = {"set": int(set_id), "status": "failed", "runner_version": None, "chg_version": None,
          "detail": "no result line: " + line[:200]}
 j["host"] = host

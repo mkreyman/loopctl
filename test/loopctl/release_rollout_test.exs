@@ -215,6 +215,15 @@ defmodule Loopctl.ReleaseRolloutTest do
     refute File.exists?(Path.join(ctx.stub, "dispatched"))
   end
 
+  test "a host whose last line is JSON but not an object is a failed host", ctx do
+    stub!(ctx.stub, "ssh", ~s(#!/usr/bin/env bash\n[ "$2" = true ] && exit 0\necho 0\n))
+
+    {out, 1} = rollout(ctx)
+    assert out =~ ~r/alpha\s+#{@set}\s+failed/
+    assert out =~ "no result line: 0"
+    refute out =~ "Traceback"
+  end
+
   defp rollout(ctx), do: System.cmd("bash", [@script], env: ctx.env, stderr_to_stdout: true)
 
   defp installs(ctx) do
