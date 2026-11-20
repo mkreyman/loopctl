@@ -271,6 +271,21 @@ defmodule Loopctl.TenantsTest do
   end
 
   describe "list_tenants_admin/1" do
+    test "tenants sharing a name page in id order, each exactly once" do
+      # Tenant names are not unique, so name alone leaves tied rows free to move between
+      # OFFSET pages. A unique name keeps other async tests' tenants out of the search.
+      name = "tiebreak-#{System.unique_integer([:positive])}"
+      ids = for _ <- 1..5, do: fixture(:tenant, %{name: name}).id
+
+      paged =
+        for page <- 1..3 do
+          {:ok, result} = Tenants.list_tenants_admin(search: name, page: page, page_size: 2)
+          Enum.map(result.data, & &1.tenant.id)
+        end
+
+      assert List.flatten(paged) == Enum.sort(ids)
+    end
+
     test "search escapes LIKE metacharacters" do
       # Create tenants with names containing LIKE special characters
       fixture(:tenant, %{name: "100% Complete"})

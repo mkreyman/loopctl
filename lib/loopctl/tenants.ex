@@ -1231,7 +1231,7 @@ defmodule Loopctl.Tenants do
 
     tenants =
       base_query
-      |> order_by([t], asc: t.name)
+      |> order_by([t], asc: t.name, asc: t.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()

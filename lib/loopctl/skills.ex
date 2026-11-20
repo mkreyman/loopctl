@@ -126,7 +126,7 @@ defmodule Loopctl.Skills do
 
     skills =
       base_query
-      |> order_by([s], asc: s.name)
+      |> order_by([s], asc: s.name, asc: s.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
