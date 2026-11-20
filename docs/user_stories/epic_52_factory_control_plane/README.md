@@ -191,7 +191,7 @@ is bound to `docs/design-system.md`:
 | `GET /docs/delivery-loop` (new) | renders `docs/agent-delivery-loop.md` with the docs page's nav and WikiShowLive's prose classes, its pre classes set to section 5's Code Blocks | 2 Color Palette (dark only), 3 Typography, 4 Layout Principles, 5 Navigation (Landing Page) and Code Blocks | 52.65 |
 | landing and docs navs (top and mobile) and footers | the GitHub link becomes the npm package link, labelled npm, in the templates and in the design system's nav drawing | 5 Navigation (Landing Page) | 52.65 |
 | landing hero and closing CTA | the secondary 'View on GitHub' CTA becomes 'View on npm' to the npm package, in the template and in the design system's hero drawing and its two-CTA rule | 7 Hero Section | 52.65 |
-| terms and privacy Contact sections | the operator address replaces GitHub issues | 3 Typography | 52.65 |
+| terms and privacy Contact sections | support@ecommercefriendly.com replaces GitHub issues | 3 Typography | 52.65 |
 
 ## What "done" means, for every story
 
@@ -514,10 +514,10 @@ is bound to `docs/design-system.md`:
 - **Policy (52.51):** `factory/policy.toml`, `Loopctl.Factory.Policy` and `GET /api/v1/factory/policy`.
 - **Pack (52.52):**
   - `mix factory.pack [--check]`;
-  - `factory/pack/` (the plugin `loopctl-factory`) and `factory/pack-review-rounds/`;
+  - `factory/pack/` (the plugin `loopctl-factory`), `factory/pack-review-rounds/` and `factory/pack-kb-first/` (the plugin `kb-first`);
   - the root `.claude-plugin/marketplace.json` (the marketplace `loopctl-factory`);
-  - `hooks/lib/policy.sh` and `hooks/lib/loopctl.sh`;
-  - the stable link `~/.claude/factory`.
+  - `hooks/lib/policy.sh`, `hooks/lib/loopctl.sh` and `bin/loopctl-mcp.sh` (the launcher of the user-scope `loopctl` MCP server);
+  - the stable link `~/.claude/factory` and the policy cache `~/.claude/factory-cache/policy.json`.
 - **Review rounds (52.53):** `Loopctl.Factory.ReviewRounds`, the routes `/api/v1/review_rounds` and `/api/v1/review_rounds/:round_id/void`, and the error codes `review_ceiling_reached`, `review_round_not_found`, `attestation_reason_required` and `work_item_not_found`.
 - **Release manifest (52.52):** the component `[components.factory_pack]`.
 - **E2E (52.55):** `E2E.ConfigDir` and `E2E.WriteScope`.
