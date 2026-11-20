@@ -367,9 +367,8 @@ defmodule Loopctl.Intake do
   # For a `pr`/`chg` source it makes the bound project the repo's one project (US-52.3):
   #   - a project with no `repo_url` takes the source's repo, so `resolve_project({repo_url})`
   #     finds it and no second project can claim the repo (the index refuses a race);
-  #   - an active `:kb` scope is promoted to `:work`, keeping its open channel.
-  # A project that already holds a DIFFERENT repo is not refused yet: the test corpus binds
-  # sources that way throughout, and the refusal is tracked as its own issue.
+  #   - an active `:kb` scope is promoted to `:work`, keeping its open channel;
+  #   - a project that already holds a DIFFERENT repo is refused (422 on `repo_full_name`).
   # A `ledger` source binds nothing, so it changes nothing here.
   #
   # Returns `{:ok, claim}`: `nil` when nothing changed, else the project as it was and the
@@ -395,10 +394,25 @@ defmodule Loopctl.Intake do
       mode == :ledger ->
         {:ok, nil}
 
+      holds_other_repo?(project, repo) ->
+        {:error,
+         Ecto.Changeset.add_error(
+           changeset,
+           :repo_full_name,
+           "is not the repository project #{project.slug} holds (#{project.repo_url}); " <>
+             "enrol it on the project resolve_project returns for that repository"
+         )}
+
       true ->
         claim_repo(tenant_id, project, repo)
     end
   end
+
+  # A project that names a repo holds THAT repo: a source for another repo would post its
+  # escalations on this project's channel, where sessions in the other repo never look (#1072).
+  # `repo_key` is the one parse of `repo_url` (US-52.1); nil when the project names no repo.
+  defp holds_other_repo?(%Project{repo_key: nil}, _repo), do: false
+  defp holds_other_repo?(%Project{repo_key: key}, repo), do: key != RepoUrl.key(repo)
 
   defp claim_repo(tenant_id, project, repo) do
     changes =

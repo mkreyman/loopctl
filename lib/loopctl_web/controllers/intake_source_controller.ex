@@ -349,7 +349,11 @@ defmodule LoopctlWeb.IntakeSourceController do
            "project of the tenant holds this repo (US-52.1: bind the source to that project). " <>
            "`pr_route_in_flight`, with `story_ids`, for a `chg` enrolment: " <>
            Intake.pr_route_in_flight_message(), "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error. Among them, `details.repo_full_name` when the project already " <>
+           "names a DIFFERENT repo in its `repo_url`: a project holds one repo (#1072), so " <>
+           "enrol the source on the project `resolve_project` returns for its repo.",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

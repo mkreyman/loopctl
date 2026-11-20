@@ -147,7 +147,11 @@ defmodule Loopctl.Changes.EventsTest do
       {:ok, _} = Loopctl.Intake.revoke_source(ctx.tenant_id, ctx.source.id)
 
       %{secret: secret, source: source} =
-        fixture(:chg_source, %{tenant_id: ctx.tenant_id, repo_full_name: "MKreyman/Infra"})
+        fixture(:chg_source, %{
+          tenant_id: ctx.tenant_id,
+          project_id: ctx.source.project_id,
+          repo_full_name: "MKreyman/Infra"
+        })
 
       ctx = %{ctx | secret: secret, source: source}
       seven = event("C1", 7, %{repo: "MKreyman/Infra"})

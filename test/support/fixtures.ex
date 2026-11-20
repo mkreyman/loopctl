@@ -52,6 +52,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Memory.SessionPromotion
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
+  alias Loopctl.Projects.RepoUrl
   alias Loopctl.QualityAssurance.UiTestRun
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchRecord
@@ -481,7 +482,9 @@ defmodule Loopctl.Fixtures do
       %{
         name: "Test Project #{seq}",
         slug: "test-project-#{seq}",
-        repo_url: "https://github.com/example/project-#{seq}",
+        # No repo by default: a project that names one holds it, and an intake source for any
+        # other repo is refused (#1072). A test that needs one names it.
+        repo_url: nil,
         description: "A test project",
         tech_stack: "elixir/phoenix",
         metadata: %{}
@@ -2605,7 +2608,7 @@ defmodule Loopctl.Fixtures do
   def fixture(:merge_ready_story, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
-    project = fixture(:project, %{tenant_id: tenant_id})
+    project = fixture(:project, %{tenant_id: tenant_id, repo_url: nil})
     epic = fixture(:epic, %{tenant_id: tenant_id, project_id: project.id})
     agent = fixture(:agent, %{tenant_id: tenant_id, agent_type: :implementer})
     verifier_agent = fixture(:agent, %{tenant_id: tenant_id, agent_type: :orchestrator})
@@ -2721,7 +2724,7 @@ defmodule Loopctl.Fixtures do
       end)
 
     {_raw, operator_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
-    project = fixture(:project, %{tenant_id: tenant.id})
+    project = fixture(:project, %{tenant_id: tenant.id, repo_url: nil})
     epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
 
     {_secret, source} =
@@ -3128,9 +3131,11 @@ defmodule Loopctl.Fixtures do
         tid -> tid
       end
 
+    # A project that names a repo holds only that repo (#1072), so the default project names
+    # none and the enrolment claims the source's repo for it.
     project_id =
       case Map.get(attrs, :project_id) do
-        nil -> fixture(:project, %{tenant_id: tenant_id}).id
+        nil -> fixture(:project, %{tenant_id: tenant_id, repo_url: nil}).id
         pid -> pid
       end
 
@@ -3149,6 +3154,17 @@ defmodule Loopctl.Fixtures do
       )
 
     {secret, source}
+  end
+
+  # A source bound to a project that holds ANOTHER repo: what enrolment allowed before #1072,
+  # and so what a legacy row can still be (two live sources on one project is how
+  # `ambiguous_intake_source` arises). It enrols on a project of its own, then the row is moved
+  # to `:project_id`. Takes the `:intake_source` attrs plus the required `:project_id`.
+  def fixture(:legacy_intake_source, attrs) do
+    attrs = Enum.into(attrs, %{})
+    project_id = Map.fetch!(attrs, :project_id)
+    {secret, source} = fixture(:intake_source, Map.delete(attrs, :project_id))
+    {secret, source |> Ecto.Changeset.change(project_id: project_id) |> AdminRepo.update!()}
   end
 
   # A `dispatches` row on AdminRepo shaped as chg-server's ROOT (US-47.2): parentless,
@@ -3177,7 +3193,8 @@ defmodule Loopctl.Fixtures do
   # US-47.3: an enrolled `chg` intake source with its root dispatch, through
   # `Loopctl.Intake.create_source/3` like `fixture(:intake_source)`. Returns
   # `%{secret: change_events_secret, source: source, root: root_dispatch}`. Optional:
-  # `:tenant_id`, `:repo_full_name`, `:secret` (at least 32 bytes).
+  # `:tenant_id`, `:project_id` (re-enrolling a repo: the project that holds it, #1072),
+  # `:repo_full_name`, `:secret` (at least 32 bytes).
   def fixture(:chg_source, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:tenant).id end)
@@ -3189,6 +3206,7 @@ defmodule Loopctl.Fixtures do
     {_webhook_secret, source} =
       fixture(:intake_source, %{
         tenant_id: tenant_id,
+        project_id: Map.get(attrs, :project_id),
         repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/infra"),
         mode: "chg",
         change_events_secret: secret,
@@ -3214,7 +3232,7 @@ defmodule Loopctl.Fixtures do
       case Map.get(attrs, :project_id) do
         nil ->
           kind = if mode == "ledger", do: :kb, else: :work
-          fixture(:project, %{tenant_id: tenant_id, kind: kind})
+          fixture(:project, %{tenant_id: tenant_id, kind: kind, repo_url: nil})
 
         project_id ->
           AdminRepo.get!(Project, project_id)
@@ -3634,8 +3652,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
 
-    project =
-      fixture(:project, %{tenant_id: tenant_id, repo_url: "https://github.com/evil/other"})
+    project = fixture(:project, %{tenant_id: tenant_id, repo_url: nil})
 
     epic = fixture(:epic, %{tenant_id: tenant_id, project_id: project.id})
     story = fixture(:story, %{tenant_id: tenant_id, epic_id: epic.id, project_id: project.id})
@@ -3646,6 +3663,15 @@ defmodule Loopctl.Fixtures do
       repo_full_name: Map.get(attrs, :repo_full_name, "acme/widgets"),
       required_checks: ["test"]
     })
+
+    # Enrolment refuses a project naming another repo (#1072), so the decoy is written after
+    # it, straight to the row: the worker must still read the source's repo, never this.
+    project
+    |> Ecto.Changeset.change(
+      repo_url: "https://github.com/evil/other",
+      repo_key: RepoUrl.key("https://github.com/evil/other")
+    )
+    |> AdminRepo.update!()
 
     %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
   end

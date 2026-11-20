@@ -432,7 +432,8 @@ defmodule Loopctl.Changes.LedgerSourcesTest do
         {_ws, source} =
           fixture(:intake_source, %{
             tenant_id: ctx.tenant.id,
-            project_id: ctx.work.id,
+            # A work project of its own per repo: a project holds one repo (#1072).
+            project_id: fixture(:project, %{tenant_id: ctx.tenant.id, kind: :work}).id,
             repo_full_name: "mkreyman/#{mode}-repo"
           })
 
