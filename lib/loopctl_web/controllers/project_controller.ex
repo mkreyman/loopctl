@@ -154,7 +154,9 @@ defmodule LoopctlWeb.ProjectController do
 
   operation(:index,
     summary: "List projects",
-    description: "Lists projects for the current tenant with pagination.",
+    description:
+      "Lists projects for the current tenant with pagination, ordered by name, then by id. " <>
+        "Names are not unique; the id breaks ties so offset pages are stable.",
     parameters: [
       page: [in: :query, type: :integer, description: "Page number"],
       page_size: [in: :query, type: :integer, description: "Items per page"],
