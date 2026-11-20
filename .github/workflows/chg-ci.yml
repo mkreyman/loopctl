@@ -1,6 +1,6 @@
 name: chg CI
 
-# chg (chg/, US-52.5), ported from mkreyman/chg's ci.yml and gated only when a change touches
+# chg (chg/, US-52.5), ported from chg's own ci.yml before the import and gated only when a change touches
 # chg/ (US-52.6). Every job runs on the fleet-ci runner pool or the CI_RUNNER_MACOS runner,
 # never on GitHub-hosted minutes. Jobs share one persistent account there, so nothing below
 # writes per-user state such as `git config --global` or `rustup default`. No paths filter:

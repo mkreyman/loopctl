@@ -105,6 +105,26 @@ defmodule Loopctl.ReleaseSetTest do
                )
     end
 
+    # US-52.11: the retired repos survive a parse and a bump's re-render.
+    test "carries the retired repos, and refuses a malformed list" do
+      text = File.read!("release/manifest.toml")
+      {:ok, manifest} = Manifest.parse(text, "m.toml")
+
+      assert manifest.retired == ["mkreyman/chg", "mkreyman/loopctl-runner"]
+
+      assert Manifest.render(Manifest.bump(manifest, [])) =~
+               ~s(repos = ["mkreyman/chg", "mkreyman/loopctl-runner"])
+
+      [head, _] = String.split(text, "[retired]")
+      assert {:ok, %{retired: []}} = Manifest.parse(head, "m.toml")
+
+      assert {:error, "m.toml: retired.repos must be a list of owner/name strings"} =
+               Manifest.parse(head <> "[retired]\nrepos = [\"chg\"]\n", "m.toml")
+
+      assert {:error, "m.toml: retired must be a table with a repos list"} =
+               Manifest.parse(head <> "[retired]\nnames = []\n", "m.toml")
+    end
+
     test "accepts semver with pre-release and build, and the literal unreported" do
       assert Manifest.valid_version?("1.2.3-rc.1+abc")
       assert Manifest.valid_version?("unreported")

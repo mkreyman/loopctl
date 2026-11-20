@@ -33,6 +33,8 @@
 #   LOOPCTL_FACTORY_CHECKOUT  the loopctl working tree runner.json's repos map names
 #                             (~/workspace/loopctl)
 #   LOOPCTL_FACTORY_SERVER_SET the set loopctl answers a join with (the <set> argument)
+#   LOOPCTL_FACTORY_CHG_CONFIG chg's loopctl sources, cleaned of [retired] repos
+#                             (~/.chg/loopctl.toml)
 set -uo pipefail
 unset CDPATH
 
@@ -54,6 +56,7 @@ poll_s=${LOOPCTL_FACTORY_POLL_S:-15}
 chg_dest=${LOOPCTL_FACTORY_CHG_DEST:-$HOME/.local/bin/chg}
 chg_system=${LOOPCTL_FACTORY_CHG_SYSTEM:-/usr/local/bin/chg}
 checkout=${LOOPCTL_FACTORY_CHECKOUT:-$HOME/workspace/loopctl}
+chg_config=${LOOPCTL_FACTORY_CHG_CONFIG:-$HOME/.chg/loopctl.toml}
 # The set loopctl answers a join with. It is the SERVER's set, so a rollback to an older set
 # still joins naming the server's current one; rollout.sh passes it then.
 server_set=${LOOPCTL_FACTORY_SERVER_SET:-$set_id}
@@ -150,6 +153,21 @@ print(j.get("runner_version") or "")
 PY
 }
 
+# US-52.11: a retired repo's chg sources go, once their queued rows are sent. Run on every
+# path that reports success, so a machine already at the set is cleaned too. A failed send
+# leaves the sources in place and fails the run; the next run retries.
+drop_retired_sources() {
+  local tree=$1 state
+  [ -f "$chg_config" ] || return 0
+  state=$(python3 "$here/lib/drop_retired_sources.py" --check "$chg_config" "$tree/release/manifest.toml") ||
+    fail "cannot read $chg_config or the set's [retired] list"
+  [ "$state" = pending ] || return 0
+  "$chg_dest" outbox send >&2 ||
+    fail "chg outbox send failed; the retired repos' sources stay in $chg_config until it succeeds"
+  python3 "$here/lib/drop_retired_sources.py" "$chg_config" "$tree/release/manifest.toml" >/dev/null ||
+    fail "cannot rewrite $chg_config"
+}
+
 manifest_version() {
   # manifest_version <tree> <component>
   python3 - "$1/release/manifest.toml" "$2" <<'PY'
@@ -168,6 +186,7 @@ if [ -L "$home/current" ] && [ "$(readlink "$home/current")" = "sets/$set_id" ] 
   if chg_matches "$want_chg" "$sha" && rv=$(joined_at_set "$jf" "$server_set" 0); then
     runner_version=$rv
     chg_version=$want_chg
+    drop_retired_sources "$set_dir"
     report unchanged "" 0
   fi
 fi
@@ -262,4 +281,5 @@ until rv=$(joined_at_set "$jf" "$server_set" "$restart"); do
 done
 runner_version=$rv
 
+drop_retired_sources "$set_dir"
 report ok "" 0

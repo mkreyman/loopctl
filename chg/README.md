@@ -19,7 +19,8 @@ Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeSc
     scripts/install.sh --release vX.Y.Z    # Linux x86_64 only: the release's static binary
 
 A Mac has no release binary, so it always builds from source: check out the commit to install
-(`git -C ~/workspace/chg pull` on master, with a clean tree) and run `scripts/install.sh`. The
+(`git -C ~/workspace/loopctl pull` on master, with a clean tree) and run `chg/scripts/install.sh`.
+On a factory machine `release/install-machine.sh` does this for the release set's commit. The
 build uses the Rust that `.tool-versions` names, and `chg --version` ends with
 `commit <sha12>` (`-dirty` when the tree had uncommitted changes), so every machine says which
 commit it runs. CI runners also need `scripts/install-system.sh` (docs/verify.md).

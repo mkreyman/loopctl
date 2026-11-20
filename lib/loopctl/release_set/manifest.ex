@@ -19,7 +19,13 @@ defmodule Loopctl.ReleaseSet.Manifest do
   """
 
   @type component :: %{version: String.t(), minimum: String.t(), source: String.t()}
-  @type t :: %{set: pos_integer(), components: %{String.t() => component()}}
+  @type t :: %{
+          set: pos_integer(),
+          components: %{String.t() => component()},
+          retired: [String.t()]
+        }
+
+  @owner_repo ~r/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/
 
   @doc "The component names, in the order the manifest lists them."
   @spec components() :: [String.t()]
@@ -32,10 +38,24 @@ defmodule Loopctl.ReleaseSet.Manifest do
   def parse(text, file) do
     with {:ok, doc} <- decode(text, file),
          {:ok, set} <- set(doc, file),
-         {:ok, components} <- components(doc, file) do
-      {:ok, %{set: set, components: components}}
+         {:ok, components} <- components(doc, file),
+         {:ok, retired} <- retired(doc, file) do
+      {:ok, %{set: set, components: components, retired: retired}}
     end
   end
+
+  # US-52.11: the repositories folded into this one and archived. Each machine's install
+  # drops their chg sources (release/install-machine.sh). Absent means none.
+  defp retired(%{"retired" => %{"repos" => repos}}, file) when is_list(repos) do
+    if Enum.all?(repos, &(is_binary(&1) and Regex.match?(@owner_repo, &1))),
+      do: {:ok, repos},
+      else: {:error, "#{file}: retired.repos must be a list of owner/name strings"}
+  end
+
+  defp retired(%{"retired" => _}, file),
+    do: {:error, "#{file}: retired must be a table with a repos list"}
+
+  defp retired(_doc, _file), do: {:ok, []}
 
   defp decode(text, file) do
     case Toml.decode(text) do
@@ -192,8 +212,14 @@ defmodule Loopctl.ReleaseSet.Manifest do
         """
       end)
 
-    @header <> "\nset = #{manifest.set}\n\n" <> tables
+    @header <>
+      "\nset = #{manifest.set}\n\n" <> tables <> render_retired(Map.get(manifest, :retired, []))
   end
+
+  defp render_retired([]), do: ""
+
+  defp render_retired(repos),
+    do: "\n[retired]\nrepos = [" <> Enum.map_join(repos, ", ", &quote_toml/1) <> "]\n"
 
   defp quote_toml(value), do: Jason.encode!(value)
 end

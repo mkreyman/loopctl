@@ -34,7 +34,14 @@ defmodule Loopctl.ReleaseInstallMachineTest do
   dest=$2
   mkdir -p "$dest"
   sha=$(git rev-parse --short=12 HEAD)
-  printf '#!/bin/sh\\necho "chg %s (adapter contract 1, commit %s)"\\n' "$(cat ../SET).0.0" "$sha" > "$dest/chg"
+  cat > "$dest/chg" <<BIN
+  #!/bin/sh
+  echo "\\$*" >> "\\$STUB/chg.log"
+  case "\\$1" in
+    outbox) [ -f "\\$STUB/send_fails" ] && exit 1; exit 0 ;;
+  esac
+  echo "chg $(cat ../SET).0.0 (adapter contract 1, commit $sha)"
+  BIN
   chmod +x "$dest/chg"
   """
 
@@ -75,6 +82,7 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       "LOOPCTL_FACTORY_CHG_DEST" => Path.join([home, "bin", "chg"]),
       "LOOPCTL_FACTORY_CHG_SYSTEM" => Path.join([tmp, "system", "chg"]),
       "LOOPCTL_FACTORY_CHECKOUT" => Path.join(home, "loopctl"),
+      "LOOPCTL_FACTORY_CHG_CONFIG" => Path.join(tmp, "loopctl.toml"),
       "LOOPCTL_FACTORY_POLL_S" => "1",
       "LOOPCTL_FACTORY_JOIN_S" => "2",
       "LOOPCTL_FACTORY_DRAIN_S" => "2"
@@ -225,6 +233,55 @@ defmodule Loopctl.ReleaseInstallMachineTest do
     end
   end
 
+  describe "TC-52.11.4: a retired repo's chg sources go once their rows are sent" do
+    @sources """
+    [[source]]
+    repo = "mkreyman/chg"
+    source_id = "7c2ca807"
+    secret_file = "/s/chg"
+
+    [[source]]
+    repo = "mkreyman/reportex"
+    source_id = "3fd6d7d5"
+    secret_file = "/s/reportex"
+    """
+
+    test "sends the outbox, then removes the retired block", ctx do
+      config = chg_config(ctx)
+
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+
+      assert File.read!(Path.join(ctx.stub, "chg.log")) =~ "outbox send"
+      refute File.read!(config) =~ "mkreyman/chg"
+      assert File.read!(config) =~ ~s(repo = "mkreyman/reportex")
+    end
+
+    test "a failed send keeps the sources and fails; a machine already at the set retries", ctx do
+      config = chg_config(ctx)
+      File.write!(Path.join(ctx.stub, "send_fails"), "")
+
+      {out, 1} = install(ctx, 2)
+      assert out["detail"] =~ "chg outbox send failed"
+      assert File.read!(config) == @sources
+
+      File.rm!(Path.join(ctx.stub, "send_fails"))
+      {%{"status" => "unchanged"}, 0} = install(ctx, 2)
+      refute File.read!(config) =~ "mkreyman/chg"
+    end
+
+    test "with nothing to remove, the outbox is not sent", ctx do
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+      refute File.read!(Path.join(ctx.stub, "chg.log")) =~ "outbox"
+    end
+
+    defp chg_config(ctx) do
+      path = Path.join(ctx.tmp, "loopctl.toml")
+      File.write!(path, @sources)
+      File.write!(Path.join(ctx.stub, "chg_config"), path)
+      path
+    end
+  end
+
   defp install(ctx, set, opts \\ []) do
     File.write!(Path.join(ctx.stub, "server_set"), to_string(Keyword.get(opts, :server_set, set)))
     env = Map.merge(ctx.env, Keyword.get(opts, :env, %{}))
@@ -239,7 +296,8 @@ defmodule Loopctl.ReleaseInstallMachineTest do
 
     File.write!(
       Path.join([work, "release", "manifest.toml"]),
-      "set = #{set}\n\n[components.chg]\nversion = \"#{set}.0.0\"\n"
+      "set = #{set}\n\n[components.chg]\nversion = \"#{set}.0.0\"\n\n" <>
+        "[retired]\nrepos = [\"mkreyman/chg\"]\n"
     )
 
     script!(Path.join([work, "runner", "rel", "install.sh"]), @runner_install)

@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **mkreyman/chg and mkreyman/loopctl-runner are retired into this repository (2026-11-19,
+  US-52.11).** `release/manifest.toml` gains `[retired] repos`. Each `install-machine.sh` run
+  sends chg's outbox and then removes those repos' `[[source]]` blocks from
+  `~/.chg/loopctl.toml` (`LOOPCTL_FACTORY_CHG_CONFIG`). A failed send leaves the blocks in place
+  and fails that host's install. `release/retire-repo.sh` transfers a repo's open issues here,
+  archives it, imports it a last time and marks its `release/imports.toml` entry
+  `archived = true`; `import-history.sh` then refuses that prefix. **Deploy ordering:** retire
+  only after the set-2 rollout is green.
 - **One command moves the fleet to a release set (2026-11-19, US-52.10).**
   `release/rollout.sh` checks that loopctl serves the manifest's set and npm has its MCP
   version, runs `release/install-machine.sh <set>` on each host of `FLEET_MACHINES` over ssh,

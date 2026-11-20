@@ -39,3 +39,6 @@ source = "chg/cli/Cargo.toml"
 version = "3.20.0"
 minimum = "3.19.1"
 source = "mcp-server/package.json"
+
+[retired]
+repos = ["mkreyman/chg", "mkreyman/loopctl-runner"]

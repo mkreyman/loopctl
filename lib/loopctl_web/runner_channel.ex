@@ -747,7 +747,7 @@ defmodule LoopctlWeb.RunnerChannel do
   # writing this meta for it would add a second, weaker mechanism in front of the durable one.
   #
   # THIS IS A BOUND ON THE DAMAGE, NOT A SUPPORTED RECOVERY PATH, and the difference decides
-  # what to do when it fires. `mkreyman/loopctl-runner` builds its join declaration and its
+  # what to do when it fires. `runner/` (`LoopctlRunner.Control`) builds its join declaration and its
   # kind check from ONE list (its maintaining session, 2026-09-14), so a runner declaring a
   # kind and then refusing it is a BUG on that side — not a state anyone should recover from
   # by reconnecting. Reconnecting clears the suppression because the declaration it

@@ -170,7 +170,7 @@ The instruction is sent again when no merge is reported within ten minutes, up t
 
 Gate B reads one trigger list per repository from `DELIVERY_GATES_CONFIG` (`Loopctl.DeliveryGates.Triggers`, loaded by `Loopctl.DeliveryGates.Config`). A repository with no entry there escalates EVERY change, at triage and at the merge gate, with `{:unknown_repo, repo}` (`Loopctl.DeliveryGates.GateB`, `repo_triggers/2`); `test/loopctl/delivery_gates/gate_b_test.exs` pins it.
 
-`mkreyman/claude-config` and `mkreyman/chg` have no entry today. Every change to them therefore goes to a human, which is what issue #986 asks for: the loop must not be able to change, unreviewed, the code that lands, reverts or gates its own work, or the hooks that stop a session from doing what it must not.
+`mkreyman/claude-config` has no entry today, and chg now lives in this repository's `chg/`. Every change to them therefore goes to a human, which is what issue #986 asks for: the loop must not be able to change, unreviewed, the code that lands, reverts or gates its own work, or the hooks that stop a session from doing what it must not.
 
 **The rule: when either repository gets an entry, its `human_paths` MUST name that repository's self-modification code**, which the loop must never change unreviewed:
 - for chg, its gate, the code that advances `verified/master`, culprit and revert, its adapters, and its CI;

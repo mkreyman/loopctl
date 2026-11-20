@@ -12,7 +12,7 @@
 # release/imports.toml records, per prefix, the source commit it holds:
 #
 #   [[import]]
-#   repo = "mkreyman/loopctl-runner"
+#   repo = "owner/source"
 #   prefix = "runner"
 #   imported_sha = "<40 hex>"
 #
@@ -61,6 +61,20 @@ recorded_sha() {
     p == want && s != "" { print s; exit }
   ' "$manifest"
 }
+
+# Whether this prefix's entry is marked `archived = true` (US-52.11, release/retire-repo.sh):
+# the source repository is archived at the recorded commit, so there is nothing to import.
+archived_entry() {
+  [[ -f $manifest ]] || return 1
+  awk -v want="$prefix" '
+    /^\[\[import\]\]/ { if (p == want && a) found = 1; p = ""; a = 0 }
+    /^prefix = / { p = $3; gsub(/"/, "", p) }
+    /^archived = true/ { a = 1 }
+    END { if (p == want && a) found = 1; exit found ? 0 : 1 }
+  ' "$manifest"
+}
+
+archived_entry && refuse "$prefix/ is imported from $repo, which is archived (release/imports.toml); nothing to import"
 
 [[ -z $(git status --porcelain) ]] || refuse "the working tree is dirty; commit or remove the changes first"
 
