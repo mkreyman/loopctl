@@ -81,6 +81,12 @@ defmodule Loopctl.Workers.RevokeEndedSessionDispatchesWorker do
   @doc """
   The dispatches a run at `now` would revoke, as `%{id, tenant_id, story_id}`, at most
   `limit`. Cross-tenant by design, like every sweep; `tenant_id` comes back on each row.
+
+  Ranked WITHIN each tenant first (`row_number()` over the tenant, as
+  `ReclaimExpiredClaimsWorker.candidates/2` ranks), then by that rank, so every tenant's first
+  comes before any tenant's second. A revoke that keeps failing leaves its row unrevoked, and
+  ordered oldest-first across all tenants such rows would fill every run's batch and block
+  every other tenant's runners for good.
   """
   @spec candidates(DateTime.t(), pos_integer()) :: [map()]
   def candidates(now, limit \\ @batch) do
@@ -91,21 +97,36 @@ defmodule Loopctl.Workers.RevokeEndedSessionDispatchesWorker do
       from r in Runner,
         where: r.tenant_id == parent_as(:d).tenant_id and r.agent_id == parent_as(:d).agent_id
 
-    from(d in Dispatch,
-      as: :d,
-      join: st in Story,
-      on: st.tenant_id == d.tenant_id and st.id == d.story_id,
-      join: s in StoryStage,
-      on: s.tenant_id == d.tenant_id and s.story_id == d.story_id,
-      where: is_nil(d.revoked_at) and d.role == :agent and not is_nil(d.story_id),
-      where: d.created_at < ^cutoff,
-      where: exists(runner_agent),
-      where:
-        s.stage not in ^live or is_nil(st.implementer_dispatch_id) or
-          st.implementer_dispatch_id != d.id,
-      order_by: [asc: d.created_at],
+    ranked =
+      from(d in Dispatch,
+        as: :d,
+        join: st in Story,
+        on: st.tenant_id == d.tenant_id and st.id == d.story_id,
+        join: s in StoryStage,
+        on: s.tenant_id == d.tenant_id and s.story_id == d.story_id,
+        where: is_nil(d.revoked_at) and d.role == :agent and not is_nil(d.story_id),
+        where: d.created_at < ^cutoff,
+        where: exists(runner_agent),
+        where:
+          s.stage not in ^live or is_nil(st.implementer_dispatch_id) or
+            st.implementer_dispatch_id != d.id,
+        select: %{
+          id: d.id,
+          tenant_id: d.tenant_id,
+          story_id: d.story_id,
+          created_at: d.created_at,
+          rank:
+            over(row_number(),
+              partition_by: d.tenant_id,
+              order_by: [asc: d.created_at, asc: d.id]
+            )
+        }
+      )
+
+    from(r in subquery(ranked),
+      order_by: [asc: r.rank, asc: r.created_at, asc: r.id],
       limit: ^limit,
-      select: %{id: d.id, tenant_id: d.tenant_id, story_id: d.story_id}
+      select: %{id: r.id, tenant_id: r.tenant_id, story_id: r.story_id}
     )
     |> AdminRepo.all()
   end

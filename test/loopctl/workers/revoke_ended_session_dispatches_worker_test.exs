@@ -10,6 +10,7 @@ defmodule Loopctl.Workers.RevokeEndedSessionDispatchesWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.WorkBreakdown.Story
@@ -90,11 +91,53 @@ defmodule Loopctl.Workers.RevokeEndedSessionDispatchesWorkerTest do
 
   test "the story's live session keeps its key at every live stage" do
     tenant = fixture(:tenant)
-    live = for stage <- [:claimed, :implementing, :ci, :merged], do: session(tenant, stage)
+
+    live =
+      for stage <- StageMachine.in_flight_stages() ++ [:merged],
+          do: session(tenant, stage)
 
     run()
 
     for d <- live, do: refute(revoked?(d), "a #{inspect(d.id)} session at a live stage")
+  end
+
+  test "a re-placed story keeps its new session's key and loses the superseded one" do
+    tenant = fixture(:tenant)
+    old = session(tenant, :implementing)
+
+    {_raw, runner} = fixture(:runner, tenant_id: tenant.id)
+
+    {:ok, %{dispatch: new}} =
+      Dispatches.create_dispatch(tenant.id, %{
+        role: :agent,
+        agent_id: runner.agent_id,
+        story_id: old.story_id
+      })
+
+    {1, _} =
+      from(d in Dispatch, where: d.id == ^new.id)
+      |> AdminRepo.update_all(set: [created_at: DateTime.add(DateTime.utc_now(), @old, :second)])
+
+    {1, _} =
+      from(s in Story, where: s.id == ^old.story_id)
+      |> AdminRepo.update_all(set: [implementer_dispatch_id: new.id])
+
+    run()
+
+    assert revoked?(old)
+    refute revoked?(AdminRepo.get!(Dispatch, new.id))
+  end
+
+  test "candidates rank within each tenant, so one tenant's backlog cannot fill the batch" do
+    busy = fixture(:tenant)
+    quiet = fixture(:tenant)
+    for _ <- 1..3, do: session(busy, :escalated, age: -7_200)
+    lone = session(quiet, :escalated)
+
+    picked = Worker.candidates(DateTime.utc_now(), 2)
+
+    assert length(picked) == 2
+    assert lone.id in Enum.map(picked, & &1.id)
   end
 
   test "a dispatch younger than the placement window is left alone" do
