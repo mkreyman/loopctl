@@ -208,6 +208,8 @@ defmodule Loopctl.Runners.Capacity do
 
   import Ecto.Query
 
+  alias Loopctl.Delivery.StageMachine
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
@@ -730,6 +732,21 @@ defmodule Loopctl.Runners.Capacity do
         where: is_nil(r.revoked_at),
         select: 1
 
+    # The story's stage row, under the claim this dispatch served, sits at a stage that ends a
+    # session — the same server-checkable rule a runner's `session_ended` report is held to
+    # (`RunnerStages`' `session_over?/2`). A session that ended `completed` at `pr_open` keeps
+    # its slot by that rule, and when the story later reaches `done` through a control-side
+    # transition (verify, merge, deploy) no runner message carries its dispatch id, so nothing
+    # released it before the wall clock ran out: about two hours of a runner taking no work
+    # (2026-11-20, the e2e verifier found no free runner).
+    session_ended_stage =
+      from s in StoryStage,
+        where: s.tenant_id == parent_as(:dispatch).tenant_id,
+        where: s.story_id == parent_as(:dispatch).story_id,
+        where: s.claim_epoch == parent_as(:dispatch).claim_epoch,
+        where: s.stage in ^StageMachine.session_ends_at(),
+        select: 1
+
     from d in DispatchRecord,
       as: :dispatch,
       where: is_nil(d.released_at),
@@ -745,6 +762,7 @@ defmodule Loopctl.Runners.Capacity do
       where:
         d.status in ["refused", "superseded"] or
           (not is_nil(d.story_id) and not exists(claim_current)) or
+          (not is_nil(d.story_id) and exists(session_ended_stage)) or
           not exists(runner_active) or undelivered_too_long(d, ^now) or
           unanswered_too_long(d, ^now) or wall_clock_over(d, ^now),
       select: d.id

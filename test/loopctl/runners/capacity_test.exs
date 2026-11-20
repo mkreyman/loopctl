@@ -799,6 +799,37 @@ defmodule Loopctl.Runners.CapacityTest do
       assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
     end
 
+    test "releases a session whose story reached a session-ending stage under its claim, and only that" do
+      runner = runner(%{max_sessions: 4})
+      tid = runner.tenant_id
+
+      at = fn stage, stage_epoch ->
+        s = story(tid)
+        d = dispatch(tid, %{"story_id" => s.id})
+        {:ok, _} = send_dispatch(runner, d)
+
+        fixture(:story_stage,
+          tenant_id: tid,
+          story_id: s.id,
+          stage: stage,
+          claim_epoch: stage_epoch
+        )
+
+        d
+      end
+
+      done = at.(:done, d_epoch = 0)
+      waiting = at.(:pr_open, d_epoch)
+      deployed = at.(:deployed, d_epoch)
+      other_claim = at.(:done, d_epoch + 1)
+
+      assert heal(runner) == {:ok, %{released: 2, in_flight: 2}}
+      assert record(runner, done.dispatch_id).released_at
+      assert record(runner, deployed.dispatch_id).released_at
+      assert record(runner, waiting.dispatch_id).released_at == nil
+      assert record(runner, other_claim.dispatch_id).released_at == nil
+    end
+
     test "releases a dispatch whose story is gone" do
       runner = runner(%{max_sessions: 3})
       s = story(runner.tenant_id)
