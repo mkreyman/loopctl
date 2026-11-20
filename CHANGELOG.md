@@ -36,8 +36,8 @@ All notable changes to loopctl are documented here.
   `archived = true`; `import-history.sh` then refuses that prefix. **Deploy ordering:** retire
   only after the set-2 rollout is green.
 - **One command moves the fleet to a release set (2026-11-19, US-52.10).**
-  `release/rollout.sh` checks that loopctl serves the manifest's set and npm has its MCP
-  version, runs `release/install-machine.sh <set>` on each host of `FLEET_MACHINES` over ssh,
+  `release/rollout.sh` checks that loopctl serves the manifest's set, npm has its MCP
+  version and `LOOPCTL_FACTORY_REPO` has the tag `factory-<set>`, runs `release/install-machine.sh <set>` on each host of `FLEET_MACHINES` over ssh,
   then dispatches the e2e workflow and rolls the hosts it moved back one set if that fails.
   On each machine the set's checkout lives at `~/.local/share/loopctl-factory/sets/<set>`
   behind the `current` symlink; the runner is drained (up to 60 minutes) before it is

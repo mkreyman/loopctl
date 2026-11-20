@@ -22,6 +22,9 @@ defmodule LoopctlE2e.StubClient do
   @impl true
   def post(pid, service, path, body), do: answer(pid, {service, :post, path}, body)
 
+  @impl true
+  def put(pid, service, path, body), do: answer(pid, {service, :put, path}, body)
+
   defp answer(pid, key, arg) do
     Agent.get_and_update(pid, fn state ->
       {reply, rest} =

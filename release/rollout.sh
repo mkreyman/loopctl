@@ -5,8 +5,9 @@
 #   release/rollout.sh
 #
 # 1. Preflight: loopctl's /.well-known/loopctl release.set equals the manifest's set (the
-#    server deploys from master on its own), and npm has loopctl-mcp-server at the set's mcp
-#    version (machines launch it through claude-config's bin/loopctl-mcp.sh).
+#    server deploys from master on its own), npm has loopctl-mcp-server at the set's mcp
+#    version (machines launch it through claude-config's bin/loopctl-mcp.sh), and the repo has
+#    the tag factory-<set> every host checks out.
 # 2. Each host of FLEET_MACHINES in turn, niced, over ssh (the host this runs on, in place):
 #    release/install-machine.sh <set>
 #    from that host's own factory checkout, bootstrapped from this tree's copy on first use.
@@ -25,6 +26,9 @@
 #   ROLLOUT_GH            the gh command (default: gh)
 #   ROLLOUT_NPM           the npm command (default: npm)
 #   ROLLOUT_CURL          the curl command (default: curl)
+#   ROLLOUT_GIT           the git command for the tag check (default: git)
+#   LOOPCTL_FACTORY_REPO  the repo the tag check reads and every host clones (default:
+#                         git@github.com:mkreyman/loopctl.git; passed to install-machine.sh)
 #   ROLLOUT_RUN_WAIT_S    how long the dispatched e2e run may take to appear (default: 120)
 set -uo pipefail
 unset CDPATH
@@ -36,6 +40,10 @@ ssh_cmd=${ROLLOUT_SSH:-ssh -o BatchMode=yes -o ConnectTimeout=10}
 gh_cmd=${ROLLOUT_GH:-gh}
 npm_cmd=${ROLLOUT_NPM:-npm}
 curl_cmd=${ROLLOUT_CURL:-curl}
+git_cmd=${ROLLOUT_GIT:-git}
+repo_url=${LOOPCTL_FACTORY_REPO:-git@github.com:mkreyman/loopctl.git}
+# Quoted for the remote shell, so every host clones the repo the tag check read.
+repo_q=$(printf '%q' "$repo_url")
 
 fleet="$HOME/workspace/claude-config/hooks/lib/fleet-name.sh"
 if [ -n "${ROLLOUT_HOSTS:-}" ]; then
@@ -79,6 +87,21 @@ if ! $npm_cmd view "loopctl-mcp-server@$mcp_version" version >/dev/null 2>&1; th
   echo "rollout: npm has no loopctl-mcp-server@$mcp_version yet; wait for its publish" >&2
   exit 2
 fi
+# factory-release.yml tags the set after master's CI passes, which can be after the deploy.
+# Without this check, the hosts that run before the tag fail and the ones after succeed,
+# leaving the fleet split across two sets (2026-11-20, set 3).
+# --exit-code tells "no such tag" (2) from "could not ask" (anything else), and ssh runs
+# without prompts and with a bound on a stalled connection, like ROLLOUT_SSH.
+tag_err=$(GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3} \
+  $git_cmd ls-remote --exit-code --tags "$repo_url" "refs/tags/factory-$set_id" 2>&1 >/dev/null)
+tag_rc=$?
+if [ "$tag_rc" -eq 2 ]; then
+  echo "rollout: tag factory-$set_id is not in $repo_url yet; wait for factory-release.yml" >&2
+  exit 2
+elif [ "$tag_rc" -ne 0 ]; then
+  echo "rollout: cannot read tags from $repo_url (git exit $tag_rc): $tag_err" >&2
+  exit 2
+fi
 
 # --- one host ---
 
@@ -106,7 +129,7 @@ install_on() {
   # cannot be left behind. COPYFILE_DISABLE keeps macOS tar from adding ._ files.
   COPYFILE_DISABLE=1 tar -C "$here" --exclude=__pycache__ -cf - install-machine.sh lib |
     on_host "$host" "d=\$(mktemp -d) && tar -C \"\$d\" -xf - &&
-LOOPCTL_FACTORY_SERVER_SET=$set_id nice -n 10 bash \"\$d/install-machine.sh\" $target; rc=\$?; rm -rf \"\$d\"; exit \$rc" |
+LOOPCTL_FACTORY_SERVER_SET=$set_id LOOPCTL_FACTORY_REPO=$repo_q nice -n 10 bash \"\$d/install-machine.sh\" $target; rc=\$?; rm -rf \"\$d\"; exit \$rc" |
     tail -1
 }
 

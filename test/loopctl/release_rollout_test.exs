@@ -18,6 +18,7 @@ defmodule Loopctl.ReleaseRolloutTest do
   set_id=$(printf '%s' "$*" | grep -oE 'install-machine.sh" [0-9]+' | grep -oE '[0-9]+$')
   server=$(printf '%s' "$*" | grep -oE 'LOOPCTL_FACTORY_SERVER_SET=[0-9]+' | cut -d= -f2)
   echo "$host $set_id $server" >> "$STUB/installs"
+  printf '%s' "$*" | grep -oE 'LOOPCTL_FACTORY_REPO=[^ ]+' >> "$STUB/$host.repo"
   status=$(cat "$STUB/$host.status" 2>/dev/null || echo ok)
   printf '{"host":"%s","set":%s,"status":"%s","runner_version":"0.9","chg_version":"1.0"}\\n' "$host" "$set_id" "$status"
   """
@@ -43,6 +44,19 @@ defmodule Loopctl.ReleaseRolloutTest do
   printf '{"release":{"set":%s}}' "$(cat "$STUB/served")"
   """
 
+  # ls-remote --exit-code: the tag's line while the stub's tag file exists, else exit 2; a
+  # git_down file makes it fail the way an unreachable remote does.
+  @git """
+  #!/bin/sh
+  echo "$*" >> "$STUB/git.log"
+  if [ -f "$STUB/git_down" ]; then
+    echo "fatal: Could not read from remote repository." >&2
+    exit 128
+  fi
+  [ -f "$STUB/tag" ] || exit 2
+  echo "c5288a6d	refs/tags/$(cat "$STUB/tag")"
+  """
+
   @moduletag :tmp_dir
 
   setup %{tmp_dir: tmp} do
@@ -51,7 +65,9 @@ defmodule Loopctl.ReleaseRolloutTest do
     File.write!(Path.join(stub, "e2e"), "0")
     File.write!(Path.join(stub, "served"), to_string(@set))
     File.write!(Path.join(stub, "npm_exit"), "0")
+    File.write!(Path.join(stub, "tag"), "factory-#{@set}")
 
+    stub!(stub, "git", @git)
     stub!(stub, "ssh", @ssh)
     stub!(stub, "gh", @gh)
     stub!(stub, "npm", @npm)
@@ -65,6 +81,8 @@ defmodule Loopctl.ReleaseRolloutTest do
       "ROLLOUT_GH" => Path.join(stub, "gh"),
       "ROLLOUT_NPM" => Path.join(stub, "npm"),
       "ROLLOUT_CURL" => Path.join(stub, "curl"),
+      "ROLLOUT_GIT" => Path.join(stub, "git"),
+      "LOOPCTL_FACTORY_REPO" => "git@example.test:acme/factory.git",
       "ROLLOUT_RUN_WAIT_S" => "3"
     }
 
@@ -94,6 +112,37 @@ defmodule Loopctl.ReleaseRolloutTest do
     {out, 2} = rollout(ctx)
     assert out =~ "npm has no loopctl-mcp-server@#{@mcp}"
     assert installs(ctx) == []
+  end
+
+  test "a set whose factory tag is not pushed yet stops before any host", ctx do
+    File.rm!(Path.join(ctx.stub, "tag"))
+
+    {out, 2} = rollout(ctx)
+    assert out =~ "tag factory-#{@set} is not in git@example.test:acme/factory.git yet"
+    assert installs(ctx) == []
+
+    assert File.read!(Path.join(ctx.stub, "git.log")) =~
+             "ls-remote --exit-code --tags git@example.test:acme/factory.git refs/tags/factory-#{@set}"
+  end
+
+  test "a remote git cannot read stops before any host, saying so rather than 'not pushed'",
+       ctx do
+    File.write!(Path.join(ctx.stub, "git_down"), "")
+
+    {out, 2} = rollout(ctx)
+    assert out =~ "cannot read tags from git@example.test:acme/factory.git (git exit 128)"
+    assert out =~ "Could not read from remote repository"
+    refute out =~ "not in git@example.test"
+    assert installs(ctx) == []
+  end
+
+  test "every host is told to clone the repo the tag check read", ctx do
+    {_out, 0} = rollout(ctx)
+
+    for host <- ["alpha", "beta"] do
+      assert File.read!(Path.join(ctx.stub, "#{host}.repo")) =~
+               "LOOPCTL_FACTORY_REPO=git@example.test:acme/factory.git"
+    end
   end
 
   test "an unreachable host is reported, the rest still run, e2e is skipped", ctx do

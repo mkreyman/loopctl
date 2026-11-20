@@ -63,6 +63,11 @@ defmodule LoopctlE2e.Client.Req do
     request(conn, service, method: :post, url: path, json: body)
   end
 
+  @impl true
+  def put(conn, service, path, body) do
+    request(conn, service, method: :put, url: path, json: body)
+  end
+
   defp request(conn, :loopctl, opts) do
     case send_request(conn, :loopctl, opts) do
       {:ok, status, body, sth} ->
