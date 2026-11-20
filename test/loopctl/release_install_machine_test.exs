@@ -14,6 +14,8 @@ defmodule Loopctl.ReleaseInstallMachineTest do
   #!/usr/bin/env bash
   set -eu
   [ -f "$STUB/runner_install_fails" ] && exit 1
+  # A Mac's non-interactive ssh: mix only through asdf's shims under HOME.
+  [ -f "$STUB/needs_shim_mix" ] && [ "$(command -v mix)" != "$HOME/.asdf/shims/mix" ] && exit 1
   mkdir -p "$LOOPCTL_RUNNER_PREFIX/current/bin"
   cat > "$LOOPCTL_RUNNER_PREFIX/current/bin/loopctl_runner" <<'BIN'
   #!/usr/bin/env bash
@@ -327,6 +329,17 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       File.ln_s!(System.find_executable("python3"), Path.join(bin, "python3.11"))
 
       {out, 0} = install(ctx, 2, env: %{"PATH" => "#{bin}:#{System.get_env("PATH")}"})
+      assert out["status"] == "ok"
+    end
+
+    test "asdf's shims under HOME are on PATH for the runner build", ctx do
+      shims = Path.join([ctx.env["HOME"], ".asdf", "shims"])
+      File.mkdir_p!(shims)
+      File.write!(Path.join(shims, "mix"), "#!/bin/sh\nexit 0\n")
+      File.chmod!(Path.join(shims, "mix"), 0o755)
+      File.write!(Path.join(ctx.stub, "needs_shim_mix"), "")
+
+      {out, 0} = install(ctx, 2)
       assert out["status"] == "ok"
     end
 

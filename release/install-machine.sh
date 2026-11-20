@@ -46,8 +46,14 @@ case $set_id in
   '' | *[!0-9]*) echo "usage: install-machine.sh <set>  (a positive integer)" >&2; exit 2 ;;
 esac
 
-# beelink and nuc need asdf sourced in a non-interactive ssh (USER.md).
+# beelink and nuc need asdf sourced in a non-interactive ssh (USER.md). asdf 0.16+ is one
+# binary with no asdf.sh, and a non-interactive ssh to a Mac has neither its shims nor
+# Homebrew's bin on PATH, so mix was not found (mac-mini, 2026-11-20).
 [ -f "$HOME/.asdf/asdf.sh" ] && . "$HOME/.asdf/asdf.sh"
+for d in /usr/local/bin /opt/homebrew/bin "$HOME/.asdf/shims"; do
+  case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
+done
+export PATH
 
 home=${LOOPCTL_FACTORY_HOME:-$HOME/.local/share/loopctl-factory}
 repo_url=${LOOPCTL_FACTORY_REPO:-git@github.com:mkreyman/loopctl.git}
@@ -318,7 +324,7 @@ fi
   fail "chg's install failed (chg/scripts/install.sh)"
 if [ -x "$chg_system" ]; then
   (cd "$set_dir/chg" && scripts/install-system.sh) >&2 ||
-    fail "chg's system install failed (chg/scripts/install-system.sh)"
+    fail "chg's system install failed (chg/scripts/install-system.sh). It runs sudo, so where sudo asks for a password, run it once in a terminal: ssh -t <host> 'cd $set_dir/chg && scripts/install-system.sh'"
 fi
 
 # The swap: a new symlink renamed over the old one, so `current` is never missing.

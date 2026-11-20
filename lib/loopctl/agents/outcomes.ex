@@ -16,7 +16,7 @@ defmodule Loopctl.Agents.Outcomes do
   |---|---|---|
   | `Loopctl.Runners.DispatchLedger` (`session_ended`) | the ledger row's session-end write | the row, `end_reason` = the runner's reason |
   | `Loopctl.Delivery.TriageVerdict` | the `triage_verdicts` insert | the row, `end_reason` `triage_verdict`/`triage_incomplete`, signal `verdict` |
-  | `Loopctl.Runners.DispatchLedger` (`agent_result`) | the ledger row's result write and its effect | the row, `end_reason` `agent_result`, signal `draft_screen` |
+  | `Loopctl.Runners.DispatchLedger` (`agent_result`) | the ledger row's result write and its effect | the row, `end_reason` `agent_result`, signal `draft_screen` (a draft) or `tuning_status` (a `spec_tuner` run, via `Loopctl.Agents.Tuning.write_result/2`) |
   | `Loopctl.Delivery.Stages` (every transition and effect) | the stage row's compare-and-set | `merge_gate`, `ci_result`, `merged`, `merge_refused`, `human_override`, `human_route`, `requeued_after_budget_kill` |
   | `Loopctl.Progress.record_review/4` | the review record's Multi | `review_findings` |
 
