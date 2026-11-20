@@ -11,7 +11,8 @@ spec = importlib.util.spec_from_file_location(
 lp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lp)
 
-HCB, CC, CHG = "mkreyman/home_care_billing", "mkreyman/claude-config", "mkreyman/chg"
+HCB, CC, CHG = "mkreyman/home_care_billing", "mkreyman/claude-config", "mkreyman/loopctl"
+assert lp.CHG == CHG, "chg's own causes are filed on the loopctl repository (US-52.5)"
 cfg = lp.config(None)
 
 
@@ -50,7 +51,8 @@ assert lp.route(HCB, "~/workspace/claude-config/docs/x.md") == HCB, "only harnes
 assert lp.route(CC, "hooks/block-complex-bash.sh") == CC
 assert lp.route(CC, "skills/handoff/SKILL.md") == CC
 assert lp.route(HCB, "/home/m/workspace/chg/cli/src/main.rs") == CHG
-assert lp.route(CHG, "cli/src/main.rs") == CHG
+assert lp.route(CHG, "chg/cli/src/main.rs") == CHG
+assert lp.route(HCB, "/home/m/workspace/loopctl/chg/cli/src/main.rs") == HCB, "only the old path routes"
 assert lp.route(HCB) == HCB
 
 # -- fingerprints -----------------------------------------------------------------------

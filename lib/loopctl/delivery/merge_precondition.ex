@@ -213,6 +213,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
+  # US-52.5: chg's source inside this repository. The selection proof measures only it.
+  @chg_prefix "chg/"
+
   # Design §5: "the 12-file / 1,000-line bound". A CEILING over the configured limits, not
   # a default for them — configuration may tighten it and may not loosen it. Without this,
   # a trigger document with `max_files: 500` would merge a 500-file change unread, and the
@@ -235,7 +238,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
           optional(:gate_a_input) => GateAInput.t(),
           optional(:trio_outputs_ignored) => boolean(),
           optional(:effect_proof) => map() | nil,
-          optional(:selection_proof) => :pass | {:fail, [term()]} | :not_applicable,
+          optional(:selection_proof) =>
+            :pass | {:fail, [term()]} | {:outside_chg, [String.t()]} | :not_applicable,
           # OPTIONAL, and the fallback behind it is deliberate: a caller of `judge/1` that
           # omits it gets the configured list, because a guard that disappears when a fact is
           # missing is the failure this key exists to prevent.
@@ -447,7 +451,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
   - `:selection_proof_repos` — the repositories whose `:prove_effect` outcome is cleared by
     `Loopctl.Changes.SelectionProof`, the measured selection-widening proof (US-51.5). Default
     `[Loopctl.Changes.Findings.chg_repo()]`. On those repositories the measured proof is the
-    ONLY thing that clears it; a caller's `:effect_proof` still never does
+    ONLY thing that clears it, and only when every effect match lies under `chg/` (US-52.5):
+    with every match outside `chg/` the change is judged as on any other repository and the
+    proof is not read; with matches on both sides it is judged the same way, and a refusal
+    names the matches outside `chg/`. A caller's `:effect_proof` still never clears a change
+    the proof covers
 
   ## Errors
 
@@ -824,6 +832,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, _proof, {:fail, reasons}),
     do: Enum.map(reasons, &{:selection_proof, &1})
 
+  # US-52.5: some effect matches lie outside chg/, which the replay does not measure. The
+  # change is judged as on a repository that is not selection-proof, and a refusal names them.
+  defp gate_b_reasons(
+         %GateB.Result{outcome: :prove_effect} = gate_b,
+         proof,
+         {:outside_chg, files}
+       ) do
+    case gate_b_reasons(gate_b, proof) do
+      [] -> []
+      reasons -> reasons ++ [{:effect_outside_selection_proof, @chg_prefix, files}]
+    end
+  end
+
   defp gate_b_reasons(%GateB.Result{outcome: :prove_effect} = gate_b, proof, _not_applicable),
     do: gate_b_reasons(gate_b, proof)
 
@@ -1021,10 +1042,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # `trio_outputs` is recorded as having done so, and nothing it sent is read.
       gate_a_input: GateAInput.for_story(story.tenant_id, story.id),
       trio_outputs_ignored: Keyword.has_key?(opts, :trio_outputs),
-      effect_proof: Keyword.get(opts, :effect_proof),
-      # US-51.5: judged only on a selection-proof repository, from the verifier's recorded
-      # verdict at the stage row's head. Never from the caller.
-      selection_proof: selection_proof(story, stage, repo, opts)
+      effect_proof: Keyword.get(opts, :effect_proof)
     }
 
     # NOT fetched when the decision will not read them: the merged branch and a moved head
@@ -1046,18 +1064,52 @@ defmodule Loopctl.Delivery.MergePrecondition do
       |> Task.async_stream(& &1.(), timeout: :infinity)
       |> Enum.map(fn {:ok, fact} -> fact end)
 
-    Map.merge(facts, %{head_files: head_files, base_files: base_files})
+    facts = Map.merge(facts, %{head_files: head_files, base_files: base_files})
+
+    # US-51.5: judged only on a selection-proof repository, from the verifier's recorded
+    # verdict at the stage row's head. Never from the caller. US-52.5: and only for the effect
+    # matches under chg/, which is all the replay measures; it is decided after the file lists
+    # because the matches come from Gate B over them.
+    Map.put(facts, :selection_proof, selection_proof(story, stage, facts, opts))
   end
 
-  defp selection_proof(story, stage, {:ok, repo}, opts) do
+  defp selection_proof(story, stage, %{repo: {:ok, repo}} = facts, opts) do
     repos = Keyword.get_lazy(opts, :selection_proof_repos, fn -> [Findings.chg_repo()] end)
 
-    if Enum.any?(repos, &(String.downcase(&1) == String.downcase(repo))),
-      do: SelectionProof.judge(story, stage.head_sha),
-      else: :not_applicable
+    with true <- Enum.any?(repos, &(String.downcase(&1) == String.downcase(repo))),
+         {:ok, %GateB.Result{outcome: :prove_effect, effect_matches: matches}} <-
+           gate_b_verdict(facts, value(facts, :pull_request) || %{}) do
+      case selection_scope(matches) do
+        :chg_only -> SelectionProof.judge(story, stage.head_sha)
+        :outside_only -> :not_applicable
+        {:mixed, outside} -> {:outside_chg, outside}
+      end
+    else
+      _not_measured -> :not_applicable
+    end
   end
 
-  defp selection_proof(_story, _stage, _repo, _opts), do: :not_applicable
+  defp selection_proof(_story, _stage, _facts, _opts), do: :not_applicable
+
+  @doc false
+  # US-52.5: the selection replay measures chg's selection rules, which live under chg/, so
+  # its proof can clear only effect matches there. One attribute decides the split and is
+  # named in the refusal.
+  @spec selection_scope([{String.t(), term()}]) ::
+          :chg_only | :outside_only | {:mixed, [String.t()]}
+  def selection_scope(matches) do
+    {inside, outside} =
+      Enum.split_with(matches, fn {file, _} -> String.starts_with?(file, @chg_prefix) end)
+
+    cond do
+      outside == [] -> :chg_only
+      inside == [] -> :outside_only
+      true -> {:mixed, outside |> Enum.map(&elem(&1, 0)) |> Enum.uniq()}
+    end
+  end
+
+  @doc false
+  def chg_prefix, do: @chg_prefix
 
   defp fetch_story(tenant_id, story_id) do
     case Stories.get_story(tenant_id, story_id) do

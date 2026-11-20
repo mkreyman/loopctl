@@ -64,7 +64,7 @@ defmodule LoopctlRunner.SelectionReplayTest do
     git!(origin, ["init", "-q", "--bare", "-b", "master"])
 
     seed = git_repo!(Path.join(root, "seed"))
-    write!(seed, "bin/chg-replay-selection.py", @base_script)
+    write!(seed, "chg/bin/chg-replay-selection.py", @base_script)
     write!(seed, "cli/src/cover.rs", "fn select() {}\n")
     write!(seed, "docs/notes.md", "notes\n")
     git!(seed, ["add", "."])
@@ -199,7 +199,7 @@ defmodule LoopctlRunner.SelectionReplayTest do
       head =
         pull_request!(ctx, [
           {"cli/src/cover.rs", "fn select() { widen() }\n"},
-          {"bin/chg-replay-selection.py", @head_script}
+          {"chg/bin/chg-replay-selection.py", @head_script}
         ])
 
       result = run(ctx, config_for(ctx, @pass), head)

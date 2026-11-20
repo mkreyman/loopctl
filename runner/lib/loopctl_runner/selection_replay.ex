@@ -15,9 +15,9 @@ defmodule LoopctlRunner.SelectionReplay do
 
   For the same reason the replay SCRIPT is read from the base (`origin/<base>`, through
   `LoopctlRunner.Worktree.commit_file/4`), never from the pull request's tree: a pull request
-  that edits `bin/chg-replay-selection.py` would otherwise choose its own measurement. The script
+  that edits `chg/bin/chg-replay-selection.py` would otherwise choose its own measurement. The script
   then builds chg at the merge base and at the head and compares what each selects over the
-  product's recent commits (chg's `bin/chg-replay-selection.py` says how). Building and running
+  product's recent commits (`chg/bin/chg-replay-selection.py` in the loopctl repository says how). Building and running
   the head's code is what the verify session does anyway when it runs the tests; this runs it as
   the runner's own command, under `LoopctlRunner.ProcessGroup.run/5`'s credential scrub.
 
@@ -69,7 +69,7 @@ defmodule LoopctlRunner.SelectionReplay do
     Worktree
   }
 
-  @script "bin/chg-replay-selection.py"
+  @script "chg/bin/chg-replay-selection.py"
   @max_script_bytes 1_048_576
   @min_corpus 5
   @max_corpus 30

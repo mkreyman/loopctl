@@ -31,7 +31,7 @@ request's own `CLAUDE.md`, `.claude/` settings, hooks, agents and skills, and `.
 The repository's rules reach it from the base instead: `CLAUDE.md` as `origin/<base>` holds it,
 in the prompt, up to 32 KiB (`LoopctlRunner.VerifyPrompt.base_rules/2`). For a repository in
 the config's `selection_replay` (chg), a change touching one of its `paths` globs is also
-REPLAYED (contract 1.32.0): beside the session, the runner runs `bin/chg-replay-selection.py`
+REPLAYED (contract 1.32.0): beside the session, the runner runs `chg/bin/chg-replay-selection.py`
 as the base holds it, comparing selection at the merge base and the head over the `product`'s
 last `corpus` commits, and adds its output to a `pass` as `selection_replay`, which loopctl
 reads to merge a selection change without a person (`LoopctlRunner.SelectionReplay`). When the

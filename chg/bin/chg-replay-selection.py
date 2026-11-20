@@ -13,7 +13,7 @@ prints that measurement: the `selection_replay` object of loopctl's runner contr
     {"corpus": [{"sha": C, "base_count": 12, "head_count": 14, "dropped": [...]}, ...],
      "miss": {"sha": M, "covered": [...]}}
 
-THE TWO SIDES. --base and --head are commits of chg (the --chg checkout): the rules being
+THE TWO SIDES. --base and --head are commits of the --chg checkout (the loopctl repository, chg under chg/): the rules being
 compared. Each is built once (cargo, and the Elixir adapter archive for the product's
 Elixir) into ~/.chg/replay/builds/<sha>/ and reused. --base-bin/--base-archives (and the
 head's) use an existing build instead, which is how the test drives it.
@@ -170,10 +170,10 @@ def build_locked(chg, sha, product, root):
         git(chg, "worktree", "add", "--detach", "-q", str(src), sha)
         env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
         run(["cargo", "build", "--release", "--locked", "--manifest-path",
-             str(src / "cli" / "Cargo.toml")], env=env, timeout=BUILD_TIMEOUT)
+             str(src / "chg" / "cli" / "Cargo.toml")], env=env, timeout=BUILD_TIMEOUT)
         shutil.copy2(root / "target" / "release" / "chg", binary)
         built = out / "ez"
-        run(["bash", str(src / "scripts" / "install-elixir-adapter.sh"), "--repo", str(product),
+        run(["bash", str(src / "chg" / "scripts" / "install-elixir-adapter.sh"), "--repo", str(product),
              "--out", str(built)], timeout=BUILD_TIMEOUT)
         ez = sorted(built.glob("*/chg_adapter.ez"))
         if len(ez) != 1:

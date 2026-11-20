@@ -60,7 +60,9 @@ Fatal = sync.Fatal
 DISPOSITIONS_PY = Path.home() / "workspace/claude-config/bin/review-dispositions.py"
 
 LABEL, ESCALATED = "chg-loop", "chg-loop-escalated"
-CLAUDE_CONFIG, CHG = "mkreyman/claude-config", "mkreyman/chg"
+# chg's source lives under chg/ in the loopctl repository (US-52.5), so chg's own causes are
+# filed there.
+CLAUDE_CONFIG, CHG = "mkreyman/claude-config", "mkreyman/loopctl"
 # A path under these claude-config directories is harness: its owner is claude-config.
 HARNESS_DIRS = ("hooks", "skills", "agents", "bin")
 BODY_CAP = 60000
@@ -106,6 +108,7 @@ def route(source_repo, path=None):
         m = re.search(r"(?:^|/)claude-config/(.+)$", p)
         if m and m.group(1).split("/")[0] in HARNESS_DIRS:
             return CLAUDE_CONFIG
+        # The old checkout path. chg/ inside a loopctl checkout is already loopctl's own.
         if re.search(r"(?:^|/)workspace/chg/", p):
             return CHG
         if source_repo == CLAUDE_CONFIG and p.split("/")[0] in HARNESS_DIRS:

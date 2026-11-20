@@ -129,6 +129,37 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.reasons == [{:selection_proof, {:selection_narrowed, "abc", ["t1"]}}]
     end
 
+    test "US-52.5: effect matches outside chg/ are judged as on any repository, and named" do
+      verdict =
+        judge(
+          files: ["priv/rates/2026.csv"],
+          diffstat: %{files: 1, changed_lines: 2},
+          selection_proof: {:outside_chg, ["priv/rates/2026.csv"]}
+        )
+
+      assert verdict.decision == :refuse
+
+      assert verdict.reasons == [
+               :effect_proof_required,
+               {:effect_outside_selection_proof, "chg/", ["priv/rates/2026.csv"]}
+             ]
+    end
+
+    test "US-52.5: the effect matches split by the chg/ prefix" do
+      assert MergePrecondition.selection_scope([{"chg/cli/src/a.rs", "chg/cli/**"}]) == :chg_only
+      assert MergePrecondition.selection_scope([{"lib/a.ex", "lib/**"}]) == :outside_only
+
+      assert MergePrecondition.selection_scope([
+               {"chg/cli/src/a.rs", "chg/cli/**"},
+               {"lib/a.ex", "lib/**"},
+               {"lib/a.ex", "lib/a.ex"}
+             ]) == {:mixed, ["lib/a.ex"]}
+
+      # A prefix match, never a substring: a file named after chg elsewhere is outside.
+      assert MergePrecondition.selection_scope([{"lib/chg/a.ex", "lib/**"}]) == :outside_only
+      assert MergePrecondition.chg_prefix() == "chg/"
+    end
+
     test "US-51.5: a selection proof never clears a human path" do
       verdict =
         judge(
