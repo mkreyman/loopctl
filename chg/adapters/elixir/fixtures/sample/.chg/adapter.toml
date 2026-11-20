@@ -1,0 +1,14 @@
+[adapter]
+kind = "elixir"
+version = "1"
+artifacts = ["deps", "_build"]
+inputs = ["lib/**", "test/**", "config/**", "priv/**", "mix.exs", "mix.lock"]
+always_all = ["mix.exs", "mix.lock", "config/**", "test/test_helper.exs", "test/support/**", ".chg/**"]
+isolation_env = { MIX_TEST_PARTITION = "{workspace_slot}" }
+
+[commands]
+snapshot = "mix chg.snapshot"
+static   = "MIX_ENV=test mix chg.static --base {base}"
+affected = "MIX_ENV=test mix chg.affected --base {base}"
+run      = "MIX_ENV=test mix chg.run --tests {file}"
+shard    = "MIX_ENV=test mix chg.shard --of {n} --index {i}"

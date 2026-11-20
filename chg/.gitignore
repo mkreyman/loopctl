@@ -1,0 +1,5 @@
+/target/
+/.claude/worktrees/
+/.claude/tmp/
+__pycache__/
+/.ci-cargo-home/

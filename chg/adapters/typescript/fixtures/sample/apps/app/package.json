@@ -1,0 +1,7 @@
+{
+  "name": "@s/app",
+  "private": true,
+  "type": "module",
+  "exports": { "./*": "./src/*.ts" },
+  "dependencies": { "@s/core": "workspace:*" }
+}

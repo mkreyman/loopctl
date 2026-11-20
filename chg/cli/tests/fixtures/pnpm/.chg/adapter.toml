@@ -1,0 +1,13 @@
+[adapter]
+kind = "pnpm"
+version = "1"
+artifacts = ["node_modules", "apps/*/node_modules", "packages/*/node_modules", "packages/*/dist"]
+inputs = ["apps/**", "packages/**", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".tool-versions"]
+always_all = ["pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig*.json", "vitest*.config.ts", "playwright.config.ts", ".github/**", ".chg/**"]
+
+[commands]
+snapshot = "sh .chg/fake-adapter.sh snapshot"
+static   = "sh .chg/fake-adapter.sh static {base}"
+affected = "sh .chg/fake-adapter.sh affected {base}"
+run      = "sh .chg/fake-adapter.sh run {file}"
+shard    = "sh .chg/fake-adapter.sh shard {n} {i}"

@@ -1,0 +1,293 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# A PR keeps only its newest run. Every master push gets its own group (keyed by sha),
+# so no master commit loses its verdict to a later push: the post-merge verifier and
+# culprit finder (design §3.8) need one result per commit.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Incremental builds are slow to cache and useless in CI.
+env:
+  CARGO_INCREMENTAL: "0"
+
+# Every job runs on the fleet-ci runner pool (beelink, minis and x1, each serving chg from
+# its INFRA_POOL_REPOS; infra decisions/0021, runbooks/ci-runner-setup.md), never on
+# GitHub-hosted minutes. beelink takes a job first; minis and x1 take it after it has
+# queued 45 s and only while their measured CPU leaves room. Jobs share
+# one persistent account there, so nothing below writes per-user state such as
+# `git config --global` or `rustup default`.
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+          # The APFS clonefile(2) path (design §3.5) only compiles for macOS. The repo
+          # variable CI_RUNNER_MACOS (a JSON label list, e.g. mac-mini's self-hosted
+          # runner) runs this leg natively, tests included. Unset, it runs on fleet-ci and
+          # cross-checks the Macs' target with clippy, no link and no tests: never a
+          # hosted macOS runner, which bills 10x.
+          - os: macos
+    runs-on: ${{ matrix.os == 'macos' && vars.CI_RUNNER_MACOS && fromJSON(vars.CI_RUNNER_MACOS) || fromJSON('["self-hosted","fleet-ci"]') }}
+    env:
+      CROSS: ${{ matrix.os == 'macos' && !vars.CI_RUNNER_MACOS && '--target aarch64-apple-darwin' || '' }}
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain from .tool-versions
+        run: scripts/ci-rust-toolchain.sh --component rustfmt --component clippy $CROSS
+      # The Linux clone tests need reflink: each fleet-ci host's chg volume (S5) is XFS with reflink.
+      # Without it they fail rather than skip: CI=true makes a missing
+      # CHG_TEST_REFLINK_DIR an error.
+      - name: chg volume
+        if: matrix.os == 'linux'
+        run: |
+          # ci-tmp is 1777 (bin/chg-volume-setup.sh), so the runner account can write it.
+          if [ -d /srv/chg/ci-tmp ] && [ -w /srv/chg/ci-tmp ]; then
+            echo "CHG_TEST_REFLINK_DIR=/srv/chg/ci-tmp" >> "$GITHUB_ENV"
+          fi
+      # Hosted and self-hosted runs must never share a cache entry (infra
+      # runbooks/ci-runner-setup.md: keys include runner.environment). A PR only restores.
+      - id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          key: ${{ runner.environment }}-rust-${{ matrix.os }}
+      - run: cargo fmt --all --check
+        if: matrix.os == 'linux'
+      - run: cargo clippy --all-targets --locked $CROSS -- -D warnings
+      # No --all-targets: that flag excludes doctests.
+      - run: cargo test --locked
+        if: env.CROSS == ''
+      # Only master saves, only when nothing under the base key was restored, after the
+      # tests, at most 3 minutes and never fatally: a slow upload once ran a green job into
+      # its timeout. The job's own timeout carries 4 minutes for this step.
+      - name: Save the cargo cache
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.matched == ''
+        uses: ./.github/actions/cargo-cache-save
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          base: ${{ steps.cargo-cache.outputs.base }}
+
+  # bin/chg-volume-setup.sh mounts and writes fstab, so its test needs root. The runner
+  # account has no sudo, so the test runs in a --privileged container through the docker
+  # group, through sudo as its contract says. That container is not isolation: it sees the
+  # host's devices (a test killed mid-run can leave a loop device attached), and the
+  # docker group is root-equivalent on every fleet-ci host. Its fstab and mounts are the container's,
+  # which is what keeps the test off the host's /etc/fstab and /srv/chg.
+  volume-setup:
+    name: volume-setup (linux)
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # apt uses mirrors.edge.kernel.org, and each apt command is capped at 5 minutes: on
+      # 2026-11-09 archive.ubuntu.com stopped answering, and apt waited out the job's
+      # 10-minute cap twice. A mirror list with archive.ubuntu.com as fallback still hung
+      # (apt fell over to it for some files); kernel.org alone took 13 s. The container is
+      # named, so a cancelled job (whose docker client the runner kills, leaving the
+      # container running) is still removed.
+      - name: shellcheck, and the volume setup test as root in a container
+        run: |
+          docker run --rm --name "chg-volume-setup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --privileged -v "$PWD:/w:ro" -w /w ubuntu:24.04 bash -euc '
+            sed -i -E "s#http://(archive|security)\.ubuntu\.com/ubuntu/?#http://mirrors.edge.kernel.org/ubuntu/#" /etc/apt/sources.list.d/ubuntu.sources
+            apt="-q -o Acquire::http::Timeout=20 -o Acquire::Retries=3"
+            timeout 300 apt-get $apt update >/dev/null
+            timeout 300 apt-get $apt install -y xfsprogs git sudo shellcheck >/dev/null
+            shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh scripts/ci-rust-toolchain.sh \
+              bin/chg-outbox-cron.sh tests/outbox-cron-test.sh
+            bash tests/outbox-cron-test.sh
+            useradd -m ci && echo "ci ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/ci
+            sudo -u ci sudo bash tests/volume-setup-test.sh'
+      - name: remove the container if the job was cancelled
+        if: always()
+        run: docker rm -f "chg-volume-setup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >/dev/null 2>&1 || true
+
+  # The Mix adapter (adapters/elixir): its unit tests, and an integration test that
+  # installs it as an archive and drives a fixture project through every task, including
+  # `chg adapter exec` (CHG_BIN), which applies always_all before the adapter runs.
+  # Twice: on adapters/elixir/.tool-versions, and on the oldest Elixir its mix.exs accepts
+  # (loopctl is on 1.19), since the adapter reads Mix's version-specific manifests.
+  elixir-adapter:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: elixir-adapter (linux)
+          - name: elixir-adapter (linux, elixir 1.19)
+            elixir: "1.19.5"
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 24
+    env:
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@localhost
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@localhost
+    defaults:
+      run:
+        working-directory: adapters/elixir
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Mix keeps its build-lock files in $TMPDIR, and a job killed mid-compile leaves one
+      # behind that a later job on this slot can wait on for its whole timeout (#119).
+      # RUNNER_TEMP is emptied at the start of every job.
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: erlef/setup-beam@v1
+        if: ${{ !matrix.elixir }}
+        with:
+          version-file: adapters/elixir/.tool-versions
+          version-type: strict
+      # The pinned OTP, so the two legs differ only in Elixir.
+      - name: OTP from .tool-versions
+        if: ${{ matrix.elixir }}
+        id: otp
+        working-directory: .
+        run: echo "version=$(awk '$1=="erlang"{print $2}' adapters/elixir/.tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: erlef/setup-beam@v1
+        if: ${{ matrix.elixir }}
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ steps.otp.outputs.version }}
+          version-type: strict
+      - name: Rust toolchain from .tool-versions
+        working-directory: .
+        run: scripts/ci-rust-toolchain.sh
+      - id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          key: ${{ runner.environment }}-elixir-${{ matrix.elixir || 'pinned' }}
+      - name: Build chg
+        working-directory: .
+        run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
+      # The formatter's output differs across versions: checked on the pinned one only.
+      - run: mix format --check-formatted
+        if: ${{ !matrix.elixir }}
+      - run: mix compile --warnings-as-errors
+      - run: mix test
+      # Only master saves, only when nothing under the base key was restored, after the
+      # tests, at most 3 minutes and never fatally: a slow upload once ran a green job into
+      # its timeout. The job's own timeout carries 4 minutes for this step.
+      - name: Save the cargo cache
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.matched == ''
+        uses: ./.github/actions/cargo-cache-save
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          base: ${{ steps.cargo-cache.outputs.base }}
+
+  # The pnpm adapter (adapters/typescript): unit tests, and an integration test that drives
+  # a fixture workspace through every command, including `chg adapter exec` (CHG_BIN).
+  typescript-adapter:
+    name: typescript-adapter (linux)
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 24
+    env:
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@localhost
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@localhost
+    defaults:
+      run:
+        working-directory: adapters/typescript
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: adapters/typescript/.tool-versions
+      # Into this job's RUNNER_TEMP. The default dest, ~/setup-pnpm, is one directory for every
+      # slot of the runner account, and another slot's install replaced it mid-run: the tests
+      # failed with `spawn pnpm ENOENT` (beelink-pool-3, 2026-10-29).
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+          dest: ${{ runner.temp }}/setup-pnpm
+      - name: pnpm is this job's own
+        run: |
+          pnpm_bin=$(command -v pnpm) || {
+            echo "::error::pnpm is not on PATH after pnpm/action-setup (PATH=$PATH)"
+            exit 1
+          }
+          case $pnpm_bin in
+            "$RUNNER_TEMP"/*) ;;
+            *) echo "::error::pnpm resolves to $pnpm_bin, outside this job's RUNNER_TEMP, where another job can replace it"
+               exit 1 ;;
+          esac
+          pnpm --version
+      - name: Rust toolchain from .tool-versions
+        working-directory: .
+        run: scripts/ci-rust-toolchain.sh
+      - id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          key: ${{ runner.environment }}-typescript
+      - name: Build chg
+        working-directory: .
+        run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
+      - run: node --test test/unit.test.mjs test/integration.test.mjs
+      # Only master saves, only when nothing under the base key was restored, after the
+      # tests, at most 3 minutes and never fatally: a slow upload once ran a green job into
+      # its timeout. The job's own timeout carries 4 minutes for this step.
+      - name: Save the cargo cache
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.matched == ''
+        uses: ./.github/actions/cargo-cache-save
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          base: ${{ steps.cargo-cache.outputs.base }}
+
+  # The generic adapter (a repo with no build: claude-config) in a throwaway repo with a fake
+  # selector and runner, including `chg adapter exec` (CHG_BIN).
+  generic-adapter:
+    name: generic-adapter (linux)
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 19
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Rust toolchain from .tool-versions
+        run: scripts/ci-rust-toolchain.sh
+      - id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          key: ${{ runner.environment }}-generic
+      - name: Build chg
+        run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
+      - run: python3 adapters/generic/test/test_adapter.py -v
+      - name: chg-loop on fixtures (no GitHub)
+        run: python3 tests/loop-test.py
+      - name: chg-replay-selection on fake builds (no cargo, no network)
+        run: python3 tests/replay-selection-test.py
+      # Only master saves, only when nothing under the base key was restored, after the
+      # tests, at most 3 minutes and never fatally: a slow upload once ran a green job into
+      # its timeout. The job's own timeout carries 4 minutes for this step.
+      - name: Save the cargo cache
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.matched == ''
+        uses: ./.github/actions/cargo-cache-save
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          base: ${{ steps.cargo-cache.outputs.base }}

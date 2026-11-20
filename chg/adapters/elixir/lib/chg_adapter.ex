@@ -1,0 +1,322 @@
+defmodule ChgAdapter do
+  @moduledoc """
+  Shared plumbing for the `mix chg.*` tasks (chg adapter contract v1,
+  `docs/adapter-contract.md`).
+
+  Every task prints exactly one JSON document as its last stdout line. Progress goes to
+  stderr, or to stdout before the document, which `chg` relays to stderr.
+  """
+
+  @state_dir "_build/chg"
+
+  @doc "Where the snapshot marker and the test reference cache live (cloned with `_build`)."
+  def state_dir, do: @state_dir
+
+  @doc """
+  Loads every module of this archive, then compiles the project. `mix compile` prunes
+  the code path to the project's own applications (`Mix.Tasks.Compile.All`), which
+  removes the archive's ebin: a module not loaded before that is unloadable after it.
+  """
+  def preload_and_compile! do
+    preload!()
+    compile!()
+  end
+
+  @doc """
+  Compiles the project through `mix chg.compile`, whose VM preloads the project's atoms
+  (`ChgAdapter.Atoms`), with its output on stderr; then `mix compile` here finds nothing
+  stale and only loads the result. A failed compile is reported by that second one.
+  """
+  def compile! do
+    _ = stream("mix", ["chg.compile"])
+    Mix.Task.run("compile")
+  end
+
+  def preload! do
+    for app <- [:chg_adapter, :ex_unit] do
+      _ = Application.load(app)
+      {:ok, mods} = :application.get_key(app, :modules)
+      Code.ensure_all_loaded!(mods)
+    end
+
+    :ok
+  end
+
+  @doc """
+  Runs `fun` only under `MIX_ENV=test`. Mix 1.20 deprecates a task choosing its own env
+  (`@preferred_cli_env`), and a product should not need a `def cli` entry for an
+  archive's tasks, so a task started in another env runs itself again under
+  `MIX_ENV=test`, passing its stdout through. The adapter manifest sets `MIX_ENV=test`
+  on these commands, so `chg` never pays for the second VM.
+  """
+  def in_test_env(task, args, fun) do
+    if Mix.env() == :test do
+      Process.put(:chg_deps, sync_deps())
+      fun.()
+    else
+      {_, status} =
+        System.cmd("mix", [task | args],
+          env: [{"MIX_ENV", "test"}],
+          into: IO.stream(:stdio, :line)
+        )
+
+      halt(status)
+    end
+  end
+
+  @doc "The hash of the tree's `mix.lock` (of the empty string when it has none)."
+  def lock_digest do
+    lock = if File.exists?("mix.lock"), do: File.read!("mix.lock"), else: ""
+    Base.encode16(:crypto.hash(:sha256, lock), case: :lower)
+  end
+
+  @doc "The file recording the `lock_digest/0` the deps directory was last fetched for."
+  def lock_marker, do: Path.join(Mix.Project.deps_path(), ".chg_lock")
+
+  @doc """
+  Runs `mix deps.get` when `marker` does not hold the hash of the tree's `mix.lock`, then
+  records the hash of the lock as the fetch left it. A hydrated tree holds its snapshot's
+  deps, so without this a commit that bumps a dependency stops every task on Mix's "lock
+  mismatch". `in_test_env/3` runs it before each task; `deps_result/0` reads the outcome.
+  Returns `:ok` or `{:error, output}`.
+  """
+  def sync_deps(marker \\ lock_marker(), digest \\ &lock_digest/0, fetch \\ &fetch_deps/0) do
+    if File.read(marker) == {:ok, digest.()} do
+      :ok
+    else
+      case fetch.() do
+        {_, 0} ->
+          record_lock(marker, digest.())
+          :ok
+
+        {out, _} ->
+          {:error, out}
+      end
+    end
+  end
+
+  defp fetch_deps, do: capture("mix", ["deps.get"])
+
+  @doc "What `sync_deps/0` returned for this task: `:ok` or `{:error, output}`."
+  def deps_result, do: Process.get(:chg_deps, :ok)
+
+  @doc "Records `digest` in `marker`, creating the deps directory a project without deps lacks."
+  def record_lock(marker \\ lock_marker(), digest \\ lock_digest()) do
+    File.mkdir_p!(Path.dirname(marker))
+    File.write!(marker, digest)
+  end
+
+  @doc """
+  Prints the contract document as the last stdout line, on a line of its own: the
+  progress before it can end mid-line, as the formatter's dots do when `mix test` stops
+  on a test file that does not compile.
+  """
+  def emit(doc), do: IO.puts(["\n", JSON.encode!(doc)])
+
+  @doc "Exits the task with `status` after the document is out."
+  def halt(0), do: :ok
+  def halt(status), do: exit({:shutdown, status})
+
+  @doc "Runs a command with its output on stderr; returns the exit status."
+  def stream(cmd, args, env \\ []) do
+    {_, status} =
+      System.cmd(cmd, args,
+        env: env,
+        into: IO.stream(:standard_error, :line),
+        stderr_to_stdout: true
+      )
+
+    status
+  end
+
+  @doc """
+  Runs a command and captures stdout, echoing it to stderr so a slow step still shows
+  progress. The command's own stderr is merged in when `merge: true`.
+  """
+  def capture(cmd, args, opts \\ []) do
+    {out, status} =
+      System.cmd(cmd, args,
+        env: Keyword.get(opts, :env, []),
+        stderr_to_stdout: Keyword.get(opts, :merge, true)
+      )
+
+    IO.write(:standard_error, out)
+    {out, status}
+  end
+
+  @doc """
+  The commit the tree holds: `CHG_SHA` when chg sets it (a snapshot build runs in a plain
+  tree with no `.git`), else git's HEAD.
+  """
+  def head! do
+    case System.get_env("CHG_SHA") do
+      sha when sha in [nil, ""] -> git!(["rev-parse", "HEAD"])
+      sha -> sha
+    end
+  end
+
+  @doc "Trimmed stdout of a git command that must succeed."
+  def git!(args) do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {out, 0} -> String.trim(out)
+      {out, _} -> Mix.raise("git #{Enum.join(args, " ")} failed: #{String.trim(out)}")
+    end
+  end
+
+  @doc """
+  Paths that differ between `base` and the working tree, tracked or untracked, with
+  renames split into the deleted and the added path, relative to the project directory
+  and limited to it (`--relative`), as the manifest records them. The same set `chg`
+  checks against `always_all`.
+  """
+  def changed_paths(base) do
+    with {:ok, sha} <- resolve(base),
+         {:ok, diff} <- git_z(["diff", "--relative", "--no-renames", "--name-only", "-z", sha]),
+         {:ok, new} <- git_z(["ls-files", "--others", "--exclude-standard", "-z"]) do
+      {:ok, Enum.uniq(diff ++ new)}
+    end
+  end
+
+  @doc """
+  `{:all, reason}` when a file changed since `rev` (committed, in the working tree, or
+  untracked) under a path dependency or umbrella sibling inside the repository
+  (`Mix.SCM.Path`), else `:ok`; the reason names the file relative to the repository. Such a dependency's modules are in no coverage record digest
+  and no module graph, so no selection accounts for a change to them. Its directory may lie
+  outside the project (an umbrella child's `../sibling`), so this asks git about that
+  directory, not the project-relative `changed_paths/1`.
+  """
+  def path_dep_change(rev) do
+    # The top from the working directory, as Mix's paths are: --show-toplevel resolves
+    # symlinks (macOS /var is /private/var), and every dependency would look outside it.
+    with {:ok, sha} <- resolve(rev),
+         {:ok, cdup} <- git_z(["rev-parse", "--show-cdup"]) do
+      top = Path.expand(cdup |> Enum.join() |> String.trim(), File.cwd!())
+      scms = Mix.Project.deps_scms()
+
+      Mix.Project.deps_paths()
+      |> Enum.filter(fn {dep, _} -> scms[dep] == Mix.SCM.Path end)
+      |> Enum.map(fn {dep, path} -> {dep, Path.relative_to(Path.expand(path), top)} end)
+      |> Enum.filter(fn {_, dir} -> Path.type(dir) == :relative and dir != "." end)
+      |> Enum.find_value(:ok, &dep_changed(&1, sha))
+    end
+  end
+
+  defp dep_changed({dep, dir}, sha) do
+    spec = ":(top)" <> dir
+
+    with {:ok, diff} <- git_z(["diff", "--no-renames", "--name-only", "-z", sha, "--", spec]),
+         {:ok, new} <- git_z(["ls-files", "--others", "--exclude-standard", "-z", "--", spec]) do
+      case diff ++ new do
+        [] ->
+          nil
+
+        [p | _] ->
+          {:all,
+           "#{p} is in the path dependency " <>
+             "#{dep} (#{dir}/), whose modules no coverage record or module graph covers"}
+      end
+    end
+  end
+
+  @doc """
+  The changed paths `chg` found matching the manifest's `read_at_runtime`, one per line in
+  `CHG_READ`: since the base, and since the coverage record when it hands one over.
+  """
+  def read_paths do
+    (System.get_env("CHG_READ") || "") |> String.split("\n", trim: true)
+  end
+
+  @doc """
+  The executables whose subprocesses read no `read_at_runtime` path (the manifest's
+  `not_read_by`), one per line in `CHG_NOT_READ_BY`.
+  """
+  def not_read_by do
+    (System.get_env("CHG_NOT_READ_BY") || "") |> String.split("\n", trim: true)
+  end
+
+  def resolve(rev) do
+    case System.cmd("git", ["rev-parse", "--verify", "--quiet", rev <> "^{commit}"],
+           stderr_to_stdout: true
+         ) do
+      {sha, 0} -> {:ok, String.trim(sha)}
+      _ -> {:error, "`#{rev}` is not a commit"}
+    end
+  end
+
+  defp git_z(args) do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {out, 0} -> {:ok, String.split(out, <<0>>, trim: true)}
+      {out, _} -> {:error, "git #{hd(args)} failed: #{String.trim(out)}"}
+    end
+  end
+
+  @doc "The project's test files, as `mix test` would load them."
+  def test_files do
+    for dir <- Mix.Project.config()[:test_paths] || ["test"],
+        file <- Path.wildcard(Path.join(dir, "**/*.exs")),
+        test_file?(file),
+        do: file
+  end
+
+  @doc "True when `path` is a file `mix test` would load."
+  def test_file?(path) do
+    config = Mix.Project.config()
+    filters = config[:test_load_filters] || [&String.ends_with?(&1, "_test.exs")]
+    ignore = config[:test_ignore_filters] || []
+
+    Enum.any?(config[:test_paths] || ["test"], &String.starts_with?(path, &1 <> "/")) and
+      Enum.any?(filters, &match_filter?(&1, path)) and
+      not Enum.any?(ignore, &match_filter?(&1, path))
+  end
+
+  @doc "True when `path` is under one of the project's test paths."
+  def test_path?(path) do
+    Enum.any?(
+      Mix.Project.config()[:test_paths] || ["test"],
+      &String.starts_with?(path, &1 <> "/")
+    )
+  end
+
+  defp match_filter?(%Regex{} = r, file), do: Regex.match?(r, file)
+  defp match_filter?(f, file) when is_function(f, 1), do: f.(file)
+
+  @doc """
+  The `MIX_ENV` to run a dependency's tasks in, from its declaration in `deps`, or nil
+  when it is not a dependency: "test" unless `:only` leaves it out of test, then "dev",
+  then the first env `:only` names. `{:dialyxir, "~> 1.4", only: :dev}` is common, and
+  `MIX_ENV=test mix dialyzer` cannot find the task there.
+  """
+  def dep_env(name, deps \\ Mix.Project.config()[:deps] || []) do
+    case Enum.find(deps, &(elem(&1, 0) == name)) do
+      nil ->
+        nil
+
+      dep ->
+        opts = dep |> Tuple.to_list() |> List.last()
+        only = if Keyword.keyword?(opts), do: opts[:only], else: nil
+
+        case List.wrap(only) do
+          [] -> "test"
+          envs -> Enum.find(["test", "dev"], &(String.to_atom(&1) in envs)) || to_string(hd(envs))
+        end
+    end
+  end
+
+  @doc "Writes `data` to `path` atomically: a reader sees the old file or the new one."
+  def write_atomic!(path, data) do
+    File.mkdir_p!(Path.dirname(path))
+    tmp = "#{path}.#{System.os_time()}.tmp"
+    File.write!(tmp, data)
+    File.rename!(tmp, path)
+  end
+
+  @doc "Milliseconds since `started` (a `System.monotonic_time/0`)."
+  def ms_since(started) do
+    System.convert_time_unit(System.monotonic_time() - started, :native, :millisecond)
+  end
+
+  @doc "The last `n` lines of `text`, for a failure message."
+  def tail(text, n \\ 40) do
+    text |> String.split("\n") |> Enum.take(-n) |> Enum.join("\n") |> String.trim()
+  end
+end

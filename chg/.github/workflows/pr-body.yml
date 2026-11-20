@@ -1,0 +1,49 @@
+# pr-body — every PR body carries Testing, Risk and How to revert sections with real content.
+#
+# A PR cannot weaken the rule it is judged by: `pull_request_target` runs this workflow as it
+# stands on the base branch, and the check, bin/pr-body-sections.sh, is fetched from the base
+# through the API. That trigger is safe here only because nothing from the PR is checked out or
+# run: the job reads the body as data. Its own workflow so a body edit re-runs it without
+# re-running ci.yml. Copied from claude-config (its #918 item 1), which holds the original.
+name: pr-body
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-body-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-body:
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 3
+    steps:
+      - name: Body has Testing, Risk and How to revert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          script=$(mktemp)
+          err=$(mktemp)
+          trap 'rm -f "$script" "$err"' EXIT
+          if ! gh api "repos/$REPO/contents/bin/pr-body-sections.sh?ref=$BASE" \
+               -H 'Accept: application/vnd.github.raw' >"$script" 2>"$err"; then
+            # Only a 404 means the base predates the script (the PR that adds it). Any other
+            # failure (auth, rate limit, 5xx, network) fails the job rather than waving a PR through.
+            if grep -q 'HTTP 404' "$err"; then
+              echo "bin/pr-body-sections.sh is not on the base yet (the PR that adds it): nothing to apply"
+              exit 0
+            fi
+            echo "::error::could not fetch bin/pr-body-sections.sh from the base: $(cat "$err")"
+            exit 1
+          fi
+          printf '%s' "$BODY" | bash "$script"
