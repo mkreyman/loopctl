@@ -1,0 +1,35 @@
+{
+  "spec": "verify",
+  "version": 1,
+  "description": "The head the dispatch names is a commit that does not exist in the fixture, as after a force push moved the pull request on. The runner must send no verdict, so loopctl places the story again. Deterministic: no session runs.",
+  "input": {
+    "dispatch_id": "e7a14040-0000-4000-8000-000000000001",
+    "story_id": "e7a14040-0000-4000-8000-000000000002",
+    "kind": "verify",
+    "repo": "eval/tiny_app",
+    "base_branch": "master",
+    "branch": "loop/eval-v04-fix-total",
+    "claim_epoch": 1,
+    "wall_clock_seconds": 900,
+    "max_turns": 40,
+    "story": {
+      "id": "e7a14040-0000-4000-8000-000000000002",
+      "title": "TinyApp.total/1 returns the sum of upload sizes",
+      "description": "total/1 reduces with size - acc, so total([2, 3]) is 1 rather than 5. It should add the sizes.",
+      "acceptance_criteria": ["TinyApp.total([2, 3]) returns 5", "TinyApp.total([]) still returns 0"],
+      "test_cases": ["total of two sizes is their sum"],
+      "touches": ["lib/tiny_app.ex", "test/tiny_app_test.exs"]
+    },
+    "verify": {"pr_number": 13, "head_sha": "4b1d0a5e9c7f3e2d1c0b9a8f7e6d5c4b3a291807"}
+  },
+  "fixture": {"repo": "fixtures/tiny_app_pr.json", "commit": "6275d38f062136ea998174995850b1bf3be1ba86"},
+  "expectations": {
+    "schema_valid": false,
+    "outcomes_allowed": ["no_result"],
+    "escalation_codes": [],
+    "lens_agreement": null,
+    "forbidden": [],
+    "screens": [],
+    "rubric": null
+  }
+}

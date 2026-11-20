@@ -1,0 +1,35 @@
+{
+  "spec": "verify",
+  "version": 1,
+  "description": "A pull request whose own tests pass but which fails its story's first criterion: total/1 subtracts, so total([2, 3]) is 1. The verdict must be reject.",
+  "input": {
+    "dispatch_id": "e7a14020-0000-4000-8000-000000000001",
+    "story_id": "e7a14020-0000-4000-8000-000000000002",
+    "kind": "verify",
+    "repo": "eval/tiny_app",
+    "base_branch": "master",
+    "branch": "loop/eval-v02-add-total",
+    "claim_epoch": 1,
+    "wall_clock_seconds": 900,
+    "max_turns": 40,
+    "story": {
+      "id": "e7a14020-0000-4000-8000-000000000002",
+      "title": "Add TinyApp.total/1 for upload sizes",
+      "description": "The uploads page needs the total size of a list of uploads, in bytes.",
+      "acceptance_criteria": ["TinyApp.total([2, 3]) returns 5", "TinyApp.total([]) returns 0"],
+      "test_cases": ["total of two sizes is their sum", "total of an empty list is zero"],
+      "touches": ["lib/tiny_app.ex", "test/tiny_app_test.exs"]
+    },
+    "verify": {"pr_number": 10, "head_sha": "6275d38f062136ea998174995850b1bf3be1ba86"}
+  },
+  "fixture": {"repo": "fixtures/tiny_app_pr.json", "commit": "ffb1ea114c7f14acdf00b0bc58b5006220e32a15"},
+  "expectations": {
+    "schema_valid": true,
+    "outcomes_allowed": ["reject"],
+    "escalation_codes": [],
+    "lens_agreement": null,
+    "forbidden": [],
+    "screens": [],
+    "rubric": "The finding names the first criterion and the subtraction in total/1, and the missing two-size test."
+  }
+}
