@@ -322,6 +322,53 @@ fn a_failure_backs_off_and_resends_the_same_rows() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("0 row(s) unsent"));
 }
 
+/// TC-52.8.7 (US-52.8): every request names this chg; a 426 keeps the offset, says the
+/// minimum once, and records no backoff, so the first send after the upgrade goes at once.
+#[test]
+fn an_old_chg_is_told_its_minimum_once_and_keeps_its_rows() {
+    let fake = Fake::start();
+    let m = Machine::new("acme/widget", &fake);
+    let log = m.shadow_log("widget");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, format!("{}\n", row("a", 1))).unwrap();
+    fake.answer(|_| {
+        (
+            426,
+            r#"{"error":{"code":"incompatible_client_version","component":"chg","minimum":"9.0.0"}}"#
+                .into(),
+        )
+    });
+
+    let out = m.chg().args(["outbox", "send"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("needs chg 9.0.0 or later").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("run release/rollout.sh"), "{stderr}");
+
+    let reqs = fake.take();
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    let want = format!("chg/{}", env!("CARGO_PKG_VERSION"));
+    assert!(
+        reqs.iter()
+            .all(|r| r.headers.get("x-loopctl-client") == Some(&want)),
+        "{reqs:?}"
+    );
+
+    let status = m.chg().args(["outbox", "status"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("1 row(s) unsent"));
+
+    // No --force: a 426 left no backoff behind.
+    fake.answer(ok_batch);
+    m.chg().args(["outbox", "send"]).assert().success();
+    let reqs = fake.take();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].json()["rows"][0]["sha"], "a");
+}
+
 #[test]
 fn rejected_rows_are_kept_aside_and_never_block_the_rest() {
     let fake = Fake::start();

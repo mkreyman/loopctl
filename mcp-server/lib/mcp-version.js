@@ -56,8 +56,12 @@
  *   - `ahead` is normal on a development machine running the package from a checkout, and it
  *     means the deployment is older than your client rather than anything being wrong.
  *
- * NEITHER SIDE IS A GATE. Nothing here refuses a call, and nothing should: this is a report so
- * that a session stops guessing, exactly as the join reply is for a runner.
+ * THIS REPORT IS NOT THE GATE. Nothing here refuses a call: it is a report so that a session
+ * stops guessing, as the join reply is for a runner. The gate is the server's (US-52.8): every
+ * request carries `x-loopctl-client: mcp/<version>` (./client-version.js), and loopctl answers
+ * 426 `incompatible_client_version` to a package below the `mcp` minimum of its release set.
+ * `behind` alone is never refused: a package between that minimum and the current version
+ * works, and this report says it is behind.
  */
 
 import { readFileSync } from "node:fs";

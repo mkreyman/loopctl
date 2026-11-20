@@ -95,6 +95,55 @@ defmodule LoopctlRunner.ControlTest do
     assert %{joined: true, topic: "runner:" <> ^runner_id} = Control.info(pid)
   end
 
+  # TC-52.8.6 (US-52.8).
+  test "joins with its own version and records the admitted join in joined.json", ctx do
+    TestLoopctl.script_joins([{:ok, %{release_set: 4}}])
+    {pid, _ref} = start_control(ctx.config)
+
+    runner_id = TestLoopctl.get(:runner_id)
+    assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
+    assert join["runner_version"] == to_string(Application.spec(:loopctl_runner, :vsn))
+    assert join["runner_version"] == Control.runner_version()
+
+    file = Control.joined_file(ctx.config)
+    assert file == Path.join(Path.dirname(ctx.config.runs_dir), "joined.json")
+    assert wait_until(fn -> File.exists?(file) end) == :ok
+
+    assert %{
+             "release_set" => 4,
+             "runner_version" => runner_version,
+             "contract_version" => contract_version,
+             "joined_at" => _
+           } = file |> File.read!() |> Jason.decode!()
+
+    assert runner_version == Control.runner_version()
+    assert contract_version == Contract.version()
+    assert %{joined: true} = Control.info(pid)
+  end
+
+  test "a release set refusing this build stops the client without rejoining", ctx do
+    TestLoopctl.script_joins([
+      {:error,
+       %{
+         reason: "incompatible_client_version",
+         component: "runner",
+         sent: "0.1.0",
+         minimum: "9.0.0"
+       }}
+    ])
+
+    {pid, ref} = start_control(ctx.config)
+
+    assert_receive {:fatal, {:join_refused, "incompatible_client_version", _}}, 10_000
+
+    assert_receive {:DOWN, ^ref, :process, ^pid,
+                    {:shutdown, {:join_refused, "incompatible_client_version", _}}}
+
+    assert_receive {:test_loopctl, {:join, _, _}}
+    refute_receive {:test_loopctl, {:join, _, _}}, 3_000
+    refute File.exists?(Control.joined_file(ctx.config))
+  end
+
   test "a refusal retrying cannot fix stops the client once, without rejoining", ctx do
     TestLoopctl.script_joins([{:error, %{reason: "machine_mismatch", declared: "testbox"}}])
     {pid, ref} = start_control(ctx.config)

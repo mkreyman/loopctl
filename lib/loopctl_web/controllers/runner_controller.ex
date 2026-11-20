@@ -257,6 +257,7 @@ defmodule LoopctlWeb.RunnerController do
                    :machine,
                    :runner_id,
                    :joined_at,
+                   :runner_version,
                    :in_flight,
                    :draining,
                    :max_sessions,
@@ -278,6 +279,13 @@ defmodule LoopctlWeb.RunnerController do
                    machine: %Schema{type: :string, description: "The enrolled machine name."},
                    runner_id: %Schema{type: :string, format: :uuid},
                    joined_at: %Schema{type: :string, format: :"date-time"},
+                   runner_version: %Schema{
+                     type: :string,
+                     nullable: true,
+                     description:
+                       "The runner's own version as it joined (contract 1.34.0), null for " <>
+                         "a runner that sent none."
+                   },
                    in_flight: %Schema{
                      type: :integer,
                      minimum: 0,
@@ -523,6 +531,7 @@ defmodule LoopctlWeb.RunnerController do
       machine: machine,
       runner_id: Map.get(meta, :runner_id),
       joined_at: Map.get(meta, :joined_at),
+      runner_version: Map.get(meta, :runner_version),
       in_flight: Map.get(held, :in_flight),
       draining: Map.get(meta, :draining),
       max_sessions: Map.get(held, :max_sessions),

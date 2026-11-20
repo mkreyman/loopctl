@@ -257,6 +257,10 @@ defmodule LoopctlRunner.TestLoopctl do
     defp scripted_reply(:ok, socket),
       do: {:ok, %{contract_version: LoopctlRunner.Contract.version()}, socket}
 
+    # An admitted join with the reply fields a test names merged in (US-52.8's release_set).
+    defp scripted_reply({:ok, extra}, socket),
+      do: {:ok, Map.merge(%{contract_version: LoopctlRunner.Contract.version()}, extra), socket}
+
     # What loopctl does on not_authorized: refuse, then close the socket.
     defp scripted_reply(:not_authorized_disconnect, _socket) do
       spawn(fn ->

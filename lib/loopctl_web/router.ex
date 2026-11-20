@@ -44,6 +44,9 @@ defmodule LoopctlWeb.Router do
     # reject them 401 first. Distinct from the per-key RateLimiter below, which
     # fails OPEN for authenticated capacity.
     plug LoopctlWeb.Plugs.AuthPathThrottle
+    # US-52.8: a factory client older than the release set gets its 426 before any key is
+    # read, so the refusal it can act on is not hidden behind a 401 it cannot.
+    plug LoopctlWeb.Plugs.ClientVersion
     plug LoopctlWeb.Plugs.ExtractApiKey
     plug LoopctlWeb.Plugs.ResolveApiKey
     plug LoopctlWeb.Plugs.SetTenant
@@ -217,6 +220,7 @@ defmodule LoopctlWeb.Router do
   # bucket of their own.
   pipeline :change_events do
     plug LoopctlWeb.Plugs.GithubIntakeThrottle, bucket: "change_events_ip"
+    plug LoopctlWeb.Plugs.ClientVersion
   end
 
   scope "/api/v1", LoopctlWeb do

@@ -87,6 +87,11 @@ import {
   updateIntakeSource,
 } from "./lib/intake-sources.js";
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
+import {
+  CLIENT_HEADER,
+  clientHeaderValue,
+  incompatibleClientError,
+} from "./lib/client-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 import { changeBindingGet as changeBindingGetRequest } from "./lib/change-bindings.js";
 import { agentOutcomes } from "./lib/agent-outcomes.js";
@@ -260,6 +265,9 @@ async function apiCall(
     Authorization: `Bearer ${key}`,
     "Content-Type": "application/json",
     Accept: "application/json",
+    // US-52.8: loopctl answers 426 incompatible_client_version to a package older than its
+    // release set accepts. Unlike x-loopctl-client-context below, this one IS judged.
+    [CLIENT_HEADER]: clientHeaderValue(SERVER_VERSION),
   };
 
   // #658: client-asserted context (session id, main-vs-child, repo, effort). None of it is
@@ -314,6 +322,10 @@ async function apiCall(
     } catch {
       responseBody = text;
     }
+  }
+
+  if (response.status === 426) {
+    return incompatibleClientError(responseBody, SERVER_VERSION);
   }
 
   if (!response.ok) {
@@ -1115,11 +1127,12 @@ async function resolvePayload(inline, payloadPath) {
 
 // --- Story Tools ---
 
-async function listStories({ project_id, agent_status, verified_status, epic_id, limit, offset, include_token_totals }) {
+async function listStories({ project_id, agent_status, verified_status, epic_id, issue_number, limit, offset, include_token_totals }) {
   const params = new URLSearchParams({ project_id });
   if (agent_status) params.set("agent_status", agent_status);
   if (verified_status) params.set("verified_status", verified_status);
   if (epic_id) params.set("epic_id", epic_id);
+  if (issue_number != null) params.set("issue_number", String(issue_number));
   params.set(
     "limit",
     String(Math.min(limit ?? DEFAULT_STORY_PAGE_SIZE, SERVER_MAX_STORY_PAGE_SIZE)),
@@ -4760,7 +4773,9 @@ const TOOLS = [
   {
     name: "list_stories",
     description:
-      "List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. " +
+      "List stories for a project, optionally filtered by agent_status, verified_status, epic_id, " +
+      "or issue_number (the stories an intake issue with that number produced; loopctl answers 400 " +
+      "unless it is a positive integer). " +
       "Returns compact results (no acceptance_criteria/description) — use get_story for full details. " +
       "Defaults to 20 per page; pass `limit` up to 500 to page larger. Use offset to paginate " +
       "(response includes total_count). Filter by epic_id or agent_status to reduce result size.",
@@ -4783,6 +4798,11 @@ const TOOLS = [
         epic_id: {
           type: "string",
           description: "Filter by epic UUID.",
+        },
+        issue_number: {
+          type: "integer",
+          description:
+            "Filter to the stories an intake issue with this number produced (stories.intake_record_id).",
         },
         limit: {
           type: "integer",
@@ -8689,7 +8709,9 @@ const TOOLS = [
     name: "runner_pool",
     description:
       "The tenant's CONNECTED runners, read from Presence (GET /api/v1/runners/pool): per machine " +
-      "name, runner_id, joined_at, draining, the latest health sample, live_sockets, and the node " +
+      "name, runner_id, joined_at, runner_version (the version the runner joined with, runner " +
+      "contract 1.34.0; null for a runner that sent none), draining, the latest health sample, " +
+      "live_sockets, and the node " +
       "and machine_id (Fly Machine) holding the socket. in_flight and max_sessions are the " +
       "CAPACITY loopctl holds in Postgres — the slots dispatch reserves against — and are null " +
       "only for a runner revoked while its socket drains; reported_in_flight and " +

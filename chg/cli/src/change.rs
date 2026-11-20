@@ -548,6 +548,7 @@ fn record_review(repo: &Path, c: &Change, rev: &Revision) -> Result<(), Refusal>
         200 | 201 => Ok(()),
         // One verdict per reviewer dispatch: a rerun after a crash finds it recorded.
         409 if r.code() == "chg_review_already_recorded" => Ok(()),
+        426 => Err(Refusal::Failed(outbox::upgrade_text(&r))),
         s => Err(Refusal::Failed(format!(
             "loopctl refused the review record: HTTP {s} {}",
             r.code()

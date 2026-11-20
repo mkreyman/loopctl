@@ -161,6 +161,36 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule IncompatibleClientVersionError do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "IncompatibleClientVersionError",
+      description:
+        "426: a factory client (`x-loopctl-client: <component>/<version>`, component one of " <>
+          "`runner`, `chg`, `mcp`) is below the release set's minimum for that component, or " <>
+          "sent no version while that minimum is one. A request without the header, or naming " <>
+          "another component, is never refused. Permanent until the client is upgraded.",
+      type: :object,
+      required: [:error],
+      properties: %{
+        error: %Schema{
+          type: :object,
+          required: [:status, :code, :component, :sent, :minimum, :message],
+          properties: %{
+            status: %Schema{type: :integer, example: 426},
+            code: %Schema{type: :string, enum: ["incompatible_client_version"]},
+            component: %Schema{type: :string, enum: ["runner", "chg", "mcp"]},
+            sent: %Schema{type: :string, nullable: true},
+            minimum: %Schema{type: :string},
+            message: %Schema{type: :string}
+          }
+        }
+      }
+    })
+  end
+
   defmodule PromotionBudgetError do
     @moduledoc false
     require OpenApiSpex

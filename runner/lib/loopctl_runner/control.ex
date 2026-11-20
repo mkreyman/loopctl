@@ -300,6 +300,7 @@ defmodule LoopctlRunner.Control do
 
   alias LoopctlRunner.{
     AgentResult,
+    AtomicFile,
     ClaimEnded,
     Config,
     Contract,
@@ -329,7 +330,7 @@ defmodule LoopctlRunner.Control do
   @reconnect_backoff_ms [1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000]
   # The join budget is 30 per minute; this ladder never approaches it.
   @rejoin_backoff_ms [2_000, 5_000, 10_000, 30_000, 60_000]
-  @fatal_reasons ~w(machine_mismatch unsupported_contract_version invalid_payload forbidden_topic unknown_topic)
+  @fatal_reasons ~w(machine_mismatch unsupported_contract_version incompatible_client_version invalid_payload forbidden_topic unknown_topic)
   @ex_config 78
   # An empty or mid-rewrite token file gets a few attempts; a file that stays unreadable is
   # a misconfiguration, and fatal, so the service does not sit "active" with no connection.
@@ -453,6 +454,9 @@ defmodule LoopctlRunner.Control do
     payload =
       %{
         "contract_version" => Contract.version(),
+        # Judged against loopctl's release set (contract 1.34.0, US-52.8): a build below its
+        # runner minimum is refused `incompatible_client_version`, which is fatal here.
+        "runner_version" => runner_version(),
         "kinds" => @kinds,
         # EXACTLY the set DispatchPolicy enforces (contract 1.14.0): silence is read as no
         # constraint, and a superset is the same failure — loopctl derives a branch this machine
@@ -783,6 +787,7 @@ defmodule LoopctlRunner.Control do
   @impl Slipstream
   def handle_join(topic, response, socket) do
     Logger.info("loopctl runner joined #{topic}#{outage(socket.assigns)}: #{inspect(response)}")
+    record_join(socket.assigns.config, response)
 
     if socket.assigns.reply_backlog != [],
       do:
@@ -815,6 +820,37 @@ defmodule LoopctlRunner.Control do
      |> schedule_verdict_backlog()
      |> schedule_trace(0, true)
      |> resume_stages()}
+  end
+
+  @doc "This runner's own version, the application vsn, as `RunnerJoin.runner_version` sends it."
+  @spec runner_version() :: String.t()
+  def runner_version, do: :loopctl_runner |> Application.spec(:vsn) |> to_string()
+
+  @doc """
+  Where an admitted join is recorded: `joined.json` beside `runs_dir`, which the installer
+  (US-52.10) reads to prove a new release joined.
+  """
+  @spec joined_file(Config.t()) :: Path.t()
+  def joined_file(%Config{runs_dir: runs_dir}),
+    do: Path.join(Path.dirname(Path.expand(runs_dir)), "joined.json")
+
+  # Never raises: a record the installer cannot read is that installer's failure to report, and
+  # must not take a joined channel down with it.
+  defp record_join(config, response) do
+    body =
+      Jason.encode!(%{
+        contract_version: Contract.version(),
+        runner_version: runner_version(),
+        release_set: Map.get(response || %{}, "release_set"),
+        joined_at: now_iso()
+      })
+
+    case AtomicFile.write(joined_file(config), body) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("could not record the join in joined.json: #{reason}")
+    end
+  rescue
+    error -> Logger.warning("could not record the join in joined.json: #{inspect(error)}")
   end
 
   # How long the runner was out of the pool, so a rejoin line says what the outage cost.

@@ -93,6 +93,15 @@ defmodule Loopctl.ApiSpec do
             content: %{
               "application/json" => %MediaType{schema: Schemas.RateLimitError}
             }
+          },
+          "IncompatibleClientVersion" => %Response{
+            description:
+              "The factory client named in `x-loopctl-client` is older than this server's " <>
+                "release set accepts (US-52.8). Answered on every authenticated and change-event " <>
+                "route before the key is read; install the current release and retry.",
+            content: %{
+              "application/json" => %MediaType{schema: Schemas.IncompatibleClientVersionError}
+            }
           }
         }
       },

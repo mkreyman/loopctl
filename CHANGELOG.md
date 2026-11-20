@@ -6,6 +6,17 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A factory client older than the release set is refused with 426 (2026-11-19, US-52.8).**
+  A request carrying `x-loopctl-client: <component>/<version>` for `runner`, `chg` or `mcp`
+  is answered `426 incompatible_client_version` (`component`, `sent`, `minimum`) on every
+  authenticated and change-event route, before the API key is read, when that version is
+  below the component's `minimum` in `release/manifest.toml`. A request without the header,
+  or naming another component, is unchanged. Runner contract 1.34.0: a runner join is refused
+  the same way, judged on its new `runner_version` field, and the join reply carries
+  `release_set`; `GET /api/v1/runners/pool` shows each connection's `runner_version`.
+  **Deploy ordering:** raise a component's `minimum` only after its clients send their version
+  (the runner, chg and the MCP package from this release on); a client sending none is refused
+  once the minimum is a version.
 - **A `pr` or `chg` intake source on a kb scope promotes it to a work project (2026-11-19,
   US-52.3).** `POST /api/v1/intake/sources` on an active `kind: kb` project used to be 422
   ("must be an active work project"); it now enrols and turns the scope into a work project in

@@ -118,6 +118,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.TriageVerdict
   alias Loopctl.LogValue
+  alias Loopctl.ReleaseSet
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
@@ -169,11 +170,11 @@ defmodule LoopctlWeb.RunnerChannel do
 
     with :ok <- join_rate_ok(runner),
          :ok <- still_authorized(socket),
-         {:ok, meta} <- RunnerContract.cast_join(payload),
+         {:ok, meta} <- RunnerContract.cast_join(payload, release_set_components(socket)),
          :ok <- enrolled_machine(meta, runner) do
       send(self(), :after_join)
 
-      {:ok, %{contract_version: RunnerContract.version()},
+      {:ok, %{contract_version: RunnerContract.version(), release_set: ReleaseSet.set()},
        socket
        |> assign(:connected_at, System.monotonic_time(:millisecond))
        |> assign(:meta, Map.put(meta, :joined_at, DateTime.utc_now()))
@@ -1146,6 +1147,11 @@ defmodule LoopctlWeb.RunnerChannel do
   # The reason -> refusal mapping lives in `LoopctlWeb.RunnerChannel.Refusal`, out of this
   # module and public, so its CATCH-ALL can be called by a test. Private here, the only way to
   # reach a missing clause was to crash a socket (#824 round 2).
+  # The release-set components a join is judged against (US-52.8): the compiled set, unless
+  # the socket was connected with its own (a test's `connect/3` assigns), never request data.
+  defp release_set_components(socket),
+    do: Map.get_lazy(socket.assigns, :release_set_components, &ReleaseSet.components/0)
+
   defp join_error(reason),
     do: Refusal.for_join(reason, max_joins: @max_joins, window_ms: @join_window_ms)
 

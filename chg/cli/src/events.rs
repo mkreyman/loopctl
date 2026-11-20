@@ -442,6 +442,9 @@ pub fn emit(repo: &Path, remote: &str, ev: &NewEvent) -> Result<Emitted, String>
 fn cursor(url: &str, src: &Source, secret: &[u8], change: &str) -> Result<(u64, Vec<u64>), String> {
     let path = format!("/api/v1/change_events/{}/cursor", src.source_id);
     let reply = outbox::get_signed(url, &path, &format!("change_id={change}"), secret)?;
+    if reply.status == 426 {
+        return Err(outbox::upgrade_text(&reply));
+    }
     if reply.status != 200 {
         return Err(format!(
             "cursor of {change}: HTTP {} {}",
@@ -550,6 +553,7 @@ fn deliver(url: &str, src: &Source, secret: &[u8], m: &Marker) -> Result<Step, H
                 ));
             }
             401 => return Err(Halt::Stop("401 invalid_signature on an event post".into())),
+            426 => return Err(Halt::Stop(outbox::upgrade_text(&reply))),
             s => return Err(Halt::Stop(format!("event post: HTTP {s} {}", reply.code()))),
         }
     }

@@ -48,4 +48,63 @@ defmodule Loopctl.ReleaseSet do
   @doc "The discovery document's `release` object."
   @spec discovery() :: %{set: pos_integer(), components: map()}
   def discovery, do: %{set: set(), components: components()}
+  @clients ~w(runner chg mcp)
+
+  @typedoc "A factory client's refusal: what it sent, and the set's floor and current version."
+  @type incompatible :: %{
+          component: String.t(),
+          sent: String.t() | nil,
+          minimum: String.t(),
+          version: String.t()
+        }
+
+  @doc "The components a client may name in `x-loopctl-client` or a runner join."
+  @spec clients() :: [String.t()]
+  def clients, do: @clients
+
+  @doc """
+  Whether a factory client at version `sent` is compatible with this set (US-52.8).
+
+  `:ok` for a semver at or above the component's minimum, newer than its version included,
+  so clients may roll before or after the server. A version below the minimum, one that is not
+  semver, or `nil` while the minimum is a version is refused. `nil` is admitted while the
+  minimum is `"unreported"`: that component's clients predate reporting a version.
+
+  `components` defaults to the compiled set; a test passes its own.
+  """
+  @spec check(atom() | String.t(), String.t() | nil, map()) ::
+          :ok | {:error, {:incompatible_client_version, incompatible()}}
+  def check(component, sent, components \\ components())
+
+  def check(component, sent, components) when is_atom(component),
+    do: check(Atom.to_string(component), sent, components)
+
+  def check(component, sent, components) when component in @clients do
+    %{minimum: minimum, version: version} = Map.fetch!(components, component)
+
+    if compatible?(sent, minimum) do
+      :ok
+    else
+      {:error,
+       {:incompatible_client_version,
+        %{component: component, sent: sent, minimum: minimum, version: version}}}
+    end
+  end
+
+  defp compatible?(nil, "unreported"), do: true
+  defp compatible?(nil, _minimum), do: false
+
+  defp compatible?(sent, minimum) when is_binary(sent) do
+    with true <- Manifest.valid_version?(sent) and sent != "unreported",
+         {:ok, sent} <- Version.parse(sent) do
+      at_least?(sent, minimum)
+    else
+      _ -> false
+    end
+  end
+
+  defp compatible?(_sent, _minimum), do: false
+
+  defp at_least?(_sent, "unreported"), do: true
+  defp at_least?(sent, minimum), do: Version.compare(sent, Version.parse!(minimum)) != :lt
 end

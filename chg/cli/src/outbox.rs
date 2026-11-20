@@ -213,6 +213,25 @@ impl Reply {
     }
 }
 
+/// The `x-loopctl-client` header every request to loopctl carries (US-52.8): loopctl answers
+/// 426 `incompatible_client_version` to a chg older than its release set accepts.
+pub fn client_header() -> String {
+    format!("x-loopctl-client: chg/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// How a 426 starts, wherever it is reported, so `send` can tell it from a transient failure.
+pub const UPGRADE_MARK: &str = "426 incompatible_client_version";
+
+/// The one line a 426 is reported as: the minimum loopctl wants, and the remedy.
+pub fn upgrade_text(reply: &Reply) -> String {
+    let error = &reply.json()["error"];
+    format!(
+        "{UPGRADE_MARK}: loopctl needs chg {} or later (this is {}); run release/rollout.sh",
+        error["minimum"].as_str().unwrap_or("newer"),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 /// A signed POST of `body` to `<url><path>`.
 pub fn post_signed(url: &str, path: &str, secret: &[u8], body: &[u8]) -> Result<Reply, String> {
     let ts = (now_ms() / 1000).to_string();
@@ -264,6 +283,8 @@ fn curl(
         &format!("X-Chg-Timestamp: {ts}"),
         "-H",
         &format!("X-Chg-Signature: sha256={sig}"),
+        "-H",
+        &client_header(),
         "-w",
         "\n%{http_code}",
     ]);
@@ -387,6 +408,8 @@ fn post_bearer_once(
         "Content-Type: application/json",
         "-H",
         witness,
+        "-H",
+        &client_header(),
         "-w",
         "\n%header{x-loopctl-current-sth}\n%{http_code}",
         "--data-binary",
@@ -632,12 +655,14 @@ enum Failure {
     Refused(String),
     /// Transient (network, 5xx, 429, busy).
     Retry(String),
+    /// loopctl refuses this chg's version (426): nothing it sends this run can land.
+    Upgrade(String),
 }
 
 impl Failure {
     fn text(&self) -> &str {
         match self {
-            Failure::Refused(s) | Failure::Retry(s) => s,
+            Failure::Refused(s) | Failure::Retry(s) | Failure::Upgrade(s) => s,
         }
     }
 }
@@ -741,6 +766,8 @@ fn send_file(
                 offset = rows[0].0;
             }
             401 => return Err(Failure::Refused(REFUSED.into())),
+            // Before the offset moves: the rows go on the first run after the upgrade.
+            426 => return Err(Failure::Upgrade(upgrade_text(&reply))),
             _ => return Err(Failure::Retry(reply.brief())),
         }
         state.files.insert(key.clone(), offset.max(mark));
@@ -862,12 +889,23 @@ pub fn send(force: bool, from_start: bool) -> Result<Summary, String> {
         if failed.is_none() {
             match events::deliver_pending(&url, src, &secret) {
                 Ok(d) => out.events = d,
+                Err(e) if e.starts_with(UPGRADE_MARK) => failed = Some(Failure::Upgrade(e)),
                 Err(e) => failed = Some(Failure::Retry(e)),
             }
         }
         match failed {
             None => {
                 state.backoff.remove(&src.repo);
+            }
+            // Permanent for this run and for every source: they all reach the same loopctl.
+            // No backoff is recorded, so the first run after the upgrade sends at once.
+            Some(Failure::Upgrade(text)) => {
+                eprintln!("chg: {text}");
+                out.problem = Some(text.clone());
+                summary.warnings.push(text);
+                write_state(&state)?;
+                summary.repos.push(out);
+                break;
             }
             Some(f) => {
                 record_failure(&mut state, &src.repo, f.text());

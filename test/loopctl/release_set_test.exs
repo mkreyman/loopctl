@@ -9,15 +9,27 @@ defmodule Loopctl.ReleaseSetTest do
   alias Loopctl.ReleaseSet.Manifest
   alias Mix.Tasks.Loopctl.ReleaseSet, as: Task
 
-  @sources %{
-    "mix.exs" =>
-      "defmodule A.MixProject do\n  def project, do: [\n      version: \"1.0.0\",\n  ]\nend\n",
-    "runner/mix.exs" => "  [\n      version: \"0.1.0\",\n  ]\n",
-    "chg/cli/Cargo.toml" =>
-      "[package]\nname = \"chg\"\nversion = \"0.1.0\"\n\n[dependencies]\nclap = { version = \"4.6\" }\n",
-    "chg/adapters/elixir/mix.exs" => "      version: \"1.0.0\",\n",
-    "mcp-server/package.json" => ~s({"name": "loopctl-mcp-server", "version": "3.19.1"}\n)
-  }
+  # The fixture sources carry the committed manifest's versions, so a bump of a real component
+  # never breaks these tests: they judge the task, not today's numbers.
+  defp sources do
+    {:ok, manifest} = Manifest.parse(File.read!("release/manifest.toml"), "m")
+    v = fn name -> manifest.components[name].version end
+
+    %{
+      "mix.exs" =>
+        "defmodule A.MixProject do\n  def project, do: [\n      version: \"#{v.("server")}\",\n  ]\nend\n",
+      "runner/mix.exs" => "  [\n      version: \"#{v.("runner")}\",\n  ]\n",
+      "chg/cli/Cargo.toml" =>
+        "[package]\nname = \"chg\"\nversion = \"#{v.("chg")}\"\n\n[dependencies]\nclap = { version = \"4.6\" }\n",
+      "chg/adapters/elixir/mix.exs" => "      version: \"#{v.("chg_adapter_elixir")}\",\n",
+      "mcp-server/package.json" => ~s({"name": "loopctl-mcp-server", "version": "#{v.("mcp")}"}\n)
+    }
+  end
+
+  defp committed(name) do
+    {:ok, manifest} = Manifest.parse(File.read!("release/manifest.toml"), "m")
+    manifest.components[name].version
+  end
 
   setup context do
     root =
@@ -25,7 +37,7 @@ defmodule Loopctl.ReleaseSetTest do
 
     on_exit(fn -> File.rm_rf!(root) end)
 
-    for {path, body} <- @sources do
+    for {path, body} <- sources() do
       File.mkdir_p!(Path.dirname(Path.join(root, path)))
       File.write!(Path.join(root, path), body)
     end
@@ -36,7 +48,7 @@ defmodule Loopctl.ReleaseSetTest do
   end
 
   describe "the committed manifest" do
-    test "lists every component, set 1, the runner's minimum unreported" do
+    test "lists every component, the server's set, the runner's minimum unreported" do
       {:ok, manifest} = Manifest.parse(File.read!("release/manifest.toml"), "m")
 
       assert manifest.set == ReleaseSet.set()
@@ -78,14 +90,19 @@ defmodule Loopctl.ReleaseSetTest do
                Manifest.parse(
                  String.replace(
                    text,
-                   ~s([components.chg]\nversion = "0.1.0"),
+                   ~s([components.chg]\nversion = "#{committed("chg")}"),
                    ~s([components.chg]\nversion = "latest")
                  ),
                  "m.toml"
                )
 
+      {:ok, manifest} = Manifest.parse(text, "m.toml")
+
       assert {:error, "m.toml: set must be a positive integer"} =
-               Manifest.parse(String.replace(text, "set = 1", "set = 0"), "m.toml")
+               Manifest.parse(
+                 String.replace(text, "set = #{manifest.set}\n", "set = 0\n"),
+                 "m.toml"
+               )
     end
 
     test "accepts semver with pre-release and build, and the literal unreported" do
@@ -102,12 +119,15 @@ defmodule Loopctl.ReleaseSetTest do
     end
 
     test "--check names each differing component", %{root: root} do
-      bump_source!(root, "runner/mix.exs", "0.1.0", "0.2.0")
-      bump_source!(root, "mcp-server/package.json", "3.19.1", "3.20.0")
+      bump_source!(root, "runner/mix.exs", committed("runner"), "9.9.9")
+      bump_source!(root, "mcp-server/package.json", committed("mcp"), "9.9.8")
 
       assert {:drift, [runner, mcp]} = Task.check(root)
-      assert runner =~ "runner: release/manifest.toml says 0.1.0, its source says 0.2.0"
-      assert mcp =~ "mcp: release/manifest.toml says 3.19.1, its source says 3.20.0"
+
+      assert runner =~
+               "runner: release/manifest.toml says #{committed("runner")}, its source says 9.9.9"
+
+      assert mcp =~ "mcp: release/manifest.toml says #{committed("mcp")}, its source says 9.9.8"
     end
 
     test "--check names a source it cannot read", %{root: root} do
@@ -117,15 +137,16 @@ defmodule Loopctl.ReleaseSetTest do
     end
 
     test "--bump moves the set and only the changed components", %{root: root} do
-      bump_source!(root, "runner/mix.exs", "0.1.0", "0.2.0")
+      bump_source!(root, "runner/mix.exs", committed("runner"), "9.9.9")
+      {:ok, before} = Manifest.parse(File.read!("release/manifest.toml"), "m")
+      set = before.set + 1
 
-      assert {:bumped, 2, ["runner"]} = Task.bump(root)
+      assert {:bumped, ^set, ["runner"]} = Task.bump(root)
 
       {:ok, next} = Manifest.parse(File.read!(Path.join(root, "release/manifest.toml")), "m")
-      {:ok, before} = Manifest.parse(File.read!("release/manifest.toml"), "m")
 
-      assert next.set == before.set + 1
-      assert next.components["runner"].version == "0.2.0"
+      assert next.set == set
+      assert next.components["runner"].version == "9.9.9"
       assert next.components["runner"].minimum == before.components["runner"].version
       assert Map.delete(next.components, "runner") == Map.delete(before.components, "runner")
       assert Task.check(root) == :ok
