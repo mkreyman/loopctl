@@ -1,0 +1,114 @@
+name: E2E
+
+# US-52.9. Two jobs with two triggers:
+#   check  the e2e/ area gate (AC-52.9.8): compile, format, credo and the harness's unit tests,
+#          on every push and PR that touches e2e/ (US-52.6's changed-areas.sh area e2e).
+#   live   one issue through the real factory on the sandbox (AC-52.9.7), nightly at 07:00
+#          UTC (after ci.yml's 02:00 run) and on workflow_dispatch, one at a time.
+on:
+  push:
+    branches: [master, "epic/**"]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: changes
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'pull_request') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, fleet-ci]
+    outputs:
+      e2e: ${{ steps.areas.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          # clean: false, then the clean step: .github/scripts/clean-workspace.sh says why.
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - id: areas
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/areas-output.sh
+
+  check:
+    name: e2e
+    needs: [changes]
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 20
+    env:
+      MIX_ENV: test
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        working-directory: .
+        run: .github/scripts/clean-workspace.sh
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix credo --strict --config-file .credo.exs
+      - run: mix test --exclude live
+
+  live:
+    name: e2e live
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, fleet-ci]
+    # Inside the harness's own 120-minute run budget, plus setup.
+    timeout-minutes: 140
+    # One at a time and never cancelled: a re-run takes a new run_id, so two runs never
+    # share an issue (US-52.9 failure_modes.retry).
+    concurrency:
+      group: e2e
+      cancel-in-progress: false
+    env:
+      MIX_ENV: test
+      LOOPCTL_E2E_ORCH_KEY: ${{ secrets.LOOPCTL_E2E_ORCH_KEY }}
+      E2E_GITHUB_TOKEN: ${{ secrets.E2E_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - name: mix e2e
+        run: |
+          (cd e2e && mix deps.get)
+          mix e2e
+      - name: Upload the stage log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-stage-log
+          path: e2e/stage-log/
+          if-no-files-found: warn

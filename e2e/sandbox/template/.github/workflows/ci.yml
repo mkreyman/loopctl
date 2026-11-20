@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    # GitHub-hosted: a personal account's self-hosted runners register per repository, so
+    # fleet-ci would need this repository in every pool host's INFRA_POOL_REPOS (infra's
+    # runbooks/ci-runner-setup.md). The suite is one module per run; it needs no fleet host.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix test

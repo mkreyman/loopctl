@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`GET /api/v1/stories` takes `issue_number`, and an end-to-end suite runs nightly
+  (2026-11-19, US-52.9).** `?project_id=P&issue_number=N` lists the stories intake issue N
+  produced; an `issue_number` that is not a positive integer is `400`. `.github/workflows/e2e.yml`
+  files an issue in the sandbox repo `mkreyman/loopctl-e2e-sandbox` at 07:00 UTC and follows it
+  to done. **Setup:** the repository secrets `LOOPCTL_E2E_ORCH_KEY` (an orchestrator key for
+  the sandbox's project) and `E2E_GITHUB_TOKEN` (issues, pull requests and deployments on the
+  sandbox); without them the live job fails at its first read. Provision the sandbox with
+  `e2e/sandbox/provision.sh`.
 - **A factory client older than the release set is refused with 426 (2026-11-19, US-52.8).**
   A request carrying `x-loopctl-client: <component>/<version>` for `runner`, `chg` or `mcp`
   is answered `426 incompatible_client_version` (`component`, `sent`, `minimum`) on every

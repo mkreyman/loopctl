@@ -1,0 +1,34 @@
+name: Deploy
+
+# The sandbox's deploy is a GitHub deployment record only (US-52.9): environment production,
+# which loopctl's PostDeployVerification reads (DELIVERY_DEPLOY_ENVIRONMENT's default).
+# Nothing is hosted.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record a production deployment of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          id=$(gh api "repos/$REPO/deployments" -X POST \
+            -f ref="$SHA" -f environment=production -F auto_merge=false \
+            -f 'required_contexts[]' --jq .id)
+          gh api "repos/$REPO/deployments/$id/statuses" -X POST -f state=success \
+            -f environment=production

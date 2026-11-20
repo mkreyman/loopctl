@@ -281,6 +281,9 @@ defmodule Loopctl.MixProject do
       # to the fleet's hooks).
       setup: ["cmd bash .githooks/install.sh", "deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
+      # US-52.9: the end-to-end suite, its own mix project under e2e/. Its live test runs only
+      # with LOOPCTL_E2E_ORCH_KEY set (e2e/test/test_helper.exs), as the e2e workflow sets it.
+      e2e: ["cmd --cd e2e mix test"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       # Run ONLY the cross-context journey tests (test/e2e/*, tagged :e2e). `--only`

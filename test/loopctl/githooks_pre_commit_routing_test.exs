@@ -121,12 +121,21 @@ defmodule Loopctl.GithooksPreCommitRoutingTest do
     assert calls(ctx) == []
   end
 
-  test "e2e/ alone runs nothing; a commit staging nothing is the fleet hook's", ctx do
+  test "e2e/ alone runs format, compile, credo and the offline tests there", ctx do
     stage!(ctx.repo, "e2e/mix.exs")
-    assert {_, 0} = hook(ctx)
-    assert calls(ctx) == []
+    dir = "#{ctx.physical}/e2e"
 
-    git!(ctx.repo, ["reset", "-q"])
+    assert {_, 0} = hook(ctx)
+
+    assert calls(ctx) == [
+             "mix #{dir} format --check-formatted",
+             "mix #{dir} compile --warnings-as-errors",
+             "mix #{dir} credo --strict --config-file .credo.exs",
+             "mix #{dir} test --exclude live"
+           ]
+  end
+
+  test "a commit staging nothing is the fleet hook's", ctx do
     assert {_, 0} = hook(ctx)
     assert calls(ctx) == ["fleet "]
   end

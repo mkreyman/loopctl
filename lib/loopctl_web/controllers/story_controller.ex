@@ -164,6 +164,13 @@ defmodule LoopctlWeb.StoryController do
         in: :query,
         type: :integer,
         description: "Number of stories to skip (default 0)"
+      ],
+      issue_number: [
+        in: :query,
+        type: :integer,
+        description:
+          "Only the stories an intake issue with this number produced " <>
+            "(stories.intake_record_id). 400 unless a positive integer."
       ]
     ],
     responses: %{
@@ -183,7 +190,9 @@ defmodule LoopctlWeb.StoryController do
              }
            }
          }},
-      400 => {"Missing project_id", "application/json", Schemas.ErrorResponse},
+      400 =>
+        {"Missing project_id, or issue_number not a positive integer", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -341,12 +350,13 @@ defmodule LoopctlWeb.StoryController do
   GET /api/v1/stories?project_id=X
 
   Lists all stories for a project. Requires agent+ role.
-  Supports ?agent_status=, ?verified_status=, ?epic_id=, ?limit=, ?offset=
+  Supports ?agent_status=, ?verified_status=, ?epic_id=, ?issue_number=, ?limit=, ?offset=
   """
   def index_by_project(conn, %{"project_id" => project_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with :ok <- ProjectId.validate(project_id) do
+    with :ok <- ProjectId.validate(project_id),
+         {:ok, issue_number} <- issue_number(params["issue_number"]) do
       limit = parse_int(params["limit"]) || parse_int(params["page_size"])
 
       opts =
@@ -356,6 +366,7 @@ defmodule LoopctlWeb.StoryController do
         |> maybe_add_opt(:epic_id, params["epic_id"])
         |> maybe_add_opt(:limit, limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
+        |> maybe_add_opt(:issue_number, issue_number)
 
       {:ok, result} = Stories.list_stories_by_project(tenant_id, project_id, opts)
 
@@ -375,6 +386,21 @@ defmodule LoopctlWeb.StoryController do
     |> put_status(:bad_request)
     |> json(%{error: %{status: 400, message: "project_id query parameter is required"}})
   end
+
+  # A malformed issue_number is refused rather than ignored: ignoring it would answer
+  # every story of the project, and a caller looking for one issue's story would take the
+  # wrong one (US-52.9).
+  defp issue_number(nil), do: {:ok, nil}
+  defp issue_number(""), do: {:ok, nil}
+
+  defp issue_number(raw) when is_binary(raw) do
+    case Integer.parse(raw) do
+      {n, ""} when n > 0 -> {:ok, n}
+      _ -> {:error, :bad_request, "issue_number must be a positive integer"}
+    end
+  end
+
+  defp issue_number(_raw), do: {:error, :bad_request, "issue_number must be a positive integer"}
 
   @doc """
   GET /api/v1/stories/:id

@@ -533,6 +533,19 @@ defmodule Loopctl.WorkBreakdown.Stories do
     |> filter_by_agent_status(Keyword.get(opts, :agent_status))
     |> filter_by_verified_status(Keyword.get(opts, :verified_status))
     |> filter_by_epic_id(Keyword.get(opts, :epic_id))
+    |> filter_by_issue_number(Keyword.get(opts, :issue_number))
+  end
+
+  # US-52.9: the stories an intake issue produced, through `stories.intake_record_id`. The
+  # join carries the tenant as well as the id, so a record of another tenant never matches
+  # even on the AdminRepo (BYPASSRLS) path.
+  defp filter_by_issue_number(query, nil), do: query
+
+  defp filter_by_issue_number(query, issue_number) when is_integer(issue_number) do
+    from s in query,
+      join: r in Loopctl.Intake.Record,
+      on: r.id == s.intake_record_id and r.tenant_id == s.tenant_id,
+      where: r.issue_number == ^issue_number
   end
 
   defp filter_by_epic_id(query, nil), do: query
