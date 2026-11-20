@@ -69,23 +69,18 @@ fi
 # install_on <host> <set>: prints the host's JSON line (or an unreachable one). The runner
 # joins naming the SERVER's set, so a rollback to <set> still waits for $set_id there.
 install_on() {
-  local host=$1 target=$2 script
-  # The machine runs install-machine.sh from this tree, piped in: its own factory checkout
-  # may not exist yet, and the script fetches the set's tree itself.
-  script=$(cat "$here/install-machine.sh")
-  local lib
-  lib=$(cat "$here/lib/rewrite_runner_config.py")
+  local host=$1 target=$2
   if ! $ssh_cmd "$host" true >/dev/null 2>&1; then
     printf '{"host":"%s","set":%s,"status":"unreachable","runner_version":null,"chg_version":null}\n' \
       "$host" "$target"
     return
   fi
-  $ssh_cmd "$host" "d=\$(mktemp -d) && mkdir -p \"\$d/lib\" && cat > \"\$d/lib/rewrite_runner_config.py\" <<'LIB'
-$lib
-LIB
-cat > \"\$d/install-machine.sh\" <<'SH'
-$script
-SH
+  # The machine runs install-machine.sh from this tree: its own factory checkout may not exist
+  # yet, and the script fetches the set's tree itself. It runs helpers from "$here/lib/", so the
+  # WHOLE lib directory goes with it, as one tar on ssh's stdin; a helper added there later
+  # cannot be left behind. COPYFILE_DISABLE keeps macOS tar from adding ._ files.
+  COPYFILE_DISABLE=1 tar -C "$here" --exclude=__pycache__ -cf - install-machine.sh lib |
+    $ssh_cmd "$host" "d=\$(mktemp -d) && tar -C \"\$d\" -xf - &&
 LOOPCTL_FACTORY_SERVER_SET=$set_id nice -n 10 bash \"\$d/install-machine.sh\" $target; rc=\$?; rm -rf \"\$d\"; exit \$rc" |
     tail -1
 }

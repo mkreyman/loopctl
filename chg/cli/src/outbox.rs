@@ -219,7 +219,7 @@ pub fn client_header() -> String {
     format!("x-loopctl-client: chg/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// How a 426 starts, wherever it is reported, so `send` can tell it from a transient failure.
+/// How a 426 starts, wherever it is reported.
 pub const UPGRADE_MARK: &str = "426 incompatible_client_version";
 
 /// The one line a 426 is reported as: the minimum loopctl wants, and the remedy.
@@ -889,8 +889,8 @@ pub fn send(force: bool, from_start: bool) -> Result<Summary, String> {
         if failed.is_none() {
             match events::deliver_pending(&url, src, &secret) {
                 Ok(d) => out.events = d,
-                Err(e) if e.starts_with(UPGRADE_MARK) => failed = Some(Failure::Upgrade(e)),
-                Err(e) => failed = Some(Failure::Retry(e)),
+                Err(events::Stop::Upgrade(e)) => failed = Some(Failure::Upgrade(e)),
+                Err(events::Stop::Failed(e)) => failed = Some(Failure::Retry(e)),
             }
         }
         match failed {

@@ -42,12 +42,12 @@ manifest="$root/release/imports.toml"
 name=${repo#*/}
 label="from:$name"
 
-# entry <field>: the [[import]] entry for this repo: its prefix, or "true" when archived.
+# entry <toml text> <field>: the [[import]] entry for this repo: its prefix, or "true" when
+# archived.
 entry() {
-  python3 - "$manifest" "$repo" "$1" <<'PY'
+  python3 - "$1" "$repo" "$2" <<'PY'
 import sys, tomllib
-with open(sys.argv[1], "rb") as f:
-    imports = tomllib.load(f).get("import", [])
+imports = tomllib.loads(sys.argv[1]).get("import", [])
 for e in imports:
     if e.get("repo") == sys.argv[2]:
         v = e.get(sys.argv[3])
@@ -57,8 +57,15 @@ sys.exit(1)
 PY
 }
 
-prefix=$(entry prefix) || { echo "retire: release/imports.toml has no entry for $repo" >&2; exit 2; }
-marked=$(entry archived)
+on_disk=$(cat "$manifest" 2>/dev/null) || { echo "retire: cannot read $manifest" >&2; exit 2; }
+prefix=$(entry "$on_disk" prefix) || { echo "retire: release/imports.toml has no entry for $repo" >&2; exit 2; }
+# The marker in the working tree, and the one HEAD holds. Only a COMMITTED marker means
+# retired: a marker written by a run whose commit then failed is still to be committed, and
+# that run already did the final import (import-history.sh refuses an archived entry anyway).
+marked=$(entry "$on_disk" archived)
+committed=$(entry "$(git -C "$root" show HEAD:release/imports.toml 2>/dev/null)" archived) || committed=""
+pending_commit=false
+[ "$marked" = true ] && [ "$committed" != true ] && pending_commit=true
 
 open_issues() {
   $gh issue list -R "$repo" --state open --limit 1000 --json number --jq '.[].number'
@@ -68,7 +75,7 @@ issues=$(open_issues) || { echo "retire: cannot list $repo's open issues" >&2; e
 is_archived=$($gh repo view "$repo" --json isArchived --jq .isArchived) ||
   { echo "retire: cannot read $repo" >&2; exit 1; }
 
-if [ "$marked" = true ] && [ "$is_archived" = true ] && [ -z "$issues" ]; then
+if [ "$committed" = true ] && [ "$is_archived" = true ] && [ -z "$issues" ]; then
   echo "retired: $repo"
   exit 0
 fi
@@ -93,7 +100,14 @@ for s in rows:
         print(f'{s.get("number")} {s.get("id")} ({a})')
 PY
 )
-if [ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]; then
+# Exactly what import-history.sh refuses (`git status --porcelain`, untracked files included),
+# checked here because the import runs only after the irreversible archive. The one change
+# allowed is our own uncommitted marker, which this run commits without importing again.
+dirty=$(git -C "$root" status --porcelain) || { echo "retire: cannot read git status" >&2; exit 1; }
+if [ "$pending_commit" = true ]; then
+  dirty=$(printf '%s\n' "$dirty" | grep -vE '^.. release/imports\.toml$')
+fi
+if [ -n "$dirty" ]; then
   blockers+=("the working tree has uncommitted changes (the final import commits)")
 fi
 if [ "${#blockers[@]}" -gt 0 ]; then
@@ -132,9 +146,10 @@ if [ "$is_archived" != true ]; then
   echo "retire: $repo archived"
 fi
 
-if [ "$marked" != true ]; then
-  (cd "$root" && "$import" "$source_url" "$prefix") || { echo "retire: the final import failed" >&2; exit 1; }
-  python3 - "$manifest" "$repo" <<'PY' || exit 1
+if [ "$committed" != true ]; then
+  if [ "$marked" != true ]; then
+    (cd "$root" && "$import" "$source_url" "$prefix") || { echo "retire: the final import failed" >&2; exit 1; }
+    python3 - "$manifest" "$repo" <<'PY' || exit 1
 import sys
 path, repo = sys.argv[1], sys.argv[2]
 lines = open(path).read().split("\n")
@@ -150,6 +165,7 @@ for i, line in enumerate(lines):
         in_entry = False
 open(path, "w").write("\n".join(out))
 PY
+  fi
   git -C "$root" add release/imports.toml
   git -C "$root" commit -q -m "Retire $repo: archived at its imported tip" -- release/imports.toml ||
     { echo "retire: could not commit the archived marker" >&2; exit 1; }

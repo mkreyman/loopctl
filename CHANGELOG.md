@@ -6,6 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **CI runs on push of every branch, never on `pull_request`, and every workflow ends in
+  an `area gate` job (2026-11-20, US-52.12 review).** The merge gate trusts only push runs
+  of a story's branch, so `ci.yml`, `runner-ci.yml`, `chg-ci.yml` and `e2e.yml` push-trigger
+  on `**`; a same-repo pull request's required checks are satisfied by the push run on its
+  head. A non-master push is judged on the whole branch, from its merge base with master.
+  `area gate` (one name in all four) is green only when every job of its workflow succeeded
+  or was skipped by area. **Fork pull requests get no CI run** (every job already skipped
+  them, which GitHub counted as passing; they now cannot satisfy required checks). **Setup:**
+  loopctl's `DELIVERY_GATES_CONFIG` entry lists `independent_checks: ["area gate"]`, and a
+  pull request that touches `.github/workflows/`, `.github/actions/` or `.github/scripts/`
+  is never merged by the loop. The live e2e job reads the repository variable
+  `LOOPCTL_E2E_PROJECT_ID` (`gh variable set`) and refuses to start without it.
+- **`GET /api/v1/stories` takes `repo` (owner/name) beside `issue_number` (2026-11-20).** An
+  issue number is unique only within one repository; `issue_number` above 2147483647 is now
+  `400` rather than `500`.
 - **mkreyman/chg and mkreyman/loopctl-runner are retired into this repository (2026-11-19,
   US-52.11).** `release/manifest.toml` gains `[retired] repos`. Each `install-machine.sh` run
   sends chg's outbox and then removes those repos' `[[source]]` blocks from
@@ -37,8 +52,11 @@ All notable changes to loopctl are documented here.
   (a non-empty list of CI job names, never `local-gate`) and `limits`. A version 1 document
   is refused `{:unsupported_version, 1}` and a `human_paths` key `{:unknown_key, ...}`, so
   every delivery-loop change escalates until the document is replaced. **Deploy ordering:
-  re-pin the production document to version 2, with its `DELIVERY_GATES_CONFIG_SHA256`, in
-  the same `fly secrets set` as this deploy** (rename `human_paths` to `independent_paths`,
+  re-pin the production document to version 2, with its `DELIVERY_GATES_CONFIG_SHA256`, as
+  STAGED secrets before the merge (`fly secrets set --stage`), so the deploy that ships this
+  code is the restart that applies them** (the old code reads only version 1 and the new
+  only version 2, so an unstaged set on either side leaves a window where every merge
+  escalates) (rename `human_paths` to `independent_paths`,
   add `independent_checks`, set `"version": 2`; recipe in `deploy/FLY_SECRETS.md`). A change
   touching an independent path, and every merge into a control-plane repository
   (`mkreyman/loopctl`, `mkreyman/claude-config`; `config :loopctl, :control_plane_repos`),

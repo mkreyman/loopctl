@@ -108,8 +108,10 @@ def route(source_repo, path=None):
         m = re.search(r"(?:^|/)claude-config/(.+)$", p)
         if m and m.group(1).split("/")[0] in HARNESS_DIRS:
             return CLAUDE_CONFIG
-        # The old checkout path. chg/ inside a loopctl checkout is already loopctl's own.
-        if re.search(r"(?:^|/)workspace/chg/", p):
+        # chg's checkout, seen from any source repo: workspace/loopctl/chg/ now, and the
+        # retired workspace/chg/, which rows written before the import still name
+        # (AC-52.5.7). A relative chg/ path under a loopctl source is loopctl's own below.
+        if re.search(r"(?:^|/)workspace/(?:loopctl/)?chg/", p):
             return CHG
         if source_repo == CLAUDE_CONFIG and p.split("/")[0] in HARNESS_DIRS:
             return CLAUDE_CONFIG

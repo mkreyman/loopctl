@@ -127,6 +127,50 @@ defmodule Loopctl.ReleaseRolloutTest do
              ]
   end
 
+  # An ssh that RUNS the remote command here, as the host would, with a `nice` that lists
+  # what reached the script's directory instead of running it. Which files install-machine.sh
+  # finds beside it is then what rollout.sh actually shipped, whatever mechanism ships them.
+  @executing_ssh """
+  #!/usr/bin/env bash
+  host=$1; shift
+  [ "$*" = true ] && exit 0
+  ROLLOUT_TEST_HOST=$host PATH="$STUB/bin:$PATH" bash -c "$*"
+  """
+
+  @listing_nice """
+  #!/usr/bin/env bash
+  # nice -n 10 bash <dir>/install-machine.sh <set>
+  dir=$(dirname "$4")
+  (cd "$dir" && find . -type f | sed 's|^\\./||' | sort) > "$STUB/$ROLLOUT_TEST_HOST.shipped"
+  printf '{"host":"%s","set":%s,"status":"ok","runner_version":"0.9","chg_version":"1.0"}\\n' "$ROLLOUT_TEST_HOST" "$5"
+  """
+
+  test "every file install-machine.sh runs from release/lib reaches the host", ctx do
+    stub!(ctx.stub, "ssh", @executing_ssh)
+    File.mkdir_p!(Path.join(ctx.stub, "bin"))
+    stub!(Path.join(ctx.stub, "bin"), "nice", @listing_nice)
+
+    {_, 0} = rollout(ctx)
+
+    lib = Path.expand("../../release/lib", __DIR__)
+
+    expected =
+      lib
+      |> File.ls!()
+      |> Enum.reject(&(&1 == "__pycache__"))
+      |> Enum.map(&("lib/" <> &1))
+      |> Kernel.++(["install-machine.sh"])
+      |> Enum.sort()
+
+    assert "lib/drop_retired_sources.py" in expected
+    assert "lib/rewrite_runner_config.py" in expected
+
+    for host <- ~w(alpha beta) do
+      shipped = ctx.stub |> Path.join("#{host}.shipped") |> File.read!() |> String.split()
+      assert shipped == expected
+    end
+  end
+
   defp rollout(ctx), do: System.cmd("bash", [@script], env: ctx.env, stderr_to_stdout: true)
 
   defp installs(ctx) do

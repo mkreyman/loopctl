@@ -13,6 +13,7 @@ defmodule Loopctl.ReleaseInstallMachineTest do
   @runner_install """
   #!/usr/bin/env bash
   set -eu
+  [ -f "$STUB/runner_install_fails" ] && exit 1
   mkdir -p "$LOOPCTL_RUNNER_PREFIX/current/bin"
   cat > "$LOOPCTL_RUNNER_PREFIX/current/bin/loopctl_runner" <<'BIN'
   #!/usr/bin/env bash
@@ -127,6 +128,56 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       assert {%{"status" => "ok"}, 0} = install(ctx, 2)
     end
 
+    test "a stale lock another run replaced before the takeover is put back, and busy", ctx do
+      lock = Path.join(ctx.factory, ".install.lock")
+      File.mkdir_p!(lock)
+      File.write!(Path.join(lock, "pid"), "999999999")
+
+      # Between this run judging the lock stale and renaming it, another run takes it over:
+      # the stub `mv` writes that run's live pid (this BEAM) into the lock, then moves it.
+      bin = Path.join(ctx.stub, "racebin")
+      File.mkdir_p!(bin)
+      real_path = System.get_env("PATH")
+
+      script!(Path.join(bin, "mv"), """
+      #!/bin/sh
+      case "$1" in
+        *.install.lock) [ -f "$STUB/raced" ] || { touch "$STUB/raced"; echo #{System.pid()} > "$1/pid"; } ;;
+      esac
+      PATH="#{real_path}" exec mv "$@"
+      """)
+
+      {out, 75} = install(ctx, 2, env: %{"PATH" => "#{bin}:#{real_path}"})
+      assert out["status"] == "busy"
+      assert File.read!(Path.join(lock, "pid")) |> String.trim() == System.pid()
+      refute File.exists?(Path.join(ctx.factory, "current"))
+    end
+
+    test "a fresh lock with no pid yet is busy, not a dead owner", ctx do
+      # The window between the owner's mkdir and its pid write.
+      lock = Path.join(ctx.factory, ".install.lock")
+      File.mkdir_p!(lock)
+
+      {out, 75} = install(ctx, 2)
+      assert out["status"] == "busy"
+      assert File.dir?(lock)
+      refute File.exists?(Path.join(ctx.factory, "current"))
+    end
+
+    test "a lock with no pid older than the bound is taken over", ctx do
+      lock = Path.join(ctx.factory, ".install.lock")
+      File.mkdir_p!(lock)
+      old = System.os_time(:second) - 600
+      File.touch!(lock, old)
+
+      assert {%{"status" => "ok"}, 0} = install(ctx, 2)
+    end
+
+    test "a finished install releases its lock", ctx do
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+      refute File.exists?(Path.join(ctx.factory, ".install.lock"))
+    end
+
     test "a set with no tag fails and leaves current alone", ctx do
       {%{"status" => "ok"}, 0} = install(ctx, 2)
       {out, 1} = install(ctx, 9)
@@ -166,6 +217,51 @@ defmodule Loopctl.ReleaseInstallMachineTest do
       assert ctx.stub |> Path.join("runner_installs") |> File.read!() |> String.split() == [
                "installed"
              ]
+    end
+
+    test "a failed runner.json rewrite after the drain undrains the runner", ctx do
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+      File.write!(Path.join(ctx.stub, "running"), "")
+      File.write!(ctx.config, "not json")
+
+      {out, 1} = install(ctx, 3)
+
+      assert out["status"] == "failed"
+      assert out["detail"] =~ "cannot rewrite"
+      assert undrained?(ctx)
+    end
+
+    test "a failed runner install after the drain undrains the runner", ctx do
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+      File.write!(Path.join(ctx.stub, "running"), "")
+      File.write!(Path.join(ctx.stub, "runner_install_fails"), "")
+
+      {out, 1} = install(ctx, 3)
+
+      assert out["status"] == "failed"
+      assert out["detail"] =~ "the runner install failed"
+      assert undrained?(ctx)
+      assert File.read_link!(Path.join(ctx.factory, "current")) == "sets/2"
+    end
+
+    test "a failure after the new runner is up does not undrain it", ctx do
+      {%{"status" => "ok"}, 0} = install(ctx, 2)
+      File.write!(Path.join(ctx.stub, "running"), "")
+      File.write!(Path.join(ctx.stub, "no_join"), "")
+
+      {%{"status" => "failed"}, 1} = install(ctx, 3)
+
+      log = File.read!(Path.join(ctx.stub, "rpc.log"))
+      assert log =~ "set_draining(LoopctlRunner.Control, true)"
+      refute log =~ "set_draining(LoopctlRunner.Control, false)"
+    end
+
+    defp undrained?(ctx) do
+      lines = ctx.stub |> Path.join("rpc.log") |> File.read!() |> String.split("\n", trim: true)
+
+      drain = Enum.find_index(lines, &(&1 =~ "set_draining(LoopctlRunner.Control, true)"))
+      undrain = Enum.find_index(lines, &(&1 =~ "set_draining(LoopctlRunner.Control, false)"))
+      is_integer(drain) and is_integer(undrain) and undrain > drain
     end
   end
 

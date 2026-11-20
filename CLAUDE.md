@@ -520,9 +520,9 @@ pgbouncer-e2e, retrieval-eval and the smoke preflight). **What would overturn th
 breaking repeatedly on combinations no single PR could have caught. Say so with the failures
 that prove it.
 
-A TEXTUAL conflict is a different thing and still stops a merge: the PR reads `DIRTY`, no CI
-runs on it at all (`ci.yml` triggers on `pull_request`, and GitHub raises no such event for a
-conflicting PR), and you merge master INTO the branch to resolve it. Never a rebase or a force
+A TEXTUAL conflict is a different thing and still stops a merge: the PR reads `DIRTY` (its
+branch's push runs still go green; the workflows run on push only), and you merge master INTO
+the branch to resolve it. Never a rebase or a force
 push onto a shared branch — `~/.claude/CLAUDE.md`'s delivery loop deny-lists both.
 
 **2. Arm auto-merge once the review round is done**, never before: `--auto` on an unreviewed PR

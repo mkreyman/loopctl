@@ -1089,9 +1089,14 @@ fn review_key(repo: &Path, s: &chg::change::Submitted) -> Result<Option<PathBuf>
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
-        if let Err(e) = chg::change::deliver_now(&cfg, &slug, &s.change_id) {
-            last = e;
-            continue;
+        match chg::change::deliver_now(&cfg, &slug, &s.change_id) {
+            Ok(()) => {}
+            // A 426 is permanent for the run (AC-52.8.6): no retry can land.
+            Err(chg::events::Stop::Upgrade(e)) => return Err(e),
+            Err(chg::events::Stop::Failed(e)) => {
+                last = e;
+                continue;
+            }
         }
         match chg::events::review_dispatch(&cfg, &slug, &s.change_id, s.revision)? {
             r if r.status == 201 || r.status == 200 => {
@@ -1099,6 +1104,7 @@ fn review_key(repo: &Path, s: &chg::change::Submitted) -> Result<Option<PathBuf>
                 return Ok(Some(path));
             }
             r if r.status == 409 => return Ok(None),
+            r if r.status == 426 => return Err(chg::outbox::upgrade_text(&r)),
             // `revision_not_submitted`: loopctl has not applied `submitted` yet.
             r if r.status == 422 => last = format!("HTTP 422 {}", r.code()),
             r => return Err(format!("HTTP {} {}", r.status, r.code())),
@@ -1141,6 +1147,10 @@ fn review_dispatch_cmd(repo: &Path, change: &str, revision: u64) -> ExitCode {
         Ok(r) if matches!(r.status, 409 | 422) => {
             eprintln!("chg: review-dispatch: HTTP {} {}", r.status, r.code());
             ExitCode::from(1)
+        }
+        Ok(r) if r.status == 426 => {
+            eprintln!("chg: review-dispatch: {}", chg::outbox::upgrade_text(&r));
+            ExitCode::from(2)
         }
         Ok(r) => {
             eprintln!("chg: review-dispatch: HTTP {} {}", r.status, r.code());

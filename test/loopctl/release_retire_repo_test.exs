@@ -143,6 +143,79 @@ defmodule Loopctl.ReleaseRetireRepoTest do
     end
   end
 
+  describe "the tree the final import needs, checked before the archive" do
+    test "an untracked file refuses with exit 2 before any write", ctx do
+      File.write!(Path.join(ctx.stub, "issues"), "3\n")
+      File.write!(Path.join(ctx.repo, "stray.txt"), "x")
+
+      {out, 2} = retire(ctx)
+      assert out =~ "the working tree has uncommitted changes"
+      refute File.exists?(Path.join(ctx.stub, "writes"))
+    end
+
+    test "a modified tracked file refuses with exit 2 before any write", ctx do
+      File.write!(Path.join([ctx.repo, "release", "imports.toml"]), @imports_toml <> "\n# x\n")
+
+      {out, 2} = retire(ctx)
+      assert out =~ "the working tree has uncommitted changes"
+      refute File.exists?(Path.join(ctx.stub, "writes"))
+    end
+
+    test "an ignored file does not block, as import-history.sh does not refuse it", ctx do
+      File.write!(Path.join(ctx.repo, ".gitignore"), "ignored.txt\n")
+      git!(ctx.repo, ["add", ".gitignore"])
+      git!(ctx.repo, ["commit", "-q", "-m", "ignore"])
+      File.write!(Path.join(ctx.repo, "ignored.txt"), "x")
+
+      assert {_, 0} = retire(ctx)
+    end
+  end
+
+  describe "an archived marker that was written but not committed" do
+    test "a re-run commits it instead of reporting retired", ctx do
+      hook = Path.join([ctx.repo, ".git", "hooks", "pre-commit"])
+      File.mkdir_p!(Path.dirname(hook))
+      exec!(hook, "#!/bin/sh\n[ -f \"$STUB/hook_fails\" ] && exit 1\nexit 0\n")
+      File.write!(Path.join(ctx.stub, "hook_fails"), "")
+
+      {out, 1} = retire(ctx)
+      assert out =~ "could not commit the archived marker"
+      assert File.read!(Path.join([ctx.repo, "release", "imports.toml"])) =~ "archived = true"
+      refute head_toml(ctx) =~ "archived = true"
+      imports = Enum.count(writes(ctx), &String.starts_with?(&1, "import"))
+
+      # Still failing: the re-run must not exit 0 over the uncommitted marker.
+      {out, 1} = retire(ctx)
+      assert out =~ "could not commit the archived marker"
+      refute head_toml(ctx) =~ "archived = true"
+
+      File.rm!(Path.join(ctx.stub, "hook_fails"))
+      {out, 0} = retire(ctx)
+      assert out =~ "retired: mkreyman/chg"
+
+      assert head_toml(ctx) =~
+               ~s(imported_sha = "7bbc5dc111b24a08742e6dc6fadd203d6b6b7c69"\narchived = true)
+
+      assert {"", 0} = System.cmd("git", ["status", "--porcelain"], cd: ctx.repo)
+
+      # The import ran once; the retries only committed the marker.
+      assert Enum.count(writes(ctx), &String.starts_with?(&1, "import")) == imports
+
+      refute File.read!(Path.join([ctx.repo, "release", "imports.toml"])) =~
+               "archived = true\narchived = true"
+    end
+
+    defp head_toml(ctx) do
+      {body, 0} =
+        System.cmd("git", ["show", "HEAD:release/imports.toml"],
+          cd: ctx.repo,
+          env: GitEnv.spawn_env()
+        )
+
+      body
+    end
+  end
+
   describe "TC-52.11.2: an in-flight story blocks retirement" do
     for {agent, verified} <- [
           {"contracted", "unverified"},

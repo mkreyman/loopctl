@@ -40,6 +40,10 @@ defmodule Loopctl.Delivery.IndependentVerificationTest do
         branch: @branch
       })
 
+    # The pull request fact 3 reads for its CI-definition refusal; a test that needs another
+    # diff stubs its own.
+    stub_pull_request(["lib/widgets/thing.ex"])
+
     Map.merge(ctx, %{
       implementer_runner: fixture(:stage_runner, %{tenant_id: tenant.id}),
       verifier_runner: fixture(:stage_runner, %{tenant_id: tenant.id})
@@ -155,6 +159,40 @@ defmodule Loopctl.Delivery.IndependentVerificationTest do
       assert verification(ctx) == {:error, {:independent_checks_not_passed, ["e2e"]}}
     end
 
+    test "a change to its own CI definitions is refused before the checks are read", ctx do
+      attest(ctx)
+
+      Mox.stub(MockPullRequestSource, :check_evidence, fn _repo, _sha, _branch ->
+        flunk("checks were read for a change that edits the definitions they run")
+      end)
+
+      for touched <- [
+            ".github/workflows/x.yml",
+            ".github/actions/setup/action.yml",
+            ".github/scripts/changed-areas.sh"
+          ] do
+        stub_pull_request(["lib/widgets/thing.ex", touched])
+
+        assert verification(ctx) == {:error, {:ci_definition_changed, [touched]}}, touched
+      end
+    end
+
+    test "a diff that could not be listed, or no diff at all, is refused", ctx do
+      attest(ctx)
+      stub_checks(ctx, [job("e2e", "success")])
+
+      truncated = {:ok, %{diff: {:error, :truncated}}}
+
+      assert verification(ctx, pull_request: truncated) ==
+               {:error, {:ci_definition_unknown, :truncated}}
+
+      assert verification(ctx, pull_request: {:ok, %{state: "open"}}) ==
+               {:error, {:ci_definition_unknown, :no_diff}}
+
+      assert verification(ctx, pull_request: {:error, {:github_unreachable, :timeout}}) ==
+               {:error, {:github_unreachable, :timeout}}
+    end
+
     test "the forge's error is passed through for transient?/1 to classify", ctx do
       attest(ctx)
 
@@ -262,6 +300,17 @@ defmodule Loopctl.Delivery.IndependentVerificationTest do
 
       assert {:ok, %Verdict{decision: :allow}} =
                evaluate(ctx, control_plane_repos: [@repo])
+    end
+
+    test "a control-plane change that edits its own workflow is held", ctx do
+      stub_pull_request(["lib/widgets/thing.ex", ".github/workflows/x.yml"])
+      stub_checks(ctx, [job("e2e", "success")])
+      attest(ctx)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} =
+               evaluate(ctx, control_plane_repos: [@repo])
+
+      assert {:independent_verification, {:ci_definition_changed, [".github/workflows/x.yml"]}} in reasons
     end
   end
 

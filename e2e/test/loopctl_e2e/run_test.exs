@@ -79,9 +79,8 @@ defmodule LoopctlE2e.RunTest do
     # One wait for the story and one for the checks, each the first poll interval.
     assert sleeps.() == [10_000, 10_000]
 
-    assert {{:loopctl, :get, "/api/v1/stories"}, [project_id: "p-1", issue_number: 5]} in StubClient.calls(
-             client
-           )
+    assert {{:loopctl, :get, "/api/v1/stories"},
+            [project_id: "p-1", issue_number: 5, repo: @repo]} in StubClient.calls(client)
   end
 
   test "a stage not reached within its budget fails the run naming it, with backoff to 120 s" do
@@ -117,6 +116,24 @@ defmodule LoopctlE2e.RunTest do
     assert Enum.sum(sleeps.()) == 60_000
   end
 
+  test "an issue that produced more than one story fails at once instead of following one" do
+    client =
+      StubClient.start(%{
+        happy_script()
+        | {:loopctl, :get, "/api/v1/stories"} => [
+            {:ok, 200, %{"data" => [@story, %{@story | "id" => "another"}]}}
+          ]
+      })
+
+    {opts, sleeps} = clock()
+
+    assert {:error, %{stage: :story_created, last_state: state}} =
+             Run.execute(client, @sandbox, "r1", opts)
+
+    assert state =~ "produced 2 stories"
+    assert sleeps.() == []
+  end
+
   test "a story that leaves the main line fails at once, without waiting out the budget" do
     script = %{
       happy_script()
@@ -131,6 +148,21 @@ defmodule LoopctlE2e.RunTest do
              Run.execute(StubClient.start(script), @sandbox, "r1", opts)
 
     assert sleeps.() == [10_000]
+  end
+
+  test "a sandbox with no project id is refused before any issue is opened" do
+    for project_id <- [nil, "", "  ", "PROJECT_ID_UNSET"] do
+      client = StubClient.start(happy_script())
+      {opts, sleeps} = clock()
+      sandbox = %{@sandbox | project_id: project_id}
+
+      assert {:error, failure} = Run.execute(client, sandbox, "r1", opts)
+      assert failure.stage == :sandbox
+      assert failure.story_id == nil
+      assert failure.last_state =~ "LOOPCTL_E2E_PROJECT_ID"
+      assert StubClient.calls(client) == [], inspect(project_id)
+      assert sleeps.() == []
+    end
   end
 
   test "a transport failure is one failed poll, and the next poll goes on" do

@@ -246,7 +246,7 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 
 | Tool | Description |
 |---|---|
-| `list_stories` | List stories for a project, optionally filtered by agent_status, verified_status, epic_id, or `issue_number` (the stories an intake issue with that number produced; 400 unless a positive integer). Pass `include_token_totals=true` for per-story token data. |
+| `list_stories` | List stories for a project, optionally filtered by agent_status, verified_status, epic_id, or `issue_number` (the stories an intake issue with that number produced; 400 unless an integer in 1..2147483647) and `repo` (owner/name: an issue number is unique only within one repository). Pass `include_token_totals=true` for per-story token data. |
 | `list_ready_stories` | List stories that are ready to be contracted and worked on (`pending`, dependencies met, delivery stage not held). |
 | `list_blocked_stories` | List stories with an unverified dependency (their own, or their epic's), whatever their own status, each with what blocks it (`GET /api/v1/stories/blocked`). The queued ones are what the dispatch driver skips and `place_dispatch` refuses `409 dependencies_not_met`. Optional `project_id` (422 if not a UUID), `page`, `page_size`. Agent key or higher. |
 | `get_story` | Get full details for a single story by ID. |

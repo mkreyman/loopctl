@@ -439,20 +439,30 @@ pub fn emit(repo: &Path, remote: &str, ev: &NewEvent) -> Result<Emitted, String>
 }
 
 /// The change's cursor: `(applied_through, held)`.
-fn cursor(url: &str, src: &Source, secret: &[u8], change: &str) -> Result<(u64, Vec<u64>), String> {
+fn cursor(url: &str, src: &Source, secret: &[u8], change: &str) -> Result<(u64, Vec<u64>), Stop> {
     let path = format!("/api/v1/change_events/{}/cursor", src.source_id);
-    let reply = outbox::get_signed(url, &path, &format!("change_id={change}"), secret)?;
+    let reply = outbox::get_signed(url, &path, &format!("change_id={change}"), secret)
+        .map_err(Stop::Failed)?;
     if reply.status == 426 {
-        return Err(outbox::upgrade_text(&reply));
+        return Err(Stop::Upgrade(outbox::upgrade_text(&reply)));
     }
     if reply.status != 200 {
-        return Err(format!(
+        return Err(Stop::Failed(format!(
             "cursor of {change}: HTTP {} {}",
             reply.status,
             reply.code()
-        ));
+        )));
     }
     Ok(parse_cursor(&reply.json()))
+}
+
+/// Why delivery stopped for the whole repo.
+#[derive(Debug)]
+pub enum Stop {
+    /// loopctl refuses this chg's version (426): permanent for the run, never retried.
+    Upgrade(String),
+    /// Anything else (network, HTTP trouble, a bad signature): a caller may retry.
+    Failed(String),
 }
 
 fn parse_cursor(v: &Value) -> (u64, Vec<u64>) {
@@ -468,7 +478,7 @@ fn parse_cursor(v: &Value) -> (u64, Vec<u64>) {
 /// Delivers every pending change of `src`. A problem with one change (its clone gone, a
 /// conflicting event) is reported and skipped; an HTTP failure stops the repo, so the
 /// caller backs off.
-pub fn deliver_pending(url: &str, src: &Source, secret: &[u8]) -> Result<Delivered, String> {
+pub fn deliver_pending(url: &str, src: &Source, secret: &[u8]) -> Result<Delivered, Stop> {
     let mut d = Delivered::default();
     for m in pending(src) {
         match deliver(url, src, secret, &m) {
@@ -505,8 +515,8 @@ enum Step {
 enum Halt {
     /// This change only.
     Skip(String),
-    /// The whole repo (HTTP trouble).
-    Stop(String),
+    /// The whole repo (HTTP trouble, or a 426).
+    Stop(Stop),
 }
 
 fn deliver(url: &str, src: &Source, secret: &[u8], m: &Marker) -> Result<Step, Halt> {
@@ -528,7 +538,8 @@ fn deliver(url: &str, src: &Source, secret: &[u8], m: &Marker) -> Result<Step, H
         let seq = applied + 1;
         let rev = format!("{tip}~{}", top - seq);
         let body = event_at(dir, &rev).map_err(Halt::Skip)?;
-        let reply = outbox::post_signed(url, &path, secret, body.as_bytes()).map_err(Halt::Stop)?;
+        let reply = outbox::post_signed(url, &path, secret, body.as_bytes())
+            .map_err(|e| Halt::Stop(Stop::Failed(e)))?;
         match reply.status {
             200 => {
                 posted += 1;
@@ -552,9 +563,18 @@ fn deliver(url: &str, src: &Source, secret: &[u8], m: &Marker) -> Result<Step, H
                     Some(format!("seq {seq}: 409 {}", reply.code())),
                 ));
             }
-            401 => return Err(Halt::Stop("401 invalid_signature on an event post".into())),
-            426 => return Err(Halt::Stop(outbox::upgrade_text(&reply))),
-            s => return Err(Halt::Stop(format!("event post: HTTP {s} {}", reply.code()))),
+            401 => {
+                return Err(Halt::Stop(Stop::Failed(
+                    "401 invalid_signature on an event post".into(),
+                )));
+            }
+            426 => return Err(Halt::Stop(Stop::Upgrade(outbox::upgrade_text(&reply)))),
+            s => {
+                return Err(Halt::Stop(Stop::Failed(format!(
+                    "event post: HTTP {s} {}",
+                    reply.code()
+                ))));
+            }
         }
     }
     if held.iter().any(|&h| h > top) {

@@ -22,6 +22,11 @@ defmodule LoopctlWeb.StoryController do
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.ProjectId
 
+  # intake_records.issue_number is int4; one attribute bounds the guard and the spec.
+  @max_issue_number 2_147_483_647
+  @issue_number_message "issue_number must be an integer in 1..#{@max_issue_number}"
+  @owner_repo ~r/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/
+
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
@@ -170,7 +175,15 @@ defmodule LoopctlWeb.StoryController do
         type: :integer,
         description:
           "Only the stories an intake issue with this number produced " <>
-            "(stories.intake_record_id). 400 unless a positive integer."
+            "(stories.intake_record_id). 400 unless an integer in 1..#{@max_issue_number}. " <>
+            "An issue number is unique only within one repository: pass repo to narrow it."
+      ],
+      repo: [
+        in: :query,
+        type: :string,
+        description:
+          "Only the stories an intake source of this repository (owner/name, " <>
+            "case-insensitive) produced. 400 unless owner/name."
       ]
     ],
     responses: %{
@@ -356,7 +369,8 @@ defmodule LoopctlWeb.StoryController do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
     with :ok <- ProjectId.validate(project_id),
-         {:ok, issue_number} <- issue_number(params["issue_number"]) do
+         {:ok, issue_number} <- issue_number(params["issue_number"]),
+         {:ok, repo} <- intake_repo(params["repo"]) do
       limit = parse_int(params["limit"]) || parse_int(params["page_size"])
 
       opts =
@@ -367,6 +381,7 @@ defmodule LoopctlWeb.StoryController do
         |> maybe_add_opt(:limit, limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
         |> maybe_add_opt(:issue_number, issue_number)
+        |> maybe_add_opt(:repo, repo)
 
       {:ok, result} = Stories.list_stories_by_project(tenant_id, project_id, opts)
 
@@ -393,14 +408,27 @@ defmodule LoopctlWeb.StoryController do
   defp issue_number(nil), do: {:ok, nil}
   defp issue_number(""), do: {:ok, nil}
 
+  # Bounded by the column: intake_records.issue_number is int4, and a larger value would
+  # reach Postgrex as an encode error (a 500) instead of this 400.
   defp issue_number(raw) when is_binary(raw) do
     case Integer.parse(raw) do
-      {n, ""} when n > 0 -> {:ok, n}
-      _ -> {:error, :bad_request, "issue_number must be a positive integer"}
+      {n, ""} when n > 0 and n <= @max_issue_number -> {:ok, n}
+      _ -> {:error, :bad_request, @issue_number_message}
     end
   end
 
-  defp issue_number(_raw), do: {:error, :bad_request, "issue_number must be a positive integer"}
+  defp issue_number(_raw), do: {:error, :bad_request, @issue_number_message}
+
+  defp intake_repo(nil), do: {:ok, nil}
+  defp intake_repo(""), do: {:ok, nil}
+
+  defp intake_repo(raw) when is_binary(raw) do
+    if Regex.match?(@owner_repo, raw),
+      do: {:ok, raw},
+      else: {:error, :bad_request, "repo must be owner/name"}
+  end
+
+  defp intake_repo(_raw), do: {:error, :bad_request, "repo must be owner/name"}
 
   @doc """
   GET /api/v1/stories/:id

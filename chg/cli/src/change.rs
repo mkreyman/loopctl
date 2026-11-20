@@ -336,18 +336,18 @@ pub fn submit(repo: &Path, remote: &str, story: Option<&str>) -> Result<Submitte
 
 /// Delivers the repo's pending events now, so loopctl has `submitted` before the review
 /// key is asked for. Only `change`'s own problems count: another change's stale marker or
-/// held event must not keep this one from its key.
-pub fn deliver_now(cfg: &outbox::Config, slug: &str, change: &str) -> Result<(), String> {
+/// held event must not keep this one from its key. `Stop::Upgrade` is a 426: permanent.
+pub fn deliver_now(cfg: &outbox::Config, slug: &str, change: &str) -> Result<(), events::Stop> {
     let src = cfg.source(slug).ok_or_else(|| {
-        format!(
+        events::Stop::Failed(format!(
             "{slug} has no source in {}",
             outbox::config_path().display()
-        )
+        ))
     })?;
-    let secret = outbox::read_secret(src)?;
+    let secret = outbox::read_secret(src).map_err(events::Stop::Failed)?;
     let d = events::deliver_pending(&cfg.url(), src, &secret)?;
     match own_problem(&d.problems, change) {
-        Some(p) => Err(p.to_string()),
+        Some(p) => Err(events::Stop::Failed(p.to_string())),
         None => Ok(()),
     }
 }
@@ -504,6 +504,7 @@ fn remint_review_key(
                 .ok_or_else(|| "loopctl's review key answer holds no api_key".to_string())
         }
         409 => Ok(None),
+        426 => Err(outbox::upgrade_text(&r)),
         s => Err(format!("minting a review key: HTTP {s} {}", r.code())),
     }
 }

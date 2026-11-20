@@ -1127,12 +1127,13 @@ async function resolvePayload(inline, payloadPath) {
 
 // --- Story Tools ---
 
-async function listStories({ project_id, agent_status, verified_status, epic_id, issue_number, limit, offset, include_token_totals }) {
+async function listStories({ project_id, agent_status, verified_status, epic_id, issue_number, repo, limit, offset, include_token_totals }) {
   const params = new URLSearchParams({ project_id });
   if (agent_status) params.set("agent_status", agent_status);
   if (verified_status) params.set("verified_status", verified_status);
   if (epic_id) params.set("epic_id", epic_id);
   if (issue_number != null) params.set("issue_number", String(issue_number));
+  if (repo) params.set("repo", repo);
   params.set(
     "limit",
     String(Math.min(limit ?? DEFAULT_STORY_PAGE_SIZE, SERVER_MAX_STORY_PAGE_SIZE)),
@@ -4775,7 +4776,8 @@ const TOOLS = [
     description:
       "List stories for a project, optionally filtered by agent_status, verified_status, epic_id, " +
       "or issue_number (the stories an intake issue with that number produced; loopctl answers 400 " +
-      "unless it is a positive integer). " +
+      "unless it is an integer in 1..2147483647). An issue number is unique only within one " +
+      "repository, so pass repo (owner/name; 400 otherwise) to narrow it to that repository's issue. " +
       "Returns compact results (no acceptance_criteria/description) — use get_story for full details. " +
       "Defaults to 20 per page; pass `limit` up to 500 to page larger. Use offset to paginate " +
       "(response includes total_count). Filter by epic_id or agent_status to reduce result size.",
@@ -4803,6 +4805,11 @@ const TOOLS = [
           type: "integer",
           description:
             "Filter to the stories an intake issue with this number produced (stories.intake_record_id).",
+        },
+        repo: {
+          type: "string",
+          description:
+            "Filter to the stories an intake source of this repository (owner/name, case-insensitive) produced.",
         },
         limit: {
           type: "integer",

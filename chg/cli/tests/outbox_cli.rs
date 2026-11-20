@@ -901,6 +901,125 @@ fn review_dispatch_posts_exactly_change_and_revision() {
         .stderr(predicates::str::contains("review_already_recorded"));
 }
 
+/// loopctl's 426 to a chg below the release set's minimum (US-52.8).
+const UPGRADE: &str =
+    r#"{"error":{"code":"incompatible_client_version","component":"chg","minimum":"9.0.0"}}"#;
+
+/// The upgrade text a 426 is reported as, wherever it comes from (AC-52.8.6).
+fn says_upgrade(stderr: &str) {
+    assert!(stderr.contains("needs chg 9.0.0 or later"), "{stderr}");
+    assert!(stderr.contains("run release/rollout.sh"), "{stderr}");
+}
+
+/// A fake loopctl that applies every event in order and answers every review-key mint
+/// with `dispatch`.
+fn applying_fake(fake: &Fake, dispatch: (u16, &'static str)) {
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    fake.answer(move |r| {
+        if r.path().ends_with("/review_dispatch") {
+            return (dispatch.0, dispatch.1.to_string());
+        }
+        let mut e = events.lock().unwrap();
+        if r.method == "POST" && r.json()["event_seq"].as_u64() == Some(e.len() as u64 + 1) {
+            e.push(r.json());
+        }
+        let cur = json!({"applied_through": e.len(), "held": []});
+        if r.method == "GET" {
+            (200, cur.to_string())
+        } else {
+            (
+                200,
+                json!({"status":"ok","outcome":"applied","cursor":cur}).to_string(),
+            )
+        }
+    });
+}
+
+/// AC-52.8.6: a 426 while `chg submit` delivers `submitted` is permanent for the run. It
+/// is asked once, never retried after a sleep, and says the minimum and the remedy.
+#[test]
+fn a_426_on_delivery_stops_the_review_key_at_once() {
+    let fake = Fake::start();
+    let t = tempfile::tempdir().unwrap();
+    let (origin, _seed) = origin_and_clone(t.path());
+    let a = clone(&origin, &t.path().join("a"));
+    let m = Machine::new("acme/widget", &fake);
+    git(&a, &["checkout", "-q", "-b", "feat/x"]);
+    commit(&a, "g", "1");
+    fake.answer(|_| (426, UPGRADE.into()));
+
+    let started = std::time::Instant::now();
+    let out = m
+        .chg()
+        .args(["submit", "--story", "S-1", "--repo"])
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    says_upgrade(&String::from_utf8_lossy(&out.stderr));
+    let reqs = fake.take();
+    assert_eq!(reqs.len(), 1, "one cursor read, no retry: {reqs:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a 426 must not wait for a retry: {:?}",
+        started.elapsed()
+    );
+}
+
+/// AC-52.8.6: a 426 from the review-key mint itself, on all three paths that mint one.
+#[test]
+fn a_426_on_the_review_key_mint_says_the_minimum_and_the_remedy() {
+    let fake = Fake::start();
+    let t = tempfile::tempdir().unwrap();
+    let (origin, _seed) = origin_and_clone(t.path());
+    let a = clone(&origin, &t.path().join("a"));
+    let m = Machine::new("acme/widget", &fake);
+    git(&a, &["checkout", "-q", "-b", "feat/x"]);
+    commit(&a, "g", "1");
+    applying_fake(&fake, (426, UPGRADE));
+
+    // `chg submit`: delivery succeeds, the mint is refused once and not asked again.
+    let out = m
+        .chg()
+        .args(["submit", "--story", "S-1", "--repo"])
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    says_upgrade(&String::from_utf8_lossy(&out.stderr));
+    let mints = fake
+        .take()
+        .iter()
+        .filter(|r| r.path().ends_with("/review_dispatch"))
+        .count();
+    assert_eq!(mints, 1);
+
+    // `chg review-dispatch`.
+    let out = m
+        .chg()
+        .args(["review-dispatch", "--repo"])
+        .arg(&a)
+        .args(["--change", "CH1", "--revision", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    says_upgrade(&String::from_utf8_lossy(&out.stderr));
+
+    // `chg review` with no kept key mints one to record the clean review.
+    let f = t.path().join("findings.json");
+    fs::write(&f, "[]").unwrap();
+    let out = m
+        .chg()
+        .args(["review", "--findings"])
+        .arg(&f)
+        .arg("--repo")
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    says_upgrade(&String::from_utf8_lossy(&out.stderr));
+}
+
 /// A fake loopctl that applies every event in order and mints a review key once the
 /// revision's `submitted` is applied.
 fn lifecycle_fake(fake: &Fake) -> Arc<Mutex<Vec<Value>>> {

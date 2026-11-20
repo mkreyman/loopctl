@@ -1,14 +1,22 @@
 name: Runner CI
 
-# The runner (runner/, US-52.4), gated only when a change touches it (US-52.6). A job skipped by
+# The runner (runner/, US-52.4), gated only when a change touches it (US-52.6). Every job but
+# the area gate runs on the fleet-ci pool. A job skipped by
 # its `if:` reports skipped, which branch protection accepts for a required check; a workflow
 # filtered by on.paths would leave the check pending, so this workflow uses no paths filter.
+#
+# Push of every branch, and no pull_request: the merge gate trusts only push runs of a
+# story's branch at its head, and a same-repo pull request's checks are the push run's check
+# runs on its head sha (ci.yml says more). The nightly run counts as every area, as ci.yml's
+# does, so a runner that stops building on an unchanged tree is found the next morning.
 on:
   push:
-    branches: [master, "epic/**"]
-  pull_request:
-    branches: [master]
+    branches: ["**"]
+  schedule:
+    - cron: "0 2 * * *"
 
+# A later push on a branch cancels the earlier push's run; areas-output.sh judges a branch
+# push from its merge base with master, so the later run covers the cancelled run's areas.
 concurrency:
   group: runner-ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
@@ -20,8 +28,6 @@ jobs:
   changes:
     name: changes
     runs-on: [self-hosted, fleet-ci]
-    # The fork-PR guard every self-hosted job carries (ci.yml, #881).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     outputs:
       runner: ${{ steps.areas.outputs.runner }}
     steps:
@@ -37,8 +43,6 @@ jobs:
       - id: areas
         env:
           EVENT_BEFORE: ${{ github.event.before }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: .github/scripts/areas-output.sh
 
   runner:
@@ -98,3 +102,31 @@ jobs:
       - run: mix credo --strict --config-file .credo.exs
       - run: mix dialyzer
       - run: mix test
+
+  # THE AREA GATE, the one check the merge gate's independent_checks names for this repository:
+  # the same job, under the same name, ends ci.yml, runner-ci.yml, chg-ci.yml and e2e.yml. It
+  # needs every job a push can run, and passes only when changes succeeded and every other
+  # need succeeded or was skipped by area; a failed or cancelled need fails it. always(), so
+  # a need that failed or was skipped never skips the gate itself. Hosted and checkout-free:
+  # it reads only the needs' results.
+  area-gate:
+    name: area gate
+    needs: [changes, runner]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded or was skipped by area
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$(jq -r '.changes.result' <<<"$NEEDS")" != success ]; then
+            echo "::error::changes did not succeed, so no area was judged"
+            exit 1
+          fi
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi

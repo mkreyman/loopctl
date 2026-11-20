@@ -60,11 +60,19 @@ defmodule LoopctlE2e.Stages do
   # --- stages ---
 
   defp story_created(client, ctx) do
-    params = [project_id: ctx.project_id, issue_number: ctx.issue_number]
+    # repo too: an issue number is unique only within one repository, and the run must follow
+    # the story of the issue it opened, not another repository's issue of the same number.
+    params = [project_id: ctx.project_id, issue_number: ctx.issue_number, repo: ctx.repo]
 
     case Client.get(client, :loopctl, "/api/v1/stories", params) do
-      {:ok, 200, %{"data" => [story | _]}} -> {:done, Map.put(ctx, :story, story)}
-      other -> {:wait, "no story for issue ##{ctx.issue_number}: #{describe(other)}"}
+      {:ok, 200, %{"data" => [story]}} ->
+        {:done, Map.put(ctx, :story, story)}
+
+      {:ok, 200, %{"data" => [_, _ | _] = stories}} ->
+        {:fail, "issue ##{ctx.issue_number} of #{ctx.repo} produced #{length(stories)} stories"}
+
+      other ->
+        {:wait, "no story for issue ##{ctx.issue_number}: #{describe(other)}"}
     end
   end
 

@@ -135,6 +135,7 @@ defmodule LoopctlE2e.ProvisionTest do
       assert yml =~ "runs-on: [self-hosted, fleet-ci]"
       assert yml =~ "secrets.LOOPCTL_E2E_ORCH_KEY"
       assert yml =~ "secrets.E2E_GITHUB_TOKEN"
+      assert yml =~ "LOOPCTL_E2E_PROJECT_ID: ${{ vars.LOOPCTL_E2E_PROJECT_ID }}"
       assert yml =~ "if: failure()"
       assert yml =~ "path: e2e/stage-log/"
     end

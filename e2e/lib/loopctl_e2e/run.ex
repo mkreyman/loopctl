@@ -55,9 +55,32 @@ defmodule LoopctlE2e.Run do
   @doc """
   Opens the run's issue and walks every stage. `sandbox` carries `:repo`, `:project_id` and
   `:label`. Returns the final context, or the failure naming the stage.
+
+  A sandbox with no project id (unset, blank, or the old placeholder) fails at stage
+  `:sandbox` before the issue is opened: every story lookup would miss, so the run could only
+  wait out its budget and leave the issue behind.
   """
   @spec execute(Client.t(), map(), String.t(), opts()) :: {:ok, map()} | {:error, failure()}
   def execute(client, sandbox, run_id, opts \\ []) do
+    case project_id(sandbox) do
+      :ok -> open_and_walk(client, sandbox, run_id, opts)
+      {:error, state} -> {:error, %{stage: :sandbox, story_id: nil, last_state: state}}
+    end
+  end
+
+  defp project_id(%{project_id: id}) when is_binary(id) do
+    if String.trim(id) in ["", "PROJECT_ID_UNSET"], do: unset(), else: :ok
+  end
+
+  defp project_id(_sandbox), do: unset()
+
+  defp unset do
+    {:error,
+     "no sandbox project id: set the repository variable LOOPCTL_E2E_PROJECT_ID " <>
+       "(the e2e workflow passes it as the environment variable of that name)"}
+  end
+
+  defp open_and_walk(client, sandbox, run_id, opts) do
     log = Keyword.get(opts, :log, fn _ -> :ok end)
 
     case Client.post(

@@ -40,3 +40,15 @@ test("the README row names it", () => {
   assert.ok(row, "list_stories has a README row");
   assert.match(row, /`issue_number`/);
 });
+
+test("repo narrows the issue number: declared, sent, and named in the README", () => {
+  const body = slice("async function listStories(", "async function listReadyStories(");
+  assert.match(body, /issue_number, repo, limit,/);
+  assert.match(body, /if \(repo\) params\.set\("repo", repo\);/);
+
+  const decl = slice('name: "list_stories"', 'required: ["project_id"]');
+  assert.match(decl, /repo: \{\s*type: "string",/);
+
+  const row = README.split("\n").find((line) => line.startsWith("| `list_stories` |"));
+  assert.match(row, /`repo`/);
+});

@@ -52,7 +52,13 @@ assert lp.route(CC, "hooks/block-complex-bash.sh") == CC
 assert lp.route(CC, "skills/handoff/SKILL.md") == CC
 assert lp.route(HCB, "/home/m/workspace/chg/cli/src/main.rs") == CHG
 assert lp.route(CHG, "chg/cli/src/main.rs") == CHG
-assert lp.route(HCB, "/home/m/workspace/loopctl/chg/cli/src/main.rs") == HCB, "only the old path routes"
+assert lp.route(HCB, "/home/m/workspace/loopctl/chg/cli/src/main.rs") == CHG, "the new checkout routes"
+assert lp.route(HCB, "~/workspace/loopctl/chg/cli/src/shadow.rs") == CHG
+assert lp.route(CHG, "/home/m/workspace/loopctl/chg/cli/src/main.rs") == CHG
+assert lp.route(CC, "/home/m/workspace/loopctl/chg/bin/chg-loop.py") == CHG
+assert lp.route(HCB, "/x/workspace/loopctl/lib/foo.ex") == HCB, "loopctl server code is not chg"
+assert lp.route(HCB, "/x/workspace/loopctl/chgx/foo.rs") == HCB
+assert lp.route(HCB, "/x/workspace/loopctl-old/chg/cli/x.rs") == HCB
 assert lp.route(HCB) == HCB
 
 # -- fingerprints -----------------------------------------------------------------------

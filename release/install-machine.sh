@@ -87,18 +87,52 @@ fail() { report failed "$1" 1; }
 
 mkdir -p "$home/sets" || fail "cannot create $home"
 
-# One install at a time; a lock whose owner is gone is taken over.
+# Set once the running runner is told to drain, cleared once the new runner is installed (a
+# restarted runner starts undrained: the flag lives only in its memory). While it is set, the
+# EXIT trap undrains the runner, so every failure between the drain and the install, and
+# runner_busy, leaves it taking work again. Best effort: the trap's own result never replaces
+# the exit status of the report that ended the run.
+drained=false
+
+on_exit() {
+  if [ "$drained" = true ]; then
+    "$runner_bin" rpc 'LoopctlRunner.Control.set_draining(LoopctlRunner.Control, false)' \
+      >/dev/null 2>&1 || true
+  fi
+  # Only our own lock: a run that took over a lock it judged stale must not lose it to us.
+  if [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$lock"; fi
+}
+
+# One install at a time. The owner writes its pid to a temporary file inside the lock and
+# renames it to `pid`, so `pid` is never seen half-written. A lock with no pid yet belongs to
+# an owner between its mkdir and that rename, which is busy, not dead: it is taken over only
+# once the lock directory is more than lock_grace_m minutes old, far longer than that window,
+# so it covers only an owner killed inside it. A lock whose pid is not running is taken over.
 lock="$home/.install.lock"
+lock_grace_m=1
 if ! mkdir "$lock" 2>/dev/null; then
   owner=$(cat "$lock/pid" 2>/dev/null || true)
   if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
     report busy "another install is running (pid $owner)" 75
   fi
-  rm -rf "$lock"
+  if [ -z "$owner" ] && [ -z "$(find "$lock" -maxdepth 0 -mmin +"$lock_grace_m" 2>/dev/null)" ]; then
+    report busy "$lock has no owner pid yet (taken over after ${lock_grace_m}m)" 75
+  fi
+  # Take it over by RENAMING it aside, never by deleting it in place: a rename is atomic, so
+  # of two runs that both judged it stale only one moves it. The mover then checks that what
+  # it moved is still the lock it judged (same pid, or still none); if another run had already
+  # replaced it with a live lock, that lock is put back and this run is busy.
+  aside="$lock.stale.$$"
+  mv "$lock" "$aside" 2>/dev/null || report busy "could not take $lock" 75
+  if [ "$(cat "$aside/pid" 2>/dev/null || true)" != "$owner" ]; then
+    mv "$aside" "$lock" 2>/dev/null || true
+    report busy "$lock was taken over by another install" 75
+  fi
+  rm -rf "$aside"
   mkdir "$lock" 2>/dev/null || report busy "could not take $lock" 75
 fi
-echo "$$" >"$lock/pid"
-trap 'rm -rf "$lock"' EXIT
+trap on_exit EXIT
+{ echo "$$" >"$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } || fail "cannot write $lock/pid"
 
 # --- what is installed now ---
 
@@ -219,13 +253,15 @@ in_flight() {
 }
 
 if [ -x "$runner_bin" ] && "$runner_bin" pid >/dev/null 2>&1; then
+  # Set before the call: a run killed while the call is in flight still undrains.
+  drained=true
   rpc 'LoopctlRunner.Control.set_draining(LoopctlRunner.Control, true)' >/dev/null
   waited=0
   while :; do
     n=$(in_flight | tail -1)
     [ "$n" = 0 ] && break
     if [ "$waited" -ge "$drain_s" ]; then
-      rpc 'LoopctlRunner.Control.set_draining(LoopctlRunner.Control, false)' >/dev/null
+      # on_exit undrains it.
       report runner_busy "${n:-?} dispatch(es) still in flight after ${drain_s}s" 1
     fi
     sleep "$poll_s"
@@ -244,6 +280,8 @@ restart=$(date +%s)
 
 (cd "$set_dir/runner" && LOOPCTL_RUNNER_PREFIX="$runner_prefix" rel/install.sh) >&2 ||
   fail "the runner install failed (runner/rel/install.sh)"
+# The new runner is up and starts undrained; nothing is left to undo.
+drained=false
 
 (cd "$set_dir/chg" && scripts/install.sh --dest "$(dirname "$chg_dest")") >&2 ||
   fail "chg's install failed (chg/scripts/install.sh)"

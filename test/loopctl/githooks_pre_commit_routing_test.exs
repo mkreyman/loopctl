@@ -22,7 +22,7 @@ defmodule Loopctl.GithooksPreCommitRoutingTest do
     Enum.each([repo, home, bin], &File.mkdir_p!/1)
     on_exit(fn -> File.rm_rf!(root) end)
 
-    for tool <- ["mix", "cargo", "node"] do
+    for tool <- ["mix", "cargo", "node", "python3"] do
       write_exec!(Path.join(bin, tool), """
       #!/bin/bash
       echo "#{tool} $(pwd -P) $*" >> "#{log}"
@@ -82,6 +82,54 @@ defmodule Loopctl.GithooksPreCommitRoutingTest do
     assert calls(ctx) == [
              "node #{ctx.physical}/chg/adapters/typescript --test test/unit.test.mjs test/integration.test.mjs"
            ]
+  end
+
+  # Finding 13: chg/adapters/generic/ fell into an arm that set no area and no fleet hook.
+  test "the generic adapter runs its test from chg/, as chg-ci does", ctx do
+    stage!(ctx.repo, "chg/adapters/generic/chg-adapter.py")
+
+    assert {_, 0} = hook(ctx)
+
+    assert calls(ctx) == [
+             "python3 #{ctx.physical}/chg adapters/generic/test/test_adapter.py"
+           ]
+  end
+
+  test "a chg/adapters path no adapter claims is judged by chg's own checks", ctx do
+    stage!(ctx.repo, "chg/adapters/README.md")
+
+    assert {_, 0} = hook(ctx)
+    assert calls(ctx) |> hd() == "cargo #{ctx.physical}/chg fmt --all --check"
+  end
+
+  # Finding 12: the runner compiles priv/runner_contract/ in, and the server exports it.
+  test "priv/runner_contract/ runs the runner's gate and the fleet hook", ctx do
+    stage!(ctx.repo, "priv/runner_contract/v1.json")
+
+    assert {_, 0} = hook(ctx, ["x"])
+    assert calls(ctx) == ["mix #{ctx.physical}/runner precommit", "fleet x"]
+  end
+
+  test "no staged path passes through the hook with no check at all", ctx do
+    for path <- [
+          "chg/adapters/generic/test/test_adapter.py",
+          "chg/adapters/other/x",
+          "chg/adapters/elixir/mix.exs",
+          "chg/adapters/typescript/lib/git.mjs",
+          "chg/x",
+          "runner/x",
+          "e2e/x",
+          "priv/runner_contract/x",
+          ".tool-versions",
+          "x"
+        ] do
+      File.rm_rf!(ctx.log)
+      git!(ctx.repo, ["reset", "-q"])
+      stage!(ctx.repo, path)
+
+      assert {_, 0} = hook(ctx)
+      assert calls(ctx) != [], path
+    end
   end
 
   test "a path outside runner/, chg/ and e2e/ hands to the fleet hook after the area checks",

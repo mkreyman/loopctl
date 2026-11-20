@@ -242,7 +242,10 @@ has exactly `effect_paths`, `independent_paths`, `independent_checks` and `limit
 `independent_paths` names the paths a change may touch only when it is independently
 verified (the verifier dispatch passed custody at the head, on another runner machine than
 the implementer, with every `independent_checks` job green at the head);
-`independent_checks` is a non-empty list of CI job names, never `local-gate`. A version 1
+`independent_checks` is a non-empty list of CI job names, never `local-gate`, judged only from
+push runs of the story's branch; for loopctl and claude-config it is `["area gate"]`, the
+always-run last job of each of their workflows, and a pull request that touches a CI definition
+(`.github/workflows/`, `.github/actions/`, `.github/scripts/`) is refused before it is read. A version 1
 document, or a `human_paths` key, is refused, so every change escalates until the document
 is re-pinned. Set both as SECRETS, together, in one command — the document
 is a map of which paths skip human review and does not belong in `fly.toml` or the public
@@ -250,7 +253,10 @@ source tree. Hash exactly the bytes you set, from the same shell variable:
 
 ```bash
 DOC="$(cat triggers.json)"
-fly secrets set DELIVERY_GATES_CONFIG="$DOC" \
+# --stage when the document's version changes with a deploy (version 1 -> 2): the deploy is
+# the restart that applies it, so no image ever reads a version it does not know. Without
+# --stage when only the content changes: that set restarts the machines itself.
+fly secrets set --stage DELIVERY_GATES_CONFIG="$DOC" \
   DELIVERY_GATES_CONFIG_SHA256="$(printf '%s' "$DOC" | sha256sum | cut -d' ' -f1)"
 ```
 

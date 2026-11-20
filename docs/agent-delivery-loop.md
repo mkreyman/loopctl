@@ -174,7 +174,7 @@ Gate B reads one trigger list per repository from `DELIVERY_GATES_CONFIG` (`Loop
 
 1. The story's verifier dispatch passed custody AT the recorded head: the same `merge_custody_status` check the custody precondition runs, whose lineage comparison refuses a verifier on the implementer's root. Otherwise `not_independently_verified`.
 2. That verifier dispatch ran on a different machine (`runners.name`) from every implement dispatch of the story, as the dispatch ledger records it. Otherwise `same_host`, or `host_unattested` when either side has no ledger row.
-3. Every check the repository lists in `independent_checks` passed at the head, on the story's branch. Otherwise `independent_checks_not_passed`, naming the checks.
+3. Every check the repository lists in `independent_checks` passed at the head, on a push run of the story's branch. Otherwise `independent_checks_not_passed`, naming the checks. A push run executes the change's own workflow files, so a pull request whose diff touches a CI definition (`.github/workflows/`, `.github/actions/`, `.github/scripts/`) is refused first, with `ci_definition_changed`. loopctl and claude-config list `area gate`: each workflow's always-run last job, green only when every area the branch touches ran green. The live end-to-end suite tests the deployed set after a merge (`release/rollout.sh`), so it is never a check at a pull request's head.
 
 Otherwise the gate refuses, naming the paths and `{:independent_verification, reason}`, and escalates the story over `merge_gate`. A change that also matches another Gate B reason (a size limit, an agent escalation) is `human` and refused, whatever the verification says.
 

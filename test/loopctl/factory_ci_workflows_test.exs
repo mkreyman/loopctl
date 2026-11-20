@@ -2,8 +2,8 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   @moduledoc """
   US-52.6: CI judges runner/ and chg/ inside the loopctl repository, each only when it changed.
 
-  `.github/scripts/changed-areas.sh` is run against throwaway repositories; the three
-  workflows are read as YAML. A job gated by area is skipped by its `if:`, never by
+  `.github/scripts/changed-areas.sh` is run against throwaway repositories; the four
+  workflows (ci, runner-ci, chg-ci, e2e) are read as YAML. A job gated by area is skipped by its `if:`, never by
   `on.paths`, because a required check on a workflow filtered out by paths stays pending.
   """
   use ExUnit.Case, async: true
@@ -15,6 +15,14 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   @ci ".github/workflows/ci.yml"
   @runner_ci ".github/workflows/runner-ci.yml"
   @chg_ci ".github/workflows/chg-ci.yml"
+  @e2e ".github/workflows/e2e.yml"
+  # The jobs the area gate does not wait on: scale-nightly is dispatch-only, live is nightly
+  # and dispatch-only, and deploy and smoke ship master rather than check a change (smoke
+  # gates nothing by design).
+  @not_on_push %{
+    ".github/workflows/ci.yml" => ["scale-nightly", "deploy", "smoke"],
+    ".github/workflows/e2e.yml" => ["live"]
+  }
   @fleet_ci ["self-hosted", "fleet-ci"]
   @macos_expr ~S<${{ matrix.os == 'macos' && vars.CI_RUNNER_MACOS && fromJSON(vars.CI_RUNNER_MACOS) || fromJSON('["self-hosted","fleet-ci"]') }}>
   @every ["chg", "e2e", "runner", "server"]
@@ -77,6 +85,7 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
 
       run_output!(repo, out, [
         {"GITHUB_EVENT_NAME", "push"},
+        {"GITHUB_REF", "refs/heads/master"},
         {"EVENT_BEFORE", base},
         {"GITHUB_SHA", head}
       ])
@@ -87,27 +96,147 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
       run_output!(repo, out, [{"GITHUB_EVENT_NAME", "schedule"}])
       assert File.read!(out) == "server=true\nrunner=true\nchg=true\ne2e=true\n"
     end
+
+    # Finding 10: a later push on a branch cancels the earlier push's run (per-ref
+    # cancel-in-progress), so a run judged only on before..sha never covered the earlier
+    # push's areas. A branch push is judged from its merge base with master.
+    test "a branch push is judged on the whole branch, from its merge base with master", %{
+      repo: repo,
+      base: base
+    } do
+      git!(repo, ["update-ref", "refs/remotes/origin/master", base])
+      git!(repo, ["checkout", "-q", "-b", "feature/x", base])
+      first = commit!(repo, "lib/loopctl.ex")
+      head = commit!(repo, "runner/lib/a.ex")
+      out = Path.join(repo, "out")
+
+      for before <- [first, String.duplicate("0", 40)] do
+        run_output!(repo, out, [
+          {"GITHUB_EVENT_NAME", "push"},
+          {"GITHUB_REF", "refs/heads/feature/x"},
+          {"EVENT_BEFORE", before},
+          {"GITHUB_SHA", head}
+        ])
+
+        assert File.read!(out) == "server=true\nrunner=true\nchg=false\ne2e=false\n", before
+        File.rm!(out)
+      end
+    end
+
+    test "a branch push whose merge base cannot be found counts as every area", %{
+      repo: repo,
+      base: base
+    } do
+      git!(repo, ["checkout", "-q", "-b", "feature/x", base])
+      head = commit!(repo, "runner/lib/a.ex")
+      out = Path.join(repo, "out")
+
+      run_output!(repo, out, [
+        {"GITHUB_EVENT_NAME", "push"},
+        {"GITHUB_REF", "refs/heads/feature/x"},
+        {"EVENT_BEFORE", base},
+        {"GITHUB_SHA", head}
+      ])
+
+      assert File.read!(out) == "server=true\nrunner=true\nchg=true\ne2e=true\n"
+    end
+
+    # Finding 11: runner-ci and e2e.yml install Erlang and Elixir from the root pin.
+    test "the root .tool-versions counts as server, runner and e2e", %{repo: repo, base: base} do
+      head = commit!(repo, ".tool-versions")
+
+      assert areas!(repo, base, head) == ["e2e", "runner", "server"]
+    end
+  end
+
+  describe "every factory workflow" do
+    for file <- [@ci, @runner_ci, @chg_ci, @e2e] do
+      test "#{file} runs on a push of every branch and never on a pull request" do
+        on = workflow(unquote(file))["on"]
+
+        assert on["push"] == %{"branches" => ["**"]}
+        refute Map.has_key?(on, "pull_request")
+        refute Map.has_key?(on, "pull_request_target")
+
+        text = File.read!(unquote(file))
+        refute text =~ "github.event.pull_request"
+        refute text =~ ~r/event_name\s*[!=]=\s*'pull_request'/
+      end
+
+      test "#{file} ends in an area gate that needs every job a push can run" do
+        jobs = jobs(unquote(file))
+        gate = jobs["area-gate"]
+
+        assert gate["name"] == "area gate"
+        assert gate["if"] == "always()"
+        assert gate["runs-on"] == "ubuntu-latest"
+
+        push_jobs =
+          jobs
+          |> Map.drop(["area-gate" | Map.get(@not_on_push, unquote(file), [])])
+          |> Map.keys()
+          |> Enum.sort()
+
+        assert "changes" in push_jobs
+        assert Enum.sort(gate["needs"]) == push_jobs
+      end
+
+      test "#{file} runs its changes job on every event" do
+        refute Map.has_key?(jobs(unquote(file))["changes"], "if")
+      end
+    end
+
+    test "the area gate is the same step in all four workflows" do
+      [first | rest] = for file <- [@ci, @runner_ci, @chg_ci, @e2e], do: gate_step(file)
+
+      for step <- rest, do: assert(step == first)
+    end
+
+    test "the area gate passes only when changes succeeded and nothing failed or was cancelled" do
+      step = gate_step(@ci)
+
+      cases = [
+        {%{"changes" => "success", "lint" => "success", "test" => "skipped"}, 0},
+        {%{"changes" => "success", "lint" => "skipped"}, 0},
+        {%{"changes" => "success", "lint" => "failure"}, 1},
+        {%{"changes" => "success", "lint" => "cancelled"}, 1},
+        {%{"changes" => "skipped", "lint" => "skipped"}, 1},
+        {%{"changes" => "failure", "lint" => "skipped"}, 1},
+        {%{"changes" => "cancelled"}, 1},
+        {%{"lint" => "success"}, 1}
+      ]
+
+      for {results, want} <- cases do
+        needs =
+          Map.new(results, fn {job, result} -> {job, %{"result" => result, "outputs" => %{}}} end)
+
+        {log, status} =
+          System.cmd("bash", ["-e", "-c", step["run"]],
+            env: [{"NEEDS", Jason.encode!(needs)}],
+            stderr_to_stdout: true
+          )
+
+        assert status == want, "#{inspect(results)}: #{log}"
+      end
+    end
+
+    test "runner-ci and chg-ci run nightly with ci.yml, so the every-area run covers them" do
+      for file <- [@runner_ci, @chg_ci] do
+        assert workflow(file)["on"]["schedule"] == [%{"cron" => "0 2 * * *"}], file
+      end
+    end
   end
 
   describe "runner-ci.yml and chg-ci.yml" do
     for file <- [@runner_ci, @chg_ci] do
-      test "#{file} runs on master and epic pushes and master pull requests, unfiltered" do
-        on = workflow(unquote(file))["on"]
-
-        assert on["push"] == %{"branches" => ["master", "epic/**"]}
-        assert on["pull_request"] == %{"branches" => ["master"]}
-        refute Map.has_key?(on["push"], "paths")
-        refute Map.has_key?(on["pull_request"], "paths")
-      end
-
-      test "#{file} never runs on a GitHub-hosted runner" do
-        for {name, job} <- jobs(unquote(file)) do
+      test "#{file} runs every job but its area gate on the fleet-ci pool" do
+        for {name, job} <- Map.delete(jobs(unquote(file)), "area-gate") do
           assert job["runs-on"] in [@fleet_ci, @macos_expr], "#{name}: #{inspect(job["runs-on"])}"
         end
       end
 
       test "#{file} keeps the root compiled tree: every checkout is clean: false, then cleaned" do
-        for {name, job} <- jobs(unquote(file)) do
+        for {name, job} <- Map.delete(jobs(unquote(file)), "area-gate") do
           steps = job["steps"]
           i = Enum.find_index(steps, &(&1["uses"] == "actions/checkout@v4"))
           assert get_in(Enum.at(steps, i), ["with", "clean"]) == false, name
@@ -139,9 +268,9 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
       jobs = jobs(@chg_ci)
 
       assert jobs |> Map.keys() |> Enum.sort() ==
-               ~w(changes elixir-adapter generic-adapter rust typescript-adapter volume-setup)
+               ~w(area-gate changes elixir-adapter generic-adapter rust typescript-adapter volume-setup)
 
-      for {name, job} <- Map.delete(jobs, "changes") do
+      for {name, job} <- Map.drop(jobs, ["changes", "area-gate"]) do
         assert job["needs"] == ["changes"], name
         assert job["if"] == "needs.changes.outputs.chg == 'true'", name
       end
@@ -163,9 +292,9 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   end
 
   describe "ci.yml" do
-    test "every job but changes, deploy and smoke needs changes and runs only on server" do
+    test "every job but changes, deploy, smoke and the area gate needs changes and runs only on server" do
       jobs = jobs(@ci)
-      gated = Map.drop(jobs, ["changes", "deploy", "smoke"])
+      gated = Map.drop(jobs, ["changes", "deploy", "smoke", "area-gate"])
       assert map_size(gated) > 0
 
       for {name, job} <- gated do
@@ -197,6 +326,12 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   defp jobs(path), do: workflow(path)["jobs"]
 
   defp runs(job), do: for(%{"run" => run} <- job["steps"], do: String.trim(run))
+
+  defp gate_step(file) do
+    assert [step] = jobs(file)["area-gate"]["steps"], file
+    assert step["env"] == %{"NEEDS" => "${{ toJSON(needs) }}"}, file
+    step
+  end
 
   defp areas!(repo, base, head) do
     {out, 0} = System.cmd("bash", [@areas, base, head], cd: repo, env: GitEnv.spawn_env())

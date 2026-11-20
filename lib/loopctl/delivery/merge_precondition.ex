@@ -91,7 +91,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
      `:same_host` otherwise, and `:host_unattested` when either side has no ledger row;
   3. every one of the repository's `independent_checks` passed at the head, judged by
      `Loopctl.Delivery.CiEvidence.judge/2` over `PullRequestSource.check_evidence/3` for the
-     stage row's branch and head: `{:independent_checks_not_passed, names}` otherwise.
+     stage row's branch and head: `{:independent_checks_not_passed, names}` otherwise. A push
+     run executes the change's own workflow files, so a pull request whose diff touches a CI
+     definition (`Loopctl.Delivery.CiDefinition.reasons/1`) is refused before the checks are
+     read, with `{:ci_definition_changed, names}` or `{:ci_definition_unknown, reason}`. For
+     loopctl and claude-config the list names `area gate`, the always-run job every workflow
+     ends with, so a pass means every area the branch touches ran green on its push run.
 
   Anything else refuses, naming the independent reasons AND `{:independent_verification,
   reason}`, and escalates like any other refusal. A transient forge fault reading the checks
@@ -201,6 +206,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   alias Loopctl.Changes.Findings
   alias Loopctl.Changes.SelectionProof
+  alias Loopctl.Delivery.CiDefinition
   alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
@@ -1102,7 +1108,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
         independent_verification(story.tenant_id, story,
           stage: stage,
           triggers: facts.triggers,
-          repo: facts.repo
+          repo: facts.repo,
+          pull_request: facts.pull_request
         )
 
       Map.put(facts, :independent_verification, verification)
@@ -1183,6 +1190,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
          {:ok, checks} <- independent_checks(triggers, name),
          {:ok, branch} <- recorded_branch(stage),
          {:ok, forge} <- Credential.repo(tenant_id, name),
+         :ok <- own_ci_untouched(forge, stage, opts),
          {:ok, evidence} <- source().check_evidence(forge, stage.head_sha, branch) do
       result = CiEvidence.judge(checks, evidence)
 
@@ -1190,6 +1198,31 @@ defmodule Loopctl.Delivery.MergePrecondition do
         [] -> :ok
         not_passed -> {:error, {:independent_checks_not_passed, not_passed}}
       end
+    end
+  end
+
+  # A push run executes the workflow files of the change's own tree, so a change that edits
+  # them could write the job its own independent check reads (`CiEvidence`'s trust model).
+  # Refused here exactly as story verification refuses it, from the pull request's diff;
+  # a diff that could not be listed is refused too, since it may touch one.
+  defp own_ci_untouched(forge, stage, opts) do
+    pull_request =
+      Keyword.get_lazy(opts, :pull_request, fn ->
+        pull_request({:ok, forge}, pr_number(stage))
+      end)
+
+    case pull_request do
+      {:ok, %{diff: diff}} ->
+        case CiDefinition.reasons(diff) do
+          [] -> :ok
+          [reason | _] -> {:error, reason}
+        end
+
+      {:ok, _no_diff} ->
+        {:error, {:ci_definition_unknown, :no_diff}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

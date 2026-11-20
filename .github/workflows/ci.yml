@@ -2,12 +2,14 @@ name: CI
 
 on:
   push:
-    # epic/** too: an epic's stories are commits pushed straight to its branch with no PR
-    # until the last one, so a push is the only event that can gate them. Deploy stays
+    # Every branch, and no pull_request trigger. The merge gate trusts only jobs of runs a PUSH
+    # of the story's branch triggered at its exact head (lib/loopctl/delivery/ci_evidence.ex),
+    # and an epic's stories are commits pushed straight to its branch with no PR until the
+    # last one. A same-repo pull request's required checks are met by the push run's check
+    # runs on its head sha. A fork pull request runs nothing: it never did on the self-hosted
+    # pool, and now no workflow here triggers on pull_request at all. Deploy stays
     # master-only (its job conditions name refs/heads/master).
-    branches: [master, "epic/**"]
-  pull_request:
-    branches: [master]
+    branches: ["**"]
   schedule:
     # Nightly at 02:00 UTC — the ordinary jobs (lint / test / retrieval-eval / security /
     # dialyzer / scale-test / pgbouncer-e2e). Explicitly NOT scale-nightly: that matrix is
@@ -37,9 +39,11 @@ on:
 # cheaper half of the same fix and stops two runs of one branch competing for the
 # five runners.
 #
-# cancel-in-progress is FALSE on master on purpose: a superseded PR run is waste,
+# cancel-in-progress is FALSE on master on purpose: a superseded branch run is waste,
 # but a superseded master run is the only CI evidence a merged commit was green,
-# and Deploy hangs off it.
+# and Deploy hangs off it. Cancelling a branch run loses no area: areas-output.sh judges a
+# branch push from its merge base with master, so the next run covers every area the
+# cancelled one would have.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
@@ -136,13 +140,10 @@ jobs:
   # runs only when .github/scripts/changed-areas.sh prints `server`. Gated by `if:`, never by
   # on.paths: a job skipped by its `if:` reports skipped, which a required check accepts,
   # while a workflow filtered out by paths leaves the check pending for ever. A schedule or a
-  # manual run counts as every area. Self-hosted under the fork-PR guard like the jobs it
-  # gates, so on a fork PR it is skipped and so is every job that needs it, the two hosted
-  # ones (pgbouncer-e2e, smoke-preflight) included.
+  # manual run counts as every area. The area gate at the end of this file sums it up.
   changes:
     name: changes
     runs-on: [self-hosted, fleet-ci]
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     outputs:
       server: ${{ steps.areas.outputs.server }}
     steps:
@@ -157,20 +158,18 @@ jobs:
       - id: areas
         env:
           EVENT_BEFORE: ${{ github.event.before }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: .github/scripts/areas-output.sh
 
   lint:
     name: Lint
     runs-on: [self-hosted, fleet-ci]
-    # FORK-PR GUARD (#881): a fork PR never runs on the shared self-hosted pool — its job
-    # code runs as the github-runner uid every pool slot shares, with read access to other
-    # slots' live JIT config and secrets. On a fork PR this job is SKIPPED (a skipped job
-    # reports success, so required checks still pass); the human backstop is the fork-PR
-    # approval policy, all_external_contributors. Same guard on every self-hosted job here.
+    # FORK PRs (#881): a fork PR never runs on the shared self-hosted pool — its job code would
+    # run as the github-runner uid every pool slot shares, with read access to other slots'
+    # live JIT config and secrets. Each self-hosted job used to carry an `if:` guard for it;
+    # the guard went with the pull_request trigger, so this workflow cannot run fork code
+    # at all. Never add pull_request or pull_request_target back without it.
     needs: [changes]
-    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.server == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -207,7 +206,7 @@ jobs:
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
           # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
+          # binary written by a branch's job be executed by the next push-to-master
           # job on the same slot, with none of the ref scoping GitHub's cache gives.
           # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
@@ -340,9 +339,9 @@ jobs:
   test:
     name: Test
     runs-on: [self-hosted, fleet-ci]
-    # Fork-PR guard — see the Lint job's comment (#881).
+    # Fork PRs — see the Lint job's comment (#881).
     needs: [changes]
-    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.server == 'true'
     # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
     # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
@@ -408,7 +407,7 @@ jobs:
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
           # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
+          # binary written by a branch's job be executed by the next push-to-master
           # job on the same slot, with none of the ref scoping GitHub's cache gives.
           # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
@@ -551,9 +550,9 @@ jobs:
   retrieval-eval:
     name: Retrieval Eval
     runs-on: [self-hosted, fleet-ci]
-    # Fork-PR guard — see the Lint job's comment (#881).
+    # Fork PRs — see the Lint job's comment (#881).
     needs: [changes]
-    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.server == 'true'
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -612,7 +611,7 @@ jobs:
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
           # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
+          # binary written by a branch's job be executed by the next push-to-master
           # job on the same slot, with none of the ref scoping GitHub's cache gives.
           # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
@@ -783,9 +782,9 @@ jobs:
   security:
     name: Security
     runs-on: [self-hosted, fleet-ci]
-    # Fork-PR guard — see the Lint job's comment (#881).
+    # Fork PRs — see the Lint job's comment (#881).
     needs: [changes]
-    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.server == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -822,7 +821,7 @@ jobs:
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
           # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
+          # binary written by a branch's job be executed by the next push-to-master
           # job on the same slot, with none of the ref scoping GitHub's cache gives.
           # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
@@ -874,9 +873,9 @@ jobs:
   dialyzer:
     name: Dialyzer
     runs-on: [self-hosted, fleet-ci]
-    # Fork-PR guard — see the Lint job's comment (#881).
+    # Fork PRs — see the Lint job's comment (#881).
     needs: [changes]
-    if: needs.changes.outputs.server == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.server == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -913,7 +912,7 @@ jobs:
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
           # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
+          # binary written by a branch's job be executed by the next push-to-master
           # job on the same slot, with none of the ref scoping GitHub's cache gives.
           # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
@@ -969,8 +968,7 @@ jobs:
 
   scale-test:
     name: Scale Tests (US-27.1)
-    # Runs on every push and same-repo PR, plus the nightly schedule (the `if:` below); fork PRs skip it
-    # under the fork-PR guard. This ensures the scale suite (which commits real rows and runs
+    # Runs on every push, plus the nightly schedule (the `if:` below). This ensures the scale suite (which commits real rows and runs
     # ANALYZE) is executed in CI and that the DBConnection.OwnershipError or
     # other regressions are caught before they reach production.
     # Self-hosted since 2026-09-26: 3-5 minutes on every push and PR had spent the account's
@@ -983,10 +981,7 @@ jobs:
     if: >
       needs.changes.outputs.server == 'true' &&
       (github.event_name == 'schedule' ||
-      github.event_name == 'push' ||
-      github.event_name == 'pull_request') &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name == 'push')
     services:
       postgres:
         # Pinned by DIGEST to the image every fleet-ci host's CI Postgres already runs (pgvector 0.8.7,
@@ -1373,11 +1368,8 @@ jobs:
     # automatically. Drift that no PR touches — a Postgres/pgvector upgrade, an ANALYZE
     # shift, a migration that fails to build an HNSW index — will not be caught until
     # somebody dispatches it. Dispatch it after any such infrastructure change.
-    # The fork-PR guard rides along so the Lint comment's "every self-hosted job" stays
-    # true and a future trigger widening (e.g. adding pull_request as a pre-merge gate)
-    # can never run fork code on the shared pool.
     needs: [changes]
-    if: needs.changes.outputs.server == 'true' && github.event_name == 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.server == 'true' && github.event_name == 'workflow_dispatch'
     env:
       # scale-nightly derives its own database per matrix file (loopctl_test_sn_<file>)
       # and drops it again at the end, so it never shared a name with anything. What it
@@ -1464,7 +1456,7 @@ jobs:
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
           # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
+          # binary written by a branch's job be executed by the next push-to-master
           # job on the same slot, with none of the ref scoping GitHub's cache gives.
           # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
@@ -1644,13 +1636,13 @@ jobs:
 
   # --- Pre-deploy smoke (#652) -------------------------------------------------
   #
-  # Runs the SAME scripts/smoke.sh against the CURRENTLY-LIVE release, on every PR and
-  # every master push, BEFORE deploy. It exists because the post-deploy smoke below can
+  # Runs the SAME scripts/smoke.sh against the CURRENTLY-LIVE release, on every push that
+  # touches the server, BEFORE deploy. It exists because the post-deploy smoke below can
   # only ever tell you something is wrong AFTER the bad release is serving traffic —
   # "we find out late" — and, running only on master push, it can never report on a PR
   # head SHA, so it CANNOT be made a required branch-protection check without
   # deadlocking every merge (a required check that never runs on the PR blocks it
-  # forever). This job can, because it runs on pull_request.
+  # forever). This job can, because it runs on the push of every branch.
   #
   # BE CLEAR ABOUT WHAT IT PROVES. It probes the release already in production, NOT the
   # code in the PR, so it does not validate your diff. What it does catch, at PR time
@@ -1793,3 +1785,33 @@ jobs:
           # and telling an operator "nothing was blocked" there would be false.
           SMOKE_CONTEXT: post-deploy
         run: bash scripts/smoke.sh
+
+  # THE AREA GATE, the one check the merge gate's independent_checks names for this repository:
+  # the same job, under the same name, ends ci.yml, runner-ci.yml, chg-ci.yml and e2e.yml. It
+  # needs every job that checks a pushed change, and passes only when changes succeeded and
+  # every other need succeeded or was skipped by area; a failed or cancelled need fails it.
+  # always(), so a need that failed or was skipped never skips the gate itself. Not needed:
+  # scale-nightly (dispatch only), deploy and smoke (they ship master rather than check a
+  # change, and smoke gates nothing by design). Hosted and checkout-free: it reads only the
+  # needs' results.
+  area-gate:
+    name: area gate
+    needs: [changes, lint, test, retrieval-eval, security, dialyzer, scale-test, pgbouncer-e2e, smoke-preflight]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded or was skipped by area
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$(jq -r '.changes.result' <<<"$NEEDS")" != success ]; then
+            echo "::error::changes did not succeed, so no area was judged"
+            exit 1
+          fi
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi
