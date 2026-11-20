@@ -31,8 +31,10 @@ All notable changes to loopctl are documented here.
   US-52.11).** `release/manifest.toml` gains `[retired] repos`. Each `install-machine.sh` run
   sends chg's outbox and then removes those repos' `[[source]]` blocks from
   `~/.chg/loopctl.toml` (`LOOPCTL_FACTORY_CHG_CONFIG`). A failed send leaves the blocks in place
-  and fails that host's install. `release/retire-repo.sh` transfers a repo's open issues here,
-  archives it, imports it a last time and marks its `release/imports.toml` entry
+  and fails that host's install. `release/retire-repo.sh` transfers a repo's open issues here
+  (a PRIVATE repo's issues cannot be transferred to this public one, so they are copied, which
+  publishes them, and the originals closed: refused unless `--copy-private-to-public` is passed
+  after reading them), archives it, imports it a last time and marks its `release/imports.toml` entry
   `archived = true`; `import-history.sh` then refuses that prefix. **Deploy ordering:** retire
   only after the set-2 rollout is green.
 - **One command moves the fleet to a release set (2026-11-19, US-52.10).**

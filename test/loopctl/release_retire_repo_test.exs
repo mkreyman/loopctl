@@ -29,8 +29,9 @@ defmodule Loopctl.ReleaseRetireRepoTest do
         [ -f "$STUB/private_${3#*/}" ] && echo PRIVATE || echo PUBLIC
       else [ -f "$STUB/archived" ] && echo true || echo false; fi ;;
     "issue view")
-      printf '{"title":"title %s","body":"body %s","url":"https://github.com/mkreyman/chg/issues/%s","comments":[{"author":{"login":"ann"},"body":"comment %s"}]}' \\
-        "$3" "$3" "$3" "$3" | jq -r "$jqf" ;;
+      json=$(printf '{"title":"title %s","body":"body %s, see #2, mkreyman/x#9 and @bob","url":"https://github.com/mkreyman/chg/issues/%s","comments":[{"author":{"login":"ann"},"body":"comment %s fixes #7"}]}' \\
+        "$3" "$3" "$3" "$3")
+      if [ -n "$jqf" ]; then printf '%s' "$json" | jq -r "$jqf"; else printf '%s' "$json"; fi ;;
     "issue create")
       title=""; body=""; prev=""
       for a in "$@"; do
@@ -182,6 +183,14 @@ defmodule Loopctl.ReleaseRetireRepoTest do
       :ok
     end
 
+    test "without --copy-private-to-public it refuses before any write, naming the issues",
+         ctx do
+      {out, 2} = retire(ctx, [])
+      assert out =~ "mkreyman/chg is private and mkreyman/loopctl public"
+      assert out =~ "(3 5)"
+      refute File.exists?(Path.join(ctx.stub, "writes"))
+    end
+
     test "each issue is copied with its body, comments and marker, then closed", ctx do
       {out, 0} = retire(ctx)
       assert out =~ "mkreyman/chg#3 copied to https://github.com/mkreyman/loopctl/issues/100"
@@ -196,8 +205,8 @@ defmodule Loopctl.ReleaseRetireRepoTest do
                Enum.find_index(writes, &(&1 == "archive"))
 
       [copy | _] = copies(ctx)
-      assert copy["body"] =~ "body 3"
-      assert copy["body"] =~ "**ann** commented:\n\ncomment 3"
+      assert copy["body"] =~ "body 3, see mkreyman/chg#2, mkreyman/x#9 and `@bob`"
+      assert copy["body"] =~ "**ann** commented:\n\ncomment 3 fixes mkreyman/chg#7"
       assert copy["body"] =~ "Copied from https://github.com/mkreyman/chg/issues/3"
       assert copy["body"] =~ "<!-- retired-from: mkreyman/chg#3 -->"
     end
@@ -457,9 +466,11 @@ defmodule Loopctl.ReleaseRetireRepoTest do
     end
   end
 
-  defp retire(ctx),
+  # Every run may copy: whether one does is decided by visibility, and the flag-less refusal
+  # has its own test.
+  defp retire(ctx, extra \\ ["--copy-private-to-public"]),
     do:
-      System.cmd("bash", [@script, "mkreyman/chg", ctx.stories],
+      System.cmd("bash", [@script, "mkreyman/chg", ctx.stories | extra],
         cd: ctx.repo,
         env: ctx.env,
         stderr_to_stdout: true
