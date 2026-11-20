@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **One command moves the fleet to a release set (2026-11-19, US-52.10).**
+  `release/rollout.sh` checks that loopctl serves the manifest's set and npm has its MCP
+  version, runs `release/install-machine.sh <set>` on each host of `FLEET_MACHINES` over ssh,
+  then dispatches the e2e workflow and rolls the hosts it moved back one set if that fails.
+  On each machine the set's checkout lives at `~/.local/share/loopctl-factory/sets/<set>`
+  behind the `current` symlink; the runner is drained (up to 60 minutes) before it is
+  replaced, `runner.json` is moved from `mkreyman/chg` to `mkreyman/loopctl`, and the install
+  is `ok` only once chg names the set's commit and the runner has rejoined at the set.
+  **Deploy ordering:** run it after the master deploy and the MCP publish of the set.
 - **`GET /api/v1/stories` takes `issue_number`, and an end-to-end suite runs nightly
   (2026-11-19, US-52.9).** `?project_id=P&issue_number=N` lists the stories intake issue N
   produced; an `issue_number` that is not a positive integer is `400`. `.github/workflows/e2e.yml`
