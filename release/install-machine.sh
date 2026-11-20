@@ -10,7 +10,8 @@
 # status ok or unchanged, 75 for busy (another install holds the lock), 1 otherwise.
 #
 #   ok           the set is installed, chg reports its version and commit, and the runner
-#                joined loopctl after the restart naming release_set <set>
+#                joined loopctl after the restart naming release_set <set>; on a machine
+#                with no runner.json, only the set and chg (runner_version null)
 #   unchanged    current already is <set> and verifies; nothing was restarted
 #   runner_busy  the runner did not drain within LOOPCTL_FACTORY_DRAIN_S; it was undrained
 #                and nothing changed

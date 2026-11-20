@@ -40,11 +40,22 @@ defmodule LoopctlE2e.RunTest do
         {:ok, 200, %{"state" => "closed", "merged" => true, "merge_commit_sha" => "m1"}}
       ],
       {:github, :get, "/repos/#{@repo}/actions/runs"} => [
-        {:ok, 200, %{"workflow_runs" => [%{"name" => "CI", "status" => "in_progress"}]}},
         {:ok, 200,
          %{
            "workflow_runs" => [
-             %{"name" => "CI", "status" => "completed", "conclusion" => "success"}
+             %{"id" => 1, "workflow_id" => 10, "name" => "CI", "status" => "in_progress"}
+           ]
+         }},
+        {:ok, 200,
+         %{
+           "workflow_runs" => [
+             %{
+               "id" => 1,
+               "workflow_id" => 10,
+               "name" => "CI",
+               "status" => "completed",
+               "conclusion" => "success"
+             }
            ]
          }}
       ],
