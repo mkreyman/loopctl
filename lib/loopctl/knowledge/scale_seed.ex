@@ -267,7 +267,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
 
   defp last_analyze_of(table) do
     case AdminRepo.query!(
-           "SELECT last_analyze FROM pg_stat_user_tables WHERE relname = $1",
+           "SELECT last_analyze FROM pg_stat_user_tables WHERE relid = to_regclass($1)",
            [table]
          ) do
       %{rows: [[ts]]} -> ts
@@ -929,66 +929,43 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   end
 
   defp analyze_and_verify(tenant_id, inserted_count) do
-    # Capture last_analyze BEFORE running ANALYZE so we can assert it advanced.
-    pre_analyze_ts = fetch_last_analyze()
-
-    # Run ANALYZE on both tables so the planner has fresh statistics.
-    # ANALYZE is non-transactional and sees only committed rows.
-    AdminRepo.query!("ANALYZE articles")
-    AdminRepo.query!("ANALYZE article_links")
-
-    # Verify pg_stat_user_tables reflects the seeded corpus (AC-27.1.5).
-    verify_stats!(tenant_id, inserted_count, pre_analyze_ts)
+    # One "did ANALYZE take effect" check for the whole module: analyze_and_confirm!/2 reads
+    # last_analyze before, runs ANALYZE and waits for it to advance. What is left here is
+    # what only seed/2 asks: that THIS tenant's rows are committed and visible.
+    analyze_and_confirm!(["articles", "article_links"])
+    verify_stats!(tenant_id, inserted_count)
+  rescue
+    error in RuntimeError -> {:error, error.message}
   end
 
-  # Fetch last_analyze from pg_stat_user_tables for the articles table.
-  # Returns nil when the table has never been analyzed.
-  defp fetch_last_analyze do
-    %{rows: rows} =
-      AdminRepo.query!("""
-      SELECT last_analyze
-      FROM pg_stat_user_tables
-      WHERE relname = 'articles'
-      """)
-
-    case rows do
-      [[ts]] -> ts
-      _ -> nil
-    end
-  end
-
-  defp verify_stats!(tenant_id, inserted_count, pre_analyze_ts) do
+  defp verify_stats!(tenant_id, inserted_count) do
     # pg_stat_user_tables is refreshed by the stats collector asynchronously.
-    # Poll with a short bounded retry to tolerate the propagation lag on idle
-    # or freshly started stats collectors.
-    poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, _attempts = 5, _delay_ms = 200)
+    # Poll with a short bounded retry to tolerate the propagation lag.
+    poll_verify_stats(tenant_id, inserted_count, _attempts = 5, _delay_ms = 200)
   end
 
-  defp poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, 0, _delay_ms) do
-    # Final attempt — run the check and propagate whatever result we get.
-    do_verify_stats(tenant_id, inserted_count, pre_analyze_ts)
+  defp poll_verify_stats(tenant_id, inserted_count, 0, _delay_ms) do
+    do_verify_stats(tenant_id, inserted_count)
   end
 
-  defp poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, attempts, delay_ms) do
-    case do_verify_stats(tenant_id, inserted_count, pre_analyze_ts) do
+  defp poll_verify_stats(tenant_id, inserted_count, attempts, delay_ms) do
+    case do_verify_stats(tenant_id, inserted_count) do
       :ok ->
         :ok
 
       {:error, _reason} ->
-        # Stats subsystem may not have flushed yet — wait and retry.
         Process.sleep(delay_ms)
-        poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, attempts - 1, delay_ms * 2)
+        poll_verify_stats(tenant_id, inserted_count, attempts - 1, delay_ms * 2)
     end
   end
 
-  defp do_verify_stats(tenant_id, inserted_count, pre_analyze_ts) do
+  defp do_verify_stats(tenant_id, inserted_count) do
     # Tenant-scoped committed row count gives an exact assertion that THIS
     # seed's rows reached the planner — table-wide n_live_tup can pass
     # spuriously on shared/re-used DBs where other tenants have rows.
     # Count ALL statuses: `inserted_count` is every seeded row, so under
     # `status_mix: true` (~20% draft/archived) a published-only count would be
-    # below inserted_count and spuriously trip the safety-net (defeating it). For an
-    # all-published corpus this is identical to the old published-only count.
+    # below inserted_count and spuriously trip the safety-net (defeating it).
     actual_count =
       AdminRepo.one!(
         from a in Article,
@@ -996,103 +973,31 @@ defmodule Loopctl.Knowledge.ScaleSeed do
           select: count(a.id)
       )
 
-    %{rows: rows} =
-      AdminRepo.query!("""
-      SELECT n_live_tup, last_analyze
-      FROM pg_stat_user_tables
-      WHERE relname = 'articles'
-      """)
-
-    case rows do
-      [[n_live_tup, last_analyze]] ->
-        check_stat_values(
-          tenant_id,
-          inserted_count,
-          actual_count,
-          n_live_tup,
-          last_analyze,
-          pre_analyze_ts
-        )
-
-      _ ->
-        {:error, "pg_stat_user_tables query returned unexpected shape: #{inspect(rows)}"}
-    end
-  end
-
-  defp check_stat_values(_tenant_id, _inserted_count, _actual_count, _n_live_tup, nil, nil) do
-    # last_analyze is nil and pre_analyze_ts was also nil → this is a
-    # never-analyzed table. The stats collector has not yet flushed the
-    # result of the ANALYZE we just ran. Caller will retry.
-    {:error,
-     "ANALYZE did not run on articles table — last_analyze is nil. " <>
-       "This usually means the table was not yet analyzed after the bulk insert. " <>
-       "Try running ANALYZE manually or check AdminRepo connectivity."}
-  end
-
-  defp check_stat_values(
-         _tenant_id,
-         _inserted_count,
-         _actual_count,
-         _n_live_tup,
-         nil,
-         _pre_analyze_ts
-       ) do
-    # Same nil case but we had a non-nil pre_analyze_ts — stats collector
-    # transiently returned nil. Caller will retry.
-    {:error,
-     "ANALYZE did not run on articles table — last_analyze is nil. " <>
-       "This usually means the table was not yet analyzed after the bulk insert. " <>
-       "Try running ANALYZE manually or check AdminRepo connectivity."}
-  end
-
-  defp check_stat_values(
-         tenant_id,
-         inserted_count,
-         actual_count,
-         _n_live_tup,
-         _last_analyze,
-         _pre_analyze_ts
-       )
-       when actual_count < inserted_count do
-    # Exact tenant-scoped count is below what was inserted — either the seed
-    # genuinely inserted fewer rows (on_conflict: :nothing dups) or this is
-    # a logic error. Surface the discrepancy so callers know the DB state.
-    {:error,
-     "Tenant-scoped article count (#{actual_count}) is below inserted count (#{inserted_count}) " <>
-       "for tenant #{tenant_id}. Seeded rows may not have committed or were deduplicated by " <>
-       "on_conflict: :nothing. Ensure seeding runs OUTSIDE the DataCase sandbox."}
-  end
-
-  defp check_stat_values(
-         _tenant_id,
-         _inserted_count,
-         _actual_count,
-         n_live_tup,
-         last_analyze,
-         pre_analyze_ts
-       ) do
-    # last_analyze advanced past pre_analyze_ts (or pre was nil) — ANALYZE ran.
-    analyze_advanced? =
-      is_nil(pre_analyze_ts) or
-        case DateTime.compare(last_analyze, pre_analyze_ts) do
-          :gt -> true
-          _ -> false
-        end
-
     cond do
-      not analyze_advanced? ->
+      actual_count < inserted_count ->
         {:error,
-         "pg_stat_user_tables.last_analyze (#{inspect(last_analyze)}) did not advance " <>
-           "past pre-ANALYZE timestamp (#{inspect(pre_analyze_ts)}). " <>
-           "The stats collector may be lagging — retry or check connectivity."}
+         "Tenant-scoped article count (#{actual_count}) is below inserted count " <>
+           "(#{inserted_count}) for tenant #{tenant_id}. Seeded rows may not have committed or " <>
+           "were deduplicated by on_conflict: :nothing. Ensure seeding runs OUTSIDE the " <>
+           "DataCase sandbox."}
 
-      n_live_tup == 0 ->
+      n_live_tup("articles") == 0 ->
         {:error,
          "pg_stat_user_tables n_live_tup is 0 after ANALYZE. " <>
            "Ensure seeding runs OUTSIDE the DataCase sandbox."}
 
       true ->
         :ok
+    end
+  end
+
+  defp n_live_tup(table) do
+    case AdminRepo.query!(
+           "SELECT n_live_tup FROM pg_stat_user_tables WHERE relid = to_regclass($1)",
+           [table]
+         ) do
+      %{rows: [[n]]} -> n
+      _ -> 0
     end
   end
 
