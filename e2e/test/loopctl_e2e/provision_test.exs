@@ -12,6 +12,20 @@ defmodule LoopctlE2e.ProvisionTest do
 
   @moduletag :tmp_dir
 
+  # Git's own repository variables, cleared (a nil value unsets it). A commit hook exports
+  # GIT_DIR and GIT_INDEX_FILE, and git would act on the repository being committed instead of
+  # the test's own.
+  @git_env [
+    {"GIT_CONFIG_GLOBAL", "/dev/null"},
+    {"GIT_CONFIG_NOSYSTEM", "1"},
+    {"GIT_DIR", nil},
+    {"GIT_INDEX_FILE", nil},
+    {"GIT_WORK_TREE", nil},
+    {"GIT_COMMON_DIR", nil},
+    {"GIT_OBJECT_DIRECTORY", nil},
+    {"GIT_PREFIX", nil}
+  ]
+
   defp stub_gh(dir, label) do
     bin = Path.join(dir, "bin")
     File.mkdir_p!(bin)
@@ -34,19 +48,15 @@ defmodule LoopctlE2e.ProvisionTest do
     env = [
       {"PATH", bin <> ":" <> System.get_env("PATH")},
       {"GH_TOKEN", "test-token"},
-      {"SANDBOX_REMOTE", remote},
-      {"GIT_CONFIG_GLOBAL", "/dev/null"},
-      {"GIT_CONFIG_NOSYSTEM", "1"}
+      {"SANDBOX_REMOTE", remote}
+      | @git_env
     ]
 
     System.cmd("bash", [@script], env: env, cd: dir, stderr_to_stdout: true)
   end
 
   defp git(dir, args) do
-    {out, 0} =
-      System.cmd("git", ["-C", dir | args],
-        env: [{"GIT_CONFIG_GLOBAL", "/dev/null"}, {"GIT_CONFIG_NOSYSTEM", "1"}]
-      )
+    {out, 0} = System.cmd("git", ["-C", dir | args], env: @git_env)
 
     String.trim(out)
   end

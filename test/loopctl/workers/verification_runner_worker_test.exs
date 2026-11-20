@@ -202,9 +202,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       ctx = setup_ctx()
       with_credential()
 
-      for repo <- ["acme/one", "acme/two"],
+      for {kind, repo} <- [intake_source: "acme/one", legacy_intake_source: "acme/two"],
           do:
-            fixture(:intake_source, %{
+            fixture(kind, %{
               tenant_id: ctx.tenant.id,
               project_id: ctx.project.id,
               repo_full_name: repo,

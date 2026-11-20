@@ -6,6 +6,12 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`POST /api/v1/intake/sources` refuses a `pr`/`chg` source on a project that names
+  another repo (2026-11-20, #1072).** A project whose `repo_url` names repo A now answers
+  `422` with `details.repo_full_name` for a source on repo B, instead of binding it and
+  splitting B's escalations onto A's channel. Enrol the source on the project
+  `resolve_project({repo_url})` returns for its repo, or on a project with no `repo_url`
+  (the enrolment claims the repo for it). `ledger` sources are unaffected.
 - **CI runs on push of every branch, never on `pull_request`, and every workflow ends in
   an `area gate` job (2026-11-20, US-52.12 review).** The merge gate trusts only push runs
   of a story's branch, so `ci.yml`, `runner-ci.yml`, `chg-ci.yml`, `e2e.yml` and `mcp-server-ci.yml` push-trigger

@@ -98,7 +98,7 @@ defmodule Loopctl.IntakeTest do
 
       assert id == mine.id
 
-      fixture(:intake_source, %{
+      fixture(:legacy_intake_source, %{
         tenant_id: tenant.id,
         project_id: project.id,
         repo_full_name: "acme/second"
@@ -237,6 +237,32 @@ defmodule Loopctl.IntakeTest do
       assert AdminRepo.get!(Source, source.id).target_epic_id == nil
     end
 
+    test "a project that names a repo takes a source for that repo only (#1072)" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{tenant_id: tenant.id, repo_url: "git@github.com:Acme/Widgets.git"})
+
+      assert {:error, changeset} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "acme/infra",
+                 project_id: project.id
+               })
+
+      assert %{repo_full_name: [message]} = errors_on(changeset)
+      assert message =~ project.slug
+      assert Intake.list_sources(tenant.id) == []
+
+      # The same repo in another spelling is the repo it holds.
+      assert {:ok, %{source: source}} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "acme/widgets",
+                 project_id: project.id
+               })
+
+      assert source.project_id == project.id
+    end
+
     test "the base branch is read by PRESENCE: absent takes master, an explicit nil is refused" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -254,7 +280,8 @@ defmodule Loopctl.IntakeTest do
       assert {:ok, %{source: defaulted}} =
                Intake.create_source(tenant.id, %{
                  repo_full_name: "mkreyman/cron_books",
-                 project_id: project.id
+                 # A project holds one repo (#1072).
+                 project_id: fixture(:project, %{tenant_id: tenant.id}).id
                })
 
       assert defaulted.base_branch == "master"
@@ -266,7 +293,7 @@ defmodule Loopctl.IntakeTest do
       assert {:error, changeset} =
                Intake.create_source(tenant.id, %{
                  repo_full_name: "mkreyman/loopctl",
-                 project_id: project.id,
+                 project_id: fixture(:project, %{tenant_id: tenant.id}).id,
                  base_branch: nil
                })
 

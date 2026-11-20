@@ -22,8 +22,18 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
     %{tenant: tenant, operator_key: operator_key, project: project}
   end
 
-  defp create_params(ctx, repo \\ "mkreyman/home_care_billing"),
-    do: %{"repo_full_name" => repo, "project_id" => ctx.project.id}
+  @default_repo "mkreyman/home_care_billing"
+
+  # A project holds one repo (#1072): the default repo enrols on `ctx.project`, any other on a
+  # project of its own.
+  defp create_params(ctx, repo \\ @default_repo) do
+    project_id =
+      if String.downcase(repo) == @default_repo,
+        do: ctx.project.id,
+        else: fixture(:project, %{tenant_id: ctx.tenant.id}).id
+
+    %{"repo_full_name" => repo, "project_id" => project_id}
+  end
 
   describe "the documented source shape" do
     test "names every field a source actually serialises", %{conn: conn} do
@@ -273,8 +283,12 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
 
       assert body["source"]["repo_full_name"] == "MKREYMAN/Loopctl"
 
+      # On the project that holds it, so the source index answers rather than the project's.
       assert json_response(
-               post(authed, ~p"/api/v1/intake/sources", create_params(ctx, "mkreyman/loopctl")),
+               post(authed, ~p"/api/v1/intake/sources", %{
+                 "repo_full_name" => "mkreyman/loopctl",
+                 "project_id" => body["source"]["project_id"]
+               }),
                422
              )
     end
@@ -776,8 +790,8 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       assert %{api_key_id: nil, agent_id: nil} =
                AdminRepo.get!(Loopctl.Dispatches.Dispatch, root_id)
 
-      {_s, source} =
-        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+      # Its own project: ctx.project already holds the repo enrolled above (#1072).
+      {_s, source} = fixture(:intake_source, %{tenant_id: ctx.tenant.id})
 
       updated =
         build_conn()
@@ -1106,11 +1120,7 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
         fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
 
       {_s, gone} =
-        fixture(:intake_source, %{
-          tenant_id: ctx.tenant.id,
-          project_id: ctx.project.id,
-          repo_full_name: "mkreyman/gone"
-        })
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, repo_full_name: "mkreyman/gone"})
 
       {:ok, _} = Intake.revoke_source(ctx.tenant.id, gone.id)
       authed = auth(conn, ctx.operator_key)
