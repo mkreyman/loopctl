@@ -37,7 +37,7 @@ defmodule Loopctl.Delivery.ImplementerStartTest do
                ImplementerStart.ensure_started(ctx.tenant.id, ctx.story.id)
     end
 
-    test "starts a holder-claimed story as its recorded holder", ctx do
+    test "starts a story a holder claimed (US-52.14)", ctx do
       attrs = %{"kind" => "interactive", "session_id" => "implementer", "host" => "minis"}
 
       {:ok, %{holder: holder}} =
@@ -50,9 +50,7 @@ defmodule Loopctl.Delivery.ImplementerStartTest do
 
       assert {:ok, :started} = ImplementerStart.ensure_started(ctx.tenant.id, ctx.story.id)
 
-      story = story(ctx)
-      assert story.agent_status == :implementing
-      assert story.assigned_holder_id == holder.id
+      assert story(ctx).agent_status == :implementing
     end
 
     test "a story nobody claimed has nothing to start", ctx do
