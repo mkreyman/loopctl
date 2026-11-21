@@ -382,7 +382,8 @@ defmodule Loopctl.WorkItems.Open do
              tenant_id,
              %{epic_id: epic_id, number: number, title: request.title},
              actor_id: request.opener.api_key_id,
-             actor_label: actor_label(holder)
+             actor_label: actor_label(holder),
+             work_item: true
            ),
          {:ok, claimed} <- claim(request, holder, story),
          {:ok, _row} <-

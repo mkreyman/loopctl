@@ -64,7 +64,9 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
 
   `resolve_escalation` needs a `:user` key no dispatch minted (`LOOPCTL_USER_KEY` in an
   interactive fleet session). That is the intended path: the session that claims the handoff
-  resolves the escalation itself, then marks the handoff done. Nothing here involves Mark.
+  resolves the escalation itself, and the resolve marks its claim done
+  (`Loopctl.Delivery.Escalations` calls `close_story/3`), so the session sends no
+  `channel_done` after it. Nothing here involves Mark.
 
   ## Retries and concurrency
 
@@ -436,8 +438,9 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
     3. Fix the story, take it over, or decide it is not wanted.
     4. resolve_escalation {story_id: "#{row.story_id}", to: done | failed | queued | detected} \
     on LOOPCTL_USER_KEY (an operator key; a dispatch-minted key is refused).
-    5. channel_done #{key}. loopctl also closes this handoff when the story leaves escalated, \
-    and posts a new one if it is finished while the story is still escalated.
+    5. Nothing more after step 4: the story leaving escalated marks your claim done, so a \
+    channel_done after it answers 404. channel_done #{key} only if you stop without step 4; \
+    loopctl then posts a new handoff while the story is still escalated.
     """
   end
 

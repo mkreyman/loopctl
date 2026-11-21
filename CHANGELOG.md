@@ -6,6 +6,16 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The factory no longer places an interactive work item (2026-11-21, set 9, MCP 3.21.2).**
+  A story a session opened with `work_item_open` is stamped `work_item_opened_at` (migration
+  `20261121070000`, which backfills it from the item event log), and implement@1 skips it: a
+  holder's end re-queues its items for the session to take back, and the dispatch driver had
+  been placing them on runners. The MCP server no longer registers an interactive holder in
+  a runner session (one launched with `LOOP_MODE`): its heartbeat had opened each runner
+  branch as a new work item, which the factory then placed, a chain that opened one item
+  every 30 to 60 seconds. The escalation handoff and `escalation_playbook` no longer
+  tell a session to `channel_done` after `resolve_escalation`; the resolve marks the claim
+  done itself, so that call always answered 404.
 - **A release no longer cuts off sessions one MCP version behind (2026-11-21, set 8).** The
   MCP component's minimum is back to 3.19.1, the first version that reports itself, so a
   session started on 3.19.1 to 3.21.0 is served again instead of `426

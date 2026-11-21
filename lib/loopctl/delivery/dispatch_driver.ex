@@ -126,7 +126,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
   `{:agent_status_in, [:pending, :contracted]}` (`pending` too because `Placement` contracts a
   pending story before it mints, #884), `:dependencies_met`, `:single_active_source`,
   `:intake_record_optional` (an authored story has no record and stays a candidate) and
-  `:issue_not_closed` (#1022), ranked `:round_robin_project_tenant` (#1019). Each predicate's
+  `:issue_not_closed` (#1022) and `:not_work_item` (a released interactive work item is its
+  session's, US-52.18), ranked `:round_robin_project_tenant` (#1019). Each predicate's
   reasoning lives on its clause in `Loopctl.Agents.Candidates`.
 
   Public so the selection is falsifiable rather than buried in the pass.
