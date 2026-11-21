@@ -1590,6 +1590,29 @@ defmodule Loopctl.ApiSpec.Schemas do
           example: "unverified"
         },
         assigned_agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        assigned_holder_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description: "The session holder the claim names (US-52.14); null when unheld."
+        },
+        claim_epoch: %Schema{type: :integer, description: "Bumped by every new claim."},
+        claimed_until: %Schema{
+          type: :string,
+          format: :"date-time",
+          nullable: true,
+          description:
+            "When the claim lapses: the holder's lease for a holder claim (US-52.19), the " <>
+              "dispatch deadline for a placed one, else the claim lease."
+        },
+        assigned_holder: %Schema{
+          type: :object,
+          nullable: true,
+          description:
+            "get_story only: the holder the claim names (id, kind, host, session_id, " <>
+              "lease_until, ended_at, ended_reason). Never a credential.",
+          additionalProperties: true
+        },
         assigned_at: %Schema{type: :string, format: :"date-time", nullable: true},
         reported_done_at: %Schema{type: :string, format: :"date-time", nullable: true},
         verified_at: %Schema{type: :string, format: :"date-time", nullable: true},
@@ -1616,6 +1639,9 @@ defmodule Loopctl.ApiSpec.Schemas do
         agent_status: "pending",
         verified_status: "unverified",
         assigned_agent_id: nil,
+        assigned_holder_id: nil,
+        claim_epoch: 0,
+        claimed_until: nil,
         assigned_at: nil,
         reported_done_at: nil,
         verified_at: nil,
@@ -1657,6 +1683,13 @@ defmodule Loopctl.ApiSpec.Schemas do
               description:
                 "The runner holding this story, while one does. Null before a placement and " <>
                   "after the claim ends."
+            },
+            runner_name: %Schema{
+              type: :string,
+              nullable: true,
+              description:
+                "That runner's name, which its session holder carries as `host` (US-52.20). " <>
+                  "Null with `runner_id`, or for a runner since deleted."
             },
             stage: %Schema{
               type: :string,

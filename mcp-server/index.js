@@ -4991,7 +4991,11 @@ const TOOLS = [
   },
   {
     name: "get_story",
-    description: "Get full details for a single story by ID.",
+    description:
+      "Get full details for a single story by ID. The claim is on it: assigned_holder_id, " +
+      "claim_epoch and claimed_until, and assigned_holder (id, kind, host, session_id, " +
+      "lease_until, ended_at, ended_reason) naming the SESSION that holds it, so a claim of " +
+      "another session of your own agent reads as someone else's.",
     inputSchema: {
       type: "object",
       properties: {

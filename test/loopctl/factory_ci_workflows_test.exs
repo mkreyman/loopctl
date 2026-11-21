@@ -22,7 +22,7 @@ defmodule Loopctl.FactoryCiWorkflowsTest do
   # gates nothing by design).
   @not_on_push %{
     ".github/workflows/ci.yml" => ["scale-nightly", "deploy", "smoke"],
-    ".github/workflows/e2e.yml" => ["live"]
+    ".github/workflows/e2e.yml" => ["live", "two-sessions"]
   }
   @fleet_ci ["self-hosted", "fleet-ci"]
   @macos_expr ~S<${{ matrix.os == 'macos' && vars.CI_RUNNER_MACOS && fromJSON(vars.CI_RUNNER_MACOS) || fromJSON('["self-hosted","fleet-ci"]') }}>

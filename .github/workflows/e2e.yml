@@ -65,6 +65,10 @@ jobs:
         with:
           version-file: .tool-versions
           version-type: strict
+      # LoopctlE2e.McpTest drives a fake MCP server with node (US-52.20).
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix format --check-formatted
@@ -111,6 +115,53 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-stage-log
+          path: e2e/stage-log/
+          if-no-files-found: warn
+
+  # US-52.20: two_sessions_one_repo, two real MCP server processes on this runner against
+  # loopctl.com. Its own job and concurrency group: it runs about 16 minutes (the lapse wait
+  # is the deployed lease plus two reclaim sweeps), and every name it makes carries its own
+  # run id, so it never meets the happy path's run.
+  two-sessions:
+    name: e2e two sessions
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, fleet-ci]
+    timeout-minutes: 40
+    concurrency:
+      group: e2e-two-sessions
+      cancel-in-progress: false
+    env:
+      MIX_ENV: test
+      # A plain agent key, not dispatch-minted: the two sessions register holders with it.
+      LOOPCTL_E2E_AGENT_KEY: ${{ secrets.LOOPCTL_E2E_AGENT_KEY }}
+      LOOPCTL_E2E_PROJECT_ID: ${{ vars.LOOPCTL_E2E_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Clean the workspace, keeping the compiled trees
+        run: .github/scripts/clean-workspace.sh
+      - name: Per-job TMPDIR
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+      - name: Install the MCP server the sessions run
+        run: npm ci --prefix mcp-server
+      - name: mix e2e --only two_sessions_one_repo
+        run: |
+          (cd e2e && mix deps.get)
+          mix e2e --only two_sessions_one_repo
+      - name: Upload the stage log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-two-sessions-log
           path: e2e/stage-log/
           if-no-files-found: warn
 

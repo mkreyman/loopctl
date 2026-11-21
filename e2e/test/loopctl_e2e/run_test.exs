@@ -21,7 +21,17 @@ defmodule LoopctlE2e.RunTest do
     {opts, fn -> pid |> Agent.get(& &1.sleeps) |> Enum.reverse() end}
   end
 
-  defp stage(name), do: {:ok, 200, %{"stage" => %{"stage" => name, "escalation_reason" => nil}}}
+  defp stage(name),
+    do:
+      {:ok, 200,
+       %{"stage" => %{"stage" => name, "escalation_reason" => nil, "runner_name" => "x1"}}}
+
+  # US-52.20: the placed story is held by the runner session it was placed on.
+  @placed_holder %{
+    "kind" => "runner_session",
+    "host" => "x1",
+    "session_id" => "0b7c3f9e-2a41-4c8d-9e57-1f2a3b4c5d6e"
+  }
 
   @long_id "20261120010203abcdef"
 
@@ -39,6 +49,10 @@ defmodule LoopctlE2e.RunTest do
         {:ok, 200, %{"data" => [@story]}}
       ],
       {:loopctl, :get, @stage} => [stage("triaged"), stage("claimed"), stage("done")],
+      {:loopctl, :get, "/api/v1/stories/#{@story["id"]}"} => [
+        {:ok, 200, %{"story" => %{"assigned_holder" => nil}}},
+        {:ok, 200, %{"story" => %{"assigned_holder" => @placed_holder}}}
+      ],
       {:github, :get, "/repos/#{@repo}/pulls"} => [{:ok, 200, [pr]}, {:ok, 200, []}],
       {:github, :get, "/repos/#{@repo}/pulls/3"} => [
         {:ok, 200, Map.put(pr, "state", "open")},
@@ -102,8 +116,9 @@ defmodule LoopctlE2e.RunTest do
     assert issue.body =~ "lib/sandbox/runs/r#{@long_id}.ex"
     assert issue.labels == ["loopctl"]
 
-    # One wait for the story and one for the checks, each the first poll interval.
-    assert sleeps.() == [10_000, 10_000]
+    # One wait for the story, one for the runner session's accept (US-52.20) and one for the
+    # checks, each the first poll interval.
+    assert sleeps.() == [10_000, 10_000, 10_000]
 
     assert {{:loopctl, :get, "/api/v1/stories"},
             [project_id: "p-1", issue_number: 5, repo: @repo]} in StubClient.calls(client)

@@ -15,6 +15,7 @@ defmodule LoopctlWeb.StoryController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
+  alias Loopctl.Holders
   alias Loopctl.Projects
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
@@ -467,7 +468,8 @@ defmodule LoopctlWeb.StoryController do
               dependencies: deps_for_story,
               artifacts: artifacts_result.data,
               latest_verification: nil,
-              iteration_count: iteration_count
+              iteration_count: iteration_count,
+              assigned_holder: assigned_holder(tenant_id, story.assigned_holder_id)
             })
             |> maybe_put(:project_mission, project_mission)
         })
@@ -546,6 +548,20 @@ defmodule LoopctlWeb.StoryController do
     end
   end
 
+  # US-52.20: the holder the claim names, as a session describes itself (kind, host, session
+  # id). No credential and no lineage: every key of the tenant reads a story.
+  defp assigned_holder(_tenant_id, nil), do: nil
+
+  defp assigned_holder(tenant_id, holder_id) do
+    case Holders.get_holder(tenant_id, holder_id) do
+      {:ok, holder} ->
+        Map.take(holder, [:id, :kind, :host, :session_id, :lease_until, :ended_at, :ended_reason])
+
+      {:error, :not_found} ->
+        nil
+    end
+  end
+
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
@@ -563,6 +579,11 @@ defmodule LoopctlWeb.StoryController do
       agent_status: story.agent_status,
       verified_status: story.verified_status,
       assigned_agent_id: story.assigned_agent_id,
+      # US-52.20: which SESSION holds the claim, and the claim itself, so a client can tell
+      # its own claim from a peer session's of the same agent and see a released one.
+      assigned_holder_id: story.assigned_holder_id,
+      claim_epoch: story.claim_epoch,
+      claimed_until: story.claimed_until,
       assigned_at: story.assigned_at,
       reported_done_at: story.reported_done_at,
       verified_at: story.verified_at,

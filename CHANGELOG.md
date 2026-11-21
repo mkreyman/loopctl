@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A story read names the session that holds it (2026-11-20, US-52.20).** Every story in
+  `GET /api/v1/stories` and `GET /api/v1/stories/:id` now carries `assigned_holder_id`,
+  `claim_epoch` and `claimed_until`; the single-story read also carries `assigned_holder`
+  (`id`, `kind`, `host`, `session_id`, `lease_until`, `ended_at`, `ended_reason`, never a
+  credential). `GET /api/v1/stories/:id/stage` adds `runner_name` beside `runner_id`.
+  Additive; no migration. The e2e suite gains `mix e2e --only two_sessions_one_repo`, which
+  needs the new repository secret `LOOPCTL_E2E_AGENT_KEY` (a plain agent key).
 - **A holder's claims live by the holder's lease (2026-11-20, US-52.19).** A claim, bulk
   claim or interactive work item taken by a holder credential, without a dispatch cap, now
   gets `claimed_until` = the holder's `lease_until` and no `claim_lease_cap`, instead of the
