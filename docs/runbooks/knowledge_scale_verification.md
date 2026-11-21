@@ -128,7 +128,7 @@ It runs in two places:
   02:00 one the rest of CI uses, and not any other. So plan drift that arrives with no PR
   (a Postgres/pgvector upgrade, an ANALYZE shift) is NOT caught automatically: dispatch the
   matrix yourself after any such infrastructure change. It is a **matrix — one isolated job per scale file**, each
-  on its own database (`loopctl_test_sn_<file>`, derived in the job; each fleet-ci host (beelink, minis, x1)
+  on its own database (`loopctl_test_sn_<file>_<run_id>_<run_attempt>`, derived in the job; each fleet-ci host (beelink, minis, x1)
   has one long-lived CI Postgres, and planner stats live in the per-database `pg_statistic`) so a
   committed-row corpus from one file can't pollute another's global planner stats. A
   failed drop step leaves that database behind on the host the job page names — reclaim it

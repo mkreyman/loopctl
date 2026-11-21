@@ -354,15 +354,18 @@ jobs:
     # test/test_helper.exs's below-0.8.4 warning no longer fires on them.
     # config/test.exs hardcodes localhost + postgres/postgres for all three repos.
     env:
-      # ci<run_id>, not the bare `ci` this used to be. The suffix separated CI from a
-      # developer's loopctl_test -- a real fix -- but not one CI run from another,
-      # because it did not vary by run. config/test.exs builds the database name from
-      # this, and the psql steps below interpolate the same variable, so one value
-      # keeps all of them on the same database.
+      # ci<run_id>_<run_attempt>, not the bare `ci` this used to be. The suffix separated
+      # CI from a developer's loopctl_test -- a real fix -- but not one CI run from
+      # another, because it did not vary by run. config/test.exs builds the database name
+      # from this, and the psql steps below interpolate the same variable, so one value
+      # keeps all of them on the same database. The attempt is part of it because a re-run
+      # keeps its run_id: a re-run of an attempt cancelled before its drop step would
+      # otherwise reuse that attempt's database, which the CI database reaper ages by
+      # creation time and can drop between two steps (#983).
       #
       # Safe as a non-integer: this job does not pass `mix test --partitions`, which is
       # the only thing that validates the variable as a bare 1..N.
-      MIX_TEST_PARTITION: ci${{ github.run_id }}
+      MIX_TEST_PARTITION: ci${{ github.run_id }}_${{ github.run_attempt }}
       # The CI-only Postgres, NOT the instance on 5432 -- which, on every fleet-ci host
       # (beelink, minis, x1), holds a developer's databases.
       TEST_DB_PORT: "5433"
@@ -463,8 +466,8 @@ jobs:
       # These steps target "loopctl_test$MIX_TEST_PARTITION", NOT a hardcoded
       # loopctl_test, and that is a FIX rather than a tidy-up.
       #
-      # MIX_TEST_PARTITION is `ci` for this job, so config/test.exs points all three repos
-      # at loopctl_testci while these psql steps were still hardcoded to loopctl_test.
+      # MIX_TEST_PARTITION is set for this job, so config/test.exs points all three repos
+      # at loopctl_test$MIX_TEST_PARTITION while these psql steps were still hardcoded to loopctl_test.
       # On the hosted runner that was merely useless (the container's only database was
       # loopctl_test). On the self-hosted box loopctl_test is the DEVELOPER'S local test
       # database, so every CI run was issuing GRANT and ALTER DEFAULT PRIVILEGES against
@@ -567,7 +570,7 @@ jobs:
       # and GRANTs, so every CI run would apply the branch's migrations to live dev
       # data. config/dev.exs now takes these two overrides, defaulting to the old
       # values so a developer sees no change.
-      DEV_DB_NAME: loopctl_ci_eval_${{ github.run_id }}
+      DEV_DB_NAME: loopctl_ci_eval_${{ github.run_id }}_${{ github.run_attempt }}
       DEV_DB_PORT: "5433"
       # psql in the steps below picks the port up from PGPORT; the Ecto repos use
       # DEV_DB_PORT above. Both name the CI-only instance, never 5432.
@@ -1371,21 +1374,20 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.server == 'true' && github.event_name == 'workflow_dispatch'
     env:
-      # scale-nightly derives its own database per matrix file (loopctl_test_sn_<file>)
-      # and drops it again at the end, so it never shared a name with anything. What it
+      # scale-nightly derives its own database per matrix file and run attempt (see the
+      # "Derive this matrix file's database" step) and drops it at the end. What it
       # DID share, on every self-hosted host, is the instance: without
       # these it would create and seed multi-hundred-thousand-row scale databases inside
       # Mark's development Postgres. Both variables are needed -- TEST_DB_PORT for the
       # Ecto repos, PGPORT for the psql steps.
       TEST_DB_PORT: "5433"
       PGPORT: "5433"
-    # The derived database is named from the scale FILE alone (loopctl_test_sn_<file>, no
-    # run id — a leftover has to name the file that made it, and run_id would push the
-    # identifier past Postgres's 63-byte limit). So two runs of the same leg would SHARE
-    # one database: two pre-merge dispatches can overlap, and the
-    # first leg to finish DROPs ... WITH (FORCE), killing the other's connections mid-seed
-    # for a false RED. Serialise per file rather than cancel — the queued run is usually
-    # the one a human is waiting on.
+    # The derived database is named from the scale file AND the run attempt
+    # (loopctl_test_sn_<file>_<run_id>_<run_attempt>), so two runs never share one and a
+    # re-run never reuses a cancelled attempt's leftover (#983). Runs are still serialised
+    # per file: two legs of one file seeding multi-hundred-thousand-row databases at once
+    # on one host would measure each other's load, not the plan. Queue rather than cancel —
+    # the queued run is usually the one a human is waiting on.
     concurrency:
       group: scale-nightly-${{ matrix.scale_file }}
       cancel-in-progress: false
@@ -1475,8 +1477,10 @@ jobs:
       # variable and this job does not.
       #
       # Derived from the file name rather than a bare index so a leftover database names
-      # the file that made it. Longest result is 40 chars, well inside Postgres's 63-byte
-      # identifier limit.
+      # the file that made it, then the run id and attempt so no two attempts share one
+      # (#983). The file part drops `_scale_test` and is cut to 24 characters, which keeps
+      # every matrix file distinct and the whole name inside Postgres's 63-byte identifier
+      # limit; the step fails rather than let Postgres truncate a longer one silently.
       # Sanitised with bash parameter expansion rather than `basename ... | tr`: piping into
       # tr feeds it basename's trailing NEWLINE, which is itself a non-alphanumeric byte and
       # so becomes a trailing underscore in the database name. Verified — the first run of
@@ -1485,11 +1489,18 @@ jobs:
       - name: Derive this matrix file's database
         run: |
           set -euo pipefail
-          suffix=$(basename '${{ matrix.scale_file }}' .exs)
+          suffix=$(basename '${{ matrix.scale_file }}' _scale_test.exs)
+          suffix=${suffix%.exs}
           suffix=${suffix//[^a-zA-Z0-9]/_}
+          suffix="${suffix:0:24}_${{ github.run_id }}_${{ github.run_attempt }}"
+          db="loopctl_test_sn_${suffix}"
+          if [ "${#db}" -gt 63 ]; then
+            echo "::error::database name ${db} is ${#db} bytes, past Postgres's 63"
+            exit 1
+          fi
           echo "MIX_TEST_PARTITION=_sn_${suffix}" >> "$GITHUB_ENV"
-          echo "SCALE_DB=loopctl_test_sn_${suffix}" >> "$GITHUB_ENV"
-          echo "This job's database: loopctl_test_sn_${suffix} (${#suffix} char suffix)"
+          echo "SCALE_DB=${db}" >> "$GITHUB_ENV"
+          echo "This job's database: ${db} (${#db} bytes)"
 
       - uses: erlef/setup-beam@v1
         with:
