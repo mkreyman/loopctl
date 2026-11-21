@@ -466,8 +466,8 @@ jobs:
       # These steps target "loopctl_test$MIX_TEST_PARTITION", NOT a hardcoded
       # loopctl_test, and that is a FIX rather than a tidy-up.
       #
-      # MIX_TEST_PARTITION is `ci` for this job, so config/test.exs points all three repos
-      # at loopctl_testci while these psql steps were still hardcoded to loopctl_test.
+      # MIX_TEST_PARTITION is set for this job, so config/test.exs points all three repos
+      # at loopctl_test$MIX_TEST_PARTITION while these psql steps were still hardcoded to loopctl_test.
       # On the hosted runner that was merely useless (the container's only database was
       # loopctl_test). On the self-hosted box loopctl_test is the DEVELOPER'S local test
       # database, so every CI run was issuing GRANT and ALTER DEFAULT PRIVILEGES against
@@ -1374,8 +1374,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.server == 'true' && github.event_name == 'workflow_dispatch'
     env:
-      # scale-nightly derives its own database per matrix file (loopctl_test_sn_<file>)
-      # and drops it again at the end, so it never shared a name with anything. What it
+      # scale-nightly derives its own database per matrix file and run attempt (see the
+      # "Derive this matrix file's database" step) and drops it at the end. What it
       # DID share, on every self-hosted host, is the instance: without
       # these it would create and seed multi-hundred-thousand-row scale databases inside
       # Mark's development Postgres. Both variables are needed -- TEST_DB_PORT for the
