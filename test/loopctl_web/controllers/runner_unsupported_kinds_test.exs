@@ -88,6 +88,28 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
     assert entry["unsupported_kinds"] == ["implement"]
   end
 
+  # #1020: what `Runners.accepts?/5` withholds from a connection is readable on the pool.
+  test "a configuration refusal on the live connection shows on the pool until a rejoin",
+       %{conn: conn} do
+    ctx = operator_ctx()
+    track(ctx.runner)
+    :ok = refuse_kind(ctx.runner, "branch_not_allowed")
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+
+    assert [%{"kind" => "implement", "repo" => "acme/widgets", "reason" => "branch_not_allowed"}] =
+             entry["refused_since_join"]
+
+    # A rejoin is a newer socket with a `joined_at` after the refusal; the pool reads the
+    # newest one, which is also the connection the memory is bounded by.
+    track(ctx.runner, %{joined_at: DateTime.add(DateTime.utc_now(), 1, :second)})
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+    assert entry["refused_since_join"] == []
+  end
+
   test "a runner that has refused nothing shows an empty list, not a missing field",
        %{conn: conn} do
     ctx = operator_ctx()
@@ -100,6 +122,7 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
 
     assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
     assert entry["unsupported_kinds"] == []
+    assert entry["refused_since_join"] == []
   end
 
   # #834 round 1, finding 3. Since contract 1.6.0 the declaration alone decides for a

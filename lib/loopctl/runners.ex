@@ -988,6 +988,28 @@ defmodule Loopctl.Runners do
   end
 
   @doc """
+  The configuration refusals each connected runner of `tenant_id` gave on its live connection,
+  as `%{runner_id => [%{kind, repo, reason, refused_at}]}` — the pairs
+  `Loopctl.Runners.Selection` withholds until the runner reconnects (#1020). ONE ledger read
+  for the whole tenant. The live connection is the newest-joined socket of the runner, the one
+  `GET /api/v1/runners/pool` shows.
+  """
+  @spec config_refusals(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [map()]}
+  def config_refusals(tenant_id) when is_binary(tenant_id) do
+    joined =
+      for {_name, %{metas: metas}} <- pool(tenant_id),
+          meta <- metas,
+          runner_id = Map.get(meta, :runner_id),
+          is_binary(runner_id),
+          %DateTime{} = at <- [Map.get(meta, :joined_at)],
+          reduce: %{} do
+        acc -> Map.update(acc, runner_id, at, &Enum.max([&1, at], DateTime))
+      end
+
+    DispatchLedger.config_refusals(tenant_id, joined)
+  end
+
+  @doc """
   Whether `runner_id`'s subscription is exhausted right now — its own `usage_exhausted_until`,
   or that of any same-tenant runner sharing its `account_ref`, is in the future
   (`Loopctl.Runners.Usage.exhausted_until/2`, US-44.6). What `dispatch/3` and

@@ -48,6 +48,12 @@ case $repo in
 esac
 [ -f "$stories" ] || { echo "retire: $stories not found (save list_stories for the repo's project)" >&2; exit 2; }
 
+# Every Python step reads TOML with tomllib (3.11+); macOS's /usr/bin/python3 is 3.9 and first
+# on PATH, so the interpreter is picked rather than taken from PATH (#1079).
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib/pick_python.sh"
+py=$(pick_python) || { echo "retire: no python3 with tomllib (3.11+) found; install one (brew install python)" >&2; exit 2; }
+
 gh=${RETIRE_GH:-gh}
 target=${RETIRE_TARGET:-mkreyman/loopctl}
 root=$(git rev-parse --show-toplevel) || exit 2
@@ -60,7 +66,7 @@ label="from:$name"
 # entry <toml text> <field>: the [[import]] entry for this repo: its prefix, or "true" when
 # archived.
 entry() {
-  python3 - "$1" "$repo" "$2" <<'PY'
+  "$py" - "$1" "$repo" "$2" <<'PY'
 import sys, tomllib
 imports = tomllib.loads(sys.argv[1]).get("import", [])
 for e in imports:
@@ -103,9 +109,10 @@ if [ "$is_archived" != true ]; then
     { echo "retire: cannot list $repo's pull requests" >&2; exit 1; }
   for n in $prs; do blockers+=("open pull request #$n"); done
 fi
-while IFS= read -r line; do
-  [ -n "$line" ] && blockers+=("story in flight: $line")
-done < <(python3 - "$stories" <<'PY'
+# Read into a variable, not through process substitution, so a failed read stops the run: a
+# substitution drops the interpreter's exit status, and an unreadable stories.json then read
+# as "nothing in flight".
+in_flight=$("$py" - "$stories" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
 rows = data.get("data", data) if isinstance(data, dict) else data
@@ -114,7 +121,10 @@ for s in rows:
     if a in ("contracted", "assigned", "implementing") or (a == "reported_done" and v == "unverified"):
         print(f'{s.get("number")} {s.get("id")} ({a})')
 PY
-)
+) || { echo "retire: cannot read the stories in $stories" >&2; exit 2; }
+while IFS= read -r line; do
+  [ -n "$line" ] && blockers+=("story in flight: $line")
+done <<< "$in_flight"
 # Exactly what import-history.sh refuses (`git status --porcelain`, untracked files included),
 # checked here because the import runs only after the irreversible archive. The one change
 # allowed is our own uncommitted marker, which this run commits without importing again.
@@ -223,7 +233,7 @@ fi
 if [ "$committed" != true ]; then
   if [ "$marked" != true ]; then
     (cd "$root" && "$import" "$source_url" "$prefix") || { echo "retire: the final import failed" >&2; exit 1; }
-    python3 - "$manifest" "$repo" <<'PY' || exit 1
+    "$py" - "$manifest" "$repo" <<'PY' || exit 1
 import sys
 path, repo = sys.argv[1], sys.argv[2]
 lines = open(path).read().split("\n")

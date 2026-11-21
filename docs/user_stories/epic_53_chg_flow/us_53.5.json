@@ -1,0 +1,55 @@
+{
+  "id": "US-53.5",
+  "title": "The commit hook checks format and compile only; CI takes over what mix precommit drops",
+  "epic": {"id": "epic_53", "name": "loopctl adopts the chg flow"},
+  "priority": "medium",
+  "phase": "chg_flow",
+  "story": {"as_a": "session committing to loopctl", "i_want_to": "have a commit checked for format and compile errors in seconds instead of running the whole gate", "so_that": "commits stop costing minutes each, while every check the old gate ran still runs before merge"},
+  "rationale": "A commit touching the root project hands to the fleet's pre-commit (.githooks/pre-commit:105-114), which runs `mix precommit` under the gate lock (claude-config git-hooks/pre-commit:164-181): hex audit, compile, unused deps, format, credo, two citation and env-doc checks, the release set, dialyzer and the whole suite (mix.exs:294-321). The local gate took a median 4m20s on minis (chg shadow report, 36 local gates, 2026-11-20). #985 allows a format-and-compile hook once verify-master, deploy-from-verified, red-master repair and affected branch CI hold, which is this epic's merge order (README). Two precommit steps run in no CI job today, mix loopctl.check_skill_citations and mix loopctl.check_env_docs (grep of ci.yml, 2026-11-20), so this story moves them into Lint before it drops them locally.",
+  "acceptance_criteria": [
+    {"id": "AC-53.5.1", "description": "With LOOPCTL_COMMIT_GATE unset or `fast`, a commit staging a path outside runner/, chg/ and e2e/ runs `mix format --check-formatted` and then `MIX_ENV=test mix compile --warnings-as-errors` at the repo root, and does not run the fleet's pre-commit."},
+    {"id": "AC-53.5.2", "description": "A failing fast check stops the commit with `❌ root: '<command>' failed; the commit is stopped` and exit 1, the same shape as the hook's other areas (.githooks/pre-commit:54-66)."},
+    {"id": "AC-53.5.3", "description": "With LOOPCTL_COMMIT_GATE=full, or any value other than fast, the hook execs the fleet's pre-commit exactly as today, so `mix precommit` runs."},
+    {"id": "AC-53.5.4", "description": "The fast gate never calls claude-config's bin/local-gate.sh record, so no commit it passed is attested as `mix precommit` and the pre-push hook's chg_record (.githooks/pre-push:183-196) records no gate verdict for it."},
+    {"id": "AC-53.5.5", "description": "A root project with no deps/ directory prints `⏭  root: no deps/ (never set up); no Elixir gate ran` and lets the commit go on, as the fleet hook does for a scaffold."},
+    {"id": "AC-53.5.6", "description": "The Lint job runs `mix loopctl.check_skill_citations` and `mix loopctl.check_env_docs` as steps, so every step of the precommit alias (mix.exs:294-321) runs in at least one ci.yml job."},
+    {"id": "AC-53.5.7", "description": "runner/, chg/ and e2e/ commits keep their own checks unchanged (.githooks/pre-commit:68-103), in both modes."}
+  ],
+  "test_cases": [
+    {"id": "TC-53.5.1", "verifies": ["AC-53.5.1", "AC-53.5.4"], "name": "fast mode: a root path runs format then compile, never the fleet hook or local-gate (stub mix, fleet hook, local-gate on PATH)", "type": "integration", "preconditions": ["test/loopctl/githooks_fast_commit_test.exs, async: true, @tag :tmp_dir, the throwaway repo and stub logger of githooks_pre_commit_routing_test.exs:6-40; a deps/ dir at the root; a stub local-gate.sh under the fake HOME that logs any call"], "steps": ["stage lib/x.ex and run .githooks/pre-commit with LOOPCTL_COMMIT_GATE unset", "repeat with LOOPCTL_COMMIT_GATE=fast"], "expected_results": ["calls == [\"mix format --check-formatted\", \"mix compile --warnings-as-errors\"] with MIX_ENV=test on the second", "no `fleet` call and no local-gate call in either run"]},
+    {"id": "TC-53.5.2", "verifies": ["AC-53.5.2"], "name": "fast mode: a failing compile stops the commit and names the root", "type": "integration", "preconditions": ["as TC-53.5.1, stub mix exiting 1 on compile"], "steps": ["run the hook"], "expected_results": ["exit 1 and stderr `❌ root: 'mix compile --warnings-as-errors' failed; the commit is stopped`"]},
+    {"id": "TC-53.5.3", "verifies": ["AC-53.5.3"], "name": "full mode and unknown values hand to the fleet hook", "type": "integration", "preconditions": ["as TC-53.5.1"], "steps": ["run with LOOPCTL_COMMIT_GATE=full", "run with LOOPCTL_COMMIT_GATE=Fast"], "expected_results": ["both runs: calls == [\"fleet \"] and no mix call by this hook"]},
+    {"id": "TC-53.5.4", "verifies": ["AC-53.5.5"], "name": "fast mode without deps/ skips and says so", "type": "integration", "preconditions": ["as TC-53.5.1 with no deps/"], "steps": ["run the hook"], "expected_results": ["exit 0, the exact skip line, no mix call"]},
+    {"id": "TC-53.5.5", "verifies": ["AC-53.5.6"], "name": "guard: every precommit step runs in some ci.yml job", "type": "unit", "preconditions": ["mix.exs's precommit alias read with Mix.Project.config()[:aliases][:precommit]; ci.yml parsed with YamlElixir"], "steps": ["map each string step to the run line that carries it; map &hex_audit!/1 to `mix hex.audit`"], "expected_results": ["every step is found in some job's run lines, and the matched set is non-empty"]},
+    {"id": "TC-53.5.6", "verifies": ["AC-53.5.7"], "name": "the existing routing suite still passes in fast mode", "type": "integration", "preconditions": ["test/loopctl/githooks_pre_commit_routing_test.exs"], "steps": ["run it with LOOPCTL_COMMIT_GATE=full set in the stub env (its fleet-hook assertions) and unset (its area assertions)"], "expected_results": ["its area cases pass unchanged in both; its fleet cases pass under full and are mirrored by TC-53.5.1 under fast"]}
+  ],
+  "technical_notes": [
+    "The routing lives in .githooks/pre-commit: the area loop (:33-50), check/3 (:54-66), the per-area checks (:68-103) and the hand-off to the fleet hook (:105-114). The fast gate replaces the hand-off for `outside` paths only when LOOPCTL_COMMIT_GATE resolves to fast.",
+    "Format is --check-formatted, never a rewrite, so nothing needs re-staging (the fleet hook re-stages only because mix precommit may rewrite, claude-config git-hooks/pre-commit:194-224). Compile runs in MIX_ENV=test, the env precommit uses (mix.exs:88), so the next mix test reuses _build/test.",
+    "Fast gate and the gate lock: neither command touches the test database, so the fast gate takes no gate lock; claude-config bin/gate-run.sh refuses compile and format anyway (claude-config CLAUDE.md, delivery loop step 2).",
+    "Why no attestation: local-gate.sh's record names a gate (claude-config bin/local-gate.sh:11-16, :155-208) and the pre-push records any attested commit as that gate's pass (.githooks/pre-push:183-196); a fast attestation would enter chg's shadow log as a full-gate pass and hide misses from US-53.6's criterion. Consequence, stated: after this story live pushes carry no local full-gate verdict, so US-53.6's evidence comes from master commits.",
+    "Precommit steps and where CI runs them: hex audit in Security (ci.yml:873-874), compile in Test (:449-450), deps.unlock and format and credo and release_set in Lint (:268-280), dialyzer in Dialyzer (:962-970), the suite in Test; check_skill_citations and check_env_docs in none until this story.",
+    "Readers of the old behaviour: CLAUDE.md `Run Commands` (mix precommit, the full gate) stays true; the repo's CLAUDE.md gains one line that the commit hook checks format and compile and the gate is branch CI plus Verify master, with LOOPCTL_COMMIT_GATE=full as the per-commit way back. docs/runbooks/chg-flow.md gains a `Commit hook` section.",
+    "LOOPCTL_COMMIT_GATE is read by a git hook only, not by config/runtime.exs or lib/**, so mix loopctl.check_env_docs does not require a deploy/FLY_SECRETS.md row for it."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Changing claude-config's fleet pre-commit: loopctl stops calling it for root paths in fast mode; the fleet hook is untouched.",
+    "The push gate: US-53.6.",
+    "Removing the precommit alias: it stays the full local gate a person runs by hand."
+  ],
+  "failure_modes": {"partition": "n/a: the fast gate runs two local mix commands with no network; AC-53.5.1 names them.", "state": "AC-53.5.4: the hook writes no attestation, so the only state it leaves is the compiled _build/test in the committer's own tree.", "retry": "AC-53.5.1: re-running a commit re-runs two idempotent checks; nothing is recorded twice.", "slow": "n/a: no external call; a slow compile is the committer's own machine, which AC-53.5.3's full mode would make slower, not faster.", "reach": "AC-53.5.7: the hook runs in the committing worktree, as every other area check does."},
+  "definition_of_done": [
+    "A commit of a one-line lib/ change on minis prints the two fast checks and finishes in under 60 seconds on a warm tree; the PR body records the time beside the 4m20s median.",
+    "`LOOPCTL_COMMIT_GATE=full git commit` on the same change runs mix precommit, shown in its output.",
+    "The Lint job of the PR's own CI run shows the two new steps passing.",
+    "The PR merges only after the verifier, the verified-only deploy, the red-master hunt and selective branch CI are all live on master (README, Merge order); it may be built before that."
+  ],
+  "defaults": [
+    "LOOPCTL_COMMIT_GATE defaults to fast; any value other than fast means full (owner may change).",
+    "Fast checks: mix format --check-formatted and MIX_ENV=test mix compile --warnings-as-errors.",
+    "Commit time target on a warm tree: under 60 seconds."
+  ],
+  "expected_size": {"insertions": 90, "files": 4},
+  "estimated_tokens": 230000
+}

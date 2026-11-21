@@ -215,6 +215,9 @@ defmodule Loopctl.Runners.DispatchLedger do
       # property: `Loopctl.Delivery.Placement` re-sends the name that is here rather than
       # re-deriving one from a declaration the machine may have changed since.
       branch: dispatch.branch,
+      # The repository the first push named, never rewritten, for the configuration-refusal
+      # memory (`config_refusals/2`).
+      repo: Map.get(dispatch, :repo),
       status: "sent",
       # THE BASE BRANCH IS BOUND AT PLACEMENT: the one this implement dispatch is placed
       # under, so story verification reads CI against the base it was built on, whatever its
@@ -566,6 +569,79 @@ defmodule Loopctl.Runners.DispatchLedger do
     pairs
     |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
     |> Map.new(fn {runner_id, kinds} -> {runner_id, Enum.sort(kinds)} end)
+  end
+
+  @config_refusal_reasons ~w(repo_not_allowed branch_not_allowed wall_clock_exceeds_limit
+                             max_turns_exceeds_limit token_budget_exceeds_limit)
+
+  @doc """
+  The refusal reasons that are a property of CONFIGURATION (#1020): the runner's own
+  (`repos`, `branch_prefixes`, its session limits) or loopctl's budgets. Neither side can
+  change without a reconnect: the runner reads its config at start, and a loopctl budget change
+  is a deploy, which drops every socket. So a dispatch refused for one of these is refused
+  again on every later pass of the same connection. `draining`, `at_capacity`,
+  `insufficient_disk`, `dispatches_disabled` and `other` clear on their own and are not here;
+  `kind_not_supported` has its own memory (`kind_unsupported?/3`).
+  """
+  @spec config_refusal_reasons() :: [String.t()]
+  def config_refusal_reasons, do: @config_refusal_reasons
+
+  @doc """
+  Every configuration refusal the tenant's runners gave on their live connections, as
+  `%{runner_id => [%{kind, repo, reason, refused_at}]}`, newest per (kind, repo): what
+  `GET /api/v1/runners/pool` shows, the unattended selection holds out and its pass logs
+  (#1020). The memory lasts exactly as long as the connection: a reconnect, which is how a
+  config change reaches loopctl, clears it. A row older than the `repo` column holds NULL and
+  is skipped. Served by the partial index `runner_dispatches_config_refusal_idx`; the reasons
+  are LITERALS for the planner proof described at `kind_unsupported?/3`, and a test asserts
+  each of `config_refusal_reasons/0` is read here. `joined` maps each
+  connected runner to the `joined_at` of its live connection; a runner absent from it, or with
+  no refusal since, is absent from the answer.
+  """
+  @spec config_refusals(Ecto.UUID.t(), %{Ecto.UUID.t() => DateTime.t()}) ::
+          %{Ecto.UUID.t() => [map()]}
+  def config_refusals(_tenant_id, joined) when map_size(joined) == 0, do: %{}
+
+  def config_refusals(tenant_id, joined) when is_binary(tenant_id) and is_map(joined) do
+    ids = Map.keys(joined)
+    earliest = joined |> Map.values() |> Enum.min(DateTime)
+
+    {:ok, rows} =
+      in_tenant(tenant_id, fn ->
+        Repo.all(
+          from r in config_refusals_query(tenant_id),
+            where: r.runner_id in ^ids and r.replied_at >= ^earliest,
+            where: not is_nil(r.repo),
+            order_by: [desc: r.replied_at],
+            select: %{
+              runner_id: r.runner_id,
+              kind: r.kind,
+              repo: r.repo,
+              reason: r.reason,
+              refused_at: r.replied_at
+            }
+        )
+      end)
+
+    rows
+    |> Enum.filter(&(DateTime.compare(&1.refused_at, Map.fetch!(joined, &1.runner_id)) != :lt))
+    |> Enum.uniq_by(&{&1.runner_id, &1.kind, String.downcase(&1.repo)})
+    |> Enum.group_by(& &1.runner_id, &Map.delete(&1, :runner_id))
+  end
+
+  # The reasons are literals, so the partial index's predicate is provable (see
+  # `kind_unsupported?/3`); `config_refusal_reasons/0` holds the same list.
+  defp config_refusals_query(tenant_id) do
+    from r in DispatchRecord,
+      where: r.tenant_id == ^tenant_id and r.status == "refused",
+      where:
+        r.reason in [
+          "repo_not_allowed",
+          "branch_not_allowed",
+          "wall_clock_exceeds_limit",
+          "max_turns_exceeds_limit",
+          "token_budget_exceeds_limit"
+        ]
   end
 
   @doc """

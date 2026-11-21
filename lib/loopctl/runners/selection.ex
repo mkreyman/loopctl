@@ -10,7 +10,9 @@ defmodule Loopctl.Runners.Selection do
       one credential is skipped rather than guessed at, since `Loopctl.Runners.dispatch/3`
       refuses it `:runner_ambiguous`;
     * accepting on its own declaration — not draining, the repository, the kind
-      (`Loopctl.Runners.accepts?/5`, the same rule `dispatch/3` applies);
+      (`Loopctl.Runners.accepts?/5`, the same rule `dispatch/3` applies) — and not holding a
+      configuration refusal of this kind for this repository from its live connection
+      (#1020), which it would only repeat;
     * not revoked, with a FREE SLOT on its row (`in_flight < max_sessions`); and
     * its SUBSCRIPTION is not exhausted (US-44.6) — no same-tenant row, its own or one sharing
       its non-null `account_ref`, holds `usage_exhausted_until` in the future.
@@ -60,14 +62,33 @@ defmodule Loopctl.Runners.Selection do
   end
 
   # The connected runners whose OWN declaration admits the dispatch, read from the meta of the
-  # sole socket a push would reach. In memory, apart from `accepts?/5`'s ledger fallback for a
-  # runner that declared no kinds.
+  # sole socket a push would reach, less those holding a configuration refusal of this kind for
+  # this repository from that connection (#1020). The declaration is judged in memory, apart
+  # from `accepts?/5`'s ledger fallback for a runner that declared no kinds; the refusals are
+  # ONE ledger read for the tenant (`Runners.config_refusals/1`), made only when some runner
+  # is accepting.
   defp accepting_ids(tenant_id, kind, repo) do
-    for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
-        runner_id = Map.get(meta, :runner_id),
-        is_binary(runner_id),
-        Runners.accepts?(tenant_id, runner_id, meta, kind, repo) == :ok,
-        do: runner_id
+    accepting =
+      for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
+          runner_id = Map.get(meta, :runner_id),
+          is_binary(runner_id),
+          Runners.accepts?(tenant_id, runner_id, meta, kind, repo) == :ok,
+          do: runner_id
+
+    case accepting do
+      [] ->
+        []
+
+      ids ->
+        held = Runners.config_refusals(tenant_id)
+        Enum.reject(ids, &held_out?(Map.get(held, &1, []), kind, repo))
+    end
+  end
+
+  # Case-insensitive on the repository, the rule `accepts?/5` applies to a declared `repos`.
+  defp held_out?(refusals, kind, repo) do
+    wanted = String.downcase(repo)
+    Enum.any?(refusals, &(&1.kind == kind and String.downcase(&1.repo) == wanted))
   end
 
   @doc """
@@ -105,8 +126,40 @@ defmodule Loopctl.Runners.Selection do
           )
       end
 
+      note_refusals(label, tenant_id, story_id)
       Map.put(cache, key, true)
     end
+  end
+
+  # #1020: a runner held out for a configuration refusal on its live connection is the one
+  # no-runner cause a person must act on (fix the config, reconnect), so it is a WARNING and
+  # names each pair. A FACT about the tenant, like the note above, not a diagnosis of this
+  # story: a listed pair may be for another kind or repository. Once per tenant per pass,
+  # under the same cache key.
+  defp note_refusals(label, tenant_id, story_id) do
+    case Runners.config_refusals(tenant_id) do
+      refusals when map_size(refusals) == 0 ->
+        :ok
+
+      refusals ->
+        pairs =
+          for {runner_id, rows} <- Enum.sort(refusals), row <- rows do
+            "runner_id=#{runner_id} kind=#{row.kind} repo=#{row.repo} reason=#{row.reason}"
+          end
+
+        Logger.warning(
+          "#{label}: no runner for story_id=#{story_id}; the tenant has runner(s) held out of " <>
+            "these (kind, repo) pairs until they reconnect, for a configuration refusal " <>
+            "since joining: " <> Enum.join(pairs, "; "),
+          tenant_id: tenant_id
+        )
+    end
+  rescue
+    error in [Postgrex.Error, DBConnection.ConnectionError] ->
+      Logger.warning(
+        "no-runner refusal note skipped, read failed: tenant_id=#{tenant_id} " <>
+          "exception=#{inspect(error.__struct__)}"
+      )
   end
 
   # The note is a diagnostic and must never change the candidate's outcome: a read that fails

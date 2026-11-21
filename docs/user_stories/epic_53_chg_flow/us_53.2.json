@@ -1,0 +1,58 @@
+{
+  "id": "US-53.2",
+  "title": "Deploy only verified/master, from its own workflow",
+  "epic": {"id": "epic_53", "name": "loopctl adopts the chg flow"},
+  "priority": "high",
+  "phase": "chg_flow",
+  "story": {"as_a": "session whose change reached verified/master", "i_want_to": "have production deploy exactly the commit verified/master names, once, and never a master tip the verifier has not passed", "so_that": "what runs on loopctl.com is always a commit the whole CI run passed on"},
+  "rationale": "ci.yml's deploy job needs lint, test, security, dialyzer, pgbouncer-e2e, retrieval-eval and smoke-preflight and deploys the pushed master commit (.github/workflows/ci.yml:1705-1729). It deploys before any verifier has spoken and once per push, and it records no GitHub deployment, so post-deploy verification, which reads the production environment's deployments by sha (lib/loopctl/delivery/post_deploy_verification.ex:35-43, :189), has nothing of loopctl's own to read. chg's rule is that a deploy runs only from a sha equal to verified/master (chg/docs/verify.md:79-83, design.md:421).",
+  "acceptance_criteria": [
+    {"id": "AC-53.2.1", "description": ".github/workflows/deploy.yml (name: Deploy) triggers on workflow_run of workflow `Verify master` with types [completed] and branches [master], plus workflow_dispatch; job deploy runs on ubuntu-latest with concurrency group deploy and cancel-in-progress false."},
+    {"id": "AC-53.2.2", "description": ".github/scripts/deploy-verified.sh reads the sha of refs/heads/verified/master from the GitHub API at run time, never github.event.workflow_run.head_sha, and checks that exact sha out before building."},
+    {"id": "AC-53.2.3", "description": "When verified/master does not exist the script prints `::warning::no verified/master ref to deploy; the next green master run creates it` and exits 0 without calling flyctl deploy."},
+    {"id": "AC-53.2.4", "description": "When `flyctl image show -a loopctl --json` reports the running image tag `verified-<sha>` for the verified sha, the script prints `production already runs verified/master <sha>; nothing to deploy` and exits 0 without deploying."},
+    {"id": "AC-53.2.5", "description": "Otherwise the script runs scripts/smoke.sh against the live release first, and a failed preflight stops the deploy with exit 1, as ci.yml's smoke-preflight gates it today (ci.yml:1669-1703)."},
+    {"id": "AC-53.2.6", "description": "The deploy runs `flyctl deploy --remote-only --image-label verified-<sha>` and records a GitHub deployment in environment production whose sha is the verified sha, with status success on exit 0 and failure otherwise."},
+    {"id": "AC-53.2.7", "description": "ci.yml no longer has a deploy or smoke job; deploy.yml's smoke job runs scripts/smoke.sh with SMOKE_CONTEXT=post-deploy after deploy succeeded, gates nothing, and keeps the advisory name `Post-deploy Smoke (advisory — release already shipped)`."},
+    {"id": "AC-53.2.8", "description": "The Verify master run of an older sha that completes after a newer one deploys nothing older: the script deploys the ref's current sha, which only moves forward, so a second run for the same ref is the no-op of AC-53.2.4."}
+  ],
+  "test_cases": [
+    {"id": "TC-53.2.1", "verifies": ["AC-53.2.1", "AC-53.2.7"], "name": "guard: Deploy's triggers, runner and concurrency; ci.yml has no deploy or smoke (ExUnit over the parsed workflows)", "type": "unit", "preconditions": ["test/loopctl/deploy_workflow_test.exs, async: true, YamlElixir"], "steps": ["read deploy.yml on, jobs.deploy, jobs.smoke", "read ci.yml's job names"], "expected_results": ["workflow_run of [\"Verify master\"], completed, [master]; workflow_dispatch present; runs-on ubuntu-latest; group deploy, cancel-in-progress false", "smoke needs deploy, its if requires needs.deploy.result == 'success', its env sets SMOKE_CONTEXT post-deploy", "ci.yml jobs contain neither deploy nor smoke"]},
+    {"id": "TC-53.2.2", "verifies": ["AC-53.2.2", "AC-53.2.6"], "name": "script: deploys the ref's sha with its label and records the deployment (stub gh, git, flyctl, smoke)", "type": "integration", "preconditions": ["@tag :tmp_dir; stub gh answering git/ref/heads/verified/master with sha B and logging deployment POSTs; GITHUB_EVENT carrying workflow_run.head_sha A != B; stub flyctl whose image show reports tag verified-A; stub smoke.sh exiting 0"], "steps": ["run bash .github/scripts/deploy-verified.sh"], "expected_results": ["git checkout of B, never A", "flyctl argv `deploy --remote-only --image-label verified-B`", "one deployment created with environment production and sha B, then a success status"]},
+    {"id": "TC-53.2.3", "verifies": ["AC-53.2.3", "AC-53.2.4", "AC-53.2.8"], "name": "script: no ref, and an already-running sha, deploy nothing", "type": "integration", "preconditions": ["as TC-53.2.2"], "steps": ["run with gh answering 404 for the ref", "run with flyctl image show reporting verified-B", "run twice in a row with the second image show reporting verified-B"], "expected_results": ["each no-deploy run exits 0 with its exact message and the flyctl log has no deploy call", "the double run deploys B exactly once"]},
+    {"id": "TC-53.2.4", "verifies": ["AC-53.2.5"], "name": "script: a red preflight smoke stops the deploy", "type": "integration", "preconditions": ["as TC-53.2.2, stub smoke.sh exiting 1"], "steps": ["run the script"], "expected_results": ["exit 1, no flyctl deploy call, no deployment created"]},
+    {"id": "TC-53.2.5", "verifies": ["AC-53.2.6"], "name": "script: a failed flyctl deploy marks the deployment failed", "type": "integration", "preconditions": ["as TC-53.2.2, stub flyctl deploy exiting 1"], "steps": ["run the script"], "expected_results": ["exit 1 and the deployment's last status is failure"]}
+  ],
+  "technical_notes": [
+    "Moved, with their comments: the deploy job (ci.yml:1705-1729, flyctl at :1726-1727) and the smoke job (ci.yml:1731-1798). smoke-preflight (ci.yml:1669-1703) stays in ci.yml as an area-gate need (ci.yml:1810); the deploy script runs the same scripts/smoke.sh again immediately before it ships, because a verified sha may deploy long after its CI run.",
+    "Hosted, not fleet-ci: the reasons at ci.yml:83-92 (deploy credentials stay off the self-hosted pool) carry over. FLY_API_TOKEN and LOOPCTL_SMOKE_KEY are existing repository secrets (gh secret list, 2026-11-20).",
+    "Three workflow_run levels (CI -> Verify master -> Deploy) is the most GitHub chains; HCB's deploy.yml says the same (HCB .github/workflows/deploy.yml:27). Nothing may be chained after Deploy.",
+    "Never the workflow run's head_sha: the reason is in lib/loopctl/delivery/post_deploy_verification.ex:35-43 (KB 3670a0de): a workflow_run run is attributed to the branch head at creation. The deployment record's sha is what that module compares, environment default production (:189, :305-313).",
+    "flyctl deploy --image-label and flyctl image show --json exist (flyctl --help, 2026-11-20). The JSON field that carries the tag is UNGROUNDED: confirm it against a live `flyctl image show -a loopctl --json` before writing the parser, and fail the run (never deploy blind) when the field is absent.",
+    "Readers of the moved jobs: test/loopctl/factory_ci_workflows_test.exs:23-26 (@not_on_push names deploy and smoke) and :310-323 (deploy and smoke conditions) move to deploy_workflow_test.exs; docs/runbooks/post-deploy-smoke.md:111-122 and :231-258 and scripts/smoke.sh:8 name ci.yml's smoke job and are repointed to deploy.yml.",
+    "CHANGELOG.md: deploy ordering changed (operator-facing). docs/runbooks/chg-flow.md gains a `Deploy` section: how to redeploy verified/master by hand (gh workflow run deploy.yml) and why a merge alone no longer deploys.",
+    "Fly app name loopctl (fly.toml:4); release_command /app/bin/migrate (fly.toml:27) still runs inside flyctl deploy, so migration ordering is unchanged."
+  ],
+  "dependencies": [
+    "US-53.1"
+  ],
+  "non_goals": [
+    "Automatic rollback on a red post-deploy smoke (chg design.md:185): the smoke stays advisory, as ci.yml has it today.",
+    "Gating factory-release.yml (factory-release.yml:14-30) on verified/master: an owner question in the epic report.",
+    "Moving deploy onto fleet-ci: excluded by ci.yml:83-92."
+  ],
+  "failure_modes": {"partition": "AC-53.2.6: Fly unreachable fails flyctl deploy, the deployment is marked failure and verified/master is untouched, so the next Deploy run ships it.", "state": "AC-53.2.4: what production runs is read from Fly's image tag, the one record of it; the GitHub deployment mirrors the sha for post-deploy verification.", "retry": "AC-53.2.8: a re-run or a late older run reads the current ref and meets the running-label no-op, so nothing deploys twice or backwards.", "slow": "AC-53.2.1: concurrency group deploy keeps one deploy at a time with one pending run, which a newer completion replaces, so a slow Fly build coalesces a burst into one deploy of the newest verified sha.", "reach": "AC-53.2.2: the job finds what to ship by reading verified/master from GitHub, wherever the run lands."},
+  "definition_of_done": [
+    "After the merge, the next green master commit produces CI -> Verify master -> Deploy runs for the same sha, and `flyctl image show -a loopctl` reports tag verified-<that sha>.",
+    "`gh api repos/mkreyman/loopctl/deployments?environment=production --jq '.[0].sha'` equals `git ls-remote origin refs/heads/verified/master`.",
+    "A manual `gh workflow run deploy.yml` right after prints the nothing-to-deploy line and creates no deployment."
+  ],
+  "defaults": [
+    "Image label verified-<40-hex sha> (owner may change).",
+    "GitHub deployment environment production, matching post-deploy verification's default.",
+    "Pre-deploy smoke runs in the deploy job, in addition to ci.yml's smoke-preflight.",
+    "Post-deploy smoke stays advisory."
+  ],
+  "expected_size": {"insertions": 220, "files": 5},
+  "estimated_tokens": 300000
+}

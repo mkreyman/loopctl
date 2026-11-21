@@ -355,6 +355,118 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
   end
 
+  describe "config_refusals/2 (#1020)" do
+    defp refused(runner, reason, attrs \\ %{}) do
+      record = sent(runner, attrs)
+
+      {:ok, _} =
+        reply(runner, record, %{
+          "decision" => "refused",
+          "reason" => reason,
+          "detail" => "test refusal"
+        })
+
+      record
+    end
+
+    defp before_now, do: DateTime.add(DateTime.utc_now(), -60, :second)
+
+    defp listed(runner, since),
+      do:
+        Map.get(
+          DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => since}),
+          runner.id,
+          []
+        )
+
+    test "every configuration reason is remembered with its kind and repository",
+         %{runner: runner} do
+      since = before_now()
+
+      for reason <- DispatchLedger.config_refusal_reasons(),
+          do: refused(runner, reason, %{"repo" => "acme/#{reason}"})
+
+      remembered = Map.new(listed(runner, since), &{&1.repo, {&1.kind, &1.reason}})
+
+      for reason <- DispatchLedger.config_refusal_reasons(),
+          do: assert(remembered["acme/#{reason}"] == {"implement", reason}, reason)
+    end
+
+    test "one repository in two cases is one pair, the newest refusal", %{runner: runner} do
+      since = before_now()
+      _ = refused(runner, "repo_not_allowed", %{"repo" => "Acme/Widgets"})
+      _ = refused(runner, "branch_not_allowed", %{"repo" => "acme/widgets"})
+
+      assert [%{repo: "acme/widgets", reason: "branch_not_allowed"}] = listed(runner, since)
+    end
+
+    test "every remembered reason is one a runner may give" do
+      assert DispatchLedger.config_refusal_reasons() --
+               RunnerContract.RunnerDispatchReply.refusal_reasons() == []
+    end
+
+    test "a refusal from before the connection joined is not remembered", %{runner: runner} do
+      _ = refused(runner, "branch_not_allowed")
+      rejoined = DateTime.add(DateTime.utc_now(), 1, :second)
+
+      assert DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => rejoined}) == %{}
+    end
+
+    test "a transient refusal is not remembered", %{runner: runner} do
+      since = before_now()
+
+      for reason <- ~w(draining at_capacity insufficient_disk dispatches_disabled other),
+          do: refused(runner, reason)
+
+      assert DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => since}) == %{}
+    end
+
+    test "config_refusals/2 lists the newest refusal per kind and repo, per runner",
+         %{runner: runner} do
+      {_raw, clean} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      since = before_now()
+      _ = refused(runner, "repo_not_allowed")
+      _ = refused(runner, "branch_not_allowed")
+      _ = refused(runner, "wall_clock_exceeds_limit", %{"repo" => "acme/infra"})
+
+      refusals =
+        DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => since, clean.id => since})
+
+      assert [infra, widgets] = Enum.sort_by(Map.fetch!(refusals, runner.id), & &1.repo)
+      assert %{kind: "implement", repo: "acme/infra", reason: "wall_clock_exceeds_limit"} = infra
+      assert %{repo: "acme/widgets", reason: "branch_not_allowed"} = widgets
+      refute Map.has_key?(refusals, clean.id)
+    end
+
+    test "is tenant-scoped", %{runner: runner} do
+      other_tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      since = before_now()
+      _ = refused(runner, "branch_not_allowed")
+
+      assert [%{reason: "branch_not_allowed"}] = listed(runner, since)
+      assert DispatchLedger.config_refusals(other_tenant.id, %{runner.id => since}) == %{}
+    end
+
+    test "the partial index the memory reads exists, is valid, and is partial" do
+      sql = """
+      SELECT pg_get_indexdef(c.oid), x.indisvalid
+        FROM pg_class c
+        JOIN pg_index x ON x.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'
+      """
+
+      assert [[definition, true]] =
+               Repo.query!(sql, ["runner_dispatches_config_refusal_idx"]).rows
+
+      assert definition =~ "USING btree (tenant_id, runner_id, kind, replied_at)"
+      assert definition =~ "refused"
+
+      for reason <- DispatchLedger.config_refusal_reasons(),
+          do: assert(definition =~ reason, reason)
+    end
+  end
+
   describe "unsupported_kinds/1" do
     test "groups the tenant's barred kinds by runner, and omits runners with none",
          %{runner: runner} do

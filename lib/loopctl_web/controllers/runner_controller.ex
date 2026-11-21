@@ -273,6 +273,7 @@ defmodule LoopctlWeb.RunnerController do
                    :specs,
                    :suppressed_kinds,
                    :unsupported_kinds,
+                   :refused_since_join,
                    :usage_exhausted_until
                  ],
                  properties: %{
@@ -411,6 +412,27 @@ defmodule LoopctlWeb.RunnerController do
                          "— and not a state to recover from by reconnecting."
                    },
                    unsupported_kinds: @unsupported_kinds_schema,
+                   refused_since_join: %Schema{
+                     type: :array,
+                     description:
+                       "The (kind, repo) pairs this CONNECTION refused for a configuration " <>
+                         "reason (`repo_not_allowed`, `branch_not_allowed`, or a budget over " <>
+                         "its limit), newest per pair (#1020). Such a refusal would repeat on " <>
+                         "every pass, so the unattended passes send this runner nothing for " <>
+                         "the pair until it reconnects; the story counts as `no_runner`. Fix " <>
+                         "the runner's config (or loopctl's budget) and reconnect it. `[]` " <>
+                         "when there is none.",
+                     items: %Schema{
+                       type: :object,
+                       required: [:kind, :repo, :reason, :refused_at],
+                       properties: %{
+                         kind: %Schema{type: :string},
+                         repo: %Schema{type: :string},
+                         reason: %Schema{type: :string},
+                         refused_at: %Schema{type: :string, format: :"date-time"}
+                       }
+                     }
+                   },
                    usage_exhausted_until: %Schema{
                      type: :string,
                      format: :"date-time",
@@ -496,11 +518,12 @@ defmodule LoopctlWeb.RunnerController do
     capacity = Runners.capacity(tenant.id)
     barred = Runners.unsupported_kinds(tenant.id)
     exhausted = Usage.exhausted_until_by_runner(tenant.id)
+    refused = Runners.config_refusals(tenant.id)
 
     runners =
       tenant.id
       |> Runners.pool()
-      |> Enum.map(&pool_entry(&1, capacity, barred, exhausted))
+      |> Enum.map(&pool_entry(&1, capacity, barred, exhausted, refused))
       |> Enum.sort_by(& &1.machine)
 
     json(conn, %{runners: runners})
@@ -523,7 +546,7 @@ defmodule LoopctlWeb.RunnerController do
   defp declared_specs(%{specs: [_ | _]} = meta), do: Runners.declared_specs(meta)
   defp declared_specs(_meta), do: nil
 
-  defp pool_entry({machine, %{metas: metas}}, capacity, barred, exhausted) do
+  defp pool_entry({machine, %{metas: metas}}, capacity, barred, exhausted, refused) do
     meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
     held = Map.get(capacity, Map.get(meta, :runner_id), %{})
 
@@ -563,6 +586,9 @@ defmodule LoopctlWeb.RunnerController do
       specs: declared_specs(meta),
       suppressed_kinds: Runners.suppressed_kinds(meta),
       unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), []),
+      # What `Runners.Selection` withholds from this connection (#1020), read by the
+      # same ledger query it decides on.
+      refused_since_join: Map.get(refused, Map.get(meta, :runner_id), []),
       # The SAME effective value placement decides on (`Loopctl.Runners.Usage`), so a machine
       # that is connected, has free slots and is placed nothing is explained here.
       usage_exhausted_until: Map.get(exhausted, Map.get(meta, :runner_id))

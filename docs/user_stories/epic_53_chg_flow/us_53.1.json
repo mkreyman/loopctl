@@ -1,0 +1,54 @@
+{
+  "id": "US-53.1",
+  "title": "Verify master: advance verified/master forward-only from each green master CI run",
+  "epic": {"id": "epic_53", "name": "loopctl adopts the chg flow"},
+  "priority": "high",
+  "phase": "chg_flow",
+  "story": {"as_a": "session that merged a change to loopctl's master", "i_want_to": "have the newest master commit whose full CI run passed recorded as verified/master, and never an older or unproven one", "so_that": "deploys and later stories have one trustworthy pointer to the last commit the whole suite passed on"},
+  "rationale": "#985 asks that the last green master tip advance a verified/master ref. Today nothing records it: origin has no verified/master ref (git ls-remote, 2026-11-20), and ci.yml's deploy job ships whatever master push went green (.github/workflows/ci.yml:1705-1729). The full suite already runs on every master push, with one pending run kept and a started one never cancelled (ci.yml:42-49), so the verifier does not need to run the suite again: chg verify --no-run advances the ref for 'a CI job whose suite already passed on S' (chg/docs/verify.md:14), forward only (verify.md:10-12). chg's design names this exact move: master's existing full-suite run becomes the verifier (chg/docs/design.md:333).",
+  "acceptance_criteria": [
+    {"id": "AC-53.1.1", "description": ".github/workflows/verify-master.yml (name: Verify master) triggers only on workflow_run of workflow CI with types [completed] and branches [master]; it has no push, pull_request or schedule trigger."},
+    {"id": "AC-53.1.2", "description": "Job advance runs only when github.event.workflow_run.conclusion is 'success' and github.event.workflow_run.event is 'push' or 'schedule'; a workflow_dispatch run (which can skip the retrieval eval gate, ci.yml:23-31), a cancelled run and a failed run start no advance."},
+    {"id": "AC-53.1.3", "description": "Job advance runs on [self-hosted, fleet-ci] with permissions contents: write and nothing else, timeout-minutes 10, and concurrency group verify-master-advance with cancel-in-progress false."},
+    {"id": "AC-53.1.4", "description": ".github/scripts/verify-master-advance.sh <sha>, run in a fetch-depth 0 checkout of exactly <sha>, invokes `chg verify --sha <sha> --no-run --ref verified/master --remote origin` once and exits 0 when chg exits 0."},
+    {"id": "AC-53.1.5", "description": "When chg verify exits 2 (no verdict: the push was refused or GitHub unreachable), the script prints `::error::verified/master held: chg verify gave no verdict for <sha>; re-run this job` and exits 1, and verified/master is not pushed by any other path."},
+    {"id": "AC-53.1.6", "description": "The script appends chg's JSON verdict for <sha> to $GITHUB_STEP_SUMMARY under the heading `verified/master`, so an `already` or `superseded` outcome (an older run finishing after a newer one) is visible and exits 0."},
+    {"id": "AC-53.1.7", "description": "When `chg` is not on PATH the script prints `::error::chg is not installed on this runner; run chg/scripts/install-system.sh on the host` and exits 1 rather than skipping the advance."}
+  ],
+  "test_cases": [
+    {"id": "TC-53.1.1", "verifies": ["AC-53.1.1", "AC-53.1.2", "AC-53.1.3"], "name": "guard: Verify master's trigger, condition, runner, permissions and concurrency (ExUnit over the parsed workflow)", "type": "unit", "preconditions": ["test/loopctl/verify_master_workflow_test.exs, use ExUnit.Case, async: true, reading .github/workflows/verify-master.yml with YamlElixir as factory_ci_workflows_test.exs:326-327 does"], "steps": ["read on, jobs.advance.if, runs-on, permissions, timeout-minutes, concurrency"], "expected_results": ["on has only workflow_run {workflows: [CI], types: [completed], branches: [master]}", "the if names conclusion == 'success' and event 'push' or 'schedule' and nothing that admits workflow_dispatch", "permissions == %{\"contents\" => \"write\"}; group verify-master-advance; cancel-in-progress false"]},
+    {"id": "TC-53.1.2", "verifies": ["AC-53.1.4", "AC-53.1.6"], "name": "script: a green run advances through chg verify --no-run and records the verdict (stub chg in tmp_dir)", "type": "integration", "preconditions": ["@tag :tmp_dir; a git repo with one commit; a stub chg on PATH that logs its argv and prints {\"verdict\":\"pass\",\"advanced\":true}; GITHUB_STEP_SUMMARY pointing at a file in tmp_dir"], "steps": ["run bash .github/scripts/verify-master-advance.sh <sha> with the stub PATH", "run it again with the stub printing a superseded verdict"], "expected_results": ["exactly one chg call per run, argv `verify --sha <sha> --no-run --ref verified/master --remote origin`", "both runs exit 0 and the summary file holds both JSON verdicts under `verified/master`"]},
+    {"id": "TC-53.1.3", "verifies": ["AC-53.1.5"], "name": "script: chg's no-verdict exit holds the ref and fails the job", "type": "integration", "preconditions": ["as TC-53.1.2, the stub chg exiting 2"], "steps": ["run the script"], "expected_results": ["exit 1", "stdout carries `::error::verified/master held: chg verify gave no verdict for <sha>; re-run this job`", "the stub log shows no second chg call and the script ran no git push"]},
+    {"id": "TC-53.1.4", "verifies": ["AC-53.1.7"], "name": "script: no chg on PATH is an error, never a silent skip", "type": "integration", "preconditions": ["a PATH holding git and bash only"], "steps": ["run the script"], "expected_results": ["exit 1 and the exact ::error line naming chg/scripts/install-system.sh"]}
+  ],
+  "technical_notes": [
+    "chg verify's flags and outcomes: chg/docs/verify.md:9-17 (--no-run at :14, forward-only push at :10, already/superseded at :11-12, exit codes at :17); clap definition chg/cli/src/main.rs:183-202.",
+    "Prior art for the trigger in this repo: .github/workflows/factory-release.yml:14-30 (workflow_run of CI on master, gated on conclusion success and event push). A workflow_run job checks out the default branch unless told otherwise, so checkout uses ref: ${{ github.event.workflow_run.head_sha }} as factory-release.yml:38 does.",
+    "ci.yml's master concurrency (ci.yml:42-49, group ci-${{ github.ref }}, cancel-in-progress false on master) already gives #985's rule: a newer tip replaces a queued run and a started run is never cancelled. A replaced pending run completes as cancelled, which AC-53.1.2 ignores.",
+    "A green run whose server jobs were skipped by area (a chg/-only commit) still advances: ci.yml's deploy deploys every green merge whatever area it touched (ci.yml:1712-1715), and the ref means 'CI passed here', not 'the server changed'.",
+    "The push uses the checkout's GITHUB_TOKEN (persist-credentials default true). A GITHUB_TOKEN push triggers no workflow (HCB .github/workflows/verify-master.yml:63), which is why US-53.2 triggers on this workflow's completion, not on a push to verified/master.",
+    "chg on fleet-ci comes from chg/scripts/install-system.sh (/usr/local/bin/chg, chg/docs/verify.md:47); present on minis (checked 2026-11-20). beelink and x1: UNGROUNDED until the DoD run lands there.",
+    "docs/runbooks/chg-flow.md is created here with a `verified/master` section: what moves it, the one-time protection (gh api -X PUT repos/mkreyman/loopctl/branches/verified%2Fmaster/protection with allow_force_pushes false and allow_deletions false; verify.md:85 leaves that to the product), and how to read a held ref.",
+    "Only ci.yml (workflow CI) gates the ref. runner-ci.yml, chg-ci.yml and e2e.yml judge artifacts the Fly deploy does not ship."
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Deploying from the ref: US-53.2.",
+    "What a red master run triggers (culprit, revert, flaky): US-53.3.",
+    "Cutting new worktrees from origin/verified/master (chg design.md:422) and changing CLAUDE.md's branch rule: an owner question in the epic report, not built here.",
+    "Publishing coverage records (chg verify without --no-run, verify.md:19): an owner question, since it re-runs the suite on every master tip."
+  ],
+  "failure_modes": {"partition": "AC-53.1.5: a runner that cannot reach GitHub gets exit 2 from chg verify, the job fails and the ref stays where it was; only deploy is delayed.", "state": "AC-53.1.4: the only state is refs/heads/verified/master on GitHub, moved by chg's non-forced push, which GitHub refuses unless it fast-forwards.", "retry": "AC-53.1.6: a re-run of the job, or an older run finishing late, gets chg's already or superseded and pushes nothing.", "slow": "AC-53.1.3: timeout-minutes 10 bounds a slow GitHub, and the verify-master-advance group queues rather than overlaps a second advance.", "reach": "AC-53.1.1: the job is found as the Verify master run triggered by the CI run of its sha, on whichever fleet-ci slot took it."},
+  "definition_of_done": [
+    "After the merge, `git ls-remote origin refs/heads/verified/master` returns the merge commit's sha within one CI run of it going green.",
+    "`gh run list --workflow verify-master.yml --limit 3` shows advance jobs on at least two fleet-ci hosts, and one of them reports `already` or `superseded` in its summary.",
+    "`gh api repos/mkreyman/loopctl/branches/verified%2Fmaster/protection` shows allow_force_pushes false and allow_deletions false."
+  ],
+  "defaults": [
+    "Only the CI workflow (ci.yml) gates verified/master; runner-ci, chg-ci and e2e do not (owner may add them).",
+    "Events that advance: push and schedule; workflow_dispatch never (owner may change).",
+    "Advance job timeout 10 minutes."
+  ],
+  "expected_size": {"insertions": 140, "files": 3},
+  "estimated_tokens": 220000
+}

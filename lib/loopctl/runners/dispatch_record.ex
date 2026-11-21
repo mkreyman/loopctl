@@ -85,6 +85,10 @@ defmodule Loopctl.Runners.DispatchRecord do
     # the first insert's row. NULL for every other row and every row older than the column:
     # story verification then falls back to the source's current base branch.
     field :base_branch, :string
+    # The repository the FIRST push named (#1020), so a configuration refusal is remembered for
+    # the repository it was about. NULL on every row older than the column, which matches no
+    # repository.
+    field :repo, :string
     field :status, :string, default: "sent"
     field :reason, :string
     field :reason_detail, :string
