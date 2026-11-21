@@ -24,6 +24,13 @@ defmodule Loopctl.Projects.Merge do
   every such key first and refuses with the full list, writing nothing. `unique_keys/0` is the
   list, bound to the schema by the same test.
 
+  One per-project unique key is renumbered instead, because its numbers carry no meaning a
+  caller owns: a channel message's `attachment_seq` (US-52.22). The source's channel messages
+  are numbered after the target's highest, in their own order, in one UPDATE taken under the
+  target channel's attachment lock (`Loopctl.Coordination.Messages.lock_attachment/2`). A
+  thread message keeps its `story_id` and its numbering, since its attachment is the story,
+  which moves whole. `renumbered_indexes/0` names these indexes for the schema-binding test.
+
   ## Intake sources keep their repo (#1113)
 
   A live `pr`/`chg` intake source routes one repo's escalations to its project's channel, and
@@ -46,6 +53,7 @@ defmodule Loopctl.Projects.Merge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Coordination.Messages
   alias Loopctl.Intake.Source
   alias Loopctl.Projects
   alias Loopctl.Projects.Project
@@ -80,7 +88,7 @@ defmodule Loopctl.Projects.Merge do
       index: "channel_posts_session_key_uidx",
       table: "channel_posts",
       columns: ~w(agent_id session_id key),
-      where: "%{a}.key IS NOT NULL"
+      where: "%{a}.key LIKE 'handoff:%'"
     },
     %{
       index: "egress_scope_markings_project_scope_idx",
@@ -109,6 +117,10 @@ defmodule Loopctl.Projects.Merge do
     }
   ]
 
+  # Per-project unique indexes a merge never conflicts on because it RENUMBERS the moved rows
+  # instead: a channel message's `attachment_seq` (US-52.22, `renumber_channel/3`).
+  @renumbered_indexes ~w(channel_posts_attachment_seq_uidx)
+
   @type conflict :: %{
           table: String.t(),
           index: String.t(),
@@ -133,6 +145,10 @@ defmodule Loopctl.Projects.Merge do
   @doc "The per-project unique indexes a merge checks for collisions."
   @spec unique_keys() :: [map()]
   def unique_keys, do: @unique_keys
+
+  @doc "The per-project unique indexes a merge renumbers rather than checks."
+  @spec renumbered_indexes() :: [String.t()]
+  def renumbered_indexes, do: @renumbered_indexes
 
   @doc """
   Merges `source_id` into `target_id`, both projects of `tenant_id`.
@@ -328,6 +344,10 @@ defmodule Loopctl.Projects.Merge do
   end
 
   defp move_rows(tenant_id, source, target) do
+    # First, so the generic move below finds only the source's THREAD rows left in
+    # channel_posts (their attachment is the story, so their numbering never collides).
+    renumber_channel(tenant_id, source, target)
+
     Enum.each(@project_tables, fn table ->
       from(r in table,
         where: r.tenant_id == type(^tenant_id, :binary_id),
@@ -337,6 +357,40 @@ defmodule Loopctl.Projects.Merge do
     end)
 
     AdminRepo.update_all(budget_query(tenant_id, source.id), set: [scope_id: target.id])
+  end
+
+  # The source's CHANNEL messages (no story, no holder) move to the target channel numbered
+  # after the target's last `attachment_seq`, in their old order, in ONE statement so
+  # `channel_posts_attachment_seq_uidx` never sees a moved row on a number the target holds.
+  # It runs under the target channel's advisory lock (`Messages.lock_attachment/2`), the lock
+  # every insert on that channel takes, so no insert can take the same numbers meanwhile. An
+  # insert on the source channel waits on the project row lock this merge holds.
+  defp renumber_channel(tenant_id, source, target) do
+    :ok = Messages.lock_attachment(tenant_id, target.id)
+
+    AdminRepo.query!(
+      """
+      UPDATE channel_posts p
+      SET project_id = $3,
+          attachment_seq = m.base + r.n
+      FROM (
+        SELECT id, row_number() OVER (ORDER BY attachment_seq, inserted_at, seq) AS n
+        FROM channel_posts
+        WHERE tenant_id = $1 AND project_id = $2
+          AND story_id IS NULL AND to_holder_id IS NULL
+      ) r,
+      (
+        SELECT COALESCE(MAX(attachment_seq), 0) AS base
+        FROM channel_posts
+        WHERE tenant_id = $1 AND project_id = $3
+          AND story_id IS NULL AND to_holder_id IS NULL
+      ) m
+      WHERE p.id = r.id
+      """,
+      [Ecto.UUID.dump!(tenant_id), Ecto.UUID.dump!(source.id), Ecto.UUID.dump!(target.id)]
+    )
+
+    :ok
   end
 
   defp sweep(tenant_id, source, target, counts, opts) do

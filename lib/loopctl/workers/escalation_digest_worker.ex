@@ -24,8 +24,8 @@ defmodule Loopctl.Workers.EscalationDigestWorker do
 
   ## Retries cannot post twice
 
-  Each post's key carries the project and the UTC date of the run (`digest_key/2`), and the
-  channel's session-key unique index makes a second insert of the same slot a refusal that
+  Each post's idempotency key carries the project and the UTC date of the run (`digest_key/2`),
+  and `channel_posts_idempotency_uidx` makes a second insert with the same key a refusal that
   `post_digest/2` reads as `:already_posted`. A retried job, or a second node's run on the same
   day, therefore posts nothing new. `now` is read once per run, so every tenant's posts in
   one run carry the same date.

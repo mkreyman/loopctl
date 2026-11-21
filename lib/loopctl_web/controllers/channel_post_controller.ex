@@ -63,6 +63,7 @@ defmodule LoopctlWeb.ChannelPostController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelCursor
+  alias Loopctl.Coordination.Messages
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -112,12 +113,16 @@ defmodule LoopctlWeb.ChannelPostController do
       "Posts one short, attributed coordination message to a project's channel (a channel IS a " <>
         "project_id). Agent+ role, NOT behind the human-anchor tier (coordination surface, owner " <>
         "decision #331). tenant_id and agent_id are stamped server-side from the verified key — " <>
-        "any agent_id/tenant_id in the body is ignored. With a `key` the write upserts the " <>
-        "caller's own per-session working-state slot (200); without a key it is a new " <>
-        "append-only row (201). On the keyless path an OPTIONAL idempotency_key makes a " <>
-        "retried append idempotent: a repeat write with the same (tenant, project, agent, " <>
-        "idempotency_key) returns the EXISTING post (200, created:false) instead of " <>
-        "appending a duplicate. expires_at is set server-side to now + 30 days.",
+        "any agent_id/tenant_id in the body is ignored. A `key` must start `handoff:`: such a " <>
+        "write upserts the caller's own per-session handoff slot (200). Any other key is " <>
+        "refused 422 `keyed_slot_retired` (working state is work-item notes, written with " <>
+        "the notes verb). Without a key it is a new append-only row (201). On the keyless " <>
+        "path an OPTIONAL idempotency_key makes a retried append idempotent: a repeat write " <>
+        "with the same (tenant, project, agent, idempotency_key) returns the EXISTING post " <>
+        "(200, created:false) instead of appending a duplicate. expires_at is set " <>
+        "server-side: now + the tenant setting channel_message_retention_days (default " <>
+        "#{Messages.default_channel_retention_days()}) for a message, now + " <>
+        "#{Coordination.retention_days()} days for a `handoff:` key.",
     request_body: {"Channel post params", "application/json", Schemas.ChannelPostRequest},
     responses: %{
       201 => {"Post created", "application/json", Schemas.ChannelPostResponse},
@@ -126,8 +131,8 @@ defmodule LoopctlWeb.ChannelPostController do
            "the existing post (created:false)", "application/json", Schemas.ChannelPostResponse},
       403 => {"Agent identity required", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error or unknown/cross-tenant project", "application/json",
-         Schemas.ErrorResponse},
+        {"Validation error, unknown/cross-tenant project, or code `keyed_slot_retired` " <>
+           "(a key that does not start `handoff:`)", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -957,6 +962,19 @@ defmodule LoopctlWeb.ChannelPostController do
     # so the write was rolled back. Also the pre-existing supersede-target case
     # above, which returns the same shape with its own message.
     err
+  end
+
+  defp render_write(conn, {:error, :keyed_slot_retired}, _tenant_id, _agent_id, _params) do
+    # US-52.22: a key that does not start `handoff:` names a retired working-state slot.
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "keyed_slot_retired",
+        message: Messages.keyed_slot_retired_message()
+      }
+    })
   end
 
   defp render_write(_conn, {:error, :conflict} = err, _tenant_id, _agent_id, _params) do

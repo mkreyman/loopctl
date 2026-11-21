@@ -142,19 +142,22 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
       refute Map.has_key?(row, "lock_target")
     end
 
-    # US-52.21: the `claim:` prefix is no longer reserved on the post path. A post
-    # keyed `claim:` is an ordinary post and never surfaces as a lock.
-    test "an ordinary post keyed claim: -> 201, and it is not a lock" do
+    # US-52.21 stopped reserving `claim:` on the post path; US-52.22 then retired every
+    # key that does not start `handoff:`. A post keyed `claim:` is refused, never a lock.
+    test "a post keyed claim: -> 422 keyed_slot_retired, and it is not a lock" do
       %{project: project, raw: raw} = setup_member()
 
-      raw
-      |> post_json("/api/v1/channel/posts", %{
-        "project_id" => project.id,
-        "body" => "ordinary keyed working state",
-        "key" => "claim:story-812",
-        "session_id" => "sess-a"
-      })
-      |> json_response(201)
+      body =
+        raw
+        |> post_json("/api/v1/channel/posts", %{
+          "project_id" => project.id,
+          "body" => "ordinary keyed working state",
+          "key" => "claim:story-812",
+          "session_id" => "sess-a"
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "keyed_slot_retired"
 
       listing =
         authed_conn(raw)

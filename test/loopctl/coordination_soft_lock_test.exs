@@ -523,11 +523,11 @@ defmodule Loopctl.CoordinationSoftLockTest do
       refute function_exported?(Coordination, :lock_key_prefix, 0)
     end
 
-    test "an ordinary post keyed claim: is an ordinary 30-day post, not a lock" do
+    # US-52.22 retired every non-handoff key, so a claim: key is refused like any other.
+    test "a post keyed claim: is refused keyed_slot_retired and never becomes a lock" do
       ctx = setup_member()
-      before = DateTime.utc_now()
 
-      assert {:ok, post, :created} =
+      assert {:error, :keyed_slot_retired} =
                Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
                  project_id: ctx.project.id,
                  body: "working state",
@@ -536,9 +536,7 @@ defmodule Loopctl.CoordinationSoftLockTest do
                  audit: audit()
                })
 
-      assert DateTime.diff(post.expires_at, before) > 29 * 24 * 3600
-
-      assert {:ok, _created} =
+      assert {:error, :keyed_slot_retired} =
                Coordination.create_post(ctx.tenant.id, ctx.project.id, ctx.agent_id, %{
                  key: "claim:story-813",
                  session_id: "sess-a",

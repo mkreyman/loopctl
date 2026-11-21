@@ -2845,6 +2845,27 @@ defmodule Loopctl.Fixtures do
   # (the runner's 1.27.0 report) default to NULL, a 1.26.0 runner's row. Pass `:tenant_id` to
   # add to an existing tenant, and `:sibling_of` (a story) to put the new story in that story's
   # project. Returns `%{story:, stage:, dispatch:}`.
+  # A live interactive holder (US-52.13), registered through `Loopctl.Holders.register/4`.
+  # Pass `:tenant_id` and `:agent_id` to put it on an existing tenant and agent (an agent is
+  # created in the tenant otherwise), and `:session_id` / `:host` to name it.
+  def fixture(:holder, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:tenant).id end)
+
+    agent_id =
+      Map.get_lazy(attrs, :agent_id, fn -> fixture(:agent, %{tenant_id: tenant_id}).id end)
+
+    {:ok, %{holder: holder}} =
+      Loopctl.Holders.register(tenant_id, agent_id, %{
+        "kind" => "interactive",
+        "session_id" =>
+          Map.get(attrs, :session_id, "session-#{System.unique_integer([:positive])}"),
+        "host" => Map.get(attrs, :host, "minis")
+      })
+
+    holder
+  end
+
   def fixture(:escalated_story, attrs) do
     attrs = Enum.into(attrs, %{})
     edge = Map.get(attrs, :edge, :budget_reported)

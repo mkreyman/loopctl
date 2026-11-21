@@ -6,6 +6,24 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A channel post is a message with one attachment; channel posts live 7 days; keyed
+  working-state slots are retired (2026-11-21, US-52.22).** Migration `20261121110000` adds
+  `story_id`, `to_holder_id`, `author_holder_id` and `attachment_seq` to `channel_posts`,
+  makes `project_id` and `expires_at` nullable, and adds the check
+  `channel_posts_one_attachment` and the unique index `channel_posts_attachment_seq_uidx`. It
+  needs no manual step, and it changes existing data: `attachment_seq` is backfilled per
+  project in insertion order; every channel post not keyed `handoff:` is clamped to
+  `inserted_at + 7 days` (quarantined posts keep their review window), so posts older than 7
+  days are swept on the next `ChannelPostSweeper` run; every key that does not start
+  `handoff:` is set to NULL (an escalation digest's day key moves to its `idempotency_key`);
+  and `channel_posts_session_key_uidx` is rebuilt with the predicate `key LIKE 'handoff:%'`.
+  Breaking for a client of `POST /api/v1/channel/posts` (MCP `channel_post`): a `key` that
+  does not start `handoff:` is now refused `422` with code `keyed_slot_retired`; write working
+  state as work-item notes. A new channel post lives the new tenant setting
+  `channel_message_retention_days` (default 7) instead of 30 days; a `handoff:` post keeps 30.
+  Post JSON gains `story_id`, `to_holder_id`, `author_holder_id` and `attachment_seq`.
+  Releasing a quarantined post now rolls it back to its own window (7 days for a channel post)
+  rather than 30.
 - **Advisory soft-locks move to their own table; `channel_recent` rows lose `lock` and
   `lock_target` (US-52.21).** A file soft-lock is now a `channel_locks` row, not a
   `claim:`-keyed `channel_posts` row. Migration `20261121100000` creates the table (RLS

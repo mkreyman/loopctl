@@ -84,7 +84,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
   describe "POST /api/v1/channel/posts" do
     # TC-39.2.1
-    test "agent posts to own project channel -> 201 with server-stamped identity + ~30d expiry" do
+    test "agent posts to own project channel -> 201 with server-stamped identity + ~7d expiry" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       project = fixture(:project, %{tenant_id: tenant.id})
       {raw, _key, agent} = member_agent_key(tenant, project)
@@ -98,7 +98,8 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert post["body"] == "pushed PR #107, CI green"
 
       {:ok, expires, _} = DateTime.from_iso8601(post["expires_at"])
-      expected = DateTime.add(DateTime.utc_now(), 30 * 86_400, :second)
+      # US-52.22: a channel message lives the tenant's channel window, 7 days by default.
+      expected = DateTime.add(DateTime.utc_now(), 7 * 86_400, :second)
       assert_in_delta DateTime.to_unix(expires), DateTime.to_unix(expected), 120
     end
 
@@ -409,7 +410,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         %{
           "project_id" => project.id,
           "session_id" => session,
-          "key" => "session_goal",
+          "key" => "handoff:session_goal",
           "body" => body
         }
       end
@@ -434,6 +435,46 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         )
 
       assert count == 2
+    end
+
+    # TC-52.22.5 — a key that does not start handoff: names a retired working-state slot.
+    test "a non-handoff key -> 422 keyed_slot_retired naming work-item notes, nothing written" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      for key <- ["session_goal", "plan", "claim:lib/a.ex"] do
+        body =
+          raw
+          |> post_json(%{
+            "project_id" => project.id,
+            "session_id" => "S1",
+            "key" => key,
+            "body" => "goal"
+          })
+          |> json_response(422)
+
+        assert body["error"]["code"] == "keyed_slot_retired"
+        assert body["error"]["message"] =~ "work-item notes"
+      end
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count
+             ) ==
+               0
+
+      # A keyless post is a 201 with the 7-day channel window and its attachment_seq.
+      assert %{"post" => post} =
+               raw
+               |> post_json(%{"project_id" => project.id, "body" => "status"})
+               |> json_response(201)
+
+      assert post["attachment_seq"] == 1
+      assert post["story_id"] == nil
+      assert post["to_holder_id"] == nil
+      {:ok, expires_at, 0} = DateTime.from_iso8601(post["expires_at"])
+      assert_in_delta DateTime.diff(expires_at, DateTime.utc_now()), 7 * 86_400, 120
     end
 
     # TC-40.B2.2 — a keyless write with a client idempotency token dedups: the
@@ -1241,6 +1282,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       AdminRepo.insert!(%ChannelPost{
         tenant_id: tenant.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: project.id,
         agent_id: agent_id,
         body: Map.get(attrs, :body, "please pick up this handoff"),

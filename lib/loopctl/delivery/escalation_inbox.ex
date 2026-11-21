@@ -64,8 +64,9 @@ defmodule Loopctl.Delivery.EscalationInbox do
   of any reason class escalated more than an hour before `now`: the count per class, the story
   ids with their class, and `work_left_behind` — never `escalation_reason`, which is untrusted
   text and would reach
-  every peer session's SessionStart preview. Its key is `escalation-digest:<project>:<UTC
-  date>`, and the post slot's unique index makes a second run on the same day a no-op
+  every peer session's SessionStart preview. It is a keyless channel message whose
+  `idempotency_key` is `escalation-digest:<project>:<UTC date>` (`digest_key/2`), and
+  `channel_posts_idempotency_uidx` makes a second run on the same day a no-op
   (`:already_posted`) rather than a second post.
 
   It posts as a per-tenant SYSTEM agent, `system:escalation-digest`. The `system:` prefix is
@@ -632,10 +633,14 @@ defmodule Loopctl.Delivery.EscalationInbox do
   defp work_left_behind(%{run: %{work_left_behind: value}}), do: value
   defp work_left_behind(_row), do: :unknown
 
+  # A keyless channel message deduped by its idempotency key (US-52.22: keyed working-state
+  # slots are retired). `channel_posts_idempotency_uidx` holds one row per (tenant, project,
+  # system agent, digest_key), so a retried job or a second node's run that day is refused by
+  # the index and answers `:already_posted`.
   defp post_project(tenant_id, project_id, agent_id, {rows, by_class}, now) do
     attrs = %{
       body: digest_body(rows, now, by_class),
-      key: digest_key(project_id, now),
+      idempotency_key: digest_key(project_id, now),
       session_id: @digest_session
     }
 
@@ -644,7 +649,7 @@ defmodule Loopctl.Delivery.EscalationInbox do
         {:posted, post.id}
 
       {:error, %Ecto.Changeset{} = changeset} ->
-        if slot_taken?(changeset),
+        if already_posted?(changeset),
           do: :already_posted,
           else: {:error, project_id, changeset_errors(changeset)}
 
@@ -653,9 +658,9 @@ defmodule Loopctl.Delivery.EscalationInbox do
     end
   end
 
-  defp slot_taken?(%Ecto.Changeset{errors: errors}) do
+  defp already_posted?(%Ecto.Changeset{errors: errors}) do
     Enum.any?(errors, fn {field, {_message, meta}} ->
-      field == :key and Keyword.get(meta, :constraint) == :unique
+      field == :idempotency_key and Keyword.get(meta, :constraint) == :unique
     end)
   end
 

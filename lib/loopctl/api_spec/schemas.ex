@@ -1234,9 +1234,9 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           nullable: true,
           description:
-            "Optional working-state slot key; a repeat post from the same session upserts it. " <>
-              "A handoff should pass a stable key of the form handoff:<anchor> " <>
-              "(e.g. handoff:repo#812) so a same-session retry refreshes the same slot."
+            "Optional handoff slot key, of the form handoff:<anchor> (e.g. handoff:repo#812); " <>
+              "a repeat post from the same session upserts it. Any other key is refused 422 " <>
+              "keyed_slot_retired: working state is work-item notes."
         },
         idempotency_key: %Schema{
           type: :string,

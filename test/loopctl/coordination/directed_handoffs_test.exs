@@ -31,6 +31,7 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
 
     AdminRepo.insert!(%ChannelPost{
       tenant_id: Map.get(attrs, :tenant_id, ctx.tenant.id),
+      attachment_seq: System.unique_integer([:positive]),
       project_id: Map.get(attrs, :project_id, ctx.project.id),
       agent_id: Map.get(attrs, :agent_id, ctx.agent_id),
       body: Map.get(attrs, :body, "please pick up this handoff"),
@@ -47,6 +48,7 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
 
     AdminRepo.insert!(%ChannelPost{
       tenant_id: ctx.tenant.id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: ctx.project.id,
       agent_id: ctx.agent_id,
       body: body,
@@ -342,6 +344,7 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
 
           %{
             tenant_id: ctx.tenant.id,
+            attachment_seq: System.unique_integer([:positive]),
             project_id: ctx.project.id,
             agent_id: ctx.agent_id,
             body: "handoff #{i}",
@@ -403,6 +406,7 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
 
           %{
             tenant_id: ctx.tenant.id,
+            attachment_seq: System.unique_integer([:positive]),
             project_id: ctx.project.id,
             agent_id: ctx.agent_id,
             session_id: session,

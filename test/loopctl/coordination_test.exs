@@ -7,6 +7,7 @@ defmodule Loopctl.CoordinationTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Coordination.Messages
   alias Loopctl.Progress
   alias Loopctl.Repo
 
@@ -28,8 +29,14 @@ defmodule Loopctl.CoordinationTest do
       assert is_nil(post.key)
       assert is_nil(post.refs)
 
-      # expires_at is ~30 days out (server-set, uniform retention).
-      expected = DateTime.add(DateTime.utc_now(), Coordination.retention_days() * 86_400, :second)
+      # expires_at is the channel window out (server-set; US-52.22: 7 days by default).
+      expected =
+        DateTime.add(
+          DateTime.utc_now(),
+          Messages.default_channel_retention_days() * 86_400,
+          :second
+        )
+
       assert_in_delta DateTime.to_unix(post.expires_at), DateTime.to_unix(expected), 120
     end
 
@@ -91,7 +98,7 @@ defmodule Loopctl.CoordinationTest do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
-      attrs = %{"body" => "goal", "session_id" => "S1", "key" => "session_goal"}
+      attrs = %{"body" => "goal", "session_id" => "S1", "key" => "handoff:session_goal"}
 
       assert {:ok, _post} = Coordination.create_post(tenant.id, project.id, agent_id, attrs)
 
@@ -812,14 +819,14 @@ defmodule Loopctl.CoordinationTest do
                Coordination.create_post(tenant.id, project.id, agent_id, %{
                  "body" => "goal A",
                  "session_id" => "S1",
-                 "key" => "session_goal"
+                 "key" => "handoff:session_goal"
                })
 
       assert {:ok, post_b} =
                Coordination.create_post(tenant.id, project.id, agent_id, %{
                  "body" => "goal B",
                  "session_id" => "S2",
-                 "key" => "session_goal"
+                 "key" => "handoff:session_goal"
                })
 
       assert post_a.id != post_b.id
@@ -1007,7 +1014,13 @@ defmodule Loopctl.CoordinationTest do
       assert post.tenant_id == tenant.id
       assert post.agent_id == agent_id
 
-      expected = DateTime.add(DateTime.utc_now(), Coordination.retention_days() * 86_400, :second)
+      expected =
+        DateTime.add(
+          DateTime.utc_now(),
+          Messages.default_channel_retention_days() * 86_400,
+          :second
+        )
+
       assert_in_delta DateTime.to_unix(post.expires_at), DateTime.to_unix(expected), 120
 
       entry = one_audit_entry(tenant.id, post.id)
@@ -1020,7 +1033,12 @@ defmodule Loopctl.CoordinationTest do
          ctx do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 
-      base = %{project_id: project.id, session_id: "S1", key: "session_goal", audit: audit}
+      base = %{
+        project_id: project.id,
+        session_id: "S1",
+        key: "handoff:session_goal",
+        audit: audit
+      }
 
       assert {:ok, first, :created} =
                Coordination.post(tenant.id, agent_id, :agent, Map.put(base, :body, "v1"))
@@ -1173,7 +1191,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  session_id: "S1",
-                 key: "session_goal",
+                 key: "handoff:session_goal",
                  body: "v1",
                  audit: audit
                })
@@ -1182,7 +1200,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  session_id: "S2",
-                 key: "session_goal",
+                 key: "handoff:session_goal",
                  body: "other",
                  audit: audit
                })
@@ -1207,7 +1225,12 @@ defmodule Loopctl.CoordinationTest do
         agent_status: :assigned
       })
 
-      slot = %{project_id: project.id, session_id: "S1", key: "session_goal", audit: audit}
+      slot = %{
+        project_id: project.id,
+        session_id: "S1",
+        key: "handoff:session_goal",
+        audit: audit
+      }
 
       assert {:ok, post_a, :created} =
                Coordination.post(tenant.id, agent_a, :agent, Map.put(slot, :body, "a"))
@@ -1293,14 +1316,14 @@ defmodule Loopctl.CoordinationTest do
                Coordination.create_post(tenant.id, project.id, agent_id, %{
                  "body" => "seed",
                  "session_id" => "S1",
-                 "key" => "session_goal"
+                 "key" => "handoff:session_goal"
                })
 
       assert {:ok, post, :updated} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  session_id: "S1",
-                 key: "session_goal",
+                 key: "handoff:session_goal",
                  body: "v2",
                  audit: audit
                })

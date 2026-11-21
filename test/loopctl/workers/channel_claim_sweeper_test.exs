@@ -18,6 +18,7 @@ defmodule Loopctl.Workers.ChannelClaimSweeperTest do
 
     AdminRepo.insert!(%ChannelPost{
       tenant_id: tenant.id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: project.id,
       agent_id: fixture(:agent, %{tenant_id: tenant.id}).id,
       body: "please pick up this handoff",
@@ -191,6 +192,7 @@ defmodule Loopctl.Workers.ChannelClaimSweeperTest do
 
       AdminRepo.insert!(%ChannelPost{
         tenant_id: tenant.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: project.id,
         agent_id: fixture(:agent, %{tenant_id: tenant.id}).id,
         body: "expired handoff",

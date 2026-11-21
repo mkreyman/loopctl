@@ -5,8 +5,8 @@ defmodule Loopctl.Coordination do
   other's working-state.
 
   A **channel is a `project_id`**. A post is one attributed message with a
-  uniform 30-day TTL; there is no message-type taxonomy. Durable keepers
-  graduate to Knowledge — the rest expires.
+  lifetime set by its attachment (`Loopctl.Coordination.Messages`, US-52.22); there is no
+  message-type taxonomy. Durable keepers graduate to Knowledge — the rest expires.
 
   ## Isolation
 
@@ -33,6 +33,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Coordination.ChannelCursor
   alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Coordination.Messages
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge
   alias Loopctl.Projects
@@ -41,9 +42,11 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
 
-  # Uniform retention for every post — one authoritative constant in code, not a
-  # DB default (owner decision; the fleet audit showed the category taxonomy and
-  # per-type retentions were unused).
+  # The retention of a channel row keyed `handoff:<anchor>` — one authoritative constant
+  # in code, not a DB default. Since US-52.22 every other message's lifetime follows its
+  # attachment (`Loopctl.Coordination.Messages`): a thread or DM has none, a channel
+  # message lives the tenant's `channel_message_retention_days` (default 7). Handoff
+  # posts keep this window until release 7 moves them.
   @retention_days 30
 
   # Issue #499: the 422 a KEYLESS idempotent re-write gets when the row holding its
@@ -231,7 +234,7 @@ defmodule Loopctl.Coordination do
   # design — AC-40.C2.4 — so the drain is the history read, not a delta continuation.)
   @commit_lag_epsilon_seconds 5
 
-  @doc "The uniform retention window, in days, applied to every post."
+  @doc "The retention window, in days, of a channel row keyed `handoff:<anchor>`."
   @spec retention_days() :: pos_integer()
   def retention_days, do: @retention_days
 
@@ -343,8 +346,11 @@ defmodule Loopctl.Coordination do
   on the struct (never from caller input); only `body` and the optional
   `session_id`/`host`/`key`/`refs`/`to_host`/`to_capability` are cast from `attrs`
   (`to_host`/`to_capability` are the advisory, spoofable, surfacing-only addressing
-  fields — see the `ChannelPost` moduledoc trust boundary). `expires_at` is fixed
-  at `now + #{@retention_days} days`.
+  fields — see the `ChannelPost` moduledoc trust boundary). The insert goes through
+  `Loopctl.Coordination.Messages.insert/2`, which numbers the post in its channel and sets
+  `expires_at` from the attachment (the tenant's channel window, or
+  #{@retention_days} days for a `handoff:` key). A key that does not start `handoff:` is
+  `{:error, :keyed_slot_retired}`.
 
   Both `project_id` and `agent_id` must belong to `tenant_id`; a mispaired call
   returns `{:error, :not_found}` rather than inserting a cross-tenant-shaped row
@@ -362,18 +368,13 @@ defmodule Loopctl.Coordination do
   @spec create_post(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
           {:ok, ChannelPost.t()}
           | {:error, Ecto.Changeset.t()}
-          | {:error, :not_found}
+          | {:error, :not_found | :keyed_slot_retired}
   def create_post(tenant_id, project_id, agent_id, attrs) do
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- Agents.get_agent(tenant_id, agent_id) do
-      %ChannelPost{
-        tenant_id: tenant_id,
-        project_id: project_id,
-        agent_id: agent_id,
-        expires_at: default_expires_at()
-      }
+      %ChannelPost{tenant_id: tenant_id, project_id: project_id, agent_id: agent_id}
       |> ChannelPost.create_changeset(attrs)
-      |> AdminRepo.insert()
+      |> Messages.insert()
       |> tap_secret_blocked()
     end
   end
@@ -399,7 +400,16 @@ defmodule Loopctl.Coordination do
     * `:audit` — the actor context keyword list (from
       `LoopctlWeb.AuditContext.from_conn/1`) written into the audit entry.
 
-  `expires_at` is fixed server-side at `now + #{@retention_days} days`.
+  `expires_at` is set server-side from the attachment by `Messages.insert/2`: the tenant's
+  `channel_message_retention_days` (default 7) for a channel message, #{@retention_days}
+  days for a `handoff:` key.
+
+  ## Retired keyed slots (US-52.22)
+
+  A `key` that does not start `handoff:` is refused `{:error, :keyed_slot_retired}`
+  (HTTP 422 `keyed_slot_retired`): a session's working state is work-item notes. The refusal
+  is judged after the ownership and membership gates, so a non-member still gets the shared
+  ownership 422.
 
   ## Project-scoped write authorization (US-40.D3) — default-DENY cross-project
 
@@ -584,6 +594,7 @@ defmodule Loopctl.Coordination do
           | {:error, :supersede_target_not_found}
           | {:error, :agent_not_found}
           | {:error, :conflict}
+          | {:error, :keyed_slot_retired}
           # Issue #499 quarantine outcomes (message-carrying 422s): the idempotency
           # token belongs to a QUARANTINED row, or the persisted row still carries a
           # credential in a field the keyed upsert cannot overwrite.
@@ -631,6 +642,7 @@ defmodule Loopctl.Coordination do
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
+         :ok <- refuse_retired_key(Map.get(attrs, :key)),
          {:ok, supersedes} <-
            fetch_supersede_target(
              tenant_id,
@@ -648,20 +660,19 @@ defmodule Loopctl.Coordination do
         |> maybe_derive_handoff_key()
         |> maybe_surrogate_session()
 
+      # `expires_at` and `attachment_seq` are set by `Messages.insert/2` from the
+      # attachment, never cast from attrs, so no request body can reach them.
       changeset =
-        %ChannelPost{
-          tenant_id: tenant_id,
-          project_id: project_id,
-          agent_id: agent_id,
-          # Fixed at `now + @retention_days` for EVERY post, set on the STRUCT and
-          # never cast from attrs, so no request body can reach it.
-          expires_at: default_expires_at()
-        }
+        %ChannelPost{tenant_id: tenant_id, project_id: project_id, agent_id: agent_id}
         |> ChannelPost.create_changeset(attrs)
         |> put_provenance_changes(attrs)
 
       run_post(tenant_id, changeset, audit, supersedes)
     end
+  end
+
+  defp refuse_retired_key(key) do
+    if Messages.retired_key?(key), do: {:error, :keyed_slot_retired}, else: :ok
   end
 
   # US-454 (defect 1), issue fix 1: a KEYLESS post whose body ANNOUNCES a
@@ -754,6 +765,8 @@ defmodule Loopctl.Coordination do
         [p],
         p.tenant_id == ^tenant_id and p.project_id == ^project_id and p.id == ^target_id
       )
+      # A thread message shares its story's project_id; only a CHANNEL post is a target.
+      |> channel_attached()
       |> AdminRepo.one()
 
     case target do
@@ -2622,7 +2635,7 @@ defmodule Loopctl.Coordination do
   def release_post(tenant_id, agent_id, role, post_id, audit \\ []) do
     with true <- valid_uuid?(tenant_id) and valid_uuid?(post_id),
          true <- Role.role_at_least?(role, :user),
-         %ChannelPost{quarantined_at: %DateTime{}} = post <- fetch_owned_post(tenant_id, post_id) do
+         %ChannelPost{quarantined_at: %DateTime{}} = post <- fetch_any_post(tenant_id, post_id) do
       run_release(tenant_id, agent_id, post, audit)
     else
       _ -> {:error, :not_found}
@@ -2636,7 +2649,7 @@ defmodule Loopctl.Coordination do
       Multi.new()
       |> Multi.update(
         :post,
-        ChannelPost.release_changeset(post, DateTime.utc_now(), @retention_days)
+        ChannelPost.release_changeset(post, DateTime.utc_now(), Messages.retention_days_for(post))
       )
       |> Audit.log_in_multi(:audit, fn %{post: released} ->
         %{
@@ -2849,10 +2862,26 @@ defmodule Loopctl.Coordination do
   # boundary on the AdminRepo (BYPASSRLS) path. A foreign-tenant or nonexistent
   # id returns nil, so both collapse to the same 404 (no existence oracle). Shared
   # by the redact path (`delete_post/5`) and the public by-id read (`get_post/2`).
+  #
+  # CHANNEL rows only (US-52.22, AC-52.22.7): a thread message or a DM is not a channel
+  # post, so the channel's by-id read, graduate and redact never resolve one. The operator's
+  # quarantine review and release see every attachment (`fetch_any_post/2`).
   defp fetch_owned_post(tenant_id, post_id) do
     ChannelPost
     |> where([p], p.id == ^post_id and p.tenant_id == ^tenant_id)
+    |> channel_attached()
     |> AdminRepo.one()
+  end
+
+  defp fetch_any_post(tenant_id, post_id) do
+    ChannelPost
+    |> where([p], p.id == ^post_id and p.tenant_id == ^tenant_id)
+    |> AdminRepo.one()
+  end
+
+  # The channel attachment: neither a thread (`story_id`) nor a DM (`to_holder_id`).
+  defp channel_attached(query) do
+    where(query, [p], is_nil(p.story_id) and is_nil(p.to_holder_id))
   end
 
   # Delete + audit in ONE transaction so the removal survives in the trail even
@@ -2962,7 +2991,7 @@ defmodule Loopctl.Coordination do
 
     multi =
       Multi.new()
-      |> Multi.insert(:post, changeset, insert_opts)
+      |> Multi.run(:post, fn _repo, _changes -> Messages.insert(changeset, insert_opts) end)
       |> secret_guard_step()
       |> maybe_supersede_step(supersedes)
       |> Audit.log_in_multi(:audit_post, fn %{post: post} ->
@@ -2995,6 +3024,10 @@ defmodule Loopctl.Coordination do
         # does. Without it the security counter under-reports exactly the confirmed cases.
         ChannelPost.emit_secret_blocked_fields(post, fields)
         {:error, :unprocessable_entity, @persisted_secret_message}
+
+      # `Messages.insert/2` refuses a retired key itself too; `post/4` judges it first.
+      {:error, :post, :keyed_slot_retired, _changes} ->
+        {:error, :keyed_slot_retired}
 
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
@@ -3233,9 +3266,10 @@ defmodule Loopctl.Coordination do
   defp insert_opts(_key) do
     [
       on_conflict: keyed_slot_on_conflict(),
+      # The index predicate since US-52.22: only `handoff:` keys hold a slot.
       conflict_target:
         {:unsafe_fragment,
-         "(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL"},
+         "(tenant_id, project_id, agent_id, session_id, key) WHERE key LIKE 'handoff:%'"},
       returning: true
     ]
   end
@@ -3453,6 +3487,9 @@ defmodule Loopctl.Coordination do
       base =
         ChannelPost
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+        # US-52.22: a thread message carries its story's project_id; the channel read
+        # returns channel rows only.
+        |> channel_attached()
         |> where([p], p.expires_at > ^now)
         |> where([p], is_nil(p.quarantined_at))
         |> apply_since(commit_lag_since(since))
@@ -3595,6 +3632,7 @@ defmodule Loopctl.Coordination do
       deduped =
         from(p in ChannelPost, as: :post)
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+        |> channel_attached()
         |> where([p], like(p.key, "handoff:%"))
         |> where([p], p.expires_at > ^now)
         # Issue #499: a QUARANTINED post carries a credential shape the write-time
@@ -3973,10 +4011,6 @@ defmodule Loopctl.Coordination do
       _ ->
         :error
     end
-  end
-
-  defp default_expires_at do
-    DateTime.add(DateTime.utc_now(), @retention_days * 24 * 60 * 60, :second)
   end
 
   defp clamp_limit(limit) when is_integer(limit) and limit > 0,

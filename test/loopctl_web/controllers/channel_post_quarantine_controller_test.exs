@@ -47,6 +47,7 @@ defmodule LoopctlWeb.ChannelPostQuarantineControllerTest do
     post =
       %ChannelPost{
         tenant_id: tenant.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: project.id,
         agent_id: agent.id,
         body: "here is the key #{@secret}",
@@ -85,6 +86,7 @@ defmodule LoopctlWeb.ChannelPostQuarantineControllerTest do
 
       %ChannelPost{
         tenant_id: tenant.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: project.id,
         agent_id: agent.id,
         body: "ordinary chatter",
@@ -175,6 +177,7 @@ defmodule LoopctlWeb.ChannelPostQuarantineControllerTest do
 
       %ChannelPost{
         tenant_id: tenant.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: project.id,
         agent_id: agent.id,
         idempotency_key: "tok-http-499",

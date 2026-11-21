@@ -31,6 +31,7 @@ defmodule Loopctl.Repo.CreateChannelLocksMigrationTest do
       struct(
         %ChannelPost{
           tenant_id: ctx.tenant.id,
+          attachment_seq: System.unique_integer([:positive]),
           project_id: ctx.project.id,
           agent_id: ctx.agent.id,
           session_id: "s1",

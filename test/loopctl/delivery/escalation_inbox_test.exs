@@ -329,8 +329,13 @@ defmodule Loopctl.Delivery.EscalationInboxTest do
       assert [post] = posts(tenant_id)
       assert post.id == post_id
       assert post.project_id == old.project_id
-      assert post.key == "escalation-digest:#{old.project_id}:2026-11-07"
-      assert post.key == EscalationInbox.digest_key(old.project_id, @now)
+      # US-52.22: the day's digest dedups on its idempotency key, never a keyed slot.
+      assert post.key == nil
+      assert post.idempotency_key == "escalation-digest:#{old.project_id}:2026-11-07"
+      assert post.idempotency_key == EscalationInbox.digest_key(old.project_id, @now)
+      # A channel message: the tenant's channel window (7 days by default).
+      assert post.story_id == nil
+      assert post.to_holder_id == nil
       assert post.body =~ "3 stories are parked"
       # From the runner's session-end report, and unknown where it made none.
       assert post.body =~ "#{old.id} budget_exhausted work_left_behind=unknown"

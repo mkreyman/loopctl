@@ -18,6 +18,7 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Coordination.Messages
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Workers.ChannelPostRescanWorker
 
@@ -46,6 +47,7 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
   defp insert_dirty_post(ctx, attrs) do
     %ChannelPost{
       tenant_id: ctx.tenant.id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: ctx.project.id,
       agent_id: ctx.agent_id,
       body: "leak #{@secret}",
@@ -287,6 +289,7 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
 
       %ChannelPost{
         tenant_id: other_tenant.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: other_project.id,
         agent_id: other_agent,
         body: "leak #{@secret}",
@@ -447,7 +450,9 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
                  ctx.audit
                )
 
-      original = DateTime.add(inserted_at, Coordination.retention_days() * 86_400, :second)
+      original =
+        DateTime.add(inserted_at, Messages.default_channel_retention_days() * 86_400, :second)
+
       assert DateTime.compare(released.expires_at, original) != :gt
     end
 

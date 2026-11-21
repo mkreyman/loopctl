@@ -305,8 +305,21 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     // fallback fired.
     assert.match(
       INDEX_SRC,
-      /Optional per-session working-state slot key[\s\S]*?process-lifetime fallback[\s\S]*?surrogate[\s\S]*?session_id_source/,
+      /Optional per-session handoff slot key[\s\S]*?process-lifetime fallback[\s\S]*?surrogate[\s\S]*?session_id_source/,
       "the channel_post `key` description must document the session fallbacks (US-454)",
+    );
+  });
+
+  test("channel_post names the keyed_slot_retired refusal for a non-handoff key (US-52.22)", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_post"[\s\S]*?Any other key is REFUSED 422 keyed_slot_retired[\s\S]*?work_item_note/,
+      "the channel_post description must say a non-handoff key is refused keyed_slot_retired",
+    );
+    assert.match(
+      INDEX_SRC,
+      /Optional per-session handoff slot key; it must start handoff: \(any other key is refused 422 keyed_slot_retired/,
+      "the channel_post `key` property must say a non-handoff key is refused",
     );
   });
 

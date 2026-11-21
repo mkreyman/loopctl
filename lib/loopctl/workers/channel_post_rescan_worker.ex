@@ -369,7 +369,9 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
 
   defp due_base(now, revision) do
     ChannelPost
-    |> where([p], p.expires_at > ^now)
+    # Every attachment (US-52.22): a thread or DM message has no `expires_at` and is live
+    # for as long as its story or holder, so it is scanned like any live channel post.
+    |> where([p], is_nil(p.expires_at) or p.expires_at > ^now)
     |> where([p], is_nil(p.quarantined_at))
     # An operator EXONERATED this row (`Coordination.release_post/5`) — skip it, but only
     # for the pattern set they judged it against. Re-examining it under the SAME revision

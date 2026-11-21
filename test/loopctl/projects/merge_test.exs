@@ -12,6 +12,7 @@ defmodule Loopctl.Projects.MergeTest do
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Coordination.Messages
   alias Loopctl.Intake.Source
   alias Loopctl.Projects
   alias Loopctl.Projects.Merge
@@ -138,7 +139,59 @@ defmodule Loopctl.Projects.MergeTest do
           AND indexname <> 'egress_scope_markings_tenant_scope_idx'
         """)
 
-      assert Enum.sort(List.flatten(rows)) == Enum.sort(Enum.map(Merge.unique_keys(), & &1.index))
+      # A renumbered index cannot conflict: the merge rewrites its key (US-52.22).
+      expected = Enum.map(Merge.unique_keys(), & &1.index) ++ Merge.renumbered_indexes()
+      assert Enum.sort(List.flatten(rows)) == Enum.sort(expected)
+    end
+  end
+
+  describe "channel messages renumber after the target's (TC-52.22.8)" do
+    test "the source's channel messages follow the target's, a thread keeps its own seq" do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+      source = fixture(:project, %{tenant_id: tenant.id})
+      target = fixture(:project, %{tenant_id: tenant.id})
+      story = fixture(:story, %{tenant_id: tenant.id, project_id: source.id})
+
+      post = fn project_id, body ->
+        {:ok, p} = Coordination.create_post(tenant.id, project_id, agent.id, %{"body" => body})
+        p
+      end
+
+      for i <- 1..5, do: post.(target.id, "t#{i}")
+      moved = for i <- 1..3, do: post.(source.id, "s#{i}")
+
+      {:ok, thread} =
+        %ChannelPost{tenant_id: tenant.id, agent_id: agent.id, story_id: story.id}
+        |> ChannelPost.create_changeset(%{"body" => "on the story"})
+        |> Messages.insert()
+
+      assert Enum.map(moved, & &1.attachment_seq) == [1, 2, 3]
+      assert thread.attachment_seq == 1
+
+      assert {:ok, _} = Merge.merge_into(tenant.id, source.id, target.id)
+
+      channel =
+        AdminRepo.all(
+          from(p in ChannelPost,
+            where: p.project_id == ^target.id and is_nil(p.story_id),
+            order_by: p.attachment_seq,
+            select: {p.body, p.attachment_seq}
+          )
+        )
+
+      assert channel ==
+               [{"t1", 1}, {"t2", 2}, {"t3", 3}, {"t4", 4}, {"t5", 5}] ++
+                 [{"s1", 6}, {"s2", 7}, {"s3", 8}]
+
+      # The thread moved with its story, keeping its story_id and its own numbering.
+      assert %ChannelPost{story_id: story_id, project_id: project_id, attachment_seq: 1} =
+               AdminRepo.get!(ChannelPost, thread.id)
+
+      assert {story_id, project_id} == {story.id, target.id}
+
+      # The next channel message continues after the merged ones.
+      assert post.(target.id, "next").attachment_seq == 9
     end
   end
 

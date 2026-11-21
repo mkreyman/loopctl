@@ -48,6 +48,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
       "drops `stories.sort_key`: a real stale schema is the subject, and the DDL lock on " <>
         "`stories` would block every concurrent test",
     "test/loopctl/coordination_claim_race_test.exs" => @race,
+    "test/loopctl/coordination/messages_race_test.exs" => @race,
     "test/loopctl/delivery/placement_fault_test.exs" =>
       @trigger_fault <> "; the sweep test is about committed rows by definition",
     "test/loopctl/delivery/session_end_release_fault_test.exs" =>

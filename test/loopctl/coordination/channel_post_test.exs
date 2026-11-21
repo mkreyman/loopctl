@@ -45,7 +45,12 @@ defmodule Loopctl.Coordination.ChannelPostTest do
     end
 
     test "rejects a keyed post without a session_id (per-session slot needs a session)" do
-      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "key" => "session_goal"})
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "key" => "handoff:session_goal"
+        })
+
       refute cs.valid?
       assert %{session_id: _} = errors_on(cs)
     end
@@ -54,7 +59,7 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "key" => "session_goal",
+          "key" => "handoff:session_goal",
           "session_id" => "S1"
         })
 

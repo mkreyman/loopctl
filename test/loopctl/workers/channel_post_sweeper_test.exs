@@ -44,6 +44,7 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
   defp insert_post(tenant, project, agent, offset_seconds) do
     %ChannelPost{
       tenant_id: tenant.id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: project.id,
       agent_id: agent.id,
       body: "post",

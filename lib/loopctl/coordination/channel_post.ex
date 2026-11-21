@@ -4,13 +4,24 @@ defmodule Loopctl.Coordination.ChannelPost do
   plane: Knowledge = durable, Memory = agent-private, Channel = repo-scoped and
   transient).
 
-  A post is one attributed, short-lived message on a project's coordination
-  channel. A **channel is a `project_id`**; sessions on the same repo — across
-  machines — read the channel to see what other sessions found, did, or are
-  doing. Retention is a uniform 30 days (`expires_at`); there is deliberately
-  **no message-type taxonomy** (`:kind`/`:category`/`:type`) — the fleet audit
-  showed the category taxonomy was essentially unused. An optional `key` reserves
-  a per-(agent, session) working-state slot: in US-39.1 a second write to the same
+  A post is one attributed message with exactly ONE attachment (US-52.22, the check
+  `channel_posts_one_attachment`): a work item's thread (`story_id`, with the story's
+  `project_id`), one holder's DMs (`to_holder_id` alone), or a repo channel (`project_id`
+  alone). A **channel is a `project_id`**; sessions on the same repo — across machines —
+  read the channel to see what other sessions found, did, or are doing. Each attachment
+  numbers its messages in `attachment_seq`, assigned by
+  `Loopctl.Coordination.Messages.insert/2`, the only insert path.
+
+  Retention follows the attachment (`Messages.insert/2` sets `expires_at`): a thread or DM
+  message has none and lives as long as its story or holder (foreign-key cascade); a channel
+  message lives the tenant setting `channel_message_retention_days` (default 7); a channel
+  row keyed `handoff:<anchor>` lives `Loopctl.Coordination.retention_days/0`. There is
+  deliberately **no message-type taxonomy** (`:kind`/`:category`/`:type`) — the fleet audit
+  showed the category taxonomy was essentially unused.
+
+  Keyed working-state slots are retired (US-52.22): a key that does not start `handoff:` is
+  refused `keyed_slot_retired` (working state is work-item notes). A `handoff:` key reserves
+  a per-(agent, session) slot: in US-39.1 a second write to the same
   `(tenant, project, agent, session, key)` is **rejected** by the partial unique
   index (`{:error, changeset}`), not merged; the `on_conflict` upsert that lets a
   session refresh its own slot lands in US-39.2. The **verified** `agent_id`
@@ -60,8 +71,9 @@ defmodule Loopctl.Coordination.ChannelPost do
 
   ## Trust boundary
 
-  `tenant_id`, `project_id`, `agent_id`, and `expires_at` are set programmatically
-  on the struct in `Loopctl.Coordination` — NEVER via `cast/3`. `agent_id` is the
+  `tenant_id`, `project_id`, `story_id`, `to_holder_id`, `author_holder_id`, `agent_id`,
+  `attachment_seq` and `expires_at` are set programmatically on the struct in
+  `Loopctl.Coordination` and `Loopctl.Coordination.Messages` — NEVER via `cast/3`. `agent_id` is the
   verified key identity (a caller can never post as another agent); `host` and
   `session_id` are client-supplied, informational, and spoofable — never used for
   authorization or as authoritative attribution.
@@ -151,6 +163,10 @@ defmodule Loopctl.Coordination.ChannelPost do
              :id,
              :tenant_id,
              :project_id,
+             :story_id,
+             :to_holder_id,
+             :author_holder_id,
+             :attachment_seq,
              :agent_id,
              :session_id,
              :host,
@@ -167,7 +183,18 @@ defmodule Loopctl.Coordination.ChannelPost do
 
   schema "channel_posts" do
     tenant_field()
+    # The ONE attachment (US-52.22), checked by `channel_posts_one_attachment`: a thread
+    # (`story_id` + the story's `project_id`), a DM (`to_holder_id` alone) or a channel
+    # (`project_id` alone). Set by the context (`Loopctl.Coordination.Messages.insert/2`
+    # resolves a thread's project from its story), never cast.
     field :project_id, :binary_id
+    field :story_id, :binary_id
+    field :to_holder_id, :binary_id
+    # The holder that wrote the message, when one did. Never cast.
+    field :author_holder_id, :binary_id
+    # The message's place in its attachment: max + 1 under the attachment's advisory lock,
+    # so this order is commit order. Assigned by `Messages.insert/2`, never cast.
+    field :attachment_seq, :integer
     field :agent_id, :binary_id
     field :session_id, :string
     field :host, :string
@@ -295,7 +322,8 @@ defmodule Loopctl.Coordination.ChannelPost do
       :to_host,
       :to_capability
     ])
-    |> validate_required([:tenant_id, :project_id, :agent_id, :body, :expires_at])
+    |> validate_required([:tenant_id, :agent_id, :body])
+    |> require_project_unless_dm()
     |> validate_length(:body, max: @body_max_length, count: :bytes)
     |> validate_length(:key, max: @key_max_length, count: :bytes)
     |> validate_length(:idempotency_key, max: @idempotency_key_max_length, count: :bytes)
@@ -310,6 +338,14 @@ defmodule Loopctl.Coordination.ChannelPost do
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:agent_id)
+    |> foreign_key_constraint(:story_id)
+    |> foreign_key_constraint(:to_holder_id)
+    |> foreign_key_constraint(:author_holder_id)
+    |> check_constraint(:story_id,
+      name: :channel_posts_one_attachment,
+      message:
+        "a message is attached to exactly one of a work item's thread, one holder's DMs, or a channel"
+    )
     |> unique_constraint(:key,
       name: :channel_posts_session_key_uidx,
       message: "has already been used by this session (working-state slot)"
@@ -359,7 +395,11 @@ defmodule Loopctl.Coordination.ChannelPost do
   end
 
   # Never SHORTENS a TTL: a post that already outlives the review window keeps its own
-  # `expires_at`.
+  # `expires_at`. A thread or DM message has none (US-52.22: it lives as long as its story or
+  # holder), and quarantining it must not give it one: that would put a message the age sweep
+  # never touches on the sweep's list.
+  defp review_deadline(nil, _at), do: nil
+
   defp review_deadline(expires_at, at) do
     deadline = DateTime.add(at, @quarantine_review_days * 86_400, :second)
 
@@ -394,7 +434,7 @@ defmodule Loopctl.Coordination.ChannelPost do
   DOUBLE documented retention. It never EXTENDS a TTL (a post whose own deadline is
   already nearer keeps it).
   """
-  @spec release_changeset(t(), DateTime.t(), pos_integer()) :: Ecto.Changeset.t()
+  @spec release_changeset(t(), DateTime.t(), pos_integer() | nil) :: Ecto.Changeset.t()
   def release_changeset(%__MODULE__{} = post, at, retention_days) do
     change(post,
       quarantined_at: nil,
@@ -405,9 +445,11 @@ defmodule Loopctl.Coordination.ChannelPost do
     )
   end
 
+  # `retention_days` nil is a thread or DM row (`Messages.retention_days_for/1`): it has no
+  # window to roll back to, and keeps whatever `expires_at` it has (nil).
   defp released_deadline(%__MODULE__{expires_at: expires_at} = post, retention_days) do
     case {post.inserted_at, expires_at} do
-      {%DateTime{} = inserted_at, %DateTime{} = current} ->
+      {%DateTime{} = inserted_at, %DateTime{} = current} when is_integer(retention_days) ->
         original = DateTime.add(inserted_at, retention_days * 86_400, :second)
 
         if DateTime.compare(current, original) == :gt, do: original, else: current
@@ -525,6 +567,17 @@ defmodule Loopctl.Coordination.ChannelPost do
 
     if is_binary(value) and String.contains?(value, <<0>>) do
       add_error(changeset, field, "must not contain NUL bytes")
+    else
+      changeset
+    end
+  end
+
+  # A thread and a channel message carry a project; a DM (`to_holder_id`) carries none
+  # (`channel_posts_one_attachment`). A thread's project is the story's, filled in by
+  # `Messages.insert/2`, so only a channel message must arrive with one.
+  defp require_project_unless_dm(changeset) do
+    if is_nil(get_field(changeset, :to_holder_id)) and is_nil(get_field(changeset, :story_id)) do
+      validate_required(changeset, :project_id)
     else
       changeset
     end

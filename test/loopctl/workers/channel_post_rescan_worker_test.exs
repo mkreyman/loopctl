@@ -72,6 +72,7 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
   defp insert_post(ctx, attrs \\ %{}) do
     %ChannelPost{
       tenant_id: ctx.tenant.id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: ctx.project.id,
       agent_id: ctx.agent.id,
       body: "ordinary coordination chatter",
@@ -127,6 +128,22 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
       assert reloaded.quarantine_reason == "secret_denylist: body"
       # The reason names FIELDS only — never the matched value.
       refute reloaded.quarantine_reason =~ @secret
+    end
+
+    # US-52.22: a thread or DM message never expires (expires_at NULL), so a scan that
+    # read `expires_at > now` alone would never reach it; quarantine gives it no expiry.
+    test "scans a never-expiring thread message and quarantines it without an expiry" do
+      ctx = setup_context()
+      story = fixture(:story, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      offender =
+        insert_post(ctx, %{body: "thread leak #{@secret}", story_id: story.id, expires_at: nil})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      reloaded = reload(offender)
+      assert %DateTime{} = reloaded.quarantined_at
+      assert reloaded.expires_at == nil
     end
 
     test "detects a denylisted shape inside a refs item field, not just the body" do

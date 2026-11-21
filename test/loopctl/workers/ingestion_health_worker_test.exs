@@ -585,6 +585,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
     %ChannelPost{
       tenant_id: tenant_id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: project.id,
       agent_id: agent.id,
       body: "post",
@@ -997,6 +998,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
       AdminRepo.insert!(%ChannelPost{
         tenant_id: tenant_b.id,
+        attachment_seq: System.unique_integer([:positive]),
         project_id: project_b.id,
         agent_id: agent_b.id,
         body: "post",

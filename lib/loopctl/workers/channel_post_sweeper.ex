@@ -3,10 +3,13 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   Oban cron worker that hard-deletes expired coordination-bus posts
   (`Loopctl.Coordination.ChannelPost`), Epic 39 / US-39.5.
 
-  The coordination bus (the third memory plane) is deliberately transient: a row
-  carries a uniform 30-day `expires_at`, set server-side in `Loopctl.Coordination`.
-  Anything worth keeping longer is already graduated to Knowledge, so hard-deleting
-  expired rows loses nothing. This worker deletes rows past `expires_at`.
+  The coordination bus (the third memory plane) is deliberately transient: a channel row
+  carries an `expires_at` set server-side from its attachment by
+  `Loopctl.Coordination.Messages` (the tenant's channel window, default 7 days; 30 days for a
+  `handoff:` row). A thread or DM message (US-52.22) has `expires_at` NULL and is never
+  swept by age: it dies with its story or holder. Anything worth keeping longer is already
+  graduated to Knowledge, so hard-deleting expired rows loses nothing. This worker deletes
+  rows past `expires_at`.
 
   **Quarantined posts** (issue #499) are the one exception to the uniform window: their
   `expires_at` is EXTENDED to at least the operator review window, so the evidence
@@ -114,7 +117,21 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   @spec perform(Oban.Job.t()) :: :ok
   def perform(%Oban.Job{args: args}) do
     limit = batch_limit(args)
-    observed(limit, fn -> {sweep_batch(ChannelPost, limit), sweep_batch(ChannelLock, limit)} end)
+    observed(limit, fn -> sweep(limit, DateTime.utc_now()) end)
+  end
+
+  @doc """
+  One bounded sweep as of `now`: at most `limit` expired posts and `limit` expired locks.
+  Returns `{posts_deleted, locks_deleted}`. `perform/1` passes the wall clock; the clock is
+  an argument (never a job arg) so a test can sweep "31 days ahead" without an enqueued job
+  ever being able to.
+
+  A row with `expires_at` NULL (a thread or DM message, US-52.22) never matches
+  `expires_at < now`, so the age sweep never deletes one.
+  """
+  @spec sweep(pos_integer(), DateTime.t()) :: {non_neg_integer(), non_neg_integer()}
+  def sweep(limit, %DateTime{} = now) do
+    {sweep_batch(ChannelPost, limit, now), sweep_batch(ChannelLock, limit, now)}
   end
 
   @doc false
@@ -189,9 +206,7 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   # One bounded batch of `schema` (`ChannelPost` or `ChannelLock`, both carrying
   # `expires_at`): select the expired ids (bounded by `limit`), then delete them.
   # Returns the number of rows deleted (0 when nothing is expired).
-  defp sweep_batch(schema, limit) do
-    now = DateTime.utc_now()
-
+  defp sweep_batch(schema, limit, now) do
     ids =
       schema
       |> where([r], r.expires_at < ^now)

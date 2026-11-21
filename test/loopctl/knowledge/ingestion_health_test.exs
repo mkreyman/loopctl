@@ -31,6 +31,7 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
 
     %ChannelPost{
       tenant_id: tenant_id,
+      attachment_seq: System.unique_integer([:positive]),
       project_id: project.id,
       agent_id: agent.id,
       body: "post",
