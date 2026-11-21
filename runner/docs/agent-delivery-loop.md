@@ -302,7 +302,8 @@ so). The branch and the worktree are the runner's, so the session removes neithe
 base out in neither. The merge is loopctl's decision: once its merge gate allows a head (CI green,
 verify@1's verdict at that head), loopctl sends a `merge` instruction (contract 1.29.0), and the
 runner, not the session, merges exactly that head (`LoopctlRunner.MergeRun`, `gh pr merge
---squash --match-head-commit`). **Nothing else runs, absence included**: a repository with no
+--squash --match-head-commit --subject --body`), with the closing keywords of the title and body
+rewritten to `Refs` so the merge closes no issue; a pull request still linked to one escalates. **Nothing else runs, absence included**: a repository with no
 `.loopctl/mode` is refused `repository has no .loopctl/mode`, because a `pr` repository's pull
 requests are merged without a person (by loopctl's gate and the runner's merge) and a repository
 that never opted in has not asked for that; an empty file or any other value is

@@ -155,7 +155,7 @@ Control decides the merge and the runner executes it. Every minute, `MergeSweepW
 2. On `allow`, it sends a `merge` message (runner contract 1.29.0) to the runner holding the claim. The message names the claim's dispatch, the epoch, the story, the repository, the pull request, the head and the merge method, `squash`.
 3. It records the instruction on the stage row (`merge_instruction`) and as a `merge_instructed` stage event.
 
-The runner merges exactly that head (`gh pr merge --squash --match-head-commit`) and reports `ci -> merged` with the merge commit. The other answers of the gate:
+The runner merges exactly that head (`gh pr merge --squash --match-head-commit --subject --body`) and reports `ci -> merged` with the merge commit. The merge closes no issue: loopctl closes the story's issue itself with its resolution label on first, so the runner first rewrites the closing keywords (`Closes #N`, `Fixes`, `Resolves`) of the pull request's title and body to `Refs`, edits the body on the pull request, and merges with the rewritten text as the squash message. A pull request GitHub still links to an issue after that (a link added by hand) is reported `ci -> escalated` over `session_escalated` and not merged. The other answers of the gate:
 
 - **`refuse`:** the gate has already escalated the story over `merge_gate`.
 - **`head_moved`:** the gate has already sent the story back to `implementing`.

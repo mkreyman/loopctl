@@ -25,15 +25,23 @@ defmodule LoopctlRunner.Forge do
   pull request because loopctl's merge gate allowed its head, never on its own judgement:
 
       gh pr view <number> --repo <owner/name>
-        --json number,state,headRefName,headRefOid,baseRefName,isCrossRepository,mergeCommit
+        --json number,state,headRefName,headRefOid,baseRefName,isCrossRepository,mergeCommit,
+               body,closingIssuesReferences
+
+      gh pr edit <number> --repo <owner/name> --body <body>
 
       gh pr merge <number> --repo <owner/name> --squash --match-head-commit <head_sha>
+        --body <body>
+
+  The edit and the explicit squash body carry the pull request's text with its issue-closing
+  keywords rewritten (`LoopctlRunner.ClosingKeywords`), so the merge closes no issue: loopctl
+  closes the one a story came from, with its resolution label on first.
 
   The merge names the head, so GitHub refuses it when the head is no longer the one the gate
   allowed. There is no `--admin` (it would bypass the branch protection the gate does not
   replace), no `--auto` (a later push would be merged unjudged) and no `--delete-branch` (gh
   deletes the LOCAL branch too, and the branch and its worktree are the runner's teardown's).
-  `pull_request/4` and `merge/5` are the defaults of `LoopctlRunner.Control`'s `:merge_forge`
+  `pull_request/4`, `edit_body/5` and `merge/6` are the defaults of `LoopctlRunner.Control`'s `:merge_forge`
   option; a test passes its own.
   """
 
@@ -74,7 +82,11 @@ defmodule LoopctlRunner.Forge do
       ["--state", "all", "--limit", Integer.to_string(@limit), "--json", Enum.join(@fields, ",")]
   end
 
-  @view_fields ~w(number state headRefName headRefOid baseRefName isCrossRepository mergeCommit)
+  # `body`, `title` and `closingIssuesReferences` need gh 2.86.0 or later, the oldest the fleet
+  # ran when they were added (blockit, 2026-11-21); an older gh refuses an unknown JSON field, so
+  # every merge read fails `unreachable` and loopctl escalates `merge_unanswered`.
+  @view_fields ~w(number state headRefName headRefOid baseRefName isCrossRepository mergeCommit
+                  title body closingIssuesReferences)
 
   @doc """
   The decoded `gh pr view` answer for pull request `number` of `repo`: `{:ok, map}`, or
@@ -107,16 +119,35 @@ defmodule LoopctlRunner.Forge do
     ]
 
   @doc """
-  Squash-merges pull request `number` of `repo` at exactly `head_sha`: `:ok` when gh exits 0,
+  Replaces pull request `number`'s body with `body`: `:ok`, or `{:error, reason}` when gh is
+  missing, fails, or does not answer within `timeout_ms`.
+  """
+  @spec edit_body(String.t(), pos_integer(), String.t(), pos_integer(), String.t() | nil) ::
+          :ok | {:error, String.t()}
+  def edit_body(repo, number, body, timeout_ms, gh \\ nil) do
+    with {:ok, path} <- locate(gh),
+         {:ok, _out} <- run_ok(path, edit_args(repo, number, body), timeout_ms),
+         do: :ok
+  end
+
+  @doc "The `gh` argv `edit_body/5` runs."
+  @spec edit_args(String.t(), pos_integer(), String.t()) :: [String.t()]
+  def edit_args(repo, number, body),
+    do: ["pr", "edit", Integer.to_string(number), "--repo", repo, "--body", body]
+
+  @doc """
+  Squash-merges pull request `number` of `repo` at exactly `head_sha`, with `message` as the
+  squash commit's subject and body (`%{subject: String.t(), body: String.t()}`), so neither is
+  GitHub's default from the session's title and commits: `:ok` when gh exits 0,
   `{:refused, output}` when it exits non-zero (GitHub, or gh, said no — a moved head among the
   reasons), `{:error, reason}` when gh is missing or does not answer within `timeout_ms`, which
   says nothing about whether the merge happened.
   """
-  @spec merge(String.t(), pos_integer(), String.t(), pos_integer(), String.t() | nil) ::
+  @spec merge(String.t(), pos_integer(), String.t(), message(), pos_integer(), String.t() | nil) ::
           :ok | {:refused, String.t()} | {:error, String.t()}
-  def merge(repo, number, head_sha, timeout_ms, gh \\ nil) do
+  def merge(repo, number, head_sha, message, timeout_ms, gh \\ nil) do
     with {:ok, path} <- locate(gh) do
-      case ProcessGroup.run(path, merge_args(repo, number, head_sha), timeout_ms, @env,
+      case ProcessGroup.run(path, merge_args(repo, number, head_sha, message), timeout_ms, @env,
              inherit: @inherit
            ) do
         {:ok, _out, 0} -> :ok
@@ -126,9 +157,12 @@ defmodule LoopctlRunner.Forge do
     end
   end
 
-  @doc "The `gh` argv `merge/5` runs."
-  @spec merge_args(String.t(), pos_integer(), String.t()) :: [String.t()]
-  def merge_args(repo, number, head_sha),
+  @typedoc "The squash commit's message: its subject line and its body."
+  @type message :: %{required(:subject) => String.t(), required(:body) => String.t()}
+
+  @doc "The `gh` argv `merge/6` runs."
+  @spec merge_args(String.t(), pos_integer(), String.t(), message()) :: [String.t()]
+  def merge_args(repo, number, head_sha, %{subject: subject, body: body}),
     do: [
       "pr",
       "merge",
@@ -137,7 +171,11 @@ defmodule LoopctlRunner.Forge do
       repo,
       "--squash",
       "--match-head-commit",
-      head_sha
+      head_sha,
+      "--subject",
+      subject,
+      "--body",
+      body
     ]
 
   defp locate(gh) do

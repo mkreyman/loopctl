@@ -165,7 +165,7 @@ defmodule LoopctlRunner.Control do
   merge gate judges the verified head and, on allow, pushes `merge` (`RunnerMergeInstruction`)
   to the runner holding the claim, and this runner merges exactly that head
   (`LoopctlRunner.MergeRun`, through the `:merge_forge` seam: `gh pr merge --squash
-  --match-head-commit`). The instruction is acted on only when it validates and names a
+  --match-head-commit --subject --body`, closing keywords rewritten to `Refs` first). The instruction is acted on only when it validates and names a
   dispatch, `claim_epoch`, story and repository of an implement run on disk here whose claim was
   never recorded over, whose session is over and whose end has been reported, and — when that run
   observed its pull request — the same pull request; the pull request must also be the run's own
@@ -552,7 +552,8 @@ defmodule LoopctlRunner.Control do
             merge_forge:
               Keyword.get(opts, :merge_forge, %{
                 view: &Forge.pull_request/3,
-                merge: &Forge.merge/4
+                edit_body: &Forge.edit_body/4,
+                merge: &Forge.merge/5
               }),
             # `MergeRun`'s options (`:retry_after_ms`, the wait before a refused merge's one
             # retry): its defaults in production, a test's own so it never sleeps.

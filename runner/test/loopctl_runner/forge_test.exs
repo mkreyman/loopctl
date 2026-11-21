@@ -3,6 +3,8 @@ defmodule LoopctlRunner.ForgeTest do
   # test ever reaches GitHub.
   use ExUnit.Case, async: true
 
+  @message %{subject: "Refs #15: return the run id (#3938)", body: "Refs #15."}
+
   alias LoopctlRunner.Forge
   import LoopctlRunner.TestSupport
 
@@ -91,9 +93,10 @@ defmodule LoopctlRunner.ForgeTest do
              Forge.pull_requests("o/r", "loop/x", "master", 5_000, missing)
 
     assert {:error, "gh is not installed" <> _} = Forge.pull_request("o/r", 7, 5_000, missing)
+    assert {:error, "gh is not installed" <> _} = Forge.edit_body("o/r", 7, "x", 5_000, missing)
 
     assert {:error, "gh is not installed" <> _} =
-             Forge.merge("o/r", 7, String.duplicate("a", 40), 5_000, missing)
+             Forge.merge("o/r", 7, String.duplicate("a", 40), @message, 5_000, missing)
   end
 
   describe "the merge loopctl instructs (US-48.17)" do
@@ -115,7 +118,8 @@ defmodule LoopctlRunner.ForgeTest do
                "--repo",
                "mkreyman/home_care_billing",
                "--json",
-               "number,state,headRefName,headRefOid,baseRefName,isCrossRepository,mergeCommit"
+               "number,state,headRefName,headRefOid,baseRefName,isCrossRepository,mergeCommit," <>
+                 "title,body,closingIssuesReferences"
              ]
 
       assert File.read!(record) =~ "GH_PROMPT_DISABLED=1"
@@ -134,7 +138,7 @@ defmodule LoopctlRunner.ForgeTest do
     test "the merge is a squash of exactly the allowed head, and nothing that bypasses or defers" do
       {gh, record} = fake_gh!("exit 0")
 
-      assert Forge.merge("mkreyman/home_care_billing", 3938, @head, 5_000, gh) == :ok
+      assert Forge.merge("mkreyman/home_care_billing", 3938, @head, @message, 5_000, gh) == :ok
 
       assert argv(record) == [
                "pr",
@@ -144,10 +148,15 @@ defmodule LoopctlRunner.ForgeTest do
                "mkreyman/home_care_billing",
                "--squash",
                "--match-head-commit",
-               @head
+               @head,
+               "--subject",
+               "Refs #15: return the run id (#3938)",
+               "--body",
+               "Refs #15."
              ]
 
-      assert argv(record) == Forge.merge_args("mkreyman/home_care_billing", 3938, @head)
+      assert argv(record) ==
+               Forge.merge_args("mkreyman/home_care_billing", 3938, @head, @message)
 
       for flag <- ~w(--admin --auto --delete-branch --merge --rebase),
           do: refute(flag in argv(record), flag)
@@ -160,13 +169,26 @@ defmodule LoopctlRunner.ForgeTest do
         )
 
       assert {:refused, "gh exited 1: GraphQL: Head branch was modified" <> _} =
-               Forge.merge("o/r", 7, @head, 5_000, gh)
+               Forge.merge("o/r", 7, @head, @message, 5_000, gh)
     end
 
     test "a merge that does not answer in time is an error, which says nothing about the merge" do
       {gh, _record} = fake_gh!("sleep 30")
 
-      assert Forge.merge("o/r", 7, @head, 300, gh) == {:error, "gh did not answer within 300 ms"}
+      assert Forge.merge("o/r", 7, @head, @message, 300, gh) ==
+               {:error, "gh did not answer within 300 ms"}
+    end
+
+    test "a body edit replaces the pull request's body, and a failing gh is an error" do
+      {gh, record} = fake_gh!("exit 0")
+
+      assert Forge.edit_body("o/r", 7, "Refs #15.", 5_000, gh) == :ok
+
+      assert argv(record) == ["pr", "edit", "7", "--repo", "o/r", "--body", "Refs #15."]
+      assert argv(record) == Forge.edit_args("o/r", 7, "Refs #15.")
+
+      {gh, _record} = fake_gh!("echo 'HTTP 502' >&2; exit 1")
+      assert {:error, "gh exited 1: HTTP 502" <> _} = Forge.edit_body("o/r", 7, "x", 5_000, gh)
     end
   end
 end

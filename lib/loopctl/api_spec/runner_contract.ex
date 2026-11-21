@@ -72,6 +72,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.33.0) A LOOP ISSUE'S FINDING, AS LOOPCTL RECORDED IT (Epic 51, US-51.7). `RunnerTriage` gains an OPTIONAL `loop_finding` (`finding_id`, `kind`, `fingerprint` at most 512 characters, `occurrences`, `fix_attempts`, and `evidence`: at most 16 `{key, value}` string entries, key at most 64 characters, value at most 200), present when the issue was filed by loopctl's chg feedback loop. It is read from loopctl's own finding record, never from the issue text; `evidence` comes from chg gate runs over repository code and is data, to be fenced. It is omitted when the whole triage object would not fit its byte cap with it, so the record is sent exactly as before. `RunnerTriage` is not `additionalProperties: false`, so every deployed runner accepts it. `RunnerVerify` gains an OPTIONAL `loop_finding` `{sha, failures}` (at most 50 names of at most 200 characters) on a story that fixes a chg `selection_miss`: the commit chg's gate failed at and the tests it failed there, which `selection_replay.miss` must cover. `RunnerVerify` IS `additionalProperties: false`, so loopctl sends this field only to a runner that JOINED declaring 1.33.0 or later and takes it off the dispatch for any other. RE-VENDOR, and declare 1.33.0 on join, to receive a verify `loop_finding` | | | | |
   | (1.34.0) THE RUNNER'S OWN VERSION, JUDGED AGAINST THE RELEASE SET (Epic 52, US-52.8). `RunnerJoin` gains an OPTIONAL `runner_version` (semver): the runner's application version. loopctl compares it with the `runner` component of the release set it was built from (`release/manifest.toml`, US-52.7) and refuses a join below that component's `minimum`, or one sending none while the minimum is a version, with the new PERMANENT reason `incompatible_client_version`, carrying `component`, `sent` and `minimum`; a runner must stop on it rather than rejoin, since only an upgrade changes the answer. A version above the set's is admitted, so runners may roll before or after the server. While the set's runner minimum is `"unreported"`, a join without the field is admitted exactly as before. The join's ok reply gains `release_set`, the set number. `GET /api/v1/runners/pool` shows each connection's `runner_version`. A join property `RunnerJoin` does not declare is still admitted and dropped. RE-VENDOR, and send `runner_version`, before the set's runner minimum becomes a version | | | | |
   | (1.35.0) A RUNNER SESSION IS A HOLDER (Epic 52, US-52.15). Every placement now makes its session a `runner_session` holder (host = the runner's enrolled name, session id `dispatch:<dispatch_id>` until named), and verify separates holders instead of agents. `RunnerDispatchReply` gains OPTIONAL `session_id` (at most 200 bytes) and `worktree` (at most 1024 bytes), allowed on an accept only and refused on a refusal: the id the runner will start Claude Code with and the directory it runs in. loopctl writes both onto the session's holder. A `session_ended` now also ends that holder (once; a replay changes nothing). Purely additive: an accept without them is recorded as before and the holder keeps its placeholder id. RE-VENDOR, and send both, so a holder names the session's transcript | | | | |
+  | (1.35.1) A RUNNER MERGE CLOSES NO ISSUE. `RunnerMergeInstruction`'s description now says how the runner merges: it rewrites the closing keywords (`Closes #N`, `Fixes`, `Resolves`) of the pull request's title and body to `Refs` first, edits the body on the pull request, merges with `--subject` and `--body` carrying the rewritten text, and reports a pull request GitHub still links to an issue as `ci -> escalated` over `session_escalated`, not merged, because loopctl closes the story's issue itself with its resolution label on first. Text only: no message, field or edge changed, and a 1.35.0 copy validates every message exactly as before. No re-vendor needed | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -435,7 +436,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.35.0"
+  @version "1.35.1"
 
   # The first version whose runner understands a `merge` push (US-48.17). A runner that joined
   # declaring an older one is never sent one: it would ignore the event, and the story would
@@ -3183,7 +3184,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "Since 1.29.0. Pushed as `merge` on the runner's topic: loopctl's merge gate " <>
             "ALLOWED `head_sha` of pull request `pr_number` in `repo`, and the runner holding " <>
             "the claim is to merge it. Merge exactly that head and nothing else — " <>
-            "`gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha>` — " <>
+            "`gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha> " <>
+            "--subject <subject> --body <body>` — so that it closes no issue: the closing " <>
+            "keywords of the pull request's title and body are rewritten to `Refs` first (the " <>
+            "body on the pull request too), the rewritten text is the squash message, and a " <>
+            "pull request GitHub still links to an issue it would close is reported " <>
+            "`ci -> escalated` over `session_escalated` and not merged, because loopctl " <>
+            "closes the story's issue itself, with its resolution label on first; " <>
             "then report `stage` `ci -> merged` (edge `forward`) under `dispatch_id` and " <>
             "`claim_epoch`, with `effects.merge_sha` the merge commit GitHub returned. When the " <>
             "pull request is ALREADY merged at `head_sha`, report that merge the same way. " <>

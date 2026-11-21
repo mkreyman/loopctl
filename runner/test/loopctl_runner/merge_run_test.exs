@@ -42,7 +42,7 @@ defmodule LoopctlRunner.MergeRunTest do
 
   # A forge whose reads answer `views` in order (the last repeats) and whose merge answers
   # `merged`, telling the test every call.
-  defp forge(views, merged \\ :ok) do
+  defp forge(views, merged \\ :ok, edited \\ :ok) do
     test = self()
     {:ok, reads} = Agent.start_link(fn -> views end)
 
@@ -58,8 +58,9 @@ defmodule LoopctlRunner.MergeRunTest do
     # `merged` is one answer for every merge, or a list answered in order (the last repeats).
     {:ok, answers} = Agent.start_link(fn -> List.wrap(merged) end)
 
-    merge = fn repo, number, head, _timeout ->
+    merge = fn repo, number, head, message, _timeout ->
       send(test, {:merge, repo, number, head})
+      send(test, {:squash, message})
 
       Agent.get_and_update(answers, fn
         [only] -> {only, [only]}
@@ -67,7 +68,12 @@ defmodule LoopctlRunner.MergeRunTest do
       end)
     end
 
-    %{view: view, merge: merge}
+    edit_body = fn repo, number, body, _timeout ->
+      send(test, {:edit_body, repo, number, body})
+      edited
+    end
+
+    %{view: view, edit_body: edit_body, merge: merge}
   end
 
   test "an open pull request at the allowed head is merged once, and the merge commit reported" do
@@ -251,5 +257,95 @@ defmodule LoopctlRunner.MergeRunTest do
              MergeRun.execute(instruction(), @where, forge([{:ok, pr(%{"state" => "DRAFT"})}]))
 
     refute_received {:merge, _, _, _}
+  end
+
+  describe "a merge closes no issue" do
+    test "a closing keyword is rewritten on the pull request, in the squash body and in the subject" do
+      body = "Fix the run id.\n\nCloses #15.\nfixes: mkreyman/other#2"
+      neutral = "Fix the run id.\n\nRefs #15.\nRefs mkreyman/other#2"
+
+      forge =
+        forge([
+          {:ok,
+           pr(%{
+             "title" => "Fixes #15: return the run id",
+             "body" => body,
+             "closingIssuesReferences" => [%{"number" => 15}]
+           })},
+          {:ok, pr(%{"body" => neutral, "closingIssuesReferences" => []})},
+          {:ok, pr(%{"state" => "MERGED", "mergeCommit" => %{"oid" => @merge_sha}})}
+        ])
+
+      assert MergeRun.execute(instruction(), @where, forge) == {:merged, @merge_sha}
+      assert_received {:edit_body, "mkreyman/fixture", 3938, ^neutral}
+      assert_received {:squash, %{subject: "Refs #15: return the run id (#3938)", body: ^neutral}}
+    end
+
+    test "a link GitHub still lists right after the edit is read again before it escalates" do
+      linked = pr(%{"body" => "Refs #15.", "closingIssuesReferences" => [%{"number" => 15}]})
+
+      forge =
+        forge([
+          {:ok, pr(%{"body" => "Closes #15.", "closingIssuesReferences" => [%{"number" => 15}]})},
+          {:ok, linked},
+          {:ok, pr(%{"body" => "Refs #15.", "closingIssuesReferences" => []})},
+          {:ok, pr(%{"state" => "MERGED", "mergeCommit" => %{"oid" => @merge_sha}})}
+        ])
+
+      assert MergeRun.execute(instruction(), @where, forge, link_settle_ms: 0) ==
+               {:merged, @merge_sha}
+    end
+
+    test "a link still listed after every read past the edit escalates and merges nothing" do
+      forge =
+        forge([
+          {:ok, pr(%{"body" => "Closes #15.", "closingIssuesReferences" => [%{"number" => 15}]})},
+          {:ok, pr(%{"body" => "Refs #15.", "closingIssuesReferences" => [%{"number" => 15}]})}
+        ])
+
+      assert {:escalate, reason} =
+               MergeRun.execute(instruction(), @where, forge, link_settle_ms: 0, link_reads: 3)
+
+      assert reason =~ "would close #15"
+      assert_received {:edit_body, _, _, "Refs #15."}
+      refute_received {:merge, _, _, _}
+      # The first read, then the three after the edit.
+      for _ <- 1..4, do: assert_received({:view, _, _})
+      refute_received {:view, _, _}
+    end
+
+    test "a body with no closing keyword is not edited, and is the squash body as it is" do
+      body = "Refs #15. Nothing here closes."
+
+      forge =
+        forge([
+          {:ok, pr(%{"body" => body, "closingIssuesReferences" => []})},
+          {:ok, pr(%{"state" => "MERGED", "mergeCommit" => %{"oid" => @merge_sha}})}
+        ])
+
+      assert MergeRun.execute(instruction(), @where, forge) == {:merged, @merge_sha}
+      refute_received {:edit_body, _, _, _}
+      assert_received {:squash, %{body: ^body}}
+    end
+
+    test "a link no body keyword makes escalates at once, with no edit, and merges nothing" do
+      forge =
+        forge([
+          {:ok, pr(%{"body" => "No keyword.", "closingIssuesReferences" => [%{"number" => 9}]})}
+        ])
+
+      assert {:escalate, reason} = MergeRun.execute(instruction(), @where, forge)
+      assert reason =~ "would close #9"
+      refute_received {:edit_body, _, _, _}
+      refute_received {:merge, _, _, _}
+    end
+
+    test "an edit that fails merges nothing and reports nothing" do
+      forge = forge([{:ok, pr(%{"body" => "Closes #15"})}], :ok, {:error, "HTTP 502"})
+
+      assert {:unreachable, reason} = MergeRun.execute(instruction(), @where, forge)
+      assert reason =~ "HTTP 502"
+      refute_received {:merge, _, _, _}
+    end
   end
 end

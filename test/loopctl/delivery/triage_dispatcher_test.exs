@@ -29,6 +29,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.OwnLog
   alias Loopctl.Progress
   alias Loopctl.Runners.Usage
+  alias Loopctl.Test.Placement
   alias Loopctl.Test.TriageDispatch
   alias LoopctlWeb.RunnerSocket
 
@@ -756,9 +757,13 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     channel
   end
 
+  # Waits for Presence to drop the channel's meta, which happens after `leave/1` returns: a
+  # rejoin while the old meta is still listed gives the runner two live metas, and selection
+  # trusts only a sole one, so the next pass read `:no_runner` under full-suite load.
   defp leave_channel(channel) do
     Process.unlink(channel.channel_pid)
     leave(channel)
+    Placement.wait_until_disconnected(channel.assigns.runner)
   end
 
   defp connect_info(token) do

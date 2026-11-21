@@ -850,7 +850,7 @@
     },
     "RunnerMergeInstruction": {
       "additionalProperties": false,
-      "description": "Since 1.29.0. Pushed as `merge` on the runner's topic: loopctl's merge gate ALLOWED `head_sha` of pull request `pr_number` in `repo`, and the runner holding the claim is to merge it. Merge exactly that head and nothing else — `gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha>` — then report `stage` `ci -> merged` (edge `forward`) under `dispatch_id` and `claim_epoch`, with `effects.merge_sha` the merge commit GitHub returned. When the pull request is ALREADY merged at `head_sha`, report that merge the same way. When GitHub refuses because the head is no longer `head_sha`, report `ci -> implementing` over `base_moved`; any other refusal, report `ci -> escalated` over `session_escalated` with the refusal as `reason`. No reply. It may be pushed more than once for one head when no merge was reported within the answer window; a second instruction for a head already merged is answered by reporting that merge again, which is idempotent. Only a runner that JOINED declaring 1.29.0 or later is sent one.",
+      "description": "Since 1.29.0. Pushed as `merge` on the runner's topic: loopctl's merge gate ALLOWED `head_sha` of pull request `pr_number` in `repo`, and the runner holding the claim is to merge it. Merge exactly that head and nothing else — `gh pr merge <pr_number> --repo <repo> --squash --match-head-commit <head_sha> --subject <subject> --body <body>` — so that it closes no issue: the closing keywords of the pull request's title and body are rewritten to `Refs` first (the body on the pull request too), the rewritten text is the squash message, and a pull request GitHub still links to an issue it would close is reported `ci -> escalated` over `session_escalated` and not merged, because loopctl closes the story's issue itself, with its resolution label on first; then report `stage` `ci -> merged` (edge `forward`) under `dispatch_id` and `claim_epoch`, with `effects.merge_sha` the merge commit GitHub returned. When the pull request is ALREADY merged at `head_sha`, report that merge the same way. When GitHub refuses because the head is no longer `head_sha`, report `ci -> implementing` over `base_moved`; any other refusal, report `ci -> escalated` over `session_escalated` with the refusal as `reason`. No reply. It may be pushed more than once for one head when no merge was reported within the answer window; a second instruction for a head already merged is answered by reporting that merge again, which is idempotent. Only a runner that JOINED declaring 1.29.0 or later is sent one.",
       "properties": {
         "claim_epoch": {
           "minimum": 0,
@@ -3309,5 +3309,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.35.0"
+  "x-contract-version": "1.35.1"
 }

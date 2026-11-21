@@ -196,7 +196,7 @@ defmodule LoopctlRunner.ControlMergeTest do
     {:ok, answers} = Agent.start(fn -> List.wrap(merged) end)
     on_exit(fn -> if Process.alive?(answers), do: Agent.stop(answers) end)
 
-    merge = fn repo, number, head, _timeout ->
+    merge = fn repo, number, head, _body, _timeout ->
       send(test, {:forge_merge, repo, number, head, self()})
       if gate, do: receive(do: (:release -> :ok))
 
@@ -206,7 +206,7 @@ defmodule LoopctlRunner.ControlMergeTest do
       end)
     end
 
-    %{view: view, merge: merge}
+    %{view: view, edit_body: fn _repo, _number, _body, _timeout -> :ok end, merge: merge}
   end
 
   defp next_stage(timeout \\ 5_000) do
