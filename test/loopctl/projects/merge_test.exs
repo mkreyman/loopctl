@@ -272,13 +272,16 @@ defmodule Loopctl.Projects.MergeTest do
       assert entry.metadata["target_id"] == kb.id
       assert entry.metadata["counts"]["stories"] == 1
 
-      assert [_] =
+      assert [promotion] =
                AdminRepo.all(
                  from a in AuditLog,
                    where:
                      a.tenant_id == ^t.id and a.entity_id == ^kb.id and
                        a.action == "kind_promoted"
                )
+
+      assert promotion.old_state["kind"] == "kb"
+      assert promotion.new_state["kind"] == "work"
     end
   end
 
@@ -369,6 +372,42 @@ defmodule Loopctl.Projects.MergeTest do
       assert project_of(Source, source.id) == source_project.id
       assert AdminRepo.get!(Project, source_project.id).status == :active
       assert is_nil(AdminRepo.get!(Project, target.id).repo_key)
+    end
+
+    test "dry_run refuses a repo a third project holds, as the merge would" do
+      t = fixture(:tenant)
+      {source_project, _source} = widgets(t)
+
+      AdminRepo.update_all(from(p in Project, where: p.id == ^source_project.id),
+        set: [repo_url: nil, repo_key: nil]
+      )
+
+      holder = fixture(:project, %{tenant_id: t.id, repo_url: "acme/widgets"})
+      target = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+      assert {:error, {:repo_has_project, holder.id}} ==
+               Merge.merge_into(t.id, source_project.id, target.id, dry_run: true)
+    end
+
+    test "the claim is audited on the target with the repo's old and new values" do
+      t = fixture(:tenant)
+      {source_project, _source} = widgets(t)
+      target = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+      assert {:ok, %{promoted: false}} = Merge.merge_into(t.id, source_project.id, target.id)
+
+      assert [entry] =
+               AdminRepo.all(
+                 from a in AuditLog,
+                   where:
+                     a.tenant_id == ^t.id and a.entity_id == ^target.id and
+                       a.action == "repo_claimed"
+               )
+
+      assert entry.old_state["repo_url"] == nil
+      assert entry.new_state["repo_url"] == "https://github.com/acme/widgets"
+      assert entry.new_state["repo_key"] == "github.com/acme/widgets"
+      assert entry.metadata["merged_from"] == source_project.id
     end
 
     test "revoked and ledger sources never block" do

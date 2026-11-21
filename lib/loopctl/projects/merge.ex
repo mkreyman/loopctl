@@ -47,6 +47,7 @@ defmodule Loopctl.Projects.Merge do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Intake.Source
+  alias Loopctl.Projects
   alias Loopctl.Projects.Project
   alias Loopctl.Projects.RepoUrl
   alias Loopctl.TokenUsage.Budget, as: TokenBudget
@@ -151,6 +152,7 @@ defmodule Loopctl.Projects.Merge do
              {:merge_conflicts, [conflict()]}
              | {:merge_strands_source, Ecto.UUID.t(), String.t()}
              | {:repo_has_project, Ecto.UUID.t()}
+             | Ecto.Changeset.t()
              | :same_project
              | :not_found
              | :target_not_active
@@ -237,13 +239,25 @@ defmodule Loopctl.Projects.Merge do
 
     case Enum.find(sources, &(RepoUrl.key(&1.repo_full_name) != keep)) do
       nil when is_nil(target.repo_key) and sources != [] ->
-        {:ok, hd(sources).repo_full_name}
+        claimable(tenant_id, hd(sources).repo_full_name, source, target)
 
       nil ->
         {:ok, nil}
 
       stranded ->
         {:error, {:merge_strands_source, stranded.id, stranded.repo_full_name}}
+    end
+  end
+
+  # Read here, before any write, so a dry run answers the refusal the merge would. The source
+  # project itself may hold the repo: it is archived before the target claims it.
+  defp claimable(tenant_id, repo, source, target) do
+    case Projects.repo_holder(tenant_id, RepoUrl.key(repo), target.id) do
+      {:ok, %Project{id: holder_id}} when holder_id != source.id ->
+        {:error, {:repo_has_project, holder_id}}
+
+      _ ->
+        {:ok, repo}
     end
   end
 
@@ -405,8 +419,8 @@ defmodule Loopctl.Projects.Merge do
     )
     |> AdminRepo.update!()
 
-    with :ok <- update_target(target, promoted, claim) do
-      audit(tenant_id, source, target, counts, promoted, opts)
+    with {:ok, changes} <- update_target(target, promoted, claim) do
+      audit(tenant_id, source, target, counts, promoted, changes, opts)
       {:ok, promoted}
     end
   end
@@ -424,35 +438,22 @@ defmodule Loopctl.Projects.Merge do
       end)
 
     if changes == [] do
-      :ok
+      {:ok, []}
     else
       target
       |> Ecto.Changeset.change(changes)
       |> Ecto.Changeset.unique_constraint(:repo_key, name: Project.repo_key_index())
-      # A savepoint, so the unique violation leaves the merge transaction usable for the
-      # holder lookup below; the caller then rolls the whole merge back.
+      # A savepoint, so a unique violation from a holder that appeared after `claimable/4`
+      # read leaves the transaction usable for the holder lookup; the merge then rolls back.
       |> AdminRepo.update(mode: :savepoint)
       |> case do
-        {:ok, _} -> :ok
-        {:error, _changeset} -> {:error, {:repo_has_project, repo_holder(target, claim)}}
+        {:ok, _} -> {:ok, changes}
+        {:error, changeset} -> Projects.changeset_or_refusal(target.tenant_id, changeset)
       end
     end
   end
 
-  defp repo_holder(target, claim) do
-    key = RepoUrl.key(claim)
-
-    from(p in Project,
-      where:
-        p.tenant_id == ^target.tenant_id and p.repo_key == ^key and p.status == :active and
-          p.id != ^target.id,
-      select: p.id,
-      limit: 1
-    )
-    |> AdminRepo.one()
-  end
-
-  defp audit(tenant_id, source, target, counts, promoted, opts) do
+  defp audit(tenant_id, source, target, counts, promoted, changes, opts) do
     {:ok, _} =
       Multi.new()
       |> Audit.log_in_multi(:audit, fn _ ->
@@ -473,28 +474,43 @@ defmodule Loopctl.Projects.Merge do
           new_state: %{"status" => "archived", "merged_into" => target.id}
         }
       end)
-      |> maybe_promotion_audit(tenant_id, source, target, promoted, opts)
+      |> maybe_target_audit(tenant_id, source, target, promoted, changes, opts)
       |> AdminRepo.transaction()
 
     :ok
   end
 
-  defp maybe_promotion_audit(multi, _tenant_id, _source, _target, false, _opts), do: multi
+  defp maybe_target_audit(multi, _tenant_id, _source, _target, _promoted, [], _opts), do: multi
 
-  defp maybe_promotion_audit(multi, tenant_id, source, target, true, opts) do
+  # One entry for whatever the merge changed on the target, every changed field old and new,
+  # as `Intake`'s enrolment claim records it: kind_promoted when the kind moved, otherwise
+  # repo_claimed.
+  defp maybe_target_audit(multi, tenant_id, source, target, promoted, changes, opts) do
+    fields = Keyword.keys(changes)
+
     Audit.log_in_multi(multi, :promotion_audit, fn _ ->
       %{
         tenant_id: tenant_id,
         entity_type: "project",
         entity_id: target.id,
-        action: "kind_promoted",
+        action: if(promoted, do: "kind_promoted", else: "repo_claimed"),
         actor_type: Keyword.get(opts, :actor_type, "api_key"),
         actor_id: Keyword.get(opts, :actor_id),
         actor_label: Keyword.get(opts, :actor_label),
         metadata: %{"merged_from" => source.id},
-        old_state: %{"kind" => "kb"},
-        new_state: %{"kind" => "work"}
+        old_state: target |> Map.take(fields) |> audit_states(),
+        new_state: changes |> Map.new() |> audit_states()
       }
+    end)
+  end
+
+  defp audit_states(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(v) and not is_boolean(v) and not is_nil(v) ->
+        {to_string(k), to_string(v)}
+
+      {k, v} ->
+        {to_string(k), v}
     end)
   end
 end

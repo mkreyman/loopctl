@@ -654,6 +654,9 @@ defmodule LoopctlWeb.ProjectController do
       {:error, {:repo_has_project, _holder_id}} = refusal ->
         refusal
 
+      {:error, %Ecto.Changeset{}} = invalid ->
+        invalid
+
       {:error, :not_found} ->
         {:error, :not_found}
 
