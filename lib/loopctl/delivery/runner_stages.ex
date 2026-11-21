@@ -20,7 +20,8 @@ defmodule Loopctl.Delivery.RunnerStages do
   stopped. It is a FACT the runner reports, never a verdict it takes, so what happens to the
   story is decided here from the reason:
 
-  - `completed` — nothing. The session's own `stage` messages already said where it got to.
+  - `completed` — the session's slot goes back, whatever stage the story is at, and the
+    story is left where the session's own `stage` messages put it.
   - `wall_clock_exceeded`, `max_turns_exceeded` — an in-flight story is ESCALATED over
     `:budget_reported`, a control-only edge (`Loopctl.Delivery.StageMachine`), and the
     session's slot goes back in that transition; then the claim it ran under is ENDED as a
@@ -336,7 +337,7 @@ defmodule Loopctl.Delivery.RunnerStages do
          :ok <- mark_exhausted(outcome, tenant_id, runner_id, message, before, session),
          :ok <- act_on_session_end(tenant_id, runner_id, actor_id, session, message),
          {:ok, row} <- stage_row(tenant_id, session.story_id) do
-      release_if_session_over(tenant_id, session, message, row)
+      release_ended_slot(tenant_id, session, message)
       {:ok, %{row: row, replayed?: outcome == :replayed}}
     end
   end
@@ -766,38 +767,29 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   defp chain_hash_violation?(%Postgrex.Error{}), do: false
 
-  # THE SLOT, released when the session is over by a rule the SERVER can check — never on the
-  # runner's word alone, which is the rule `StageMachine.ends_session?/1` exists to hold: a
-  # message able to say "my session is over" while it ran could free a slot still in use.
-  #
-  # So a report frees the slot only where the heal sweep would: the claim it ran under has
-  # ENDED (the row is bound to a later epoch — a `crashed` release, a reclaim), or the row sits
-  # at a stage that ends a session. A `completed` report at `pr_open` frees nothing; the heal
-  # sweep's wall-clock bound still does. Idempotent by generation, so the transition that
-  # already released inline makes this a no-op.
-  defp release_if_session_over(tenant_id, session, message, row) do
-    if session_over?(row, session) do
-      case Runners.release_slot(tenant_id, message.dispatch_id, session.slot_generation) do
-        {:ok, _outcome} ->
-          :ok
+  # THE SLOT goes back with the recorded session end, whatever its reason and wherever the
+  # story's row stands. The report is the session's end in the same sense a triage verdict or a
+  # draft's `agent_result` is (`DispatchLedger.record_agent_result/5` releases on it): the
+  # runner that holds the dispatch, authenticated by its own token, after acceptance and under
+  # the claim's epoch. Holding the slot until the row reached a session-ending stage kept a
+  # `completed` session at `pr_open` or `ci` on its machine's only slot for the whole wall clock
+  # while nothing ran, and the triage and verify sessions the story needed next found no runner
+  # (2026-11-21, the live e2e). A replay releases too, so a release lost after the record is
+  # healed by the resend; idempotent by generation, and the heal sweep reads the same fact
+  # (`Capacity.dead_reservations/1`).
+  defp release_ended_slot(tenant_id, session, message) do
+    case Runners.release_slot(tenant_id, message.dispatch_id, session.slot_generation) do
+      {:ok, _outcome} ->
+        :ok
 
-        {:error, reason} ->
-          Logger.warning(
-            "ended session did not release its slot; the heal sweep bounds it: " <>
-              "tenant_id=#{tenant_id} dispatch_id=#{message.dispatch_id} " <>
-              "reason=#{inspect(reason)}"
-          )
-      end
+      {:error, reason} ->
+        Logger.warning(
+          "ended session did not release its slot; the heal sweep releases it: " <>
+            "tenant_id=#{tenant_id} dispatch_id=#{message.dispatch_id} " <>
+            "reason=#{inspect(reason)}"
+        )
     end
   end
-
-  defp session_over?(%StoryStage{claim_epoch: epoch}, %{claim_epoch: ours}) when epoch > ours,
-    do: true
-
-  defp session_over?(%StoryStage{claim_epoch: epoch, stage: stage}, %{claim_epoch: epoch}),
-    do: StageMachine.ends_session?(stage)
-
-  defp session_over?(_row, _session), do: false
 
   @doc """
   A stage row as the wire states it: where the story IS, under which claim, and what

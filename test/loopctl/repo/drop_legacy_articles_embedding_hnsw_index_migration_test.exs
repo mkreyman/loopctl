@@ -70,6 +70,14 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
 
   @index "articles_embedding_hnsw_idx"
 
+  # Every CONCURRENTLY statement this module issues itself (the restore, and the forged
+  # leftover's drop) waits for every transaction that holds an older
+  # snapshot of the database to finish, the sandbox transactions of other test modules
+  # included. That wait is not bounded by this module's own work, and DBConnection's default
+  # 15 s timeout canceled the restore on a loaded CI runner (57014 in on_exit, PR #1127's run
+  # 44885244827). A minute holds that wait and still fails a real hang.
+  @ddl_timeout :timer.minutes(1)
+
   # Restore the canonical state BEFORE and AFTER every test. The applied-migration
   # baseline in the test DB is: read flag ABSENT (so the legacy column is the live read
   # path) and the legacy index PRESENT AND VALID. Both directions of every test below can
@@ -100,13 +108,17 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
       ])
 
       if index_present?(@index) and not index_valid?(@index) do
-        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}", [], timeout: @ddl_timeout)
       end
 
-      AdminRepo.query!("""
-      CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
-      ON articles USING hnsw (embedding vector_cosine_ops) #{HnswIndex.with_params_clause()}
-      """)
+      AdminRepo.query!(
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
+        ON articles USING hnsw (embedding vector_cosine_ops) #{HnswIndex.with_params_clause()}
+        """,
+        [],
+        timeout: @ddl_timeout
+      )
     end)
   end
 
@@ -313,7 +325,7 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
       with_unboxed(fn ->
         clear_read_flag()
 
-        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}", [], timeout: @ddl_timeout)
 
         # Forge the exact leftover a failed CONCURRENTLY build produces: present in the
         # catalog, marked NOT valid.

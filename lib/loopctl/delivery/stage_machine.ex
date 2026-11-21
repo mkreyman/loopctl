@@ -885,12 +885,13 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc """
   True when arriving at `to` ends the session (`session_ends_at/0`).
 
-  DERIVED from the destination stage, never asserted by the caller. A message that could say
-  "my session is over" while it ran would let a runner free a slot it is still using, and the
-  admission ceiling it feeds is what keeps six concurrent sessions off one Anthropic account
-  (design §9). Both release paths read THIS — `Loopctl.Delivery.Stages`' inline release and
-  `Loopctl.Delivery.RunnerStages`' replay release — so they cannot disagree about when a
-  session ended.
+  DERIVED from the destination stage, never asserted by a stage message's caller: the
+  admission ceiling a release feeds is what keeps six concurrent sessions off one Anthropic
+  account (design §9). Both stage release paths read THIS — `Loopctl.Delivery.Stages`' inline
+  release and `Loopctl.Delivery.RunnerStages`' replay release — so they cannot disagree about
+  when a session ended. The other way a session's slot goes back is the session's own end
+  report (`session_ended`, `triage_verdict`, `agent_result`), sent by the runner that holds the
+  dispatch once its session process has exited.
   """
   @spec ends_session?(stage()) :: boolean()
   def ends_session?(to), do: to in @session_ends_at

@@ -121,7 +121,7 @@ defmodule Loopctl.Delivery.SessionEndTest do
   end
 
   describe "completed (AC-44.3.7)" do
-    test "changes no stage, releases nothing, and is recorded on the ledger row" do
+    test "changes no stage, frees the slot, and is recorded on the ledger row" do
       ctx = session(:pr_open)
 
       assert {:ok, %{row: row, replayed?: false}} = end_session(ctx, "completed")
@@ -130,9 +130,9 @@ defmodule Loopctl.Delivery.SessionEndTest do
       assert stage_of(ctx.story).lock_version == ctx.row.lock_version
       assert transitions(ctx.story) == []
 
-      # The runner's word that its session is over frees no slot on its own: the row is not at
-      # a stage that ends a session, and the claim it ran under is still live.
-      assert in_flight(ctx.runner) == 1
+      # The session is over, so its slot goes back even though the row stays at `pr_open` and
+      # the claim stays live: verify and merge run without this session.
+      assert in_flight(ctx.runner) == 0
 
       recorded = ledger(ctx.record)
       assert recorded.session_ended_reason == "completed"
@@ -141,7 +141,7 @@ defmodule Loopctl.Delivery.SessionEndTest do
       assert recorded.counts_toward_retry_ceiling == nil
     end
 
-    test "at a stage that ends the session, the slot goes back: the stage decides, not the word" do
+    test "at a stage that ends the session, the slot goes back too" do
       ctx = session(:deployed)
       assert in_flight(ctx.runner) == 1
 
