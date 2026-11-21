@@ -38,7 +38,9 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
   - `tenant_id` -- the tenant UUID
   - `attrs` -- map with `:epic_id`, `:number`, `:title`, and optional fields
-  - `opts` -- keyword list with `:actor_id`, `:actor_label` and `:intake_record_id`
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:intake_record_id` and
+    `:work_item` (true when `Loopctl.WorkItems.Open` creates an interactive work item; the
+    story is stamped `work_item_opened_at`, provenance set here and nowhere else)
 
   ## `:intake_record_id` — the intake link (#803 §4, #805)
 
@@ -95,7 +97,8 @@ defmodule Loopctl.WorkBreakdown.Stories do
           tenant_id: tenant_id,
           project_id: epic.project_id,
           epic_id: epic.id,
-          intake_record_id: intake_record_id
+          intake_record_id: intake_record_id,
+          work_item_opened_at: work_item_opened_at(opts)
         }
         |> Story.create_changeset(attrs)
         # Maps `stories_intake_record_uidx` to a changeset error rather than a raise, so a
@@ -505,6 +508,9 @@ defmodule Loopctl.WorkBreakdown.Stories do
   # Absent is `{:ok, nil}` and is the ordinary case. A malformed id is refused rather than
   # cast-and-hoped: `Ecto.UUID.cast/1` here means the FK never sees a value the database
   # would reject with a 500 instead of a domain error.
+  defp work_item_opened_at(opts),
+    do: if(Keyword.get(opts, :work_item) == true, do: DateTime.utc_now())
+
   defp intake_link(tenant_id, opts) do
     case Keyword.get(opts, :intake_record_id) do
       nil ->

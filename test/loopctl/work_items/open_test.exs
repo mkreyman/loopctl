@@ -88,6 +88,7 @@ defmodule Loopctl.WorkItems.OpenTest do
       assert story.agent_status == :implementing
       assert story.assigned_holder_id == ctx.h.id
       assert story.assigned_agent_id == ctx.agent.id
+      assert %DateTime{} = story.work_item_opened_at
       assert %DateTime{} = story.claimed_until
       assert %DateTime{} = story.lifecycle_entered_at
 

@@ -44,7 +44,8 @@ defmodule Loopctl.Agents.Specs.ImplementV1 do
         :dependencies_met,
         :single_active_source,
         :intake_record_optional,
-        :issue_not_closed
+        :issue_not_closed,
+        :not_work_item
       ],
       order: :round_robin_project_tenant
     },

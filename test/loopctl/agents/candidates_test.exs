@@ -127,6 +127,23 @@ defmodule Loopctl.Agents.CandidatesTest do
     end
   end
 
+  describe "an interactive work item (US-52.18)" do
+    setup ctx, do: %{corpus: seed_corpus(ctx)}
+
+    test "released to queued, is never an implement candidate", ctx do
+      c = ctx.corpus
+      assert c.q_authored in ids(run(ImplementV1.spec(), 50))
+
+      {1, _} =
+        AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^c.q_authored),
+          set: [work_item_opened_at: DateTime.utc_now()]
+        )
+
+      refute c.q_authored in ids(run(ImplementV1.spec(), 50))
+      refute c.q_authored in ids(DispatchDriver.candidates(50))
+    end
+  end
+
   describe "tenant isolation (AC-48.3.4)" do
     test "TC-48.3.3: a tenant-scoped read never returns another tenant's story", ctx do
       mine_detected = detected(ctx.tenant.id, -100)

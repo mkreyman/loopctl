@@ -121,6 +121,13 @@ defmodule Loopctl.WorkBreakdown.Story do
     # is the friendly error in front of it, not the enforcement.
     field :intake_record_id, Ecto.UUID
 
+    # US-52.18: when `Loopctl.WorkItems.Open` created this story as an interactive session's
+    # work item, or nil. Provenance like `intake_record_id`: set once from a
+    # `create_story/3` OPTION, never cast, never rewritten. implement@1 never places a story
+    # that carries it (`Loopctl.Agents.Candidates`' `:not_work_item`): a holder's end
+    # re-queues its items for the session to take back, not for the factory.
+    field :work_item_opened_at, :utc_datetime_usec
+
     # #803: the claim's lease and its fence. `claimed_until` is when the claim may be
     # released by `Loopctl.Workers.ReclaimExpiredClaimsWorker` (NULL = no lease, which
     # the reclaimer ignores — every claim made before the lease existed). `claim_epoch`

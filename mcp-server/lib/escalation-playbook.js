@@ -33,7 +33,7 @@ export const TAKE_OVER_STEPS = Object.freeze([
   "If the row's run.work_left_behind is \"true\", the runner left unpushed commits on run.branch. runner_list gives the runner's host; the commits are in <repo>/.claude/worktrees/loop-story-<story_id> there. Push that branch or cherry-pick from it rather than starting over.",
   "Do the work through the normal delivery loop in the story's repo: branch from the repo's base branch (the intake source's base_branch in intake_source_list, the trunk the runner used), tests, the review round, a PR whose body says \"Fixes #<issue>\" so GitHub closes the issue, merge on green.",
   "Close the story: resolve_escalation {story_id, to: \"done\", reason: \"fixed by <owner/repo>#<PR>\"}. That needs LOOPCTL_USER_KEY, an operator key no dispatch minted; an interactive fleet session holds one, so the session that took the story over resolves it itself, never Mark. If the work turns out not to be wanted, use to: \"failed\" instead.",
-  "Finish the escalation handoff loopctl posted for the story on its repo channel (handoff:<repo>:escalation-<story_id>-g<N>): claim it before you start (step 1 of its body) and channel_done it after the resolve. loopctl closes it itself once the story leaves escalated, and posts a new generation if it is finished while the story is still escalated.",
+  "Finish the escalation handoff loopctl posted for the story on its repo channel (handoff:<repo>:escalation-<story_id>-g<N>): claim it before you start (step 1 of its body). The resolve marks that claim done itself, so do not channel_done it afterwards (that answers 404); channel_done it only if you stop without resolving, and loopctl then posts a new generation while the story is still escalated.",
 ]);
 
 const ALREADY_MERGED =

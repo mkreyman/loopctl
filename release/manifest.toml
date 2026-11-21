@@ -3,7 +3,7 @@
 # file; `mix loopctl.release_set --check` fails when one differs, and `--bump` moves the set.
 # Written by `mix loopctl.release_set --bump`; edit by hand only to change a minimum.
 
-set = 8
+set = 9
 
 [components.server]
 version = "1.0.0"
@@ -36,7 +36,7 @@ minimum = "0.1.0"
 source = "chg/cli/Cargo.toml"
 
 [components.mcp]
-version = "3.21.1"
+version = "3.21.2"
 minimum = "3.19.1"
 source = "mcp-server/package.json"
 

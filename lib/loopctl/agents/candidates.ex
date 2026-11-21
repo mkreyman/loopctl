@@ -13,6 +13,7 @@ defmodule Loopctl.Agents.Candidates do
   | `{:stage, stage}` | its stage row is at `stage` (exactly one per spec) |
   | `:intake_record_required` | it was filed from an intake record (inner join) |
   | `:intake_record_optional` | always; joins its record when it has one (left join) |
+  | `:not_work_item` | it was not opened as an interactive work item (`work_item_opened_at` is nil, US-52.18) |
   | `:single_active_source` | its project is bound to exactly ONE unrevoked intake source |
   | `:issue_not_closed` | its issue's latest delivered state is not `closed` (NULL passes) |
   | `:requires_ticket_if_source_says` | its source does not set `triage_requires_ticket`, or its record carries a `ticket_id` |
@@ -140,7 +141,8 @@ defmodule Loopctl.Agents.Candidates do
                        :pr_route_source,
                        :head_unverified,
                        :implementer_dispatched,
-                       :no_live_verifier_dispatch
+                       :no_live_verifier_dispatch,
+                       :not_work_item
                      ]
 
   @orders [:round_robin_project_tenant]
@@ -381,6 +383,12 @@ defmodule Loopctl.Agents.Candidates do
       on: b.tenant_id == st.tenant_id and b.project_id == st.project_id
     )
   end
+
+  # An interactive session's work item is that session's: a holder's end re-queues it so the
+  # session can take its branch back (`Loopctl.WorkItems.Open`), and it carries no
+  # acceptance criteria a placed session could implement.
+  defp apply_predicate(:not_work_item, query, _kind),
+    do: where(query, [story: st], is_nil(st.work_item_opened_at))
 
   # Triage's payload IS the reporter's words, so a story with no record has nothing to triage.
   defp apply_predicate(:intake_record_required, query, _kind) do
