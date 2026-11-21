@@ -42,6 +42,11 @@ end
 #   * `check_rate/3` runs a single upsert via the BYPASSRLS `Loopctl.AdminRepo`
 #     on every authenticated request — size/monitor the AdminRepo pool, and note
 #     the hottest bucket's single row is a serialization + autovacuum-bloat point.
+#
+# The API pipeline's TENANT-WIDE bucket is the exception: it is counted on the
+# Postgres impl whatever this selects (`Loopctl.RateLimiter.tenant_impl/0`,
+# US-52.26), so that one upsert per authenticated request runs even when this is
+# unset. Only the per-key bucket and the other gates follow `RATE_LIMITER`.
 if System.get_env("RATE_LIMITER") == "postgres" do
   config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
 end

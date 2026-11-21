@@ -395,9 +395,6 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         end)
 
       assert log =~ "ownership_rejected"
-      # A non-rate-limit event carries NO `limit_kind` — its log line must not emit
-      # a dangling `limit_kind=` token (the discriminator is write/read-cap only).
-      refute log =~ "limit_kind="
       assert_receive {:ownership_rejected, %{count: 1}, meta}
       assert meta.project_id == foreign.id
     end
@@ -550,78 +547,6 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
       assert log =~ "agent_identity_required"
-    end
-
-    # AC-39.2.8 — a per-write cap stored as a JSON STRING must still enforce. Without
-    # coercion the string flows to the limiter verbatim, where Elixir term ordering
-    # (int < binary) never denies (Hammer) or the is_integer guard raises and is
-    # swallowed to fail-open (Postgres) — either way silently neutering the cap.
-    test "a coordination write cap stored as a STRING is coerced and still enforces (429)" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_write_limit_per_minute" => "3"}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = member_agent_key(tenant, project)
-
-      for _ <- 1..3 do
-        conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
-        assert conn.status in [200, 201]
-      end
-
-      conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
-      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-    end
-
-    # AC-39.2.9 — a rate-limiter fault must fail OPEN (write allowed) but stay
-    # OBSERVABLE via the shared throttled FailOpenLog, never be silently swallowed.
-    test "a rate-limiter fault fails open (write allowed) and is logged, not swallowed" do
-      # sec-4: let the fail-CLOSED auth-path gate (`auth_ip:*`) pass so this test
-      # exercises the per-write limiter's OWN fail-OPEN handling in isolation.
-      stub(Loopctl.MockRateLimiter, :check_rate, fn
-        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
-        _bucket, _window, _limit -> raise "limiter boom"
-      end)
-
-      tenant = fixture(:tenant)
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = member_agent_key(tenant, project)
-
-      log =
-        capture_log(fn ->
-          conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
-          # Fail-open: the write still lands despite the limiter fault.
-          assert conn.status in [200, 201]
-        end)
-
-      assert log =~ "RateLimiter fail-open"
-      assert log =~ "channel_post_write:key"
-    end
-
-    # TC-39.2.6
-    test "over-cap writes are 429 with Retry-After and emit a security-event log" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_write_limit_per_minute" => 3}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = member_agent_key(tenant, project)
-
-      # First 3 writes are within the per-write cap.
-      for _ <- 1..3 do
-        conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
-        assert conn.status in [200, 201]
-      end
-
-      log =
-        capture_log(fn ->
-          conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
-
-          assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-          assert [retry] = get_resp_header(conn, "retry-after")
-          assert String.to_integer(retry) >= 1
-        end)
-
-      assert log =~ "rate_limited"
-      # The signal carries a write discriminator so an external telemetry/log
-      # consumer can tell write flooding from read scraping (US-40.D5).
-      assert log =~ "limit_kind=write"
     end
 
     # AC-39.2.6 — a denylist hit / oversized body is a 422 (validation), not persisted.
@@ -1279,8 +1204,8 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     end
 
     # AC-40.D1.4 — the full-body :show read must be rate-limited. It is covered by
-    # the generic per-key limiter of the :authenticated pipeline (NOT the tighter
-    # write cap, which guards writes only). This asserts that guarantee actually
+    # the generic per-key limiter of the :authenticated pipeline for a key that is
+    # not a holder credential (US-52.26). This asserts that guarantee actually
     # holds for :show: once the per-key RPM budget is exhausted, further reads are
     # 429 with a Retry-After, exactly like every other authenticated read.
     test "over-cap :show reads are 429 with Retry-After (pipeline limiter applies)" do
@@ -1429,25 +1354,6 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         |> get(@handoffs_path, %{"project_id" => project.id})
 
       assert conn.status in [401, 403]
-    end
-
-    # AC-40.D5.1: the handoffs read is behind the DEDICATED per-read coordination
-    # cap (same @read_actions gate as :index/:show). A burst past it is 429.
-    test "an over-cap handoffs read burst is 429 with Retry-After (dedicated read cap)" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 2}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
-
-      for _ <- 1..2 do
-        conn = authed_conn(raw) |> get(@handoffs_path, %{"project_id" => project.id})
-        assert conn.status == 200
-      end
-
-      conn = authed_conn(raw) |> get(@handoffs_path, %{"project_id" => project.id})
-      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-      assert [retry] = get_resp_header(conn, "retry-after")
-      assert String.to_integer(retry) >= 1
     end
   end
 
@@ -1603,168 +1509,8 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     end
   end
 
-  describe "read rate limiting (US-40.D5)" do
-    # TC-40.D5.1 — a burst of :index reads past the DEDICATED read cap gets 429 with
-    # a Retry-After and emits the coordination :rate_limited signal, on a bucket
-    # SEPARATE from the write cap. The read cap (3) trips at a LOWER count than the
-    # pipeline per-key cap (default 300), so the coordination signal fires instead
-    # of being shadowed by an anonymous pipeline 429 (independence/observability).
-    test "an :index read burst past the read cap is 429 with Retry-After + :rate_limited signal" do
-      counts = stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 3}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
-
-      # First 3 reads are within the per-read cap.
-      for _ <- 1..3 do
-        conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-        assert conn.status == 200
-      end
-
-      log =
-        capture_log(fn ->
-          conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-
-          assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-          assert [retry] = get_resp_header(conn, "retry-after")
-          assert String.to_integer(retry) >= 1
-        end)
-
-      assert log =~ "rate_limited"
-      # The signal carries a READ discriminator so an external telemetry/log
-      # consumer can tell read scraping from write flooding (US-40.D5) — the two
-      # trips are no longer an indistinguishable :rate_limited shape.
-      assert log =~ "limit_kind=read"
-
-      # The trip was counted on the READ bucket, distinct from the write bucket —
-      # read and write abuse are independently observable (US-40.D5 technical note).
-      buckets = Agent.get(counts, &Map.keys/1)
-      assert Enum.any?(buckets, &String.starts_with?(&1, "channel_post_read:key"))
-      refute Enum.any?(buckets, &String.starts_with?(&1, "channel_post_write:key"))
-    end
-
-    # TC-40.D5.2 — the full-body :show read is behind the SAME dedicated read cap,
-    # not only the pipeline limiter: a burst of by-id reads trips at the read cap.
-    test "GET /:id is rate-limited by the dedicated read cap too" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 3}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, agent} = agent_key(tenant)
-
-      {:ok, post} = Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "hi"})
-
-      for _ <- 1..3 do
-        conn = authed_conn(raw) |> get(show_path(post.id))
-        assert conn.status == 200
-      end
-
-      conn = authed_conn(raw) |> get(show_path(post.id))
-      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-      assert [retry] = get_resp_header(conn, "retry-after")
-      assert String.to_integer(retry) >= 1
-    end
-
-    # TC-40.D5.3 — a read-path limiter fault fails OPEN (read allowed) but stays
-    # OBSERVABLE via the shared throttled FailOpenLog on the read bucket family,
-    # never silently swallowed (full parity with the write path).
-    test "a limiter fault on the read path fails open (read allowed) and is logged" do
-      # sec-4: let the fail-CLOSED auth-path gate (`auth_ip:*`) pass so this test
-      # exercises the per-read limiter's OWN fail-OPEN handling in isolation.
-      stub(Loopctl.MockRateLimiter, :check_rate, fn
-        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
-        _bucket, _window, _limit -> raise "limiter boom"
-      end)
-
-      tenant = fixture(:tenant)
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
-
-      log =
-        capture_log(fn ->
-          conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-          # Fail-open: the read still lands despite the limiter fault.
-          assert conn.status == 200
-        end)
-
-      assert log =~ "RateLimiter fail-open"
-      assert log =~ "channel_post_read:key"
-    end
-
-    # TC-40.D5.4 — a normal read cadence under the cap is unaffected: backward
-    # compatible with US-39.3 / US-40.C2 (reads behave exactly as before the cap).
-    test "a normal read cadence under the cap is unaffected (all 200, no 429)" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 10}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
-
-      for _ <- 1..5 do
-        conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-        assert conn.status == 200
-        assert get_resp_header(conn, "retry-after") == []
-      end
-    end
-
-    # AC-40.D5.3 — the coordination read cap is CLAMPED below the tenant's live
-    # pipeline per-key cap (read_limit/1's min/2). A tenant misconfiguring the read
-    # cap ABOVE the pipeline cap must NOT leave read trips shadowed by an anonymous
-    # pipeline 429: the effective read cap is the pipeline value, not the configured
-    # (larger) read value. Assert the EFFECTIVE limit the controller hands the read
-    # bucket, independent of plug ordering (parity with write_limit/1's clamp).
-    test "AC-40.D5.3: a read cap set ABOVE the pipeline cap is clamped to the pipeline value" do
-      {:ok, limits} = Agent.start_link(fn -> %{} end)
-
-      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window_ms, limit ->
-        Agent.update(limits, &Map.put(&1, bucket, limit))
-        {:allow, 1}
-      end)
-
-      # Read cap (100) deliberately set ABOVE the pipeline per-key cap (3).
-      tenant =
-        fixture(:tenant, %{
-          settings: %{
-            "channel_post_read_limit_per_minute" => 100,
-            "rate_limit_requests_per_minute" => 3
-          }
-        })
-
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
-
-      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-      assert conn.status == 200
-
-      read_bucket =
-        limits
-        |> Agent.get(&Map.keys/1)
-        |> Enum.find(&String.starts_with?(&1, "channel_post_read:key"))
-
-      # Effective cap clamped to the pipeline value (3), NOT the configured 100.
-      assert Agent.get(limits, &Map.get(&1, read_bucket)) == 3
-    end
-
-    # AC-40.D5.3 — a per-read cap stored as a JSON STRING must still enforce. Without
-    # coercion the string flows to the limiter verbatim, where Elixir term ordering
-    # (int < binary) never denies (Hammer) or the is_integer guard raises and is
-    # swallowed to fail-open (Postgres) — either way silently neutering the read cap.
-    # Mirrors the write-path regression test ("...write cap stored as a STRING...").
-    test "a coordination read cap stored as a STRING is coerced and still enforces (429)" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => "3"}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
-
-      for _ <- 1..3 do
-        conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-        assert conn.status == 200
-      end
-
-      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
-      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-    end
-
-    # AC-40.D5.2 — the read response is BOUNDED BY CONSTRUCTION; this story adds the
-    # limiter and ASSERTS the bounds already hold. The list clamps `limit` to 100
+  describe "read response bounds (US-40.D5)" do
+    # AC-40.D5.2 — the read response is BOUNDED BY CONSTRUCTION. The list clamps `limit` to 100
     # (@max_recent_limit) and returns bounded previews (not full bodies).
     test "AC-40.D5.2: :index clamps limit to 100 and returns bounded previews, not full bodies" do
       tenant = fixture(:tenant)

@@ -101,8 +101,6 @@ defmodule LoopctlWeb.ChannelClaimController do
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Projects
-  alias Loopctl.RateLimiter.FailOpenLog
-  alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -110,47 +108,8 @@ defmodule LoopctlWeb.ChannelClaimController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:create, :done, :release, :index]
 
-  # Per-claim rate limit (review finding): a dedicated cap on the claim write path,
-  # mirroring the ChannelPostController's per-write cap. Reuses the same RateLimiter
-  # behaviour seam, fail-open discipline, and security telemetry. The claim surface
-  # is high-value (24h leases, no operator force-release) so a dedicated cap is
-  # warranted even though the generic pipeline limiter also runs first.
-  plug :rate_limit_claim when action in [:create]
-
-  # The read gets its OWN bucket, not a share of the write cap (#707). This endpoint
-  # exists to replace a destructive probe, so polling it must not spend the CLAIM write
-  # budget. A separate bucket alone does NOT deliver that, though: the generic per-key
-  # pipeline limiter (LoopctlWeb.Plugs.RateLimiter) counts EVERY authenticated request,
-  # reads included, so a read cap merely bounded BY the pipeline budget could still
-  # exhaust it and 429 the caller out of claiming. `claim_read_limit/1` therefore clamps
-  # the read to a SHARE (a quarter) of that budget — but never BELOW the claim write
-  # cap, which would invert the guarantee and 429 the caller out of the very read that
-  # replaces the probe.
-  plug :rate_limit_claim_read when action in [:index]
-
-  # 60s fixed window, matching the ETS/Hammer contract the pipeline limiter uses.
-  @claim_window_ms 60_000
-
-  # Config-default per-minute claim cap; a tenant may override via the
-  # `channel_claim_limit_per_minute` setting.
-  @default_claim_limit 60
-
-  # Config-default per-minute cap for the claim READ; a tenant may override via the
-  # `channel_claim_read_limit_per_minute` setting. Set above the write cap because a
-  # read is cheap, idempotent, and is the behaviour we are trying to make the easy one.
-  @default_claim_read_limit 120
-
-  # The read's share of the per-key PIPELINE budget (see the `:rate_limit_claim_read`
-  # plug note). A quarter, FLOORED at the claim write cap by `claim_read_limit/1`: the
-  # share bounds an unbounded poll rate aimed at AdminRepo's small pool, and the floor
-  # keeps the read at least as available as the write it precedes. On the default
-  # 300/min pipeline budget the effective read cap is therefore 75, not the 120 above —
-  # the 120 is the cap this endpoint asks for, the pipeline share is what it gets.
-  @claim_read_pipeline_share 4
-
-  # Fallback for the generic per-key pipeline limit, kept in sync with
-  # LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit.
-  @pipeline_per_key_limit_default 300
+  # No coordination rate cap here (US-52.26): the only request bounds are the
+  # pipeline's, in `LoopctlWeb.Plugs.RateLimiter`.
 
   # A missing/cross-tenant/cross-project project returns this ONE message on the
   # claim path — no existence oracle (mirrors ChannelPostController).
@@ -498,148 +457,6 @@ defmodule LoopctlWeb.ChannelClaimController do
           "This API key's agent identity is not valid for this tenant; it cannot claim a coordination handoff"
       }
     })
-  end
-
-  # --- Rate limiting (function plug) ---
-
-  defp rate_limit_claim(conn, _opts) do
-    api_key = conn.assigns.current_api_key
-    tenant = conn.assigns[:current_tenant]
-    limit = claim_limit(tenant)
-    identifier = "channel_claim:key:#{api_key.id}"
-
-    case check_rate(identifier, limit) do
-      {:allow, _count} ->
-        conn
-
-      {:deny, _limit} ->
-        reset_at = window_reset_at()
-        retry_after = max(1, reset_at - System.system_time(:second))
-
-        emit_security_event(:rate_limited, %{
-          tenant_id: api_key.tenant_id,
-          api_key_id: api_key.id,
-          limit_kind: :claim
-        })
-
-        conn
-        |> put_resp_header("retry-after", to_string(retry_after))
-        |> put_status(:too_many_requests)
-        |> json(%{error: %{status: 429, message: "Rate limit exceeded"}})
-        |> halt()
-    end
-  end
-
-  defp rate_limit_claim_read(conn, _opts) do
-    api_key = conn.assigns.current_api_key
-    tenant = conn.assigns[:current_tenant]
-    limit = claim_read_limit(tenant)
-    identifier = "channel_claim_read:key:#{api_key.id}"
-
-    case check_rate(identifier, limit) do
-      {:allow, _count} ->
-        conn
-
-      {:deny, _limit} ->
-        reset_at = window_reset_at()
-        retry_after = max(1, reset_at - System.system_time(:second))
-
-        emit_security_event(:rate_limited, %{
-          tenant_id: api_key.tenant_id,
-          api_key_id: api_key.id,
-          limit_kind: :claim_read
-        })
-
-        conn
-        |> put_resp_header("retry-after", to_string(retry_after))
-        |> put_status(:too_many_requests)
-        |> json(%{error: %{status: 429, message: "Rate limit exceeded"}})
-        |> halt()
-    end
-  end
-
-  defp check_rate(identifier, limit) do
-    case Loopctl.RateLimiter.impl().check_rate(identifier, @claim_window_ms, limit) do
-      {:allow, count} when is_integer(count) -> {:allow, count}
-      {:deny, denied} when is_integer(denied) -> {:deny, denied}
-      other -> fail_open(identifier, "limiter returned #{inspect(other)}")
-    end
-  rescue
-    e -> fail_open(identifier, Exception.message(e))
-  catch
-    :exit, reason -> fail_open(identifier, "limiter exit: #{inspect(reason)}")
-    :throw, value -> fail_open(identifier, "limiter throw: #{inspect(value)}")
-  end
-
-  defp fail_open(identifier, detail) do
-    FailOpenLog.warn(:coordination, identifier, detail)
-    {:allow, 0}
-  end
-
-  defp claim_limit(nil), do: default_claim_limit()
-
-  defp claim_limit(tenant) do
-    configured =
-      tenant
-      |> Tenants.get_tenant_settings("channel_claim_limit_per_minute", default_claim_limit())
-      |> coerce_positive_int(default_claim_limit())
-
-    min(configured, pipeline_per_key_limit(tenant))
-  end
-
-  defp default_claim_limit do
-    Application.get_env(:loopctl, :channel_claim_limit_per_minute, @default_claim_limit)
-  end
-
-  defp claim_read_limit(nil), do: default_claim_read_limit()
-
-  defp claim_read_limit(tenant) do
-    configured =
-      tenant
-      |> Tenants.get_tenant_settings(
-        "channel_claim_read_limit_per_minute",
-        default_claim_read_limit()
-      )
-      |> coerce_positive_int(default_claim_read_limit())
-
-    # NEVER below `claim_limit/1`: a read cap tighter than the write cap 429s the caller
-    # out of reading while it can still claim, which is the destructive probe again.
-    min(
-      configured,
-      max(claim_limit(tenant), div(pipeline_per_key_limit(tenant), @claim_read_pipeline_share))
-    )
-  end
-
-  defp default_claim_read_limit do
-    Application.get_env(:loopctl, :channel_claim_read_limit_per_minute, @default_claim_read_limit)
-  end
-
-  defp pipeline_per_key_limit(tenant) do
-    tenant
-    |> Tenants.get_tenant_settings(
-      "rate_limit_requests_per_minute",
-      @pipeline_per_key_limit_default
-    )
-    |> coerce_positive_int(@pipeline_per_key_limit_default)
-  end
-
-  defp coerce_positive_int(value, _default) when is_integer(value) and value > 0, do: value
-
-  defp coerce_positive_int(value, default) when is_binary(value) do
-    case Integer.parse(value) do
-      {n, ""} when n > 0 -> n
-      _ -> default
-    end
-  end
-
-  defp coerce_positive_int(_value, default), do: default
-
-  defp window_reset_at do
-    # Hammer uses millisecond windows aligned to epoch; the next reset is the
-    # next multiple of the window size.
-    now = System.system_time(:millisecond)
-    ceil = div(now, @claim_window_ms) * @claim_window_ms + @claim_window_ms
-    div(ceil, 1000)
   end
 
   # Coordination-surface security telemetry (parity with ChannelPostController).

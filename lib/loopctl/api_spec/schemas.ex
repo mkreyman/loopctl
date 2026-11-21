@@ -138,9 +138,13 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "RateLimitError",
       description:
-        "Rate limit exceeded. Default limits: 300 requests/minute per API key and 3x that " <>
-          "per tenant (superadmin keys are exempt; per-tenant overrides via the " <>
-          "`rate_limit_requests_per_minute` setting). Back off using the response headers: " <>
+        "Rate limit exceeded. Every tenant has ONE cluster-global limit, the tenant setting " <>
+          "`rate_limit_tenant_requests_per_minute` (default 900 requests/minute), shared by all " <>
+          "its keys on every node. Holder credentials (session keys) have no per-key limit: " <>
+          "they meet only the tenant limit, and their X-RateLimit headers report it. Any other " <>
+          "key also has a per-key limit, the tenant setting `rate_limit_requests_per_minute` " <>
+          "(default 300), which its headers report. Superadmin keys are exempt from both. " <>
+          "Back off using the response headers: " <>
           "`Retry-After` (seconds until the window resets, always >= 1), plus `X-RateLimit-Limit`, " <>
           "`X-RateLimit-Remaining`, and `X-RateLimit-Reset` (Unix epoch seconds), which are set " <>
           "on every response.",

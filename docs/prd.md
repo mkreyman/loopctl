@@ -448,6 +448,7 @@ Tenant-level configuration stored in `tenants.settings`:
   "max_webhooks": 10,
   "webhook_max_consecutive_failures": 10,
   "rate_limit_requests_per_minute": 300,
+  "rate_limit_tenant_requests_per_minute": 900,
   "auto_reset_on_rejection": true,
   "timezone": "UTC"
 }

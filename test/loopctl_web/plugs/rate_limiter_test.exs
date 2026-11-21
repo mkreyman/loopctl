@@ -3,6 +3,7 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.ApiSpec.Schemas.RateLimitError
   alias Loopctl.Auth.ApiKey
   alias Loopctl.RateLimiter.FailOpenLog
   alias LoopctlWeb.Plugs.RateLimiter
@@ -161,6 +162,246 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
       # non-identifying family ("key"/"tenant"), never the raw UUID.
       assert log =~ "fail-open"
       assert log =~ "family=key"
+    end
+  end
+
+  # US-52.26: a holder credential meets only the tenant-wide bucket.
+  describe "holder credentials (US-52.26)" do
+    defp holder_and_plain_keys(settings) do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored, settings: settings})
+      {plain_raw, _plain_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
+
+      {:ok, %{raw_key: holder_raw, api_key: holder_key}} =
+        Loopctl.Holders.register(tenant.id, agent.id, %{
+          "kind" => "interactive",
+          "session_id" => "s1",
+          "host" => "minis"
+        })
+
+      %{tenant: tenant, holder_raw: holder_raw, holder_key: holder_key, plain_raw: plain_raw}
+    end
+
+    # TC-52.26.1
+    test "a holder credential skips the per-key check; a plain key keeps it", %{conn: conn} do
+      counts = stub_counting_limiter()
+
+      ctx =
+        holder_and_plain_keys(%{
+          "rate_limit_requests_per_minute" => 2,
+          "rate_limit_tenant_requests_per_minute" => 100
+        })
+
+      assert is_binary(ctx.holder_key.holder_id)
+
+      holder =
+        for _ <- 1..3 do
+          build_conn() |> auth_conn(ctx.holder_raw) |> get(~p"/api/v1/tenants/me")
+        end
+
+      assert Enum.map(holder, & &1.status) == [200, 200, 200]
+
+      assert Enum.map(holder, &get_resp_header(&1, "x-ratelimit-limit")) == [
+               ["100"],
+               ["100"],
+               ["100"]
+             ]
+
+      assert Enum.map(holder, &get_resp_header(&1, "x-ratelimit-remaining")) ==
+               [["99"], ["98"], ["97"]]
+
+      # The holder's key bucket was never counted.
+      refute Map.has_key?(Agent.get(counts, & &1), "key:#{ctx.holder_key.id}")
+
+      plain =
+        for _ <- 1..3 do
+          build_conn() |> auth_conn(ctx.plain_raw) |> get(~p"/api/v1/tenants/me")
+        end
+
+      assert Enum.map(plain, & &1.status) == [200, 200, 429]
+      assert get_resp_header(hd(plain), "x-ratelimit-limit") == ["2"]
+
+      # Both keys drew on the one tenant bucket: 3 holder checks + 2 plain ones (the
+      # plain key's third request stopped at its own key bucket).
+      assert Agent.get(counts, &Map.get(&1, "tenant:#{ctx.tenant.id}")) == 5
+
+      # The superadmin key reaches no limiter at all, on 300 calls.
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _w, _l ->
+        send(test_pid, {:checked, bucket})
+        {:allow, 1}
+      end)
+
+      superadmin = %ApiKey{id: Ecto.UUID.generate(), role: :superadmin, tenant_id: nil}
+
+      for _ <- 1..300 do
+        result =
+          conn
+          |> assign(:current_api_key, superadmin)
+          |> assign(:current_tenant, nil)
+          |> RateLimiter.call(
+            tenant_limiter: Loopctl.MockRateLimiter,
+            key_limiter: Loopctl.MockRateLimiter
+          )
+
+        refute result.halted
+      end
+
+      refute_received {:checked, _}
+    end
+  end
+
+  # TC-52.26.6
+  test "the OpenAPI RateLimitError names the tenant setting and the holder exemption" do
+    description = RateLimitError.schema().description
+
+    assert description =~ "rate_limit_tenant_requests_per_minute"
+    assert description =~ "no per-key limit"
+  end
+
+  describe "tenant-wide limit (US-52.26)" do
+    defp call_plug(tenant, api_key_attrs \\ %{}) do
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window_ms, limit ->
+        send(test_pid, {:limit, bucket, limit})
+        {:allow, 1}
+      end)
+
+      api_key =
+        struct(
+          ApiKey,
+          Map.merge(
+            %{id: Ecto.UUID.generate(), role: :agent, tenant_id: tenant.id, holder_id: nil},
+            api_key_attrs
+          )
+        )
+
+      build_conn()
+      |> assign(:current_api_key, api_key)
+      |> assign(:current_tenant, tenant)
+      |> RateLimiter.call(
+        tenant_limiter: Loopctl.MockRateLimiter,
+        key_limiter: Loopctl.MockRateLimiter
+      )
+    end
+
+    defp tenant_limit_seen(tenant_id) do
+      bucket = "tenant:#{tenant_id}"
+      assert_received {:limit, ^bucket, limit}
+      limit
+    end
+
+    # TC-52.26.2
+    test "the tenant limit is its own setting, not per_key_limit * 3" do
+      decoupled = fixture(:tenant, %{settings: %{"rate_limit_requests_per_minute" => 100}})
+      set = fixture(:tenant, %{settings: %{"rate_limit_tenant_requests_per_minute" => 50}})
+
+      call_plug(decoupled)
+      assert tenant_limit_seen(decoupled.id) == 900
+      assert_received {:limit, "key:" <> _, 100}
+
+      call_plug(set)
+      assert tenant_limit_seen(set.id) == 50
+    end
+
+    test "a tenant setting stored as a string is coerced; garbage falls back to 900" do
+      string = fixture(:tenant, %{settings: %{"rate_limit_tenant_requests_per_minute" => "40"}})
+      garbage = fixture(:tenant, %{settings: %{"rate_limit_tenant_requests_per_minute" => 0}})
+
+      call_plug(string)
+      assert tenant_limit_seen(string.id) == 40
+
+      call_plug(garbage)
+      assert tenant_limit_seen(garbage.id) == RateLimiter.default_tenant_limit()
+    end
+
+    test "a holder credential's call checks the tenant bucket only" do
+      tenant = fixture(:tenant)
+      call_plug(tenant, %{holder_id: Ecto.UUID.generate()})
+
+      assert tenant_limit_seen(tenant.id) == 900
+      refute_received {:limit, "key:" <> _, _}
+    end
+
+    test "the tenant bucket resolves through tenant_impl/0, the per-key bucket through impl/0" do
+      assert Loopctl.RateLimiter.default_tenant_impl() == Loopctl.RateLimiter.Postgres
+      assert Loopctl.RateLimiter.default_impl() == Loopctl.RateLimiter.Hammer
+      # config/test.exs points both at the mock.
+      assert Loopctl.RateLimiter.tenant_impl() == Loopctl.MockRateLimiter
+    end
+
+    # TC-52.26.5
+    test "over the tenant limit: 429 with retry-after and the error body" do
+      tenant = fixture(:tenant)
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window_ms, _limit ->
+        {:deny, 900}
+      end)
+
+      holder_key = %ApiKey{
+        id: Ecto.UUID.generate(),
+        role: :agent,
+        tenant_id: tenant.id,
+        holder_id: Ecto.UUID.generate()
+      }
+
+      conn =
+        build_conn()
+        |> assign(:current_api_key, holder_key)
+        |> assign(:current_tenant, tenant)
+        |> RateLimiter.call(tenant_limiter: Loopctl.MockRateLimiter)
+
+      assert conn.halted
+      assert conn.status == 429
+      assert [retry] = get_resp_header(conn, "retry-after")
+      assert String.to_integer(retry) >= 1
+      assert get_resp_header(conn, "x-ratelimit-limit") == ["900"]
+
+      assert Jason.decode!(conn.resp_body) == %{
+               "error" => %{"status" => 429, "message" => "Rate limit exceeded"}
+             }
+    end
+
+    test "a raising, exiting or throwing limiter fails open with one warning per family" do
+      import ExUnit.CaptureLog
+
+      tenant = fixture(:tenant)
+      {:ok, faults} = Agent.start_link(fn -> [:raise, :exit, :throw] end)
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window_ms, _limit ->
+        case Agent.get(faults, &hd/1) do
+          :raise -> raise "limiter store is down"
+          :exit -> exit(:pool_timeout)
+          :throw -> throw(:boom)
+        end
+      end)
+
+      FailOpenLog.reset(:plug, "key")
+      FailOpenLog.reset(:plug, "tenant")
+
+      api_key = %ApiKey{id: Ecto.UUID.generate(), role: :agent, tenant_id: tenant.id}
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..3 do
+            conn =
+              build_conn()
+              |> assign(:current_api_key, api_key)
+              |> assign(:current_tenant, tenant)
+              |> RateLimiter.call(
+                tenant_limiter: Loopctl.MockRateLimiter,
+                key_limiter: Loopctl.MockRateLimiter
+              )
+
+            refute conn.halted
+            assert conn.status == nil
+            Agent.update(faults, &tl/1)
+          end
+        end)
+
+      assert length(Regex.scan(~r/fail-open \[plug\].*family=key;/, log)) == 1
+      assert length(Regex.scan(~r/fail-open \[plug\].*family=tenant;/, log)) == 1
     end
   end
 end

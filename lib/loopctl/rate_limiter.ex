@@ -70,6 +70,23 @@ defmodule Loopctl.RateLimiter do
   @spec default_impl() :: module()
   def default_impl, do: @default_impl
 
+  @default_tenant_impl Loopctl.RateLimiter.Postgres
+
+  @doc """
+  The limiter that counts the API pipeline's TENANT-WIDE bucket (US-52.26).
+
+  Reads `Application.get_env(:loopctl, :tenant_rate_limiter, Loopctl.RateLimiter.Postgres)`,
+  so whatever `RATE_LIMITER` selects for `impl/0`, the tenant bucket is counted in the
+  shared `rate_limit_counters` table and every node draws on one budget. Only the tenant
+  bucket goes here; every other gate keeps `impl/0`.
+  """
+  @spec tenant_impl() :: module()
+  def tenant_impl, do: Application.get_env(:loopctl, :tenant_rate_limiter, @default_tenant_impl)
+
+  @doc "The production default of `tenant_impl/0`: `Loopctl.RateLimiter.Postgres`."
+  @spec default_tenant_impl() :: module()
+  def default_tenant_impl, do: @default_tenant_impl
+
   @doc """
   FAIL-OPEN limiter check for CAPACITY gates.
 

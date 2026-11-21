@@ -499,6 +499,13 @@ config :loopctl, :streaming_export_body_probe, Loopctl.MockStreamingExportBodyPr
 
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 
+# US-52.26: the pipeline's tenant-wide bucket resolves through
+# Loopctl.RateLimiter.tenant_impl/0 (production default: Postgres). Point it at the same
+# mock so every ConnCase request stays off rate_limit_counters (no committed counter
+# rows, no AdminRepo upsert per request) and under the permissive default stub; the test
+# whose subject is the shared Postgres counter passes `tenant_limiter:` to the plug.
+config :loopctl, :tenant_rate_limiter, Loopctl.MockRateLimiter
+
 # Trusted-proxy range for the shared Loopctl.RemoteIp resolver in tests. Headers
 # are chosen per-call (singleton fly-client-ip / x-forwarded-for), so only
 # :proxies is configured here.

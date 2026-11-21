@@ -18,6 +18,20 @@ All notable changes to loopctl are documented here.
   `422`. The three `/api/v1/channel/locks` endpoints answer with the same JSON as before.
   `ChannelPostSweeper` also deletes expired locks, at most its batch limit per run, and its
   `channel_post_swept` telemetry gains a `locks_deleted` measurement.
+- **A session is never rate-limited by its own key (2026-11-21, US-52.26).** A holder
+  credential (a key carrying a `holder_id`) has no per-key limit any more: it meets only the
+  tenant-wide limit, which its `X-RateLimit-*` headers now report. The tenant-wide limit is a
+  new tenant setting, `rate_limit_tenant_requests_per_minute` (default 900), instead of three
+  times `rate_limit_requests_per_minute`; a tenant that lowered the per-key setting keeps a
+  tenant limit of 900. It is counted in Postgres (`rate_limit_counters`) whatever
+  `RATE_LIMITER` selects, so every node draws on one budget, at the cost of one AdminRepo
+  upsert per authenticated request; a counter fault still fails open. Keys without a holder
+  keep the per-key check against `rate_limit_requests_per_minute` (default 300). The
+  coordination caps are removed with their tenant settings, which are no longer read:
+  `channel_post_write_limit_per_minute` (120, posts and graduate),
+  `channel_post_read_limit_per_minute` (240), `channel_lock_limit_per_minute` (120),
+  `channel_claim_limit_per_minute` (60) and `channel_claim_read_limit_per_minute` (120), and
+  with them the coordination `:rate_limited` telemetry event.
 - **A runner merge never closes an issue (2026-11-21, set 11, runner 0.1.2).** Before merging,
   the runner rewrites the closing keywords (`Closes #15`, `Fixes`, `Resolves`, ...) of the pull
   request's title and body to `Refs`, edits the body on the pull request when that changed it,

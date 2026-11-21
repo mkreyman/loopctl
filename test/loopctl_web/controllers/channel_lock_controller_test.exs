@@ -49,24 +49,6 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
 
   defp post_json(raw, path, params), do: authed_conn(raw) |> post(path, params)
 
-  # Stateful counting stub for the DI-resolved rate limiter (config/test.exs maps
-  # `:rate_limiter` to Loopctl.MockRateLimiter, whose default stub always allows).
-  defp stub_counting_limiter do
-    {:ok, counts} = Agent.start_link(fn -> %{} end)
-
-    stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window_ms, limit ->
-      count =
-        Agent.get_and_update(counts, fn m ->
-          c = Map.get(m, bucket, 0) + 1
-          {c, Map.put(m, bucket, c)}
-        end)
-
-      if count <= limit, do: {:allow, count}, else: {:deny, limit}
-    end)
-
-    counts
-  end
-
   defp setup_member do
     tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
     project = fixture(:project, %{tenant_id: tenant.id})
@@ -275,37 +257,6 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
         |> json_response(403)
 
       assert body["error"]["code"] == "agent_identity_required"
-    end
-
-    test "over-cap lock writes are 429 with Retry-After and a :rate_limited signal" do
-      stub_counting_limiter()
-      tenant = fixture(:tenant, %{settings: %{"channel_lock_limit_per_minute" => 2}})
-      project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = member_agent_key(tenant, project)
-
-      for n <- 1..2 do
-        conn =
-          post_json(raw, @path, %{
-            "project_id" => project.id,
-            "target" => "lib/f#{n}.ex",
-            "session_id" => "sess-a"
-          })
-
-        assert conn.status in [200, 201]
-      end
-
-      log =
-        capture_log(fn ->
-          conn =
-            post_json(raw, @path, %{"project_id" => project.id, "target" => "lib/over.ex"})
-
-          assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
-          assert [retry] = get_resp_header(conn, "retry-after")
-          assert String.to_integer(retry) >= 1
-        end)
-
-      assert log =~ "rate_limited"
-      assert log =~ "limit_kind=lock"
     end
   end
 

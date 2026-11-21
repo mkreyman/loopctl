@@ -119,12 +119,13 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottle do
     1. Many legitimate keys/tenants behind ONE egress IP share this single
        bucket, so their COMBINED valid traffic counts toward `max_requests_per_ip`
        even while each key stays under its per-key limit (300/min default) and
-       each tenant under its per-tenant aggregate (900/min default). With the
-       default 3000/60s ceiling this leaves generous headroom; a shared-egress
-       deployment that legitimately exceeds it should raise the knob.
-    2. If an operator raises a tenant's per-key limit above ~1000 (per-tenant
-       aggregate > 3000), this coarse 3000/IP ceiling silently becomes the
-       binding constraint and caps that tenant BELOW its configured allowance.
+       each tenant under its tenant-wide limit (`rate_limit_tenant_requests_per_minute`,
+       900/min default). With the default 3000/60s ceiling this leaves generous
+       headroom; a shared-egress deployment that legitimately exceeds it should
+       raise the knob.
+    2. If an operator raises a tenant's `rate_limit_tenant_requests_per_minute`
+       above 3000, this coarse 3000/IP ceiling silently becomes the binding
+       constraint and caps that tenant BELOW its configured allowance.
        Raise `max_requests_per_ip` accordingly (rule of thumb: keep it at or
        above the largest configured per-tenant aggregate that shares an IP).
   """
@@ -137,8 +138,8 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottle do
 
   # Coarse per-IP volumetric ceiling over a 60s window (DEFAULTS; operator-
   # overridable via Application env — see the moduledoc). The per-KEY limiter
-  # defaults to 300 req/min and the per-TENANT aggregate to 900 req/min
-  # (`@default_per_key_limit` * 3 in `LoopctlWeb.Plugs.RateLimiter`), so this
+  # defaults to 300 req/min and the tenant-wide limit to 900 req/min
+  # (`LoopctlWeb.Plugs.RateLimiter`, `rate_limit_tenant_requests_per_minute`), so this
   # ceiling sits generously ABOVE any legitimate single-IP authenticated volume
   # — normal valid traffic (already bounded by those limiters) never trips it,
   # but an unbounded bad-key/no-key flood does. It intentionally counts ALL

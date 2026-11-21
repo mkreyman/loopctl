@@ -103,6 +103,9 @@ defmodule Loopctl.TestSuiteHygieneTest do
     "test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs" => @scale,
     "test/loopctl/workers/triage_trigger_worker_lock_test.exs" => @second_connection,
     "test/loopctl/workers/verification_runner_worker_lock_test.exs" => @second_connection,
+    "test/loopctl_web/plugs/rate_limiter_postgres_test.exs" =>
+      "one COMMITTED rate_limit_counters row counted from two connections is the subject: " <>
+        "two nodes drawing on one tenant budget",
     "test/loopctl_web/runner_channel_lock_test.exs" => @second_connection
   }
 

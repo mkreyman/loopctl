@@ -73,8 +73,6 @@ defmodule LoopctlWeb.ChannelLockController do
 
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelLock
-  alias Loopctl.RateLimiter.FailOpenLog
-  alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -82,26 +80,8 @@ defmodule LoopctlWeb.ChannelLockController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:create, :release, :index]
 
-  # Per-lock rate limit, mirroring the ChannelPostController write cap and the
-  # ChannelClaimController claim cap: the same `Loopctl.RateLimiter` behaviour seam,
-  # the same fail-open + throttled FailOpenLog discipline, on its OWN bucket family
-  # (`channel_lock:key:<id>`) so lock churn is independently observable. It covers
-  # the READ too: a soft-lock read is a body-returning coordination read and must
-  # not escape a dedicated cap (the AC-40.D5.1 symmetry rule).
-  plug :rate_limit_lock when action in [:create, :release, :index]
-
-  # 60s fixed window, matching the ETS/Hammer contract the pipeline limiter uses.
-  @lock_window_ms 60_000
-
-  # Config-default per-minute lock cap; a tenant may override via the
-  # `channel_lock_limit_per_minute` setting. Set above the claim cap (a lock is a
-  # cheap, frequently-refreshed hint) but below the pipeline per-key default so it
-  # stays the binding, observable constraint.
-  @default_lock_limit 120
-
-  # Fallback for the generic per-key pipeline limit, kept in sync with
-  # LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit.
-  @pipeline_per_key_limit_default 300
+  # No coordination rate cap here (US-52.26): the only request bounds are the
+  # pipeline's, in `LoopctlWeb.Plugs.RateLimiter`.
 
   # A missing / cross-tenant / cross-project project returns this ONE message — no
   # existence oracle (mirrors ChannelPostController and ChannelClaimController).
@@ -325,115 +305,16 @@ defmodule LoopctlWeb.ChannelLockController do
     })
   end
 
-  # --- Rate limiting (function plug) ---
-
-  defp rate_limit_lock(conn, _opts) do
-    api_key = conn.assigns.current_api_key
-    tenant = conn.assigns[:current_tenant]
-    limit = lock_limit(tenant)
-    identifier = "channel_lock:key:#{api_key.id}"
-
-    case check_rate(identifier, limit) do
-      {:allow, _count} ->
-        conn
-
-      {:deny, _limit} ->
-        reset_at = window_reset_at()
-        retry_after = max(1, reset_at - System.system_time(:second))
-
-        emit_security_event(:rate_limited, %{
-          tenant_id: api_key.tenant_id,
-          api_key_id: api_key.id,
-          limit_kind: :lock
-        })
-
-        conn
-        |> put_resp_header("retry-after", to_string(retry_after))
-        |> put_status(:too_many_requests)
-        |> json(%{error: %{status: 429, message: "Rate limit exceeded"}})
-        |> halt()
-    end
-  end
-
-  defp check_rate(identifier, limit) do
-    case Loopctl.RateLimiter.impl().check_rate(identifier, @lock_window_ms, limit) do
-      {:allow, count} when is_integer(count) -> {:allow, count}
-      {:deny, denied} when is_integer(denied) -> {:deny, denied}
-      other -> fail_open(identifier, "limiter returned #{inspect(other)}")
-    end
-  rescue
-    e -> fail_open(identifier, Exception.message(e))
-  catch
-    :exit, reason -> fail_open(identifier, "limiter exit: #{inspect(reason)}")
-    :throw, value -> fail_open(identifier, "limiter throw: #{inspect(value)}")
-  end
-
-  defp fail_open(identifier, detail) do
-    FailOpenLog.warn(:coordination, identifier, detail)
-    {:allow, 0}
-  end
-
-  defp lock_limit(nil), do: default_lock_limit()
-
-  defp lock_limit(tenant) do
-    configured =
-      tenant
-      |> Tenants.get_tenant_settings("channel_lock_limit_per_minute", default_lock_limit())
-      |> coerce_positive_int(default_lock_limit())
-
-    min(configured, pipeline_per_key_limit(tenant))
-  end
-
-  defp default_lock_limit do
-    Application.get_env(:loopctl, :channel_lock_limit_per_minute, @default_lock_limit)
-  end
-
-  defp pipeline_per_key_limit(tenant) do
-    tenant
-    |> Tenants.get_tenant_settings(
-      "rate_limit_requests_per_minute",
-      @pipeline_per_key_limit_default
-    )
-    |> coerce_positive_int(@pipeline_per_key_limit_default)
-  end
-
-  defp coerce_positive_int(value, _default) when is_integer(value) and value > 0, do: value
-
-  defp coerce_positive_int(value, default) when is_binary(value) do
-    case Integer.parse(value) do
-      {n, ""} when n > 0 -> n
-      _ -> default
-    end
-  end
-
-  defp coerce_positive_int(_value, default), do: default
-
-  defp window_reset_at do
-    now = System.system_time(:millisecond)
-    ceil = div(now, @lock_window_ms) * @lock_window_ms + @lock_window_ms
-    div(ceil, 1000)
-  end
-
   # Coordination-surface security telemetry (parity with ChannelPostController).
   defp emit_security_event(event, metadata) do
     :telemetry.execute([:loopctl, :coordination, event], %{count: 1}, metadata)
-
-    # `limit_kind` is the rate-cap discriminator, carried ONLY by the :rate_limited
-    # caller; render it solely when present so the other events don't emit a
-    # dangling `limit_kind=` (nil) token (mirrors ChannelPostController).
-    limit_kind_token =
-      case Map.fetch(metadata, :limit_kind) do
-        {:ok, kind} -> " limit_kind=#{kind}"
-        :error -> ""
-      end
 
     Logger.warning(
       "coordination security event: #{event} " <>
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{log_safe_id(Map.get(metadata, :project_id))}" <>
-        limit_kind_token <> ")"
+        "project=#{log_safe_id(Map.get(metadata, :project_id))})"
     )
 
     :ok
