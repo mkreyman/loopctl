@@ -71,8 +71,13 @@ defmodule Loopctl.Delivery.ImplementerStart do
   defp start(tenant_id, story, opts) do
     with :ok <- custody_open(tenant_id),
          {:ok, lineage} <- implementer_lineage(tenant_id, story) do
+      # The start is the IMPLEMENTER's, so it names the claim the story recorded: its agent and,
+      # since holders (US-52.14), its holder. Without the holder a holder-claimed story refuses
+      # its own implementer's start (`held_by_other_holder`), and a pass verdict that starts
+      # it first never lands.
       case Progress.start_story(tenant_id, story.id,
              agent_id: story.assigned_agent_id,
+             holder_id: story.assigned_holder_id,
              cap_id: start_cap_id(tenant_id, story.id, lineage),
              lineage: lineage,
              claim_epoch: story.claim_epoch,
