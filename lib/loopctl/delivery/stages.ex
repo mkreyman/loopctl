@@ -287,37 +287,51 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
-  Opens a story's stage row at `implementing`, inside the caller's `Loopctl.Repo.with_tenant/2`
-  transaction, for a change-protocol story that a session claimed and started outside the
-  runner (US-47.8): chg's `submitted` is the first thing the delivery machine hears of it, and
-  without a row no event of the change can move the story (`no_stage_row`).
+  Opens a story's stage row at `implementing` for work that started outside the runner,
+  inside the caller's transaction: a change-protocol story a session claimed and started by
+  hand (US-47.8: chg's `submitted` is the first thing the delivery machine hears of it, and
+  without a row no event of the change can move the story), or an interactive session's
+  branch (US-52.18, `Loopctl.WorkItems.open_interactive/3`).
 
   `implementing` and not `detected`, because the work it names is already being done: the
   story's own `agent_status` says so, and the caller checks that before calling. The row is
-  bound to `epoch`, the story's current `claim_epoch`, read under the caller's story lock
-  (`lock_for_control_in_tenant_transaction/2`). The `opened` stage event carries `event_data`.
+  bound to `epoch`, the story's current `claim_epoch`, read under the caller's story lock.
+
+  Options:
+
+  - `:repo` — the repo whose transaction this runs in: `Loopctl.Repo` (the default, inside
+    `Repo.with_tenant/2`) or `Loopctl.AdminRepo` (inside a claim-shaped `AdminRepo`
+    transaction, like `follow_claim/4`);
+  - `:branch` — written on the inserted row, with an `effect_recorded` event, because the
+    work's branch is known when it starts outside the runner (the runner records it at
+    `worktree`);
+  - `:actor_label`, `:actor_holder_id`, `:reason` and `:event_data` — on the `opened` event
+    (and the `effect_recorded` one).
 
   Returns `{:ok, row}` with the row locked, the row that already exists included (a replay
   finds it and writes nothing).
   """
-  @spec open_for_change_in_tenant_transaction(
+  @spec open_started_in_tenant_transaction(
           Ecto.UUID.t(),
           Ecto.UUID.t(),
           non_neg_integer(),
           keyword()
         ) :: {:ok, StoryStage.t()}
-  def open_for_change_in_tenant_transaction(tenant_id, story_id, epoch, opts) do
-    unless Repo.in_transaction?(),
+  def open_started_in_tenant_transaction(tenant_id, story_id, epoch, opts) do
+    repo = Keyword.get(opts, :repo, Repo)
+
+    unless repo in [Repo, AdminRepo] and repo.in_transaction?(),
       do:
         raise(
           ArgumentError,
-          "open_for_change_in_tenant_transaction/4 needs a Loopctl.Repo transaction"
+          "open_started_in_tenant_transaction/4 needs a Loopctl.Repo or Loopctl.AdminRepo transaction"
         )
 
     now = DateTime.utc_now()
     id = Ecto.UUID.generate()
+    branch = Keyword.get(opts, :branch)
 
-    Repo.insert_all(
+    repo.insert_all(
       StoryStage,
       [
         %{
@@ -326,6 +340,7 @@ defmodule Loopctl.Delivery.Stages do
           story_id: story_id,
           stage: :implementing,
           claim_epoch: epoch,
+          branch: branch,
           attempts: %{},
           lock_version: 0,
           inserted_at: now,
@@ -336,19 +351,76 @@ defmodule Loopctl.Delivery.Stages do
       conflict_target: [:tenant_id, :story_id]
     )
 
-    row = lock_row(tenant_id, story_id)
+    row = row_query(tenant_id, story_id) |> lock("FOR UPDATE") |> repo.one()
 
     if row.id == id do
-      insert_event(Repo, %{
+      event = %{
         row: row,
-        event: "opened",
         actor_label: Keyword.get(opts, :actor_label),
-        data: Keyword.get(opts, :event_data, %{})
-      })
+        actor_holder_id: Keyword.get(opts, :actor_holder_id),
+        reason: Keyword.get(opts, :reason)
+      }
+
+      insert_event(
+        repo,
+        Map.merge(event, %{event: "opened", data: Keyword.get(opts, :event_data, %{})})
+      )
+
+      if branch,
+        do:
+          insert_event(
+            repo,
+            Map.merge(event, %{
+              event: "effect_recorded",
+              data: %{"effect" => "branch", "value" => branch}
+            })
+          )
     end
 
     {:ok, row}
   end
+
+  @doc """
+  Records `branch` on an open stage row that has none, inside the caller's `AdminRepo`
+  transaction (US-52.18): an interactive session already holding an item that started with no
+  branch tells loopctl which branch the work is on. Any stage but `done` and `failed`, because
+  the work started outside the runner and its stage says nothing about where its branch came
+  from. A row that already names a branch is left as it is.
+
+  Returns `{:ok, row}`, the row as it now stands.
+  """
+  @spec put_started_branch_in_admin_transaction(StoryStage.t(), String.t(), keyword()) ::
+          {:ok, StoryStage.t()}
+  def put_started_branch_in_admin_transaction(%StoryStage{branch: nil} = row, branch, opts)
+      when is_binary(branch) do
+    unless AdminRepo.in_transaction?(),
+      do:
+        raise(
+          ArgumentError,
+          "put_started_branch_in_admin_transaction/3 needs an AdminRepo transaction"
+        )
+
+    {1, [updated]} =
+      from(s in StoryStage,
+        where: s.id == ^row.id and s.tenant_id == ^row.tenant_id and is_nil(s.branch),
+        select: s,
+        update: [set: [branch: ^branch, updated_at: ^DateTime.utc_now()], inc: [lock_version: 1]]
+      )
+      |> AdminRepo.update_all([])
+
+    insert_event(AdminRepo, %{
+      row: updated,
+      event: "effect_recorded",
+      actor_label: Keyword.get(opts, :actor_label),
+      actor_holder_id: Keyword.get(opts, :actor_holder_id),
+      reason: Keyword.get(opts, :reason),
+      data: %{"effect" => "branch", "value" => branch}
+    })
+
+    {:ok, updated}
+  end
+
+  def put_started_branch_in_admin_transaction(%StoryStage{} = row, _branch, _opts), do: {:ok, row}
 
   # The stages a story waits in before anyone holds it: triage and the queue. A runner-held
   # row (`claimed`, `worktree`) is the runner's to move, and every later stage has an edge of
@@ -356,38 +428,57 @@ defmodule Loopctl.Delivery.Stages do
   @pre_claim_stages [:detected, :triaged, :queued]
 
   @doc """
-  `open_for_change_in_tenant_transaction/4` for a story whose row EXISTS but still waits in
+  `open_started_in_tenant_transaction/4` for a story whose row EXISTS but still waits in
   triage or the queue (#{inspect(@pre_claim_stages)}), because a session claimed the story by
   hand (`follow_claim/4` keeps the stage and takes the new epoch). Moves the row to
   `implementing` with a `rebound` stage event from its old stage, carrying `event_data`.
 
   Only a row on `epoch`: one behind its story's epoch is fenced, and the caller says so.
   Returns `{:ok, row}` — moved, or unchanged when it is at any other stage.
+
+  Options: `:repo` (`Loopctl.Repo`, the default, or `Loopctl.AdminRepo` for a claim-shaped
+  transaction), `:started_by` (`"change_submitted"` by default; `"interactive_open"` for
+  `Loopctl.WorkItems.open_interactive/3`), `:reason`, `:actor_label`, `:actor_holder_id` and
+  `:event_data`.
   """
   @spec start_for_change_in_tenant_transaction(StoryStage.t(), non_neg_integer(), keyword()) ::
           {:ok, StoryStage.t()}
   def start_for_change_in_tenant_transaction(%StoryStage{} = row, epoch, opts) do
+    repo = Keyword.get(opts, :repo, Repo)
+
     if row.stage in @pre_claim_stages and row.claim_epoch == epoch do
       now = DateTime.utc_now()
 
       {1, [moved]} =
-        Repo.update_all(
+        repo.update_all(
           from(s in StoryStage,
-            where: s.id == ^row.id and s.stage == ^row.stage and s.claim_epoch == ^epoch,
+            where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+            where: s.stage == ^row.stage and s.claim_epoch == ^epoch,
             select: s
           ),
           set: [stage: :implementing, updated_at: now],
           inc: [lock_version: 1]
         )
 
-      data = Map.put(Keyword.get(opts, :event_data, %{}), "started_by", "change_submitted")
+      data =
+        Map.put(
+          Keyword.get(opts, :event_data, %{}),
+          "started_by",
+          Keyword.get(opts, :started_by, "change_submitted")
+        )
 
-      insert_event(Repo, %{
+      insert_event(repo, %{
         row: moved,
         event: "rebound",
         from: row.stage,
         actor_label: Keyword.get(opts, :actor_label),
-        reason: "a change submission started the story outside the runner",
+        actor_holder_id: Keyword.get(opts, :actor_holder_id),
+        reason:
+          Keyword.get(
+            opts,
+            :reason,
+            "a change submission started the story outside the runner"
+          ),
         data: data
       })
 

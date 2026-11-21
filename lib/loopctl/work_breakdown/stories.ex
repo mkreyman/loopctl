@@ -23,6 +23,11 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Loopctl.WorkBreakdown.RestrictedDelete
   alias Loopctl.WorkBreakdown.Story
 
+  # `Loopctl.WorkBreakdown.Story`'s own rule, restated here because this is the only module
+  # that CONSTRUCTS a number rather than accepting one: each part of a `MAJOR.MINOR` story
+  # number must be a non-negative integer below this.
+  @max_number_part 10_000
+
   @doc """
   Creates a new story within an epic.
 
@@ -634,5 +639,106 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
   defp safe_to_status_atom(str) do
     Map.get(@valid_statuses, str)
+  end
+
+  # The unique index on `(tenant_id, project_id, number)` refuses the loser with a changeset
+  # error, the record stays `pending_triage`, and the next run reads a sequence that is now
+  # free. A worker whose retry is free is the right place to leave that, rather than a lock or
+  # a retry loop inside one call.
+  # AND IT CAN REFUSE, because the two schemas disagree and nothing had made that visible.
+  # `epics.number` is validated only `greater_than: 0` — unbounded above — while a story
+  # number's parts must be under 10_000. So an epic numbered 10_000 or higher is legal and
+  # every story in it is unnumberable, which every hand-authored story has silently assumed
+  # away. This is the first caller to construct one programmatically and therefore the first
+  # to meet it; it was found by the full suite, where the fixture's epic numbers are large,
+  # after passing in isolation where they are small.
+  #
+  # Refused rather than worked around. A reserved MAJOR band would put this story somewhere
+  # its epic's other stories are not, which is the numbering equivalent of guessing an epic —
+  # and the operator's remedy, renumbering the epic, is one they can actually take. Same
+  # choice as `:no_target_epic` and for the same reason.
+  # `get_by`, not `get_by!`. This function's whole contract is `{:ok, _} | {:error, _}`, and a
+  # `target_epic_id` that resolves to nothing — a deleted epic, a cross-tenant id — would
+  # otherwise raise `Ecto.NoResultsError` straight out of it. The caller's remedy for a
+  # misconfigured source is an escalation, not a crashed worker.
+  @doc """
+  The next free story number under `epic_id`: `"<epic major>.<highest minor in the project + 1>"`,
+  read on `AdminRepo` (inside the caller's `AdminRepo` transaction when there is one).
+
+  Returns `{:ok, number}`, `{:error, :target_epic_missing}` for an epic that is not this
+  tenant's, `{:error, :epic_number_unnumberable}` for an epic numbered 10_000 or higher, or
+  `{:error, :story_number_exhausted}` when the minor would reach 10_000. Shared by
+  `Loopctl.Delivery.TriageTrigger` and `Loopctl.WorkItems.open_interactive/3`, so there is
+  one numbering.
+  """
+  @spec next_number(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, String.t()}
+          | {:error, :target_epic_missing | :epic_number_unnumberable | :story_number_exhausted}
+  def next_number(tenant_id, epic_id) do
+    case AdminRepo.get_by(Epic, id: epic_id, tenant_id: tenant_id) do
+      nil ->
+        {:error, :target_epic_missing}
+
+      %Epic{number: number} when number >= @max_number_part ->
+        {:error, :epic_number_unnumberable}
+
+      %Epic{} = epic ->
+        numbered(epic, next_sequence(tenant_id, epic))
+    end
+  end
+
+  # The highest MINOR already used under this MAJOR anywhere in the PROJECT, plus one.
+  #
+  # Scoped to the project and not to the epic, because that is the scope the uniqueness has:
+  # `stories_tenant_id_project_id_number_index` is project-wide and nothing ties a story's
+  # MAJOR to its epic. An epic-scoped scan made the moduledoc's "the next run reads a sequence
+  # that is now free" false in the case this module itself creates — renumbering an epic is
+  # the remedy it recommends for `:epic_number_unnumberable`, which leaves stories numbered
+  # under the OLD major, and a later epic taking that number would have its scan come back
+  # empty, pick `.1`, collide on the project index and recompute the same number on every
+  # retry. The record would stall in `pending_triage` for ever rather than self-heal.
+  #
+  # Read off `stories` rather than counted, so a deleted story does not hand its number to the
+  # next arrival.
+  # THE MINOR HAS THE SAME CEILING AS THE MAJOR, and guarding only the major left the failure
+  # this module's own comments say the project-wide scan exists to avoid. A sequence at or
+  # past 10_000 is rejected by `Story.validate_number_format/1` as an opaque changeset error,
+  # and it does not self-heal: every retry rescans, computes the same max plus one, and fails
+  # identically, so the record stalls in `pending_triage` for ever.
+  #
+  # It does not take 10_000 stories to get there. The scan is project-wide and reads whatever
+  # is in `stories`, so a single hand-authored `43.9999` anywhere in the project makes the
+  # next promote under epic 43 produce `43.10000`.
+  defp numbered(%Epic{number: major}, minor) when minor < @max_number_part,
+    do: {:ok, "#{major}.#{minor}"}
+
+  defp numbered(%Epic{}, _minor), do: {:error, :story_number_exhausted}
+
+  # Takes the `%Epic{}` `next_number/2` already loaded — tenant-scoped — rather than reading
+  # it again by id alone. The re-read was a second round trip on `AdminRepo`'s 3-connection
+  # pool for a row that was in hand, and it was the one query in this module carrying no
+  # `tenant_id` predicate, against the rule every other read here follows.
+  defp next_sequence(tenant_id, %Epic{project_id: project_id, number: major}) do
+    prefix = "#{major}."
+
+    used =
+      AdminRepo.all(
+        from s in Story,
+          where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
+          where: like(s.number, ^(prefix <> "%")),
+          select: s.number
+      )
+
+    used
+    |> Enum.map(&minor_of(&1, prefix))
+    |> Enum.max(fn -> 0 end)
+    |> Kernel.+(1)
+  end
+
+  defp minor_of(number, prefix) do
+    case Integer.parse(String.replace_prefix(number, prefix, "")) do
+      {n, ""} -> n
+      _ -> 0
+    end
   end
 end

@@ -155,6 +155,7 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.EpicDependencyController",
       "LoopctlWeb.StoryDependencyController",
       "LoopctlWeb.WorkItemNoteController",
+      "LoopctlWeb.WorkItemController",
       "LoopctlWeb.ImportExportController"
     ],
     chain_of_custody: [

@@ -62,7 +62,21 @@ export function createHolderSession(deps) {
     randomUUID,
     setInterval: setTimer = globalThis.setInterval,
     clearInterval: clearTimer = globalThis.clearInterval,
+    // US-52.18: run after every register or heartbeat that leaves a live credential (the
+    // branch open, lib/branch-item.js). Its failure never fails the heartbeat.
+    afterBeat = null,
   } = deps;
+
+  async function beat(result) {
+    if (afterBeat && holder && credential && result && !result.error) {
+      try {
+        await afterBeat(holder, credential);
+      } catch {
+        // The next heartbeat tries again.
+      }
+    }
+    return result;
+  }
 
   const sessionId = envClaimSessionId(env) || randomUUID();
   let holder = null;
@@ -115,7 +129,7 @@ export function createHolderSession(deps) {
       arm(result.heartbeat_seconds);
     }
 
-    return result;
+    return beat(result);
   }
 
   async function heartbeat() {
@@ -135,7 +149,7 @@ export function createHolderSession(deps) {
       holder = { ...holder, lease_until: result.lease_until };
     }
 
-    return result;
+    return beat(result);
   }
 
   async function end() {

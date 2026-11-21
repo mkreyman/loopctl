@@ -367,6 +367,7 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
     {:post, "/api/v1/stories/bulk/reject"} => :orchestrator,
     {:post, "/api/v1/stories/bulk/mark-complete"} => :orchestrator,
     {:post, "/api/v1/stories/:id/notes"} => :agent,
+    {:post, "/api/v1/work_items"} => :agent,
     {:post, "/api/v1/skill_results"} => :orchestrator
   }
 

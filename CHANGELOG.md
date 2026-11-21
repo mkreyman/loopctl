@@ -448,6 +448,17 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Interactive work on a branch becomes a work item (2026-11-21, US-52.18).**
+  `POST /api/v1/work_items` with `{repo_url, branch, title?, epic_id?}` from a holder
+  credential creates one story in the repo's project, already `implementing` and held by the
+  caller, with a stage row at `implementing` naming the branch. The epic is `epic_id`, else
+  the target epic of the project's one live intake source (`422 no_target_epic` otherwise).
+  One item per (project, branch): the caller's own item and an unheld one come back with 200,
+  another holder's is `409 branch_held`; a key with no holder is
+  `403 holder_credential_required`, and a repo no project of the tenant holds is
+  `404 project_not_found`. MCP tool `work_item_open`; the MCP server now also opens the item
+  on each holder heartbeat for a worktree on a non-default branch, once per branch per
+  holder, with no opt-out in this release. No migration.
 - **A work item carries its notes (2026-11-21, US-52.17).** `POST /api/v1/stories/:id/notes`
   appends a note (`section`: plan, progress, decision or question; `body` 1 to 16384 bytes,
   refused 422 if it looks like a credential) and records a `note_written` event in the same

@@ -44,6 +44,9 @@ defmodule Loopctl.WorkItems do
           current: %{optional(String.t()) => Note.t()} | nil
         }
 
+  @doc "Opens an interactive session's work item for its branch: `Loopctl.WorkItems.Open`."
+  defdelegate open_interactive(tenant_id, opener, attrs, opts \\ []), to: Loopctl.WorkItems.Open
+
   @doc "The default and the largest page `list_notes/3` returns."
   @spec page_limits() :: {pos_integer(), pos_integer()}
   def page_limits, do: {@default_limit, @max_limit}

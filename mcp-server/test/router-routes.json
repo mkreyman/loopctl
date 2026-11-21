@@ -313,6 +313,7 @@
     ["PUT","/api/v1/webhooks/:id","LoopctlWeb.WebhookController",":update"],
     ["GET","/api/v1/webhooks/:id/deliveries","LoopctlWeb.WebhookController",":deliveries"],
     ["POST","/api/v1/webhooks/:id/test","LoopctlWeb.WebhookController",":test"],
+    ["POST","/api/v1/work_items","LoopctlWeb.WorkItemController",":create"],
     ["GET","/chg","Phoenix.LiveView.Plug",":index"],
     ["GET","/docs","LoopctlWeb.PageController",":docs"],
     ["GET","/enroll","Phoenix.LiveView.Plug",":index"],

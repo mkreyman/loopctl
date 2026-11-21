@@ -284,7 +284,7 @@ defmodule Loopctl.Changes.EventEffects do
          %{row: nil, started: true} = target
        ) do
     {:ok, row} =
-      Stages.open_for_change_in_tenant_transaction(
+      Stages.open_started_in_tenant_transaction(
         tenant_id,
         target.story_id,
         target.claim_epoch,

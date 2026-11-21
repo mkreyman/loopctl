@@ -457,6 +457,7 @@ defmodule LoopctlWeb.Router do
     get "/stories/:id/history", StoryHistoryController, :show
 
     # US-52.17 — a work item's notes (its holder's plan, progress, decisions, questions)
+    post "/work_items", WorkItemController, :create
     post "/stories/:id/notes", WorkItemNoteController, :create
     get "/stories/:id/notes", WorkItemNoteController, :index
 

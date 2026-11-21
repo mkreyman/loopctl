@@ -22,9 +22,10 @@ import { applyArgAliases } from "./lib/arg-aliases.js";
 import { articleId } from "./lib/article-id.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
+import { createBranchItemOpener, openWorkItem } from "./lib/branch-item.js";
 import { createHolderSession } from "./lib/holder.js";
 import { listWorkItemNotes, writeWorkItemNote } from "./lib/work-items.js";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
   projectsPath,
@@ -203,23 +204,38 @@ function resolveKey(keyOverride) {
 // LOOPCTL_AGENT_KEY sends `agentKey()` instead: the holder's own credential once the
 // startup register succeeds, else LOOPCTL_AGENT_KEY unchanged (lib/holder.js says why a
 // failed register never stops a session working).
+function sessionWorktree() {
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+  } catch {
+    return process.cwd();
+  }
+}
+
+// US-52.18: on each heartbeat, the worktree's branch becomes a work item this holder holds.
+const branchItemOpener = createBranchItemOpener({
+  apiCall: (...args) => apiCall(...args),
+  worktree: sessionWorktree,
+  git: (args) =>
+    new Promise((resolve) => {
+      execFile("git", args, { encoding: "utf8", timeout: 2000 }, (err, stdout) =>
+        resolve(err ? null : String(stdout).trim()),
+      );
+    }),
+});
+
 const holderSession = createHolderSession({
   apiCall: (...args) => apiCall(...args),
   env: process.env,
   hostname: () => os.hostname(),
-  worktree: () => {
-    try {
-      return execFileSync("git", ["rev-parse", "--show-toplevel"], {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 2000,
-      }).trim();
-    } catch {
-      return process.cwd();
-    }
-  },
+  worktree: sessionWorktree,
   randomUUID: () => crypto.randomUUID(),
+  afterBeat: (holder, credential) => branchItemOpener.tick(holder, credential),
 });
 
 function agentKey() {
@@ -3236,6 +3252,16 @@ async function holderEndTool() {
 async function workItemNoteTool(args) {
   return toContent(
     await writeWorkItemNote(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
+    }),
+  );
+}
+
+// US-52.18: open (or reopen) the work item for a branch, on the session's own key: the
+// route accepts only a holder credential (lib/branch-item.js).
+async function workItemOpenTool(args) {
+  return toContent(
+    await openWorkItem(args, {
       apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
     }),
   );
@@ -8734,6 +8760,36 @@ const TOOLS = [
   },
 
   {
+    name: "work_item_open",
+    description:
+      "OPEN THE WORK ITEM FOR A BRANCH (POST /api/v1/work_items): your interactive work on " +
+      "`branch` becomes one story in the project `repo_url` resolves to, already " +
+      "implementing and held by this session, with a stage row naming the branch. The MCP " +
+      "server already does this on each heartbeat for the worktree's non-default branch; " +
+      "call it to name a title or an epic. The epic is `epic_id`, else the target epic of " +
+      "the project's live intake source. Reopening your own item returns it (200, outcome " +
+      "existing), an unheld item on the branch is claimed back for you (200, claimed), and " +
+      "your one held item with no branch takes this one (200, branch_recorded). Needs this " +
+      "session's holder credential: 403 holder_credential_required for any other key. 409 " +
+      "branch_held (another session's open item has the branch; names story_id and " +
+      "holder_id), 409 holder_ended, 409 story_held (the item is escalated). 404 " +
+      "project_not_found (no project of your tenant has the repo), 404 epic_not_found. 422 " +
+      "no_target_epic (pass epic_id), 422 invalid_branch (empty, whitespace, HEAD, over 255 " +
+      "bytes). The item reaches verified only through report, review and verify like any " +
+      "story; you cannot report it yourself.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo_url: { type: "string", description: "The repo's remote URL (git remote get-url origin)." },
+        branch: { type: "string", description: "The branch the work is on." },
+        title: { type: "string", description: "Optional: the item's title (default: the branch)." },
+        epic_id: { type: "string", description: "Optional: the UUID of the epic to file it under." },
+      },
+      required: ["repo_url", "branch"],
+    },
+  },
+
+  {
     name: "work_item_notes",
     description:
       "READ A WORK ITEM'S NOTES (GET /api/v1/stories/:id/notes), oldest first. The FIRST page " +
@@ -11122,6 +11178,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "work_item_note":
       return await workItemNoteTool(args);
+
+    case "work_item_open":
+      return await workItemOpenTool(args);
 
     case "work_item_notes":
       return await workItemNotesTool(args);
