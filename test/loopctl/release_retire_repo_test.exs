@@ -153,6 +153,32 @@ defmodule Loopctl.ReleaseRetireRepoTest do
       assert {"", 0} = System.cmd("git", ["status", "--porcelain"], cd: ctx.repo)
     end
 
+    test "a python3 without tomllib first on PATH is passed over (#1079)", ctx do
+      bin = Path.join(ctx.stub, "pybin")
+      File.mkdir_p!(bin)
+      # macOS's /usr/bin/python3 is 3.9: first on PATH, and no tomllib.
+      exec!(Path.join(bin, "python3"), "#!/bin/sh\nexit 1\n")
+      File.ln_s!(System.find_executable("python3"), Path.join(bin, "python3.11"))
+      File.write!(Path.join(ctx.stub, "issues"), "3\n")
+
+      ctx = %{ctx | env: [{"PATH", bin <> ":" <> System.get_env("PATH")} | ctx.env]}
+
+      {out, 0} = retire(ctx)
+      assert out =~ "retired: mkreyman/chg"
+
+      assert File.read!(Path.join([ctx.repo, "release", "imports.toml"])) =~
+               ~s(imported_sha = "7bbc5dc111b24a08742e6dc6fadd203d6b6b7c69"\narchived = true)
+    end
+
+    test "an unreadable stories file refuses with exit 2 before any write", ctx do
+      File.write!(ctx.stories, "not json")
+      File.write!(Path.join(ctx.stub, "issues"), "3\n")
+
+      {out, 2} = retire(ctx)
+      assert out =~ "cannot read the stories"
+      refute File.exists?(Path.join(ctx.stub, "writes"))
+    end
+
     test "a retired repo makes no write and says so", ctx do
       {_, 0} = retire(ctx)
       File.rm!(Path.join(ctx.stub, "writes"))

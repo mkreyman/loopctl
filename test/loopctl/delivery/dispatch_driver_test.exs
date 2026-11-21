@@ -452,6 +452,46 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       leave_channel(channel)
     end
 
+    # #1020: Placement's undo re-queued a story the runner refused `branch_not_allowed`, so
+    # every pass claimed it again and was refused again.
+    test "a runner that refused the repo for a CONFIGURATION reason on this connection is " <>
+           "not placed on again, and the story is not claimed",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+      channel = join_runner(ctx)
+      now = DateTime.utc_now()
+
+      AdminRepo.insert_all(Loopctl.Runners.DispatchRecord, [
+        %{
+          tenant_id: ctx.tenant.id,
+          runner_id: ctx.runner.id,
+          dispatch_id: Ecto.UUID.generate(),
+          story_id: story.id,
+          claim_epoch: 0,
+          kind: "implement",
+          repo: @repo,
+          status: "refused",
+          reason: "branch_not_allowed",
+          reason_detail: "master is outside [\"loop/\"]",
+          replied_at: now,
+          released_at: now,
+          wall_clock_seconds: 3_600,
+          reserved_at: now,
+          slot_generation: 1,
+          trace_acked_seq: -1,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+      assert DispatchDriver.run_with(20, @budgets) == [:no_runner]
+      refute_push "dispatch", _pushed
+      assert Stages.get(ctx.tenant.id, story.id).stage == :queued
+      assert reload(ctx.tenant.id, story.id).agent_status == :contracted
+
+      leave_channel(channel)
+    end
+
     test "no connected runner leaves the story queued for the next pass", ctx do
       story = bind_repo(ctx, queued_story(ctx), @repo)
 

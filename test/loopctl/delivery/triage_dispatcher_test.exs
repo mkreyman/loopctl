@@ -284,6 +284,61 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       refute_push "dispatch", _pushed
     end
 
+    # #1020, production 2026-11-06: minis refused every triage dispatch `branch_not_allowed`
+    # within 0.1 s, the slot came straight back, and the next pass sent the same three stories
+    # again, logged as `dispatched` — three a minute for as long as the config stayed wrong.
+    test "a runner that refused the repo for a CONFIGURATION reason on this connection is " <>
+           "not sent it again, and the pass says why",
+         ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      repo = story_repo(ctx, story.id)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+      write_refusal(ctx, story.id, repo, "branch_not_allowed")
+
+      log =
+        OwnLog.capture_naming(story.id, [level: :warning], fn ->
+          assert TriageDispatcher.run_with(20, @budgets) == [:no_runner]
+        end)
+
+      refute_push "dispatch", _pushed
+      assert log =~ "held out until they reconnect"
+
+      assert log =~
+               "runner_id=#{ctx.runner.id} kind=triage repo=#{repo} reason=branch_not_allowed"
+
+      # A reconnect is how a config change reaches loopctl, so it clears the memory.
+      leave_channel(channel)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+
+      assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
+      assert_push "dispatch", %{story_id: story_id}, @reply_timeout
+      assert story_id == story.id
+
+      leave_channel(channel)
+    end
+
+    test "a TRANSIENT refusal on this connection is retried on the next pass", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+      write_refusal(ctx, story.id, story_repo(ctx, story.id), "at_capacity")
+
+      assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      leave_channel(channel)
+    end
+
+    test "a configuration refusal for ANOTHER repository does not hold this one out", ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+      write_refusal(ctx, story.id, "mkreyman/elsewhere", "repo_not_allowed")
+
+      assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      leave_channel(channel)
+    end
+
     test "a second pass starts NO second session on the same ticket", ctx do
       story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
@@ -583,6 +638,40 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         updated_at: now
       }
     ])
+  end
+
+  # A triage dispatch the runner REFUSED, as `record_reply/3` leaves one: replied now, its slot
+  # given straight back.
+  defp write_refusal(ctx, story_id, repo, reason) do
+    now = DateTime.utc_now()
+
+    AdminRepo.insert_all(Loopctl.Runners.DispatchRecord, [
+      %{
+        tenant_id: ctx.tenant.id,
+        runner_id: ctx.runner.id,
+        dispatch_id: Ecto.UUID.generate(),
+        story_id: story_id,
+        claim_epoch: 0,
+        kind: "triage",
+        repo: repo,
+        status: "refused",
+        reason: reason,
+        reason_detail: "test refusal",
+        replied_at: now,
+        released_at: now,
+        wall_clock_seconds: 900,
+        reserved_at: now,
+        slot_generation: 1,
+        trace_acked_seq: -1,
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+  end
+
+  defp story_repo(ctx, story_id) do
+    {source_id, _record_id} = source_and_record(ctx, story_id)
+    AdminRepo.get!(Loopctl.Intake.Source, source_id).repo_full_name
   end
 
   # What every ending does to the row, whatever ended it: `Capacity.release/4` on a refusal or

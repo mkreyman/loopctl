@@ -10,7 +10,9 @@ defmodule Loopctl.Runners.Selection do
       one credential is skipped rather than guessed at, since `Loopctl.Runners.dispatch/3`
       refuses it `:runner_ambiguous`;
     * accepting on its own declaration — not draining, the repository, the kind
-      (`Loopctl.Runners.accepts?/5`, the same rule `dispatch/3` applies);
+      (`Loopctl.Runners.accepts?/5`, the same rule `dispatch/3` applies) — and not holding a
+      configuration refusal of this kind for this repository from its live connection
+      (#1020), which it would only repeat;
     * not revoked, with a FREE SLOT on its row (`in_flight < max_sessions`); and
     * its SUBSCRIPTION is not exhausted (US-44.6) — no same-tenant row, its own or one sharing
       its non-null `account_ref`, holds `usage_exhausted_until` in the future.
@@ -105,8 +107,37 @@ defmodule Loopctl.Runners.Selection do
           )
       end
 
+      note_refusals(label, tenant_id, story_id)
       Map.put(cache, key, true)
     end
+  end
+
+  # #1020: a runner held out for a configuration refusal on its live connection is the one
+  # no-runner cause a person must act on (fix the config, reconnect), so it is a WARNING and
+  # names each pair. Once per tenant per pass, under the same cache key as the note above.
+  defp note_refusals(label, tenant_id, story_id) do
+    case Runners.config_refusals(tenant_id) do
+      refusals when map_size(refusals) == 0 ->
+        :ok
+
+      refusals ->
+        pairs =
+          for {runner_id, rows} <- Enum.sort(refusals), row <- rows do
+            "runner_id=#{runner_id} kind=#{row.kind} repo=#{row.repo} reason=#{row.reason}"
+          end
+
+        Logger.warning(
+          "#{label}: no runner for story_id=#{story_id}; held out until they reconnect, " <>
+            "refused for configuration since joining: " <> Enum.join(pairs, "; "),
+          tenant_id: tenant_id
+        )
+    end
+  rescue
+    error in [Postgrex.Error, DBConnection.ConnectionError] ->
+      Logger.warning(
+        "no-runner refusal note skipped, read failed: tenant_id=#{tenant_id} " <>
+          "exception=#{inspect(error.__struct__)}"
+      )
   end
 
   # The note is a diagnostic and must never change the candidate's outcome: a read that fails

@@ -259,6 +259,11 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
         "#{device}; qcom; en_US; 509948027)"
     end
 
+    # Over 90,000 user agents. 7.6 s alone on minis (2026-11-20), but past ExUnit's 60 s default
+    # on a loaded fleet-ci runner, which turned master red and skipped the deploy. Ten minutes is
+    # about 80x the unloaded time and far below the test job's limit (none set, so GitHub's 360).
+    # The sweep stays whole: the margin in injection_detector.ex's moduledoc is over EVERY device.
+    @tag timeout: 600_000
     test "no device on the Google Play supported devices list fires in a WebView or an Instagram frame" do
       user_agents =
         :intake_play_supported_devices
