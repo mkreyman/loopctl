@@ -545,7 +545,7 @@ describe("index.js wiring (source-level pins)", () => {
       "feeds the static tool names for the collision/prefix drop",
     );
     assert.ok(
-      /agentKey:\s*\(\)\s*=>\s*process\.env\.LOOPCTL_AGENT_KEY/.test(INDEX_SRC),
+      /agentKey:\s*\(\)\s*=>\s*agentKey\(\)/.test(INDEX_SRC),
       "generated calls resolve the agent key (same auth as static reads)",
     );
   });

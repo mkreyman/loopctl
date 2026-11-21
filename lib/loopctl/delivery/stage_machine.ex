@@ -600,6 +600,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :runner_gone
           | :merge_unanswered
           | :ungated_merge
+          | :review_missing
 
   @type effect ::
           :runner_id
@@ -662,6 +663,48 @@ defmodule Loopctl.Delivery.StageMachine do
   """
   @spec max_reason_length() :: pos_integer()
   def max_reason_length, do: @max_reason_length
+
+  # US-52.16: the fixed sentence a `transitioned` event carries when its writer gives no
+  # reason. One per edge of `t:edge/0`; `StageMachineTest` fails on an edge without one.
+  @edge_reasons %{
+    forward: "moved forward",
+    ci_red: "CI went red",
+    review_findings: "review found defects",
+    base_moved: "the base branch moved",
+    verification_failed: "verification failed",
+    triage_escalate: "triage escalated it to a person",
+    triage_reject: "triage rejected it",
+    merge_gate: "the merge gate held it",
+    merge_refused: "the merge was refused",
+    budget_exceeded: "its budget ran out",
+    budget_reported: "its session reported the budget spent",
+    runner_lost: "its runner was lost",
+    claim_released: "its claim was released",
+    attempts_exhausted: "its attempts ran out",
+    operator_released: "an operator released it",
+    human_resolution: "a person resolved it",
+    session_escalated: "its session asked for a person",
+    change_ready: "its change is ready for CI",
+    change_resubmitted: "its change was resubmitted",
+    change_review_findings: "its change's review found defects",
+    reverted: "its merge was reverted",
+    reverted_after_verify: "its merge was reverted after verification",
+    change_outside_lifecycle: "its change moved outside the lifecycle",
+    verify_rejected: "the verifier rejected it",
+    no_independent_verifier_runner: "no independent verifier runner is available",
+    runner_gone: "its runner is gone",
+    merge_unanswered: "the runner did not answer the merge instruction",
+    ungated_merge: "it was merged without the merge gate",
+    review_missing: "it landed without a chg review of its landed revision"
+  }
+
+  @doc "The fixed sentence a transition over `edge` carries when no reason is given."
+  @spec edge_reason(edge()) :: String.t()
+  def edge_reason(edge), do: Map.fetch!(@edge_reasons, edge)
+
+  @doc "Every edge `edge_reason/1` names (the drift test compares it with `t:edge/0`)."
+  @spec reasoned_edges() :: [edge()]
+  def reasoned_edges, do: Map.keys(@edge_reasons)
 
   # What a CONTROL writer stores, in codepoints: the bound less a deliberate margin, so the
   # truncation is never the thing that costs an escalation its write.

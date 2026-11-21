@@ -6,6 +6,79 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A story read names the session that holds it (2026-11-20, US-52.20).** Every story in
+  `GET /api/v1/stories` and `GET /api/v1/stories/:id` now carries `assigned_holder_id`,
+  `claim_epoch` and `claimed_until`; the single-story read also carries `assigned_holder`
+  (`id`, `kind`, `host`, `session_id`, `lease_until`, `ended_at`, `ended_reason`, never a
+  credential). `GET /api/v1/stories/:id/stage` adds `runner_name` beside `runner_id`.
+  Additive; no migration. The e2e suite gains `mix e2e --only two_sessions_one_repo`, which
+  needs the new repository secret `LOOPCTL_E2E_AGENT_KEY` (a plain agent key).
+- **A holder's claims live by the holder's lease (2026-11-20, US-52.19).** A claim, bulk
+  claim or interactive work item taken by a holder credential, without a dispatch cap, now
+  gets `claimed_until` = the holder's `lease_until` and no `claim_lease_cap`, instead of the
+  24-hour `STORY_CLAIM_LEASE_SECONDS` lease; each heartbeat (and `renew-claim`) moves those
+  claims to the new lease. A holder whose lease has run out is refused `409
+  holder_lease_expired` on claim, renew, work-item open and heartbeat; that late heartbeat
+  ENDS the holder (`ended_reason: lapsed`), revokes its credential and releases its claims,
+  and the MCP server registers a new holder. `POST /api/v1/holders/:id/end` now releases the
+  holder's uncapped claims (item event reason `holder ended`). `ReclaimExpiredClaimsWorker`
+  also ends, after its claim pass, every interactive or cloud holder past its lease and every
+  runner-session holder older than 600 s that holds no claim or whose dispatch is revoked or
+  expired. `HOLDER_LEASE_SECONDS` (300) and `HOLDER_HEARTBEAT_SECONDS` (60) keep their
+  defaults, now measured (`docs/factory/measurements/session-holder-lease.md`); the lease now
+  also bounds how long a dead session keeps its items. New `mix loopctl.session_gaps`. No
+  migration. Plain agent keys are unchanged.
+- **The story's event log names the holder and the reason for every event (2026-11-21,
+  US-52.16).** `story_stage_events` gains `actor_holder_id`, `reason` (NOT NULL, 1..2000
+  characters) and `idempotency_key`, and now also carries `claimed`, `released` and
+  `note_written` events for any story, with or without a stage row; every claim, unclaim,
+  force-unclaim, lease reclaim, session-end release and bulk claim writes one in its own
+  transaction. `POST /api/v1/stories/:id/force-unclaim` (MCP `force_unclaim_story`) takes an
+  optional `reason`, recorded as `force-unclaimed: <reason>`. Migration 20261121050000
+  backfills `reason` on existing rows (from `data->>'reason'`, else the edge, else the event
+  name) in one UPDATE inside its transaction; no manual step. Its rollback refuses while any
+  item event exists, since those rows are the only record of who held each story.
+- **A runner session is a holder, and verify separates holders (2026-11-21, US-52.15).** A
+  placement now mints its session dispatch together with a `runner_session` holder (host =
+  the runner's name), and the claim names it (`assigned_holder_id`). The holder ends when the
+  runner reports `session_ended`, when the placement is undone or its dispatch revoked, and
+  lapses when the dispatch expires. Runner contract 1.35.0: an `accepted` dispatch reply may
+  carry `session_id` (at most 200 bytes) and `worktree` (at most 1024 bytes), written onto the
+  holder; a refusal carrying either is `invalid_payload`, and a 1.34.0 accept is recorded as
+  before. loopctl-runner sends both and launches `claude` with that `--session-id`. Verify
+  compares HOLDERS, not agents, when the story and the verifier dispatch both have one: the
+  same holder is `409 self_verify_blocked`, different holders pass under one shared agent;
+  either side without a holder keeps the agent-id check. Migration `20261121040000` adds the
+  nullable `holders.runner_dispatch_id`; no backfill, no manual step. Deploy loopctl before
+  the runners: a runner on 1.35.0 sends fields a 1.34.0 server refuses. Each session's key now
+  carries its holder, which puts it outside the agent's one-key-per-role slot: a runner takes
+  as many concurrent placements as its `max_sessions`, where before the second placement for
+  the same agent was refused `agent already has an active key with this role`.
+- **A claim names its holder, and another session's claim is refused (2026-11-21,
+  US-52.14).** A story claimed with a holder credential records `stories.assigned_holder_id`
+  (shown on the story), and `claim`, `start`, `renew-claim`, `request-review` and `unclaim`
+  answer every other caller, including another session with the same agent key and a key
+  with no holder, `409 held_by_other_holder` with `error.holder_id`, `holder_kind` and
+  `holder_host`. The holder claiming again gets `200` with the claim unchanged (no new epoch
+  or audit row). Channel claims record `claimant_holder_id`: a peer session of the same agent
+  now gets `409 already_claimed` where it used to get `200 already_held`, and `404` on
+  `done`/`release` whatever `session_id` it sends. Claims made before this release, or by a
+  key with no holder, keep the agent-id checks. Migration `20261121030000` adds the two
+  nullable columns; no backfill, no manual step.
+- **Every session is a holder (2026-11-21, US-52.13).** New `POST /api/v1/holders`,
+  `POST /api/v1/holders/:id/heartbeat` and `POST /api/v1/holders/:id/end` (MCP tools
+  `holder_register`, `holder_heartbeat`, `holder_end`). A session registers with its agent's
+  plain key and gets a credential of its own, an `:agent` key carrying `holder_id`; the MCP
+  server (3.21.0) does this at startup, sends every agent-key request with that credential,
+  heartbeats it and ends it on exit, and falls back to `LOOPCTL_AGENT_KEY` when the register
+  is refused. Register refuses `403 holder_mint_forbidden` to a dispatch-minted key, `422
+  agent_required` to a key naming no agent, `409 session_id_held` when a live holder of another
+  kind (a runner session) has that session id, and `403 custody_tier_required` on an
+  agent-rooted tenant. Migration `20261121020000` creates `holders`, adds
+  `api_keys.holder_id`, and rebuilds `api_keys_one_role_per_agent_idx` to exclude holder keys
+  (one live key per holder is held by `api_keys_one_live_key_per_holder_idx` instead); no
+  manual step. New env vars `HOLDER_LEASE_SECONDS` (300) and `HOLDER_HEARTBEAT_SECONDS` (60);
+  a lease no longer than the heartbeat interval refuses the boot.
 - **`POST /api/v1/projects/:id/merge_into` keeps a live intake source on its repo
   (2026-11-21, #1113).** A merge whose source project carries a live `pr`/`chg` source for a
   repo the target does not hold answers `409 merge_strands_intake_source` with
@@ -355,6 +428,15 @@ All notable changes to loopctl are documented here.
 
 ### Removed
 
+- **Orchestrator state is deleted (2026-11-21, US-52.17).** BREAKING for anything still calling
+  it: `PUT /api/v1/orchestrator/state/:project_id`, `GET /api/v1/orchestrator/state/:project_id`
+  and `GET .../history` now answer 404, the CLI's `loopctl state save|load` is gone, and the
+  `OrchestratorStateRequest`/`OrchestratorStateResponse` schemas leave the OpenAPI spec. No MCP
+  tool ever reached it. Migration `20261121060000` copies every `orchestrator_states` row into
+  `audit_log` (`entity_type` project, `action` orchestrator_state_retired, `new_state` holding
+  `state_key`, `version` and `state_data`) and drops the table; no manual step. A session
+  resumes from the work item instead: its stage, its event log and its notes.
+
 - **Epic 45's change threads are deleted (#984).** BREAKING for anything still calling them:
   `GET /api/v1/stories/:id/thread`, `POST .../thread/checkpoints`, `.../thread/entries`,
   `.../thread/reviews`, `.../thread/fixes`, `GET .../thread/reviews/:review_id`,
@@ -388,6 +470,28 @@ All notable changes to loopctl are documented here.
   were unset on 2026-10-19.
 
 ### Added
+
+- **Interactive work on a branch becomes a work item (2026-11-21, US-52.18).**
+  `POST /api/v1/work_items` with `{repo_url, branch, title?, epic_id?}` from a holder
+  credential creates one story in the repo's project, already `implementing` and held by the
+  caller, with a stage row at `implementing` naming the branch. The epic is `epic_id`, else
+  the target epic of the project's one live intake source (`422 no_target_epic` otherwise).
+  One item per (project, branch): the caller's own item and an unheld one come back with 200,
+  another holder's is `409 branch_held`; a key with no holder is
+  `403 holder_credential_required`, and a repo no project of the tenant holds is
+  `404 project_not_found`. MCP tool `work_item_open`; the MCP server now also opens the item
+  on each holder heartbeat for a worktree on a non-default branch, once per branch per
+  holder, with no opt-out in this release. No migration.
+- **A work item carries its notes (2026-11-21, US-52.17).** `POST /api/v1/stories/:id/notes`
+  appends a note (`section`: plan, progress, decision or question; `body` 1 to 16384 bytes,
+  refused 422 if it looks like a credential) and records a `note_written` event in the same
+  transaction; `GET /api/v1/stories/:id/notes` pages them oldest first (`limit` default 50,
+  max 200, `after` cursor) with `current`, the newest note per section, on the first page.
+  Only the story's current holder, or an orchestrator, user or superadmin key, writes one:
+  another session is `409 held_by_other_holder`, and an agent on an item nobody holds is
+  `409 not_holder`. A writer repeating its own `idempotency_key` gets its first note back;
+  another writer reusing that key is `409 idempotency_key_reused`. MCP tools
+  `work_item_note` and `work_item_notes`. New table `story_notes` (RLS enabled).
 
 - **A session end reports its turns and the work it left behind (2026-11-07, US-48.11,
   runner contract 1.27.0).** `session_ended` gains two optional fields: `turns_used` (an

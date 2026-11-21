@@ -119,7 +119,7 @@ describe("the handler in index.js", () => {
     // out wiring would otherwise still match.
     const handler = stripComments(INDEX_SRC.slice(start, end));
     assert.match(handler, /changeBindingGetRequest\(args,/);
-    assert.match(handler, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.match(handler, /agentKey\(\)/);
     assert.match(handler, /apiCall\(method, path, body, key\)/);
   });
 });

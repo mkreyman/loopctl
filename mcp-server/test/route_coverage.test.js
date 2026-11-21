@@ -256,9 +256,6 @@ const DECLARED = {
   "POST /api/v1/story_dependencies": "gap", // StoryDependencyController.create
   "DELETE /api/v1/story_dependencies/:param": "gap", // StoryDependencyController.delete
   "GET /api/v1/epics/:param/story_dependencies": "gap", // StoryDependencyController.index
-  "PUT /api/v1/orchestrator/state/:param": "gap", // OrchestratorStateController.save
-  "GET /api/v1/orchestrator/state/:param": "gap", // OrchestratorStateController.show
-  "GET /api/v1/orchestrator/state/:param/history": "gap", // OrchestratorStateController.history
   "POST /api/v1/webhooks": "gap", // WebhookController.create
   "GET /api/v1/webhooks": "gap", // WebhookController.index
   "PATCH /api/v1/webhooks/:param": "gap", // WebhookController.update

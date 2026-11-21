@@ -239,8 +239,22 @@ defmodule LoopctlWeb.StoryVerificationController do
         "story whose stage row the release leaves at `queued` is escalated over " <>
         "`operator_released`: an operator took it back, so an operator decides what it does " <>
         "next, from `escalated` (`POST /stories/:id/stage/resolve`). It spends no attempt " <>
-        "against the retry ceiling.",
+        "against the retry ceiling. An optional `reason` is recorded on the story's event " <>
+        "log as `force-unclaimed: <reason>` (trimmed, at most 2000 characters, longer is " <>
+        "cut); without it the event says `force-unclaimed: operator`.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Force-unclaim params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           reason: %OpenApiSpex.Schema{
+             type: :string,
+             nullable: true,
+             description: "Why the operator released it, for the story's event log."
+           }
+         }
+       }},
     responses: %{
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
       400 =>
@@ -611,6 +625,9 @@ defmodule LoopctlWeb.StoryVerificationController do
           orchestrator_agent_id: api_key.agent_id,
           actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
+        # US-52.16: the operator's words for the `released` event's reason. Free text, never
+        # identity; bounded by the event log (`Stages.record_item_event/4`).
+        |> put_release_reason(conn.body_params)
 
       # `with`, not a two-clause `case` (846.8, AC-5). This matched `{:ok, _}` and
       # `{:error, :not_found}` and nothing else, so the OTHER refusals this function has
@@ -724,4 +741,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   defp maybe_put_run_error(body, nil), do: body
   defp maybe_put_run_error(body, error), do: Map.put(body, :verification_run_error, error)
+
+  defp put_release_reason(opts, %{"reason" => reason}) when is_binary(reason),
+    do: Keyword.put(opts, :release_reason, String.trim(reason))
+
+  defp put_release_reason(opts, _params), do: opts
 end

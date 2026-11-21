@@ -107,26 +107,25 @@ defmodule Loopctl.Agents.BuildDispatcherTest do
         leave_channel(minis)
       end
 
-      test "TC-48.7.1, one runner taking every repository: the second placement is refused " <>
-             "by the agent's key slot",
-           ctx do
+      # US-52.15: each session's key carries its holder, and holder keys are outside the
+      # agent's one-key-per-role slot (`api_keys_one_role_per_agent_idx`, US-52.13), so one
+      # runner places as many sessions as it declares. Before holders the slot refused the
+      # second placement, capping every runner at one session per agent.
+      test "TC-48.7.1, one runner taking every repository: both placements land on it", ctx do
         corpus = corpus(ctx)
         minis = join_as(ctx.runner, ctx.runner_key, "minis", [@repo, @repo_main, @repo_legacy])
 
         {outcomes, log} = run_recorded(ctx, unquote(path))
 
-        assert outcomes == [:placed, :unplaceable, :unplaceable, :no_runner]
-        assert_summary(outcomes, %{placed: 1, unplaceable: 2, no_runner: 1})
+        assert outcomes == [:placed, :placed, :unplaceable, :no_runner]
+        assert_summary(outcomes, %{placed: 2, unplaceable: 1, no_runner: 1})
+        refute log =~ "agent already has an active key with this role"
 
-        assert log =~
-                 "[info] DispatchDriver: leaving for the next pass: " <>
-                   "story_id=#{corpus.main_base.id} reason=#Ecto.Changeset<"
-
-        assert log =~ "agent already has an active key with this role"
-
-        pushed = collect_pushed(1)
+        pushed = collect_pushed(2)
         assert_pushed(ctx, pushed[corpus.plain.id], corpus.plain, @repo, "master")
-        assert_untouched(ctx, corpus.main_base)
+        assert_pushed(ctx, pushed[corpus.main_base.id], corpus.main_base, @repo_main, "main")
+        assert_claimed(ctx, corpus.plain, ctx.runner)
+        assert_claimed(ctx, corpus.main_base, ctx.runner)
 
         leave_channel(minis)
       end
@@ -203,16 +202,16 @@ defmodule Loopctl.Agents.BuildDispatcherTest do
 
         {outcomes, log} = run_recorded(ctx, unquote(path))
 
-        assert outcomes == [:placed, :unplaceable, :unplaceable, :no_runner]
-        assert_summary(outcomes, %{placed: 1, unplaceable: 2, no_runner: 1})
+        # Both on the healthy machine: holder keys are outside the agent's key slot (US-52.15).
+        assert outcomes == [:placed, :placed, :unplaceable, :no_runner]
+        assert_summary(outcomes, %{placed: 2, unplaceable: 1, no_runner: 1})
+        refute log =~ "agent already has an active key with this role"
 
-        assert log =~
-                 "[info] DispatchDriver: leaving for the next pass: " <>
-                   "story_id=#{corpus.main_base.id} reason=#Ecto.Changeset<"
-
-        pushed = collect_pushed(1)
+        pushed = collect_pushed(2)
         assert_pushed(ctx, pushed[corpus.plain.id], corpus.plain, @repo, "master")
+        assert_pushed(ctx, pushed[corpus.main_base.id], corpus.main_base, @repo_main, "main")
         assert_claimed(ctx, corpus.plain, ctx.second)
+        assert_claimed(ctx, corpus.main_base, ctx.second)
 
         leave_channel(healthy)
         leave_channel(broken)

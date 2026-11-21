@@ -150,6 +150,7 @@ defmodule Loopctl.Delivery.PlacementTest do
         edge: "verify_rejected",
         claim_epoch: row.claim_epoch,
         lock_version: row.lock_version + 1,
+        reason: "the verifier rejected it",
         data: %{
           "payload" => %{
             "verify" => %{

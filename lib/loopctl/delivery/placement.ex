@@ -814,16 +814,20 @@ defmodule Loopctl.Delivery.Placement do
 
     with :ok <- runner_accepting_work(meta),
          :ok <- runner_not_exhausted(tenant_id, runner_id),
-         {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
+         {:ok, runner} <- provisioned_runner(tenant_id, runner_id),
          {:ok, dispatch} <-
            DispatchPayload.fill(tenant_id, dispatch,
              branch_prefixes: declared_branch_prefixes(meta)
            ),
          {:ok, dispatch} <- lease_capable(dispatch),
          {:ok, story} <- ready_story(tenant_id, story_id),
-         :ok <- contract_if_pending(tenant_id, story, caller.id, agent_id, opts),
-         {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
-      claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
+         :ok <- contract_if_pending(tenant_id, story, caller.id, runner.agent_id, opts),
+         {:ok, session, holder} <-
+           mint_session_dispatch(tenant_id, runner, story_id, caller, dispatch, opts) do
+      # The claim names the session's holder (US-52.15). Put by THIS function, over anything
+      # the caller's opts carried, so no caller can claim under another holder.
+      opts = Keyword.put(opts, :session_holder_id, holder.id)
+      claim_then_push(tenant_id, runner_id, dispatch, story_id, runner.agent_id, session, opts)
     end
   end
 
@@ -1165,6 +1169,7 @@ defmodule Loopctl.Delivery.Placement do
       agent_id: agent_id,
       dispatch_id: session.id,
       lineage: session.lineage_path,
+      holder_id: Keyword.fetch!(opts, :session_holder_id),
       actor_label: Keyword.get(opts, :actor_label),
       lease_until: DispatchLease.cap(placed_at, Map.fetch!(dispatch, "wall_clock_seconds"))
     )
@@ -1213,20 +1218,37 @@ defmodule Loopctl.Delivery.Placement do
   # caller's subtree — the lineage ceiling, applied by this path rather than inherited from a
   # controller it does not go through. `nil` is a ROOT and has already been gated by
   # `may_mint_session_dispatch/2`.
-  defp mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
+  #
+  # The session is a HOLDER from this moment (US-52.15): `:runner_session` makes the mint create
+  # it in the same transaction, host = the runner row's name, lease = the claim's cap computed
+  # from the wall clock `lease_capable/1` already checked. A mint that fails leaves no holder,
+  # and every revoke of this dispatch ends it (`Dispatches.revoke/3`).
+  defp mint_session_dispatch(tenant_id, runner, story_id, caller, dispatch, opts) do
     caller_lineage = caller.lineage
 
     attrs = %{
       parent_dispatch_id: List.last(caller_lineage),
       role: :agent,
-      agent_id: agent_id,
+      agent_id: runner.agent_id,
       story_id: story_id,
       expires_in_seconds:
         Keyword.get(opts, :session_expires_in_seconds, @session_expires_in_seconds)
     }
 
-    case Dispatches.create_dispatch(tenant_id, attrs, actor_lineage: caller_lineage) do
-      {:ok, %{dispatch: dispatch}} -> {:ok, dispatch}
+    runner_session = %{
+      host: runner.name,
+      # The wire id the runner's accept and session_ended will name; the session's
+      # `dispatches` row is a different id.
+      runner_dispatch_id: Map.fetch!(dispatch, "dispatch_id"),
+      lease_until:
+        DispatchLease.cap(DateTime.utc_now(), Map.fetch!(dispatch, "wall_clock_seconds"))
+    }
+
+    case Dispatches.create_dispatch(tenant_id, attrs,
+           actor_lineage: caller_lineage,
+           runner_session: runner_session
+         ) do
+      {:ok, %{dispatch: session, holder: holder}} -> {:ok, session, holder}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -1266,10 +1288,13 @@ defmodule Loopctl.Delivery.Placement do
   # resolves to nothing. `nil` is not "claim for nobody": a story whose `implementer_dispatch_id`
   # is set and whose `assigned_agent_id` is not cannot even reach `reported_done`
   # (`stories_reported_done_requires_agent`).
-  defp runner_agent_id(tenant_id, runner_id) do
+  # The runner row, provisioned: its agent is who the session dispatch is minted for, and its
+  # NAME is the session holder's host (US-52.15) — the one host loopctl attests rather than
+  # takes from a session.
+  defp provisioned_runner(tenant_id, runner_id) do
     case Runners.get_runner(tenant_id, runner_id) do
       {:ok, %{agent_id: nil}} -> {:error, :runner_not_provisioned}
-      {:ok, %{agent_id: agent_id}} -> {:ok, agent_id}
+      {:ok, runner} -> {:ok, runner}
       {:error, :not_found} -> {:error, :not_authorized}
     end
   end

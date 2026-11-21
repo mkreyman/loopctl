@@ -50,7 +50,7 @@ lib/loopctl/
 ├── work_breakdown/    # Epics, stories, dependencies
 ├── progress/          # Two-tier status tracking
 ├── artifacts/         # Artifact reports, verification results
-├── orchestrator/      # Orchestrator state checkpointing
+├── work_items/        # Work item notes (plan, progress, decision, question)
 ├── webhooks/          # Webhook subscriptions, events, delivery
 ├── import_export/     # Bulk import/export
 ├── skills/            # Skill versioning and performance
@@ -169,9 +169,14 @@ in order:
    when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set, decided by
    `verify_lineage_separated/4`: an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:952-956`) blocks, and the
-   `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
-   short-circuited by it.
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:980-984`) blocks, and an
+   IDENTITY check is evaluated IN ADDITION to the lineage comparison, never short-circuited by
+   it (`verify_identity_separated/2`). Every fleet session shares one agent, so when the story
+   names its implementing holder (`assigned_holder_id`) AND the verifier dispatch has a holder
+   (`Holders.holder_for_dispatch/2`, read server-side from the dispatch row), the HOLDERS are
+   compared: the same holder is `self_verify_blocked`, and different holders pass even under
+   one agent (US-52.15). Either side without a holder keeps the `assigned_agent_id` equality
+   refusal.
 5. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories and for every
    story that lacks a verifier dispatch.
 
@@ -191,7 +196,7 @@ a head the current verifier did not judge.
 `verifier_dispatch_id` is written only by the assign-verifier flow
 (`assign_rotating_verifier/3`, `progress.ex:755-802`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:1093`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:1127`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 
@@ -256,7 +261,7 @@ marker and restored the claim → force-unclaim → backfill-to-verified launder
 (`lib/loopctl/changes/review_custody.ex`). A story with a change binding is a chg story, and
 its chg root is the `chg_root_dispatch_id` of the one intake source that delivered the bound
 change's events (any other count: no root, nobody qualifies). On such a story
-`record_review/4` runs `chg_review/4` (`lib/loopctl/progress.ex:2846`) AFTER
+`record_review/4` runs `chg_review/4` (`lib/loopctl/progress.ex:3003`) AFTER
 `validate_not_self_review/3`, never instead: the reviewer's LIVE lineage must be a STRICT
 descendant of the root (`chg_reviewer_required`, the root's own key included), then
 `commit_sha` must be the sha of an APPLIED `submitted` event of the CURRENT binding
@@ -297,9 +302,9 @@ landed event's own transaction over the control-only edge `:review_missing`
 fails CLOSED: a refused escalation rolls the whole landing back (`:busy`, or
 `change_event_failed`, logged and counted) so chg redelivers it — the merge never commits
 without its hold. Such a story is never verified: every path that reaches `verified` —
-verify and verify-all through `chg_landed_review/2` (`progress.ex:3128`), bulk verify
-through `process_verify/3` (`bulk_operations.ex:433`), backfill and bulk mark-complete
-through `guard_backfill/3` (`progress.ex:3240`) — calls one function,
+verify and verify-all through `chg_landed_review/2` (`progress.ex:3285`), bulk verify
+through `process_verify/3` (`bulk_operations.ex:445`), backfill and bulk mark-complete
+through `guard_backfill/3` (`progress.ex:3397`) — calls one function,
 `ReviewCustody.ensure_landed_review/3` (`lib/loopctl/changes/review_custody.ex:272`). It refuses a chg story with
 `review_missing_escalated` while its stage is escalated over `:review_missing` (a human
 resolves it) and with `chg_review_not_for_landed_revision` unless a chg review names its
@@ -324,6 +329,8 @@ Ask these questions:
    **Asserting a conflict is reachability, not authority (#730).** `POST /api/v1/knowledge/conflicts` (`role: :agent`) lets a caller open a `:potential_conflict` pair the auto-linker never flagged — the deliberate-correction case, where the pair is minutes old and a correction that argues about a conclusion may never cross the similarity threshold. It stays agent-role for the same reason the rest of this carve-out does: it is non-destructive and audited. What it does NOT grant is the point. An assertion is stamped `auto_generated: false`, so it never reaches curated suppression (`open_conflict_subquery/1`, `authoritative_curated?/2`) — otherwise any agent could retract any article from the governed answer path by disputing it. And the asserting principal may not record the pair's verdict (`409 self_asserted_conflict`, checked at write time AND re-checked at execution time), because the pair is manufacturable by construction: the caller named both ids. That is the same structural separation `annotate_conflict/3` already draws by GRANTING a supersede's confidence from the recorder's role. **Never let an assertion set `auto_generated: true`, and never let the asserter judge its own pair** — either one turns a curation surface into a caller-driven takedown.
 
    **KB project-scope carve-out (extends #331).** `:kb`-kind project scopes — `create_kb_scope`, `archive_kb_scope`, `restore_kb_scope` (`lib/loopctl_web/controllers/project_controller.ex:25-35`) — are `role: :agent` and deliberately NOT behind `RequireHumanAnchor` (`:52-66`): a `:kb` scope carries no chain-of-custody surface (`RequireWorkProject` bars work attachment), so an agent-rooted tenant may partition its own knowledge. `:work` project create/update/delete stays `:orchestrator`/`:user` AND human-anchored.
+
+   **Interactive work-item carve-out (US-52.18).** `POST /api/v1/work_items` (`LoopctlWeb.WorkItemController`, `Loopctl.WorkItems.Open`) lets a HOLDER credential (`role: :agent`, human-anchored) create a story, which is otherwise `:orchestrator` work. It is the holder recording its OWN work atomic with its claim, not composing a project: the one story is created already `implementing` and held by the caller, in the repo's project, with no acceptance criteria, and it reaches `verified` only through report, review and verify like any story — the caller is its implementer, so it cannot report it (`self_report_blocked`). A key without a holder is `403 holder_credential_required`; a chg-rooted key is `chg_root_review_only`, as at claim. Do not widen it to a general agent-role story create.
 
    **Tier discoverability, not tier weakening (#505).** An agent-rooted tenant could previously map the tier boundary only by taking a `403 custody_tier_required` per endpoint, which reads as a dead end. `Loopctl.Tenants.TierCapabilities` is now the single derivation of "which surfaces does this tier include", advertised on `GET /api/v1/tenants/me` (`get_tenant`) and embedded in the 403 body itself; a `RequireHumanAnchor` mount may additionally name an `alternative:` (ProjectController names `create_kb_scope`, on `:create` only — an alternative is offered only where it GENUINELY substitutes). The advertised map is bound to the ENFORCED gate mechanically: `TierCapabilities.gated_controllers/0` names the `RequireHumanAnchor`-mounting controllers per human-anchored surface, and `test/loopctl/tenants/tier_capabilities_test.exs` scans the `lib/loopctl_web` sources and fails in both directions — never relax that test to make a new mount pass. The map states its own BOUNDS in the payload (`scope: trust_tier_only`, `applies_to: mutating_actions`): the ROLE gate applies independently (an `allowed` surface can still return `403 insufficient_role`, which now carries a stable `code` and the same capability block) and READS stay open on every surface. On `ProjectController` the tier gate is deliberately mounted BEFORE `RequireRole` on `:create` — controller plugs run in declaration order, and with the role gate first an `:agent`-role key (the default MCP shape) was halted before it could ever see the `create_kb_scope` alternative. **This changed no gate.** If a future change is tempted to let `agent_rooted` through `RequireHumanAnchor`, that is an L0 regression — the human anchor is the root the whole custody chain hangs from, and a tenant opening a custody surface for itself is the exact failure the product exists to prevent. The correct answer to "an agent needs a project row for its repo" is `create_kb_scope`, not a weaker gate.
 3. **Does this collapse trust boundaries?** The role hierarchy exists so that agents can't self-promote. Lowering a role requirement is fine for read operations and for operations the role logically needs (orchestrators creating projects). It's wrong for operations that serve as a security gate.
@@ -640,10 +647,10 @@ force-unclaim had an endpoint and no tool — the only one the old wording catch
 `place_dispatch`'s `inputSchema` omitted `repo`, which its own 409 `no_intake_source` tells the
 caller to pass (`dispatch_placement_controller.ex:418-426`); it reached the server only because
 no schema here sets `additionalProperties: false`. **846.6**, `PATCH /api/v1/stories/:id`
-(`router.ex:477`) had been served for months with no tool, so a session could file a story and
+(`router.ex:592`) had been served for months with no tool, so a session could file a story and
 not correct it. **846.7**, a tool that merged, went green and deployed and was still uncallable,
 because it ships as an npm package and MCP binds its tool list at session start. And **PR #862**,
-`Dispatches.revoke/3` (`dispatches.ex:617`) — then a context function with no route at all, so
+`Dispatches.revoke/3` (`dispatches.ex:640`) — then a context function with no route at all, so
 the one call that unsticks a parked dispatch key was reachable only from `iex`. #862 gave it
 both, which is why this entry reads in the past tense while the four above it do not.
 
@@ -719,9 +726,11 @@ loopctl supports external observability tooling through its API and data model:
 
 - **Two-tier trust model**: `agent_status` (self-reported) vs `verified_status` (orchestrator-set) are
   separate fields on every story. External tools can compare them to detect unverified completions.
-- **Orchestrator state checkpointing**: `PUT /orchestrator/state/:project_id` persists orchestrator
-  session state (phase, last verified story, decision context). Enables crash recovery and session
-  handoff. Versioned with optimistic locking.
+- **Work item notes** (US-52.17): `POST`/`GET /api/v1/stories/:id/notes` (MCP `work_item_note` /
+  `work_item_notes`) carry the holder's plan, progress, decisions and questions, so a session resumes
+  from the item. Only the item's CURRENT holder or an orchestrator+ key writes one: a note is
+  progress on held work, so another session of the same agent is `409 held_by_other_holder`, the
+  same refusal every claimant verb gives. It replaced orchestrator state checkpointing.
 - **Audit API**: `GET /stories/:id/history` returns the immutable event log for any story. External
   observers can replay the decision chain for any story without parsing raw session logs.
 - **Change feed**: `GET /changes?since=...` lets observer processes poll for all state transitions

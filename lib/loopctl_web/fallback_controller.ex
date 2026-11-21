@@ -361,6 +361,81 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-52.14: another session (holder) holds the story. Its kind and host are named so the
+  # caller can tell which of its peers it is; both are the holder's own registration fields,
+  # in the caller's tenant only.
+  def call(conn, {:error, {:held_by_other_holder, holder_id}}) do
+    holder =
+      case Loopctl.Holders.get_holder(conn.assigns.current_api_key.tenant_id, holder_id) do
+        {:ok, h} -> %{id: h.id, kind: h.kind, host: h.host}
+        {:error, :not_found} -> %{id: holder_id, kind: nil, host: nil}
+      end
+
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "held_by_other_holder",
+        message:
+          "Another session holds this story (holder #{holder.id}, #{holder.kind} on " <>
+            "#{holder.host}). Only that session can start, renew, request review on or " <>
+            "release it, even with the same agent key. Work something else; the claim " <>
+            "ends when that session releases it or its lease runs out.",
+        holder_id: holder.id,
+        holder_kind: holder.kind,
+        holder_host: holder.host
+      }
+    })
+  end
+
+  # US-52.19: the caller is a holder whose lease has passed or that has ended. Its claims
+  # live by that lease, so it may not take or renew one until it registers again.
+  def call(conn, {:error, :holder_lease_expired}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "holder_lease_expired",
+        message:
+          "This session's holder lease has run out, and a holder's claims live by its " <>
+            "lease. Register the session again (POST /api/v1/holders) and retry with the " <>
+            "new credential."
+      }
+    })
+  end
+
+  # US-52.17: an agent-role note on a work item nobody holds.
+  def call(conn, {:error, :not_holder}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "not_holder",
+        message:
+          "Nobody holds this story, so an agent key cannot write its notes: a note is " <>
+            "progress on held work. Claim the story first, or write with an orchestrator key."
+      }
+    })
+  end
+
+  # US-52.17: a note whose idempotency_key another writer's note on this story already carries.
+  def call(conn, {:error, :idempotency_key_reused}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "idempotency_key_reused",
+        message:
+          "Another writer's note on this story already carries this idempotency_key; " <>
+            "nothing was written. Send a key of your own."
+      }
+    })
+  end
+
   def call(conn, {:error, :not_claimant}) do
     conn
     |> put_status(:conflict)

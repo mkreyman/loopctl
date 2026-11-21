@@ -31,7 +31,7 @@ defmodule Loopctl.CLI.ClientTest do
         {"DELETE", "/api/v1/projects/project-1"} ->
           Plug.Conn.send_resp(conn, 204, "")
 
-        {"PUT", "/api/v1/orchestrator/state/project-1"} ->
+        {"PUT", "/api/v1/example/project-1"} ->
           Req.Test.json(conn, %{"ok" => true})
 
         _ ->
@@ -102,7 +102,7 @@ defmodule Loopctl.CLI.ClientTest do
     test "makes a PUT request with JSON body" do
       assert {:ok, body} =
                Client.put(
-                 "/api/v1/orchestrator/state/project-1",
+                 "/api/v1/example/project-1",
                  %{"state" => "data"},
                  server: "http://localhost:4000",
                  api_key: "lc_testkey"

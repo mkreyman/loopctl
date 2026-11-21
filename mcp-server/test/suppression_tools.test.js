@@ -88,7 +88,7 @@ describe("knowledge_suppress / knowledge_unsuppress", () => {
 
     assert.ok(block.includes("/suppress`"), "posts to the suppress path");
     assert.ok(block.includes("{ reason }"), "forwards the reason as the body");
-    assert.ok(block.includes("LOOPCTL_AGENT_KEY"), "agent role, per the #331 carve-out");
+    assert.ok(block.includes("agentKey()"), "agent role, per the #331 carve-out");
   });
 
   test("knowledge_index DECLARES and FORWARDS the suppressed mode its description promises", () => {
@@ -115,6 +115,6 @@ describe("knowledge_suppress / knowledge_unsuppress", () => {
     const block = indexSource.slice(idx, idx + 600);
 
     assert.ok(block.includes("/unsuppress`"), "posts to the unsuppress path");
-    assert.ok(block.includes("LOOPCTL_AGENT_KEY"), "agent role");
+    assert.ok(block.includes("agentKey()"), "agent role");
   });
 });

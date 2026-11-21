@@ -138,7 +138,7 @@ describe("escalation_list in index.js and the README", () => {
     const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
     const handler = stripComments(INDEX_SRC.slice(start, end));
 
-    assert.match(handler, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.match(handler, /agentKey\(\)/);
     assert.match(handler, /escalationListRequest\(args,/);
     assert.doesNotMatch(handler, /exactKey/);
   });

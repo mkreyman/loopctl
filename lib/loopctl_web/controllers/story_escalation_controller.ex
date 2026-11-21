@@ -142,7 +142,8 @@ defmodule LoopctlWeb.StoryEscalationController do
     description:
       "The row `Loopctl.Delivery.Stages` keeps for this story: where it is in the delivery " <>
         "machine, the `claim_epoch` every transition is fenced on, the `lock_version` and " <>
-        "`attempts`, the `runner_id` holding it, and the escalation reason when it is " <>
+        "`attempts`, the `runner_id` holding it and its `runner_name`, and the escalation " <>
+        "reason when it is " <>
         "parked. `null` when the story has no stage row, which means the delivery loop has " <>
         "never touched it.\n\n" <>
         "THE LOOP WAS UNOBSERVABLE WITHOUT THIS. Nothing on the API returned a stage, so an " <>
@@ -371,6 +372,9 @@ defmodule LoopctlWeb.StoryEscalationController do
       # watching a run wants the machine as much as the stage, and a story stuck at `claimed`
       # is a question about a runner.
       runner_id: row.runner_id,
+      # US-52.20: the runner's NAME too, which a runner-session holder carries as its host.
+      # Every key of the tenant reads a stage, and the runner list is user-only.
+      runner_name: runner_name(row),
       stage: row.stage,
       claim_epoch: row.claim_epoch,
       lock_version: row.lock_version,
@@ -378,5 +382,14 @@ defmodule LoopctlWeb.StoryEscalationController do
       escalation_reason: row.escalation_reason,
       escalation_reason_untrusted: true
     }
+  end
+
+  defp runner_name(%{runner_id: nil}), do: nil
+
+  defp runner_name(%{tenant_id: tenant_id, runner_id: runner_id}) do
+    case Loopctl.Runners.get_runner(tenant_id, runner_id) do
+      {:ok, runner} -> runner.name
+      _ -> nil
+    end
   end
 end

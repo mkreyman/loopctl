@@ -77,7 +77,7 @@ defmodule Loopctl.BulkOperations do
         process_claims(
           sorted_ids,
           locked_stories,
-          %{held: held, blocked: blocked},
+          %{held: held, blocked: blocked, holder_id: Keyword.get(opts, :holder_id)},
           agent_id,
           tenant_id,
           actor_id,
@@ -415,7 +415,19 @@ defmodule Loopctl.BulkOperations do
 
   defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
     with :ok <- validate_claim_preconditions(story, batch_reads),
-         {:ok, updated} <- apply_claim(story, agent_id) do
+         {:ok, updated} <- apply_claim(story, agent_id, batch_reads.holder_id) do
+      # US-52.16: the claimed item event, in the batch's transaction. It can refuse only a
+      # story that is not the tenant's or a holder that is not, and both were resolved
+      # server-side under the lock, so a refusal is a defect and aborts the batch.
+      {:ok, _event} =
+        Stages.record_item_event(tenant_id, story.id, "claimed",
+          repo: AdminRepo,
+          reason: "claimed",
+          actor_holder_id: batch_reads.holder_id,
+          actor_label: actor_label,
+          data: %{"agent_id" => agent_id}
+        )
+
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
       %{story_id: story.id, status: "success"}
@@ -586,20 +598,28 @@ defmodule Loopctl.BulkOperations do
   # Private: Apply Operations
   # ===================================================================
 
-  defp apply_claim(story, agent_id) do
+  defp apply_claim(story, agent_id, holder_id) do
     now = DateTime.utc_now()
 
     # The same lease and epoch Progress.claim_story/3 writes (#803), so a bulk claim is
-    # released by the reclaimer like any other rather than holding its stories forever.
-    story
-    |> Ecto.Changeset.change(
-      Map.merge(
-        %{agent_status: :assigned, assigned_agent_id: agent_id, assigned_at: now},
-        Progress.claim_lease_change(story, now)
+    # released by the reclaimer like any other rather than holding its stories forever; a
+    # holder's claim takes the holder's lease, and a lapsed holder claims nothing (US-52.19).
+    with {:ok, lease} <- Progress.claim_lease(story.tenant_id, holder_id, nil, now) do
+      story
+      |> Ecto.Changeset.change(
+        Map.merge(
+          %{
+            agent_status: :assigned,
+            assigned_agent_id: agent_id,
+            assigned_holder_id: holder_id,
+            assigned_at: now
+          },
+          Progress.claim_lease_change(story, now, lease)
+        )
       )
-    )
-    |> AdminRepo.update()
-    |> follow_claim()
+      |> AdminRepo.update()
+      |> follow_claim()
+    end
   end
 
   # #803: the stage row follows the claim's epoch inside bulk claim's transaction, like the
@@ -1028,6 +1048,11 @@ defmodule Loopctl.BulkOperations do
     do:
       "chg_trunk_unevaluated: #{reason}; retry after #{retry_after} seconds. " <>
         Messages.chg_trunk_unevaluated()
+
+  defp format_reason(:holder_lease_expired),
+    do:
+      "holder_lease_expired: this session's holder lease has run out; register the session " <>
+        "again and retry with the new credential"
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"

@@ -11,6 +11,11 @@
 # verify@1 runs on a runner other than the implementer's, and a runner holds a slot through
 # its story's `ci` stage, so with only two listed one busy machine leaves the verifier with
 # nowhere to go: on 2026-11-20 the run failed at review_recorded that way.
+#
+# The two-session scenario (US-52.20, `mix e2e --only two_sessions_one_repo`) also needs the
+# repository secret LOOPCTL_E2E_AGENT_KEY: a PLAIN agent key of the same tenant (not one a
+# dispatch minted, which may not register a holder), and the intake source above with a
+# target epic, which every branch the scenario opens is filed under.
 %{
   repo: "mkreyman/loopctl-e2e-sandbox",
   project_id: System.get_env("LOOPCTL_E2E_PROJECT_ID"),

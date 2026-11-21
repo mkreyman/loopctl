@@ -41,6 +41,7 @@ defmodule LoopctlE2e.Stages do
       stage(:story_created, 10, &story_created/2),
       stage(:triaged, 10, &at_least(&1, &2, "triaged")),
       stage(:dispatched, 15, &at_least(&1, &2, "claimed")),
+      stage(:runner_session_holder, 10, &runner_session_holder/2),
       stage(:pr_opened, 30, &pr_opened/2),
       stage(:ci_green, 20, &ci_green/2),
       stage(:review_recorded, 15, &review_recorded/2),
@@ -90,6 +91,43 @@ defmodule LoopctlE2e.Stages do
       {:error, why} ->
         {:wait, why}
     end
+  end
+
+  # US-52.20 (AC-52.20.7): the placed story is held by the runner SESSION, not by an agent:
+  # a runner_session holder whose host is the runner the stage row names and whose session id
+  # is the uuid the runner launched `claude` with (it reports it on accept, US-52.15). Waits
+  # while the runner has not accepted yet; fails if anything else holds the story.
+  defp runner_session_holder(client, ctx) do
+    with {:ok, 200, %{"story" => story}} <-
+           Client.get(client, :loopctl, "/api/v1/stories/#{ctx.story["id"]}"),
+         {:ok, row} <- stage_row(client, ctx) do
+      case judge_holder(story["assigned_holder"], row) do
+        :done -> {:done, ctx}
+        other -> other
+      end
+    else
+      {:error, why} -> {:wait, why}
+      other -> {:wait, describe(other)}
+    end
+  end
+
+  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
+
+  @doc false
+  # Public for the unit test.
+  @spec judge_holder(map() | nil, map()) :: :done | {:wait, String.t()} | {:fail, String.t()}
+  def judge_holder(nil, row), do: {:wait, "no holder on the story at stage #{row["stage"]}"}
+
+  def judge_holder(%{"kind" => kind}, _row) when kind != "runner_session",
+    do: {:fail, "the placed story is held by a #{kind} holder"}
+
+  def judge_holder(%{"host" => host}, %{"runner_name" => name}) when host != name,
+    do: {:fail, "holder host #{inspect(host)}, but the story was placed on #{inspect(name)}"}
+
+  def judge_holder(%{"session_id" => session_id}, _row) do
+    if is_binary(session_id) and session_id =~ @uuid,
+      do: :done,
+      else: {:wait, "the runner session holder has no launched session id yet"}
   end
 
   defp pr_opened(client, ctx) do

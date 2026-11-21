@@ -110,6 +110,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriageVerdictRecord
+  alias Loopctl.Holders
   alias Loopctl.Progress
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -331,11 +332,25 @@ defmodule Loopctl.Delivery.RunnerStages do
              session_end_attrs(message, story_id)
            ),
          :ok <- log_recorded(outcome, tenant_id, runner_id, session, message),
+         :ok <- end_session_holder(tenant_id, message),
          :ok <- mark_exhausted(outcome, tenant_id, runner_id, message, before, session),
          :ok <- act_on_session_end(tenant_id, runner_id, actor_id, session, message),
          {:ok, row} <- stage_row(tenant_id, session.story_id) do
       release_if_session_over(tenant_id, session, message, row)
       {:ok, %{row: row, replayed?: outcome == :replayed}}
+    end
+  end
+
+  # The session's holder ends with it (US-52.15): `ended_at` set, its credential revoked, one
+  # audit row. A replayed report changes nothing, and `end_runner_session/3` is itself a no-op
+  # on a holder already ended.
+  # Run on a REPLAY too: the session end was committed by `record_session_end/4` before this
+  # step, so a failure here is healed only by the redelivery, which reads `:replayed`. Ending a
+  # holder already ended writes nothing, so a replay still changes nothing.
+  defp end_session_holder(tenant_id, message) do
+    case Holders.end_runner_session(tenant_id, message.dispatch_id, actor_label: "runner") do
+      {:ok, _holder} -> :ok
+      {:error, _changeset} -> {:error, :rejected_by_database}
     end
   end
 

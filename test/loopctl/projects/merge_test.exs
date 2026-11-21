@@ -12,7 +12,6 @@ defmodule Loopctl.Projects.MergeTest do
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Intake.Source
-  alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects
   alias Loopctl.Projects.Merge
   alias Loopctl.Projects.Project
@@ -52,8 +51,6 @@ defmodule Loopctl.Projects.MergeTest do
         claimant_agent_id: agent.id
       })
 
-    state = fixture(:orchestrator_state, %{tenant_id: tenant.id, project_id: work.id})
-
     kb =
       fixture(:project, %{
         tenant_id: tenant.id,
@@ -73,7 +70,6 @@ defmodule Loopctl.Projects.MergeTest do
         source: source,
         post: post,
         claim: claim,
-        state: state,
         article: article
       }
     }
@@ -96,7 +92,6 @@ defmodule Loopctl.Projects.MergeTest do
       assert project_of(Source, rows.source.id) == kb.id
       assert project_of(ChannelPost, rows.post.id) == kb.id
       assert project_of(ChannelClaim, rows.claim.id) == kb.id
-      assert project_of(OrchestratorState, rows.state.id) == kb.id
       assert project_of(Loopctl.Knowledge.Article, rows.article.id) == kb.id
 
       assert %{kind: :work, status: :active} = AdminRepo.get!(Project, kb.id)
@@ -231,13 +226,12 @@ defmodule Loopctl.Projects.MergeTest do
       %{tenant: t, work: work, kb: kb} = pair()
       {:ok, _} = Merge.merge_into(t.id, work.id, kb.id)
 
-      straggler =
-        fixture(:orchestrator_state, %{tenant_id: t.id, project_id: work.id, state_key: "late"})
+      straggler = fixture(:article, %{tenant_id: t.id, project_id: work.id})
 
-      assert {:ok, %{already_merged: true, counts: %{"orchestrator_states" => 1}}} =
+      assert {:ok, %{already_merged: true, counts: %{"articles" => 1}}} =
                Merge.merge_into(t.id, work.id, kb.id)
 
-      assert project_of(OrchestratorState, straggler.id) == kb.id
+      assert project_of(Loopctl.Knowledge.Article, straggler.id) == kb.id
 
       assert [_] =
                AdminRepo.all(

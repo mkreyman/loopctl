@@ -6,8 +6,6 @@ defmodule Loopctl.CLI.Commands.Orchestrator do
   - `loopctl verify <story_id> --result <pass|fail|partial> --summary <text>`
   - `loopctl reject <story_id> --reason <text>`
   - `loopctl pending --project <project>`
-  - `loopctl state save --project <project> --data <json>`
-  - `loopctl state load --project <project>`
   """
 
   alias Loopctl.CLI.Client
@@ -65,52 +63,8 @@ defmodule Loopctl.CLI.Commands.Orchestrator do
     end
   end
 
-  def run("state", ["save" | rest], opts) do
-    parsed = parse_kv_args(rest)
-    project_id = Map.get(parsed, "project")
-    data_json = Map.get(parsed, "data")
-    state_key = Map.get(parsed, "key", "main")
-
-    if project_id && data_json do
-      save_state(project_id, data_json, state_key, opts)
-    else
-      Output.error("Usage: loopctl state save --project <id> --data <json>")
-    end
-  end
-
-  def run("state", ["load" | rest], opts) do
-    parsed = parse_kv_args(rest)
-    project_id = Map.get(parsed, "project")
-    state_key = Map.get(parsed, "key")
-    params = if state_key, do: [{"state_key", state_key}], else: []
-
-    if project_id do
-      case Client.get("/api/v1/orchestrator/state/#{project_id}", params: params) do
-        {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
-        {:error, reason} -> handle_error(reason)
-      end
-    else
-      Output.error("Usage: loopctl state load --project <id> [--key <state_key>]")
-    end
-  end
-
   def run(command, _args, _opts) do
     Output.error("Usage: loopctl #{command} <story_id> [options]")
-  end
-
-  defp save_state(project_id, data_json, state_key, opts) do
-    case Jason.decode(data_json) do
-      {:ok, state_data} ->
-        body = %{"state_key" => state_key, "state_data" => state_data}
-
-        case Client.put("/api/v1/orchestrator/state/#{project_id}", body) do
-          {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
-          {:error, reason} -> handle_error(reason)
-        end
-
-      {:error, _} ->
-        Output.error("Invalid JSON in --data")
-    end
   end
 
   defp handle_error(:no_server_configured) do

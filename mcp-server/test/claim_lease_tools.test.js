@@ -190,7 +190,7 @@ describe("index.js wiring", () => {
   test("the handler injects the real apiCall and surfaces the lease", () => {
     assert.match(
       functionSource("renewStoryClaim"),
-      /withClaimLeaseNotice\(await renewStoryClaimRequest\(args, \{ apiCall \}\)\)/,
+      /withClaimLeaseNotice\(await renewStoryClaimRequest\(args, \{ apiCall, env: agentKeyEnv\(\) \}\)\)/,
     );
   });
 

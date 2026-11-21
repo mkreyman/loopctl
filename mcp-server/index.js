@@ -22,6 +22,10 @@ import { applyArgAliases } from "./lib/arg-aliases.js";
 import { articleId } from "./lib/article-id.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
+import { createBranchItemOpener, openWorkItem } from "./lib/branch-item.js";
+import { createHolderSession } from "./lib/holder.js";
+import { listWorkItemNotes, writeWorkItemNote } from "./lib/work-items.js";
+import { execFile, execFileSync } from "node:child_process";
 import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
   projectsPath,
@@ -195,6 +199,67 @@ function resolveKey(keyOverride) {
     process.env.LOOPCTL_ORCH_KEY
   );
 }
+
+// US-52.13: this process's session holder. Every request that used to send
+// LOOPCTL_AGENT_KEY sends `agentKey()` instead: the holder's own credential once the
+// startup register succeeds, else LOOPCTL_AGENT_KEY unchanged (lib/holder.js says why a
+// failed register never stops a session working).
+function sessionWorktree() {
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+  } catch {
+    return process.cwd();
+  }
+}
+
+// US-52.18: on each heartbeat, the worktree's branch becomes a work item this holder holds.
+const branchItemOpener = createBranchItemOpener({
+  apiCall: (...args) => apiCall(...args),
+  worktree: sessionWorktree,
+  git: (args) =>
+    new Promise((resolve) => {
+      execFile("git", args, { encoding: "utf8", timeout: 2000 }, (err, stdout) =>
+        resolve(err ? null : String(stdout).trim()),
+      );
+    }),
+});
+
+const holderSession = createHolderSession({
+  apiCall: (...args) => apiCall(...args),
+  env: process.env,
+  hostname: () => os.hostname(),
+  worktree: sessionWorktree,
+  randomUUID: () => crypto.randomUUID(),
+  afterBeat: (holder, credential) => branchItemOpener.tick(holder, credential),
+});
+
+function agentKey() {
+  return holderSession.agentKey();
+}
+
+// For a lib module that reads `env.LOOPCTL_AGENT_KEY` from an injected env (claim-lease.js,
+// escalation.js): the process env with the agent key replaced by `agentKey()`.
+function agentKeyEnv() {
+  return { ...process.env, LOOPCTL_AGENT_KEY: agentKey() };
+}
+
+// US-52.14: the refusal a session gets on an item another session holds, even one with the
+// same agent key. Shared by the story and channel claimant tools' descriptions.
+const HELD_BY_OTHER_HOLDER =
+  "Refused 409 held_by_other_holder when another session holds the story, even one with " +
+  "your agent key: the error names that session's holder_id, holder_kind and holder_host. " +
+  "Only that session can start, renew, request review on or release it; work something " +
+  "else.";
+
+const CHANNEL_HELD_BY_OTHER_SESSION =
+  "A ref another session holds, even one with your agent key, is refused 409 " +
+  "already_claimed on claim and 404 on done and release, whatever session id is sent: the " +
+  "claim is bound to the session's holder from its verified key (US-52.14).";
 
 let clientContextHeaderCache;
 function cachedClientContextHeader() {
@@ -539,7 +604,7 @@ async function resolveProjectRaw({ slug, repo_url, name } = {}) {
     "GET",
     `/api/v1/projects/resolve?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
 }
 
@@ -564,7 +629,7 @@ async function createKbScopeRaw({ name, slug, repo_url, description, tech_stack 
   if (tech_stack) body.tech_stack = tech_stack;
   // Uses the AGENT key (not ORCH): a KB scope is agent-createable on the KB tier — that is
   // the whole point. The server forces kind: :kb; a body-supplied kind is ignored.
-  return await apiCall("POST", "/api/v1/kb-scopes", body, process.env.LOOPCTL_AGENT_KEY);
+  return await apiCall("POST", "/api/v1/kb-scopes", body, agentKey());
 }
 
 async function createKbScope(args) {
@@ -578,7 +643,7 @@ async function archiveKbScope({ project_id }) {
     "DELETE",
     `/api/v1/kb-scopes/${project_id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -590,7 +655,7 @@ async function restoreKbScope({ project_id }) {
     "POST",
     `/api/v1/kb-scopes/${project_id}/restore`,
     {},
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -684,7 +749,7 @@ async function channelPostRaw({
     "POST",
     "/api/v1/channel/posts",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
 }
 
@@ -723,7 +788,7 @@ async function channelRecent({ project_id, since, limit }) {
     "GET",
     `/api/v1/channel/posts?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -759,7 +824,7 @@ async function channelHandoffs({ project_id, host, capabilities, only_mine }) {
     "GET",
     `/api/v1/channel/handoffs?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -774,7 +839,7 @@ async function channelGet({ post_id }) {
     "GET",
     `/api/v1/channel/posts/${post_id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -799,7 +864,7 @@ async function channelClaim({ project_id, ref, lease_seconds }) {
     "POST",
     "/api/v1/channel/claims",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -825,7 +890,7 @@ async function channelClaims({ project_id, ref, limit }) {
     "GET",
     `/api/v1/channel/claims?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -849,7 +914,7 @@ async function channelRelease({ project_id, ref, force }) {
     "POST",
     "/api/v1/channel/claims/release",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -867,7 +932,7 @@ async function channelDone({ project_id, ref, force }) {
     "POST",
     "/api/v1/channel/claims/done",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -895,7 +960,7 @@ async function channelLock({ project_id, target, ttl_seconds, note }) {
     "POST",
     "/api/v1/channel/locks",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -914,7 +979,7 @@ async function channelUnlock({ project_id, target }) {
     "POST",
     "/api/v1/channel/locks/release",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -931,7 +996,7 @@ async function channelLocks({ project_id, limit }) {
     "GET",
     `/api/v1/channel/locks?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -947,7 +1012,7 @@ async function channelDelete({ post_id }) {
     "DELETE",
     `/api/v1/channel/posts/${post_id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -967,7 +1032,7 @@ async function channelGraduate({ post_id, title, tags, category }) {
     "POST",
     `/api/v1/channel/posts/${post_id}/graduate`,
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1236,7 +1301,7 @@ async function contractStory({ story_id, story_title, ac_count }) {
     "POST",
     `/api/v1/stories/${story_id}/contract`,
     { story_title, ac_count },
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1330,7 +1395,7 @@ async function recoverStartCap(storyId) {
       "POST",
       `/api/v1/stories/${storyId}/recover-cap`,
       null,
-      process.env.LOOPCTL_AGENT_KEY
+      agentKey()
     );
     return result && result.data && result.data.cap_id;
   } catch {
@@ -1343,7 +1408,7 @@ async function claimStory({ story_id }) {
     "POST",
     `/api/v1/stories/${story_id}/claim`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   // The claim response carries the start_cap that POST /start will require.
   rememberCap(story_id, result && result.capability);
@@ -1359,13 +1424,13 @@ function withClaimLeaseNotice(result) {
 }
 
 async function renewStoryClaim(args) {
-  return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall }));
+  return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall, env: agentKeyEnv() }));
 }
 
 // #803: escalation leads with a STOP line. A session that escalates and keeps working is
 // the failure the affordance exists to prevent, and the JSON body alone does not say so.
 async function escalateStory(args) {
-  const result = await escalateStoryRequest(args, { apiCall });
+  const result = await escalateStoryRequest(args, { apiCall, env: agentKeyEnv() });
   const notice = escalationNotice(result);
   if (!notice) return toContent(result);
   return { content: [{ type: "text", text: notice }, ...toContent(result).content] };
@@ -1378,14 +1443,14 @@ async function startStory({ story_id, capability }) {
   const cap =
     capability ||
     takeCap(story_id, "start_cap") ||
-    (await fetchCap(story_id, "start_cap", process.env.LOOPCTL_AGENT_KEY)) ||
+    (await fetchCap(story_id, "start_cap", agentKey())) ||
     (await recoverStartCap(story_id));
 
   const result = await apiCall(
     "POST",
     `/api/v1/stories/${story_id}/start`,
     cap ? { capability: cap } : null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1395,7 +1460,7 @@ async function requestReview({ story_id }) {
     "POST",
     `/api/v1/stories/${story_id}/request-review`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1531,7 +1596,7 @@ async function reportTokenUsage({ story_id, input_tokens, output_tokens, model_n
     "POST",
     "/api/v1/token-usage",
     body,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1637,7 +1702,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
   if (suppressed) params.set("suppressed", suppressed);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1646,7 +1711,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
 // step deletes the stale-dimension rows (loopctl reserves data-removing operations for
 // higher roles), so it deliberately does NOT fall back to the agent key.
 async function embeddingStatus() {
-  const result = await apiCall("GET", "/api/v1/knowledge/embeddings", null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", "/api/v1/knowledge/embeddings", null, agentKey());
   return toContent(result);
 }
 
@@ -1655,7 +1720,7 @@ async function embeddingMaterializeSystemCorpus() {
     "POST",
     "/api/v1/knowledge/embeddings/system-corpus",
     {},
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1686,7 +1751,7 @@ async function knowledgeStats({ project_id }) {
   const path = project_id
     ? `/api/v1/projects/${project_id}/knowledge/stats`
     : "/api/v1/knowledge/stats";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1701,7 +1766,7 @@ async function knowledgeGraph({ article_id, depth, project_id }) {
     "GET",
     `/api/v1/knowledge/graph?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1718,7 +1783,7 @@ async function knowledgeSuggestLinks({ article_id, limit, threshold }) {
     "GET",
     qs ? `${base}?${qs}` : base,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1732,7 +1797,7 @@ async function knowledgeDistantPairs({ min_distance, max_distance, bridge_path, 
   if (offset != null) params.set("offset", String(offset));
   const qs = params.toString();
   const path = qs ? `/api/v1/knowledge/pairs?${qs}` : "/api/v1/knowledge/pairs";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1742,7 +1807,7 @@ async function knowledgeNovelty({ ideas, texts, prior_tag }) {
   if (ideas !== undefined) body.ideas = ideas;
   if (texts !== undefined) body.texts = texts;
   if (prior_tag) body.prior_tag = prior_tag;
-  const result = await apiCall("POST", "/api/v1/knowledge/novelty", body, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("POST", "/api/v1/knowledge/novelty", body, agentKey());
   return toContent(result);
 }
 
@@ -1754,7 +1819,7 @@ async function knowledgeRandomWalk({ start_id, length }) {
     "GET",
     `/api/v1/knowledge/walk?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1780,7 +1845,7 @@ async function knowledgeCount({
   if (idempotency_key) params.set("idempotency_key", idempotency_key);
   const qs = params.toString();
   const path = qs ? `/api/v1/knowledge/count?${qs}` : "/api/v1/knowledge/count";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1806,7 +1871,7 @@ async function knowledgeFacets({
     "GET",
     `/api/v1/knowledge/facets?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1830,7 +1895,7 @@ async function knowledgeSearch({ q, project_id, story_id, category, tags, match,
   if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
 
-  const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, agentKey());
   // If search silently degraded to keyword-only for a missing embedding key, the
   // server attaches meta.remediation — surface it PROMINENTLY so the agent knows to
   // call set_llm_config to enable semantic ranking.
@@ -1850,7 +1915,7 @@ async function knowledgeHybridSearch({ query, project_id, category, tags, match,
     "POST",
     "/api/v1/knowledge/hybrid_search",
     bodyPayload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // meta.provenance ("curated" | "retrieved") is the load-bearing field and rides
   // through toContent verbatim. Same missing-embedding-key remediation surfacing as
@@ -1872,7 +1937,7 @@ async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
     "GET",
     `/api/v1/knowledge/progressive_index?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // A topic browse is a RETRIEVAL: it runs the same ranked pool, so it can come back
   // short or keyword-only. Without the banner a shed index reads as "the KB has no
@@ -1890,7 +1955,7 @@ async function knowledgeHeatIndex({ category, limit, since }) {
     "GET",
     `/api/v1/knowledge/heat_index?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // The query-free route, reached for precisely when the query-shaped ones came back
   // empty — so an unannounced degradation here strands the agent with no route left.
@@ -1913,7 +1978,7 @@ async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offs
     "GET",
     qs ? `${base}?${qs}` : base,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1956,7 +2021,7 @@ async function knowledgeList({
     "GET",
     `/api/v1/articles?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Enumeration, not ranking — but a short page still under-reports the set, and an
   // agent enumerating to decide something absent is the caller least able to tell.
@@ -1988,7 +2053,7 @@ async function knowledgeGet({
     params.set("body_offset", String(body_offset));
   const qs = params.toString();
   const path = qs ? `/api/v1/articles/${art.id}?${qs}` : `/api/v1/articles/${art.id}`;
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -2012,7 +2077,7 @@ async function knowledgeContext({
   if (agents) params.set("agents", Array.isArray(agents) ? agents.join(",") : agents);
   if (conversation_id) params.set("conversation_id", conversation_id);
 
-  const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, agentKey());
   // Same as knowledge_search: surface a missing-embedding-key remediation prominently.
   return withRemediationNotice(result);
 }
@@ -2056,7 +2121,7 @@ async function knowledgeCreate({
     "POST",
     "/api/v1/articles",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2078,7 +2143,7 @@ async function knowledgeUpdate({ article_id, title, body, category, tags, metada
     "PATCH",
     `/api/v1/articles/${art.id}`,
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2126,7 +2191,7 @@ async function memoryRemember({
     "POST",
     "/api/v1/memory",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2140,7 +2205,7 @@ async function memoryRecall({ query, limit, include_superseded }) {
     "POST",
     "/api/v1/memory/recall",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Surface meta (fallback/reason/total_count/underfilled) so the caller can tell
   // a degraded recall from a genuinely empty scope (AC-28.4.4). meta alone was not
@@ -2167,7 +2232,7 @@ async function recallContext({ query, project_id, limit, session_id }) {
     "POST",
     "/api/v1/recall",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Surface both per-source metas (memory fallback/underfilled + knowledge degraded)
   // so the caller can tell a degraded recall from a genuinely empty scope. The merged
@@ -2201,7 +2266,7 @@ async function recallReferenced({ recall_id, article_ids, project_id }) {
     "POST",
     `/api/v1/recall/${encodeURIComponent(recall_id.trim())}/referenced`,
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2212,7 +2277,7 @@ async function memoryList({ limit, offset, include_superseded, all_subjects }) {
   // one deliberate cross-subject read this MCP surface can express (module
   // comment above), and only for a superadmin caller.
   const path = memoryPath({ limit, offset, include_superseded, all_subjects });
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   // Surface meta.total_count/limit/offset (AC-28.4.4).
   return toContent(result);
 }
@@ -2230,7 +2295,7 @@ async function memoryForget({ id }) {
     "DELETE",
     `/api/v1/memory/${id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2241,7 +2306,7 @@ async function memoryPromote({ session_id }) {
     "POST",
     "/api/v1/memory/promote",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2259,7 +2324,7 @@ async function memoryGraduate({ memory_id, re_scope }) {
     "POST",
     "/api/v1/memory/graduate",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2345,7 +2410,7 @@ async function knowledgeArchive({ article_id }) {
     "POST",
     `/api/v1/articles/${art.id}/archive`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2360,7 +2425,7 @@ async function knowledgeSuppress({ article_id, reason }) {
     "POST",
     `/api/v1/articles/${art.id}/suppress`,
     { reason },
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2372,7 +2437,7 @@ async function knowledgeUnsuppress({ article_id }) {
     "POST",
     `/api/v1/articles/${art.id}/unsuppress`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2385,7 +2450,7 @@ async function knowledgeDelete({ article_id }) {
     "DELETE",
     `/api/v1/articles/${art.id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2472,7 +2537,7 @@ async function knowledgeConflicts({ limit, offset }) {
   const path = qs
     ? `/api/v1/knowledge/conflicts?${qs}`
     : "/api/v1/knowledge/conflicts";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -2491,7 +2556,7 @@ async function knowledgeAssertConflict({
     "POST",
     "/api/v1/knowledge/conflicts",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2523,7 +2588,7 @@ async function knowledgeResolveConflict({
     "POST",
     "/api/v1/knowledge/conflicts/resolve",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2697,7 +2762,7 @@ async function egressPosture() {
     "GET",
     "/api/v1/egress/posture",
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2714,7 +2779,7 @@ async function custodyClaim({ subject_type, subject_id } = {}) {
     "GET",
     `/api/v1/custody/claims/${encodeURIComponent(subject_type)}/${encodeURIComponent(subject_id)}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2724,7 +2789,7 @@ async function custodyFailures() {
     "GET",
     "/api/v1/custody/failures",
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2788,7 +2853,7 @@ async function egressRepin({ host, project_id } = {}) {
     "POST",
     "/api/v1/egress/repin",
     body,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3165,6 +3230,51 @@ async function revokeDispatch(args) {
   );
 }
 
+// US-52.13: this session's holder. The raw credential never leaves the process, so each tool
+// answers with `holderSession.status()` beside what loopctl said, never the key.
+async function holderRegisterTool() {
+  const result = await holderSession.register();
+  return toContent(result && result.error ? result : holderSession.status());
+}
+
+async function holderHeartbeatTool() {
+  const result = await holderSession.heartbeat();
+  return toContent(result && result.error ? result : { ...holderSession.status(), lease: result });
+}
+
+async function holderEndTool() {
+  const result = await holderSession.end();
+  return toContent(result && result.error ? result : holderSession.status());
+}
+
+// US-52.17: a work item's notes, on the session's own key: the write is accepted from the
+// story's CURRENT holder, so it travels on the credential that holds it (lib/work-items.js).
+async function workItemNoteTool(args) {
+  return toContent(
+    await writeWorkItemNote(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
+    }),
+  );
+}
+
+// US-52.18: open (or reopen) the work item for a branch, on the session's own key: the
+// route accepts only a holder credential (lib/branch-item.js).
+async function workItemOpenTool(args) {
+  return toContent(
+    await openWorkItem(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
+    }),
+  );
+}
+
+async function workItemNotesTool(args) {
+  return toContent(
+    await listWorkItemNotes(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
+    }),
+  );
+}
+
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
 // ROTATION (an owner key already exists) requires `rotation_proof`: a hex Ed25519
 // signature by the OUTGOING owner key over owner_rotation_preimage(tenant_id,
@@ -3494,7 +3604,7 @@ async function storyStage(args) {
   // LOOPCTL_API_KEY, then an override, then LOOPCTL_ORCH_KEY — never LOOPCTL_AGENT_KEY. A
   // session refused `stale_stage` is running on an agent key, and this read is what tells it
   // where the row actually is, so on an agent-key-only config it has to work.
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await storyStageRequest(args, {
@@ -3510,7 +3620,7 @@ async function storyStage(args) {
 // OVERRIDE, not `exactKey`, so `resolveKey`'s order holds: LOOPCTL_API_KEY when set, else
 // LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY.
 async function changeBindingGet(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await changeBindingGetRequest(args, {
@@ -3522,7 +3632,7 @@ async function changeBindingGet(args) {
 // US-48.12: a READ of the run-outcome ledger, `role: :agent` with the hierarchy — keyed as
 // changeBindingGet is, LOOPCTL_AGENT_KEY as an OVERRIDE so `resolveKey`'s order holds.
 async function agentOutcomesRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await agentOutcomes(args, {
@@ -3534,7 +3644,7 @@ async function agentOutcomesRead(args) {
 // US-50.6: a READ of the chg ledger summary, `role: :agent` with the hierarchy — keyed as
 // agentOutcomesRead is, LOOPCTL_AGENT_KEY as an OVERRIDE so `resolveKey`'s order holds.
 async function chgLedgerSummaryRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await chgLedgerSummary(args, {
@@ -3546,7 +3656,7 @@ async function chgLedgerSummaryRead(args) {
 // US-51.6: the findings list is a READ keyed as chgLedgerSummaryRead is; clearing one is a
 // person's act and takes the EXACT user key through runnerDeps().
 async function chgFindingsRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await chgFindings(args, {
@@ -3570,7 +3680,7 @@ async function resolveEscalation(args) {
 // US-48.11: the escalation inbox is a READ, `role: :agent` with the hierarchy, so it takes
 // LOOPCTL_AGENT_KEY as an override for changeBindingGet's reason above, never `exactKey`.
 async function escalationListRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     withRemedies(
@@ -3741,7 +3851,7 @@ async function corpusCreate(args) {
     "POST",
     corporaPath(),
     buildCorpusCreateBody(args),
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3751,7 +3861,7 @@ async function corpusList(args = {}) {
     "GET",
     corporaPath(args),
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3763,7 +3873,7 @@ async function corpusIndex({ corpus_id, chunks, source_complete }) {
     "POST",
     corpusIndexPath(corpus_id),
     buildCorpusIndexBody({ chunks, source_complete }),
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3773,7 +3883,7 @@ async function corpusSearch({ corpus_id, query, query_vector, lanes, limit }) {
     "POST",
     corpusSearchPath(corpus_id),
     buildCorpusSearchBody({ query, query_vector, lanes, limit }),
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Pointers + snippets only — the caller's next step is to open the file at
   // source_ref/locator. Nothing here is auto-injected into a recall pack, so a
@@ -3787,7 +3897,7 @@ async function corpusStatus({ corpus_id, limit, offset }) {
     "GET",
     corpusStatusPath(corpus_id, { limit, offset }),
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -4226,7 +4336,8 @@ const TOOLS = [
   {
     name: "channel_claim",
     description:
-      "Claim a handoff ref for EXACTLY ONE agent on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key. Use this to coordinate an out-of-band unit of work (e.g. 'handoff:repo#812') among several agents racing on the same repo, so only ONE picks it up. INSERT-to-claim: the first agent to claim (tenant, project, ref) wins and gets the claim. Re-claiming YOUR OWN still-active ref is idempotent — it returns your existing claim, so a lost response / timeout is safe to retry with the same ref. A 409 tells you WHICH of four situations you hit, in its error.code — do not treat every 409 the same. 409 already_claimed means a peer holds a live claim, or you already completed this one: the ref is taken, so move on to other work. 409 claim_lease_expired means the lease died without completion and the row is only awaiting the sweeper — nobody is working it, so retry THIS ref shortly rather than moving on. 409 ref_superseded means the ref's instructions were retired by a successor post: nobody holds it, claim the successor instead. 409 claim_budget_exhausted is a limit on YOU, not a statement about the ref — finish or release one of your open claims and retry. channel_claims shows the same distinction on each row via its expired and done flags. A channel IS a project_id; the claim is tenant-isolated and project-scoped by membership (you must be a writable member of the project). tenant/agent are server-stamped from your verified key. Mark the work finished with channel_done, or give it up for another agent with channel_release. READ THE already_held FLAG BEFORE YOU START WORKING (issue #779). A fresh claim answers 201 with created: true. An idempotent re-claim answers 200 with created: false, already_held: true, the row's ORIGINAL claimed_at, and the claimed_by_session/claimed_by_host of whoever actually took it — and because a fleet's sessions typically all authenticate as ONE agent_id, that idempotent branch is ALSO what a PEER SESSION's live claim comes back as. already_held is the DECISIVE flag: the row already existed, so you did not take this ref and must not start the work on the strength of this call alone. same_session only refines it, and is the server's comparison against this session's id. false means a DIFFERENT session stamped it — usually a peer, but ALSO your own session after a restart, because a relaunched session carries a new id: compare claimed_by_host and claimed_at (an older timestamp on this same host is very likely your own crashed run) before standing down, and finish or release that ref with force: true rather than abandoning it for the rest of the lease. null means undiscriminable (the row predates the field, or the client that wrote it sends none) and is NOT the same as false. true means the same Claude Code session — which a dispatched subagent shares with its parent and its siblings, so it is not proof that YOU took it. Two machines each read a bare success as 'one claim, mine' and shipped duplicate PRs before this flag existed. STILL DO NOT USE THIS AS A PROBE: the marker tells you afterwards that you did not create the claim, but the write is still a write — call channel_claims, which answers the same question and writes nothing.",
+      "Claim a handoff ref for EXACTLY ONE agent on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key. Use this to coordinate an out-of-band unit of work (e.g. 'handoff:repo#812') among several agents racing on the same repo, so only ONE picks it up. INSERT-to-claim: the first agent to claim (tenant, project, ref) wins and gets the claim. Re-claiming YOUR OWN still-active ref is idempotent — it returns your existing claim, so a lost response / timeout is safe to retry with the same ref. A 409 tells you WHICH of four situations you hit, in its error.code — do not treat every 409 the same. 409 already_claimed means a peer holds a live claim, or you already completed this one: the ref is taken, so move on to other work. 409 claim_lease_expired means the lease died without completion and the row is only awaiting the sweeper — nobody is working it, so retry THIS ref shortly rather than moving on. 409 ref_superseded means the ref's instructions were retired by a successor post: nobody holds it, claim the successor instead. 409 claim_budget_exhausted is a limit on YOU, not a statement about the ref — finish or release one of your open claims and retry. channel_claims shows the same distinction on each row via its expired and done flags. A channel IS a project_id; the claim is tenant-isolated and project-scoped by membership (you must be a writable member of the project). tenant/agent are server-stamped from your verified key. Mark the work finished with channel_done, or give it up for another agent with channel_release. READ THE already_held FLAG BEFORE YOU START WORKING (issue #779). A fresh claim answers 201 with created: true. An idempotent re-claim answers 200 with created: false, already_held: true, the row's ORIGINAL claimed_at, and the claimed_by_session/claimed_by_host of whoever actually took it — and because a fleet's sessions typically all authenticate as ONE agent_id, that idempotent branch is ALSO what a PEER SESSION's live claim comes back as. already_held is the DECISIVE flag: the row already existed, so you did not take this ref and must not start the work on the strength of this call alone. same_session only refines it, and is the server's comparison against this session's id. false means a DIFFERENT session stamped it — usually a peer, but ALSO your own session after a restart, because a relaunched session carries a new id: compare claimed_by_host and claimed_at (an older timestamp on this same host is very likely your own crashed run) before standing down, and finish or release that ref with force: true rather than abandoning it for the rest of the lease. null means undiscriminable (the row predates the field, or the client that wrote it sends none) and is NOT the same as false. true means the same Claude Code session — which a dispatched subagent shares with its parent and its siblings, so it is not proof that YOU took it. Two machines each read a bare success as 'one claim, mine' and shipped duplicate PRs before this flag existed. STILL DO NOT USE THIS AS A PROBE: the marker tells you afterwards that you did not create the claim, but the write is still a write — call channel_claims, which answers the same question and writes nothing. " +
+      CHANNEL_HELD_BY_OTHER_SESSION,
     inputSchema: {
       type: "object",
       properties: {
@@ -4251,7 +4362,8 @@ const TOOLS = [
   {
     name: "channel_release",
     description:
-      "Release (give up) YOUR OWN claim on a handoff ref on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — deletes the claim so the ref reopens and another agent can claim it. Owner-scoped: you can only release a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle). SCOPE: ownership is (tenant, project, AGENT, ref), and on top of it the server refuses a claim stamped by a DIFFERENT SESSION with 409 claim_session_mismatch (issue #779) — this call used to DELETE a peer session's live claim, silently, because two sessions on one agent key were indistinguishable. That refusal is ADVISORY, not authorization: session_id is proxy-supplied and spoofable, and force: true clears it. Use force ONLY when the claim is your own work from a session that has since restarted (a relaunched session carries a new session id) — never to take a ref off a peer that is still working it. Read channel_claims first: claimed_by_session, claimed_by_host and same_session say whose claim it is. A claim whose session died for good is also protected by the abandoned-lease sweep.",
+      "Release (give up) YOUR OWN claim on a handoff ref on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — deletes the claim so the ref reopens and another agent can claim it. Owner-scoped: you can only release a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle). SCOPE: ownership is (tenant, project, AGENT, ref), and on top of it the server refuses a claim stamped by a DIFFERENT SESSION with 409 claim_session_mismatch (issue #779) — this call used to DELETE a peer session's live claim, silently, because two sessions on one agent key were indistinguishable. That refusal is ADVISORY, not authorization: session_id is proxy-supplied and spoofable, and force: true clears it. Use force ONLY when the claim is your own work from a session that has since restarted (a relaunched session carries a new session id) — never to take a ref off a peer that is still working it. Read channel_claims first: claimed_by_session, claimed_by_host and same_session say whose claim it is. A claim whose session died for good is also protected by the abandoned-lease sweep. " +
+      CHANNEL_HELD_BY_OTHER_SESSION,
     inputSchema: {
       type: "object",
       properties: {
@@ -4269,7 +4381,8 @@ const TOOLS = [
   {
     name: "channel_done",
     description:
-      "Mark YOUR OWN handoff claim done on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — sets done_at, recording that you completed the claimed work. The done claim is retained briefly (7 days) as an audit/idempotency breadcrumb, then swept. Owner-scoped: you can only mark done a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle). A claim stamped by a DIFFERENT SESSION on your agent key is 409 claim_session_mismatch (issue #779) — do not mark done work a peer session is doing. That refusal is ADVISORY (session_id is proxy-supplied and spoofable, so it stops an accident, not an attack) and force: true clears it, which is what a session that crashed and relaunched under a new session id should use to finish its own work rather than waiting out the lease.",
+      "Mark YOUR OWN handoff claim done on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — sets done_at, recording that you completed the claimed work. The done claim is retained briefly (7 days) as an audit/idempotency breadcrumb, then swept. Owner-scoped: you can only mark done a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle). A claim stamped by a DIFFERENT SESSION on your agent key is 409 claim_session_mismatch (issue #779) — do not mark done work a peer session is doing. That refusal is ADVISORY (session_id is proxy-supplied and spoofable, so it stops an accident, not an attack) and force: true clears it, which is what a session that crashed and relaunched under a new session id should use to finish its own work rather than waiting out the lease. " +
+      CHANNEL_HELD_BY_OTHER_SESSION,
     inputSchema: {
       type: "object",
       properties: {
@@ -4878,7 +4991,11 @@ const TOOLS = [
   },
   {
     name: "get_story",
-    description: "Get full details for a single story by ID.",
+    description:
+      "Get full details for a single story by ID. The claim is on it: assigned_holder_id, " +
+      "claim_epoch and claimed_until, and assigned_holder (id, kind, host, session_id, " +
+      "lease_until, ended_at, ended_reason) naming the SESSION that holds it, so a claim of " +
+      "another session of your own agent reads as someone else's.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4928,14 +5045,19 @@ const TOOLS = [
       "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
-      "is released back to pending under you. Refused 409 story_held when the story's " +
+      "is released back to pending under you. Claimed with this session's holder credential, " +
+      "the claim instead takes the holder's lease and the heartbeat keeps it alive; refused " +
+      "409 holder_lease_expired once that lease has run out. Refused 409 story_held when the story's " +
       "delivery stage is escalated, done or failed: it is not yours to claim even when it " +
       "reads pending or contracted — move on. An escalated story is claimable again only " +
       "after resolve_escalation sends it to queued; a done or failed one never is. Refused " +
       "409 dependencies_not_met when a story it depends on, or one in an epic its epic " +
       "depends on, is not verified: list_blocked_stories names them. Refused 409 " +
       "chg_root_review_only when the key descends from an intake source's " +
-      "chg_root_dispatch_id: chg-server's keys may only review.",
+      "chg_root_dispatch_id: chg-server's keys may only review. " +
+      HELD_BY_OTHER_HOLDER +
+      " Claiming a story THIS session already holds returns the claim unchanged, so a " +
+      "retry after a lost response is safe.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4966,7 +5088,8 @@ const TOOLS = [
       "expired and was reclaimed, released, or claimed again, so stop working it); 409 " +
       "not_claimant (your key's agent is not the story's assigned agent); " +
       "409 lease_cap_reached (a driver-placed claim already at its cap: nothing is renewed " +
-      "and the claim ends there, so stop working it).",
+      "and the claim ends there, so stop working it). " +
+      HELD_BY_OTHER_HOLDER,
     inputSchema: {
       type: "object",
       properties: {
@@ -5039,7 +5162,8 @@ const TOOLS = [
       "Agent starts work on a claimed story. Transitions assigned -> implementing. Uses the AGENT key. " +
       "The L1 capability (start_cap) is handled for you: it is taken from the claim_story response, " +
       "and re-minted via recover-cap if this process lost it (e.g. after a session crash). " +
-      "Pass `capability` only to override that.",
+      "Pass `capability` only to override that. " +
+      HELD_BY_OTHER_HOLDER,
     inputSchema: {
       type: "object",
       properties: {
@@ -5062,7 +5186,8 @@ const TOOLS = [
     name: "request_review",
     description:
       "Agent signals that implementation is complete and ready for review. " +
-      "Does NOT change the story status — fires a webhook event for the reviewer. Uses the AGENT key.",
+      "Does NOT change the story status — fires a webhook event for the reviewer. Uses the AGENT key. " +
+      HELD_BY_OTHER_HOLDER,
     inputSchema: {
       type: "object",
       properties: {
@@ -8574,6 +8699,132 @@ const TOOLS = [
   },
 
   {
+    name: "holder_register",
+    description:
+      "REGISTER THIS SESSION AS A HOLDER (POST /api/v1/holders, US-52.13). The MCP server " +
+      "already does this at startup and heartbeats on a timer; call it only to re-register " +
+      "after holder_end or when holder_heartbeat reports no holder. Sends LOOPCTL_AGENT_KEY " +
+      "(exactly, never another variable) with kind interactive, this session's id, the host " +
+      "and the git top level. loopctl answers with the SAME holder while it is live and a new " +
+      "credential, which this process keeps in memory and sends on every agent-key request " +
+      "from then on; the credential is never returned to you. REFUSES: 403 " +
+      "custody_tier_required on an agent-rooted tenant, 403 holder_mint_forbidden for a " +
+      "dispatch-minted key, 422 agent_required for a key naming no agent. On any refusal the " +
+      "session keeps using LOOPCTL_AGENT_KEY.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  {
+    name: "holder_heartbeat",
+    description:
+      "RENEW THIS SESSION'S HOLDER LEASE NOW (POST /api/v1/holders/:id/heartbeat), by the " +
+      "holder's own credential. The server does this every heartbeat_seconds on its own. " +
+      "It also moves every uncapped claim the holder holds to the new lease. A 401, 404 or " +
+      "409 (credential expired, holder ended) makes it register again; 409 " +
+      "holder_lease_expired means the lease ran out first, so loopctl ended the holder and " +
+      "released its claims: the session registers as a NEW holder and must re-claim.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  {
+    name: "holder_end",
+    description:
+      "END THIS SESSION'S HOLDER (POST /api/v1/holders/:id/end): sets ended_at and revokes " +
+      "its credential; this process falls back to LOOPCTL_AGENT_KEY. The server does this " +
+      "itself when stdin closes or on SIGTERM. A repeated end writes nothing.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  {
+    name: "work_item_note",
+    description:
+      "WRITE A NOTE ON A WORK ITEM (POST /api/v1/stories/:id/notes): your plan, progress, a " +
+      "decision or an open question, appended under `section` and never edited, so the next " +
+      "session resumes from the item instead of from your transcript. Records a note_written " +
+      "event on the story's log in the same transaction. Uses this session's own key (its " +
+      "holder credential). Only the story's CURRENT holder writes one: " +
+      "409 held_by_other_holder when another session holds it (the error names that " +
+      "session's holder_id, holder_kind and holder_host), 409 not_holder when nobody holds " +
+      "it, 404 for a story that is not this tenant's. 422 for an unknown section, an empty " +
+      "body, a body over 16384 bytes, or a body that looks like a credential (every holder " +
+      "reads notes). Pass `idempotency_key` to make a retry after a lost response return the " +
+      "first note and write nothing; the key is the WRITER's, so a key another writer's note " +
+      "on this story already carries is 409 idempotency_key_reused and writes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The UUID of the story." },
+        section: {
+          type: "string",
+          enum: ["plan", "progress", "decision", "question"],
+          description: "Which section the note is filed under.",
+        },
+        body: { type: "string", description: "The note's text, 1 to 16384 bytes." },
+        idempotency_key: {
+          type: "string",
+          description: "Optional: a key unique to this note, so a retry writes it once.",
+        },
+      },
+      required: ["story_id", "section", "body"],
+    },
+  },
+
+  {
+    name: "work_item_open",
+    description:
+      "OPEN THE WORK ITEM FOR A BRANCH (POST /api/v1/work_items): your interactive work on " +
+      "`branch` becomes one story in the project `repo_url` resolves to, already " +
+      "implementing and held by this session, with a stage row naming the branch. The MCP " +
+      "server already does this on each heartbeat for the worktree's non-default branch; " +
+      "call it to name a title or an epic. The epic is `epic_id`, else the target epic of " +
+      "the project's live intake source. Reopening your own item returns it (200, outcome " +
+      "existing), an unheld item on the branch is claimed back for you (200, claimed), and " +
+      "your one held item with no branch takes this one (200, branch_recorded). Needs this " +
+      "session's holder credential: 403 holder_credential_required for any other key. 409 " +
+      "branch_held (another session's open item has the branch; names story_id and " +
+      "holder_id), 409 holder_ended, 409 story_held (the item is escalated). 404 " +
+      "project_not_found (no project of your tenant has the repo), 404 epic_not_found. 422 " +
+      "no_target_epic (pass epic_id), 422 invalid_branch (empty, whitespace, HEAD, over 255 " +
+      "bytes). The item reaches verified only through report, review and verify like any " +
+      "story; you cannot report it yourself.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo_url: { type: "string", description: "The repo's remote URL (git remote get-url origin)." },
+        branch: { type: "string", description: "The branch the work is on." },
+        title: { type: "string", description: "Optional: the item's title (default: the branch)." },
+        epic_id: { type: "string", description: "Optional: the UUID of the epic to file it under." },
+      },
+      required: ["repo_url", "branch"],
+    },
+  },
+
+  {
+    name: "work_item_notes",
+    description:
+      "READ A WORK ITEM'S NOTES (GET /api/v1/stories/:id/notes), oldest first. The FIRST page " +
+      "carries `current`: the newest note of each section, which is where the item stands. " +
+      "Optional `section` filters to one section; `limit` defaults to 50, at most 200; pass a " +
+      "page's `next_cursor` back as `after` for the next one. Any key of the tenant reads " +
+      "them. 404 for a story that is not this tenant's; 422 for an unknown section or a " +
+      "cursor this endpoint did not return.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The UUID of the story." },
+        section: {
+          type: "string",
+          enum: ["plan", "progress", "decision", "question"],
+          description: "Optional: only this section's notes.",
+        },
+        limit: { type: "integer", description: "Optional page size (default 50, max 200)." },
+        after: { type: "string", description: "Optional: the previous page's next_cursor." },
+      },
+      required: ["story_id"],
+    },
+  },
+
+  {
     name: "revoke_dispatch",
     description:
       "REVOKE A DISPATCH AND ITS WHOLE SUBTREE (POST /api/v1/dispatches/:id/revoke), plus the " +
@@ -9423,11 +9674,17 @@ const TOOLS = [
       "server-side condition a re-run meets again until an operator acts; " +
       "`force_unclaim_failed` (the " +
       "server log names the step) is remedied by calling it again. A 422 means the release " +
-      "write itself was rejected. It takes no request body.",
+      "write itself was rejected. Optional `reason`: recorded on the story's event log as " +
+      "`force-unclaimed: <reason>` (at most 2000 characters, longer is cut); without it the " +
+      "log says `force-unclaimed: operator`.",
     inputSchema: {
       type: "object",
       properties: {
         story_id: { type: "string", description: "The story UUID to free." },
+        reason: {
+          type: "string",
+          description: "Why you are taking it back, for the story's event log.",
+        },
       },
       required: ["story_id"],
     },
@@ -10432,7 +10689,7 @@ const TOOLS = [
 // that isn't `cr_`-prefixed or that collides with a built-in tool name.
 const generatedToolsRuntime = createGeneratedToolsRuntime({
   apiCall,
-  agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+  agentKey: () => agentKey(),
   staticToolNames: new Set(TOOLS.map((t) => t.name)),
   toContent,
 });
@@ -10920,6 +11177,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "revoke_dispatch":
       return await revokeDispatch(args);
 
+    case "holder_register":
+      return await holderRegisterTool();
+
+    case "holder_heartbeat":
+      return await holderHeartbeatTool();
+
+    case "holder_end":
+      return await holderEndTool();
+
+    case "work_item_note":
+      return await workItemNoteTool(args);
+
+    case "work_item_open":
+      return await workItemOpenTool(args);
+
+    case "work_item_notes":
+      return await workItemNotesTool(args);
+
     case "runner_enroll":
       return await runnerEnroll(args);
 
@@ -11066,6 +11341,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+
+// US-52.13: register this session as a holder before serving, waiting at most 5s so a slow
+// loopctl never delays startup; end it when Claude Code closes stdin or stops the process.
+await holderSession.start({ timeoutMs: 5000 });
+
+let shuttingDown = false;
+async function endHolderAndExit() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const cap = new Promise((resolve) => setTimeout(resolve, 3000).unref());
+  await Promise.race([holderSession.end().catch(() => {}), cap]);
+  process.exit(0);
+}
+
+process.stdin.on("close", endHolderAndExit);
+process.on("SIGTERM", endHolderAndExit);
 
 const transport = new StdioServerTransport();
 await server.connect(transport).catch((err) => {

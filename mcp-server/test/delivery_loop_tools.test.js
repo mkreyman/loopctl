@@ -273,9 +273,9 @@ describe("resolve_escalation", () => {
 });
 
 describe("force_unclaim_story", () => {
-  test("POSTs to the hyphenated force-unclaim route with no body", async () => {
+  test("POSTs to the hyphenated force-unclaim route, with no body when no reason", async () => {
     // The route is `force-unclaim`. An underscore there is a 404 that reads like the story
-    // not existing, and the endpoint takes no body — the story is named in the path.
+    // not existing; the story is named in the path, and the body carries only a reason.
     const { calls, apiCall } = fakeApi({ story: { agent_status: "pending" } });
 
     await forceUnclaimStory({ story_id: STORY_ID }, { orchKey: "orch-key", apiCall });
@@ -283,6 +283,25 @@ describe("force_unclaim_story", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].method, "POST");
     assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID}/force-unclaim`);
+    assert.equal(calls[0].body, null);
+  });
+
+  test("sends the operator's reason for the event log when one is given (US-52.16)", async () => {
+    const { calls, apiCall } = fakeApi({ story: { agent_status: "pending" } });
+
+    await forceUnclaimStory(
+      { story_id: STORY_ID, reason: "runner wedged" },
+      { orchKey: "orch-key", apiCall },
+    );
+
+    assert.deepEqual(calls[0].body, { reason: "runner wedged" });
+  });
+
+  test("a blank reason sends no body", async () => {
+    const { calls, apiCall } = fakeApi({ story: { agent_status: "pending" } });
+
+    await forceUnclaimStory({ story_id: STORY_ID, reason: "  " }, { orchKey: "orch-key", apiCall });
+
     assert.equal(calls[0].body, null);
   });
 

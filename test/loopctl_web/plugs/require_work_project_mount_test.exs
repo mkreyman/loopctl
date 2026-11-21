@@ -35,7 +35,6 @@ defmodule LoopctlWeb.Plugs.RequireWorkProjectMountTest do
   @expected [
     "LoopctlWeb.EpicController",
     "LoopctlWeb.ImportExportController",
-    "LoopctlWeb.OrchestratorStateController",
     "LoopctlWeb.StoryController",
     "LoopctlWeb.UiTestController"
   ]

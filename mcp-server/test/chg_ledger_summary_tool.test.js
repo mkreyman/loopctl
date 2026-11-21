@@ -134,7 +134,7 @@ describe("chg_ledger_summary wiring in index.js", () => {
     assert.ok(end > start, "the handler has no following function to bound it");
     const handler = stripComments(INDEX_SRC.slice(start, end));
 
-    assert.match(handler, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.match(handler, /agentKey\(\)/);
     assert.match(handler, /chgLedgerSummary\(args,/);
     assert.doesNotMatch(handler, /exactKey/);
   });

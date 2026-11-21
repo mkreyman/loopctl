@@ -519,6 +519,9 @@ defmodule LoopctlRunner.Run do
         {Session.run(
            config: config,
            story: story,
+           # The id the accept named to loopctl (contract 1.35.0), so loopctl's holder for this
+           # dispatch names the transcript; a run started without one gets a fresh uuid.
+           session_id: Keyword.get(opts, :session_id),
            worktree: path,
            # The runner cut this worktree on a branch of its own, so this run's session may hold
            # the subagent git grant. A triage run has no branch of its own and gets none.

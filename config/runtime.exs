@@ -158,6 +158,29 @@ case System.get_env("STORY_CLAIM_LEASE_SECONDS") &&
   _ -> :ok
 end
 
+# US-52.13: a session holder's lease and heartbeat interval. Positive integer seconds; unset,
+# blank or malformed leaves the defaults in Loopctl.Holders (300 and 60). A lease no longer
+# than the heartbeat interval lapses every holder between two heartbeats, so that pair
+# refuses the boot rather than ending every session.
+holder_seconds = fn value ->
+  case value && Integer.parse(value) do
+    {seconds, ""} when seconds > 0 -> seconds
+    _ -> nil
+  end
+end
+
+holder_lease = holder_seconds.(System.get_env("HOLDER_LEASE_SECONDS"))
+holder_heartbeat = holder_seconds.(System.get_env("HOLDER_HEARTBEAT_SECONDS"))
+
+if holder_lease, do: config(:loopctl, :holder_lease_seconds, holder_lease)
+if holder_heartbeat, do: config(:loopctl, :holder_heartbeat_seconds, holder_heartbeat)
+
+if (holder_lease || 300) <= (holder_heartbeat || 60) do
+  raise "HOLDER_LEASE_SECONDS (#{holder_lease || 300}) must be longer than " <>
+          "HOLDER_HEARTBEAT_SECONDS (#{holder_heartbeat || 60}): a lease no longer than one " <>
+          "heartbeat interval lapses every session holder between two heartbeats"
+end
+
 # US-51.1: the chg feedback loop. CHG_FINDINGS_DAILY_CAP caps new loop issues per repository
 # per UTC day (positive integer; anything else leaves the default of 5 in
 # Loopctl.Changes.Findings.daily_cap/1). CHG_FINDINGS_REPO is the `owner/name` chg's own

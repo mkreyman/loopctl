@@ -139,6 +139,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Agents.Registry
   alias Loopctl.Agents.Spec
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Holders
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
   alias Loopctl.Repo
@@ -1317,7 +1318,22 @@ defmodule Loopctl.Runners.DispatchLedger do
       end
     end)
     |> flatten()
+    |> record_holder_accept(tenant_id, reply)
   end
+
+  # US-52.15 (contract 1.35.0): an accept names the session the runner will start, written on
+  # the dispatch's holder once the reply is recorded. An identical repeat writes the same
+  # values; a refusal, an error, or a dispatch with no live holder writes nothing.
+  defp record_holder_accept(
+         {:ok, %DispatchRecord{status: "accepted"}} = result,
+         tenant_id,
+         reply
+       ) do
+    :ok = Holders.record_runner_accept(tenant_id, reply.dispatch_id, reply)
+    result
+  end
+
+  defp record_holder_accept(result, _tenant_id, _reply), do: result
 
   defp apply_reply(%DispatchRecord{status: "sent"} = record, reply) do
     record

@@ -82,6 +82,7 @@ defmodule Loopctl.Coordination.ChannelClaim do
              :tenant_id,
              :project_id,
              :claimant_agent_id,
+             :claimant_holder_id,
              :ref,
              :claimed_at,
              :lease_expires_at,
@@ -96,6 +97,10 @@ defmodule Loopctl.Coordination.ChannelClaim do
     tenant_field()
     field :project_id, :binary_id
     field :claimant_agent_id, :binary_id
+    # US-52.14: the claiming key's holder (session), set programmatically like
+    # `claimant_agent_id`. Unlike `claimed_by_session` it IS a boundary: it comes from the
+    # verified key. NULL for a key with no holder.
+    field :claimant_holder_id, :binary_id
     field :ref, :string
     field :claimed_at, :utc_datetime_usec
     field :lease_expires_at, :utc_datetime_usec

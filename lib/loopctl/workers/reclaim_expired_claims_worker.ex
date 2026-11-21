@@ -43,6 +43,11 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   only, never cast, and cleared by every release (`Progress.claim_release_change/1`), so it
   describes the lease it failed on and never the story's next one.
 
+  After the claim pass, the same run ends every holder whose session can no longer be working
+  (`Loopctl.Holders.end_lapsed/2`, US-52.19): a session holder past its lease, and a runner
+  session that holds no claim any more or whose dispatch is dead. So a dead session's holder
+  and its claims are both gone within one lease plus one run.
+
   A candidate whose release RAISES is logged ONCE, at error, naming the exception's MODULE and
   its stack trace — never its message, which for a database error can quote the story row — then
   the pass goes on.
@@ -55,6 +60,7 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Holders
   alias Loopctl.Progress
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
@@ -95,7 +101,24 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
       )
     end
 
+    end_lapsed_holders(DateTime.utc_now())
     :ok
+  end
+
+  # US-52.19: AFTER the claim pass, so a dead session's expired claims are released as
+  # "lease expired" first and a runner session that held only those claims holds none when
+  # the holder pass asks. A raise is logged and never fails the job: the next run retries.
+  defp end_lapsed_holders(now) do
+    case Holders.end_lapsed(now) do
+      0 -> :ok
+      ended -> Logger.info("ReclaimExpiredClaimsWorker: holders_lapsed=#{ended}")
+    end
+  rescue
+    error ->
+      Logger.error(
+        "ReclaimExpiredClaimsWorker: holder pass raised: exception=#{inspect(error.__struct__)}\n" <>
+          Exception.format_stacktrace(__STACKTRACE__)
+      )
   end
 
   # ONE STORY CANNOT END THE PASS (#877 review round 1). A candidate whose release RAISES — a

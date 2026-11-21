@@ -250,38 +250,6 @@ defmodule LoopctlWeb.ImpersonationIntegrationTest do
       assert ctx.webhook.id in ids
     end
 
-    test "superadmin can save orchestrator state via impersonation", ctx do
-      conn =
-        ctx.sa_conn
-        |> effective_role_conn("orchestrator")
-        |> put(~p"/api/v1/orchestrator/state/#{ctx.project.id}", %{
-          "state_key" => "main",
-          "state_data" => %{"phase" => "testing"}
-        })
-
-      body = json_response(conn, 200)
-      assert body["state"]["state_key"] == "main"
-    end
-
-    test "superadmin can read orchestrator state via impersonation", ctx do
-      # First save state
-      ctx.sa_conn
-      |> effective_role_conn("orchestrator")
-      |> put(~p"/api/v1/orchestrator/state/#{ctx.project.id}", %{
-        "state_key" => "main",
-        "state_data" => %{"phase" => "read-test"}
-      })
-      |> json_response(200)
-
-      conn =
-        ctx.sa_conn
-        |> effective_role_conn("orchestrator")
-        |> get(~p"/api/v1/orchestrator/state/#{ctx.project.id}")
-
-      body = json_response(conn, 200)
-      assert body["state"]["state_data"]["phase"] == "read-test"
-    end
-
     test "superadmin can list dependency graph via impersonation", ctx do
       conn =
         ctx.sa_conn

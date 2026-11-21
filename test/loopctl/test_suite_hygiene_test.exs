@@ -38,6 +38,7 @@ defmodule Loopctl.TestSuiteHygieneTest do
       "an AdminRepo write committing apart from a failed Repo transaction is the subject: " <>
         "two connections over committed rows",
     "test/loopctl/changes_lock_test.exs" => @race,
+    "test/loopctl/work_items/open_race_test.exs" => @race,
     "test/loopctl/changes/events_lock_test.exs" => @race,
     "test/loopctl/changes/review_custody_lock_test.exs" => @race,
     "test/loopctl/config_test_exs_partition_wiring_test.exs" =>

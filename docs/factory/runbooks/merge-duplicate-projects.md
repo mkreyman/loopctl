@@ -44,9 +44,8 @@ scope, and the next sweep re-posts their handoffs there.
    - `stories` / `epics`: renumber the source's row with `update_story` / `update_epic`.
    - `channel_claims` / `channel_locks`: `channel_release` / `channel_unlock` on the source.
    - `egress_scope_markings`: `clear_local_only` on the source project.
-   - `token_budgets` and `orchestrator_states`: no MCP tool deletes either row
-     (`DELETE /api/v1/token-budgets/:id` exists but has no tool; nothing deletes a
-     checkpoint). Keep the target's row, and delete the source's with production SQL inside a
+   - `token_budgets`: no MCP tool deletes the row
+     (`DELETE /api/v1/token-budgets/:id` exists but has no tool). Keep the target's row, and delete the source's with production SQL inside a
      transaction, after reading it (the `fly-mpg-connect` skill). Record the statement in
      Results.
 3. **Merge.** The same call without `dry_run`. The result carries `counts` and

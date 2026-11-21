@@ -660,6 +660,7 @@ defmodule Loopctl.Agents.VerifyFlowTest do
         edge: "human_resolution",
         claim_epoch: row.claim_epoch,
         lock_version: row.lock_version + 1,
+        reason: "a person re-triaged it",
         data: %{}
       })
 

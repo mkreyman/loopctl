@@ -25,20 +25,6 @@ defmodule Loopctl.CLI.Commands.OrchestratorTest do
             ]
           })
 
-        {"PUT", "/api/v1/orchestrator/state/" <> _id} ->
-          Req.Test.json(conn, %{
-            "state_key" => "main",
-            "version" => 1,
-            "state_data" => %{"progress" => 50}
-          })
-
-        {"GET", "/api/v1/orchestrator/state/" <> _id} ->
-          Req.Test.json(conn, %{
-            "state_key" => "main",
-            "version" => 1,
-            "state_data" => %{"progress" => 50}
-          })
-
         _ ->
           conn = Plug.Conn.put_status(conn, 404)
           Req.Test.json(conn, %{"error" => "not found"})
@@ -78,48 +64,6 @@ defmodule Loopctl.CLI.Commands.OrchestratorTest do
         end)
 
       assert output =~ "Pending Story"
-    end
-  end
-
-  describe "state save" do
-    test "saves orchestrator state" do
-      data = Jason.encode!(%{"progress" => 50})
-
-      output =
-        capture_io(fn ->
-          Orchestrator.run("state", ["save", "--project", "p-1", "--data", data], [])
-        end)
-
-      assert output =~ "main"
-    end
-
-    test "requires --project and --data" do
-      output =
-        capture_io(:stderr, fn ->
-          Orchestrator.run("state", ["save", "--project", "p-1"], [])
-        end)
-
-      assert output =~ "Usage:"
-    end
-  end
-
-  describe "state load" do
-    test "loads orchestrator state" do
-      output =
-        capture_io(fn ->
-          Orchestrator.run("state", ["load", "--project", "p-1"], [])
-        end)
-
-      assert output =~ "main"
-    end
-
-    test "requires --project" do
-      output =
-        capture_io(:stderr, fn ->
-          Orchestrator.run("state", ["load"], [])
-        end)
-
-      assert output =~ "Usage:"
     end
   end
 end

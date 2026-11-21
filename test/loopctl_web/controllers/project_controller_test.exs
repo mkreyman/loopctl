@@ -564,19 +564,6 @@ defmodule LoopctlWeb.ProjectControllerTest do
       assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
     end
 
-    test "orchestrator-state save on a :kb scope 422s (human-anchored caller)", %{conn: conn} do
-      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
-      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
-
-      conn =
-        conn
-        |> auth_conn(orch_key)
-        |> put(~p"/api/v1/orchestrator/state/#{kb.id}", %{"state" => %{}})
-
-      assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
-    end
-
     test "a work project (kind: :work) is NOT rejected by the guard", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

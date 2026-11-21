@@ -180,6 +180,7 @@ defmodule LoopctlWeb.ChannelClaimController do
     with_agent(conn, fn tenant_id, agent_id, role ->
       case Coordination.claim(tenant_id, agent_id, params["project_id"], params["ref"],
              role: role,
+             holder_id: conn.assigns.current_api_key.holder_id,
              lease_seconds: params["lease_seconds"],
              session_id: params["session_id"],
              host: params["host"],
@@ -267,7 +268,8 @@ defmodule LoopctlWeb.ChannelClaimController do
              params["ref"],
              AuditContext.from_conn(conn),
              session_id: params["session_id"],
-             force: truthy?(params["force"])
+             force: truthy?(params["force"]),
+             holder_id: conn.assigns.current_api_key.holder_id
            ) do
         {:ok, claim} -> json(conn, %{claim: claim})
         {:error, :not_found} -> {:error, :not_found}
@@ -294,7 +296,8 @@ defmodule LoopctlWeb.ChannelClaimController do
              params["ref"],
              AuditContext.from_conn(conn),
              session_id: params["session_id"],
-             force: truthy?(params["force"])
+             force: truthy?(params["force"]),
+             holder_id: conn.assigns.current_api_key.holder_id
            ) do
         {:ok, claim} -> json(conn, %{claim: claim})
         {:error, :not_found} -> {:error, :not_found}

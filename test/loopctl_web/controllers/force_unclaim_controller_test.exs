@@ -1,6 +1,8 @@
 defmodule LoopctlWeb.ForceUnclaimControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Delivery.Stages
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -67,6 +69,25 @@ defmodule LoopctlWeb.ForceUnclaimControllerTest do
         )
 
       assert result.data != []
+    end
+
+    test "the operator's reason goes on the story's event log (US-52.16)", %{conn: conn} do
+      %{story: story, orch_key: orch_key, tenant: tenant} =
+        setup_story_with_orchestrator(%{agent_status: :implementing})
+
+      conn
+      |> auth_conn(orch_key)
+      |> post(~p"/api/v1/stories/#{story.id}/force-unclaim", %{"reason" => "  runner wedged "})
+      |> json_response(200)
+
+      assert [
+               %{
+                 event: "released",
+                 reason: "force-unclaimed: runner wedged",
+                 actor_holder_id: nil
+               }
+             ] =
+               Stages.list_events(tenant.id, story.id)
     end
 
     test "force-unclaim on pending story is idempotent (200)", %{conn: conn} do

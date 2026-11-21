@@ -412,6 +412,12 @@ defmodule LoopctlWeb.Router do
     post "/dispatches/:id/revoke", DispatchController, :revoke
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
 
+    # US-52.13: session holders. Not custody surface (LoopctlWeb.CustodySurface): a halt must
+    # not strand a session's lease or stop it ending itself.
+    post "/holders", HolderController, :create
+    post "/holders/:id/heartbeat", HolderController, :heartbeat
+    post "/holders/:id/end", HolderController, :end_holder
+
     # API key management
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
     post "/api_keys/:id/rotate", ApiKeyController, :rotate
@@ -449,6 +455,11 @@ defmodule LoopctlWeb.Router do
 
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
+
+    # US-52.17 — a work item's notes (its holder's plan, progress, decisions, questions)
+    post "/work_items", WorkItemController, :create
+    post "/stories/:id/notes", WorkItemNoteController, :create
+    get "/stories/:id/notes", WorkItemNoteController, :index
 
     # US-26.4.1 — First-class acceptance criteria
     get "/stories/:story_id/acceptance_criteria", AcceptanceCriteriaController, :index
@@ -596,9 +607,6 @@ defmodule LoopctlWeb.Router do
     get "/epics/:id/story_dependencies", StoryDependencyController, :index
 
     # Orchestrator state
-    put "/orchestrator/state/:project_id", OrchestratorStateController, :save
-    get "/orchestrator/state/:project_id", OrchestratorStateController, :show
-    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
 
     # Webhooks (Epic 10)
     resources "/webhooks", WebhookController, only: [:create, :index, :update, :delete]
