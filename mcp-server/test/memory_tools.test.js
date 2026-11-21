@@ -1002,7 +1002,7 @@ describe("AC-28.4.1 / AC-29.4.1: five memory tools registered by the existing co
 
     const listStart = INDEX_SRC.indexOf("async function memoryList(");
     const listBody = INDEX_SRC.slice(listStart, listStart + 900);
-    assert.match(listBody, /apiCall\("GET", path, null, process\.env\.LOOPCTL_AGENT_KEY\)/);
+    assert.match(listBody, /apiCall\("GET", path, null, agentKey\(\)\)/);
     assert.match(listBody, /memoryPath\(\{ limit, offset, include_superseded, all_subjects \}\)/);
 
     const forgetStart = INDEX_SRC.indexOf("async function memoryForget(");
@@ -1026,7 +1026,7 @@ describe("AC-28.4.1 / AC-29.4.1: five memory tools registered by the existing co
       const end = INDEX_SRC.indexOf("\n}\n", start);
       const body = INDEX_SRC.slice(start, end);
       assert.ok(
-        /process\.env\.LOOPCTL_AGENT_KEY/.test(body),
+        /agentKey\(\)/.test(body),
         `${fnName} must route through LOOPCTL_AGENT_KEY`,
       );
     }
@@ -1266,7 +1266,7 @@ describe("recall_referenced: registered, routed, and scope-free", () => {
 
     assert.ok(handler.includes('"POST"'), "must be a POST");
     assert.ok(
-      handler.includes("process.env.LOOPCTL_AGENT_KEY"),
+      handler.includes("agentKey()"),
       "must use the agent key — the recording identity is derived from it server-side",
     );
   });

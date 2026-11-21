@@ -22,6 +22,8 @@ import { applyArgAliases } from "./lib/arg-aliases.js";
 import { articleId } from "./lib/article-id.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
+import { createHolderSession } from "./lib/holder.js";
+import { execFileSync } from "node:child_process";
 import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
   projectsPath,
@@ -194,6 +196,39 @@ function resolveKey(keyOverride) {
     keyOverride ||
     process.env.LOOPCTL_ORCH_KEY
   );
+}
+
+// US-52.13: this process's session holder. Every request that used to send
+// LOOPCTL_AGENT_KEY sends `agentKey()` instead: the holder's own credential once the
+// startup register succeeds, else LOOPCTL_AGENT_KEY unchanged (lib/holder.js says why a
+// failed register never stops a session working).
+const holderSession = createHolderSession({
+  apiCall: (...args) => apiCall(...args),
+  env: process.env,
+  hostname: () => os.hostname(),
+  worktree: () => {
+    try {
+      return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2000,
+      }).trim();
+    } catch {
+      return process.cwd();
+    }
+  },
+  randomUUID: () => crypto.randomUUID(),
+});
+
+function agentKey() {
+  return holderSession.agentKey();
+}
+
+// For a lib module that reads `env.LOOPCTL_AGENT_KEY` from an injected env (claim-lease.js,
+// escalation.js): the process env with the agent key replaced by `agentKey()`.
+function agentKeyEnv() {
+  return { ...process.env, LOOPCTL_AGENT_KEY: agentKey() };
 }
 
 let clientContextHeaderCache;
@@ -539,7 +574,7 @@ async function resolveProjectRaw({ slug, repo_url, name } = {}) {
     "GET",
     `/api/v1/projects/resolve?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
 }
 
@@ -564,7 +599,7 @@ async function createKbScopeRaw({ name, slug, repo_url, description, tech_stack 
   if (tech_stack) body.tech_stack = tech_stack;
   // Uses the AGENT key (not ORCH): a KB scope is agent-createable on the KB tier — that is
   // the whole point. The server forces kind: :kb; a body-supplied kind is ignored.
-  return await apiCall("POST", "/api/v1/kb-scopes", body, process.env.LOOPCTL_AGENT_KEY);
+  return await apiCall("POST", "/api/v1/kb-scopes", body, agentKey());
 }
 
 async function createKbScope(args) {
@@ -578,7 +613,7 @@ async function archiveKbScope({ project_id }) {
     "DELETE",
     `/api/v1/kb-scopes/${project_id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -590,7 +625,7 @@ async function restoreKbScope({ project_id }) {
     "POST",
     `/api/v1/kb-scopes/${project_id}/restore`,
     {},
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -684,7 +719,7 @@ async function channelPostRaw({
     "POST",
     "/api/v1/channel/posts",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
 }
 
@@ -723,7 +758,7 @@ async function channelRecent({ project_id, since, limit }) {
     "GET",
     `/api/v1/channel/posts?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -759,7 +794,7 @@ async function channelHandoffs({ project_id, host, capabilities, only_mine }) {
     "GET",
     `/api/v1/channel/handoffs?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -774,7 +809,7 @@ async function channelGet({ post_id }) {
     "GET",
     `/api/v1/channel/posts/${post_id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -799,7 +834,7 @@ async function channelClaim({ project_id, ref, lease_seconds }) {
     "POST",
     "/api/v1/channel/claims",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -825,7 +860,7 @@ async function channelClaims({ project_id, ref, limit }) {
     "GET",
     `/api/v1/channel/claims?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -849,7 +884,7 @@ async function channelRelease({ project_id, ref, force }) {
     "POST",
     "/api/v1/channel/claims/release",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -867,7 +902,7 @@ async function channelDone({ project_id, ref, force }) {
     "POST",
     "/api/v1/channel/claims/done",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -895,7 +930,7 @@ async function channelLock({ project_id, target, ttl_seconds, note }) {
     "POST",
     "/api/v1/channel/locks",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -914,7 +949,7 @@ async function channelUnlock({ project_id, target }) {
     "POST",
     "/api/v1/channel/locks/release",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -931,7 +966,7 @@ async function channelLocks({ project_id, limit }) {
     "GET",
     `/api/v1/channel/locks?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -947,7 +982,7 @@ async function channelDelete({ post_id }) {
     "DELETE",
     `/api/v1/channel/posts/${post_id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -967,7 +1002,7 @@ async function channelGraduate({ post_id, title, tags, category }) {
     "POST",
     `/api/v1/channel/posts/${post_id}/graduate`,
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1236,7 +1271,7 @@ async function contractStory({ story_id, story_title, ac_count }) {
     "POST",
     `/api/v1/stories/${story_id}/contract`,
     { story_title, ac_count },
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1330,7 +1365,7 @@ async function recoverStartCap(storyId) {
       "POST",
       `/api/v1/stories/${storyId}/recover-cap`,
       null,
-      process.env.LOOPCTL_AGENT_KEY
+      agentKey()
     );
     return result && result.data && result.data.cap_id;
   } catch {
@@ -1343,7 +1378,7 @@ async function claimStory({ story_id }) {
     "POST",
     `/api/v1/stories/${story_id}/claim`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   // The claim response carries the start_cap that POST /start will require.
   rememberCap(story_id, result && result.capability);
@@ -1359,13 +1394,13 @@ function withClaimLeaseNotice(result) {
 }
 
 async function renewStoryClaim(args) {
-  return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall }));
+  return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall, env: agentKeyEnv() }));
 }
 
 // #803: escalation leads with a STOP line. A session that escalates and keeps working is
 // the failure the affordance exists to prevent, and the JSON body alone does not say so.
 async function escalateStory(args) {
-  const result = await escalateStoryRequest(args, { apiCall });
+  const result = await escalateStoryRequest(args, { apiCall, env: agentKeyEnv() });
   const notice = escalationNotice(result);
   if (!notice) return toContent(result);
   return { content: [{ type: "text", text: notice }, ...toContent(result).content] };
@@ -1378,14 +1413,14 @@ async function startStory({ story_id, capability }) {
   const cap =
     capability ||
     takeCap(story_id, "start_cap") ||
-    (await fetchCap(story_id, "start_cap", process.env.LOOPCTL_AGENT_KEY)) ||
+    (await fetchCap(story_id, "start_cap", agentKey())) ||
     (await recoverStartCap(story_id));
 
   const result = await apiCall(
     "POST",
     `/api/v1/stories/${story_id}/start`,
     cap ? { capability: cap } : null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1395,7 +1430,7 @@ async function requestReview({ story_id }) {
     "POST",
     `/api/v1/stories/${story_id}/request-review`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1531,7 +1566,7 @@ async function reportTokenUsage({ story_id, input_tokens, output_tokens, model_n
     "POST",
     "/api/v1/token-usage",
     body,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -1637,7 +1672,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
   if (suppressed) params.set("suppressed", suppressed);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1646,7 +1681,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
 // step deletes the stale-dimension rows (loopctl reserves data-removing operations for
 // higher roles), so it deliberately does NOT fall back to the agent key.
 async function embeddingStatus() {
-  const result = await apiCall("GET", "/api/v1/knowledge/embeddings", null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", "/api/v1/knowledge/embeddings", null, agentKey());
   return toContent(result);
 }
 
@@ -1655,7 +1690,7 @@ async function embeddingMaterializeSystemCorpus() {
     "POST",
     "/api/v1/knowledge/embeddings/system-corpus",
     {},
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1686,7 +1721,7 @@ async function knowledgeStats({ project_id }) {
   const path = project_id
     ? `/api/v1/projects/${project_id}/knowledge/stats`
     : "/api/v1/knowledge/stats";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1701,7 +1736,7 @@ async function knowledgeGraph({ article_id, depth, project_id }) {
     "GET",
     `/api/v1/knowledge/graph?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1718,7 +1753,7 @@ async function knowledgeSuggestLinks({ article_id, limit, threshold }) {
     "GET",
     qs ? `${base}?${qs}` : base,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1732,7 +1767,7 @@ async function knowledgeDistantPairs({ min_distance, max_distance, bridge_path, 
   if (offset != null) params.set("offset", String(offset));
   const qs = params.toString();
   const path = qs ? `/api/v1/knowledge/pairs?${qs}` : "/api/v1/knowledge/pairs";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1742,7 +1777,7 @@ async function knowledgeNovelty({ ideas, texts, prior_tag }) {
   if (ideas !== undefined) body.ideas = ideas;
   if (texts !== undefined) body.texts = texts;
   if (prior_tag) body.prior_tag = prior_tag;
-  const result = await apiCall("POST", "/api/v1/knowledge/novelty", body, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("POST", "/api/v1/knowledge/novelty", body, agentKey());
   return toContent(result);
 }
 
@@ -1754,7 +1789,7 @@ async function knowledgeRandomWalk({ start_id, length }) {
     "GET",
     `/api/v1/knowledge/walk?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1780,7 +1815,7 @@ async function knowledgeCount({
   if (idempotency_key) params.set("idempotency_key", idempotency_key);
   const qs = params.toString();
   const path = qs ? `/api/v1/knowledge/count?${qs}` : "/api/v1/knowledge/count";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -1806,7 +1841,7 @@ async function knowledgeFacets({
     "GET",
     `/api/v1/knowledge/facets?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1830,7 +1865,7 @@ async function knowledgeSearch({ q, project_id, story_id, category, tags, match,
   if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
 
-  const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, agentKey());
   // If search silently degraded to keyword-only for a missing embedding key, the
   // server attaches meta.remediation — surface it PROMINENTLY so the agent knows to
   // call set_llm_config to enable semantic ranking.
@@ -1850,7 +1885,7 @@ async function knowledgeHybridSearch({ query, project_id, category, tags, match,
     "POST",
     "/api/v1/knowledge/hybrid_search",
     bodyPayload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // meta.provenance ("curated" | "retrieved") is the load-bearing field and rides
   // through toContent verbatim. Same missing-embedding-key remediation surfacing as
@@ -1872,7 +1907,7 @@ async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
     "GET",
     `/api/v1/knowledge/progressive_index?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // A topic browse is a RETRIEVAL: it runs the same ranked pool, so it can come back
   // short or keyword-only. Without the banner a shed index reads as "the KB has no
@@ -1890,7 +1925,7 @@ async function knowledgeHeatIndex({ category, limit, since }) {
     "GET",
     `/api/v1/knowledge/heat_index?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // The query-free route, reached for precisely when the query-shaped ones came back
   // empty — so an unannounced degradation here strands the agent with no route left.
@@ -1913,7 +1948,7 @@ async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offs
     "GET",
     qs ? `${base}?${qs}` : base,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -1956,7 +1991,7 @@ async function knowledgeList({
     "GET",
     `/api/v1/articles?${params}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Enumeration, not ranking — but a short page still under-reports the set, and an
   // agent enumerating to decide something absent is the caller least able to tell.
@@ -1988,7 +2023,7 @@ async function knowledgeGet({
     params.set("body_offset", String(body_offset));
   const qs = params.toString();
   const path = qs ? `/api/v1/articles/${art.id}?${qs}` : `/api/v1/articles/${art.id}`;
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -2012,7 +2047,7 @@ async function knowledgeContext({
   if (agents) params.set("agents", Array.isArray(agents) ? agents.join(",") : agents);
   if (conversation_id) params.set("conversation_id", conversation_id);
 
-  const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, agentKey());
   // Same as knowledge_search: surface a missing-embedding-key remediation prominently.
   return withRemediationNotice(result);
 }
@@ -2056,7 +2091,7 @@ async function knowledgeCreate({
     "POST",
     "/api/v1/articles",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2078,7 +2113,7 @@ async function knowledgeUpdate({ article_id, title, body, category, tags, metada
     "PATCH",
     `/api/v1/articles/${art.id}`,
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2126,7 +2161,7 @@ async function memoryRemember({
     "POST",
     "/api/v1/memory",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2140,7 +2175,7 @@ async function memoryRecall({ query, limit, include_superseded }) {
     "POST",
     "/api/v1/memory/recall",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Surface meta (fallback/reason/total_count/underfilled) so the caller can tell
   // a degraded recall from a genuinely empty scope (AC-28.4.4). meta alone was not
@@ -2167,7 +2202,7 @@ async function recallContext({ query, project_id, limit, session_id }) {
     "POST",
     "/api/v1/recall",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Surface both per-source metas (memory fallback/underfilled + knowledge degraded)
   // so the caller can tell a degraded recall from a genuinely empty scope. The merged
@@ -2201,7 +2236,7 @@ async function recallReferenced({ recall_id, article_ids, project_id }) {
     "POST",
     `/api/v1/recall/${encodeURIComponent(recall_id.trim())}/referenced`,
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2212,7 +2247,7 @@ async function memoryList({ limit, offset, include_superseded, all_subjects }) {
   // one deliberate cross-subject read this MCP surface can express (module
   // comment above), and only for a superadmin caller.
   const path = memoryPath({ limit, offset, include_superseded, all_subjects });
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   // Surface meta.total_count/limit/offset (AC-28.4.4).
   return toContent(result);
 }
@@ -2230,7 +2265,7 @@ async function memoryForget({ id }) {
     "DELETE",
     `/api/v1/memory/${id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2241,7 +2276,7 @@ async function memoryPromote({ session_id }) {
     "POST",
     "/api/v1/memory/promote",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2259,7 +2294,7 @@ async function memoryGraduate({ memory_id, re_scope }) {
     "POST",
     "/api/v1/memory/graduate",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2345,7 +2380,7 @@ async function knowledgeArchive({ article_id }) {
     "POST",
     `/api/v1/articles/${art.id}/archive`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2360,7 +2395,7 @@ async function knowledgeSuppress({ article_id, reason }) {
     "POST",
     `/api/v1/articles/${art.id}/suppress`,
     { reason },
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2372,7 +2407,7 @@ async function knowledgeUnsuppress({ article_id }) {
     "POST",
     `/api/v1/articles/${art.id}/unsuppress`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2385,7 +2420,7 @@ async function knowledgeDelete({ article_id }) {
     "DELETE",
     `/api/v1/articles/${art.id}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY
+    agentKey()
   );
   return toContent(result);
 }
@@ -2472,7 +2507,7 @@ async function knowledgeConflicts({ limit, offset }) {
   const path = qs
     ? `/api/v1/knowledge/conflicts?${qs}`
     : "/api/v1/knowledge/conflicts";
-  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  const result = await apiCall("GET", path, null, agentKey());
   return toContent(result);
 }
 
@@ -2491,7 +2526,7 @@ async function knowledgeAssertConflict({
     "POST",
     "/api/v1/knowledge/conflicts",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2523,7 +2558,7 @@ async function knowledgeResolveConflict({
     "POST",
     "/api/v1/knowledge/conflicts/resolve",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2697,7 +2732,7 @@ async function egressPosture() {
     "GET",
     "/api/v1/egress/posture",
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2714,7 +2749,7 @@ async function custodyClaim({ subject_type, subject_id } = {}) {
     "GET",
     `/api/v1/custody/claims/${encodeURIComponent(subject_type)}/${encodeURIComponent(subject_id)}`,
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2724,7 +2759,7 @@ async function custodyFailures() {
     "GET",
     "/api/v1/custody/failures",
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -2788,7 +2823,7 @@ async function egressRepin({ host, project_id } = {}) {
     "POST",
     "/api/v1/egress/repin",
     body,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3165,6 +3200,23 @@ async function revokeDispatch(args) {
   );
 }
 
+// US-52.13: this session's holder. The raw credential never leaves the process, so each tool
+// answers with `holderSession.status()` beside what loopctl said, never the key.
+async function holderRegisterTool() {
+  const result = await holderSession.register();
+  return toContent(result && result.error ? result : holderSession.status());
+}
+
+async function holderHeartbeatTool() {
+  const result = await holderSession.heartbeat();
+  return toContent(result && result.error ? result : { ...holderSession.status(), lease: result });
+}
+
+async function holderEndTool() {
+  const result = await holderSession.end();
+  return toContent(result && result.error ? result : holderSession.status());
+}
+
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
 // ROTATION (an owner key already exists) requires `rotation_proof`: a hex Ed25519
 // signature by the OUTGOING owner key over owner_rotation_preimage(tenant_id,
@@ -3494,7 +3546,7 @@ async function storyStage(args) {
   // LOOPCTL_API_KEY, then an override, then LOOPCTL_ORCH_KEY — never LOOPCTL_AGENT_KEY. A
   // session refused `stale_stage` is running on an agent key, and this read is what tells it
   // where the row actually is, so on an agent-key-only config it has to work.
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await storyStageRequest(args, {
@@ -3510,7 +3562,7 @@ async function storyStage(args) {
 // OVERRIDE, not `exactKey`, so `resolveKey`'s order holds: LOOPCTL_API_KEY when set, else
 // LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY.
 async function changeBindingGet(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await changeBindingGetRequest(args, {
@@ -3522,7 +3574,7 @@ async function changeBindingGet(args) {
 // US-48.12: a READ of the run-outcome ledger, `role: :agent` with the hierarchy — keyed as
 // changeBindingGet is, LOOPCTL_AGENT_KEY as an OVERRIDE so `resolveKey`'s order holds.
 async function agentOutcomesRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await agentOutcomes(args, {
@@ -3534,7 +3586,7 @@ async function agentOutcomesRead(args) {
 // US-50.6: a READ of the chg ledger summary, `role: :agent` with the hierarchy — keyed as
 // agentOutcomesRead is, LOOPCTL_AGENT_KEY as an OVERRIDE so `resolveKey`'s order holds.
 async function chgLedgerSummaryRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await chgLedgerSummary(args, {
@@ -3546,7 +3598,7 @@ async function chgLedgerSummaryRead(args) {
 // US-51.6: the findings list is a READ keyed as chgLedgerSummaryRead is; clearing one is a
 // person's act and takes the EXACT user key through runnerDeps().
 async function chgFindingsRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     await chgFindings(args, {
@@ -3570,7 +3622,7 @@ async function resolveEscalation(args) {
 // US-48.11: the escalation inbox is a READ, `role: :agent` with the hierarchy, so it takes
 // LOOPCTL_AGENT_KEY as an override for changeBindingGet's reason above, never `exactKey`.
 async function escalationListRead(args) {
-  const key = process.env.LOOPCTL_AGENT_KEY;
+  const key = agentKey();
 
   return toContent(
     withRemedies(
@@ -3741,7 +3793,7 @@ async function corpusCreate(args) {
     "POST",
     corporaPath(),
     buildCorpusCreateBody(args),
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3751,7 +3803,7 @@ async function corpusList(args = {}) {
     "GET",
     corporaPath(args),
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3763,7 +3815,7 @@ async function corpusIndex({ corpus_id, chunks, source_complete }) {
     "POST",
     corpusIndexPath(corpus_id),
     buildCorpusIndexBody({ chunks, source_complete }),
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -3773,7 +3825,7 @@ async function corpusSearch({ corpus_id, query, query_vector, lanes, limit }) {
     "POST",
     corpusSearchPath(corpus_id),
     buildCorpusSearchBody({ query, query_vector, lanes, limit }),
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   // Pointers + snippets only — the caller's next step is to open the file at
   // source_ref/locator. Nothing here is auto-injected into a recall pack, so a
@@ -3787,7 +3839,7 @@ async function corpusStatus({ corpus_id, limit, offset }) {
     "GET",
     corpusStatusPath(corpus_id, { limit, offset }),
     null,
-    process.env.LOOPCTL_AGENT_KEY,
+    agentKey(),
   );
   return toContent(result);
 }
@@ -8574,6 +8626,40 @@ const TOOLS = [
   },
 
   {
+    name: "holder_register",
+    description:
+      "REGISTER THIS SESSION AS A HOLDER (POST /api/v1/holders, US-52.13). The MCP server " +
+      "already does this at startup and heartbeats on a timer; call it only to re-register " +
+      "after holder_end or when holder_heartbeat reports no holder. Sends LOOPCTL_AGENT_KEY " +
+      "(exactly, never another variable) with kind interactive, this session's id, the host " +
+      "and the git top level. loopctl answers with the SAME holder while it is live and a new " +
+      "credential, which this process keeps in memory and sends on every agent-key request " +
+      "from then on; the credential is never returned to you. REFUSES: 403 " +
+      "custody_tier_required on an agent-rooted tenant, 403 holder_mint_forbidden for a " +
+      "dispatch-minted key, 422 agent_required for a key naming no agent. On any refusal the " +
+      "session keeps using LOOPCTL_AGENT_KEY.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  {
+    name: "holder_heartbeat",
+    description:
+      "RENEW THIS SESSION'S HOLDER LEASE NOW (POST /api/v1/holders/:id/heartbeat), by the " +
+      "holder's own credential. The server does this every heartbeat_seconds on its own. " +
+      "A 401, 404 or 409 (credential expired, holder ended) makes it register again.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  {
+    name: "holder_end",
+    description:
+      "END THIS SESSION'S HOLDER (POST /api/v1/holders/:id/end): sets ended_at and revokes " +
+      "its credential; this process falls back to LOOPCTL_AGENT_KEY. The server does this " +
+      "itself when stdin closes or on SIGTERM. A repeated end writes nothing.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  {
     name: "revoke_dispatch",
     description:
       "REVOKE A DISPATCH AND ITS WHOLE SUBTREE (POST /api/v1/dispatches/:id/revoke), plus the " +
@@ -10432,7 +10518,7 @@ const TOOLS = [
 // that isn't `cr_`-prefixed or that collides with a built-in tool name.
 const generatedToolsRuntime = createGeneratedToolsRuntime({
   apiCall,
-  agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+  agentKey: () => agentKey(),
   staticToolNames: new Set(TOOLS.map((t) => t.name)),
   toContent,
 });
@@ -10920,6 +11006,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "revoke_dispatch":
       return await revokeDispatch(args);
 
+    case "holder_register":
+      return await holderRegisterTool();
+
+    case "holder_heartbeat":
+      return await holderHeartbeatTool();
+
+    case "holder_end":
+      return await holderEndTool();
+
     case "runner_enroll":
       return await runnerEnroll(args);
 
@@ -11066,6 +11161,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+
+// US-52.13: register this session as a holder before serving, waiting at most 5s so a slow
+// loopctl never delays startup; end it when Claude Code closes stdin or stops the process.
+await holderSession.start({ timeoutMs: 5000 });
+
+let shuttingDown = false;
+async function endHolderAndExit() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const cap = new Promise((resolve) => setTimeout(resolve, 3000).unref());
+  await Promise.race([holderSession.end().catch(() => {}), cap]);
+  process.exit(0);
+}
+
+process.stdin.on("close", endHolderAndExit);
+process.on("SIGTERM", endHolderAndExit);
 
 const transport = new StdioServerTransport();
 await server.connect(transport).catch((err) => {

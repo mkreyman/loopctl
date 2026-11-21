@@ -50,6 +50,9 @@ defmodule Loopctl.Auth do
     `:superadmin` — this is the privileged bootstrap/fixture/dispatch path.
     `:http` uses `ApiKey.http_create_changeset/2`, which structurally rejects
     `:superadmin`. The public HTTP controller passes `changeset: :http`.
+  - `:holder_id` — the holder (session) this key is the credential of (US-52.13). An OPTION,
+    never an attr, because `holder_id` is never cast: only `Loopctl.Holders` mints a holder's
+    credential, and it names the holder it just created or resolved.
   """
   @spec generate_api_key(map(), keyword()) ::
           {:ok, {String.t(), ApiKey.t()}} | {:error, Ecto.Changeset.t()}
@@ -68,6 +71,7 @@ defmodule Loopctl.Auth do
       |> build_create_changeset(attrs, Keyword.get(opts, :changeset, :full))
       |> Ecto.Changeset.put_change(:key_hash, key_hash)
       |> Ecto.Changeset.put_change(:key_prefix, key_prefix)
+      |> put_holder(Keyword.get(opts, :holder_id))
 
     case AdminRepo.insert(changeset) do
       {:ok, api_key} ->
@@ -81,6 +85,11 @@ defmodule Loopctl.Auth do
         {:error, changeset}
     end
   end
+
+  defp put_holder(changeset, nil), do: changeset
+
+  defp put_holder(changeset, holder_id) when is_binary(holder_id),
+    do: Ecto.Changeset.put_change(changeset, :holder_id, holder_id)
 
   defp build_create_changeset(base, attrs, :http),
     do: ApiKey.http_create_changeset(base, attrs)

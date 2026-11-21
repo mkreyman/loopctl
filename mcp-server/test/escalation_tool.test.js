@@ -194,7 +194,7 @@ describe("index.js wiring", () => {
 
   test("the handler injects the real apiCall and leads with the stop notice", () => {
     const source = functionSource("escalateStory");
-    assert.match(source, /escalateStoryRequest\(args, \{ apiCall \}\)/);
+    assert.match(source, /escalateStoryRequest\(args, \{ apiCall, env: agentKeyEnv\(\) \}\)/);
     assert.match(source, /escalationNotice\(result\)/);
     assert.match(source, /\{ type: "text", text: notice \}, \.\.\.toContent\(result\)\.content/);
   });

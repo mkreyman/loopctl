@@ -410,7 +410,7 @@ describe("index.js wiring (AC-43.4.1)", () => {
     ]) {
       assert.match(
         functionSource(fn),
-        /process\.env\.LOOPCTL_AGENT_KEY/,
+        /agentKey\(\)/,
         `${fn} must authenticate with the agent key`,
       );
     }

@@ -412,6 +412,12 @@ defmodule LoopctlWeb.Router do
     post "/dispatches/:id/revoke", DispatchController, :revoke
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
 
+    # US-52.13: session holders. Not custody surface (LoopctlWeb.CustodySurface): a halt must
+    # not strand a session's lease or stop it ending itself.
+    post "/holders", HolderController, :create
+    post "/holders/:id/heartbeat", HolderController, :heartbeat
+    post "/holders/:id/end", HolderController, :end_holder
+
     # API key management
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
     post "/api_keys/:id/rotate", ApiKeyController, :rotate

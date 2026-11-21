@@ -6,6 +6,19 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Every session is a holder (2026-11-21, US-52.13).** New `POST /api/v1/holders`,
+  `POST /api/v1/holders/:id/heartbeat` and `POST /api/v1/holders/:id/end` (MCP tools
+  `holder_register`, `holder_heartbeat`, `holder_end`). A session registers with its agent's
+  plain key and gets a credential of its own, an `:agent` key carrying `holder_id`; the MCP
+  server (3.21.0) does this at startup, sends every agent-key request with that credential,
+  heartbeats it and ends it on exit, and falls back to `LOOPCTL_AGENT_KEY` when the register
+  is refused. Register refuses `403 holder_mint_forbidden` to a dispatch-minted key, `422
+  agent_required` to a key naming no agent, and `403 custody_tier_required` on an
+  agent-rooted tenant. Migration `20261121020000` creates `holders`, adds
+  `api_keys.holder_id`, and rebuilds `api_keys_one_role_per_agent_idx` to exclude holder keys
+  (one live key per holder is held by `api_keys_one_live_key_per_holder_idx` instead); no
+  manual step. New env vars `HOLDER_LEASE_SECONDS` (300) and `HOLDER_HEARTBEAT_SECONDS` (60);
+  a lease no longer than the heartbeat interval refuses the boot.
 - **`POST /api/v1/projects/:id/merge_into` keeps a live intake source on its repo
   (2026-11-21, #1113).** A merge whose source project carries a live `pr`/`chg` source for a
   repo the target does not hold answers `409 merge_strands_intake_source` with

@@ -130,7 +130,7 @@ describe("#411 gap1: resolve_project wiring", () => {
     const src = functionSource("resolveProjectRaw");
     assert.match(
       src,
-      /\{ slug, repo_url, name \} = \{\}\) \{[\s\S]*?\/api\/v1\/projects\/resolve\?\$\{params\}[\s\S]*?LOOPCTL_AGENT_KEY/,
+      /\{ slug, repo_url, name \} = \{\}\) \{[\s\S]*?\/api\/v1\/projects\/resolve\?\$\{params\}[\s\S]*?agentKey\(\)/,
       "resolveProjectRaw must GET /api/v1/projects/resolve with a query string on the agent key",
     );
     assert.match(
@@ -164,7 +164,7 @@ describe("#418: create_kb_scope wiring", () => {
   test("createKbScope POSTs /kb-scopes on the AGENT key (not the orch key)", () => {
     assert.match(
       functionSource("createKbScopeRaw"),
-      /"POST",\s*"\/api\/v1\/kb-scopes",\s*body,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /"POST",\s*"\/api\/v1\/kb-scopes",\s*body,\s*agentKey\(\)/,
       "createKbScopeRaw must POST /api/v1/kb-scopes with the agent key",
     );
     assert.match(
@@ -198,7 +198,7 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     // channelPost is a toContent wrapper over it.
     assert.match(
       functionSource("channelPostRaw"),
-      /"POST",\s*"\/api\/v1\/channel\/posts",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /"POST",\s*"\/api\/v1\/channel\/posts",\s*payload,\s*agentKey\(\)/,
       "channelPostRaw must POST /api/v1/channel/posts with the agent key",
     );
     assert.match(
@@ -292,7 +292,7 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
   test("channelRecent GETs /channel/posts on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelRecent\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\?\$\{params\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelRecent\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\?\$\{params\}`,\s*null,\s*agentKey\(\)/,
       "channelRecent must GET /api/v1/channel/posts with a query string on the agent key",
     );
   });
@@ -370,7 +370,7 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
   test("channelClaim POSTs /channel/claims on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelClaim\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelClaim\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims",\s*payload,\s*agentKey\(\)/,
       "channelClaim must POST /api/v1/channel/claims with the agent key",
     );
   });
@@ -378,7 +378,7 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
   test("channelRelease POSTs /channel/claims/release on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelRelease\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/release",[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelRelease\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/release",[\s\S]*?agentKey\(\)/,
       "channelRelease must POST /api/v1/channel/claims/release with the agent key",
     );
   });
@@ -386,7 +386,7 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
   test("channelDone POSTs /channel/claims/done on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelDone\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/done",[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelDone\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/done",[\s\S]*?agentKey\(\)/,
       "channelDone must POST /api/v1/channel/claims/done with the agent key",
     );
   });
@@ -673,7 +673,7 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
   test("channelLock POSTs /channel/locks on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelLock\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/locks",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelLock\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/locks",\s*payload,\s*agentKey\(\)/,
       "channelLock must POST /api/v1/channel/locks with the agent key",
     );
   });
@@ -724,7 +724,7 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
   test("channelUnlock POSTs /channel/locks/release on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelUnlock\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/locks\/release",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelUnlock\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/locks\/release",\s*payload,\s*agentKey\(\)/,
       "channelUnlock must POST /api/v1/channel/locks/release with the agent key",
     );
   });
@@ -732,7 +732,7 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
   test("channelLocks GETs /channel/locks with project_id and limit on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelLocks\([\s\S]*?params\.set\("project_id", project_id\)[\s\S]*?params\.set\("limit", limit\)[\s\S]*?"GET",\s*`\/api\/v1\/channel\/locks\?\$\{params\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelLocks\([\s\S]*?params\.set\("project_id", project_id\)[\s\S]*?params\.set\("limit", limit\)[\s\S]*?"GET",\s*`\/api\/v1\/channel\/locks\?\$\{params\}`,\s*null,\s*agentKey\(\)/,
       "channelLocks must GET /api/v1/channel/locks with the agent key, forwarding project_id and limit",
     );
   });
@@ -768,7 +768,7 @@ describe("#39.7: channel_delete wiring", () => {
   test("channelDelete DELETEs /channel/posts/${post_id} on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelDelete\([\s\S]*?"DELETE",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelDelete\([\s\S]*?"DELETE",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*agentKey\(\)/,
       "channelDelete must DELETE /api/v1/channel/posts/${post_id} with the agent key",
     );
   });
@@ -807,7 +807,7 @@ describe("#40.D1: channel_get wiring + untrusted-DATA framing", () => {
   test("channelGet GETs /channel/posts/${post_id} on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelGet\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelGet\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*agentKey\(\)/,
       "channelGet must GET /api/v1/channel/posts/${post_id} with the agent key",
     );
   });
@@ -881,7 +881,7 @@ describe("#40.E1: channel_graduate wiring", () => {
   test("channelGraduate POSTs /channel/posts/${post_id}/graduate on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function channelGraduate\([\s\S]*?"POST",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}\/graduate`,\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function channelGraduate\([\s\S]*?"POST",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}\/graduate`,\s*payload,\s*agentKey\(\)/,
       "channelGraduate must POST /api/v1/channel/posts/${post_id}/graduate with the agent key",
     );
   });
@@ -921,7 +921,7 @@ describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () =>
   test("archiveKbScope DELETEs /kb-scopes/:id on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function archiveKbScope\(\{ project_id \}\)[\s\S]*?"DELETE",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function archiveKbScope\(\{ project_id \}\)[\s\S]*?"DELETE",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}`,\s*null,\s*agentKey\(\)/,
       "archiveKbScope must DELETE /api/v1/kb-scopes/:id on the agent key",
     );
   });
@@ -929,7 +929,7 @@ describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () =>
   test("restoreKbScope POSTs /kb-scopes/:id/restore on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
-      /async function restoreKbScope\(\{ project_id \}\)[\s\S]*?"POST",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}\/restore`,[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      /async function restoreKbScope\(\{ project_id \}\)[\s\S]*?"POST",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}\/restore`,[\s\S]*?agentKey\(\)/,
       "restoreKbScope must POST /api/v1/kb-scopes/:id/restore on the agent key",
     );
   });
@@ -1270,7 +1270,7 @@ describe("#730: knowledge_assert_conflict wiring", () => {
         "and would 422 on an unflagged pair, which is the whole bug this closes",
     );
     assert.doesNotMatch(body, /conflicts\/resolve/);
-    assert.match(body, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.match(body, /agentKey\(\)/);
   });
 
   test("optional fields are omitted rather than sent as undefined", () => {
@@ -1285,7 +1285,7 @@ describe("#730: knowledge_assert_conflict wiring", () => {
   // verdict, not only on an asserted pair.
   test("knowledge_resolve_conflict does not escalate to the orchestrator key", () => {
     const body = functionSource("knowledgeResolveConflict");
-    assert.match(body, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.match(body, /agentKey\(\)/);
     assert.doesNotMatch(
       body,
       /process\.env\.LOOPCTL_ORCH_KEY/,

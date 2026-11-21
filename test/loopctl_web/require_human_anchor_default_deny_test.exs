@@ -291,6 +291,13 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # key, project-scoped by membership — NOT chain-of-custody, so
                # deliberately outside the human-anchor tier gate (owner decision #331).
                {:post, "/api/v1/channel/claims"},
+               # US-52.13 holder heartbeat and end. REGISTER stays human-anchored
+               # (HolderController mounts RequireHumanAnchor on :create), so an
+               # agent-rooted tenant never holds a holder credential; these two
+               # answer only that credential (any other caller is 404), and ending
+               # a session it cannot open would strand nothing but its own lease.
+               {:post, "/api/v1/holders/:id/heartbeat"},
+               {:post, "/api/v1/holders/:id/end"},
                {:post, "/api/v1/channel/claims/release"},
                {:post, "/api/v1/channel/claims/done"},
                # US-40.4 Repo Coordination Bus ADVISORY FILE SOFT-LOCK surface —

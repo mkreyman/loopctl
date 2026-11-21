@@ -43,6 +43,11 @@ defmodule Loopctl.Auth.ApiKey do
     field :revoked_at, :utc_datetime_usec
     field :sth_bootstrap_consumed_at, :utc_datetime_usec
 
+    # The holder (session) this key is the credential of, US-52.13. Set programmatically by
+    # `Loopctl.Holders`, never cast: a caller naming its own holder would claim another
+    # session's identity.
+    field :holder_id, :binary_id
+
     timestamps()
   end
 
@@ -94,6 +99,10 @@ defmodule Loopctl.Auth.ApiKey do
     |> unique_constraint([:tenant_id, :agent_id],
       name: :api_keys_one_role_per_agent_idx,
       message: "agent already has an active key with this role"
+    )
+    |> unique_constraint(:holder_id,
+      name: :api_keys_one_live_key_per_holder_idx,
+      message: "holder already has a live credential"
     )
   end
 

@@ -165,7 +165,7 @@ describe("chg findings wiring in index.js", () => {
   test("the list reads with LOOPCTL_AGENT_KEY as an override, never pinned", () => {
     const body = handler("chgFindingsRead");
 
-    assert.match(body, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.match(body, /agentKey\(\)/);
     assert.match(body, /chgFindings\(args,/);
     assert.doesNotMatch(body, /exactKey/);
   });

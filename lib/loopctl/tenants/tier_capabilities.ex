@@ -104,7 +104,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
     {:dispatch, :human_anchored,
      "Minting per-dispatch ephemeral keys and lineage paths (L4), and PLACING a queued " <>
        "story on a runner — which mints a session dispatch, claims the story under it and " <>
-       "pushes. Reading your own dispatches stays open."},
+       "pushes, and registering a session as a holder (US-52.13), which mints the " <>
+       "session's own credential. Reading your own dispatches stays open, and so do a " <>
+       "holder's heartbeat and end."},
     {:runner_pool, :human_anchored,
      "Enrolling and revoking agent delivery loop runners (#801): a runner is a machine " <>
        "that executes dispatched sessions, so admitting one is an execution root. Listing " <>
@@ -179,7 +181,10 @@ defmodule Loopctl.Tenants.TierCapabilities do
       # (the same L4 act this surface is about), and additionally claims the story and pushes
       # to the runner. Placed here rather than under `runner_pool`: that surface is about
       # ADMITTING a machine, and this is about minting a credential for a session on one.
-      "LoopctlWeb.DispatchPlacementController"
+      "LoopctlWeb.DispatchPlacementController",
+      # US-52.13 — registering a session holder mints that session's credential, the same
+      # act as minting a dispatch key. Heartbeat and end are not gated.
+      "LoopctlWeb.HolderController"
     ],
     runner_pool: ["LoopctlWeb.RunnerController"],
     issue_intake: [
