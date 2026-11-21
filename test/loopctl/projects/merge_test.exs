@@ -272,13 +272,162 @@ defmodule Loopctl.Projects.MergeTest do
       assert entry.metadata["target_id"] == kb.id
       assert entry.metadata["counts"]["stories"] == 1
 
-      assert [_] =
+      assert [promotion] =
                AdminRepo.all(
                  from a in AuditLog,
                    where:
                      a.tenant_id == ^t.id and a.entity_id == ^kb.id and
                        a.action == "kind_promoted"
                )
+
+      assert promotion.old_state["kind"] == "kb"
+      assert promotion.new_state["kind"] == "work"
+    end
+  end
+
+  describe "intake sources keep their repo (#1113)" do
+    # A work project holding acme/widgets with a live pr source for it.
+    defp widgets(tenant) do
+      project = fixture(:project, %{tenant_id: tenant.id, repo_url: nil})
+
+      {_secret, source} =
+        fixture(:intake_source, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          repo_full_name: "acme/widgets"
+        })
+
+      {AdminRepo.get!(Project, project.id), source}
+    end
+
+    test "a target holding another repo is refused and nothing moves" do
+      t = fixture(:tenant)
+      {source_project, source} = widgets(t)
+      target = fixture(:project, %{tenant_id: t.id, repo_url: "acme/infra"})
+
+      assert {:error, {:merge_strands_source, source.id, "acme/widgets"}} ==
+               Merge.merge_into(t.id, source_project.id, target.id)
+
+      assert project_of(Source, source.id) == source_project.id
+      assert AdminRepo.get!(Project, source_project.id).status == :active
+    end
+
+    test "dry_run applies the same refusal" do
+      t = fixture(:tenant)
+      {source_project, source} = widgets(t)
+      target = fixture(:project, %{tenant_id: t.id, repo_url: "acme/infra"})
+
+      assert {:error, {:merge_strands_source, source_id, _}} =
+               Merge.merge_into(t.id, source_project.id, target.id, dry_run: true)
+
+      assert source_id == source.id
+    end
+
+    test "a target holding the same repo in another spelling merges" do
+      t = fixture(:tenant)
+      {source_project, source} = widgets(t)
+      # The source project gives up the repo so the target can hold it beside it.
+      AdminRepo.update_all(from(p in Project, where: p.id == ^source_project.id),
+        set: [repo_url: nil, repo_key: nil]
+      )
+
+      target = fixture(:project, %{tenant_id: t.id, repo_url: "git@github.com:acme/widgets.git"})
+
+      assert {:ok, %{promoted: false}} = Merge.merge_into(t.id, source_project.id, target.id)
+      assert project_of(Source, source.id) == target.id
+    end
+
+    test "a repo-less target claims the sources' repo and resolves by it" do
+      t = fixture(:tenant)
+      {source_project, source} = widgets(t)
+      target = fixture(:project, %{tenant_id: t.id, kind: :kb, repo_url: nil})
+
+      assert {:ok, %{promoted: true}} = Merge.merge_into(t.id, source_project.id, target.id)
+
+      merged = AdminRepo.get!(Project, target.id)
+      assert merged.repo_key == "github.com/acme/widgets"
+      assert merged.kind == :work
+      assert project_of(Source, source.id) == target.id
+
+      assert {:ok, %{id: resolved}, :repo_url} =
+               Projects.resolve_project(t.id, repo_url: "https://github.com/acme/widgets")
+
+      assert resolved == target.id
+    end
+
+    test "a repo-less target cannot claim a repo a third project holds; the merge rolls back" do
+      t = fixture(:tenant)
+      {source_project, source} = widgets(t)
+      # The source project lets go of the repo, and a third project takes it.
+      AdminRepo.update_all(from(p in Project, where: p.id == ^source_project.id),
+        set: [repo_url: nil, repo_key: nil]
+      )
+
+      holder = fixture(:project, %{tenant_id: t.id, repo_url: "acme/widgets"})
+      target = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+      assert {:error, {:repo_has_project, holder.id}} ==
+               Merge.merge_into(t.id, source_project.id, target.id)
+
+      assert project_of(Source, source.id) == source_project.id
+      assert AdminRepo.get!(Project, source_project.id).status == :active
+      assert is_nil(AdminRepo.get!(Project, target.id).repo_key)
+    end
+
+    test "dry_run refuses a repo a third project holds, as the merge would" do
+      t = fixture(:tenant)
+      {source_project, _source} = widgets(t)
+
+      AdminRepo.update_all(from(p in Project, where: p.id == ^source_project.id),
+        set: [repo_url: nil, repo_key: nil]
+      )
+
+      holder = fixture(:project, %{tenant_id: t.id, repo_url: "acme/widgets"})
+      target = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+      assert {:error, {:repo_has_project, holder.id}} ==
+               Merge.merge_into(t.id, source_project.id, target.id, dry_run: true)
+    end
+
+    test "the claim is audited on the target with the repo's old and new values" do
+      t = fixture(:tenant)
+      {source_project, _source} = widgets(t)
+      target = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+      assert {:ok, %{promoted: false}} = Merge.merge_into(t.id, source_project.id, target.id)
+
+      assert [entry] =
+               AdminRepo.all(
+                 from a in AuditLog,
+                   where:
+                     a.tenant_id == ^t.id and a.entity_id == ^target.id and
+                       a.action == "repo_claimed"
+               )
+
+      assert entry.old_state["repo_url"] == nil
+      assert entry.new_state["repo_url"] == "https://github.com/acme/widgets"
+      assert entry.new_state["repo_key"] == "github.com/acme/widgets"
+      assert entry.metadata["merged_from"] == source_project.id
+    end
+
+    test "revoked and ledger sources never block" do
+      t = fixture(:tenant)
+      {source_project, source} = widgets(t)
+
+      AdminRepo.update_all(from(s in Source, where: s.id == ^source.id),
+        set: [revoked_at: DateTime.utc_now()]
+      )
+
+      fixture(:ledger_source, %{
+        tenant_id: t.id,
+        project_id: source_project.id,
+        repo_full_name: "acme/other"
+      })
+
+      target = fixture(:project, %{tenant_id: t.id, repo_url: "acme/infra"})
+
+      assert {:ok, _} = Merge.merge_into(t.id, source_project.id, target.id)
+      assert AdminRepo.get!(Project, target.id).repo_key == "github.com/acme/infra"
     end
   end
 

@@ -247,7 +247,11 @@ defmodule LoopctlWeb.ProjectController do
         "naming :id. User role on a human-anchored tenant. dry_run: true returns the per-table " <>
         "counts and conflicts and writes nothing. A repeat call on an already-merged source " <>
         "returns already_merged and moves only rows written to it since. A :project token " <>
-        "budget moves with the rows.",
+        "budget moves with the rows. A live pr or chg intake source on :id must keep its " <>
+        "repo: a target that names another repo is refused 409 merge_strands_intake_source " <>
+        "(error.intake_source_id), and a target that names no repo claims the sources' repo " <>
+        "(refused 409 repo_already_has_project when another active project holds it). " <>
+        "dry_run applies the same refusals.",
     parameters: [id: [in: :path, type: :string, description: "Source project UUID"]],
     request_body:
       {"Merge params", "application/json",
@@ -267,8 +271,11 @@ defmodule LoopctlWeb.ProjectController do
       404 => {"Source or target not in your tenant", "application/json", Schemas.ErrorResponse},
       409 =>
         {"merge_conflicts: both projects hold a row under one per-project unique key; " <>
-           "error.conflicts lists each (table, index, source_row_id, target_row_id). Nothing " <>
-           "was moved.", "application/json", Schemas.ErrorResponse},
+           "error.conflicts lists each (table, index, source_row_id, target_row_id). " <>
+           "merge_strands_intake_source: a live pr/chg intake source on :id names a repo " <>
+           "the target does not hold. repo_already_has_project: a repo-less target would " <>
+           "claim a repo another active project holds. Nothing was moved.", "application/json",
+         Schemas.ErrorResponse},
       422 =>
         {"Same project, an archived target, or an archived source not merged into this target",
          "application/json", Schemas.ErrorResponse},
@@ -627,6 +634,28 @@ defmodule LoopctlWeb.ProjectController do
             conflicts: conflicts
           }
         })
+
+      {:error, {:merge_strands_source, intake_source_id, repo}} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          error: %{
+            status: 409,
+            code: "merge_strands_intake_source",
+            intake_source_id: intake_source_id,
+            message:
+              "Live intake source #{intake_source_id} routes #{repo} to the source project, " <>
+                "and the target does not hold that repo, so its escalations would reach a " <>
+                "channel no session in #{repo} reads. Merge into the project that holds " <>
+                "#{repo}, or revoke that source first (intake_source_revoke). Nothing was moved."
+          }
+        })
+
+      {:error, {:repo_has_project, _holder_id}} = refusal ->
+        refusal
+
+      {:error, %Ecto.Changeset{}} = invalid ->
+        invalid
 
       {:error, :not_found} ->
         {:error, :not_found}
