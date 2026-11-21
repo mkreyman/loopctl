@@ -82,6 +82,9 @@ defmodule LoopctlRunner.TriageRunTest do
     assert_received {:judged, ^repo, "master"}
     tree = Worktree.triage_tree_path(ctx.config.runs_dir, repo)
     assert git!(tree, ["rev-parse", "HEAD"]) == shipped
+    # Origin's base is the commit cut at, never a verify head the result would carry.
+    assert {:ok, state} = RunStateRead.read(result.run_dir)
+    refute Map.has_key?(state, "judged_head")
   end
 
   test "a dispatch naming no base judges the checkout's commit", ctx do

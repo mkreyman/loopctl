@@ -540,13 +540,13 @@ defmodule LoopctlRunner.TriageRun do
   end
 
   defp prepare_and_judge(config, triage, repo, run_dir, run_id, trace, seq, opts) do
-    commit = cut_at(triage, opts)
+    head = cut_at(triage, opts)
 
     with {:ok, name, path} <- checkout(config, repo),
          :ok <- budgets(config, opts),
          {:ok, opts} <- spec_tune_context(config, triage, run_dir, opts),
          :ok <- fetch_head(path, triage, trace, seq, opts),
-         {:ok, commit} <- judged_commit(path, commit, trace, seq, opts),
+         {:ok, commit} <- judged_commit(path, head, trace, seq, opts),
          {:ok, tokens} <- tokens(run_dir, opts),
          {:ok, tree} <-
            detached_tree(config, path, commit, run_dir, run_id, trace, seq, opts[:owner]) do
@@ -574,7 +574,7 @@ defmodule LoopctlRunner.TriageRun do
           end)
 
         with {:ok, prompt} <- prompt,
-             :ok <- judged_head(tree, commit, run_dir, trace, seq) do
+             :ok <- judged_head(tree, head, run_dir, trace, seq) do
           opts = if verify?(opts), do: Keyword.put(opts, :verify_subject, triage), else: opts
           judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts)
         end
@@ -584,8 +584,9 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  # The commit a verify run's tree is cut at: the dispatch's head. Every other run cuts at the
-  # checkout's own commit (nil).
+  # A verify run's HEAD: the dispatch's head, the commit its tree is cut at and must read as
+  # (`judged_head/5`). Every other run has none (nil); the commit its tree is cut at is
+  # `judged_commit/5`'s.
   defp cut_at(%{"verify" => %{"head_sha" => head}}, opts) do
     if verify?(opts), do: head
   end
@@ -1134,7 +1135,8 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  # `commit` nil is the checkout's own; a verify run's is the pull request's head.
+  # `commit` nil is the checkout's own; otherwise origin's base (`judged_commit/5`) or, for a
+  # verify run, the pull request's head.
   defp cut(path, %{shared?: true, path: tree}, commit),
     do: tree_result(Worktree.refresh_detached(path, tree, commit))
 

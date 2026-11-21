@@ -162,8 +162,9 @@ defmodule LoopctlRunner.Worktree do
     with {:ok, sha} <- cut_commit(repo_path, commit), do: add_detached(repo_path, path, sha)
   end
 
-  # The commit a detached tree is cut at: the checkout's own (triage, reply_draft), or `commit`
-  # (verify, US-48.18), which must already be in the repository — `fetch_commit/4` brings it — and
+  # The commit a detached tree is cut at: the checkout's own when `commit` is nil, or `commit`
+  # (origin's base for triage and reply_draft, `judged_commit/3`; the head for verify, US-48.18),
+  # which must already be in the repository — `fetch_commit/4` brings it — and
   # is resolved to the COMMIT it names, so a caller compares what it asked for with what it got.
   defp cut_commit(repo_path, nil), do: head_commit(repo_path)
 
