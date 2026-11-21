@@ -974,49 +974,25 @@ defmodule Loopctl.Runners do
   finds a free slot (`Loopctl.Runners.Selection`), while `dispatch/3` and
   `Loopctl.Delivery.Placement` refuse an exhausted machine beside the push.
 
-  Last, and the only part that reads the database for a declaring runner: whether this
-  CONNECTION already refused a `kind` dispatch for `repo` for a configuration reason
-  (`DispatchLedger.config_refused/5`, #1020). Such a refusal is repeated on every pass until
-  the runner reconnects, so the runner is not selected for that pair until it does:
-  `{:error, :refused_since_join}`. A meta with no `joined_at` has no connection to bound the
-  memory by, and is judged without it.
-
-  `:ok`, or
-  `{:error, :runner_draining | :repo_not_allowed | :kind_not_supported | :refused_since_join}`.
+  `:ok`, or `{:error, :runner_draining | :repo_not_allowed | :kind_not_supported}`.
   """
   @spec accepts?(Ecto.UUID.t(), Ecto.UUID.t(), map(), String.t(), String.t()) ::
-          :ok
-          | {:error,
-             :runner_draining | :repo_not_allowed | :kind_not_supported | :refused_since_join}
+          :ok | {:error, :runner_draining | :repo_not_allowed | :kind_not_supported}
   def accepts?(tenant_id, runner_id, meta, kind, repo)
       when is_binary(kind) and is_binary(repo) do
     cond do
-      not accepting_work?(meta) ->
-        {:error, :runner_draining}
-
-      not repo_allowed?(meta, repo) ->
-        {:error, :repo_not_allowed}
-
-      true ->
-        with :ok <- kind_supported(tenant_id, runner_id, meta, kind),
-             do: not_refused_since_join(tenant_id, runner_id, meta, kind, repo)
+      not accepting_work?(meta) -> {:error, :runner_draining}
+      not repo_allowed?(meta, repo) -> {:error, :repo_not_allowed}
+      true -> kind_supported(tenant_id, runner_id, meta, kind)
     end
   end
-
-  defp not_refused_since_join(tenant_id, runner_id, %{joined_at: %DateTime{} = at}, kind, repo) do
-    case DispatchLedger.config_refused(tenant_id, runner_id, kind, repo, at) do
-      nil -> :ok
-      _reason -> {:error, :refused_since_join}
-    end
-  end
-
-  defp not_refused_since_join(_tenant_id, _runner_id, _meta, _kind, _repo), do: :ok
 
   @doc """
   The configuration refusals each connected runner of `tenant_id` gave on its live connection,
-  as `%{runner_id => [%{kind, repo, reason, refused_at}]}` — the pairs `accepts?/5` is
-  withholding until the runner reconnects (#1020). The live connection is the newest-joined
-  socket of the runner, the one `GET /api/v1/runners/pool` shows.
+  as `%{runner_id => [%{kind, repo, reason, refused_at}]}` — the pairs
+  `Loopctl.Runners.Selection` withholds until the runner reconnects (#1020). ONE ledger read
+  for the whole tenant. The live connection is the newest-joined socket of the runner, the one
+  `GET /api/v1/runners/pool` shows.
   """
   @spec config_refusals(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [map()]}
   def config_refusals(tenant_id) when is_binary(tenant_id) do

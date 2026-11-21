@@ -1,16 +1,16 @@
 defmodule Loopctl.Repo.Migrations.AddRunnerConfigRefusalIndex do
   @moduledoc """
   Issue #1020: the partial index behind the configuration-refusal memory
-  (`Loopctl.Runners.DispatchLedger.config_refused/5`), which `Loopctl.Runners.accepts?/5`
-  asks for every connected runner of every unattended pass. No column, constraint or policy
-  changes; no backfill and no manual step.
+  (`Loopctl.Runners.DispatchLedger.config_refusals/2`), which `Loopctl.Runners.Selection`
+  reads once per selection in every unattended pass and the pool reads on every poll. No
+  column, constraint or policy changes; no backfill and no manual step.
 
   The same reasoning as `20260919100000`'s `kind_not_supported` index: `runner_dispatches` has
   no age-based retention, and the common answer is NO MATCH, which on the general
   `(tenant_id, runner_id)` index costs a read of every dispatch the runner ever held. PARTIAL on
   the refusal reasons the memory reads, so the index holds a handful of rows. The query names
   those reasons as LITERALS so the planner can prove the predicate (see the note in
-  `config_refused/5`).
+  `config_refusals/2`).
 
   Built `CONCURRENTLY` behind the same validity guard as `20260919100000`, for the same reason:
   a plain build blocks every dispatch insert, and an interrupted concurrent build leaves an

@@ -291,7 +291,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
            "not sent it again, and the pass says why",
          ctx do
       story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
-      repo = story_repo(ctx, story.id)
+      # Recorded in another case than the source names it: the hold is case-insensitive, as
+      # `Runners.accepts?/5` is on a declared `repos` list.
+      repo = String.upcase(story_repo(ctx, story.id))
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
       write_refusal(ctx, story.id, repo, "branch_not_allowed")
 
@@ -301,7 +303,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         end)
 
       refute_push "dispatch", _pushed
-      assert log =~ "held out until they reconnect"
+      assert log =~ "held out of these (kind, repo) pairs until they reconnect"
 
       assert log =~
                "runner_id=#{ctx.runner.id} kind=triage repo=#{repo} reason=branch_not_allowed"
@@ -332,6 +334,18 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
       write_refusal(ctx, story.id, "mkreyman/elsewhere", "repo_not_allowed")
+
+      assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      leave_channel(channel)
+    end
+
+    test "a configuration refusal of ANOTHER kind for this repository does not hold it out",
+         ctx do
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      channel = join_runner(ctx, %{"kinds" => ["triage", "implement"]})
+      write_refusal(ctx, story.id, story_repo(ctx, story.id), "branch_not_allowed", "implement")
 
       assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
       assert_push "dispatch", _pushed, @reply_timeout
@@ -642,7 +656,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   # A triage dispatch the runner REFUSED, as `record_reply/3` leaves one: replied now, its slot
   # given straight back.
-  defp write_refusal(ctx, story_id, repo, reason) do
+  defp write_refusal(ctx, story_id, repo, reason, kind \\ "triage") do
     now = DateTime.utc_now()
 
     AdminRepo.insert_all(Loopctl.Runners.DispatchRecord, [
@@ -652,7 +666,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         dispatch_id: Ecto.UUID.generate(),
         story_id: story_id,
         claim_epoch: 0,
-        kind: "triage",
+        kind: kind,
         repo: repo,
         status: "refused",
         reason: reason,

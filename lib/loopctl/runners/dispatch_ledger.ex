@@ -216,7 +216,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       # re-deriving one from a declaration the machine may have changed since.
       branch: dispatch.branch,
       # The repository the first push named, never rewritten, for the configuration-refusal
-      # memory (`config_refused/5`).
+      # memory (`config_refusals/2`).
       repo: Map.get(dispatch, :repo),
       status: "sent",
       # THE BASE BRANCH IS BOUND AT PLACEMENT: the one this implement dispatch is placed
@@ -587,45 +587,14 @@ defmodule Loopctl.Runners.DispatchLedger do
   def config_refusal_reasons, do: @config_refusal_reasons
 
   @doc """
-  The configuration reason `runner_id` gave for refusing a `kind` dispatch for `repo` at or
-  after `since`, or nil (#1020). `since` is the `joined_at` of the runner's live connection, so
-  the memory lasts exactly as long as that connection: a reconnect, which is how a config change
-  reaches loopctl, clears it. The newest such refusal wins.
-
-  `repo` is compared case-insensitively, the rule `Loopctl.Runners.accepts?/5` applies to a
-  declared `repos` list. A row older than the `repo` column holds NULL and matches nothing.
-
-  Served by the partial index `runner_dispatches_config_refusal_idx`; the reasons are LITERALS
-  for the planner proof described at `kind_unsupported?/3`. `config_refusal_reasons/0` is the
-  same list, and a test asserts each of its reasons is remembered here.
-  """
-  @spec config_refused(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), String.t(), DateTime.t()) ::
-          String.t() | nil
-  def config_refused(tenant_id, runner_id, kind, repo, %DateTime{} = since)
-      when is_binary(tenant_id) and is_binary(runner_id) and is_binary(kind) and
-             is_binary(repo) do
-    wanted = String.downcase(repo)
-
-    {:ok, reason} =
-      in_tenant(tenant_id, fn ->
-        Repo.one(
-          from r in config_refusals_query(tenant_id),
-            where: r.runner_id == ^runner_id and r.kind == ^kind,
-            where: fragment("lower(?)", r.repo) == ^wanted,
-            where: r.replied_at >= ^since,
-            order_by: [desc: r.replied_at],
-            limit: 1,
-            select: r.reason
-        )
-      end)
-
-    reason
-  end
-
-  @doc """
   Every configuration refusal the tenant's runners gave on their live connections, as
   `%{runner_id => [%{kind, repo, reason, refused_at}]}`, newest per (kind, repo): what
-  `GET /api/v1/runners/pool` shows and the unattended pass logs (#1020). `joined` maps each
+  `GET /api/v1/runners/pool` shows, the unattended selection holds out and its pass logs
+  (#1020). The memory lasts exactly as long as the connection: a reconnect, which is how a
+  config change reaches loopctl, clears it. A row older than the `repo` column holds NULL and
+  is skipped. Served by the partial index `runner_dispatches_config_refusal_idx`; the reasons
+  are LITERALS for the planner proof described at `kind_unsupported?/3`, and a test asserts
+  each of `config_refusal_reasons/0` is read here. `joined` maps each
   connected runner to the `joined_at` of its live connection; a runner absent from it, or with
   no refusal since, is absent from the answer.
   """

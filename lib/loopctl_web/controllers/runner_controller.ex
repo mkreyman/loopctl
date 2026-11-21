@@ -586,7 +586,7 @@ defmodule LoopctlWeb.RunnerController do
       specs: declared_specs(meta),
       suppressed_kinds: Runners.suppressed_kinds(meta),
       unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), []),
-      # What `Runners.accepts?/5` is withholding from this connection (#1020), read by the
+      # What `Runners.Selection` withholds from this connection (#1020), read by the
       # same ledger query it decides on.
       refused_since_join: Map.get(refused, Map.get(meta, :runner_id), []),
       # The SAME effective value placement decides on (`Loopctl.Runners.Usage`), so a machine

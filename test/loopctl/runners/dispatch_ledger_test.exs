@@ -355,7 +355,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
   end
 
-  describe "config_refused/5 and config_refusals/2 (#1020)" do
+  describe "config_refusals/2 (#1020)" do
     defp refused(runner, reason, attrs \\ %{}) do
       record = sent(runner, attrs)
 
@@ -371,41 +371,33 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     defp before_now, do: DateTime.add(DateTime.utc_now(), -60, :second)
 
-    test "every configuration reason is remembered for its kind and repository",
+    defp listed(runner, since),
+      do:
+        Map.get(
+          DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => since}),
+          runner.id,
+          []
+        )
+
+    test "every configuration reason is remembered with its kind and repository",
          %{runner: runner} do
-      for reason <- DispatchLedger.config_refusal_reasons() do
-        repo = "acme/#{reason}"
-        since = before_now()
-        _ = refused(runner, reason, %{"repo" => repo})
+      since = before_now()
 
-        assert DispatchLedger.config_refused(
-                 runner.tenant_id,
-                 runner.id,
-                 "implement",
-                 repo,
-                 since
-               ) ==
-                 reason
+      for reason <- DispatchLedger.config_refusal_reasons(),
+          do: refused(runner, reason, %{"repo" => "acme/#{reason}"})
 
-        # Case-insensitively, as `Runners.accepts?/5` compares a declared `repos` list.
-        assert DispatchLedger.config_refused(
-                 runner.tenant_id,
-                 runner.id,
-                 "implement",
-                 String.upcase(repo),
-                 since
-               ) == reason
+      remembered = Map.new(listed(runner, since), &{&1.repo, {&1.kind, &1.reason}})
 
-        refute DispatchLedger.config_refused(runner.tenant_id, runner.id, "triage", repo, since)
+      for reason <- DispatchLedger.config_refusal_reasons(),
+          do: assert(remembered["acme/#{reason}"] == {"implement", reason}, reason)
+    end
 
-        refute DispatchLedger.config_refused(
-                 runner.tenant_id,
-                 runner.id,
-                 "implement",
-                 "acme/other",
-                 since
-               )
-      end
+    test "one repository in two cases is one pair, the newest refusal", %{runner: runner} do
+      since = before_now()
+      _ = refused(runner, "repo_not_allowed", %{"repo" => "Acme/Widgets"})
+      _ = refused(runner, "branch_not_allowed", %{"repo" => "acme/widgets"})
+
+      assert [%{repo: "acme/widgets", reason: "branch_not_allowed"}] = listed(runner, since)
     end
 
     test "every remembered reason is one a runner may give" do
@@ -417,14 +409,6 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       _ = refused(runner, "branch_not_allowed")
       rejoined = DateTime.add(DateTime.utc_now(), 1, :second)
 
-      refute DispatchLedger.config_refused(
-               runner.tenant_id,
-               runner.id,
-               "implement",
-               "acme/widgets",
-               rejoined
-             )
-
       assert DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => rejoined}) == %{}
     end
 
@@ -433,14 +417,6 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
       for reason <- ~w(draining at_capacity insufficient_disk dispatches_disabled other),
           do: refused(runner, reason)
-
-      refute DispatchLedger.config_refused(
-               runner.tenant_id,
-               runner.id,
-               "implement",
-               "acme/widgets",
-               since
-             )
 
       assert DispatchLedger.config_refusals(runner.tenant_id, %{runner.id => since}) == %{}
     end
@@ -467,14 +443,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       since = before_now()
       _ = refused(runner, "branch_not_allowed")
 
-      refute DispatchLedger.config_refused(
-               other_tenant.id,
-               runner.id,
-               "implement",
-               "acme/widgets",
-               since
-             )
-
+      assert [%{reason: "branch_not_allowed"}] = listed(runner, since)
       assert DispatchLedger.config_refusals(other_tenant.id, %{runner.id => since}) == %{}
     end
 

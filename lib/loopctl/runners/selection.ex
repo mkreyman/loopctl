@@ -62,14 +62,33 @@ defmodule Loopctl.Runners.Selection do
   end
 
   # The connected runners whose OWN declaration admits the dispatch, read from the meta of the
-  # sole socket a push would reach. In memory, apart from `accepts?/5`'s ledger fallback for a
-  # runner that declared no kinds.
+  # sole socket a push would reach, less those holding a configuration refusal of this kind for
+  # this repository from that connection (#1020). The declaration is judged in memory, apart
+  # from `accepts?/5`'s ledger fallback for a runner that declared no kinds; the refusals are
+  # ONE ledger read for the tenant (`Runners.config_refusals/1`), made only when some runner
+  # is accepting.
   defp accepting_ids(tenant_id, kind, repo) do
-    for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
-        runner_id = Map.get(meta, :runner_id),
-        is_binary(runner_id),
-        Runners.accepts?(tenant_id, runner_id, meta, kind, repo) == :ok,
-        do: runner_id
+    accepting =
+      for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
+          runner_id = Map.get(meta, :runner_id),
+          is_binary(runner_id),
+          Runners.accepts?(tenant_id, runner_id, meta, kind, repo) == :ok,
+          do: runner_id
+
+    case accepting do
+      [] ->
+        []
+
+      ids ->
+        held = Runners.config_refusals(tenant_id)
+        Enum.reject(ids, &held_out?(Map.get(held, &1, []), kind, repo))
+    end
+  end
+
+  # Case-insensitive on the repository, the rule `accepts?/5` applies to a declared `repos`.
+  defp held_out?(refusals, kind, repo) do
+    wanted = String.downcase(repo)
+    Enum.any?(refusals, &(&1.kind == kind and String.downcase(&1.repo) == wanted))
   end
 
   @doc """
@@ -114,7 +133,9 @@ defmodule Loopctl.Runners.Selection do
 
   # #1020: a runner held out for a configuration refusal on its live connection is the one
   # no-runner cause a person must act on (fix the config, reconnect), so it is a WARNING and
-  # names each pair. Once per tenant per pass, under the same cache key as the note above.
+  # names each pair. A FACT about the tenant, like the note above, not a diagnosis of this
+  # story: a listed pair may be for another kind or repository. Once per tenant per pass,
+  # under the same cache key.
   defp note_refusals(label, tenant_id, story_id) do
     case Runners.config_refusals(tenant_id) do
       refusals when map_size(refusals) == 0 ->
@@ -127,8 +148,9 @@ defmodule Loopctl.Runners.Selection do
           end
 
         Logger.warning(
-          "#{label}: no runner for story_id=#{story_id}; held out until they reconnect, " <>
-            "refused for configuration since joining: " <> Enum.join(pairs, "; "),
+          "#{label}: no runner for story_id=#{story_id}; the tenant has runner(s) held out of " <>
+            "these (kind, repo) pairs until they reconnect, for a configuration refusal " <>
+            "since joining: " <> Enum.join(pairs, "; "),
           tenant_id: tenant_id
         )
     end
