@@ -27,8 +27,8 @@
  * excused an assertion at the far end of the very block that disproves the claim.
  *
  * What the pinning IS for is an operator's expressed configuration. `resolveKey` in
- * `index.js` reads `LOOPCTL_API_KEY || keyOverride || LOOPCTL_ORCH_KEY` — the global
- * override wins over the key the tool names. So an operator who set `LOOPCTL_ORCH_KEY`
+ * `index.js` reads LOOPCTL_API_KEY before the tool's override (`lib/default-key.js`) — the
+ * global override wins over the key the tool names. So an operator who set `LOOPCTL_ORCH_KEY`
  * specifically for these verbs AND a `LOOPCTL_API_KEY` of some other role for everything else
  * had the orchestrator key silently discarded on precisely the calls they set it for, and paid a
  * round trip to learn it. Honouring it costs nothing and is what they asked for.

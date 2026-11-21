@@ -51,6 +51,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { memoryPath } from "../lib/http-helpers.js";
 import { createWitnessClient } from "../lib/witness-sth.js";
+import { resolveDefaultKey } from "../lib/default-key.js";
 
 const INDEX_SRC = readFileSync(
   path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "index.js"),
@@ -65,8 +66,13 @@ function getBaseUrl() {
   return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
 }
 
+// The shipped order, not a copy of it (the session's agent key is LOOPCTL_AGENT_KEY here).
 function resolveKey(keyOverride) {
-  return process.env.LOOPCTL_API_KEY || keyOverride || process.env.LOOPCTL_ORCH_KEY;
+  return resolveDefaultKey({
+    env: process.env,
+    keyOverride,
+    agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+  });
 }
 
 async function apiCall(method, apiPath, body, keyOverride) {
