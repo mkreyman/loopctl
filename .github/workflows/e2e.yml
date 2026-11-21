@@ -77,8 +77,9 @@ jobs:
     runs-on: [self-hosted, fleet-ci]
     # Inside the harness's own 120-minute run budget, plus setup.
     timeout-minutes: 140
-    # One at a time and never cancelled: a re-run takes a new run_id, so two runs never
-    # share an issue (US-52.9 failure_modes.retry).
+    # One at a time and never cancelled. Every execution mints its own run id
+    # (LoopctlE2e.Run.run_id/1: timestamp + random hex, never github.run_id, which a re-run
+    # keeps), so a re-run of this workflow never shares an issue (US-52.9 failure_modes.retry).
     concurrency:
       group: e2e
       cancel-in-progress: false
