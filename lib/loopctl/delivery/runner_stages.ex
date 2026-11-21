@@ -20,7 +20,8 @@ defmodule Loopctl.Delivery.RunnerStages do
   stopped. It is a FACT the runner reports, never a verdict it takes, so what happens to the
   story is decided here from the reason:
 
-  - `completed` — nothing. The session's own `stage` messages already said where it got to.
+  - `completed` — the session's slot goes back, whatever stage the story is at, and the
+    story is left where the session's own `stage` messages put it.
   - `wall_clock_exceeded`, `max_turns_exceeded` — an in-flight story is ESCALATED over
     `:budget_reported`, a control-only edge (`Loopctl.Delivery.StageMachine`), and the
     session's slot goes back in that transition; then the claim it ran under is ENDED as a

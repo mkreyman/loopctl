@@ -70,7 +70,8 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
 
   @index "articles_embedding_hnsw_idx"
 
-  # The restore's DDL runs CONCURRENTLY, which waits for every transaction that holds an older
+  # Every CONCURRENTLY statement this module issues itself (the restore, and the forged
+  # leftover's drop) waits for every transaction that holds an older
   # snapshot of the database to finish, the sandbox transactions of other test modules
   # included. That wait is not bounded by this module's own work, and DBConnection's default
   # 15 s timeout canceled the restore on a loaded CI runner (57014 in on_exit, PR #1127's run
@@ -324,7 +325,7 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
       with_unboxed(fn ->
         clear_read_flag()
 
-        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}", [], timeout: @ddl_timeout)
 
         # Forge the exact leftover a failed CONCURRENTLY build produces: present in the
         # catalog, marked NOT valid.

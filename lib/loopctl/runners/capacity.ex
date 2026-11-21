@@ -744,15 +744,15 @@ defmodule Loopctl.Runners.Capacity do
         select: 1
 
     # The story's stage row, under the claim this dispatch served, sits at a stage that ends a
-    # session — the same server-checkable rule a runner's `session_ended` report is held to
-    # (`StageMachine.session_ends_at/0`). Before a session end freed its slot, a session that
-    # ended `completed` at `pr_open` kept it, and when the story later reached `done` through a control-side
-    # transition (verify, merge, deploy) no runner message carries its dispatch id, so nothing
-    # released it before the wall clock ran out: about two hours of a runner taking no work
-    # (2026-11-20, the e2e verifier found no free runner).
+    # session (`StageMachine.session_ends_at/0`). A recorded session end frees the slot on its
+    # own (`implement_session_over/2`), so this clause is for the session whose `session_ended`
+    # never arrived: when its story reaches `done` through a control-side transition (verify,
+    # merge, deploy), no runner message carries its dispatch id, and without this clause
+    # nothing releases it before the wall clock runs out, about two hours of a runner taking
+    # no work (2026-11-20, the e2e verifier found no free runner).
     #
-    # IMPLEMENT dispatches only: the implement session is the one the stage row tracks, the
-    # one `session_over?/2` judges. Other kinds run while the story already sits at such a
+    # IMPLEMENT dispatches only: the implement session is the one the stage row tracks.
+    # Other kinds run while the story already sits at such a
     # stage — `reply_draft@1` drafts for a story triage left at `failed` or `escalated`, under
     # that same claim epoch — so for them a session-ending stage says nothing about whether
     # their session is over, and this rule would free a slot still in use.
