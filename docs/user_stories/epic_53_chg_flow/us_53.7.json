@@ -1,0 +1,58 @@
+{
+  "id": "US-53.7",
+  "title": "The week's measurement: PR CI median, catch-up merges, deploy provenance, master red time and reverts",
+  "epic": {"id": "epic_53", "name": "loopctl adopts the chg flow"},
+  "priority": "medium",
+  "phase": "chg_flow",
+  "story": {"as_a": "Mark, deciding whether #985 is done", "i_want_to": "read one report over a week that gives the PR CI median, the catch-up merges made without a conflict, whether every deploy came from verified/master, master's red time and the revert count", "so_that": "#985 closes on numbers, and a metric that did not move is named with its cause"},
+  "rationale": "#985's Done-when is four measured facts over a week, and nothing computes them: chg's S9 measurement script (chg/docs/design.md:424-427) is not in claude-config's bin/ or chg/bin/ (ls, 2026-11-20). The repo already has the shape for this: an offline mix task over JSON that gh fetched outside it, writing an artifact and a summary under docs/measurements (lib/mix/tasks/loopctl.gates.measure_a.ex:3-38). Merging the base only on a conflict is a standing rule (CLAUDE.md:491-530), and this report is what shows whether sessions follow it.",
+  "acceptance_criteria": [
+    {"id": "AC-53.7.1", "description": "Loopctl.ChgFlow.Report.pr_ci_median/2 returns the median wall-clock seconds (updated_at minus run_started_at) of the completed CI push runs at the head sha of each PR merged inside the window, ignoring master runs and runs outside the window."},
+    {"id": "AC-53.7.2", "description": "Report.catch_up_merges/2 returns the PR commits inside the window that have two parents, whose second parent is a master commit, and whose recorded merge-tree result is clean; a merge whose merge-tree result is a conflict is not counted."},
+    {"id": "AC-53.7.3", "description": "Report.deploys_not_from_verified/2 returns every production deployment inside the window whose sha has no successful Verify master advance run, and every Fly release inside the window whose image label is not verified-<sha>."},
+    {"id": "AC-53.7.4", "description": "Report.master_red_seconds/2 sums, over CI push runs on master ordered by completion, each interval from a failed run that follows a green one to the next successful run, clipped to the window; an interval still open at the window's end ends there and is flagged open."},
+    {"id": "AC-53.7.5", "description": "Report.revert_count/2 counts PRs labelled auto-revert that merged inside the window, and lists each with its culprit's PR from the body chg wrote."},
+    {"id": "AC-53.7.6", "description": "`mix loopctl.chg_flow.report --inputs DIR --since ISO --until ISO --out F.json --summary F.md` writes the JSON artifact and a markdown table of metric, value, target and met, reading only files in DIR and making no network call."},
+    {"id": "AC-53.7.7", "description": "A missing or unparsable input file stops the task with `missing input <name>: run scripts/chg/flow-inputs.sh <since> <until> <dir> first` and exit 1, never a partial report."},
+    {"id": "AC-53.7.8", "description": "scripts/chg/flow-inputs.sh <since> <until> <dir> writes runs.json, prs.json, pr_commits.json (each two-parent commit with its `git merge-tree --write-tree` exit status), deployments.json, verify_runs.json and fly_releases.json, each gh or flyctl call under timeout 60."}
+  ],
+  "test_cases": [
+    {"id": "TC-53.7.1", "verifies": ["AC-53.7.1"], "name": "pr_ci_median over a window: master and out-of-window runs ignored", "type": "unit", "preconditions": ["test/loopctl/chg_flow/report_test.exs, async: true; build(:...) not needed: plain maps shaped like gh run list --json output, with three merged PRs (runs of 240, 300 and 720 s), one master run and one run before the window"], "steps": ["Report.pr_ci_median(inputs, window)"], "expected_results": ["300"]},
+    {"id": "TC-53.7.2", "verifies": ["AC-53.7.2"], "name": "catch_up_merges counts clean merges of master only", "type": "unit", "preconditions": ["pr_commits with a clean merge of a master commit, a conflicted one, a merge of another branch and a one-parent commit"], "steps": ["Report.catch_up_merges(inputs, window)"], "expected_results": ["exactly the clean master merge"]},
+    {"id": "TC-53.7.3", "verifies": ["AC-53.7.3"], "name": "deploys_not_from_verified flags an unverified deployment and a hand-labelled release", "type": "unit", "preconditions": ["deployments for shas A (with a successful advance) and B (without); fly releases labelled verified-A and deployment-20261201"], "steps": ["Report.deploys_not_from_verified(inputs, window)"], "expected_results": ["B's deployment and the deployment-20261201 release, nothing for A"]},
+    {"id": "TC-53.7.4", "verifies": ["AC-53.7.4"], "name": "master_red_seconds sums red intervals and clips an open one", "type": "unit", "preconditions": ["master runs: green t0, red t1, red t2, green t3, red t4 with the window ending at t5"], "steps": ["Report.master_red_seconds(inputs, window)"], "expected_results": ["(t3 - t1) + (t5 - t4), with open: true"]},
+    {"id": "TC-53.7.5", "verifies": ["AC-53.7.5"], "name": "revert_count counts merged auto-revert PRs only", "type": "unit", "preconditions": ["prs: one merged auto-revert PR whose body carries chg's culprit marker, one closed unmerged auto-revert PR, one merged ordinary PR"], "steps": ["Report.revert_count(inputs, window)"], "expected_results": ["1, listing the culprit's PR"]},
+    {"id": "TC-53.7.6", "verifies": ["AC-53.7.6", "AC-53.7.7"], "name": "the task writes both artifacts offline, and refuses a missing input", "type": "integration", "preconditions": ["@tag :tmp_dir holding the six input files from the unit fixtures"], "steps": ["Mix.Tasks.Loopctl.ChgFlow.Report.run([...]) into tmp_dir", "run again with deployments.json removed"], "expected_results": ["both files exist; the markdown has one row per metric with its target and met column", "the second run raises Mix.Error with the exact missing-input message and writes nothing"]},
+    {"id": "TC-53.7.7", "verifies": ["AC-53.7.8"], "name": "flow-inputs.sh writes six files and records merge-tree status (stub gh, flyctl, git)", "type": "integration", "preconditions": ["@tag :tmp_dir; stub gh and flyctl answering fixed JSON; a repo with one clean and one conflicting merge of master"], "steps": ["run scripts/chg/flow-inputs.sh 2026-12-01 2026-12-08 <dir>"], "expected_results": ["six files present; pr_commits.json carries merge_tree_status 0 for the clean merge and 1 for the conflict; every stub call ran under timeout 60"]}
+  ],
+  "technical_notes": [
+    "Shape copied from Mix.Tasks.Loopctl.Gates.MeasureA (lib/mix/tasks/loopctl.gates.measure_a.ex:3-38): the network step (gh, flyctl, git fetch of refs/pull/<n>/head) is outside the task, so a run is offline and repeatable; artifacts go to docs/measurements/ beside gate_a_2026-10-19.{json,md}.",
+    "Loopctl.ChgFlow.Report is pure: every function takes the parsed inputs and the window, so the clock is an input (CLAUDE.md, Dependency Injection). The task only reads files, calls it and writes two files.",
+    "Names the inputs read: the CI workflow is `CI` (.github/workflows/ci.yml:1), the verifier `Verify master` with job advance (US-53.1), deploys are GitHub deployments in environment production (US-53.2, AC-53.2.6) and Fly releases with image label verified-<sha> (US-53.2). flyctl's releases JSON (fields carrying the image ref) is UNGROUNDED: confirm the field with a live `flyctl releases -a loopctl --json` before parsing.",
+    "Catch-up merges are read from PR commits (gh api repos/:repo/pulls/:n/commits), because PRs squash-merge (CLAUDE.md:531-532) and master's history never holds the branch's merge commits.",
+    "PR CI is the CI workflow's push run at the PR's head sha: workflows trigger on push only (ci.yml:4-12), so a PR's checks are its head's push run.",
+    "The week: it starts the day the fast commit hook merges (README build order), not the push-gate cutover, which waits on S10 and may take longer; the report states whether the cutover had happened by the window's end. The summary is posted to the loopctl channel and filed to the KB as a finding by the session that runs it."
+  ],
+  "dependencies": [
+    "US-53.2",
+    "US-53.3",
+    "US-53.4"
+  ],
+  "non_goals": [
+    "A dashboard or MCP tool for these numbers: the report is a file; no endpoint is added.",
+    "Agent-hours of CI wait and worktree ready time (chg S9's other metrics, design.md:425): not in #985's Done-when.",
+    "Fixing a metric that misses its target: a new story named in the report."
+  ],
+  "failure_modes": {"partition": "AC-53.7.7: a fetch that failed leaves an input missing, and the task refuses rather than reporting on part of the week.", "state": "AC-53.7.6: the inputs and the two artifacts are files; the task keeps nothing else.", "retry": "AC-53.7.6: the task is a pure function of its input directory and window, so a re-run writes identical artifacts.", "slow": "AC-53.7.8: every gh and flyctl call in flow-inputs.sh runs under timeout 60, so a slow API fails the fetch instead of hanging it.", "reach": "n/a: a session runs the script and the task on its own machine; nothing is dispatched or addressed."},
+  "definition_of_done": [
+    "docs/measurements/chg_flow_<end-date>.json and .md exist for the seven days after the fast commit hook merged, and the markdown shows PR CI median, catch-up merges without a conflict, deploys not from verified/master, master red time and revert count, each beside its target.",
+    "#985 is closed with that table when the first three targets are met, or kept open with each missed metric and its cause named."
+  ],
+  "defaults": [
+    "Window: seven days from the fast commit hook's merge (owner may change).",
+    "Targets: PR CI median under 300 s; zero catch-up merges without a conflict; zero deploys not from verified/master; red time and revert count reported, no target.",
+    "PR CI = the CI workflow push run at the PR's head sha (not the slowest required check)."
+  ],
+  "expected_size": {"insertions": 320, "files": 4},
+  "estimated_tokens": 300000
+}

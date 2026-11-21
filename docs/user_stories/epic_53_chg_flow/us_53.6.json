@@ -1,0 +1,57 @@
+{
+  "id": "US-53.6",
+  "title": "Cut the push gate over from shadow to chg check once S10 holds; CHG_GATE=off runs mix precommit",
+  "epic": {"id": "epic_53", "name": "loopctl adopts the chg flow"},
+  "priority": "medium",
+  "phase": "chg_flow",
+  "story": {"as_a": "session pushing a loopctl branch", "i_want_to": "have chg check judge my push once chg has been shown never to pass a push the full gate failed, with one environment variable to fall back to the full gate", "so_that": "the push gate costs what the diff can affect, and a bad chg day costs one switch, not a code change"},
+  "rationale": "chg's shadow check already runs on every loopctl push (.githooks/pre-push:83-94, :215-251), and the hook leaves mode `on` for the cutover PR to wire (:83-86). S10's criterion is at least 200 paired pushes on at least 3 machines with zero cases of chg green while the gate is red (chg/docs/shadow.md:43-46). On 2026-11-20 the loopctl log stood at 41 pushes on 1 machine, 0 misses, 14 chg-red (chg shadow report on minis), so organic pushes alone are far from it, and once the fast commit hook lands (US-53.5) a live push carries no full-gate verdict at all. Replays of master commits count (Mark, 2026-10-19, shadow.md:52), and master's CI Test keeps running the whole suite on every push (ci.yml:517-518; branch CI's test selection never applies to master), so master commits are where the evidence comes from.",
+  "acceptance_criteria": [
+    {"id": "AC-53.6.1", "description": "scripts/chg/replay-master.sh <first> <last> builds one snapshot of <first>^1 and runs `chg check --shadow --foreground --replay --sha S --base S^1` for each first-parent master commit S from <first> to <last>, oldest first (shadow.md:54-66)."},
+    {"id": "AC-53.6.2", "description": "scripts/chg/cutover-evidence.sh --hosts <h1,h2,...> --subset-since <iso8601> copies each host's ~/.chg/shadow/loopctl.jsonl over ssh, keeps a row only when its sha is a first-parent commit of origin/master or its at_ms is before --subset-since, and runs `chg shadow report --file <kept> --ci-check Test`, exiting with the report's code."},
+    {"id": "AC-53.6.3", "description": "With chg gate answering `on`, the pre-push hook runs `chg check --sha <tip> --base <nearest base>` for each pushed tip after the fleet hook passed; exit 0 lets the push go on, exit 1 or 2 stops it with `❌ chg check failed for <sha12> (exit <n>); fix it, or push once with CHG_GATE=off to run mix precommit instead`."},
+    {"id": "AC-53.6.4", "description": "When chg check exits 3 (the gate was switched off between the two calls) the hook runs the off path of AC-53.6.5 for that tip, as shadow.md:105-111 prescribes."},
+    {"id": "AC-53.6.5", "description": "With chg gate answering `off`, the pre-push hook runs `mix precommit` through claude-config bin/gate-run.sh's heavy take for each pushed tip and stops the push when it fails, so the switch back restores the full local gate that US-53.5 removed from the commit."},
+    {"id": "AC-53.6.6", "description": "After deciding a tip in mode on or off, the hook appends `chg shadow record --source hook --sha <sha> --verdict pass|fail|error --gate \"chg check\"|\"mix precommit\" --ms <ms>`, bounded like every other chg call and never changing the push's outcome."},
+    {"id": "AC-53.6.7", "description": "A chg check that runs past CHG_GATE_TIMEOUT_S seconds (default 2700) is killed, recorded as error and stops the push with the AC-53.6.3 message; mode shadow behaves exactly as before this story."},
+    {"id": "AC-53.6.8", "description": ".chg/policy.toml carries `[gate]` with `mode = \"on\"`, and the cutover PR body carries the cutover-evidence.sh output whose report exits 0."}
+  ],
+  "test_cases": [
+    {"id": "TC-53.6.1", "verifies": ["AC-53.6.1"], "name": "replay-master.sh walks first-parent commits oldest first from one snapshot (stub chg)", "type": "integration", "preconditions": ["@tag :tmp_dir; a repo with three first-parent master commits and a merged side branch; a stub chg logging argv"], "steps": ["run scripts/chg/replay-master.sh <first> <last>"], "expected_results": ["one `snapshot build . <first>^1`, then one `check --shadow --foreground --replay --sha S --base S^1` per first-parent commit in order, and none for the side branch's commits"]},
+    {"id": "TC-53.6.2", "verifies": ["AC-53.6.2"], "name": "cutover-evidence.sh keeps master and pre-subset rows only (stub ssh, stub chg)", "type": "integration", "preconditions": ["stub ssh printing a jsonl with a master-commit row, a branch row after --subset-since and a branch row before it; stub chg recording the --file it got and exiting 0"], "steps": ["run the script with --hosts a,b --subset-since 2026-12-01T00:00:00Z"], "expected_results": ["the kept file holds the master row and the early branch row from both hosts, never the late branch row", "chg was called with `shadow report --file <kept> --ci-check Test` and the script exited 0"]},
+    {"id": "TC-53.6.3", "verifies": ["AC-53.6.3", "AC-53.6.6"], "name": "mode on: chg check decides the push and its verdict is recorded (githooks_pre_push_test harness)", "type": "integration", "preconditions": ["test/loopctl/githooks_pre_push_test.exs's describe block helpers (fake fleet hook, stub chg, commit!/3); stub chg gate printing on"], "steps": ["push with chg check exiting 0", "push with chg check exiting 1", "push with chg check exiting 2"], "expected_results": ["first push exits 0; the other two exit 1 with the exact message", "each run records one `shadow record --source hook` with verdict pass, fail, error and --gate \"chg check\""]},
+    {"id": "TC-53.6.4", "verifies": ["AC-53.6.4", "AC-53.6.5"], "name": "mode off, and chg's exit 3, run mix precommit through gate-run", "type": "integration", "preconditions": ["as TC-53.6.3; a stub gate-run.sh logging its argv"], "steps": ["push with chg gate printing off and stub mix precommit exiting 1", "push with chg gate on and chg check exiting 3"], "expected_results": ["gate-run argv carries --heavy -- mix precommit in both", "the first push exits 1; each records --gate \"mix precommit\""]},
+    {"id": "TC-53.6.5", "verifies": ["AC-53.6.7"], "name": "a hung chg check is cut off and blocks; shadow is unchanged", "type": "integration", "preconditions": ["as TC-53.6.3, stub chg check sleeping; CHG_GATE_TIMEOUT_S=1"], "steps": ["push in mode on", "run the existing `pre-push, chg in shadow` cases"], "expected_results": ["the push exits 1 and records verdict error", "every existing shadow case passes unchanged"]},
+    {"id": "TC-53.6.6", "verifies": ["AC-53.6.8"], "name": "guard: the policy file turns the gate on", "type": "unit", "preconditions": ["read .chg/policy.toml"], "steps": ["parse [gate] mode"], "expected_results": ["mode == \"on\""]}
+  ],
+  "technical_notes": [
+    "Hook wiring follows chg/docs/shadow.md:98-122 verbatim in shape (the case on chg gate, exit 3 to the old gate, the hook-row record with --gate exactly `chg check` or the old gate's name, :124). Rollback is CHG_GATE=off for one push or mode = \"off\" in the policy for everyone (:126); unreadable policy resolves to off (:11).",
+    "Existing pieces reused: bounded/1 and timed_out/3 (.githooks/pre-push:59-81) for every chg call; nearest-base.sh for the base (.githooks/lib/nearest-base.sh, called at pre-push:233); gate-run.sh's heavy take, already used to queue the shadow check (pre-push:242). CHG_GATE_TIMEOUT_S is separate from CHG_HOOK_TIMEOUT_S (default 60, pre-push:53-54), which bounds the quick calls.",
+    "Why the filter in AC-53.6.2: --ci-check fills a commit no local gate judged from CI's check run of that name (shadow.md:28); once branch CI selects tests (README, Merge order) a branch push's Test check runs a subset, so pairing it with chg would compare a subset with a subset and could never show a miss. Master commits (squash merges, never a pushed branch sha) are judged by master's full Test run.",
+    "S10 also asks for 3 machines (shadow.md:45): replay slices run on minis, x1 and beelink (beelink is the main CI host, USER.md; replays run at nice 10 behind chg's shadow lock, shadow.md:17).",
+    "chg-red (chg failed, gate passed) stood at 14 of 41 on 2026-11-20. It is not an S10 criterion, but in mode on every chg-red blocks a good push; the cutover PR body reports its share and the five most frequent reasons from the report (shadow.md:28).",
+    "CHANGELOG.md: the push gate changed (operator-facing). docs/runbooks/chg-flow.md gains a `Push gate` section: the three modes, CHG_GATE=off, and how to read a blocked push."
+  ],
+  "dependencies": [
+    "US-53.5"
+  ],
+  "non_goals": [
+    "Changing S10's criteria (200 pushes, 3 machines, zero misses): chg's, shadow.md:43-46.",
+    "Running chg check on CI as the merge gate: branch CI keeps its own selection (US-53.4).",
+    "Fixing chg-red causes inside chg/: separate chg stories."
+  ],
+  "failure_modes": {"partition": "AC-53.6.7: a chg check that cannot finish (a hung hydrate, an unreachable store) is cut off and blocks the push with the CHG_GATE=off way out, never passing it.", "state": "AC-53.6.6: each decision is one hook row in the host's ~/.chg/shadow/loopctl.jsonl, appended and never rewritten; the mode lives in .chg/policy.toml or CHG_GATE.", "retry": "AC-53.6.6: a retried push records a new hook row, which chg's report pairs with its own check inside HOOK_PAIR_WINDOW_MS (shadow.md:28), so a retry never overwrites an earlier decision.", "slow": "AC-53.6.7: CHG_GATE_TIMEOUT_S bounds the gate at 2700 seconds by default.", "reach": "AC-53.6.2: the evidence script reaches each host's log over ssh by host name; a host it cannot reach is reported and leaves the count short rather than the run green."},
+  "definition_of_done": [
+    "The cutover PR body carries cutover-evidence.sh's output with all three criteria checked and the report's exit 0, plus the false-red rate over the same rows (chg failed, the full gate passed) at or under the ceiling in defaults; shadow on 2026-11-20 read 14 of 41, so each cause is fixed in chg or the adapter first.",
+    "After the merge, one push in mode on, one with CHG_GATE=off and one in mode shadow (CHG_GATE=shadow) are shown with their hook rows from `tail ~/.chg/shadow/loopctl.jsonl`."
+  ],
+  "defaults": [
+    "S10 criteria as chg defines them: >= 200 paired pushes, >= 3 machines, 0 misses (owner may change in chg).",
+    "CHG_GATE_TIMEOUT_S 2700 seconds.",
+    "False-red ceiling for the cutover: chg fails at most 5% of the paired pushes the full gate passed (owner may change); in mode on each one blocks a good push.",
+    "Replay hosts minis, x1, beelink.",
+    "The off path runs mix precommit at push time."
+  ],
+  "expected_size": {"insertions": 230, "files": 5},
+  "estimated_tokens": 320000
+}
