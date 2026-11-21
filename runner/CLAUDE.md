@@ -178,8 +178,10 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
 - **Parking is never "no writes under `subagents/`"** (design §8). See `LoopctlRunner.Liveness`.
 - **A triage run works in a DETACHED worktree, never in the operator's live checkout.** It is the
   repo's one reused tree (`Worktree.triage_tree_path/2`, under `runs_dir/.triage-trees`, so his
-  checkout gains nothing), refreshed to the commit the checkout has out by the run holding its
-  `WorktreeLock`; a run that finds it held cuts a tree of its own, removed at teardown whatever it
+  checkout gains nothing), refreshed by the run holding its `WorktreeLock` to the commit it
+  judges: `origin`'s copy of the dispatch's base, fetched first, when the checkout is behind it
+  or at it, and the checkout's own commit when it holds commits origin lacks, the fetch fails,
+  or the dispatch names no base (`Worktree.judged_commit/3`, traced as `triage.base`); a run that finds it held cuts a tree of its own, removed at teardown whatever it
   holds. Either is on no branch, recorded in `state.json` as `scratch` before it is cut, and
   removed by the reaper whatever it holds. Only a tree that is detached AND carries the runner's
   marker is ever reset; anything else at that path is moved aside, never removed, and the tree

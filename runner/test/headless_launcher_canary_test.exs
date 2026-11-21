@@ -41,9 +41,11 @@ defmodule LoopctlRunner.HeadlessLauncherCanaryTest do
         "rel"
       ])
 
+    # `--others` lists untracked files, and one another process writes and removes meanwhile (seen
+    # 2026-11-21: a `config/dev.exs` gone by the time it was read) can no longer start anything.
     offenders =
       for rel <- String.split(files, "\n", trim: true),
-          content = File.read!(Path.join(@root, rel)),
+          {:ok, content} <- [File.read(Path.join(@root, rel))],
           pattern <- @direct,
           content =~ pattern,
           do: {rel, Regex.source(pattern)}

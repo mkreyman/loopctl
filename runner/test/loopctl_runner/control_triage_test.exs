@@ -370,6 +370,27 @@ defmodule LoopctlRunner.ControlTriageTest do
       :ok = wait_until(fn -> length(RunState.all(ctx.config.runs_dir)) == 2 end, 10_000)
     end
 
+    test "is run with the dispatch's base_branch, the base it judges origin's copy of", ctx do
+      test_pid = self()
+
+      triage_run = fn config, triage, repo, opts ->
+        send(test_pid, {:base_branch, opts[:base_branch]})
+        TriageRun.execute(config, triage, repo, opts)
+      end
+
+      {_pid, topic} =
+        running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_run: triage_run)
+
+      TestLoopctl.Endpoint.broadcast(
+        topic,
+        "dispatch",
+        triage_dispatch(%{"base_branch" => "main"})
+      )
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:base_branch, "main"}, 10_000
+    end
+
     test "whose verdict its Control died before delivering is sent by the next one", ctx do
       dispatch = triage_dispatch()
       :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)

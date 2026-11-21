@@ -546,6 +546,7 @@ defmodule LoopctlRunner.TriageRun do
          :ok <- budgets(config, opts),
          {:ok, opts} <- spec_tune_context(config, triage, run_dir, opts),
          :ok <- fetch_head(path, triage, trace, seq, opts),
+         {:ok, commit} <- judged_commit(path, commit, trace, seq, opts),
          {:ok, tokens} <- tokens(run_dir, opts),
          {:ok, tree} <-
            detached_tree(config, path, commit, run_dir, run_id, trace, seq, opts[:owner]) do
@@ -618,6 +619,42 @@ defmodule LoopctlRunner.TriageRun do
   end
 
   defp fetch_head(_path, _subject, _trace, _seq, _opts), do: :ok
+
+  # A run with no commit of its own to judge (triage, reply_draft) judges origin's copy of the
+  # dispatch's base whenever the checkout is merely behind it (`Worktree.judged_commit/3`): a
+  # runner host's checkout of a repository nobody works in there is never pulled, and a report
+  # judged against it is judged against code that predates it. A verify run's commit is its head,
+  # and a dispatch that names no base keeps the checkout's commit, as before. Never refuses: a
+  # failed fetch judges the checkout and the trace says why.
+  defp judged_commit(_path, commit, _trace, _seq, _opts) when is_binary(commit), do: {:ok, commit}
+
+  defp judged_commit(path, nil, trace, seq, opts) do
+    case opts[:base_branch] do
+      base when is_binary(base) and base != "" ->
+        judged = Keyword.get(opts, :judged_commit, &Worktree.judged_commit/3)
+
+        case judged.(path, base, []) do
+          {:ok, sha, :origin} ->
+            Trace.emit(trace, "triage.base", seq, %{"source" => "origin", "commit" => sha})
+            {:ok, sha}
+
+          {:ok, sha, :checkout, why} ->
+            Trace.emit(trace, "triage.base", seq, %{
+              "source" => "checkout",
+              "commit" => sha,
+              "why" => why
+            })
+
+            {:ok, sha}
+
+          {:unreadable, _} ->
+            {:ok, nil}
+        end
+
+      _ ->
+        {:ok, nil}
+    end
+  end
 
   # A verify session's repository rules, read from the BASE in the checkout (`VerifyPrompt.
   # base_rules/2`) — never from the tree, which is the pull request's. Every other run reads none.

@@ -1887,6 +1887,7 @@ defmodule LoopctlRunner.Control do
          template: template,
          subject: subject,
          repo: dispatch["repo"],
+         base_branch: dispatch["base_branch"],
          wall_clock_s: fields.wall_clock_s,
          max_turns: fields.max_turns,
          deadline_at: fields.deadline_at
@@ -2442,6 +2443,8 @@ defmodule LoopctlRunner.Control do
                 # The run directory travels with the outcome: it is where the message this
                 # process is about to build is kept until loopctl records it, and a Control that
                 # did not start this run has no other way to learn it.
+                # The base a triage-shaped run judges origin's copy of (`TriageRun`).
+                base_branch: Map.get(work, :base_branch),
                 wall_clock_s: work.wall_clock_s,
                 max_turns: work.max_turns,
                 deadline_at: work.deadline_at,
