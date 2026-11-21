@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`PATCH /api/v1/projects/:id` refuses to move or clear `repo_url` under a live intake
+  source (2026-11-21, #1082).** While a live `pr`/`chg` source on the project names another
+  repo, a `repo_url` change, clearing included, answers `409 repo_held_by_intake_source` with
+  `error.intake_source_id`, instead of leaving that source posting escalations to a channel
+  its repo's sessions no longer resolve. `DELETE /api/v1/projects/:id` answers the same 409
+  while any live `pr`/`chg` source is bound to the project, since an archived project no
+  longer resolves by its repo either. Revoke the source first. `ledger` sources, revoked
+  sources and other edits are unaffected.
 - **`POST /api/v1/intake/sources` refuses a `pr`/`chg` source on a project that names
   another repo (2026-11-20, #1072).** A project whose `repo_url` names repo A now answers
   `422` with `details.repo_full_name` for a source on repo B, instead of binding it and

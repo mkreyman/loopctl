@@ -199,13 +199,19 @@ defmodule LoopctlWeb.ProjectController do
         "(archived included) holds is refused 422. Both are audited. A body " <>
         "carrying status is refused 422 whatever its value: archive with DELETE " <>
         "/api/v1/projects/:id (user+) and restore with POST /api/v1/projects/:id/restore. " <>
-        "A blank name is refused 422.",
+        "A blank name is refused 422. A repo_url change, clearing included, is refused 409 " <>
+        "repo_held_by_intake_source while a live pr or chg intake source on the project " <>
+        "names a different repo (error.intake_source_id); revoke that source first.",
     parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
     request_body: {"Update params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       200 => {"Updated project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => @repo_conflict,
+      409 =>
+        {"repo_already_has_project: another active project holds this repo_url " <>
+           "(error.existing_project_id). repo_held_by_intake_source: a live pr/chg intake " <>
+           "source on this project names another repo (error.intake_source_id).",
+         "application/json", Schemas.ErrorResponse},
       422 =>
         {"Validation error, or status in the body", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -272,11 +278,18 @@ defmodule LoopctlWeb.ProjectController do
 
   operation(:delete,
     summary: "Archive project",
-    description: "Archives a project (soft delete). Requires user+ role.",
+    description:
+      "Archives a project (soft delete). Requires user+ role. Refused 409 " <>
+        "repo_held_by_intake_source while a live pr or chg intake source is bound to the " <>
+        "project (error.intake_source_id): an archived project no longer resolves by its " <>
+        "repo, so the source's escalations would be stranded. Revoke that source first.",
     parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
     responses: %{
       200 => {"Archived project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"repo_held_by_intake_source: a live pr/chg intake source is bound to the project " <>
+           "(error.intake_source_id).", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -645,8 +658,8 @@ defmodule LoopctlWeb.ProjectController do
         {:ok, archived} ->
           json(conn, %{project: project_json(archived)})
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
+        {:error, _reason} = error ->
+          error
       end
     end
   end

@@ -38,7 +38,8 @@ defmodule LoopctlWeb.AdminTenantController do
   operation(:index,
     summary: "List all tenants (admin)",
     description:
-      "Lists all tenants with summary stats. Requires superadmin. " <>
+      "Lists all tenants with summary stats. Requires superadmin. Ordered by name, then id, " <>
+        "so tenants sharing a name keep one position across pages. " <>
         "`api_key_count` counts keys that can AUTHENTICATE right now: neither revoked nor " <>
         "past `expires_at` (846.8). It tested revocation alone before that.",
     parameters: [

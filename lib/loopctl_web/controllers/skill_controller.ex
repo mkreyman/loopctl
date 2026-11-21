@@ -71,7 +71,8 @@ defmodule LoopctlWeb.SkillController do
 
   operation(:index,
     summary: "List skills",
-    description: "Lists skills with pagination and filtering.",
+    description:
+      "Lists skills with pagination and filtering. Ordered by name, then id, so skills sharing a name across projects keep one position across pages.",
     parameters: [
       page: [in: :query, type: :integer, description: "Page number"],
       page_size: [in: :query, type: :integer, description: "Items per page"],

@@ -91,6 +91,31 @@ defmodule Loopctl.SkillsTest do
       assert result.total == 2
     end
 
+    test "same-name skills across projects page in id order, each exactly once" do
+      # Uniqueness is (tenant_id, project_id, name), so one tenant can hold a name per project.
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+
+      ids =
+        for _ <- 1..5 do
+          project = fixture(:project, %{tenant_id: tenant.id})
+          fixture(:skill, %{tenant_id: tenant.id, project_id: project.id, name: "shared"}).id
+        end
+
+      for _ <- 1..2 do
+        project = fixture(:project, %{tenant_id: other.id})
+        fixture(:skill, %{tenant_id: other.id, project_id: project.id, name: "shared"})
+      end
+
+      paged =
+        for page <- 1..3 do
+          {:ok, result} = Skills.list_skills(tenant.id, page: page, page_size: 2)
+          Enum.map(result.data, & &1.id)
+        end
+
+      assert List.flatten(paged) == Enum.sort(ids)
+    end
+
     test "tenant isolation" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)

@@ -456,6 +456,25 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # #1082: a live pr/chg intake source holds the project's repo, so its repo_url cannot move
+  # and the project cannot be archived.
+  # 409: the request is well-formed; the source's binding forbids it until it is revoked.
+  def call(conn, {:error, {:repo_held_by_source, source_id, repo}}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "repo_held_by_intake_source",
+        intake_source_id: source_id,
+        message:
+          "Live intake source #{source_id} routes #{repo} to this project, so the project " <>
+            "cannot let go of that repo: its repo_url cannot change or be cleared, and it " <>
+            "cannot be archived. Revoke that source first (intake_source_revoke)."
+      }
+    })
+  end
+
   # US-47.2: a switch to `chg` would strand an unconsumed PR-route allow (`Intake.update_source/4`).
   # 409: the request is well-formed; the source's stories are in a state that forbids it now.
   def call(conn, {:error, {:pr_route_in_flight, story_ids}}) when is_list(story_ids) do

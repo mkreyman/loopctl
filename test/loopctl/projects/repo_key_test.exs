@@ -161,6 +161,98 @@ defmodule Loopctl.Projects.RepoKeyTest do
     end
   end
 
+  describe "update_project/4 under a live intake source (#1082)" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, repo_url: nil})
+
+      {_secret, source} =
+        fixture(:intake_source, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          repo_full_name: "acme/widgets"
+        })
+
+      %{tenant: tenant, project: AdminRepo.get!(Project, project.id), source: source}
+    end
+
+    test "re-pointing repo_url to another repo is refused", %{tenant: t, project: p, source: s} do
+      assert p.repo_key == "github.com/acme/widgets"
+
+      assert {:error, {:repo_held_by_source, s.id, "acme/widgets"}} ==
+               Projects.update_project(t.id, p, %{repo_url: "acme/infra"})
+
+      assert AdminRepo.get!(Project, p.id).repo_key == "github.com/acme/widgets"
+    end
+
+    test "clearing repo_url is refused", %{tenant: t, project: p, source: s} do
+      for cleared <- [nil, ""] do
+        assert {:error, {:repo_held_by_source, source_id, _}} =
+                 Projects.update_project(t.id, p, %{repo_url: cleared})
+
+        assert source_id == s.id
+      end
+
+      assert AdminRepo.get!(Project, p.id).repo_key == "github.com/acme/widgets"
+    end
+
+    test "the same repo in another spelling, or no repo change, is allowed",
+         %{tenant: t, project: p} do
+      assert {:ok, same} =
+               Projects.update_project(t.id, p, %{repo_url: "git@github.com:acme/widgets.git"})
+
+      assert same.repo_key == "github.com/acme/widgets"
+      assert {:ok, renamed} = Projects.update_project(t.id, same, %{name: "widgets-renamed"})
+      assert renamed.name == "widgets-renamed"
+    end
+
+    test "archiving is refused while the source is live", %{tenant: t, project: p, source: s} do
+      assert {:error, {:repo_held_by_source, s.id, "acme/widgets"}} ==
+               Projects.archive_project(t.id, p)
+
+      assert AdminRepo.get!(Project, p.id).status == :active
+
+      {:ok, _} = Intake.revoke_source(t.id, s.id)
+      assert {:ok, %Project{status: :archived}} = Projects.archive_project(t.id, p)
+    end
+
+    test "a revoked source no longer holds the repo", %{tenant: t, project: p, source: s} do
+      {:ok, _} = Intake.revoke_source(t.id, s.id)
+
+      assert {:ok, moved} = Projects.update_project(t.id, p, %{repo_url: "acme/infra"})
+      assert moved.repo_key == "github.com/acme/infra"
+    end
+
+    test "a ledger source binds no repo and never blocks" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, repo_url: "acme/widgets"})
+
+      %{source: source} =
+        fixture(:ledger_source, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          repo_full_name: "acme/other"
+        })
+
+      assert source.mode == :ledger and is_nil(source.revoked_at)
+      project = AdminRepo.get!(Project, project.id)
+      assert {:ok, moved} = Projects.update_project(tenant.id, project, %{repo_url: "acme/infra"})
+      assert moved.repo_key == "github.com/acme/infra"
+    end
+
+    test "another tenant's live source never blocks an update", %{source: s} do
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id, repo_url: "acme/widgets"})
+
+      assert s.tenant_id != tenant_b.id
+
+      assert {:ok, moved} =
+               Projects.update_project(tenant_b.id, project_b, %{repo_url: "acme/infra"})
+
+      assert moved.repo_key == "github.com/acme/infra"
+    end
+  end
+
   describe "tenant isolation (TC-52.1.7)" do
     test "another tenant's project on the repo never blocks a create" do
       tenant_a = fixture(:tenant)
