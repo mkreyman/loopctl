@@ -41,12 +41,28 @@ defmodule LoopctlRunner.MergeRun do
   so a refusal that never clears (required reviews, strict protection) costs one wait, not a
   loop.
 
-  `forge` is `%{view: (repo, number, timeout_ms -> {:ok, map} | {:error, reason}), merge: (repo,
-  number, head_sha, timeout_ms -> :ok | {:refused, out} | {:error, reason})}`,
-  `LoopctlRunner.Forge.pull_request/4` and `merge/5` in production. Every value reported — the
-  merge sha, the moved head — is GitHub's.
+  ## A merge closes no issue
+
+  loopctl closes the issue a story came from itself, with its resolution label on BEFORE the
+  close, because the reporting system's webhook fires on the close and picks its text by the
+  label (`Loopctl.Delivery.IssueCloser`). GitHub closes an issue at a merge from a closing keyword
+  in the pull request's body or in the squash commit's message, with no label on it, and loopctl
+  then abandons its closure as somebody else's (the e2e sandbox's issue #15, 2026-11-21). So
+  before merging, the body's keywords are rewritten to `Refs` (`LoopctlRunner.ClosingKeywords`)
+  and the pull request edited when that changed it, and the merge carries the rewritten body as
+  its squash message, so no commit message the session wrote reaches the base either. A pull
+  request GitHub still links to an issue it would close (a link added by hand, which no body
+  text makes) escalates: merging would close that issue unlabelled. A failed edit is
+  `unreachable`; nothing was merged.
+
+  `forge` is `%{view: (repo, number, timeout_ms -> {:ok, map} | {:error, reason}), edit_body:
+  (repo, number, body, timeout_ms -> :ok | {:error, reason}), merge: (repo, number, head_sha,
+  body, timeout_ms -> :ok | {:refused, out} | {:error, reason})}`,
+  `LoopctlRunner.Forge.pull_request/4`, `edit_body/5` and `merge/6` in production. Every value
+  reported — the merge sha, the moved head — is GitHub's.
   """
 
+  alias LoopctlRunner.ClosingKeywords
   alias LoopctlRunner.DispatchRun
 
   @sha ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
@@ -93,14 +109,58 @@ defmodule LoopctlRunner.MergeRun do
     %{view: view, merge: merge} = ctx.forge
 
     with {:ok, pr} <- read(view, repo, number, ctx.view_ms),
-         :merge <- judge(pr, number, head, ctx.where) do
-      merged = merge.(repo, number, head, ctx.merge_ms)
+         :merge <- judge(pr, number, head, ctx.where),
+         {:ok, body} <- unlinked(pr, ctx) do
+      merged = merge.(repo, number, head, body, ctx.merge_ms)
 
       read(view, repo, number, ctx.view_ms)
       |> after_merge(merged, number, head, ctx.where)
       |> retried(ctx, retries)
     end
   end
+
+  # The squash body the merge carries, once the pull request closes no issue (see the moduledoc's
+  # "A merge closes no issue"). Its body is rewritten on GitHub only when a keyword was there,
+  # and read again to see what GitHub still links: a link no keyword makes (one added in the
+  # sidebar) is a person's to remove, so it escalates rather than merging past it.
+  defp unlinked(pr, ctx) do
+    %{"repo" => repo, "pr_number" => number} = ctx.instruction
+    body = if is_binary(pr["body"]), do: pr["body"], else: ""
+    neutral = ClosingKeywords.neutralize(body)
+
+    with {:ok, pr} <- rewritten(pr, body, neutral, ctx) do
+      case closing_issues(pr) do
+        [] ->
+          {:ok, neutral}
+
+        issues ->
+          {:escalate,
+           "pull request ##{number} of #{repo} would close #{Enum.map_join(issues, ", ", &"##{&1}")} " <>
+             "when merged, through a link its body does not make; remove that link so loopctl " <>
+             "closes the issue with its resolution"}
+      end
+    end
+  end
+
+  defp rewritten(pr, same, same, _ctx), do: {:ok, pr}
+
+  defp rewritten(_pr, _body, neutral, ctx) do
+    %{"repo" => repo, "pr_number" => number} = ctx.instruction
+
+    case ctx.forge.edit_body.(repo, number, neutral, ctx.view_ms) do
+      :ok ->
+        read(ctx.forge.view, repo, number, ctx.view_ms)
+
+      {:error, reason} ->
+        {:unreachable,
+         "could not rewrite ##{number}'s issue-closing keywords before the merge: #{reason}"}
+    end
+  end
+
+  defp closing_issues(%{"closingIssuesReferences" => refs}) when is_list(refs),
+    do: for(%{"number" => n} <- refs, is_integer(n), do: n)
+
+  defp closing_issues(_pr), do: []
 
   defp retried({:refused, _reason}, ctx, retries) when retries > 0 do
     Process.sleep(ctx.retry_after_ms)

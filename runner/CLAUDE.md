@@ -211,8 +211,12 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   the session never merges (US-48.17, after HCB PR #3938 merged itself past the gate). The merge
   is loopctl's decision: once an independent verifier passed the head and the merge gate allowed
   it, loopctl sends a `merge` instruction (contract 1.29.0) and the runner runs
-  `gh pr merge N --repo R --squash --match-head-commit SHA` and reports `ci → merged`
-  (`LoopctlRunner.MergeRun`, `Control.merge_instructed/2`). That is the only merge the runner
+  `gh pr merge N --repo R --squash --match-head-commit SHA --body BODY` and reports `ci → merged`
+  (`LoopctlRunner.MergeRun`, `Control.merge_instructed/2`). **A merge closes no issue**: loopctl
+  closes the one a story came from, with its resolution label on first, so the runner rewrites
+  the pull request body's closing keywords to `Refs` before merging, passes that text as the
+  squash body so no session commit message reaches the base, and escalates a pull request GitHub
+  still links to an issue it would close (`LoopctlRunner.ClosingKeywords`). That is the only merge the runner
   makes, and only for a run it holds at that claim epoch. The branch and the worktree stay the
   runner's: the pr-mode prompt tells the session not to remove the worktree, delete the local
   branch or check the base out in it. The contract carries the whole ladder (`claimed → worktree →

@@ -2,7 +2,7 @@ defmodule LoopctlWeb.EndpointHttp2Test do
   @moduledoc """
   The endpoint serves no HTTP/2: `config/runtime.exs` sets `http_2_options: [enabled:
   false]`. That began as the mitigation for CVE-2026-105659 while no patched bandit
-  existed; bandit 1.14.1 is OSV-clean and the advisory ignore is gone, but the option
+  existed; bandit 1.15.0 is OSV-clean and the advisory ignore is gone, but the option
   stays (Fly's proxy speaks HTTP/1.1 to the app regardless). This builds every listener
   the way the endpoint boots it (`Bandit.PhoenixAdapter.child_specs/2` over the
   endpoint's own config) and speaks to it, so it fails if that option goes, if a
@@ -33,9 +33,10 @@ defmodule LoopctlWeb.EndpointHttp2Test do
   @deadline 30_000
   @moduletag timeout: 4 * @deadline
 
-  # The version this suite's no-ignore state was reasoned against: 1.14.1 clears the
-  # thirteen HTTP/2 and WebSocket advisories filed against 1.13.1, and OSV reports it clean.
-  @acknowledged_bandit "1.14.1"
+  # The version this suite's no-ignore state was reasoned against: 1.14.1 cleared the
+  # thirteen HTTP/2 and WebSocket advisories filed against 1.13.1, and `mix hex.audit` reports
+  # 1.15.0 (pulled in by phoenix 1.8.17, 2026-11-21) clean too.
+  @acknowledged_bandit "1.15.0"
 
   defp listeners do
     config = [

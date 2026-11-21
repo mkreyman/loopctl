@@ -552,7 +552,8 @@ defmodule LoopctlRunner.Control do
             merge_forge:
               Keyword.get(opts, :merge_forge, %{
                 view: &Forge.pull_request/3,
-                merge: &Forge.merge/4
+                edit_body: &Forge.edit_body/4,
+                merge: &Forge.merge/5
               }),
             # `MergeRun`'s options (`:retry_after_ms`, the wait before a refused merge's one
             # retry): its defaults in production, a test's own so it never sleeps.

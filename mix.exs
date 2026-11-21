@@ -42,7 +42,8 @@ defmodule Loopctl.MixProject do
           # The HTTP/1-only posture is still pinned by
           # test/loopctl/net/no_outbound_http2_test.exs.
           # bandit moved to 1.14.1 (2026-11-02), which clears the thirteen HTTP/2
-          # and WebSocket advisories filed against 1.13.1, so no bandit ignore remains.
+          # and WebSocket advisories filed against 1.13.1, and to 1.15.0 (2026-11-21,
+          # with phoenix 1.8.17), which hex.audit reports clean: no bandit ignore remains.
           # endpoint_http2_test.exs fails on any bandit version change, so a move
           # cannot go unnoticed.
           # cloak 1.1.4 and cloak_ecto 1.3.0 — no patched release exists for either

@@ -4,7 +4,7 @@ defmodule LoopctlRunner.MixProject do
   def project do
     [
       app: :loopctl_runner,
-      version: "0.1.1",
+      version: "0.1.2",
       # 1.18 is the floor: the JSON module. blockit runs 1.18.4 on OTP 27.
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
