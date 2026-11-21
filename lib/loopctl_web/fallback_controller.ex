@@ -456,7 +456,8 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
-  # #1082: a live pr/chg intake source holds the project's repo, so its repo_url cannot move.
+  # #1082: a live pr/chg intake source holds the project's repo, so its repo_url cannot move
+  # and the project cannot be archived.
   # 409: the request is well-formed; the source's binding forbids it until it is revoked.
   def call(conn, {:error, {:repo_held_by_source, source_id, repo}}) do
     conn
@@ -467,8 +468,9 @@ defmodule LoopctlWeb.FallbackController do
         code: "repo_held_by_intake_source",
         intake_source_id: source_id,
         message:
-          "Live intake source #{source_id} routes #{repo} to this project, so its repo_url " <>
-            "cannot change or be cleared. Revoke that source first (intake_source_revoke)."
+          "Live intake source #{source_id} routes #{repo} to this project, so the project " <>
+            "cannot let go of that repo: its repo_url cannot change or be cleared, and it " <>
+            "cannot be archived. Revoke that source first (intake_source_revoke)."
       }
     })
   end

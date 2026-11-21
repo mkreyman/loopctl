@@ -206,6 +206,16 @@ defmodule Loopctl.Projects.RepoKeyTest do
       assert renamed.name == "widgets-renamed"
     end
 
+    test "archiving is refused while the source is live", %{tenant: t, project: p, source: s} do
+      assert {:error, {:repo_held_by_source, s.id, "acme/widgets"}} ==
+               Projects.archive_project(t.id, p)
+
+      assert AdminRepo.get!(Project, p.id).status == :active
+
+      {:ok, _} = Intake.revoke_source(t.id, s.id)
+      assert {:ok, %Project{status: :archived}} = Projects.archive_project(t.id, p)
+    end
+
     test "a revoked source no longer holds the repo", %{tenant: t, project: p, source: s} do
       {:ok, _} = Intake.revoke_source(t.id, s.id)
 

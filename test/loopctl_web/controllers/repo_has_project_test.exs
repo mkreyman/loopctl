@@ -113,4 +113,27 @@ defmodule LoopctlWeb.RepoHasProjectTest do
     assert error["message"] =~ "acme/widgets"
     assert error["message"] =~ "Revoke that source first"
   end
+
+  test "DELETE /projects/:id under a live intake source answers 409 (#1082)",
+       %{conn: conn, tenant: t, user_key: key} do
+    project = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+    {_secret, source} =
+      fixture(:intake_source, %{
+        tenant_id: t.id,
+        project_id: project.id,
+        repo_full_name: "acme/widgets"
+      })
+
+    error =
+      conn
+      |> auth(key)
+      |> delete(~p"/api/v1/projects/#{project.id}")
+      |> json_response(409)
+      |> Map.fetch!("error")
+
+    assert error["code"] == "repo_held_by_intake_source"
+    assert error["intake_source_id"] == source.id
+    assert error["message"] =~ "cannot be archived"
+  end
 end
