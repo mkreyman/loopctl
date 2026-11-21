@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`POST /api/v1/projects/:id/merge_into` keeps a live intake source on its repo
+  (2026-11-21, #1113).** A merge whose source project carries a live `pr`/`chg` source for a
+  repo the target does not hold answers `409 merge_strands_intake_source` with
+  `error.intake_source_id`, and moves nothing. A target with no `repo_url` now claims the
+  sources' repo, and answers `409 repo_already_has_project` when another active project holds
+  it. `dry_run` applies both refusals. Merge into the project that holds the repo, or revoke
+  the source first.
 - **`PATCH /api/v1/projects/:id` refuses to move or clear `repo_url` under a live intake
   source (2026-11-21, #1082).** While a live `pr`/`chg` source on the project names another
   repo, a `repo_url` change, clearing included, answers `409 repo_held_by_intake_source` with

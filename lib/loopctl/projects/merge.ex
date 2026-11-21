@@ -24,6 +24,16 @@ defmodule Loopctl.Projects.Merge do
   every such key first and refuses with the full list, writing nothing. `unique_keys/0` is the
   list, bound to the schema by the same test.
 
+  ## Intake sources keep their repo (#1113)
+
+  A live `pr`/`chg` intake source routes one repo's escalations to its project's channel, and
+  sessions find that channel through `resolve_project({repo_url})`. The merge archives the
+  source project, so a moved source must land on a project that holds its repo. A target that
+  names another repo refuses with `{:merge_strands_source, source_id, repo}`. A target that
+  names no repo claims the sources' one repo (as `Intake.prepare_project/2` does at
+  enrolment), and refuses the same way when the sources name more than one. A third active
+  project already holding that repo refuses with `{:repo_has_project, holder_id}`.
+
   ## Concurrency
 
   Both project rows are locked `FOR UPDATE` before anything is read, so two merges of one
@@ -36,7 +46,9 @@ defmodule Loopctl.Projects.Merge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Intake.Source
   alias Loopctl.Projects.Project
+  alias Loopctl.Projects.RepoUrl
   alias Loopctl.TokenUsage.Budget, as: TokenBudget
 
   @project_tables ~w(
@@ -130,12 +142,15 @@ defmodule Loopctl.Projects.Merge do
   merged into this target: that call moves any row written to the archived source since (a
   write that waited on the merge's lock, a session still holding the old id) and nothing else.
   A `:project`-scoped token budget moves with the rows. Errors: `{:error, reason}` with `{:merge_conflicts, conflicts}`, `:same_project`,
-  `:not_found`, `:target_not_active` or `:source_not_active`.
+  `:not_found`, `:target_not_active`, `:source_not_active`,
+  `{:merge_strands_source, source_id, repo}` or `{:repo_has_project, holder_id}`.
   """
   @spec merge_into(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, result()}
           | {:error,
              {:merge_conflicts, [conflict()]}
+             | {:merge_strands_source, Ecto.UUID.t(), String.t()}
+             | {:repo_has_project, Ecto.UUID.t()}
              | :same_project
              | :not_found
              | :target_not_active
@@ -171,7 +186,8 @@ defmodule Loopctl.Projects.Merge do
 
     with {:ok, source} <- Map.fetch(projects, source_id) |> found(),
          {:ok, target} <- Map.fetch(projects, target_id) |> found(),
-         {:ok, how} <- mergeable(source, target) do
+         {:ok, how} <- mergeable(source, target),
+         {:ok, claim} <- sources_repo(tenant_id, source, target, how) do
       base = %{source_id: source_id, target_id: target_id}
       base = if how == :sweep, do: Map.put(base, :already_merged, true), else: base
       counts = counts(tenant_id, source_id)
@@ -189,9 +205,45 @@ defmodule Loopctl.Projects.Merge do
           {:ok, Map.merge(base, %{dry_run: false, counts: counts})}
 
         true ->
-          promoted = apply_merge(tenant_id, source, target, counts, opts)
-          {:ok, Map.merge(base, %{dry_run: false, counts: counts, promoted: promoted})}
+          tenant_id
+          |> apply_merge(source, target, claim, counts, opts)
+          |> merged(base, counts)
       end
+    end
+  end
+
+  defp merged({:ok, promoted}, base, counts),
+    do: {:ok, Map.merge(base, %{dry_run: false, counts: counts, promoted: promoted})}
+
+  defp merged({:error, reason}, _base, _counts), do: AdminRepo.rollback(reason)
+
+  # The repo the merged target must hold for the source's live pr/chg sources, read with both
+  # project rows already locked: `{:ok, nil}` when the target already holds it (or nothing
+  # needs one), `{:ok, repo}` when a repo-less target must claim it. A sweep moves only rows
+  # written after the merge, and no source can be enrolled on an archived project.
+  defp sources_repo(_tenant_id, _source, _target, :sweep), do: {:ok, nil}
+
+  defp sources_repo(tenant_id, source, target, :merge) do
+    sources =
+      from(s in Source,
+        where:
+          s.tenant_id == ^tenant_id and s.project_id == ^source.id and is_nil(s.revoked_at) and
+            s.mode in [:pr, :chg],
+        order_by: [asc: s.inserted_at, asc: s.id]
+      )
+      |> AdminRepo.all()
+
+    keep = target.repo_key || Enum.find_value(sources, &RepoUrl.key(&1.repo_full_name))
+
+    case Enum.find(sources, &(RepoUrl.key(&1.repo_full_name) != keep)) do
+      nil when is_nil(target.repo_key) and sources != [] ->
+        {:ok, hd(sources).repo_full_name}
+
+      nil ->
+        {:ok, nil}
+
+      stranded ->
+        {:error, {:merge_strands_source, stranded.id, stranded.repo_full_name}}
     end
   end
 
@@ -339,15 +391,13 @@ defmodule Loopctl.Projects.Merge do
 
   defp alias_where(where, a), do: String.replace(where, "%{a}", a)
 
-  defp apply_merge(tenant_id, source, target, counts, opts) do
+  defp apply_merge(tenant_id, source, target, claim, counts, opts) do
     move_rows(tenant_id, source, target)
 
     promoted = source.kind == :work and target.kind == :kb
 
-    if promoted do
-      target |> Ecto.Changeset.change(kind: :work, open_channel: true) |> AdminRepo.update!()
-    end
-
+    # The source is archived before the target claims a repo: while the source is active it may
+    # hold that same repo under `projects_tenant_repo_key_active_uidx`.
     source
     |> Ecto.Changeset.change(
       status: :archived,
@@ -355,8 +405,51 @@ defmodule Loopctl.Projects.Merge do
     )
     |> AdminRepo.update!()
 
-    audit(tenant_id, source, target, counts, promoted, opts)
-    promoted
+    with :ok <- update_target(target, promoted, claim) do
+      audit(tenant_id, source, target, counts, promoted, opts)
+      {:ok, promoted}
+    end
+  end
+
+  defp update_target(target, promoted, claim) do
+    changes =
+      if(promoted, do: [kind: :work, open_channel: true], else: [])
+      |> then(fn changes ->
+        if claim do
+          url = "https://github.com/#{claim}"
+          [{:repo_url, url}, {:repo_key, RepoUrl.key(url)} | changes]
+        else
+          changes
+        end
+      end)
+
+    if changes == [] do
+      :ok
+    else
+      target
+      |> Ecto.Changeset.change(changes)
+      |> Ecto.Changeset.unique_constraint(:repo_key, name: Project.repo_key_index())
+      # A savepoint, so the unique violation leaves the merge transaction usable for the
+      # holder lookup below; the caller then rolls the whole merge back.
+      |> AdminRepo.update(mode: :savepoint)
+      |> case do
+        {:ok, _} -> :ok
+        {:error, _changeset} -> {:error, {:repo_has_project, repo_holder(target, claim)}}
+      end
+    end
+  end
+
+  defp repo_holder(target, claim) do
+    key = RepoUrl.key(claim)
+
+    from(p in Project,
+      where:
+        p.tenant_id == ^target.tenant_id and p.repo_key == ^key and p.status == :active and
+          p.id != ^target.id,
+      select: p.id,
+      limit: 1
+    )
+    |> AdminRepo.one()
   end
 
   defp audit(tenant_id, source, target, counts, promoted, opts) do

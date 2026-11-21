@@ -7,6 +7,8 @@ defmodule LoopctlWeb.ProjectMergeControllerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Projects.Project
 
+  import Ecto.Query, only: [from: 2]
+
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
   setup do
@@ -97,5 +99,63 @@ defmodule LoopctlWeb.ProjectMergeControllerTest do
       "target_project_id" => fixture(:project).id
     })
     |> json_response(404)
+  end
+
+  test "a source whose live intake source names another repo is refused 409 (#1113)",
+       %{conn: conn, tenant: t} do
+    source_project = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+    {_secret, source} =
+      fixture(:intake_source, %{
+        tenant_id: t.id,
+        project_id: source_project.id,
+        repo_full_name: "acme/widgets"
+      })
+
+    target = fixture(:project, %{tenant_id: t.id, repo_url: "acme/infra"})
+
+    error =
+      conn
+      |> auth(key(t, :user))
+      |> post(~p"/api/v1/projects/#{source_project.id}/merge_into", %{
+        "target_project_id" => target.id
+      })
+      |> json_response(409)
+      |> Map.fetch!("error")
+
+    assert error["code"] == "merge_strands_intake_source"
+    assert error["intake_source_id"] == source.id
+    assert %{status: :active} = AdminRepo.get!(Project, source_project.id)
+  end
+
+  test "a repo-less target that would claim a held repo is refused 409 (#1113)",
+       %{conn: conn, tenant: t} do
+    source_project = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+    fixture(:intake_source, %{
+      tenant_id: t.id,
+      project_id: source_project.id,
+      repo_full_name: "acme/widgets"
+    })
+
+    AdminRepo.update_all(
+      from(p in Project, where: p.id == ^source_project.id),
+      set: [repo_url: nil, repo_key: nil]
+    )
+
+    holder = fixture(:project, %{tenant_id: t.id, repo_url: "acme/widgets"})
+    target = fixture(:project, %{tenant_id: t.id, repo_url: nil})
+
+    error =
+      conn
+      |> auth(key(t, :user))
+      |> post(~p"/api/v1/projects/#{source_project.id}/merge_into", %{
+        "target_project_id" => target.id
+      })
+      |> json_response(409)
+      |> Map.fetch!("error")
+
+    assert error["code"] == "repo_already_has_project"
+    assert error["existing_project_id"] == holder.id
   end
 end
