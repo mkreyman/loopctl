@@ -275,7 +275,11 @@ defmodule Loopctl.Delivery.Stages do
 
       # Only the insert that won writes the event; a replay finds the row and adds nothing.
       if row.id == id do
-        insert_event(Repo, row, "opened", nil, nil, Keyword.get(opts, :actor_label), %{})
+        insert_event(Repo, %{
+          row: row,
+          event: "opened",
+          actor_label: Keyword.get(opts, :actor_label)
+        })
       end
 
       {row, nil}
@@ -335,15 +339,12 @@ defmodule Loopctl.Delivery.Stages do
     row = lock_row(tenant_id, story_id)
 
     if row.id == id do
-      insert_event(
-        Repo,
-        row,
-        "opened",
-        nil,
-        nil,
-        Keyword.get(opts, :actor_label),
-        Keyword.get(opts, :event_data, %{})
-      )
+      insert_event(Repo, %{
+        row: row,
+        event: "opened",
+        actor_label: Keyword.get(opts, :actor_label),
+        data: Keyword.get(opts, :event_data, %{})
+      })
     end
 
     {:ok, row}
@@ -380,7 +381,16 @@ defmodule Loopctl.Delivery.Stages do
         )
 
       data = Map.put(Keyword.get(opts, :event_data, %{}), "started_by", "change_submitted")
-      insert_event(Repo, moved, "rebound", row.stage, nil, Keyword.get(opts, :actor_label), data)
+
+      insert_event(Repo, %{
+        row: moved,
+        event: "rebound",
+        from: row.stage,
+        actor_label: Keyword.get(opts, :actor_label),
+        reason: "a change submission started the story outside the runner",
+        data: data
+      })
+
       {:ok, moved}
     else
       {:ok, row}
@@ -446,7 +456,12 @@ defmodule Loopctl.Delivery.Stages do
     transitions
   end
 
-  @doc "A story's stage events, oldest first."
+  @doc """
+  A story's whole event log, oldest first: its stage events and its item events (`claimed`,
+  `released`, `note_written`). Ordered by `inserted_at`, then `lock_version` (an item event
+  has none, so it sorts after a stage event of the same instant), then `id`, so the order is
+  total and two reads of one log agree.
+  """
   @spec list_events(Ecto.UUID.t(), Ecto.UUID.t()) :: [StageEvent.t()]
   def list_events(tenant_id, story_id) do
     {:ok, events} =
@@ -454,11 +469,126 @@ defmodule Loopctl.Delivery.Stages do
         Repo.all(
           from e in StageEvent,
             where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
-            order_by: [asc: e.inserted_at, asc: e.lock_version]
+            order_by: [asc: e.inserted_at, asc: e.lock_version, asc: e.id]
         )
       end)
 
     events
+  end
+
+  @doc """
+  Records an item event on a story's log (US-52.16): `claimed`, `released` or
+  `note_written`, on any story, with or without a stage row.
+
+  Options:
+
+  - `:reason` (required) — what happened, in words a person can read; trimmed, bounded to
+    `StageEvent.max_reason_length/0` codepoints.
+  - `:actor_holder_id` — the holder that acted, resolved SERVER-SIDE by the caller (the
+    claim's `holder_id`, from the authenticating key), never from request params. Nil when
+    the system acted.
+  - `:actor_label`, `:data` (a map). The event carries the story's current `claim_epoch`,
+    read in the write's own transaction.
+  - `:idempotency_key` — a second record with the same key on the same story writes
+    nothing and returns `{:ok, :replayed}` (`story_stage_events_idempotency_uidx`).
+  - `:repo` — `Loopctl.AdminRepo` to write inside a caller's AdminRepo transaction (every
+    claim and release path); otherwise the write runs in its own tenant-scoped transaction.
+
+  Returns `{:ok, %StageEvent{}}`, `{:ok, :replayed}`, `{:error, :reason_required}`,
+  `{:error, :invalid_event}`, `{:error, :invalid_holder}` (a holder that is not this
+  tenant's: a foreign key does not scope a row to its tenant) or `{:error, :not_found}`
+  (no such story in this tenant).
+  """
+  @spec record_item_event(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, StageEvent.t() | :replayed}
+          | {:error, :reason_required | :invalid_event | :invalid_holder | :not_found}
+  def record_item_event(tenant_id, story_id, event, opts \\ []) do
+    with :ok <- item_event(event),
+         {:ok, reason} <- required_reason(Keyword.get(opts, :reason)) do
+      write = &write_item_event(&1, tenant_id, story_id, event, reason, opts)
+
+      case Keyword.get(opts, :repo, Repo) do
+        AdminRepo -> write.(AdminRepo)
+        Repo -> in_tenant_write(tenant_id, write)
+      end
+    end
+  end
+
+  # Its own tenant-scoped transaction, rolled back on a refusal so nothing half-writes.
+  defp in_tenant_write(tenant_id, write) do
+    case Repo.with_tenant(tenant_id, fn -> rollback_on_error(write.(Repo)) end) do
+      {:ok, ok} -> ok
+      {:error, refusal} -> {:error, refusal}
+    end
+  end
+
+  defp rollback_on_error({:error, refusal}), do: Repo.rollback(refusal)
+  defp rollback_on_error(ok), do: ok
+
+  defp item_event(event) do
+    if event in StageEvent.item_events(), do: :ok, else: {:error, :invalid_event}
+  end
+
+  defp required_reason(reason) do
+    case bounded_event_reason(reason) do
+      nil -> {:error, :reason_required}
+      text -> {:ok, text}
+    end
+  end
+
+  defp write_item_event(repo, tenant_id, story_id, event, reason, opts) do
+    holder_id = Keyword.get(opts, :actor_holder_id)
+
+    # The story's CURRENT epoch, read here rather than passed: inside a claim or release
+    # transaction this is the epoch that transaction just wrote.
+    epoch =
+      repo.one(
+        from s in Story,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+          select: s.claim_epoch
+      )
+
+    cond do
+      is_nil(epoch) ->
+        {:error, :not_found}
+
+      not is_nil(holder_id) and
+          not repo.exists?(
+            from h in Loopctl.Holders.Holder,
+              where: h.id == ^holder_id and h.tenant_id == ^tenant_id
+          ) ->
+        {:error, :invalid_holder}
+
+      true ->
+        insert_item_event(repo, tenant_id, story_id, event, reason, epoch, opts)
+    end
+  end
+
+  defp insert_item_event(repo, tenant_id, story_id, event, reason, epoch, opts) do
+    row = %{
+      id: Ecto.UUID.generate(),
+      tenant_id: tenant_id,
+      story_id: story_id,
+      event: event,
+      claim_epoch: epoch,
+      actor_label: Keyword.get(opts, :actor_label),
+      actor_holder_id: Keyword.get(opts, :actor_holder_id),
+      reason: reason,
+      idempotency_key: Keyword.get(opts, :idempotency_key),
+      data: Keyword.get(opts, :data, %{}),
+      inserted_at: DateTime.utc_now()
+    }
+
+    case repo.insert_all(StageEvent, [row],
+           on_conflict: :nothing,
+           conflict_target:
+             {:unsafe_fragment,
+              "(tenant_id, story_id, idempotency_key) WHERE idempotency_key IS NOT NULL"},
+           returning: true
+         ) do
+      {1, [event]} -> {:ok, event}
+      {0, []} -> {:ok, :replayed}
+    end
   end
 
   @doc """
@@ -829,7 +959,13 @@ defmodule Loopctl.Delivery.Stages do
     data =
       note(nil, opts) |> Map.merge(%{"effect" => "trunk_verified_sha", "value" => sha})
 
-    insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
+    insert_event(Repo, %{
+      row: row,
+      event: "effect_recorded",
+      actor_label: opts[:actor_label],
+      data: data
+    })
+
     {:ok, :recorded, row}
   end
 
@@ -928,7 +1064,17 @@ defmodule Loopctl.Delivery.Stages do
     row_guard!(previous, Keyword.get(opts, :row_guard))
 
     row = compare_and_set(tenant_id, story, transition, reason)
-    insert_event(Repo, row, "transitioned", from, edge, opts[:actor_label], note(reason, opts))
+
+    insert_event(Repo, %{
+      row: row,
+      event: "transitioned",
+      from: from,
+      edge: edge,
+      actor_label: opts[:actor_label],
+      actor_holder_id: opts[:actor_holder_id],
+      reason: reason,
+      data: note(reason, opts)
+    })
 
     # BEFORE the chain entry is built, in this same transaction: the entry has to NAME the
     # effect the transition asserts. `ci -> merged` carrying the sha GitHub just returned is
@@ -1241,7 +1387,13 @@ defmodule Loopctl.Delivery.Stages do
       )
       |> Repo.update_all([])
 
-    insert_event(Repo, row, counter.event, nil, nil, opts[:actor_label], value)
+    insert_event(Repo, %{
+      row: row,
+      event: counter.event,
+      actor_label: opts[:actor_label],
+      data: value
+    })
+
     counts
   end
 
@@ -1404,7 +1556,7 @@ defmodule Loopctl.Delivery.Stages do
       |> Repo.update_all([])
 
     data = if is_nil(value), do: %{"cleared" => previous}, else: value
-    insert_event(Repo, updated, event, nil, nil, opts[:actor_label], data)
+    insert_event(Repo, %{row: updated, event: event, actor_label: opts[:actor_label], data: data})
     updated
   end
 
@@ -1442,7 +1594,13 @@ defmodule Loopctl.Delivery.Stages do
       )
       |> Repo.update_all([])
 
-    insert_event(Repo, row, counter.event, nil, nil, opts[:actor_label], %{"cleared" => previous})
+    insert_event(Repo, %{
+      row: row,
+      event: counter.event,
+      actor_label: opts[:actor_label],
+      data: %{"cleared" => previous}
+    })
+
     :cleared
   end
 
@@ -1591,7 +1749,13 @@ defmodule Loopctl.Delivery.Stages do
       note(nil, opts)
       |> Map.merge(%{"effect" => Atom.to_string(effect), "value" => event_value(value)})
 
-    insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
+    insert_event(Repo, %{
+      row: row,
+      event: "effect_recorded",
+      actor_label: opts[:actor_label],
+      data: data
+    })
+
     # The merge gate's ALLOW is this effect (`merge_gate_allowed_sha`); its outcome signal
     # (US-48.12) is written here, in the write's own transaction. Every other effect: nothing.
     :ok = Outcomes.observe_effect(Repo, row, effect)
@@ -1922,11 +2086,17 @@ defmodule Loopctl.Delivery.Stages do
           )
           |> AdminRepo.update_all([])
 
-        insert_event(AdminRepo, updated, "effect_recorded", nil, nil, opts[:actor_label], %{
-          "effect" => "verified_head_sha",
-          "value" => "cleared",
-          "previous" => head,
-          "reason" => "verifier_rebound"
+        insert_event(AdminRepo, %{
+          row: updated,
+          event: "effect_recorded",
+          actor_label: opts[:actor_label],
+          reason: "the verifier was rebound, so its verified head was cleared",
+          data: %{
+            "effect" => "verified_head_sha",
+            "value" => "cleared",
+            "previous" => head,
+            "reason" => "verifier_rebound"
+          }
         })
 
         {:ok, :cleared}
@@ -1954,8 +2124,13 @@ defmodule Loopctl.Delivery.Stages do
       |> transition_update(from, :queued, edge, [claim_epoch: new_epoch], counted?)
       |> AdminRepo.update_all([])
 
-    insert_event(AdminRepo, updated, "transitioned", from, edge, opts[:actor_label], %{
-      "released_claim_epoch" => row.claim_epoch
+    insert_event(AdminRepo, %{
+      row: updated,
+      event: "transitioned",
+      from: from,
+      edge: edge,
+      actor_label: opts[:actor_label],
+      data: %{"released_claim_epoch" => row.claim_epoch}
     })
 
     {:ok, updated}
@@ -2000,8 +2175,11 @@ defmodule Loopctl.Delivery.Stages do
       )
       |> AdminRepo.update_all([])
 
-    insert_event(AdminRepo, updated, "rebound", nil, nil, opts[:actor_label], %{
-      "released_claim_epoch" => row.claim_epoch
+    insert_event(AdminRepo, %{
+      row: updated,
+      event: "rebound",
+      actor_label: opts[:actor_label],
+      data: %{"released_claim_epoch" => row.claim_epoch}
     })
 
     {:ok, updated}
@@ -2048,8 +2226,14 @@ defmodule Loopctl.Delivery.Stages do
       |> transition_update(:queued, :escalated, edge, escalation_reason: reason)
       |> AdminRepo.update_all([])
 
-    insert_event(AdminRepo, escalated, "transitioned", :queued, edge, opts[:actor_label], %{
-      "reason" => reason
+    insert_event(AdminRepo, %{
+      row: escalated,
+      event: "transitioned",
+      from: :queued,
+      edge: edge,
+      actor_label: opts[:actor_label],
+      reason: reason,
+      data: %{"reason" => reason}
     })
 
     # A custody transition whose chain entry did not land must not commit — so the refusal is
@@ -2619,7 +2803,11 @@ defmodule Loopctl.Delivery.Stages do
 
   defp fetch_row!(tenant_id, story_id), do: Repo.one!(row_query(tenant_id, story_id))
 
-  defp insert_event(repo, %StoryStage{} = row, event, from, edge, actor_label, data) do
+  # US-52.16: one writer for every stage event, taking a map. Its `reason` is the caller's
+  # (`:reason`, trimmed and bounded), else the edge's fixed sentence, else the event's.
+  defp insert_event(repo, %{row: %StoryStage{} = row, event: event} = e) do
+    edge = Map.get(e, :edge)
+
     repo.insert_all(StageEvent, [
       %{
         id: Ecto.UUID.generate(),
@@ -2627,15 +2815,47 @@ defmodule Loopctl.Delivery.Stages do
         story_stage_id: row.id,
         story_id: row.story_id,
         event: event,
-        from_stage: from && Atom.to_string(from),
+        from_stage: Map.get(e, :from) && Atom.to_string(Map.get(e, :from)),
         to_stage: Atom.to_string(row.stage),
         edge: edge && Atom.to_string(edge),
         claim_epoch: row.claim_epoch,
         lock_version: row.lock_version,
-        actor_label: actor_label,
-        data: data,
+        actor_label: Map.get(e, :actor_label),
+        actor_holder_id: Map.get(e, :actor_holder_id),
+        reason: event_reason(Map.get(e, :reason), event, edge),
+        data: Map.get(e, :data, %{}),
         inserted_at: DateTime.utc_now()
       }
     ])
   end
+
+  @doc false
+  # Public for `record_item_event/4` and the tests: the reason an event row stores.
+  @spec event_reason(term(), String.t(), StageMachine.edge() | nil) :: String.t()
+  def event_reason(reason, event, edge) do
+    case bounded_event_reason(reason) do
+      nil when not is_nil(edge) -> StageMachine.edge_reason(edge)
+      nil -> Map.fetch!(StageEvent.reasons(), event)
+      text -> text
+    end
+  end
+
+  # A blank or non-string reason is no reason. CODEPOINTS, like the column's CHECK
+  # (`char_length`), so a bounded reason never fails the write.
+  defp bounded_event_reason(reason) when is_binary(reason) do
+    case String.trim(reason) do
+      "" ->
+        nil
+
+      text ->
+        max = StageEvent.max_reason_length()
+        chars = String.to_charlist(text)
+
+        if length(chars) > max,
+          do: chars |> Enum.take(max - 1) |> List.to_string() |> Kernel.<>("…"),
+          else: text
+    end
+  end
+
+  defp bounded_event_reason(_reason), do: nil
 end

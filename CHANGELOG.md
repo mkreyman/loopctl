@@ -6,6 +6,16 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The story's event log names the holder and the reason for every event (2026-11-21,
+  US-52.16).** `story_stage_events` gains `actor_holder_id`, `reason` (NOT NULL, 1..2000
+  characters) and `idempotency_key`, and now also carries `claimed`, `released` and
+  `note_written` events for any story, with or without a stage row; every claim, unclaim,
+  force-unclaim, lease reclaim, session-end release and bulk claim writes one in its own
+  transaction. `POST /api/v1/stories/:id/force-unclaim` (MCP `force_unclaim_story`) takes an
+  optional `reason`, recorded as `force-unclaimed: <reason>`. Migration 20261121050000
+  backfills `reason` on existing rows (from `data->>'reason'`, else the edge, else the event
+  name) in one UPDATE inside its transaction; no manual step. Its rollback refuses while any
+  item event exists, since those rows are the only record of who held each story.
 - **A runner session is a holder, and verify separates holders (2026-11-21, US-52.15).** A
   placement now mints its session dispatch together with a `runner_session` holder (host =
   the runner's name), and the claim names it (`assigned_holder_id`). The holder ends when the

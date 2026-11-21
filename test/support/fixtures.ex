@@ -2870,6 +2870,7 @@ defmodule Loopctl.Fixtures do
             claim_epoch: stage.claim_epoch,
             lock_version: stage.lock_version,
             actor_label: "fixture",
+            reason: "fixture escalation",
             data: %{},
             inserted_at: escalated_at
           }
@@ -4355,6 +4356,7 @@ defmodule Loopctl.Fixtures do
         claim_epoch: row.claim_epoch,
         lock_version: row.lock_version,
         actor_label: "fixture",
+        reason: "fixture merge",
         data: %{},
         inserted_at: merged_at
       }

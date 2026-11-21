@@ -9531,11 +9531,17 @@ const TOOLS = [
       "server-side condition a re-run meets again until an operator acts; " +
       "`force_unclaim_failed` (the " +
       "server log names the step) is remedied by calling it again. A 422 means the release " +
-      "write itself was rejected. It takes no request body.",
+      "write itself was rejected. Optional `reason`: recorded on the story's event log as " +
+      "`force-unclaimed: <reason>` (at most 2000 characters, longer is cut); without it the " +
+      "log says `force-unclaimed: operator`.",
     inputSchema: {
       type: "object",
       properties: {
         story_id: { type: "string", description: "The story UUID to free." },
+        reason: {
+          type: "string",
+          description: "Why you are taking it back, for the story's event log.",
+        },
       },
       required: ["story_id"],
     },

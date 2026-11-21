@@ -355,6 +355,16 @@ defmodule Loopctl.Progress do
       |> Multi.run(:stage, fn _repo, %{story: updated} ->
         Stages.follow_claim(tenant_id, updated.id, updated.claim_epoch, actor_label: actor_label)
       end)
+      # US-52.16: the item's log names the claiming holder, in the claim's own transaction.
+      |> Multi.run(:item_event, fn _repo, %{story: updated} ->
+        Stages.record_item_event(tenant_id, updated.id, "claimed",
+          repo: AdminRepo,
+          reason: "claimed",
+          actor_holder_id: holder_id,
+          actor_label: actor_label,
+          data: %{"agent_id" => agent_id}
+        )
+      end)
       |> Multi.run(:mint_cap, fn _repo, %{story: updated} ->
         mint_cap(tenant_id, "start_cap", updated.id, Keyword.get(opts, :lineage, []))
       end)
@@ -1636,7 +1646,8 @@ defmodule Loopctl.Progress do
       {:error, :story, changeset, _} ->
         {:error, changeset}
 
-      {:error, step, reason, _} when step in [:stage, :audit, :webhook_events, :recontract] ->
+      {:error, step, reason, _}
+      when step in [:stage, :item_event, :audit, :webhook_events, :recontract] ->
         {:error, reason}
     end
   end
@@ -1675,6 +1686,12 @@ defmodule Loopctl.Progress do
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
         cause: :attempt,
         actor_lineage: Keyword.get(opts, :actor_lineage, []),
+        actor_label: actor_label
+      )
+    end)
+    |> Multi.run(:item_event, fn _repo, %{story: updated, lock: old} ->
+      record_released(tenant_id, updated, old, "released by holder",
+        actor_holder_id: Keyword.get(opts, :holder_id),
         actor_label: actor_label
       )
     end)
@@ -2424,6 +2441,7 @@ defmodule Loopctl.Progress do
           Map.merge(lease, %{
             action: "claim_lease_expired",
             webhook_reason: "claim_lease_expired",
+            release_reason: "lease expired",
             new_state: %{}
           })
         )
@@ -2437,6 +2455,7 @@ defmodule Loopctl.Progress do
           Map.merge(lease, %{
             action: "claim_session_ended",
             webhook_reason: "session_ended:" <> reason,
+            release_reason: "session ended: " <> reason,
             new_state: %{"session_ended_reason" => reason},
             cause: :usage_exhausted
           })
@@ -2453,6 +2472,7 @@ defmodule Loopctl.Progress do
           Map.merge(lease, %{
             action: "claim_session_ended",
             webhook_reason: "session_ended:" <> reason,
+            release_reason: "session ended: " <> reason,
             new_state: %{"session_ended_reason" => reason}
           })
         )
@@ -2543,6 +2563,7 @@ defmodule Loopctl.Progress do
       actor_id: actor_id,
       actor_label: actor_label,
       webhook_reason: "session_ended:" <> session_reason,
+      release_reason: "session ended: " <> session_reason,
       new_state: %{"session_ended_reason" => session_reason},
       cause: Keyword.fetch!(opts, :cause)
     })
@@ -2556,6 +2577,38 @@ defmodule Loopctl.Progress do
   # not (`not_held`), the action, the actor, the webhook's reason, any keys the audit entry
   # adds to `new_state` on top of the ones every release records, and WHY the claim was
   # released (`cause`), which decides where the story goes next (`Stages.follow_release/5`).
+  # US-52.16: a release's `released` item event, written in the releasing transaction. It
+  # names the holder that let go when one did (`unclaim`); a force-unclaim and a reclaim are
+  # an operator's or the system's act, so the holder that held it goes in `data`.
+  defp record_released(tenant_id, updated, old, reason, opts) do
+    Stages.record_item_event(
+      tenant_id,
+      updated.id,
+      "released",
+      Keyword.merge(opts,
+        repo: AdminRepo,
+        reason: reason,
+        data: %{
+          "released_holder_id" => old.assigned_holder_id,
+          "released_agent_id" => old.assigned_agent_id,
+          "released_claim_epoch" => old.claim_epoch
+        }
+      )
+    )
+  end
+
+  # The operator's own words when the request carried them (`POST /stories/:id/force-unclaim`
+  # `reason`), else the release cause.
+  defp force_unclaim_reason(opts) do
+    case Keyword.get(opts, :release_reason) do
+      text when is_binary(text) and text != "" ->
+        "force-unclaimed: " <> text
+
+      _ ->
+        "force-unclaimed: " <> Atom.to_string(Keyword.get(opts, :release_cause, :operator))
+    end
+  end
+
   defp runner_lost_release(tenant_id, story_id, spec) do
     Multi.new()
     |> Multi.run(:gate, fn _repo, _changes -> spec.gate.() end)
@@ -2579,6 +2632,9 @@ defmodule Loopctl.Progress do
         actor_lineage: [],
         actor_label: spec.actor_label
       )
+    end)
+    |> Multi.run(:item_event, fn _repo, %{story: updated, lock: old} ->
+      record_released(tenant_id, updated, old, spec.release_reason, actor_label: spec.actor_label)
     end)
     |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
       %{
@@ -4116,7 +4172,8 @@ defmodule Loopctl.Progress do
       # counts only an any-reason clause. The escalation's chain entry being refused (logged by
       # `Stages`) is answered as itself, like every other release path; the release rolled back
       # and the story is still claimed.
-      {:error, step, reason, _} when step in [:stage, :recontract, :audit, :webhook_events] ->
+      {:error, step, reason, _}
+      when step in [:stage, :item_event, :recontract, :audit, :webhook_events] ->
         force_unclaim_refused(tenant_id, story_id, step, reason)
     end
   end
@@ -4188,6 +4245,11 @@ defmodule Loopctl.Progress do
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
         cause: Keyword.get(opts, :release_cause, :operator),
         actor_lineage: Keyword.get(opts, :actor_lineage, []),
+        actor_label: actor_label
+      )
+    end)
+    |> Multi.run(:item_event, fn _repo, %{story: updated, lock: old} ->
+      record_released(tenant_id, updated, old, force_unclaim_reason(opts),
         actor_label: actor_label
       )
     end)

@@ -416,6 +416,18 @@ defmodule Loopctl.BulkOperations do
   defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
     with :ok <- validate_claim_preconditions(story, batch_reads),
          {:ok, updated} <- apply_claim(story, agent_id, batch_reads.holder_id) do
+      # US-52.16: the claimed item event, in the batch's transaction. It can refuse only a
+      # story that is not the tenant's or a holder that is not, and both were resolved
+      # server-side under the lock, so a refusal is a defect and aborts the batch.
+      {:ok, _event} =
+        Stages.record_item_event(tenant_id, story.id, "claimed",
+          repo: AdminRepo,
+          reason: "claimed",
+          actor_holder_id: batch_reads.holder_id,
+          actor_label: actor_label,
+          data: %{"agent_id" => agent_id}
+        )
+
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
       %{story_id: story.id, status: "success"}
