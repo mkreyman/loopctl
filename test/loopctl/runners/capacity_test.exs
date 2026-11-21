@@ -841,6 +841,39 @@ defmodule Loopctl.Runners.CapacityTest do
       for d <- drafting, do: assert(record(runner, d.dispatch_id).released_at == nil)
     end
 
+    test "releases an implement session the runner reported ended, whatever its stage" do
+      runner = runner(%{max_sessions: 4})
+      tid = runner.tenant_id
+
+      at_ci = fn kind ->
+        s = story(tid)
+        d = dispatch(tid, %{"story_id" => s.id})
+        {:ok, _} = send_dispatch(runner, d)
+        fixture(:story_stage, tenant_id: tid, story_id: s.id, stage: :ci, claim_epoch: 0)
+        force_dispatch(runner, d.dispatch_id, kind: kind)
+        d
+      end
+
+      ended = at_ci.("implement")
+      running = at_ci.("implement")
+      # Only an implement session reports `session_ended`; a field on another kind is not one.
+      other_kind = at_ci.("reply_draft")
+
+      session_end = [
+        session_ended_at: DateTime.utc_now(),
+        session_ended_reason: "completed",
+        session_ended_digest: "digest"
+      ]
+
+      force_dispatch(runner, ended.dispatch_id, session_end)
+      force_dispatch(runner, other_kind.dispatch_id, session_end)
+
+      assert heal(runner) == {:ok, %{released: 1, in_flight: 2}}
+      assert record(runner, ended.dispatch_id).released_at
+      assert record(runner, running.dispatch_id).released_at == nil
+      assert record(runner, other_kind.dispatch_id).released_at == nil
+    end
+
     test "releases a dispatch whose story is gone" do
       runner = runner(%{max_sessions: 3})
       s = story(runner.tenant_id)

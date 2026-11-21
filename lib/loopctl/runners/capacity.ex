@@ -711,6 +711,17 @@ defmodule Loopctl.Runners.Capacity do
     end
   end
 
+  # An IMPLEMENT session is over when its story's row sits at a session-ending stage under its
+  # claim (`stage_query`), or when the runner's session end is recorded on the row
+  # (`DispatchLedger.record_session_end/4`; `RunnerStages` releases inline on it, so this frees
+  # a slot whose inline release was lost).
+  defmacrop implement_session_over(dispatch, stage_query) do
+    quote do
+      unquote(dispatch).kind == "implement" and
+        (exists(unquote(stage_query)) or not is_nil(unquote(dispatch).session_ended_at))
+    end
+  end
+
   @doc """
   Every unreleased reservation that can no longer be running, fleet-wide, as of `now`. The
   heal scopes it to one runner; `Loopctl.Workers.HealRunnerCapacityWorker` reads it whole to
@@ -734,8 +745,8 @@ defmodule Loopctl.Runners.Capacity do
 
     # The story's stage row, under the claim this dispatch served, sits at a stage that ends a
     # session — the same server-checkable rule a runner's `session_ended` report is held to
-    # (`RunnerStages`' `session_over?/2`). A session that ended `completed` at `pr_open` keeps
-    # its slot by that rule, and when the story later reaches `done` through a control-side
+    # (`StageMachine.session_ends_at/0`). Before a session end freed its slot, a session that
+    # ended `completed` at `pr_open` kept it, and when the story later reached `done` through a control-side
     # transition (verify, merge, deploy) no runner message carries its dispatch id, so nothing
     # released it before the wall clock ran out: about two hours of a runner taking no work
     # (2026-11-20, the e2e verifier found no free runner).
@@ -768,7 +779,7 @@ defmodule Loopctl.Runners.Capacity do
       where:
         d.status in ["refused", "superseded"] or
           (not is_nil(d.story_id) and not exists(claim_current)) or
-          (d.kind == "implement" and exists(session_ended_stage)) or
+          implement_session_over(d, session_ended_stage) or
           not exists(runner_active) or undelivered_too_long(d, ^now) or
           unanswered_too_long(d, ^now) or wall_clock_over(d, ^now),
       select: d.id
