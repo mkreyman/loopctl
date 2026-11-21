@@ -55,6 +55,52 @@ defmodule LoopctlRunner.TriageRunTest do
     assert {:ok, %{"status" => "verdict", "kind" => "triage"}} = RunStateRead.read(result.run_dir)
   end
 
+  test "a dispatch's base is judged at the commit judged_commit names, not the checkout's", ctx do
+    # The checkout is behind origin, as a runner host's checkout of an unworked repo always is.
+    repo = Path.join(ctx.root, "repo")
+    checkout = git!(repo, ["rev-parse", "HEAD"])
+    git!(repo, ["checkout", "-q", "-b", "shipped"])
+    File.write!(Path.join(repo, "seeded.ex"), "the file the report is about")
+    git!(repo, ["add", "seeded.ex"])
+    git!(repo, ["commit", "-q", "-m", "seed"])
+    shipped = git!(repo, ["rev-parse", "HEAD"])
+    git!(repo, ["checkout", "-q", checkout])
+    test_pid = self()
+
+    judged = fn path, base, _opts ->
+      send(test_pid, {:judged, path, base})
+      {:ok, shipped, :origin}
+    end
+
+    result =
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+        base_branch: "master",
+        judged_commit: judged
+      )
+
+    assert {:verdict, _} = result.outcome
+    assert_received {:judged, ^repo, "master"}
+    tree = Worktree.triage_tree_path(ctx.config.runs_dir, repo)
+    assert git!(tree, ["rev-parse", "HEAD"]) == shipped
+    # Origin's base is the commit cut at, never a verify head the result would carry.
+    assert {:ok, state} = RunStateRead.read(result.run_dir)
+    refute Map.has_key?(state, "judged_head")
+  end
+
+  test "a dispatch naming no base judges the checkout's commit", ctx do
+    repo = Path.join(ctx.root, "repo")
+    checkout = git!(repo, ["rev-parse", "HEAD"])
+
+    result =
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+        judged_commit: fn _, _, _ -> flunk("no base, so nothing is judged against origin") end
+      )
+
+    assert {:verdict, _} = result.outcome
+    tree = Worktree.triage_tree_path(ctx.config.runs_dir, repo)
+    assert git!(tree, ["rev-parse", "HEAD"]) == checkout
+  end
+
   test "a triage whose claim ended before its session starts none", ctx do
     binding = %{"dispatch_id" => LoopctlRunner.Session.uuid4(), "claim_epoch" => 3}
 

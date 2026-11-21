@@ -162,8 +162,9 @@ defmodule LoopctlRunner.Worktree do
     with {:ok, sha} <- cut_commit(repo_path, commit), do: add_detached(repo_path, path, sha)
   end
 
-  # The commit a detached tree is cut at: the checkout's own (triage, reply_draft), or `commit`
-  # (verify, US-48.18), which must already be in the repository — `fetch_commit/4` brings it — and
+  # The commit a detached tree is cut at: the checkout's own when `commit` is nil, or `commit`
+  # (origin's base for triage and reply_draft, `judged_commit/3`; the head for verify, US-48.18),
+  # which must already be in the repository — `fetch_commit/4` brings it — and
   # is resolved to the COMMIT it names, so a caller compares what it asked for with what it got.
   defp cut_commit(repo_path, nil), do: head_commit(repo_path)
 
@@ -185,6 +186,58 @@ defmodule LoopctlRunner.Worktree do
     case git(path, ["rev-parse", "--verify", "HEAD^{commit}"]) do
       {:ok, sha} -> {:ok, sha}
       {:error, out} -> {:error, "#{path} has no commit checked out: #{out}"}
+    end
+  end
+
+  @doc """
+  The commit a triage-shaped run (triage, reply_draft) judges in `repo_path`: `origin`'s copy of
+  `base`, fetched first, whenever the checkout's own commit is BEHIND it or equal to it; otherwise
+  the checkout's commit. Returns `{:ok, sha, :origin}` or `{:ok, sha, :checkout, why}`.
+
+  A runner host's checkout of a repository nobody works in there is never pulled, and a run cut
+  at it judged a report against code that predates it: on 2026-11-21 a sandbox issue about a file
+  the run had just committed was escalated because the runner's checkout, three commits behind,
+  had no such file. Origin is what the report is about. The checkout still wins when it holds
+  commits origin's base lacks (the operator's own unpushed work is what that host is about) and
+  when the fetch fails, so a host off the network judges what it has, as before.
+
+  `:fetch_base` in `opts` replaces `fetch_base/3`.
+  """
+  @spec judged_commit(String.t(), String.t(), keyword()) ::
+          {:ok, String.t(), :origin}
+          | {:ok, String.t(), :checkout, String.t()}
+          | {:unreadable, String.t()}
+  def judged_commit(repo_path, base, opts \\ []) do
+    fetch_base = Keyword.get(opts, :fetch_base, &fetch_base/3)
+
+    with {:ok, head} <- head_commit(repo_path) do
+      case origin_commit(repo_path, base, fetch_base) do
+        {:ok, origin} -> behind_or_at(repo_path, head, origin, base)
+        {:error, why} -> {:ok, head, :checkout, why}
+      end
+    end
+  end
+
+  defp origin_commit(repo_path, base, fetch_base) do
+    case fetch_base.(repo_path, base, []) do
+      :ok ->
+        case git(repo_path, ["rev-parse", "--verify", "--quiet", origin_ref(base) <> "^{commit}"]) do
+          {:ok, sha} -> {:ok, sha}
+          {:error, _} -> {:error, "origin has no #{name(base)} after the fetch"}
+        end
+
+      {:error, reason} ->
+        {:error, "origin's #{name(base)} was not fetched: #{reason}"}
+    end
+  end
+
+  defp behind_or_at(repo_path, head, origin, base) do
+    case git(repo_path, ["merge-base", "--is-ancestor", head, origin]) do
+      {:ok, _} ->
+        {:ok, origin, :origin}
+
+      {:error, _} ->
+        {:ok, head, :checkout, "the checkout holds commits origin's #{name(base)} lacks"}
     end
   end
 

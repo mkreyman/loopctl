@@ -922,6 +922,53 @@ defmodule LoopctlRunner.WorktreeTest do
              Worktree.remove_if_clean(repo, path, "loop/s1", "master")
   end
 
+  describe "judged_commit/3, the commit a triage run judges" do
+    setup %{repo: repo} do
+      origin = Path.join(Path.dirname(repo), "origin.git")
+      git!(Path.dirname(repo), ["clone", "-q", "--bare", repo, origin])
+      git!(repo, ["remote", "add", "origin", origin])
+      {:ok, origin: origin}
+    end
+
+    test "is origin's base when the checkout is behind it", %{repo: repo, origin: origin} do
+      # The 2026-11-21 sandbox case: a run commits to origin, and the runner's checkout of that
+      # repository is never pulled.
+      other = clone_origin!(origin)
+      commit!(other, "seeded.ex", "the file the report is about")
+      git!(other, ["push", "-q", "origin", "master"])
+      shipped = git!(other, ["rev-parse", "HEAD"])
+
+      assert {:ok, ^shipped, :origin} = Worktree.judged_commit(repo, "master")
+      refute git!(repo, ["rev-parse", "HEAD"]) == shipped
+    end
+
+    test "is origin's base when the checkout is at it", %{repo: repo} do
+      head = git!(repo, ["rev-parse", "HEAD"])
+      assert {:ok, ^head, :origin} = Worktree.judged_commit(repo, "master")
+    end
+
+    test "is the checkout's commit when it holds commits origin's base lacks", %{repo: repo} do
+      commit!(repo, "local.ex", "the operator's unpushed work")
+      head = git!(repo, ["rev-parse", "HEAD"])
+
+      assert {:ok, ^head, :checkout, why} = Worktree.judged_commit(repo, "master")
+      assert why =~ "holds commits origin's master lacks"
+    end
+
+    test "is the checkout's commit when origin cannot be fetched", %{repo: repo} do
+      git!(repo, ["remote", "set-url", "origin", Path.join(Path.dirname(repo), "no-such.git")])
+      head = git!(repo, ["rev-parse", "HEAD"])
+
+      assert {:ok, ^head, :checkout, why} = Worktree.judged_commit(repo, "master")
+      assert why =~ "origin's master was not fetched"
+    end
+
+    test "is the checkout's commit when origin has no such base", %{repo: repo} do
+      head = git!(repo, ["rev-parse", "HEAD"])
+      assert {:ok, ^head, :checkout, _why} = Worktree.judged_commit(repo, "no-such-branch")
+    end
+  end
+
   describe "the triage trees" do
     setup %{repo: repo} do
       {:ok, runs: Path.join(Path.dirname(repo), "runs")}

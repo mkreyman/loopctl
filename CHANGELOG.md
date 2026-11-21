@@ -6,9 +6,17 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A triage run judges origin's base, not a stale checkout (2026-11-21, set 10, runner
+  0.1.1).** A triage or reply_draft run fetches the dispatch's base and cuts its tree at
+  `origin/<base>` whenever the runner host's checkout is behind it or at it; the checkout's
+  own commit is still judged when it holds commits origin lacks or the fetch fails, and the
+  run's trace (`triage.base`) names which. A host's checkout of a repository nobody works in
+  there is never pulled, so triage had judged reports against code that predates them: the
+  e2e run's sandbox issue was escalated because the file it named was three commits ahead of
+  the runner's checkout. Roll it out with `release/rollout.sh`.
 - **The factory no longer places an interactive work item (2026-11-21, set 9, MCP 3.21.2).**
   A story a session opened with `work_item_open` is stamped `work_item_opened_at` (migration
-  `20261121070000`, which backfills it from the item event log), and implement@1 skips it: a
+  `20261121070000`, which backfills it from the `work_item_opened` audit entry), and implement@1 skips it: a
   holder's end re-queues its items for the session to take back, and the dispatch driver had
   been placing them on runners. The MCP server no longer registers an interactive holder in
   a runner session (one launched with `LOOP_MODE`): its heartbeat had opened each runner
