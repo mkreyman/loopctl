@@ -508,9 +508,6 @@ defmodule Loopctl.WorkBreakdown.Stories do
   # Absent is `{:ok, nil}` and is the ordinary case. A malformed id is refused rather than
   # cast-and-hoped: `Ecto.UUID.cast/1` here means the FK never sees a value the database
   # would reject with a 500 instead of a domain error.
-  defp work_item_opened_at(opts),
-    do: if(Keyword.get(opts, :work_item) == true, do: DateTime.utc_now())
-
   defp intake_link(tenant_id, opts) do
     case Keyword.get(opts, :intake_record_id) do
       nil ->
@@ -525,6 +522,9 @@ defmodule Loopctl.WorkBreakdown.Stories do
         end
     end
   end
+
+  defp work_item_opened_at(opts),
+    do: if(Keyword.get(opts, :work_item) == true, do: DateTime.utc_now())
 
   defp cast_uuid(value) do
     case Ecto.UUID.cast(value) do

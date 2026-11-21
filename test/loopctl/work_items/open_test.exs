@@ -16,6 +16,8 @@ defmodule Loopctl.WorkItems.OpenTest do
   alias Loopctl.Holders
   alias Loopctl.Holders.Holder
   alias Loopctl.Progress
+  alias Loopctl.Repo.Migrations.AddWorkItemOpenedAtToStories
+  alias Loopctl.Test.MigrationFile
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.WorkItems
 
@@ -74,6 +76,26 @@ defmodule Loopctl.WorkItems.OpenTest do
 
   defp story_count(tenant_id),
     do: AdminRepo.aggregate(from(s in Story, where: s.tenant_id == ^tenant_id), :count)
+
+  describe "the work_item_opened_at backfill (migration 20261121070000)" do
+    setup :setup_project
+
+    test "stamps a created item from its audit entry and nothing else", ctx do
+      migration = MigrationFile.require!(AddWorkItemOpenedAtToStories, 20_261_121_070_000)
+
+      assert {:ok, :created, item} = open(ctx, ctx.h, %{"branch" => "fix/a"})
+      other = fixture(:story, %{tenant_id: ctx.tenant_id, epic_id: ctx.epic.id})
+
+      AdminRepo.update_all(from(s in Story, where: s.id in ^[item.id, other.id]),
+        set: [work_item_opened_at: nil]
+      )
+
+      AdminRepo.query!(migration.backfill_sql())
+
+      assert %DateTime{} = AdminRepo.get!(Story, item.id).work_item_opened_at
+      assert is_nil(AdminRepo.get!(Story, other.id).work_item_opened_at)
+    end
+  end
 
   describe "open_interactive/4 creates the item" do
     setup :setup_project

@@ -64,7 +64,9 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
 
   `resolve_escalation` needs a `:user` key no dispatch minted (`LOOPCTL_USER_KEY` in an
   interactive fleet session). That is the intended path: the session that claims the handoff
-  resolves the escalation itself, then marks the handoff done. Nothing here involves Mark.
+  resolves the escalation itself, and the resolve marks its claim done
+  (`Loopctl.Delivery.Escalations` calls `close_story/3`), so the session sends no
+  `channel_done` after it. Nothing here involves Mark.
 
   ## Retries and concurrency
 

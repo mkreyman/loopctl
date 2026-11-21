@@ -57,6 +57,20 @@ const registered = {
 };
 
 describe("holder session", () => {
+  test("a runner session (LOOP_MODE) registers nothing and keeps the plain key", async () => {
+    const { session, calls, timers } = harness({
+      env: { LOOPCTL_AGENT_KEY: "plain", CLAUDE_SESSION_ID: "s1", LOOP_MODE: "1" },
+      answers: [registered],
+    });
+
+    const result = await session.start();
+
+    assert.equal(result.error, true);
+    assert.equal(calls.length, 0);
+    assert.equal(timers.length, 0);
+    assert.equal(session.agentKey(), "plain");
+  });
+
   test("registers first, then sends the holder credential, heartbeats and ends", async () => {
     const { session, calls, timers } = harness({
       answers: [registered, { lease_until: "2026-11-21T00:06:00Z", heartbeat_seconds: 60 }, { holder: { ...HOLDER, ended_at: "x" } }],

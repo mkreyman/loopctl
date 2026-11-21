@@ -112,6 +112,7 @@ defmodule Loopctl.Agents.Candidates do
           | :head_unverified
           | :implementer_dispatched
           | :no_live_verifier_dispatch
+          | :not_work_item
 
   @type order :: :round_robin_project_tenant
 

@@ -36,9 +36,19 @@
  * prevent. A uuid minted once per process stands in when neither is set.
  *
  * The raw credential lives only in this process's memory and is never returned by a tool.
+ *
+ * ## A runner session registers nothing
+ *
+ * loopctl-runner launches its sessions with LOOP_MODE set, and placement already made such a
+ * session a holder (US-52.15). With LOOP_MODE present, `register()` sends nothing and the
+ * session stays on LOOPCTL_AGENT_KEY, so the branch open (lib/branch-item.js) never runs.
  */
 
 import { envClaimSessionId } from "./claim-session.js";
+
+function present(value) {
+  return typeof value === "string" && value.trim() !== "";
+}
 
 export const HOLDERS_PATH = "/api/v1/holders";
 
@@ -150,6 +160,13 @@ export function createHolderSession(deps) {
   }
 
   async function register() {
+    // A runner session (loopctl-runner sets LOOP_MODE) is already a holder, placed with its
+    // dispatch (US-52.15). Registering it as interactive made its branch a new work item on
+    // every heartbeat's open, which the factory then placed again (2026-11-21).
+    if (present(env.LOOP_MODE)) {
+      return { error: true, status: 0, body: "a runner session (LOOP_MODE) registers no interactive holder" };
+    }
+
     const key = plainKey();
     if (!key) return { error: true, status: 0, body: "LOOPCTL_AGENT_KEY is not set" };
 
