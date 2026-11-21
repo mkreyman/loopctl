@@ -17,7 +17,9 @@ defmodule Loopctl.Delivery.MergeExecution do
      recorded head as CONTROL, and on `:allow` pushes a `merge` instruction
      (`RunnerMergeInstruction`, contract 1.29.0) to the runner holding the claim, then records
      the send on the row (`Stages.record_merge_instruction/4`).
-  3. The runner merges exactly that head (`gh pr merge --squash --match-head-commit`) and
+  3. The runner merges exactly that head (`gh pr merge --squash --match-head-commit`, with a
+     squash message whose closing keywords it rewrote to `Refs`, so the merge closes no issue:
+     `LoopctlRunner.MergeRun` in `runner/`, which escalates a pull request still linked) and
      reports `ci -> merged` with the `merge_sha` — the path `Loopctl.Delivery.RunnerStages`
      already had. A merge reported for a head the gate did NOT allow is escalated over
      `:ungated_merge` in the same transaction (`Loopctl.Delivery.Stages.advance/4`).

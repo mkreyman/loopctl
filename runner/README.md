@@ -67,7 +67,8 @@ mode is `pr`: the session runs the operator's delivery loop up to an open pull r
 opened with `gh pr create --base <base>` and reviewed — and never merges it (US-48.17; its prompt
 says so). The merge is loopctl's: once its merge gate allows a head, it sends a `merge`
 instruction, and the runner carries out exactly that one (`LoopctlRunner.MergeRun`, `gh pr merge
---squash --match-head-commit`). The session leaves the worktree and the branch, which are the
+--squash --match-head-commit --subject --body`, closing keywords rewritten to `Refs` so the merge
+closes no issue; it needs gh 2.86.0 or later, for `closingIssuesReferences`). The session leaves the worktree and the branch, which are the
 runner's, for the runner to remove once the branch has shipped. A repository with no
 `.loopctl/mode`, an empty one or any other value is refused before a session starts
 (`repository has no .loopctl/mode` for the first): only an explicit `pr` runs. A repository that

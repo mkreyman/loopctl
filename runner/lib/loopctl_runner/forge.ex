@@ -82,8 +82,11 @@ defmodule LoopctlRunner.Forge do
       ["--state", "all", "--limit", Integer.to_string(@limit), "--json", Enum.join(@fields, ",")]
   end
 
+  # `body`, `title` and `closingIssuesReferences` need gh 2.86.0 or later, the oldest the fleet
+  # ran when they were added (blockit, 2026-11-21); an older gh refuses an unknown JSON field, so
+  # every merge read fails `unreachable` and loopctl escalates `merge_unanswered`.
   @view_fields ~w(number state headRefName headRefOid baseRefName isCrossRepository mergeCommit
-                  body closingIssuesReferences)
+                  title body closingIssuesReferences)
 
   @doc """
   The decoded `gh pr view` answer for pull request `number` of `repo`: `{:ok, map}`, or
@@ -133,17 +136,18 @@ defmodule LoopctlRunner.Forge do
     do: ["pr", "edit", Integer.to_string(number), "--repo", repo, "--body", body]
 
   @doc """
-  Squash-merges pull request `number` of `repo` at exactly `head_sha`, with `body` as the squash
-  commit's message body: `:ok` when gh exits 0,
+  Squash-merges pull request `number` of `repo` at exactly `head_sha`, with `message` as the
+  squash commit's subject and body (`%{subject: String.t(), body: String.t()}`), so neither is
+  GitHub's default from the session's title and commits: `:ok` when gh exits 0,
   `{:refused, output}` when it exits non-zero (GitHub, or gh, said no — a moved head among the
   reasons), `{:error, reason}` when gh is missing or does not answer within `timeout_ms`, which
   says nothing about whether the merge happened.
   """
-  @spec merge(String.t(), pos_integer(), String.t(), String.t(), pos_integer(), String.t() | nil) ::
+  @spec merge(String.t(), pos_integer(), String.t(), message(), pos_integer(), String.t() | nil) ::
           :ok | {:refused, String.t()} | {:error, String.t()}
-  def merge(repo, number, head_sha, body, timeout_ms, gh \\ nil) do
+  def merge(repo, number, head_sha, message, timeout_ms, gh \\ nil) do
     with {:ok, path} <- locate(gh) do
-      case ProcessGroup.run(path, merge_args(repo, number, head_sha, body), timeout_ms, @env,
+      case ProcessGroup.run(path, merge_args(repo, number, head_sha, message), timeout_ms, @env,
              inherit: @inherit
            ) do
         {:ok, _out, 0} -> :ok
@@ -153,9 +157,12 @@ defmodule LoopctlRunner.Forge do
     end
   end
 
+  @typedoc "The squash commit's message: its subject line and its body."
+  @type message :: %{required(:subject) => String.t(), required(:body) => String.t()}
+
   @doc "The `gh` argv `merge/6` runs."
-  @spec merge_args(String.t(), pos_integer(), String.t(), String.t()) :: [String.t()]
-  def merge_args(repo, number, head_sha, body),
+  @spec merge_args(String.t(), pos_integer(), String.t(), message()) :: [String.t()]
+  def merge_args(repo, number, head_sha, %{subject: subject, body: body}),
     do: [
       "pr",
       "merge",
@@ -165,6 +172,8 @@ defmodule LoopctlRunner.Forge do
       "--squash",
       "--match-head-commit",
       head_sha,
+      "--subject",
+      subject,
       "--body",
       body
     ]

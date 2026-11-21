@@ -7,14 +7,16 @@ All notable changes to loopctl are documented here.
 ### Changed
 
 - **A runner merge never closes an issue (2026-11-21, set 11, runner 0.1.2).** Before merging,
-  the runner rewrites the pull request body's closing keywords (`Closes #15`, `Fixes`,
-  `Resolves`, ...) to `Refs`, edits the pull request when that changed it, and merges with that
-  text as the squash commit body; a pull request GitHub still links to an issue it would close is
+  the runner rewrites the closing keywords (`Closes #15`, `Fixes`, `Resolves`, ...) of the pull
+  request's title and body to `Refs`, edits the body on the pull request when that changed it,
+  and merges with that text as the squash commit's subject and body; a pull request GitHub still links to an issue it would close is
   escalated rather than merged. loopctl closes the issue a story came from with its resolution
   label on first, and a keyword close beat it at the merge, so the closure was abandoned as
   someone else's and the reporter never got loopctl's resolution. The runner and the server
   also move to phoenix 1.8.17 (EEF-CVE-2026-128361, EEF-CVE-2026-129344) and the runner to plug
-  1.20.4 (EEF-CVE-2026-120287). Roll it out with `release/rollout.sh`.
+  1.20.4 (EEF-CVE-2026-120287). The runner now needs gh 2.86.0 or later (`closingIssuesReferences`);
+  every fleet host had it on 2026-11-21. Runner contract 1.35.1 says so in `RunnerMergeInstruction`;
+  it is text only, so no holder re-vendors. Roll it out with `release/rollout.sh`.
 - **A triage run judges origin's base, not a stale checkout (2026-11-21, set 10, runner
   0.1.1).** A triage or reply_draft run fetches the dispatch's base and cuts its tree at
   `origin/<base>` whenever the runner host's checkout is behind it or at it; the checkout's

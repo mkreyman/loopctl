@@ -49,15 +49,18 @@ defmodule LoopctlRunner.MergeRun do
   in the pull request's body or in the squash commit's message, with no label on it, and loopctl
   then abandons its closure as somebody else's (the e2e sandbox's issue #15, 2026-11-21). So
   before merging, the body's keywords are rewritten to `Refs` (`LoopctlRunner.ClosingKeywords`)
-  and the pull request edited when that changed it, and the merge carries the rewritten body as
-  its squash message, so no commit message the session wrote reaches the base either. A pull
-  request GitHub still links to an issue it would close (a link added by hand, which no body
-  text makes) escalates: merging would close that issue unlabelled. A failed edit is
-  `unreachable`; nothing was merged.
+  and the pull request edited when that changed it, and the merge carries its own squash
+  message: the title rewritten the same way plus ` (#N)` as the subject (GitHub's default
+  subject is the session's title, keyword and all), the rewritten body as the body, so no
+  commit message the session wrote reaches the base either. A pull request GitHub still links
+  to an issue it would close escalates: merging would close that issue unlabelled. After an
+  edit the link is read again up to `:link_reads` times, `:link_settle_ms` apart, before that
+  verdict, so a link GitHub has not yet dropped is not mistaken for one added by hand. A failed
+  edit is `unreachable`; nothing was merged.
 
   `forge` is `%{view: (repo, number, timeout_ms -> {:ok, map} | {:error, reason}), edit_body:
   (repo, number, body, timeout_ms -> :ok | {:error, reason}), merge: (repo, number, head_sha,
-  body, timeout_ms -> :ok | {:refused, out} | {:error, reason})}`,
+  %{subject, body}, timeout_ms -> :ok | {:refused, out} | {:error, reason})}`,
   `LoopctlRunner.Forge.pull_request/4`, `edit_body/5` and `merge/6` in production. Every value
   reported — the merge sha, the moved head — is GitHub's.
   """
@@ -73,6 +76,10 @@ defmodule LoopctlRunner.MergeRun do
   # How long a refused merge waits before its one retry: long enough for a sibling merge's base
   # move or GitHub's mergeability recompute to settle, short against loopctl's answer window.
   @retry_after_ms 5_000
+  # After a body edit, how often and how far apart the closing links are read before a link
+  # still listed is judged one no body text makes.
+  @link_reads 3
+  @link_settle_ms 2_000
 
   @type outcome ::
           {:merged, String.t()}
@@ -87,7 +94,8 @@ defmodule LoopctlRunner.MergeRun do
   @doc """
   Merges the pull request `instruction` names (a validated `RunnerMergeInstruction`) if it is
   `where`'s and open at the allowed head, and says what to report. `opts` may carry
-  `:view_timeout_ms`, `:merge_timeout_ms` and `:retry_after_ms`.
+  `:view_timeout_ms`, `:merge_timeout_ms`, `:retry_after_ms`, `:link_reads` and
+  `:link_settle_ms`.
   """
   @spec execute(map(), where(), map(), keyword()) :: outcome()
   def execute(instruction, where, forge, opts \\ []) do
@@ -97,7 +105,9 @@ defmodule LoopctlRunner.MergeRun do
       forge: forge,
       view_ms: Keyword.get(opts, :view_timeout_ms, @view_timeout_ms),
       merge_ms: Keyword.get(opts, :merge_timeout_ms, @merge_timeout_ms),
-      retry_after_ms: Keyword.get(opts, :retry_after_ms, @retry_after_ms)
+      retry_after_ms: Keyword.get(opts, :retry_after_ms, @retry_after_ms),
+      link_reads: Keyword.get(opts, :link_reads, @link_reads),
+      link_settle_ms: Keyword.get(opts, :link_settle_ms, @link_settle_ms)
     }
 
     attempt(ctx, 1)
@@ -110,8 +120,8 @@ defmodule LoopctlRunner.MergeRun do
 
     with {:ok, pr} <- read(view, repo, number, ctx.view_ms),
          :merge <- judge(pr, number, head, ctx.where),
-         {:ok, body} <- unlinked(pr, ctx) do
-      merged = merge.(repo, number, head, body, ctx.merge_ms)
+         {:ok, message} <- unlinked(pr, ctx) do
+      merged = merge.(repo, number, head, message, ctx.merge_ms)
 
       read(view, repo, number, ctx.view_ms)
       |> after_merge(merged, number, head, ctx.where)
@@ -119,19 +129,20 @@ defmodule LoopctlRunner.MergeRun do
     end
   end
 
-  # The squash body the merge carries, once the pull request closes no issue (see the moduledoc's
-  # "A merge closes no issue"). Its body is rewritten on GitHub only when a keyword was there,
-  # and read again to see what GitHub still links: a link no keyword makes (one added in the
-  # sidebar) is a person's to remove, so it escalates rather than merging past it.
+  # The squash message the merge carries, once the pull request closes no issue (see the
+  # moduledoc's "A merge closes no issue"). Its body is rewritten on GitHub only when a keyword
+  # was there, and read again to see what GitHub still links: a link no keyword makes (one added
+  # in the sidebar) is a person's to remove, so it escalates rather than merging past it.
   defp unlinked(pr, ctx) do
     %{"repo" => repo, "pr_number" => number} = ctx.instruction
-    body = if is_binary(pr["body"]), do: pr["body"], else: ""
+    body = text(pr["body"])
     neutral = ClosingKeywords.neutralize(body)
+    subject = "#{ClosingKeywords.neutralize(text(pr["title"]))} (##{number})"
 
     with {:ok, pr} <- rewritten(pr, body, neutral, ctx) do
       case closing_issues(pr) do
         [] ->
-          {:ok, neutral}
+          {:ok, %{subject: subject, body: neutral}}
 
         issues ->
           {:escalate,
@@ -142,6 +153,9 @@ defmodule LoopctlRunner.MergeRun do
     end
   end
 
+  defp text(value) when is_binary(value), do: value
+  defp text(_value), do: ""
+
   defp rewritten(pr, same, same, _ctx), do: {:ok, pr}
 
   defp rewritten(_pr, _body, neutral, ctx) do
@@ -149,11 +163,26 @@ defmodule LoopctlRunner.MergeRun do
 
     case ctx.forge.edit_body.(repo, number, neutral, ctx.view_ms) do
       :ok ->
-        read(ctx.forge.view, repo, number, ctx.view_ms)
+        settled(ctx, ctx.link_reads)
 
       {:error, reason} ->
         {:unreachable,
          "could not rewrite ##{number}'s issue-closing keywords before the merge: #{reason}"}
+    end
+  end
+
+  # The pull request as GitHub holds it after the edit, read until it lists no closing issue or
+  # `reads` run out: the last read is what `unlinked/2` judges.
+  defp settled(ctx, reads) do
+    %{"repo" => repo, "pr_number" => number} = ctx.instruction
+
+    with {:ok, pr} <- read(ctx.forge.view, repo, number, ctx.view_ms) do
+      if closing_issues(pr) == [] or reads <= 1 do
+        {:ok, pr}
+      else
+        Process.sleep(ctx.link_settle_ms)
+        settled(ctx, reads - 1)
+      end
     end
   end
 
