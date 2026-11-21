@@ -20,7 +20,7 @@ const README = readFileSync(path.join(DIR, "..", "README.md"), "utf8");
 
 const HOLDER = { id: "8e82ea63-e83b-4654-afa8-2df6e0c68aa3", lease_until: "2026-11-21T00:05:00Z" };
 
-function harness({ env = { LOOPCTL_AGENT_KEY: "plain", CLAUDE_SESSION_ID: "s1" }, answers = [] } = {}) {
+function harness({ env = { LOOPCTL_AGENT_KEY: "plain", CLAUDE_SESSION_ID: "s1" }, answers = [], log = () => {} } = {}) {
   const calls = [];
   const timers = [];
   const queue = [...answers];
@@ -36,6 +36,7 @@ function harness({ env = { LOOPCTL_AGENT_KEY: "plain", CLAUDE_SESSION_ID: "s1" }
     hostname: () => "minis",
     worktree: () => "/w",
     randomUUID: () => "generated-uuid",
+    log,
     setInterval: (fn, ms) => {
       const t = { fn, ms, cleared: false };
       timers.push(t);
@@ -141,6 +142,52 @@ describe("holder session", () => {
     const { session } = harness({ answers: [registered] });
     await session.start();
     assert.doesNotMatch(JSON.stringify(session.status()), /holder-key/);
+  });
+});
+
+describe("a lapsed holder (US-52.19)", () => {
+  test("a heartbeat refused holder_lease_expired registers a new holder and logs the lapse", async () => {
+    const lines = [];
+    const fresh = { holder: { id: "new-holder", lease_until: "x" }, credential: { raw_key: "new-key" }, heartbeat_seconds: 60 };
+    const { session, calls, timers } = harness({
+      log: (line) => lines.push(line),
+      answers: [
+        registered,
+        { error: true, status: 409, body: { error: { code: "holder_lease_expired" } } },
+        fresh,
+      ],
+    });
+
+    await session.start();
+    await timers[0].fn();
+    // the timer callback swallows the promise; let it settle
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const registers = calls.filter((c) => c.method === "POST" && c.path === HOLDERS_PATH);
+    assert.equal(registers.length, 2);
+    assert.equal(calls[1].path, heartbeatPath(HOLDER.id));
+    assert.equal(session.agentKey(), "new-key");
+    assert.equal(session.status().holder.id, "new-holder");
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /lapsed/);
+    assert.match(lines[0], new RegExp(HOLDER.id));
+  });
+
+  test("a raw JSON body is read the same way, and another 409 logs nothing", async () => {
+    const lines = [];
+    const { session, timers } = harness({
+      log: (line) => lines.push(line),
+      answers: [
+        registered,
+        { error: true, status: 409, body: JSON.stringify({ error: { code: "holder_ended" } }) },
+        registered,
+      ],
+    });
+
+    await session.start();
+    await timers[0].fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(lines.length, 0);
   });
 });
 

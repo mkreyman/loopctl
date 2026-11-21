@@ -81,6 +81,28 @@ defmodule LoopctlWeb.HolderControllerTest do
     end
   end
 
+  describe "a late heartbeat (US-52.19)" do
+    test "TC-52.19.4: 409 holder_lease_expired, then 401 because the credential is revoked",
+         ctx do
+      registered = json_response(register(ctx.agent_key), 201)
+      id = registered["holder"]["id"]
+      own = registered["credential"]["raw_key"]
+
+      Loopctl.Holders.Holder
+      |> Loopctl.AdminRepo.get!(id)
+      |> Ecto.Changeset.change(lease_until: DateTime.add(DateTime.utc_now(), -1, :second))
+      |> Loopctl.AdminRepo.update!()
+
+      late = build_conn() |> auth(own) |> post(~p"/api/v1/holders/#{id}/heartbeat")
+      assert json_response(late, 409)["error"]["code"] == "holder_lease_expired"
+
+      assert Loopctl.AdminRepo.get!(Loopctl.Holders.Holder, id).ended_reason == :lapsed
+
+      again = build_conn() |> auth(own) |> post(~p"/api/v1/holders/#{id}/heartbeat")
+      assert json_response(again, 401)
+    end
+  end
+
   describe "heartbeat and end" do
     setup ctx do
       h1 = json_response(register(ctx.agent_key), 201)

@@ -24,6 +24,18 @@ defmodule Loopctl.Holders do
   holds the holder to one live credential. A repeated end finds the holder ended and writes
   nothing.
 
+  ## A holder's claims live by its lease (US-52.19)
+
+  A claim a holder makes without a cap takes the holder's `lease_until`
+  (`claim_lease/3`), every heartbeat moves those claims to the new lease in its own
+  transaction, and a holder that ends, by its own end, a late heartbeat or the sweep
+  (`end_lapsed/2`), releases them in the end's transaction. Capped claims (a runner's
+  dispatch lease) keep their cap. The values and the measurement behind them:
+  `docs/factory/measurements/session-holder-lease.md`.
+
+  Lock order: a holder row before story rows. The claim path reads the holder after taking
+  the story lock, but without locking it, so no cycle is added.
+
   ## Cache invalidation happens after commit
 
   `Loopctl.Auth.ApiKeyCache` is read-through: a request that misses while a revoke is still
@@ -42,11 +54,17 @@ defmodule Loopctl.Holders do
   alias Loopctl.Audit
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Delivery.Stages
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Holders.Holder
+  alias Loopctl.Progress
+  alias Loopctl.Tenants.Tenant
+  alias Loopctl.WorkBreakdown.Story
 
   @default_lease_seconds 300
   @default_heartbeat_seconds 60
   @self_kinds [:interactive, :cloud]
+  @claimed_statuses [:assigned, :implementing]
 
   @type register_result :: %{
           holder: Holder.t(),
@@ -56,8 +74,19 @@ defmodule Loopctl.Holders do
         }
 
   @doc """
+  The measured default lease, five heartbeat intervals
+  (`docs/factory/measurements/session-holder-lease.md`).
+  """
+  @spec default_lease_seconds() :: pos_integer()
+  def default_lease_seconds, do: @default_lease_seconds
+
+  @doc "The measured default heartbeat interval."
+  @spec default_heartbeat_seconds() :: pos_integer()
+  def default_heartbeat_seconds, do: @default_heartbeat_seconds
+
+  @doc """
   How long a holder's lease runs from its last heartbeat: `:holder_lease_seconds`, set from
-  `HOLDER_LEASE_SECONDS`, default #{@default_lease_seconds}. US-52.19 measures and sets it.
+  `HOLDER_LEASE_SECONDS`, default #{@default_lease_seconds}, the value US-52.19 measured.
   """
   @spec lease_seconds() :: pos_integer()
   def lease_seconds do
@@ -156,43 +185,106 @@ defmodule Loopctl.Holders do
   @doc """
   Renews the lease of the holder `holder_id`, by its own credential `caller`.
 
-  Sets `last_seen_at` to now and `lease_until` to now plus `lease_seconds/0`, and moves the
-  credential's `expires_at` to the new lease plus one heartbeat interval. A holder that is not
-  `caller`'s is `:not_found` (no existence oracle); an ended one is `:holder_ended`.
+  Sets `last_seen_at` to now and `lease_until` to now plus `lease_seconds/0`, moves the
+  credential's `expires_at` to the new lease plus one heartbeat interval, and moves every
+  uncapped claim the holder holds to the new lease (US-52.19), all in one transaction. A
+  claim only ever moves FORWARD, so a repeated heartbeat changes nothing.
+
+  A holder that is not `caller`'s is `:not_found` (no existence oracle); an ended one is
+  `:holder_ended`. A heartbeat that arrives after the lease ran out is
+  `:holder_lease_expired`, and it COMMITS the end: the holder ends `:lapsed`, its credential
+  is revoked and its claims are released, so the session registers again as a new holder.
   """
   @spec heartbeat(Ecto.UUID.t(), ApiKey.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Holder.t()} | {:error, :not_found | :holder_ended}
+          {:ok, Holder.t()} | {:error, :not_found | :holder_ended | :holder_lease_expired}
   def heartbeat(tenant_id, %ApiKey{} = caller, holder_id, opts \\ []) do
     now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
 
     AdminRepo.transaction(fn ->
       with {:ok, holder} <- owned_holder_for_update(tenant_id, caller, holder_id),
            :ok <- refuse_ended(holder) do
-        lease_until = DateTime.add(now, lease_seconds(), :second)
-
-        holder =
-          holder
-          |> Ecto.Changeset.change(last_seen_at: now, lease_until: lease_until)
-          |> AdminRepo.update!()
-
-        hashes =
-          redate_credentials(
-            tenant_id,
-            holder.id,
-            DateTime.add(lease_until, heartbeat_seconds(), :second)
-          )
-
-        {holder, hashes}
+        beat_or_lapse(holder, now, opts)
       else
         {:error, reason} -> AdminRepo.rollback(reason)
       end
     end)
     |> after_commit()
+    |> case do
+      {:ok, {:lapsed, _holder}} -> {:error, :holder_lease_expired}
+      other -> other
+    end
+  end
+
+  defp beat_or_lapse(holder, now, opts) do
+    if DateTime.after?(holder.lease_until, now) do
+      renew_holder(holder, now)
+    else
+      {ended, hashes, releases} = end_live_holder(holder, :lapsed, now, opts)
+      {{:lapsed, ended}, hashes, releases}
+    end
+  end
+
+  defp renew_holder(holder, now) do
+    lease_until = DateTime.add(now, lease_seconds(), :second)
+
+    holder =
+      holder
+      |> Ecto.Changeset.change(last_seen_at: now, lease_until: lease_until)
+      |> AdminRepo.update!()
+
+    hashes =
+      redate_credentials(
+        holder.tenant_id,
+        holder.id,
+        DateTime.add(lease_until, heartbeat_seconds(), :second)
+      )
+
+    move_claims(holder, lease_until, now)
+    {holder, hashes}
+  end
+
+  # Story rows after the holder row (see the moduledoc's lock order). NULL `claimed_until`
+  # never compares, so a claim without a lease is never given one here.
+  defp move_claims(holder, lease_until, now) do
+    from(s in Story,
+      where:
+        s.tenant_id == ^holder.tenant_id and s.assigned_holder_id == ^holder.id and
+          s.agent_status in ^@claimed_statuses and is_nil(s.claim_lease_cap) and
+          s.claimed_until < ^lease_until
+    )
+    |> AdminRepo.update_all(set: [claimed_until: lease_until, updated_at: now])
   end
 
   @doc """
-  Ends the holder `holder_id`, by its own credential `caller`: sets `ended_at` and revokes its
-  credential, in one transaction. A repeated end returns the ended holder and writes nothing.
+  The lease an uncapped claim by holder `holder_id` takes (US-52.19): the holder's
+  `lease_until`, or `{:error, :holder_lease_expired}` when that has passed, the holder has
+  ended, or no such holder is in the tenant. Read without a lock, under the caller's story
+  lock (the moduledoc's lock order).
+  """
+  @spec claim_lease(Ecto.UUID.t(), Ecto.UUID.t(), DateTime.t()) ::
+          {:ok, DateTime.t()} | {:error, :holder_lease_expired}
+  def claim_lease(tenant_id, holder_id, %DateTime{} = now) do
+    from(h in Holder,
+      where: h.tenant_id == ^tenant_id and h.id == ^holder_id,
+      select: {h.lease_until, h.ended_at}
+    )
+    |> AdminRepo.one()
+    |> case do
+      {%DateTime{} = lease_until, nil} ->
+        if DateTime.after?(lease_until, now),
+          do: {:ok, lease_until},
+          else: {:error, :holder_lease_expired}
+
+      _ ->
+        {:error, :holder_lease_expired}
+    end
+  end
+
+  @doc """
+  Ends the holder `holder_id`, by its own credential `caller`: sets `ended_at`, revokes its
+  credential and releases each uncapped claim it holds through `Progress.unclaim_story/3`'s
+  path (a `released` item event, reason "holder ended"), in one transaction. A repeated end
+  returns the ended holder and writes nothing, so nothing is released twice.
   """
   @spec end_holder(Ecto.UUID.t(), ApiKey.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Holder.t()} | {:error, :not_found}
@@ -202,7 +294,7 @@ defmodule Loopctl.Holders do
     AdminRepo.transaction(fn ->
       case owned_holder_for_update(tenant_id, caller, holder_id) do
         {:ok, %Holder{ended_at: %DateTime{}} = holder} ->
-          {holder, []}
+          {holder, [], []}
 
         {:ok, holder} ->
           end_live_holder(holder, :ended, now, opts)
@@ -342,9 +434,9 @@ defmodule Loopctl.Holders do
         lock: "FOR UPDATE"
       )
       |> AdminRepo.all()
-      |> Enum.reduce({nil, []}, fn holder, {_last, hashes} ->
-        {ended, more} = end_live_holder(holder, :ended, now, opts)
-        {ended, hashes ++ more}
+      |> Enum.reduce({nil, [], []}, fn holder, {_last, hashes, releases} ->
+        {ended, more, released} = end_live_holder(holder, :ended, now, opts)
+        {ended, hashes ++ more, releases ++ released}
       end)
     end)
     |> after_commit()
@@ -416,6 +508,7 @@ defmodule Loopctl.Holders do
       )
       |> AdminRepo.update!()
 
+    move_claims(holder, holder.lease_until, now)
     {raw_key, api_key} = mint_credential(holder)
     audit!(holder, "credential_rotated", %{"api_key_id" => api_key.id}, opts)
     {%{holder: holder, raw_key: raw_key, api_key: api_key, outcome: :rotated}, hashes}
@@ -463,6 +556,8 @@ defmodule Loopctl.Holders do
   defp refuse_ended(%Holder{ended_at: nil}), do: :ok
   defp refuse_ended(%Holder{}), do: {:error, :holder_ended}
 
+  # The one end path: the holder row, its credential, its claims and the audit entry, in the
+  # caller's transaction. Returns the released stage rows for `after_commit/1` to announce.
   defp end_live_holder(holder, reason, now, opts) do
     holder =
       holder
@@ -478,8 +573,163 @@ defmodule Loopctl.Holders do
         end
       end)
 
+    releases = release_claims(holder, reason, opts)
     audit!(holder, "ended", %{"reason" => to_string(reason)}, opts)
-    {holder, hashes}
+    {holder, hashes, releases}
+  end
+
+  # Each uncapped claim the holder still holds, released through `unclaim_story/3`'s own
+  # Multi so the stage row, the item event, the audit entry and the webhook all follow it. A
+  # story whose review was requested is left alone: its implementer's lease stopped applying
+  # at the hand-off, exactly as `ReclaimExpiredClaimsWorker` leaves it. Capped claims belong
+  # to a dispatch lease and are released by it.
+  defp release_claims(holder, reason, opts) do
+    from(s in Story,
+      where:
+        s.tenant_id == ^holder.tenant_id and s.assigned_holder_id == ^holder.id and
+          s.assigned_agent_id == ^holder.agent_id and s.agent_status in ^@claimed_statuses and
+          is_nil(s.claim_lease_cap) and is_nil(s.review_requested_at),
+      order_by: s.id,
+      select: s.id
+    )
+    |> AdminRepo.all()
+    |> Enum.map(fn story_id ->
+      multi =
+        Progress.unclaim_multi(holder.tenant_id, story_id,
+          agent_id: holder.agent_id,
+          holder_id: holder.id,
+          item_reason: "holder #{reason}",
+          actor_type: Keyword.get(opts, :actor_type, "system"),
+          actor_id: Keyword.get(opts, :actor_id),
+          actor_label: Keyword.get(opts, :actor_label, "holder:#{holder.id}")
+        )
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{stage: released}} -> released
+        {:error, _step, failure, _changes} -> AdminRepo.rollback(failure)
+      end
+    end)
+  end
+
+  # --- the sweep (US-52.19) ---
+
+  @runner_claim_grace_seconds 600
+
+  @doc """
+  Ends every holder whose session can no longer be working, with `ended_reason: :lapsed`
+  through the one end path (credential revoked, uncapped claims released). Called by
+  `Loopctl.Workers.ReclaimExpiredClaimsWorker` AFTER its claim pass. Returns how many ended.
+
+  - **`:interactive` and `:cloud`**: `lease_until` before `now`.
+  - **`:runner_session`**: inserted more than #{@runner_claim_grace_seconds} s ago, and either
+    no story's `assigned_holder_id` names it, or its dispatch is revoked or expired. Its
+    `lease_until` is never read: `Loopctl.Delivery.DispatchLease` moves the claim's cap after
+    placement and a story waiting at ci keeps its claim past the cap, so the claim, not the
+    holder row, says whether the session may still be working. The grace exists because
+    placement commits the holder before the claim (`Loopctl.Delivery.Placement`).
+
+  Tenants under a custody halt or not `:active` are skipped, as the claim pass skips them.
+  The read is advisory: each holder is re-checked under its row lock, so a heartbeat or a
+  claim that lands meanwhile keeps it live. At most `:limit` (default 100) per run.
+  """
+  @spec end_lapsed(DateTime.t(), keyword()) :: non_neg_integer()
+  def end_lapsed(%DateTime{} = now, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 100)
+
+    now
+    |> lapsed_query()
+    |> order_by([holder: h], asc: h.lease_until, asc: h.id)
+    |> limit(^limit)
+    |> select([holder: h], {h.tenant_id, h.id})
+    |> AdminRepo.all()
+    |> Enum.count(fn {tenant_id, holder_id} -> end_lapsed_holder(tenant_id, holder_id, now) end)
+  end
+
+  defp end_lapsed_holder(tenant_id, holder_id, now) do
+    AdminRepo.transaction(fn ->
+      now
+      |> lapsed_query()
+      |> where([holder: h], h.tenant_id == ^tenant_id and h.id == ^holder_id)
+      |> lock("FOR UPDATE OF h0")
+      |> AdminRepo.one()
+      |> case do
+        nil ->
+          {nil, [], []}
+
+        %Holder{} = holder ->
+          end_live_holder(holder, :lapsed, now, actor_label: "worker:reclaim_expired_claims")
+      end
+    end)
+    |> after_commit()
+    |> case do
+      {:ok, %Holder{}} ->
+        true
+
+      {:ok, nil} ->
+        false
+
+      {:error, reason} ->
+        Logger.warning(
+          "Holders.end_lapsed: end failed: tenant_id=#{tenant_id} holder_id=#{holder_id} " <>
+            "reason=#{inspect(failure_reason(reason))}"
+        )
+
+        false
+    end
+  end
+
+  defp failure_reason(%Ecto.Changeset{errors: errors}),
+    do: {:invalid_changeset, Keyword.keys(errors)}
+
+  defp failure_reason(reason), do: reason
+
+  defp lapsed_query(now) do
+    from(h in Holder,
+      as: :holder,
+      join: t in Tenant,
+      on: t.id == h.tenant_id,
+      as: :tenant,
+      left_join: d in Dispatch,
+      on: d.id == h.dispatch_id and d.tenant_id == h.tenant_id,
+      as: :dispatch,
+      where: is_nil(h.ended_at),
+      where: ^tenant_can_renew(),
+      where: ^lapsed(now)
+    )
+  end
+
+  defp lapsed(now), do: dynamic(^self_lapsed(now) or ^runner_session_done(now))
+
+  defp tenant_can_renew,
+    do: dynamic([tenant: t], t.status == :active and is_nil(t.custody_halted_at))
+
+  defp self_lapsed(now),
+    do: dynamic([holder: h], h.kind in ^@self_kinds and h.lease_until < ^now)
+
+  defp runner_session_done(now) do
+    grace_cutoff = DateTime.add(now, -@runner_claim_grace_seconds, :second)
+
+    holds_nothing =
+      dynamic(
+        [holder: h],
+        not exists(
+          from(s in Story,
+            where:
+              s.tenant_id == parent_as(:holder).tenant_id and
+                s.assigned_holder_id == parent_as(:holder).id,
+            select: 1
+          )
+        )
+      )
+
+    dispatch_dead =
+      dynamic([dispatch: d], not is_nil(d.revoked_at) or d.expires_at < ^now)
+
+    dynamic(
+      [holder: h],
+      h.kind == :runner_session and h.inserted_at < ^grace_cutoff and
+        (^holds_nothing or ^dispatch_dead)
+    )
   end
 
   # --- credentials ---
@@ -555,6 +805,12 @@ defmodule Loopctl.Holders do
 
   defp after_commit({:ok, {result, hashes}}) do
     Auth.invalidate_key_cache_by_hashes(hashes)
+    {:ok, result}
+  end
+
+  defp after_commit({:ok, {result, hashes, releases}}) do
+    Auth.invalidate_key_cache_by_hashes(hashes)
+    Enum.each(releases, &Stages.announce_release/1)
     {:ok, result}
   end
 

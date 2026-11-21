@@ -309,8 +309,16 @@ defmodule Loopctl.Progress do
       |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
         check_claim_dependencies(tenant_id, story)
       end)
-      |> Multi.run(:story, fn _repo, %{lock: story} ->
+      # US-52.19: read under the story lock, so the lease written is the holder's as it stands.
+      |> Multi.run(:lease, fn _repo, _changes ->
         now = DateTime.utc_now()
+
+        with {:ok, lease} <-
+               claim_lease(tenant_id, holder_id, Keyword.get(opts, :lease_until), now) do
+          {:ok, {now, lease}}
+        end
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story, lease: {now, lease}} ->
         dispatch_id = Keyword.get(opts, :dispatch_id)
 
         changes =
@@ -321,7 +329,7 @@ defmodule Loopctl.Progress do
               assigned_holder_id: holder_id,
               assigned_at: now
             },
-            claim_lease_change(story, now, Keyword.get(opts, :lease_until))
+            claim_lease_change(story, now, lease)
           )
 
         # US-26.2.2 AC-3: record implementer's dispatch at claim time
@@ -447,7 +455,7 @@ defmodule Loopctl.Progress do
   # (`:lock`), the transition is illegal (`:validate`), its stage is held (`:not_held`), its
   # dependencies are unmet (`:check_deps`), or its own changeset did not validate (`:story`).
   defp claim_result({:error, step, reason, _changes})
-       when step in [:lock, :validate, :not_held, :check_deps],
+       when step in [:lock, :validate, :not_held, :check_deps, :lease],
        do: {:error, reason}
 
   defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
@@ -1689,8 +1697,14 @@ defmodule Loopctl.Progress do
         actor_label: actor_label
       )
     end)
+    # `:item_reason` and `:actor_type` are set only by `Loopctl.Holders`' end path (US-52.19),
+    # which releases a holder's claims as "holder ended" / "holder lapsed".
     |> Multi.run(:item_event, fn _repo, %{story: updated, lock: old} ->
-      record_released(tenant_id, updated, old, "released by holder",
+      record_released(
+        tenant_id,
+        updated,
+        old,
+        Keyword.get(opts, :item_reason, "released by holder"),
         actor_holder_id: Keyword.get(opts, :holder_id),
         actor_label: actor_label
       )
@@ -1701,7 +1715,7 @@ defmodule Loopctl.Progress do
         entity_type: "story",
         entity_id: updated.id,
         action: "status_changed",
-        actor_type: "api_key",
+        actor_type: Keyword.get(opts, :actor_type, "api_key"),
         actor_id: actor_id,
         actor_label: actor_label,
         old_state: %{
@@ -1842,8 +1856,15 @@ defmodule Loopctl.Progress do
   Public because `Loopctl.BulkOperations.bulk_claim/4` claims too and must write the
   identical change (it never passes a cap).
   """
-  @spec claim_lease_change(Story.t(), DateTime.t(), DateTime.t() | nil) :: map()
+  @spec claim_lease_change(Story.t(), DateTime.t(), DateTime.t() | {:holder, DateTime.t()} | nil) ::
+          map()
   def claim_lease_change(story, now, lease_until \\ nil)
+
+  # US-52.19: a holder's claim lives by the holder's lease and carries no cap, so every
+  # heartbeat can move it.
+  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{}, {:holder, %DateTime{} = until}) do
+    %{claimed_until: until, claim_lease_cap: nil, claim_epoch: epoch + 1}
+  end
 
   def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{} = now, nil) do
     %{
@@ -1855,6 +1876,25 @@ defmodule Loopctl.Progress do
 
   def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{}, %DateTime{} = lease_until) do
     %{claimed_until: lease_until, claim_lease_cap: lease_until, claim_epoch: epoch + 1}
+  end
+
+  @doc """
+  The lease argument `claim_lease_change/3` takes for a claim (US-52.19): an explicit `cap`
+  (a runner's dispatch lease) as it is; a holder's claim `{:holder, lease_until}` from
+  `Loopctl.Holders.claim_lease/3`; a key with no holder `nil`, the global lease. A holder
+  whose lease has passed or that has ended is `{:error, :holder_lease_expired}`, so no holder
+  claim is issued without a live lease.
+
+  Public because `Loopctl.BulkOperations` claims too and must decide identically.
+  """
+  @spec claim_lease(Ecto.UUID.t(), Ecto.UUID.t() | nil, DateTime.t() | nil, DateTime.t()) ::
+          {:ok, DateTime.t() | {:holder, DateTime.t()} | nil} | {:error, :holder_lease_expired}
+  def claim_lease(_tenant_id, _holder_id, %DateTime{} = cap, _now), do: {:ok, cap}
+  def claim_lease(_tenant_id, nil, nil, _now), do: {:ok, nil}
+
+  def claim_lease(tenant_id, holder_id, nil, now) do
+    with {:ok, until} <- Holders.claim_lease(tenant_id, holder_id, now),
+         do: {:ok, {:holder, until}}
   end
 
   # A capped claim whose cap is not after `now` has nothing left to renew, and a 200 would
@@ -2239,11 +2279,19 @@ defmodule Loopctl.Progress do
   - `{:error, :not_claimant}` if the caller is not the story's assigned agent
   - `{:error, :lease_cap_reached}` if the claim's `claim_lease_cap` is not after now: a
     renewal could only write a lease already in the past, so none is written
+  - `{:error, :holder_lease_expired}` (US-52.19) if the caller is a holder whose lease has
+    passed or that has ended; a holder's uncapped claim is renewed to the holder's own
+    `lease_until`, never to now plus `claim_lease_seconds/0`
   """
   @spec renew_claim(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()}
           | {:error,
-             :not_found | :not_claimed | :stale_claim_epoch | :not_claimant | :lease_cap_reached}
+             :not_found
+             | :not_claimed
+             | :stale_claim_epoch
+             | :not_claimant
+             | :lease_cap_reached
+             | :holder_lease_expired}
           | {:error, Ecto.Changeset.t() | {:held_by_other_holder, Ecto.UUID.t()}}
   def renew_claim(tenant_id, story_id, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
@@ -2262,15 +2310,18 @@ defmodule Loopctl.Progress do
 
         # Epoch before identity: a session whose claim ended learns THAT, which is the
         # one fact it can act on, even when a peer now holds the story.
+        holder_id = Keyword.get(opts, :holder_id)
+
         with :ok <- validate_claimed(story),
              :ok <- validate_claim_epoch(story, epoch),
-             :ok <- validate_holder(story, Keyword.get(opts, :holder_id)),
+             :ok <- validate_holder(story, holder_id),
              :ok <- validate_claimant(story, agent_id),
-             :ok <- validate_lease_cap_ahead(story, now) do
-          {:ok, {story, now}}
+             :ok <- validate_lease_cap_ahead(story, now),
+             {:ok, until} <- renewed_until(tenant_id, story, holder_id, now) do
+          {:ok, {story, until}}
         end
       end)
-      |> Multi.merge(fn %{validate: {story, now}} -> renewal(tenant_id, story, now, opts) end)
+      |> Multi.merge(fn %{validate: {story, until}} -> renewal(tenant_id, story, until, opts) end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
@@ -2280,19 +2331,28 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # What an uncapped renewal writes (US-52.19): the holder's own lease for a holder's claim,
+  # so a renew and a heartbeat agree, and the global lease for a key with no holder. A capped
+  # claim writes nothing (`renewal/4`), so it reads no holder.
+  defp renewed_until(_tenant_id, %Story{claim_lease_cap: %DateTime{}}, _holder_id, _now),
+    do: {:ok, nil}
+
+  defp renewed_until(_tenant_id, _story, nil, now),
+    do: {:ok, DateTime.add(now, claim_lease_seconds(), :second)}
+
+  defp renewed_until(tenant_id, _story, holder_id, now),
+    do: Holders.claim_lease(tenant_id, holder_id, now)
+
   # A CAPPED claim has nothing to renew: its lease already is its cap (see `renew_claim/3`),
   # so it is answered as it stands, with no write and no `claim_renewed` entry.
-  defp renewal(_tenant_id, %Story{claim_lease_cap: %DateTime{}} = story, _now, _opts),
+  defp renewal(_tenant_id, %Story{claim_lease_cap: %DateTime{}} = story, _until, _opts),
     do: Multi.put(Multi.new(), :story, story)
 
-  defp renewal(tenant_id, %Story{} = old, now, opts) do
+  defp renewal(tenant_id, %Story{} = old, until, opts) do
     agent_id = Keyword.get(opts, :agent_id)
 
     Multi.new()
-    |> Multi.update(
-      :story,
-      Ecto.Changeset.change(old, claimed_until: DateTime.add(now, claim_lease_seconds(), :second))
-    )
+    |> Multi.update(:story, Ecto.Changeset.change(old, claimed_until: until))
     |> Audit.log_in_multi(:audit, fn %{story: updated} ->
       %{
         tenant_id: tenant_id,

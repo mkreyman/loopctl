@@ -602,21 +602,24 @@ defmodule Loopctl.BulkOperations do
     now = DateTime.utc_now()
 
     # The same lease and epoch Progress.claim_story/3 writes (#803), so a bulk claim is
-    # released by the reclaimer like any other rather than holding its stories forever.
-    story
-    |> Ecto.Changeset.change(
-      Map.merge(
-        %{
-          agent_status: :assigned,
-          assigned_agent_id: agent_id,
-          assigned_holder_id: holder_id,
-          assigned_at: now
-        },
-        Progress.claim_lease_change(story, now)
+    # released by the reclaimer like any other rather than holding its stories forever; a
+    # holder's claim takes the holder's lease, and a lapsed holder claims nothing (US-52.19).
+    with {:ok, lease} <- Progress.claim_lease(story.tenant_id, holder_id, nil, now) do
+      story
+      |> Ecto.Changeset.change(
+        Map.merge(
+          %{
+            agent_status: :assigned,
+            assigned_agent_id: agent_id,
+            assigned_holder_id: holder_id,
+            assigned_at: now
+          },
+          Progress.claim_lease_change(story, now, lease)
+        )
       )
-    )
-    |> AdminRepo.update()
-    |> follow_claim()
+      |> AdminRepo.update()
+      |> follow_claim()
+    end
   end
 
   # #803: the stage row follows the claim's epoch inside bulk claim's transaction, like the
@@ -1045,6 +1048,11 @@ defmodule Loopctl.BulkOperations do
     do:
       "chg_trunk_unevaluated: #{reason}; retry after #{retry_after} seconds. " <>
         Messages.chg_trunk_unevaluated()
+
+  defp format_reason(:holder_lease_expired),
+    do:
+      "holder_lease_expired: this session's holder lease has run out; register the session " <>
+        "again and retry with the new credential"
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"

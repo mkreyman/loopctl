@@ -77,8 +77,8 @@ defmodule LoopctlWeb.WorkItemController do
          Schemas.ErrorResponse},
       409 =>
         {"`branch_held`: another holder's open item has this branch (`story_id`, " <>
-           "`holder_id`); `holder_ended`; `ambiguous_project`; `story_held` (escalated)",
-         "application/json", Schemas.ErrorResponse},
+           "`holder_id`); `holder_ended`; `holder_lease_expired`; `ambiguous_project`; " <>
+           "`story_held` (escalated)", "application/json", Schemas.ErrorResponse},
       422 =>
         {"`no_target_epic`: pass epic_id; `invalid_branch`; `invalid_repo_url`",
          "application/json", Schemas.ErrorResponse},
@@ -140,6 +140,8 @@ defmodule LoopctlWeb.WorkItemController do
     project_not_found: {:not_found, "No project of this tenant has this repo_url."},
     epic_not_found: {:not_found, "epic_id is not an epic of the repo's project."},
     holder_ended: {:conflict, "This holder has ended; register the session again."},
+    holder_lease_expired:
+      {:conflict, "This holder's lease has run out; register the session again."},
     ambiguous_project: {:conflict, "More than one project has this repo_url."},
     story_held: {:conflict, "The branch's work item is escalated; a human resolves it."},
     no_target_epic:

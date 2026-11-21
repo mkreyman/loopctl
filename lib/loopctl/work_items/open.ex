@@ -63,6 +63,7 @@ defmodule Loopctl.WorkItems.Open do
   @type refusal ::
           :holder_credential_required
           | :holder_ended
+          | :holder_lease_expired
           | :invalid_branch
           | :invalid_repo_url
           | :project_not_found
@@ -163,10 +164,17 @@ defmodule Loopctl.WorkItems.Open do
     )
     |> AdminRepo.one()
     |> case do
-      %Holder{ended_at: nil} = holder -> {:ok, holder}
+      %Holder{ended_at: nil} = holder -> live_lease(holder)
       %Holder{} -> {:error, :holder_ended}
       nil -> {:error, :holder_credential_required}
     end
+  end
+
+  # US-52.19: the item is claimed on the holder's lease, so a lapsed holder opens nothing.
+  defp live_lease(%Holder{lease_until: lease_until} = holder) do
+    if DateTime.after?(lease_until, DateTime.utc_now()),
+      do: {:ok, holder},
+      else: {:error, :holder_lease_expired}
   end
 
   # ── inputs ─────────────────────────────────────────────────────────────────
@@ -414,7 +422,7 @@ defmodule Loopctl.WorkItems.Open do
         assigned_at: now,
         lifecycle_entered_at: Progress.lifecycle_stamp(story)
       }
-      |> Map.merge(Progress.claim_lease_change(story, now))
+      |> Map.merge(Progress.claim_lease_change(story, now, {:holder, holder.lease_until}))
       |> put_dispatch(request.opener)
 
     story

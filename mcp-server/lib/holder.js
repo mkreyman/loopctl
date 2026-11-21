@@ -14,7 +14,9 @@
  * LOOPCTL_AGENT_KEY and the session works exactly as it did before. A heartbeat refused
  * 401/404/409 means the credential or holder is gone (a laptop slept past the lease, the
  * holder was ended): the next tick registers again, which loopctl answers with the SAME
- * holder while it is live. A network error leaves the credential in place for the next tick.
+ * holder while it is live. A heartbeat refused 409 holder_lease_expired (US-52.19) ended the
+ * holder and released its claims, so the register makes a NEW holder, and the lapse is
+ * logged to stderr. A network error leaves the credential in place for the next tick.
  *
  * ## The session id
  *
@@ -42,6 +44,19 @@ export function endPath(id) {
 
 const GONE = new Set([401, 404, 409]);
 
+/** The `error.code` of a refusal body, parsed or raw. */
+function errorCode(body) {
+  let parsed = body;
+  if (typeof body === "string") {
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return null;
+    }
+  }
+  return (parsed && parsed.error && parsed.error.code) || null;
+}
+
 /**
  * @param {{
  *   apiCall: Function,
@@ -65,6 +80,8 @@ export function createHolderSession(deps) {
     // US-52.18: run after every register or heartbeat that leaves a live credential (the
     // branch open, lib/branch-item.js). Its failure never fails the heartbeat.
     afterBeat = null,
+    // US-52.19: where a lapse is reported. stderr, never stdout: stdout is the MCP stream.
+    log = (line) => process.stderr.write(`${line}\n`),
   } = deps;
 
   async function beat(result) {
@@ -140,6 +157,14 @@ export function createHolderSession(deps) {
     });
 
     if (result && result.error && GONE.has(result.status)) {
+      // US-52.19: a heartbeat after the lease ran out ended the holder and released its
+      // claims, so this session comes back as a NEW holder and must re-claim what it held.
+      if (errorCode(result.body) === "holder_lease_expired") {
+        log(
+          `loopctl: holder ${holder.id} lapsed (its lease ran out before this heartbeat); ` +
+            "its claims were released. Registering a new holder.",
+        );
+      }
       credential = null;
       holder = null;
       return register();

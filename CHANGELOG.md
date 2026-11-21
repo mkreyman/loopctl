@@ -6,6 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A holder's claims live by the holder's lease (2026-11-20, US-52.19).** A claim, bulk
+  claim or interactive work item taken by a holder credential, without a dispatch cap, now
+  gets `claimed_until` = the holder's `lease_until` and no `claim_lease_cap`, instead of the
+  24-hour `STORY_CLAIM_LEASE_SECONDS` lease; each heartbeat (and `renew-claim`) moves those
+  claims to the new lease. A holder whose lease has run out is refused `409
+  holder_lease_expired` on claim, renew, work-item open and heartbeat; that late heartbeat
+  ENDS the holder (`ended_reason: lapsed`), revokes its credential and releases its claims,
+  and the MCP server registers a new holder. `POST /api/v1/holders/:id/end` now releases the
+  holder's uncapped claims (item event reason `holder ended`). `ReclaimExpiredClaimsWorker`
+  also ends, after its claim pass, every interactive or cloud holder past its lease and every
+  runner-session holder older than 600 s that holds no claim or whose dispatch is revoked or
+  expired. `HOLDER_LEASE_SECONDS` (300) and `HOLDER_HEARTBEAT_SECONDS` (60) keep their
+  defaults, now measured (`docs/factory/measurements/session-holder-lease.md`); the lease now
+  also bounds how long a dead session keeps its items. New `mix loopctl.session_gaps`. No
+  migration. Plain agent keys are unchanged.
 - **The story's event log names the holder and the reason for every event (2026-11-21,
   US-52.16).** `story_stage_events` gains `actor_holder_id`, `reason` (NOT NULL, 1..2000
   characters) and `idempotency_key`, and now also carries `claimed`, `released` and

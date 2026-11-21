@@ -5041,7 +5041,9 @@ const TOOLS = [
       "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
-      "is released back to pending under you. Refused 409 story_held when the story's " +
+      "is released back to pending under you. Claimed with this session's holder credential, " +
+      "the claim instead takes the holder's lease and the heartbeat keeps it alive; refused " +
+      "409 holder_lease_expired once that lease has run out. Refused 409 story_held when the story's " +
       "delivery stage is escalated, done or failed: it is not yours to claim even when it " +
       "reads pending or contracted — move on. An escalated story is claimable again only " +
       "after resolve_escalation sends it to queued; a done or failed one never is. Refused " +
@@ -8713,7 +8715,10 @@ const TOOLS = [
     description:
       "RENEW THIS SESSION'S HOLDER LEASE NOW (POST /api/v1/holders/:id/heartbeat), by the " +
       "holder's own credential. The server does this every heartbeat_seconds on its own. " +
-      "A 401, 404 or 409 (credential expired, holder ended) makes it register again.",
+      "It also moves every uncapped claim the holder holds to the new lease. A 401, 404 or " +
+      "409 (credential expired, holder ended) makes it register again; 409 " +
+      "holder_lease_expired means the lease ran out first, so loopctl ended the holder and " +
+      "released its claims: the session registers as a NEW holder and must re-claim.",
     inputSchema: { type: "object", properties: {} },
   },
 

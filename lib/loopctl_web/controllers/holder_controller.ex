@@ -58,7 +58,9 @@ defmodule LoopctlWeb.HolderController do
       {"insufficient_role, custody_tier_required (register), or holder_mint_forbidden " <>
          "(register by a dispatch-minted key)", "application/json", Schemas.ErrorResponse},
     404 => {"Not your holder", "application/json", Schemas.ErrorResponse},
-    409 => {"holder_ended", "application/json", Schemas.ErrorResponse},
+    409 =>
+      {"holder_ended, or holder_lease_expired (heartbeat after the lease ran out)",
+       "application/json", Schemas.ErrorResponse},
     422 =>
       {"agent_required (the key names no agent), or invalid fields", "application/json",
        Schemas.ErrorResponse}
@@ -87,8 +89,11 @@ defmodule LoopctlWeb.HolderController do
     summary: "Renew a holder's lease",
     description:
       "By the holder's own credential only: sets `last_seen_at` to now, `lease_until` to now " <>
-        "plus the lease, and moves the credential's expiry to the new lease plus one heartbeat " <>
-        "interval. Any other caller gets 404. 409 holder_ended on an ended holder. Role: agent+.",
+        "plus the lease, moves the credential's expiry to the new lease plus one heartbeat " <>
+        "interval, and moves every uncapped claim the holder holds to the new lease. Any other " <>
+        "caller gets 404. 409 holder_ended on an ended holder. 409 holder_lease_expired when " <>
+        "the lease had already run out: that heartbeat ENDS the holder (lapsed), revokes the " <>
+        "credential and releases its claims, so register again. Role: agent+.",
     parameters: [id: [in: :path, type: :string, description: "Holder id"]],
     responses:
       Map.put(@errors, 200, {"Lease", "application/json", HolderSchemas.HeartbeatResponse})
@@ -97,8 +102,8 @@ defmodule LoopctlWeb.HolderController do
   operation(:end_holder,
     summary: "End a holder",
     description:
-      "By the holder's own credential only: sets `ended_at` and revokes the credential in one " <>
-        "transaction. A repeated end answers 200 with the ended holder and writes nothing " <>
+      "By the holder's own credential only: sets `ended_at`, revokes the credential and " <>
+        "releases each uncapped claim the holder holds, in one transaction. A repeated end answers 200 with the ended holder and writes nothing " <>
         "(it is reachable only while the revoked key is still cached; afterwards it is 401). " <>
         "Any other caller gets 404. Role: agent+.",
     parameters: [id: [in: :path, type: :string, description: "Holder id"]],

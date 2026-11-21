@@ -389,6 +389,23 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-52.19: the caller is a holder whose lease has passed or that has ended. Its claims
+  # live by that lease, so it may not take or renew one until it registers again.
+  def call(conn, {:error, :holder_lease_expired}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "holder_lease_expired",
+        message:
+          "This session's holder lease has run out, and a holder's claims live by its " <>
+            "lease. Register the session again (POST /api/v1/holders) and retry with the " <>
+            "new credential."
+      }
+    })
+  end
+
   # US-52.17: an agent-role note on a work item nobody holds.
   def call(conn, {:error, :not_holder}) do
     conn

@@ -132,6 +132,20 @@ defmodule Loopctl.WorkItems.OpenTest do
       assert {:error, :holder_ended} = open(ctx, ctx.h, %{"branch" => "fix/x"})
     end
 
+    test "US-52.19: a lapsed holder opens nothing; a live one's item takes its lease", ctx do
+      {:ok, :created, story} = open(ctx, ctx.h, %{"branch" => "fix/live"})
+      assert story.claimed_until == AdminRepo.get!(Holder, ctx.h.id).lease_until
+      assert is_nil(story.claim_lease_cap)
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(h in Holder, where: h.id == ^ctx.h2.id),
+          set: [lease_until: DateTime.add(DateTime.utc_now(), -1, :second)]
+        )
+
+      assert {:error, :holder_lease_expired} = open(ctx, ctx.h2, %{"branch" => "fix/y"})
+    end
+
     test "a branch that is not a branch name is refused", ctx do
       for branch <- ["", "HEAD", "two words", "tab\there", String.duplicate("b", 256), 7] do
         assert {:error, :invalid_branch} = open(ctx, ctx.h, %{"branch" => branch})
