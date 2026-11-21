@@ -100,6 +100,41 @@ describe("holder session", () => {
     assert.equal(session.agentKey(), "plain");
   });
 
+  test("a failed startup register arms the timer, and its tick registers (AC-52.13.4)", async () => {
+    const { session, calls, timers } = harness({
+      answers: [{ error: true, status: 0, body: "econnrefused" }, registered],
+    });
+    await session.start();
+    assert.equal(session.agentKey(), "plain");
+    assert.equal(timers.length, 1, "a failed register leaves the session ticking");
+
+    await timers[0].fn();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls[1].path, HOLDERS_PATH);
+    assert.equal(session.agentKey(), "holder-key");
+  });
+
+  test("a heartbeat in flight when the session ends never registers it again", async () => {
+    let answerHeartbeat;
+    const inFlight = new Promise((resolve) => {
+      answerHeartbeat = resolve;
+    });
+
+    const { session, calls } = harness({
+      answers: [registered, inFlight, { holder: { ...HOLDER, ended_at: "x" } }, registered],
+    });
+    await session.start();
+
+    const beating = session.heartbeat();
+    await session.end();
+    // The end revoked the credential the heartbeat was sent with.
+    answerHeartbeat({ error: true, status: 401 });
+    await beating;
+
+    assert.equal(calls.length, 3, "nothing is sent after the end");
+    assert.equal(session.agentKey(), "plain");
+  });
+
   test("a heartbeat refused 401 registers again", async () => {
     const { session, calls } = harness({
       answers: [registered, { error: true, status: 401 }, { ...registered, credential: { raw_key: "k2" } }],

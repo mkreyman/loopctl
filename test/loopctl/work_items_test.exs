@@ -298,6 +298,28 @@ defmodule Loopctl.WorkItemsTest do
       assert {:ok, ^first} = WorkItems.write_note(story.tenant_id, story.id, attrs, author)
     end
 
+    test "another holder repeating the holder's key is refused, not answered the note",
+         %{agent: agent, holder_id: holder_id, story: story, author: author} do
+      attrs = %{"section" => "plan", "body" => "first", "idempotency_key" => "k-other"}
+      {:ok, _first} = WorkItems.write_note(story.tenant_id, story.id, attrs, author)
+
+      other = %{
+        api_key_id: Ecto.UUID.generate(),
+        role: :agent,
+        holder_id: holder(agent.tenant_id, agent.id, "session-other")
+      }
+
+      assert {:error, {:held_by_other_holder, ^holder_id}} =
+               WorkItems.write_note(story.tenant_id, story.id, %{attrs | "body" => "b"}, other)
+
+      plain = %{api_key_id: Ecto.UUID.generate(), role: :agent, holder_id: nil}
+
+      assert {:error, {:held_by_other_holder, ^holder_id}} =
+               WorkItems.write_note(story.tenant_id, story.id, attrs, plain)
+
+      assert note_count(story.tenant_id, story.id) == 1
+    end
+
     test "a note row already holding the key is answered even if its event is missing",
          %{story: story, author: author} do
       # The race the unique index settles: another write committed the note first.

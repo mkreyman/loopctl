@@ -137,7 +137,8 @@ defmodule Loopctl.Holders do
   `attrs` carries the session's own description: `kind`, `session_id`, `host` and `worktree`.
   A live holder for the same `(agent_id, session_id)` is reused, its lease reset and its
   credential rotated (`outcome: :rotated`); otherwise a new holder is created
-  (`outcome: :created`). Either way the result carries the new raw key once.
+  (`outcome: :created`). Either way the result carries the new raw key once. A live holder of
+  ANOTHER kind under that session id (a runner session's) is `{:error, :session_id_held}`.
 
   ## Options
 
@@ -176,9 +177,16 @@ defmodule Loopctl.Holders do
 
     lock_session(tenant_id, agent_id, session_id)
 
+    kind = Ecto.Changeset.get_field(changeset, :kind)
+
     case live_holder(tenant_id, agent_id, session_id) do
       nil -> create_holder(changeset, now, opts)
-      %Holder{} = holder -> rotate_holder(holder, now, opts)
+      %Holder{kind: ^kind} = holder -> rotate_holder(holder, now, opts)
+      # A live holder of another kind under this session id is not the caller's to rotate: a
+      # runner session's id is derivable ("dispatch:<id>", then the launched uuid), and
+      # rotating it would revoke that session's dispatch key and hand its holder_id to
+      # whoever holds the agent's plain key.
+      %Holder{} -> AdminRepo.rollback(:session_id_held)
     end
   end
 
@@ -622,7 +630,9 @@ defmodule Loopctl.Holders do
 
   - **`:interactive` and `:cloud`**: `lease_until` before `now`.
   - **`:runner_session`**: inserted more than #{@runner_claim_grace_seconds} s ago, and either
-    no story's `assigned_holder_id` names it, or its dispatch is revoked or expired. Its
+    no story names it (as `assigned_holder_id`, or its dispatch as `verifier_dispatch_id`: a
+    verify@1 session binds as the verifier and never claims), or its dispatch is revoked or
+    expired. Its
     `lease_until` is never read: `Loopctl.Delivery.DispatchLease` moves the claim's cap after
     placement and a story waiting at ci keeps its claim past the cap, so the claim, not the
     holder row, says whether the session may still be working. The grace exists because
@@ -716,7 +726,8 @@ defmodule Loopctl.Holders do
           from(s in Story,
             where:
               s.tenant_id == parent_as(:holder).tenant_id and
-                s.assigned_holder_id == parent_as(:holder).id,
+                (s.assigned_holder_id == parent_as(:holder).id or
+                   s.verifier_dispatch_id == parent_as(:holder).dispatch_id),
             select: 1
           )
         )

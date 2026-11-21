@@ -73,15 +73,17 @@ defmodule LoopctlWeb.WorkItemController do
          Schemas.ErrorResponse},
       404 =>
         {"`project_not_found`: no project of this tenant has this repo; " <>
-           "`epic_not_found`: epic_id is not an epic of that project", "application/json",
+           "`epic_not_found`: epic_id is not an epic of that project; " <>
+           "`target_epic_missing`: the target epic is not this tenant's", "application/json",
          Schemas.ErrorResponse},
       409 =>
         {"`branch_held`: another holder's open item has this branch (`story_id`, " <>
            "`holder_id`); `holder_ended`; `holder_lease_expired`; `ambiguous_project`; " <>
            "`story_held` (escalated)", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"`no_target_epic`: pass epic_id; `invalid_branch`; `invalid_repo_url`",
-         "application/json", Schemas.ErrorResponse},
+        {"`no_target_epic`: pass epic_id; `invalid_branch`; `invalid_repo_url`; " <>
+           "`epic_number_unnumberable` / `story_number_exhausted`: the epic cannot number " <>
+           "another story, pass another epic_id", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -150,7 +152,15 @@ defmodule LoopctlWeb.WorkItemController do
     invalid_branch:
       {:unprocessable_entity,
        "branch is a branch name: 1 to #{Open.max_branch_bytes()} bytes, no whitespace, not HEAD."},
-    invalid_repo_url: {:unprocessable_entity, "repo_url is required."}
+    invalid_repo_url: {:unprocessable_entity, "repo_url is required."},
+    # Stories.next_number/2 refusals: the epic cannot number another story.
+    target_epic_missing: {:not_found, "The target epic is not an epic of this tenant."},
+    epic_number_unnumberable:
+      {:unprocessable_entity,
+       "The epic's number is 10000 or more, so its stories cannot be numbered: pass another epic_id."},
+    story_number_exhausted:
+      {:unprocessable_entity,
+       "The epic has no story number left below 10000: pass another epic_id."}
   }
 
   defp render_refusal(conn, refusal) do

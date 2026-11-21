@@ -38,21 +38,31 @@ defmodule LoopctlE2e.TwoSessions do
   @spec run(map(), map()) :: {:ok, map()} | {:error, failure()}
   def run(cfg, deps) do
     with {:ok, wts} <- clone(cfg, deps),
-         {:ok, a} <- start(deps, cfg, :a, wts.a),
-         {:ok, b} <- start(deps, cfg, :b, wts.b) do
-      result =
-        with {:ok, ctx} <- holders(deps, %{cfg: cfg, a: a, b: b}),
-             {:ok, ctx} <- open_items(deps, ctx, wts),
-             {:ok, ctx} <- channel_refusal(deps, ctx),
-             {:ok, ctx} <- verb_refusals(deps, ctx),
-             {:ok, ctx} <- lapse(deps, ctx),
-             do: finish(deps, ctx)
-
-      # A killed session's port is already closed; stop/1 on it is a no-op.
-      deps.stop.(a)
-      deps.stop.(b)
-      result
+         {:ok, a} <- start(deps, cfg, :a, wts.a) do
+      # Every session that started is stopped, whatever the steps after it did (a failed
+      # start of B, a step that raised): an unstopped one keeps heartbeating its holder.
+      try do
+        with {:ok, b} <- start(deps, cfg, :b, wts.b) do
+          try do
+            steps(deps, %{cfg: cfg, a: a, b: b}, wts)
+          after
+            deps.stop.(b)
+          end
+        end
+      after
+        # A killed session's port is already closed; stop/1 on it is a no-op.
+        deps.stop.(a)
+      end
     end
+  end
+
+  defp steps(deps, ctx, wts) do
+    with {:ok, ctx} <- holders(deps, ctx),
+         {:ok, ctx} <- open_items(deps, ctx, wts),
+         {:ok, ctx} <- channel_refusal(deps, ctx),
+         {:ok, ctx} <- verb_refusals(deps, ctx),
+         {:ok, ctx} <- lapse(deps, ctx),
+         do: finish(deps, ctx)
   end
 
   # --- setup ---
@@ -372,7 +382,8 @@ defmodule LoopctlE2e.TwoSessions do
 
   defp live_claims(deps, ctx) do
     case deps.call.(ctx.b, "channel_claims", %{project_id: ctx.cfg.project_id}) do
-      {:ok, %{"data" => rows}} ->
+      # GET /api/v1/channel/claims answers {claims: [...], meta: {...}}.
+      {:ok, %{"claims" => rows}} ->
         for %{"ref" => ref} = row <- rows,
             ref == ref(ctx.cfg),
             row["done"] != true and row["expired"] != true,

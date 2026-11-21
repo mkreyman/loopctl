@@ -85,6 +85,22 @@ defmodule Loopctl.HoldersTest do
       assert %{kind: [_]} = errors_on(cs)
     end
 
+    test "a register never rotates a live holder of another kind under its session id",
+         %{tenant: tenant, agent: agent} do
+      # A runner session's id is derivable ("dispatch:<id>"); a plain-key register naming it
+      # must not revoke that session's key or take its holder_id.
+      {:ok, runner} =
+        Holders.register(tenant.id, agent.id, attrs("dispatch:d1", %{"kind" => "runner_session"}),
+          kinds: [:runner_session]
+        )
+
+      assert {:error, :session_id_held} =
+               Holders.register(tenant.id, agent.id, attrs("dispatch:d1"))
+
+      assert {:ok, _} = Auth.verify_api_key(runner.raw_key)
+      assert is_nil(AdminRepo.get!(Holder, runner.holder.id).ended_at)
+    end
+
     test "requires session_id and host", %{tenant: tenant, agent: agent} do
       assert {:error, cs} = Holders.register(tenant.id, agent.id, %{"kind" => "interactive"})
       assert %{session_id: [_], host: [_]} = errors_on(cs)

@@ -90,6 +90,19 @@ defmodule LoopctlWeb.WorkItemControllerTest do
     assert error["message"] =~ "epic_id"
   end
 
+  test "an epic that cannot number another story is 422, never 500", ctx do
+    big =
+      fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.epic.project_id, number: 10_000})
+
+    error =
+      json_response(open(ctx.h1.raw_key, %{params(ctx, "fix/big") | epic_id: big.id}), 422)[
+        "error"
+      ]
+
+    assert error["code"] == "epic_number_unnumberable"
+    assert error["message"] =~ "epic_id"
+  end
+
   test "a detached HEAD is 422 invalid_branch", ctx do
     error = json_response(open(ctx.h1.raw_key, params(ctx, "HEAD")), 422)["error"]
     assert error["code"] == "invalid_branch"

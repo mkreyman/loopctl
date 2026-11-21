@@ -346,7 +346,17 @@ defmodule Loopctl.WorkItems.Open do
     |> Enum.map(fn {story_id, _row_id} ->
       {lock_story(tenant_id, story_id), stage_row(tenant_id, story_id)}
     end)
+    # The select ran unlocked: an overlapping open for another branch may have recorded its
+    # branch, or a release moved the story, before the lock. Judge again under the lock.
+    |> Enum.filter(fn {story, row} -> still_unbranched?(story, row, holder_id) end)
   end
+
+  defp still_unbranched?(%Story{} = story, %StoryStage{} = row, holder_id) do
+    story.assigned_holder_id == holder_id and story.agent_status in [:assigned, :implementing] and
+      is_nil(row.branch) and row.stage not in @closed_stages
+  end
+
+  defp still_unbranched?(_story, _row, _holder_id), do: false
 
   defp record_branch(request, holder, story, row) do
     {:ok, _row} =

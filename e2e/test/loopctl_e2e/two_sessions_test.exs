@@ -25,6 +25,7 @@ defmodule LoopctlE2e.TwoSessionsTest do
             hosts: %{a: "minis", b: "minis"},
             b_verb: :refuse,
             open_items: true,
+            claim_done: true,
             git: [],
             stopped: []
           },
@@ -140,7 +141,12 @@ defmodule LoopctlE2e.TwoSessionsTest do
   defp answer(_w, :a, "channel_claim", _args), do: {:ok, %{"created" => true}}
   defp answer(_w, :b, "channel_claim", _args), do: refusal("already_claimed")
   defp answer(_w, :a, "channel_done", _args), do: {:ok, %{"done" => true}}
-  defp answer(_w, :b, "channel_claims", _args), do: {:ok, %{"data" => []}}
+  # The shape GET /api/v1/channel/claims answers: A's claim on the scenario's ref, done unless
+  # the world says the done never landed.
+  defp answer(w, :b, "channel_claims", _args) do
+    row = %{"ref" => TwoSessions.ref(@cfg), "done" => get(w, :claim_done), "expired" => false}
+    {:ok, %{"claims" => [row], "meta" => %{"count" => 1}}}
+  end
 
   defp answer(w, :b, verb, _args)
        when verb in ["claim_story", "start_story", "renew_story_claim", "work_item_note"] do
@@ -187,6 +193,27 @@ defmodule LoopctlE2e.TwoSessionsTest do
     assert Enum.sort(get(w, :stopped)) == [:a, :b]
   end
 
+  test "B failing to start still stops A" do
+    w = world()
+
+    deps =
+      Map.put(deps(w), :start_session, fn
+        %{name: :a} -> {:ok, :a}
+        %{name: :b} -> {:error, :enoent}
+      end)
+
+    assert {:error, %{step: :start_b}} = TwoSessions.run(@cfg, deps)
+    assert get(w, :stopped) == [:a]
+  end
+
+  test "a step that raises still stops both sessions" do
+    w = world()
+    deps = Map.put(deps(w), :call, fn _s, _t, _a -> raise "transport gone" end)
+
+    assert_raise RuntimeError, fn -> TwoSessions.run(@cfg, deps) end
+    assert Enum.sort(get(w, :stopped)) == [:a, :b]
+  end
+
   test "two hosts fail at holders" do
     w = world(%{hosts: %{a: "minis", b: "x1"}})
     assert {:error, %{step: :holders}} = run(w)
@@ -219,6 +246,12 @@ defmodule LoopctlE2e.TwoSessionsTest do
     w = world(%{lapse_after_s: 950})
     # 950 s is inside 300 + 600 + 60 = 960 s, so it passes.
     assert {:ok, _} = run(w)
+  end
+
+  test "a channel claim left live fails at clean" do
+    w = world(%{claim_done: false})
+    assert {:error, %{step: :clean, last_state: state}} = run(w)
+    assert state =~ "channel claim e2e-ref-r1 is live"
   end
 
   test "names carry the run id" do

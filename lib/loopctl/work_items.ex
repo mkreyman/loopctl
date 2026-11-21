@@ -80,8 +80,10 @@ defmodule Loopctl.WorkItems do
     if changeset.valid? do
       key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
+      # The writer's own retry is answered even after the item changed hands; anyone else
+      # repeating that key goes through may_write/2 and is refused like any other write.
       case existing_note(tenant_id, story_id, key) do
-        %Note{} = note -> {:ok, note}
+        %Note{} = note -> own_replay(note, tenant_id, story_id, changeset, author, opts)
         nil -> insert_note(tenant_id, story_id, changeset, author, opts)
       end
     else
@@ -89,11 +91,24 @@ defmodule Loopctl.WorkItems do
     end
   end
 
+  defp own_replay(note, tenant_id, story_id, changeset, author, opts) do
+    if written_by?(note, author),
+      do: {:ok, note},
+      else: insert_note(tenant_id, story_id, changeset, author, opts)
+  end
+
+  defp written_by?(%Note{holder_id: nil} = note, author),
+    do: note.author_api_key_id == author.api_key_id
+
+  defp written_by?(%Note{holder_id: holder_id}, author), do: holder_id == author.holder_id
+
   defp insert_note(tenant_id, story_id, changeset, author, opts) do
+    key = Ecto.Changeset.get_field(changeset, :idempotency_key)
+
     AdminRepo.transaction(fn ->
       with {:ok, story} <- story_for_write(tenant_id, story_id, opts),
            :ok <- may_write(story, author),
-           {:ok, note} <- append(tenant_id, story, changeset, author) do
+           {:ok, note} <- replay_or_append(tenant_id, story, changeset, author, key) do
         note
       else
         {:error, :replayed} -> AdminRepo.rollback(:replayed)
@@ -103,7 +118,6 @@ defmodule Loopctl.WorkItems do
     |> case do
       # A concurrent write with the same key won the unique index: answer its note.
       {:error, :replayed} ->
-        key = Ecto.Changeset.get_field(changeset, :idempotency_key)
         {:ok, existing_note(tenant_id, story_id, key)}
 
       result ->
@@ -198,6 +212,13 @@ defmodule Loopctl.WorkItems do
        do: holder_id
 
   defp writer_holder(_story, _author), do: nil
+
+  defp replay_or_append(tenant_id, story, changeset, author, key) do
+    case existing_note(tenant_id, story.id, key) do
+      %Note{} = note -> {:ok, note}
+      nil -> append(tenant_id, story, changeset, author)
+    end
+  end
 
   defp existing_note(_tenant_id, _story_id, nil), do: nil
 

@@ -16,7 +16,14 @@
  * holder was ended): the next tick registers again, which loopctl answers with the SAME
  * holder while it is live. A heartbeat refused 409 holder_lease_expired (US-52.19) ended the
  * holder and released its claims, so the register makes a NEW holder, and the lapse is
- * logged to stderr. A network error leaves the credential in place for the next tick.
+ * logged to stderr. A network error leaves the credential in place for the next tick. A
+ * register that fails (at startup, or after a refused heartbeat) arms the timer anyway, so
+ * the session keeps trying and registers once loopctl answers (AC-52.13.4).
+ *
+ * An end is final for every call already in flight: each register and heartbeat remembers
+ * the generation it started in, and one that lands after an end adopts nothing, so a
+ * heartbeat refused because the end revoked its credential never registers the session
+ * back to life. An explicit register after the end starts a new generation and is honoured.
  *
  * ## The session id
  *
@@ -43,6 +50,11 @@ export function endPath(id) {
 }
 
 const GONE = new Set([401, 404, 409]);
+
+// The retry interval before loopctl has named one: the server's own heartbeat interval
+// (HOLDER_HEARTBEAT_SECONDS' default), so an unregistered session retries no faster than a
+// registered one beats.
+const DEFAULT_HEARTBEAT_SECONDS = 60;
 
 /** The `error.code` of a refusal body, parsed or raw. */
 function errorCode(body) {
@@ -100,6 +112,8 @@ export function createHolderSession(deps) {
   let credential = null;
   let timer = null;
   let ended = false;
+  // Bumped by end(): a call started before it adopts nothing that lands after it.
+  let generation = 0;
 
   function plainKey() {
     return env.LOOPCTL_AGENT_KEY;
@@ -130,6 +144,7 @@ export function createHolderSession(deps) {
     const key = plainKey();
     if (!key) return { error: true, status: 0, body: "LOOPCTL_AGENT_KEY is not set" };
 
+    const gen = generation;
     const result = await apiCall(
       "POST",
       HOLDERS_PATH,
@@ -138,12 +153,17 @@ export function createHolderSession(deps) {
       { exactKey: true },
     );
 
+    if (gen !== generation) return result;
+
     if (result && !result.error && result.holder) {
       holder = result.holder;
       // `credential: null` means the key we sent is already this holder's; keep what we hold.
       if (result.credential && result.credential.raw_key) credential = result.credential.raw_key;
       ended = false;
       arm(result.heartbeat_seconds);
+    } else if (timer === null) {
+      // Not registered: keep ticking, and the next tick registers again.
+      arm(DEFAULT_HEARTBEAT_SECONDS);
     }
 
     return beat(result);
@@ -152,9 +172,12 @@ export function createHolderSession(deps) {
   async function heartbeat() {
     if (!holder || !credential) return register();
 
+    const gen = generation;
     const result = await apiCall("POST", heartbeatPath(holder.id), null, credential, {
       exactKey: true,
     });
+
+    if (gen !== generation) return result;
 
     if (result && result.error && GONE.has(result.status)) {
       // US-52.19: a heartbeat after the lease ran out ended the holder and released its
@@ -179,6 +202,7 @@ export function createHolderSession(deps) {
 
   async function end() {
     stopTimer();
+    generation += 1;
     if (!holder || !credential || ended) return { ended: true, holder };
 
     const id = holder.id;

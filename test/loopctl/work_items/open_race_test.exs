@@ -104,6 +104,66 @@ defmodule Loopctl.WorkItems.OpenRaceTest do
     assert {:ok, :created, _story} = Task.await(opener_task, 10_000)
   end
 
+  # An open for another branch records its branch on the caller's unbranched item while this
+  # open waits on the item's row lock: under the lock the item is no longer unbranched, so this
+  # open creates its own item rather than answering branch_recorded for a branch it never wrote.
+  test "an unbranched item taken by an overlapping open is judged again under the lock", ctx do
+    %{tenant: tenant, epic: epic, holders: [holder | _]} = ctx
+    opener = %{api_key_id: Ecto.UUID.generate(), agent_id: holder.agent_id, holder_id: holder.id}
+    attrs = %{"repo_url" => "https://github.com/mkreyman/chg", "epic_id" => epic.id}
+
+    {:ok, :created, item} =
+      WorkItems.open_interactive(tenant.id, opener, Map.put(attrs, "branch", "fix/b0"))
+
+    {1, _} =
+      AdminRepo.update_all(
+        from(st in Loopctl.Delivery.StoryStage, where: st.story_id == ^item.id),
+        set: [branch: nil]
+      )
+
+    parent = self()
+
+    locker =
+      Task.async(fn ->
+        :ok =
+          ProductionTopology.checkout_unboxed!([AdminRepo], ownership_timeout: @ownership_timeout)
+
+        AdminRepo.transaction(fn ->
+          AdminRepo.one!(from(s in Story, where: s.id == ^item.id, lock: "FOR UPDATE"))
+          send(parent, :locked)
+
+          receive do
+            :release -> :ok
+          end
+
+          AdminRepo.update_all(
+            from(st in Loopctl.Delivery.StoryStage, where: st.story_id == ^item.id),
+            set: [branch: "fix/b1"]
+          )
+        end)
+      end)
+
+    assert_receive :locked, 5_000
+
+    opener_task =
+      Task.async(fn ->
+        :ok =
+          ProductionTopology.checkout_unboxed!([Repo, AdminRepo],
+            ownership_timeout: @ownership_timeout
+          )
+
+        WorkItems.open_interactive(tenant.id, opener, Map.put(attrs, "branch", "fix/b2"))
+      end)
+
+    assert Task.yield(opener_task, 500) == nil, "the open did not wait on the item's row lock"
+
+    send(locker.pid, :release)
+    Task.await(locker)
+
+    assert {:ok, :created, second} = Task.await(opener_task, 10_000)
+    refute second.id == item.id
+  end
+
   # TC-52.18.4
   test "two holders racing one branch yield one item", %{tenant: tenant, epic: epic} = ctx do
     attrs = %{

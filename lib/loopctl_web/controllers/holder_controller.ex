@@ -59,8 +59,9 @@ defmodule LoopctlWeb.HolderController do
          "(register by a dispatch-minted key)", "application/json", Schemas.ErrorResponse},
     404 => {"Not your holder", "application/json", Schemas.ErrorResponse},
     409 =>
-      {"holder_ended, or holder_lease_expired (heartbeat after the lease ran out)",
-       "application/json", Schemas.ErrorResponse},
+      {"holder_ended, holder_lease_expired (heartbeat after the lease ran out), or session_id_held " <>
+         "(register: a live holder of another kind has this session id)", "application/json",
+       Schemas.ErrorResponse},
     422 =>
       {"agent_required (the key names no agent), or invalid fields", "application/json",
        Schemas.ErrorResponse}
@@ -75,7 +76,8 @@ defmodule LoopctlWeb.HolderController do
         "for a live holder of the same session answers 200 with the SAME holder and a NEW " <>
         "credential, revoking the previous one. A key that is already a holder's credential " <>
         "gets 200 with its holder and `credential: null`. 403 holder_mint_forbidden for a " <>
-        "dispatch-minted key; 422 agent_required for a key with no agent. `kind` is " <>
+        "dispatch-minted key; 409 session_id_held when a live holder of another kind (a runner " <>
+        "session) has this session id; 422 agent_required for a key with no agent. `kind` is " <>
         "interactive or cloud. Role: agent+, human-anchored tenant.",
     request_body: {"Session", "application/json", HolderSchemas.RegisterRequest},
     responses:
@@ -127,16 +129,28 @@ defmodule LoopctlWeb.HolderController do
     attrs = Map.take(params, ["kind", "session_id", "host", "worktree"])
     opts = LoopctlWeb.AuditContext.from_conn(conn)
 
-    with {:ok, result} <- Holders.register(tenant_id, agent_id, attrs, opts) do
-      status = if result.outcome == :created, do: :created, else: :ok
+    case Holders.register(tenant_id, agent_id, attrs, opts) do
+      {:ok, result} ->
+        status = if result.outcome == :created, do: :created, else: :ok
 
-      conn
-      |> put_status(status)
-      |> json(%{
-        holder: holder_json(result.holder),
-        credential: credential_json(result),
-        heartbeat_seconds: Holders.heartbeat_seconds()
-      })
+        conn
+        |> put_status(status)
+        |> json(%{
+          holder: holder_json(result.holder),
+          credential: credential_json(result),
+          heartbeat_seconds: Holders.heartbeat_seconds()
+        })
+
+      {:error, :session_id_held} ->
+        error(
+          conn,
+          :conflict,
+          "session_id_held",
+          "A live holder of another kind already has this session id; register under your own session id."
+        )
+
+      {:error, _} = error ->
+        error
     end
   end
 

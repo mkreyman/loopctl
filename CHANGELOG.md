@@ -72,7 +72,8 @@ All notable changes to loopctl are documented here.
   server (3.21.0) does this at startup, sends every agent-key request with that credential,
   heartbeats it and ends it on exit, and falls back to `LOOPCTL_AGENT_KEY` when the register
   is refused. Register refuses `403 holder_mint_forbidden` to a dispatch-minted key, `422
-  agent_required` to a key naming no agent, and `403 custody_tier_required` on an
+  agent_required` to a key naming no agent, `409 session_id_held` when a live holder of another
+  kind (a runner session) has that session id, and `403 custody_tier_required` on an
   agent-rooted tenant. Migration `20261121020000` creates `holders`, adds
   `api_keys.holder_id`, and rebuilds `api_keys_one_role_per_agent_idx` to exclude holder keys
   (one live key per holder is held by `api_keys_one_live_key_per_holder_idx` instead); no

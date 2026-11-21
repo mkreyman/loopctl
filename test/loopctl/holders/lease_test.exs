@@ -325,6 +325,13 @@ defmodule Loopctl.Holders.LeaseTest do
       # R6: minted 10 s ago, its claim not committed yet.
       r6 = runner_session(ctx, seconds(-10))
 
+      # R7: a verify@1 session, bound as a story's verifier on a live dispatch; it never claims.
+      r7 = runner_session(ctx, old)
+
+      story(ctx)
+      |> Ecto.Changeset.change(verifier_dispatch_id: r7.dispatch.id)
+      |> AdminRepo.update!()
+
       :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
 
       assert reload(r1s).agent_status == :pending
@@ -334,7 +341,7 @@ defmodule Loopctl.Holders.LeaseTest do
         assert live_keys(ctx.tenant_id, r.holder.id) == 0
       end
 
-      for r <- [r3, r4, r5, r6] do
+      for r <- [r3, r4, r5, r6, r7] do
         assert is_nil(holder_row(r.holder.id).ended_at)
         assert live_keys(ctx.tenant_id, r.holder.id) == 1
       end

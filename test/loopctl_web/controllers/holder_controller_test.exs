@@ -39,6 +39,22 @@ defmodule LoopctlWeb.HolderControllerTest do
       refute second["credential"]["raw_key"] == first["credential"]["raw_key"]
     end
 
+    test "a runner session's id is 409 session_id_held, and its holder is untouched", ctx do
+      {:ok, runner} =
+        Loopctl.Holders.register(
+          ctx.tenant.id,
+          ctx.agent.id,
+          Map.merge(@body, %{"kind" => "runner_session", "session_id" => "dispatch:d1"}),
+          kinds: [:runner_session]
+        )
+
+      body =
+        json_response(register(ctx.agent_key, %{@body | "session_id" => "dispatch:d1"}), 409)
+
+      assert body["error"]["code"] == "session_id_held"
+      assert {:ok, _} = Loopctl.Auth.verify_api_key(runner.raw_key)
+    end
+
     test "a holder credential gets its own holder and no new credential", ctx do
       first = json_response(register(ctx.agent_key), 201)
       again = json_response(register(first["credential"]["raw_key"]), 200)
