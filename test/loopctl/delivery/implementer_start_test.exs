@@ -13,6 +13,7 @@ defmodule Loopctl.Delivery.ImplementerStartTest do
   alias Loopctl.Delivery.ImplementerStart
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Holders
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -34,6 +35,22 @@ defmodule Loopctl.Delivery.ImplementerStartTest do
 
       assert {:ok, :already_started} =
                ImplementerStart.ensure_started(ctx.tenant.id, ctx.story.id)
+    end
+
+    test "starts a story a holder claimed (US-52.14)", ctx do
+      attrs = %{"kind" => "interactive", "session_id" => "implementer", "host" => "minis"}
+
+      {:ok, %{holder: holder}} =
+        Holders.register(ctx.tenant.id, ctx.implementer_runner.agent_id, attrs)
+
+      {1, _} =
+        AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
+          set: [assigned_holder_id: holder.id]
+        )
+
+      assert {:ok, :started} = ImplementerStart.ensure_started(ctx.tenant.id, ctx.story.id)
+
+      assert story(ctx).agent_status == :implementing
     end
 
     test "a story nobody claimed has nothing to start", ctx do

@@ -9,8 +9,9 @@ defmodule Loopctl.Delivery.ImplementerStart do
   reported, reviewed or verified, and `Progress.merge_custody_status/1` was never `:ok`.
 
   `ensure_started/3` calls `Progress.start_story/3` with the identity the CLAIM recorded —
-  the story's `assigned_agent_id` and the lineage of its `implementer_dispatch_id` row —
-  never anything a runner message carries. It spends the live `start_cap` the claim minted
+  the story's `assigned_agent_id`, its `assigned_holder_id` (US-52.14: a holder-claimed story
+  refuses a start that names no holder, `held_by_other_holder`) and the lineage of its
+  `implementer_dispatch_id` row — never anything a runner message carries. It spends the live `start_cap` the claim minted
   for that lineage, and only when none is live (the 1-hour TTL ran out, or a tenant whose
   claim minted none) mints one for the same lineage, exactly as `recover-cap` would. On a
   tenant with no audit key there is nothing to mint and `start_story/3`'s pre-v2 path takes a
@@ -46,7 +47,7 @@ defmodule Loopctl.Delivery.ImplementerStart do
           | term()
 
   @doc """
-  Moves `story_id` from `:assigned` to `:implementing` as its assigned agent.
+  Moves `story_id` from `:assigned` to `:implementing` as its assigned agent and holder.
 
   Returns `{:ok, :started}`, `{:ok, :already_started}` for a story past `:assigned`, or
   `{:error, reason}`: `:not_claimed` for a story at `:pending` (nothing to start),
@@ -73,6 +74,7 @@ defmodule Loopctl.Delivery.ImplementerStart do
          {:ok, lineage} <- implementer_lineage(tenant_id, story) do
       case Progress.start_story(tenant_id, story.id,
              agent_id: story.assigned_agent_id,
+             holder_id: story.assigned_holder_id,
              cap_id: start_cap_id(tenant_id, story.id, lineage),
              lineage: lineage,
              claim_epoch: story.claim_epoch,
