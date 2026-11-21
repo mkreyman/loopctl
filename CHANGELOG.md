@@ -405,6 +405,15 @@ All notable changes to loopctl are documented here.
 
 ### Removed
 
+- **Orchestrator state is deleted (2026-11-21, US-52.17).** BREAKING for anything still calling
+  it: `PUT /api/v1/orchestrator/state/:project_id`, `GET /api/v1/orchestrator/state/:project_id`
+  and `GET .../history` now answer 404, the CLI's `loopctl state save|load` is gone, and the
+  `OrchestratorStateRequest`/`OrchestratorStateResponse` schemas leave the OpenAPI spec. No MCP
+  tool ever reached it. Migration `20261121060000` copies every `orchestrator_states` row into
+  `audit_log` (`entity_type` project, `action` orchestrator_state_retired, `new_state` holding
+  `state_key`, `version` and `state_data`) and drops the table; no manual step. A session
+  resumes from the work item instead: its stage, its event log and its notes.
+
 - **Epic 45's change threads are deleted (#984).** BREAKING for anything still calling them:
   `GET /api/v1/stories/:id/thread`, `POST .../thread/checkpoints`, `.../thread/entries`,
   `.../thread/reviews`, `.../thread/fixes`, `GET .../thread/reviews/:review_id`,
@@ -438,6 +447,16 @@ All notable changes to loopctl are documented here.
   were unset on 2026-10-19.
 
 ### Added
+
+- **A work item carries its notes (2026-11-21, US-52.17).** `POST /api/v1/stories/:id/notes`
+  appends a note (`section`: plan, progress, decision or question; `body` 1 to 16384 bytes,
+  refused 422 if it looks like a credential) and records a `note_written` event in the same
+  transaction; `GET /api/v1/stories/:id/notes` pages them oldest first (`limit` default 50,
+  max 200, `after` cursor) with `current`, the newest note per section, on the first page.
+  Only the story's current holder, or an orchestrator, user or superadmin key, writes one:
+  another session is `409 held_by_other_holder`, and an agent on an item nobody holds is
+  `409 not_holder`. A repeated `idempotency_key` returns the first note. MCP tools
+  `work_item_note` and `work_item_notes`. New table `story_notes` (RLS enabled).
 
 - **A session end reports its turns and the work it left behind (2026-11-07, US-48.11,
   runner contract 1.27.0).** `session_ended` gains two optional fields: `turns_used` (an

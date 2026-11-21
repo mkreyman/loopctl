@@ -55,7 +55,7 @@ defmodule Loopctl.Projects.Merge do
   @project_tables ~w(
     agent_run_outcomes article_access_events articles channel_claims channel_posts corpora
     egress_blocked_decisions egress_scope_markings epics intake_records intake_sources memories
-    orchestrator_states reply_drafts session_memories skills spec_tuning_drafts stories
+    reply_drafts session_memories skills spec_tuning_drafts stories
     token_usage_reports ui_test_runs webhooks
   )
 
@@ -85,12 +85,6 @@ defmodule Loopctl.Projects.Merge do
       index: "epics_tenant_id_project_id_number_index",
       table: "epics",
       columns: ~w(number),
-      where: nil
-    },
-    %{
-      index: "orchestrator_states_tenant_id_project_id_state_key_index",
-      table: "orchestrator_states",
-      columns: ~w(state_key),
       where: nil
     },
     %{index: "skills_tenant_project_name_index", table: "skills", columns: ~w(name), where: nil},

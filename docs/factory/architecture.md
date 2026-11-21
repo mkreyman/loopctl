@@ -135,7 +135,7 @@ client version for one release (R7).
 | `Loopctl.Delivery.RetryCeiling` + the `:attempts_exhausted` edge | the attempt count before an item escalates to a different holder (R4); `DISPATCH_MAX_ATTEMPTS` keeps having no default | 5 |
 | SessionStart TEAM CHANNEL block | the session's inbox read at start, which until release 7 also lists the repo's open `handoff:` posts | 4 |
 | loopctl MCP registration per machine (user scope in `~/.claude.json`, launched by claude-config's `bin/loopctl-mcp.sh` at `loopctl-mcp-server@latest`) | carried by the factory plugin: the pack ships the launcher pinned to the release-set MCP version, and each machine's user-scope `loopctl` entry points at it. It stays a user-scope entry, not a plugin `.mcp.json`, because a plugin server's tools are named `mcp__plugin_<plugin>_<server>__*`, which would rename every `mcp__loopctl__*` tool that allowlists, hooks and agent tool lists name | 8 |
-| `orchestrator_state` | checked in release 3: whatever duplicates work-item state is folded in or deleted | 3 |
+| `orchestrator_state` | deleted (US-52.17): every key it held duplicated story or stage state; a work item's notes (`/api/v1/stories/:id/notes`) carry what a session resumes from, and the old rows are `orchestrator_state_retired` entries in `audit_log` | 3 |
 | knowledge plane | unchanged | — |
 
 Each story names the existing modules it changes and the ones it deletes. A story that adds a

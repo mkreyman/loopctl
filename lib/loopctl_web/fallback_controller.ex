@@ -389,6 +389,21 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-52.17: an agent-role note on a work item nobody holds.
+  def call(conn, {:error, :not_holder}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "not_holder",
+        message:
+          "Nobody holds this story, so an agent key cannot write its notes: a note is " <>
+            "progress on held work. Claim the story first, or write with an orchestrator key."
+      }
+    })
+  end
+
   def call(conn, {:error, :not_claimant}) do
     conn
     |> put_status(:conflict)

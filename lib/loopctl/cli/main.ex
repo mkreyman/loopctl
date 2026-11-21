@@ -28,7 +28,6 @@ defmodule Loopctl.CLI.Main do
     "verify" => Commands.Orchestrator,
     "reject" => Commands.Orchestrator,
     "pending" => Commands.Orchestrator,
-    "state" => Commands.Orchestrator,
     "history" => Commands.Webhooks,
     "audit" => Commands.Webhooks,
     "changes" => Commands.Webhooks,
@@ -122,7 +121,6 @@ defmodule Loopctl.CLI.Main do
       verify    Verify a story
       reject    Reject a story
       pending   List pending stories
-      state     Orchestrator state management
       history   Story audit history
       audit     Query audit log
       changes   Change feed

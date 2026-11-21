@@ -2125,65 +2125,6 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
-  # ---------- Orchestrator State ----------
-
-  defmodule OrchestratorStateRequest do
-    @moduledoc false
-    require OpenApiSpex
-
-    OpenApiSpex.schema(%{
-      title: "OrchestratorStateRequest",
-      description: "Save orchestrator state (upsert with optimistic locking)",
-      type: :object,
-      required: [:state_key, :state_data],
-      properties: %{
-        state_key: %Schema{type: :string, description: "State namespace key (default: 'main')"},
-        state_data: %Schema{
-          type: :object,
-          additionalProperties: true,
-          description: "Arbitrary state payload"
-        },
-        version: %Schema{
-          type: :integer,
-          description: "Expected version for optimistic lock",
-          nullable: true
-        }
-      },
-      example: %{state_key: "main", state_data: %{phase: "epic_3"}, version: 0}
-    })
-  end
-
-  defmodule OrchestratorStateResponse do
-    @moduledoc false
-    require OpenApiSpex
-
-    OpenApiSpex.schema(%{
-      title: "OrchestratorStateResponse",
-      description: "Orchestrator state checkpoint",
-      type: :object,
-      properties: %{
-        id: %Schema{type: :string, format: :uuid},
-        tenant_id: %Schema{type: :string, format: :uuid},
-        project_id: %Schema{type: :string, format: :uuid},
-        state_key: %Schema{type: :string},
-        state_data: %Schema{type: :object, additionalProperties: true},
-        version: %Schema{type: :integer},
-        inserted_at: %Schema{type: :string, format: :"date-time"},
-        updated_at: %Schema{type: :string, format: :"date-time"}
-      },
-      example: %{
-        id: "e1f2a3b4-c5d6-7890-efab-012345678901",
-        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
-        state_key: "main",
-        state_data: %{phase: "epic_3", current_epic: 3, stories_verified: 12},
-        version: 5,
-        inserted_at: "2026-01-15T10:00:00Z",
-        updated_at: "2026-03-25T14:30:00Z"
-      }
-    })
-  end
-
   # ---------- Skills ----------
 
   defmodule SkillResponse do

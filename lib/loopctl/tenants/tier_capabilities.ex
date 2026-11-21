@@ -154,7 +154,7 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.StoryController",
       "LoopctlWeb.EpicDependencyController",
       "LoopctlWeb.StoryDependencyController",
-      "LoopctlWeb.OrchestratorStateController",
+      "LoopctlWeb.WorkItemNoteController",
       "LoopctlWeb.ImportExportController"
     ],
     chain_of_custody: [

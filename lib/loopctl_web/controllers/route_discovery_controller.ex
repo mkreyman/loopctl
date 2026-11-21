@@ -439,23 +439,6 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description: "Verify all reported-done stories in epic"
       },
 
-      # Orchestrator state
-      %{
-        method: "GET",
-        path: "/api/v1/orchestrator/state/:project_id",
-        description: "Get orchestrator checkpoint for project"
-      },
-      %{
-        method: "PUT",
-        path: "/api/v1/orchestrator/state/:project_id",
-        description: "Save orchestrator checkpoint"
-      },
-      %{
-        method: "GET",
-        path: "/api/v1/orchestrator/state/:project_id/history",
-        description: "Orchestrator checkpoint history"
-      },
-
       # Webhooks
       %{method: "POST", path: "/api/v1/webhooks", description: "Create webhook subscription"},
       %{method: "GET", path: "/api/v1/webhooks", description: "List webhook subscriptions"},

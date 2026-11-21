@@ -23,6 +23,7 @@ import { articleId } from "./lib/article-id.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { createHolderSession } from "./lib/holder.js";
+import { listWorkItemNotes, writeWorkItemNote } from "./lib/work-items.js";
 import { execFileSync } from "node:child_process";
 import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
@@ -3228,6 +3229,24 @@ async function holderHeartbeatTool() {
 async function holderEndTool() {
   const result = await holderSession.end();
   return toContent(result && result.error ? result : holderSession.status());
+}
+
+// US-52.17: a work item's notes, on the session's own key: the write is accepted from the
+// story's CURRENT holder, so it travels on the credential that holds it (lib/work-items.js).
+async function workItemNoteTool(args) {
+  return toContent(
+    await writeWorkItemNote(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
+    }),
+  );
+}
+
+async function workItemNotesTool(args) {
+  return toContent(
+    await listWorkItemNotes(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, agentKey()),
+    }),
+  );
 }
 
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
@@ -8682,6 +8701,64 @@ const TOOLS = [
   },
 
   {
+    name: "work_item_note",
+    description:
+      "WRITE A NOTE ON A WORK ITEM (POST /api/v1/stories/:id/notes): your plan, progress, a " +
+      "decision or an open question, appended under `section` and never edited, so the next " +
+      "session resumes from the item instead of from your transcript. Records a note_written " +
+      "event on the story's log in the same transaction. Uses this session's own key (its " +
+      "holder credential). Only the story's CURRENT holder writes one: " +
+      "409 held_by_other_holder when another session holds it (the error names that " +
+      "session's holder_id, holder_kind and holder_host), 409 not_holder when nobody holds " +
+      "it, 404 for a story that is not this tenant's. 422 for an unknown section, an empty " +
+      "body, a body over 16384 bytes, or a body that looks like a credential (every holder " +
+      "reads notes). Pass `idempotency_key` to make a retry after a lost response return the " +
+      "first note and write nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The UUID of the story." },
+        section: {
+          type: "string",
+          enum: ["plan", "progress", "decision", "question"],
+          description: "Which section the note is filed under.",
+        },
+        body: { type: "string", description: "The note's text, 1 to 16384 bytes." },
+        idempotency_key: {
+          type: "string",
+          description: "Optional: a key unique to this note, so a retry writes it once.",
+        },
+      },
+      required: ["story_id", "section", "body"],
+    },
+  },
+
+  {
+    name: "work_item_notes",
+    description:
+      "READ A WORK ITEM'S NOTES (GET /api/v1/stories/:id/notes), oldest first. The FIRST page " +
+      "carries `current`: the newest note of each section, which is where the item stands. " +
+      "Optional `section` filters to one section; `limit` defaults to 50, at most 200; pass a " +
+      "page's `next_cursor` back as `after` for the next one. Any key of the tenant reads " +
+      "them. 404 for a story that is not this tenant's; 422 for an unknown section or a " +
+      "cursor this endpoint did not return.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The UUID of the story." },
+        section: {
+          type: "string",
+          enum: ["plan", "progress", "decision", "question"],
+          description: "Optional: only this section's notes.",
+        },
+        limit: { type: "integer", description: "Optional page size (default 50, max 200)." },
+        after: { type: "string", description: "Optional: the previous page's next_cursor." },
+      },
+      required: ["story_id"],
+    },
+  },
+
+  {
     name: "revoke_dispatch",
     description:
       "REVOKE A DISPATCH AND ITS WHOLE SUBTREE (POST /api/v1/dispatches/:id/revoke), plus the " +
@@ -11042,6 +11119,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "holder_end":
       return await holderEndTool();
+
+    case "work_item_note":
+      return await workItemNoteTool(args);
+
+    case "work_item_notes":
+      return await workItemNotesTool(args);
 
     case "runner_enroll":
       return await runnerEnroll(args);

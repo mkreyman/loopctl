@@ -50,7 +50,7 @@ lib/loopctl/
 ├── work_breakdown/    # Epics, stories, dependencies
 ├── progress/          # Two-tier status tracking
 ├── artifacts/         # Artifact reports, verification results
-├── orchestrator/      # Orchestrator state checkpointing
+├── work_items/        # Work item notes (plan, progress, decision, question)
 ├── webhooks/          # Webhook subscriptions, events, delivery
 ├── import_export/     # Bulk import/export
 ├── skills/            # Skill versioning and performance
@@ -645,7 +645,7 @@ force-unclaim had an endpoint and no tool — the only one the old wording catch
 `place_dispatch`'s `inputSchema` omitted `repo`, which its own 409 `no_intake_source` tells the
 caller to pass (`dispatch_placement_controller.ex:418-426`); it reached the server only because
 no schema here sets `additionalProperties: false`. **846.6**, `PATCH /api/v1/stories/:id`
-(`router.ex:477`) had been served for months with no tool, so a session could file a story and
+(`router.ex:592`) had been served for months with no tool, so a session could file a story and
 not correct it. **846.7**, a tool that merged, went green and deployed and was still uncallable,
 because it ships as an npm package and MCP binds its tool list at session start. And **PR #862**,
 `Dispatches.revoke/3` (`dispatches.ex:640`) — then a context function with no route at all, so
@@ -724,9 +724,11 @@ loopctl supports external observability tooling through its API and data model:
 
 - **Two-tier trust model**: `agent_status` (self-reported) vs `verified_status` (orchestrator-set) are
   separate fields on every story. External tools can compare them to detect unverified completions.
-- **Orchestrator state checkpointing**: `PUT /orchestrator/state/:project_id` persists orchestrator
-  session state (phase, last verified story, decision context). Enables crash recovery and session
-  handoff. Versioned with optimistic locking.
+- **Work item notes** (US-52.17): `POST`/`GET /api/v1/stories/:id/notes` (MCP `work_item_note` /
+  `work_item_notes`) carry the holder's plan, progress, decisions and questions, so a session resumes
+  from the item. Only the item's CURRENT holder or an orchestrator+ key writes one: a note is
+  progress on held work, so another session of the same agent is `409 held_by_other_holder`, the
+  same refusal every claimant verb gives. It replaced orchestrator state checkpointing.
 - **Audit API**: `GET /stories/:id/history` returns the immutable event log for any story. External
   observers can replay the decision chain for any story without parsing raw session logs.
 - **Change feed**: `GET /changes?since=...` lets observer processes poll for all state transitions

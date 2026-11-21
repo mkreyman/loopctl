@@ -117,40 +117,21 @@ The orchestrator should poll `/stories/ready` after every verification, not just
 
 ---
 
-## Orchestrator State Checkpointing
+## Resuming a Work Item
 
-Orchestrator sessions can run for hours. Process restarts, context compaction, and timeout evictions
-all terminate the session mid-loop. Checkpointing enables recovery.
+Orchestrator sessions can run for hours, and process restarts, context compaction and timeout
+evictions end them mid-loop. What a session needs to resume lives on the work item, not in a
+per-session blob:
 
-```
-PUT /orchestrator/state/:project_id
-{
-  "state_key": "main",
-  "state_data": {
-    "phase": "epic_3",
-    "last_verified": "US-3.4",
-    "pending_review": "US-3.5",
-    "cycle_counts": {"US-2.1": 1, "US-3.2": 2}
-  },
-  "version": 4
-}
-```
+- the item's status and stage (`GET /stories/:id`, `story_stage`), which every transition keeps;
+- its event log (`GET /stories/:id/history`), which names the holder and the reason of every event;
+- its notes (`POST`/`GET /api/v1/stories/:id/notes`, MCP `work_item_note` / `work_item_notes`): the
+  holder's plan, progress, decisions and open questions by section. The first page of
+  `work_item_notes` carries `current`, the newest note of each section.
 
-The `version` field is an optimistic lock. Concurrent writes fail if versions do not match,
-preventing two orchestrator sessions from diverging silently.
-
-On session start, the orchestrator loads its checkpoint:
-
-```
-GET /orchestrator/state/:project_id?state_key=main
-```
-
-If no checkpoint exists, the orchestrator starts from scratch. If a checkpoint exists, it resumes
-from the recorded phase, re-validates the state against current story statuses, and continues the
-loop.
-
-**Checkpoint after every verification** — not just at phase boundaries. A crash between two verifications
-costs at most one re-verification, not a full phase replay.
+The orchestrator state checkpoint (`/orchestrator/state/:project_id`) was retired in US-52.17: every
+key it held duplicated story or stage state, and nothing reached it but the CLI. Its rows were copied
+into `audit_log` as `orchestrator_state_retired` entries.
 
 ---
 

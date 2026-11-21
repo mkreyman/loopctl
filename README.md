@@ -258,7 +258,7 @@ Per story (orchestrator):
 |------|--------|
 | `superadmin` | Everything. Cross-tenant via impersonation. |
 | `user` | Manage tenant settings, API keys, projects, import/export. |
-| `orchestrator` | Verify/reject stories. Write orchestrator state. Force-unclaim. |
+| `orchestrator` | Verify/reject stories. Write any work item's notes. Force-unclaim. |
 | `agent` | Contract, claim, start, report stories. Submit artifacts. |
 
 > **Role design note:** The `user` role is for tenant administration -- managing settings, API keys, and projects. It does not participate in the development trust model. The `orchestrator` and `agent` roles manage the development loop. This separation is by design: tenant admins provision infrastructure while the trust model governs the implementation/verification cycle.
@@ -925,7 +925,7 @@ lib/loopctl/
   work_breakdown/  # Epics, stories, dependencies, graph queries
   progress/        # Two-tier status tracking
   artifacts/       # Artifact reports, verification results
-  orchestrator/    # State checkpointing
+  work_items/      # Work item notes
   webhooks/        # Subscriptions, events, delivery
   import_export/   # Bulk import/export
   bulk_operations/ # Bulk claim/verify/reject

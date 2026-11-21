@@ -456,6 +456,10 @@ defmodule LoopctlWeb.Router do
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
 
+    # US-52.17 — a work item's notes (its holder's plan, progress, decisions, questions)
+    post "/stories/:id/notes", WorkItemNoteController, :create
+    get "/stories/:id/notes", WorkItemNoteController, :index
+
     # US-26.4.1 — First-class acceptance criteria
     get "/stories/:story_id/acceptance_criteria", AcceptanceCriteriaController, :index
 
@@ -602,9 +606,6 @@ defmodule LoopctlWeb.Router do
     get "/epics/:id/story_dependencies", StoryDependencyController, :index
 
     # Orchestrator state
-    put "/orchestrator/state/:project_id", OrchestratorStateController, :save
-    get "/orchestrator/state/:project_id", OrchestratorStateController, :show
-    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
 
     # Webhooks (Epic 10)
     resources "/webhooks", WebhookController, only: [:create, :index, :update, :delete]

@@ -50,7 +50,6 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Memory.PromotionEval.Dataset, as: PromotionEvalDataset
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
-  alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.Projects.RepoUrl
   alias Loopctl.QualityAssurance.UiTestRun
@@ -531,17 +530,6 @@ defmodule Loopctl.Fixtures do
 
   def build(:story_dependency, attrs) do
     Enum.into(attrs, %{})
-  end
-
-  def build(:orchestrator_state, attrs) do
-    Map.merge(
-      %{
-        state_key: "main",
-        state_data: %{"current_epic" => 1, "completed_stories" => []},
-        version: 1
-      },
-      Enum.into(attrs, %{})
-    )
   end
 
   def build(:artifact_report, attrs) do
@@ -3911,51 +3899,6 @@ defmodule Loopctl.Fixtures do
       |> put_inserted_at(inserted_at)
 
     AdminRepo.insert!(changeset)
-  end
-
-  def fixture(:orchestrator_state, attrs) do
-    attrs = Enum.into(attrs, %{})
-
-    # Auto-create tenant if not provided
-    {tenant_id, attrs} =
-      case Map.get(attrs, :tenant_id) do
-        nil ->
-          tenant = fixture(:tenant)
-          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
-
-        tid ->
-          {tid, attrs}
-      end
-
-    # Auto-create project if not provided
-    {project_id, attrs} =
-      case Map.get(attrs, :project_id) do
-        nil ->
-          project = fixture(:project, %{tenant_id: tenant_id})
-          {project.id, Map.put(attrs, :project_id, project.id)}
-
-        pid ->
-          {pid, attrs}
-      end
-
-    data = build(:orchestrator_state, attrs)
-
-    changeset =
-      %OrchestratorState{tenant_id: tenant_id, project_id: project_id}
-      |> OrchestratorState.create_changeset(data)
-
-    # Allow overriding version after creation
-    version = Map.get(data, :version, 1)
-
-    state = AdminRepo.insert!(changeset)
-
-    if version != 1 do
-      state
-      |> Ecto.Changeset.change(%{version: version})
-      |> AdminRepo.update!()
-    else
-      state
-    end
   end
 
   def fixture(:skill, attrs) do
