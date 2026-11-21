@@ -832,7 +832,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       first = hd(data)
 
       assert Map.keys(first) |> Enum.sort() ==
-               ~w(agent_id body_preview expires_at host id inserted_at key lock lock_target refs session_id superseded_by to_capability to_host truncated updated_at)
+               ~w(agent_id body_preview expires_at host id inserted_at key refs session_id superseded_by to_capability to_host truncated updated_at)
 
       assert first["agent_id"] == agent.id
     end
@@ -1214,7 +1214,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       # the US-40.4 lock marker pair ride BOTH reads (review #451): a consumer must
       # be able to tell a live advisory lock from an expired-but-unswept one.
       assert Map.keys(body) |> Enum.sort() ==
-               ~w(agent_id body expires_at host id inserted_at key lock lock_target refs session_id superseded_by to_capability to_host updated_at)
+               ~w(agent_id body expires_at host id inserted_at key refs session_id superseded_by to_capability to_host updated_at)
 
       refute Map.has_key?(body, "tenant_id")
       refute Map.has_key?(body, "project_id")
@@ -1356,7 +1356,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       # Same narrowed field set as the list read.
       assert Map.keys(row) |> Enum.sort() ==
-               ~w(agent_id body_preview directed_to_me expires_at host id inserted_at key lock lock_target refs session_id superseded_by to_capability to_host truncated updated_at)
+               ~w(agent_id body_preview directed_to_me expires_at host id inserted_at key refs session_id superseded_by to_capability to_host truncated updated_at)
     end
 
     # AC-40.C1.2: PINNED — a directed handoff is returned even behind many newer

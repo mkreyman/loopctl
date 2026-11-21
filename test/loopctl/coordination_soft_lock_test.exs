@@ -1,7 +1,7 @@
 defmodule Loopctl.CoordinationSoftLockTest do
   @moduledoc """
-  US-40.4 — ADVISORY file soft-locks (`Coordination.lock_file/5`,
-  `unlock_file/5`, `active_locks/3`).
+  US-40.4 / US-52.21 — ADVISORY file soft-locks (`Coordination.lock_file/5`,
+  `unlock_file/5`, `active_locks/3`), stored in `channel_locks`.
 
   These are NOT the exactly-once handoff claim (`claim/5` + `channel_claims`,
   covered by `coordination_claim_test.exs`). A soft-lock is advisory: it never
@@ -16,6 +16,7 @@ defmodule Loopctl.CoordinationSoftLockTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Workers.ChannelPostSweeper
 
@@ -61,18 +62,24 @@ defmodule Loopctl.CoordinationSoftLockTest do
 
   defp lock_rows(tenant_id, project_id) do
     AdminRepo.all(
-      from(p in ChannelPost,
-        where: p.tenant_id == ^tenant_id and p.project_id == ^project_id,
-        where: like(p.key, "claim:%"),
-        order_by: [asc: p.inserted_at]
+      from(l in ChannelLock,
+        where: l.tenant_id == ^tenant_id and l.project_id == ^project_id,
+        order_by: [asc: l.inserted_at]
       )
+    )
+  end
+
+  defp post_count(tenant_id, project_id) do
+    AdminRepo.aggregate(
+      from(p in ChannelPost, where: p.tenant_id == ^tenant_id and p.project_id == ^project_id),
+      :count
     )
   end
 
   defp audit_actions(tenant_id, entity_id) do
     AdminRepo.all(
       from(a in AuditLog,
-        where: a.tenant_id == ^tenant_id and a.entity_type == "channel_post",
+        where: a.tenant_id == ^tenant_id and a.entity_type == "channel_lock",
         where: a.entity_id == ^entity_id,
         order_by: [asc: a.inserted_at],
         select: a.action
@@ -80,35 +87,49 @@ defmodule Loopctl.CoordinationSoftLockTest do
     )
   end
 
-  describe "lock_file/5 — TC-40.4.1" do
-    test "writes a claim-keyed post with a file ref and a clamped short TTL, and surfaces it" do
+  defp unlock(ctx, session_id, opts \\ []) do
+    Coordination.unlock_file(
+      ctx.tenant.id,
+      Keyword.get(opts, :agent_id, ctx.agent_id),
+      ctx.project.id,
+      Keyword.get(opts, :target, @target),
+      session_id: session_id,
+      audit: audit()
+    )
+  end
+
+  describe "lock_file/5 writes channel_locks, never channel_posts (TC-52.21.1)" do
+    test "a lock and its refresh are one channel_locks row with a clamped TTL and no post" do
       ctx = setup_member()
-      before = DateTime.utc_now()
 
-      assert {:ok, post, :created} = take_lock(ctx, ttl_seconds: 600)
+      assert {:ok, %ChannelLock{} = first, :created} =
+               take_lock(ctx, target: "./lib/foo.ex", session_id: "s1", ttl_seconds: 99_999)
 
-      assert post.key == "claim:#{@target}"
-      assert post.refs == [%{"type" => "file", "value" => @target}]
+      assert {:ok, %ChannelLock{} = second, :updated} =
+               take_lock(ctx, target: "./lib/foo.ex", session_id: "s1", ttl_seconds: 99_999)
 
-      # AC-40.4.1: the TTL is the ONE caller-influenced expires_at, and 600s is
-      # inside the [60, 3600] clamp so it applies verbatim.
-      assert_in_delta DateTime.diff(post.expires_at, before), 600, 5
+      assert second.id == first.id
+      assert [row] = lock_rows(ctx.tenant.id, ctx.project.id)
+      assert row.target == "lib/foo.ex"
+      assert row.session_id == "s1"
+      assert row.agent_id == ctx.agent_id
 
-      # AC-40.4.2: it is surfaced as an active lock, and the call did not block.
-      assert [surfaced] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
-      assert surfaced.id == post.id
-      assert surfaced.target == @target
-      assert surfaced.agent_id == ctx.agent_id
-      assert surfaced.session_id == "sess-a"
+      ceiling = DateTime.add(DateTime.utc_now(), 3600, :second)
+      assert DateTime.compare(row.expires_at, ceiling) != :gt
+      assert post_count(ctx.tenant.id, ctx.project.id) == 0
     end
 
-    test "an ordinary channel_recent read also sees the live lock" do
+    test "the wire shape helpers keep the pre-52.21 key, refs and default body" do
       ctx = setup_member()
-      assert {:ok, post, :created} = take_lock(ctx)
+      assert {:ok, lock, :created} = take_lock(ctx)
 
-      assert ctx.tenant.id
-             |> Coordination.recent(ctx.project.id)
-             |> Enum.any?(&(&1.id == post.id))
+      assert ChannelLock.key(lock) == "claim:#{@target}"
+      assert ChannelLock.refs(lock) == [%{"type" => "file", "value" => @target}]
+      assert ChannelLock.body(lock) =~ "advisory soft-lock: editing #{@target}"
+
+      assert {:ok, noted, :updated} = take_lock(ctx, body: "  refactoring the parser  ")
+      assert noted.note == "refactoring the parser"
+      assert ChannelLock.body(noted) == "refactoring the parser"
     end
 
     test "a blank / oversized / non-binary target is rejected with :invalid_target" do
@@ -120,29 +141,103 @@ defmodule Loopctl.CoordinationSoftLockTest do
       assert {:error, :invalid_target} = take_lock(ctx, target: 42)
       assert {:error, :invalid_target} = take_lock(ctx, target: String.duplicate("a", 195))
 
-      # 194 bytes is the boundary that still fits the 200-byte key column.
-      assert {:ok, _post, :created} = take_lock(ctx, target: String.duplicate("a", 194))
+      # 194 bytes keeps the wire key ("claim:" <> target) within 200 bytes.
+      assert {:ok, _lock, :created} = take_lock(ctx, target: String.duplicate("a", 194))
+    end
+
+    test "a lock write with no session_id is REJECTED and writes nothing" do
+      ctx = setup_member()
+
+      assert {:error, :missing_session} = take_lock(ctx, session_id: nil)
+      assert {:error, :missing_session} = take_lock(ctx, session_id: "   ")
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+    end
+  end
+
+  describe "the write gates (TC-52.21.2)" do
+    test "a credential-shaped note is refused with a note error and the secret signal" do
+      ctx = setup_member()
+      test_pid = self()
+      handler = "soft-lock-secret-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _name, measurements, meta, _ ->
+          if meta.project_id == ctx.project.id,
+            do: send(test_pid, {:secret_blocked, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               take_lock(ctx, body: "token lc_live_0123456789abcdef")
+
+      assert %{note: [_ | _]} = errors_on(changeset)
+      assert_receive {:secret_blocked, %{count: 1}, %{field: :note}}
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "a credential in the session id, host or target is refused too" do
+      ctx = setup_member()
+      secret = "lc_live_0123456789abcdef"
+
+      assert {:error, %Ecto.Changeset{} = cs} = take_lock(ctx, session_id: secret)
+      assert %{session_id: [_ | _]} = errors_on(cs)
+
+      assert {:error, %Ecto.Changeset{} = cs} = take_lock(ctx, host: secret)
+      assert %{host: [_ | _]} = errors_on(cs)
+
+      assert {:error, %Ecto.Changeset{} = cs} = take_lock(ctx, target: "lib/#{secret}.ex")
+      assert %{target: [_ | _]} = errors_on(cs)
+
+      assert {:error, %Ecto.Changeset{} = cs} = take_lock(ctx, body: "nul \u0000 byte")
+      assert %{note: ["must not contain NUL bytes"]} = errors_on(cs)
+
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "a non-member :agent gets the byte-identical :not_found; a foreign agent :agent_not_found" do
+      ctx = setup_member()
+      outsider = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
+      sibling = fixture(:project, %{tenant_id: ctx.tenant.id})
+      other = setup_member()
+
+      assert {:error, :not_found} = take_lock(ctx, agent_id: outsider)
+      assert {:error, :not_found} = take_lock(ctx, project_id: sibling.id)
+      assert {:error, :not_found} = take_lock(ctx, project_id: Ecto.UUID.generate())
+      assert {:error, :not_found} = take_lock(ctx, project_id: other.project.id)
+      assert {:error, :not_found} = take_lock(ctx, project_id: "not-a-uuid\r\nforged")
+      assert {:error, :agent_not_found} = take_lock(ctx, agent_id: other.agent_id)
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "a role >= :user bypasses the membership gate" do
+      ctx = setup_member()
+      sibling = fixture(:project, %{tenant_id: ctx.tenant.id})
+
+      assert {:ok, _lock, :created} = take_lock(ctx, project_id: sibling.id, role: :user)
     end
   end
 
   describe "TTL clamping" do
     test "the clamp bounds are exact: [60, 3600] seconds, default 900" do
       assert Coordination.lock_ttl_seconds(1) == 60
-      assert Coordination.lock_ttl_seconds(59) == 60
       assert Coordination.lock_ttl_seconds(60) == 60
       assert Coordination.lock_ttl_seconds(3600) == 3600
       assert Coordination.lock_ttl_seconds(3601) == 3600
-      assert Coordination.lock_ttl_seconds(999_999) == 3600
       assert Coordination.lock_ttl_seconds(0) == 60
       assert Coordination.lock_ttl_seconds(-5) == 60
       assert Coordination.lock_ttl_seconds(nil) == 900
       assert Coordination.lock_ttl_seconds("not-a-number") == 900
       assert Coordination.lock_ttl_seconds("12abc") == 900
       assert Coordination.lock_ttl_seconds(%{}) == 900
-      # An integer-shaped STRING parses and is then clamped like an integer.
       assert Coordination.lock_ttl_seconds("120") == 120
       assert Coordination.lock_ttl_seconds("10") == 60
       assert Coordination.lock_ttl_seconds("99999") == 3600
+      assert Coordination.max_lock_ttl_seconds() == 3600
     end
 
     test "a below-min, above-max, absent, and non-integer ttl all land on the clamped bound" do
@@ -160,86 +255,16 @@ defmodule Loopctl.CoordinationSoftLockTest do
       assert_in_delta DateTime.diff(junk.expires_at, before), 900, 5
     end
 
-    test "a ttl override does NOT apply to an ordinary (non-claim:) post — it keeps 30d retention" do
-      ctx = setup_member()
-      before = DateTime.utc_now()
-
-      assert {:ok, plain, :created} =
-               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
-                 project_id: ctx.project.id,
-                 body: "working on something",
-                 key: "wip:something",
-                 session_id: "sess-a",
-                 ttl_seconds: 60,
-                 audit: audit()
-               })
-
-      assert DateTime.diff(plain.expires_at, before) > 29 * 24 * 3600
-
-      assert {:ok, keyless, :created} =
-               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
-                 project_id: ctx.project.id,
-                 body: "keyless note",
-                 ttl_seconds: 60,
-                 audit: audit()
-               })
-
-      assert DateTime.diff(keyless.expires_at, before) > 29 * 24 * 3600
-    end
-
-    # Review #451 (high): the short TTL used to be routed on the CALLER-CHOSEN key
-    # prefix, so an ordinary post innocently keyed `claim:story-812` was silently cut
-    # from 30 days to 900s AND surfaced as a bogus file lock. The prefix is now a
-    # RESERVED namespace on the generic write path, and the short TTL is driven by a
-    # private marker only `lock_file/5` stamps.
-    test "the claim: key namespace is RESERVED on the generic post path (422, not a silent 900s TTL)" do
+    test "a refresh extends the lease and keeps host and inserted_at" do
       ctx = setup_member()
 
-      assert {:error, :unprocessable_entity, message} =
-               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
-                 project_id: ctx.project.id,
-                 body: "an ordinary keyed slot that happens to be named claim:...",
-                 key: "claim:story-812",
-                 session_id: "sess-a",
-                 ttl_seconds: 60,
-                 audit: audit()
-               })
-
-      assert message =~ "reserved"
-
-      # Nothing was written, so nothing can masquerade as a live lock.
-      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
-      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
-    end
-
-    test "the reserved-prefix guard does not fire for the lock path itself" do
-      ctx = setup_member()
-      assert {:ok, post, :created} = take_lock(ctx)
-      assert post.key == "claim:#{@target}"
-    end
-
-    # Review #451 (medium): a surrogate session is minted fresh per write, so a
-    # session-less lock is neither refreshable nor releasable — reject it instead.
-    test "a lock write with no session_id is REJECTED rather than given a surrogate slot" do
-      ctx = setup_member()
-
-      assert {:error, :missing_session} = take_lock(ctx, session_id: nil)
-      assert {:error, :missing_session} = take_lock(ctx, session_id: "   ")
-      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
-    end
-  end
-
-  describe "refresh (same slot)" do
-    test "the same (tenant, project, agent, session, key) UPSERTS in place — one row, refreshed TTL" do
-      ctx = setup_member()
-
-      assert {:ok, first, :created} = take_lock(ctx, ttl_seconds: 60)
-      assert {:ok, second, :updated} = take_lock(ctx, ttl_seconds: 3600)
+      assert {:ok, first, :created} = take_lock(ctx, ttl_seconds: 60, host: "beelink")
+      assert {:ok, second, :updated} = take_lock(ctx, ttl_seconds: 3600, host: "minis")
 
       assert second.id == first.id
       assert DateTime.compare(second.expires_at, first.expires_at) == :gt
-      assert DateTime.compare(second.updated_at, first.updated_at) in [:gt, :eq]
-      assert [_only_one] = lock_rows(ctx.tenant.id, ctx.project.id)
+      assert second.host == "beelink"
+      assert second.inserted_at == first.inserted_at
     end
   end
 
@@ -251,11 +276,8 @@ defmodule Loopctl.CoordinationSoftLockTest do
       assert {:ok, b, :created} = take_lock(ctx, session_id: "sess-b")
 
       refute a.id == b.id
-      assert length(lock_rows(ctx.tenant.id, ctx.project.id)) == 2
-
       ids = ctx.tenant.id |> Coordination.active_locks(ctx.project.id) |> Enum.map(& &1.id)
-      assert a.id in ids
-      assert b.id in ids
+      assert Enum.sort(ids) == Enum.sort([a.id, b.id])
     end
 
     test "two DIFFERENT agents lock the same file; neither is rejected and both surface" do
@@ -263,10 +285,8 @@ defmodule Loopctl.CoordinationSoftLockTest do
       agent_b = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
       make_member(ctx.tenant, ctx.project, agent_b)
 
-      assert {:ok, a, :created} = take_lock(ctx, session_id: "sess-a")
-      assert {:ok, b, :created} = take_lock(ctx, agent_id: agent_b, session_id: "sess-b")
-
-      refute a.agent_id == b.agent_id
+      assert {:ok, _a, :created} = take_lock(ctx, session_id: "sess-a")
+      assert {:ok, _b, :created} = take_lock(ctx, agent_id: agent_b, session_id: "sess-b")
 
       locks = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
       assert length(locks) == 2
@@ -274,27 +294,36 @@ defmodule Loopctl.CoordinationSoftLockTest do
     end
   end
 
-  describe "unlock_file/5 — TC-40.4.3" do
-    test "removes the caller's own lock only; a peer session's lock on the same target survives" do
+  describe "unlock_file/5 deletes only the caller's slot (TC-52.21.3)" do
+    test "the (agent, s1) slot goes, (agent, s2) and (agent2, s1) stay, every miss is :not_found" do
       ctx = setup_member()
+      agent2 = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
+      make_member(ctx.tenant, ctx.project, agent2)
 
-      assert {:ok, mine, :created} = take_lock(ctx, session_id: "sess-a")
-      assert {:ok, peer, :created} = take_lock(ctx, session_id: "sess-b")
+      assert {:ok, mine, :created} = take_lock(ctx, session_id: "s1")
+      assert {:ok, peer_session, :created} = take_lock(ctx, session_id: "s2")
+      assert {:ok, peer_agent, :created} = take_lock(ctx, agent_id: agent2, session_id: "s1")
 
-      assert {:ok, deleted} =
-               Coordination.unlock_file(ctx.tenant.id, ctx.agent_id, ctx.project.id, @target,
-                 session_id: "sess-a",
-                 audit: audit()
-               )
+      assert {:ok, released} = unlock(ctx, "s1")
+      assert released.id == mine.id
 
-      assert deleted.id == mine.id
-      assert [remaining] = lock_rows(ctx.tenant.id, ctx.project.id)
-      assert remaining.id == peer.id
-      assert [surfaced] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
-      assert surfaced.id == peer.id
+      missing = unlock(ctx, "s3")
+      malformed = unlock(ctx, "s1", target: "")
+      assert missing == {:error, :not_found}
+      assert malformed == missing
+      # Already released, another agent's slot under a session it never used, and a
+      # missing session id: the same answer.
+      assert unlock(ctx, "s1") == missing
+      assert unlock(ctx, "s2", agent_id: agent2) == missing
+      assert unlock(ctx, nil) == missing
+
+      assert audit_actions(ctx.tenant.id, mine.id) == ["posted", "soft_lock_released"]
+
+      remaining = ctx.tenant.id |> lock_rows(ctx.project.id) |> Enum.map(& &1.id)
+      assert Enum.sort(remaining) == Enum.sort([peer_session.id, peer_agent.id])
     end
 
-    test "a re-lock after unlock is a fresh :created (the row is really gone, not tombstoned)" do
+    test "a re-lock after unlock is a fresh :created (the row is really gone)" do
       ctx = setup_member()
       assert {:ok, first, :created} = take_lock(ctx)
       assert {:ok, _} = unlock(ctx, "sess-a")
@@ -302,33 +331,9 @@ defmodule Loopctl.CoordinationSoftLockTest do
       refute second.id == first.id
     end
 
-    test "oracle-safe :not_found for nonexistent, another session's, another agent's, and cross-tenant locks" do
+    test "malformed ids are the same :not_found, never a raise" do
       ctx = setup_member()
-      other = setup_member()
-      agent_b = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
-      make_member(ctx.tenant, ctx.project, agent_b)
-
-      assert {:ok, _post, :created} = take_lock(ctx, session_id: "sess-a")
-
-      # never locked
-      assert {:error, :not_found} = unlock(ctx, "sess-a", target: "lib/never.ex")
-      # someone else's session
-      assert {:error, :not_found} = unlock(ctx, "sess-zzz")
-      # another agent in the same tenant/project
-      assert {:error, :not_found} =
-               Coordination.unlock_file(ctx.tenant.id, agent_b, ctx.project.id, @target,
-                 session_id: "sess-a"
-               )
-
-      # another tenant's agent
-      assert {:error, :not_found} =
-               Coordination.unlock_file(other.tenant.id, other.agent_id, ctx.project.id, @target,
-                 session_id: "sess-a"
-               )
-
-      # missing session id / malformed ids / blank target — all the same shape
-      assert {:error, :not_found} = unlock(ctx, nil)
-      assert {:error, :not_found} = unlock(ctx, "sess-a", target: "  ")
+      assert {:ok, _lock, :created} = take_lock(ctx)
 
       assert {:error, :not_found} =
                Coordination.unlock_file("not-a-uuid", ctx.agent_id, ctx.project.id, @target,
@@ -340,106 +345,101 @@ defmodule Loopctl.CoordinationSoftLockTest do
                  session_id: "sess-a"
                )
 
-      # the lock itself is untouched by every failed attempt
       assert [_still_there] = lock_rows(ctx.tenant.id, ctx.project.id)
     end
+
+    test "a sibling session under the same agent key CAN release the peer's lock (agent scope)" do
+      ctx = setup_member()
+
+      assert {:ok, held, :created} = take_lock(ctx, session_id: "sess-a")
+      assert [surfaced] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
+      assert surfaced.session_id == "sess-a"
+
+      assert {:ok, released} = unlock(ctx, surfaced.session_id)
+      assert released.id == held.id
+    end
   end
 
-  describe "self-expiry — TC-40.4.2" do
-    test "an expired lock is not surfaced by the live read, and the sweeper deletes it" do
+  describe "audit" do
+    test "lock, refresh and unlock each write a channel_lock entry naming the target" do
       ctx = setup_member()
-      assert {:ok, post, :created} = take_lock(ctx)
 
-      # Force the lock past its TTL (the write path clamps, so expire it directly).
-      past = DateTime.add(DateTime.utc_now(), -60, :second)
+      assert {:ok, lock, :created} = take_lock(ctx)
+      assert {:ok, _refreshed, :updated} = take_lock(ctx)
+      assert {:ok, _released} = unlock(ctx, "sess-a")
 
-      {1, _} =
-        AdminRepo.update_all(
-          from(p in ChannelPost, where: p.id == ^post.id),
-          set: [expires_at: past]
+      assert audit_actions(ctx.tenant.id, lock.id) == ["posted", "upserted", "soft_lock_released"]
+
+      metadata =
+        AdminRepo.all(
+          from(a in AuditLog,
+            where: a.tenant_id == ^ctx.tenant.id and a.entity_id == ^lock.id,
+            select: a.metadata
+          )
         )
 
-      # The live read filters on expires_at INDEPENDENTLY of the sweep, so the lock
-      # disappears immediately — a crashed session can never hold a file.
-      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
-      # ...and the row is still there until the sweep runs.
-      assert [_row] = lock_rows(ctx.tenant.id, ctx.project.id)
-
-      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{}})
-      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+      assert Enum.all?(metadata, &(Map.get(&1, "soft_lock_target") == @target))
     end
   end
 
-  describe "active_locks/3" do
-    test "returns ONLY claim:-prefixed live posts (handoffs and keyless posts are excluded)" do
+  describe "active_locks_page/3 (TC-52.21.4)" do
+    test "keeps the per-agent fairness cap and drops expired locks" do
       ctx = setup_member()
+      quiet = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
+      make_member(ctx.tenant, ctx.project, quiet)
 
-      assert {:ok, lock_post, :created} = take_lock(ctx)
+      for i <- 1..3 do
+        assert {:ok, _, :created} =
+                 take_lock(ctx, agent_id: quiet, session_id: "quiet", target: "lib/q#{i}.ex")
+      end
 
-      {:ok, handoff, :created} =
-        Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+      for i <- 1..25 do
+        assert {:ok, _, :created} = take_lock(ctx, target: "lib/noisy#{i}.ex")
+      end
+
+      expired =
+        fixture(:channel_lock, %{
+          tenant_id: ctx.tenant.id,
           project_id: ctx.project.id,
-          body: "handoff body",
-          key: "handoff:repo#812",
-          session_id: "sess-a",
-          audit: audit()
+          agent_id: quiet,
+          expires_at: DateTime.add(DateTime.utc_now(), -60, :second)
         })
 
-      {:ok, keyless, :created} =
-        Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
-          project_id: ctx.project.id,
-          body: "just a note",
-          audit: audit()
-        })
+      assert {locks, false, true} =
+               Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 100)
 
-      ids = ctx.tenant.id |> Coordination.active_locks(ctx.project.id) |> Enum.map(& &1.id)
-      assert ids == [lock_post.id]
-      refute handoff.id in ids
-      refute keyless.id in ids
-
-      # Handoff discovery is unchanged by the presence of a lock.
-      handoff_ids =
-        ctx.tenant.id |> Coordination.directed_handoffs(ctx.project.id) |> Enum.map(& &1.id)
-
-      assert handoff_ids == [handoff.id]
+      assert length(locks) == 23
+      assert Enum.count(locks, &(&1.agent_id == ctx.agent_id)) == 20
+      assert Enum.count(locks, &(&1.agent_id == quiet)) == 3
+      refute expired.id in Enum.map(locks, & &1.id)
     end
 
-    test "tenant isolation: tenant A never sees tenant B's locks" do
-      a = setup_member()
-      b = setup_member()
-
-      assert {:ok, a_lock, :created} = take_lock(a)
-      assert {:ok, b_lock, :created} = take_lock(b)
-
-      assert [only_a] = Coordination.active_locks(a.tenant.id, a.project.id)
-      assert only_a.id == a_lock.id
-
-      assert [only_b] = Coordination.active_locks(b.tenant.id, b.project.id)
-      assert only_b.id == b_lock.id
-
-      # Tenant A asking for tenant B's project id gets nothing (no cross-tenant read).
-      assert Coordination.active_locks(a.tenant.id, b.project.id) == []
-    end
-
-    test "a malformed tenant/project id yields an empty set, never a raise" do
+    test "the fairness cap is NOT escapable by rotating the caller-supplied session_id" do
       ctx = setup_member()
-      assert Coordination.active_locks("not-a-uuid", ctx.project.id) == []
-      assert Coordination.active_locks(ctx.tenant.id, "not-a-uuid") == []
-      assert Coordination.active_locks(ctx.tenant.id, nil) == []
+
+      for i <- 1..25 do
+        assert {:ok, _, :created} = take_lock(ctx, session_id: "rot-#{i}", target: "lib/n#{i}.ex")
+      end
+
+      {locks, _overflow?, holders_truncated?} =
+        Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 100)
+
+      assert length(locks) == 20
+      assert holders_truncated?
     end
 
-    test "the page cap is clamped and overflow is reported" do
+    test "the page cap is clamped and overflow is reported; newest first" do
       ctx = setup_member()
 
       for n <- 1..3 do
-        assert {:ok, _post, :created} =
+        assert {:ok, _lock, :created} =
                  take_lock(ctx, target: "lib/f#{n}.ex", session_id: "s#{n}")
       end
 
-      assert {locks, true, false} =
+      assert {[newest, _], true, false} =
                Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 2)
 
-      assert length(locks) == 2
+      assert newest.target == "lib/f3.ex"
 
       assert {all, false, false} = Coordination.active_locks_page(ctx.tenant.id, ctx.project.id)
       assert length(all) == 3
@@ -449,193 +449,44 @@ defmodule Loopctl.CoordinationSoftLockTest do
       assert Coordination.clamp_active_locks_limit("5") == 5
       assert Coordination.clamp_active_locks_limit("junk") == 100
     end
-  end
 
-  describe "authorization (shared US-40.D3 gate)" do
-    test "a non-member :agent locking a sibling project gets the byte-identical :not_found" do
+    test "a malformed tenant/project id yields an empty set, never a raise" do
       ctx = setup_member()
-      sibling = fixture(:project, %{tenant_id: ctx.tenant.id})
-
-      assert {:error, :not_found} = take_lock(ctx, project_id: sibling.id)
-      # Byte-identical to a nonexistent / cross-tenant project.
-      assert {:error, :not_found} = take_lock(ctx, project_id: Ecto.UUID.generate())
-
-      other = setup_member()
-      assert {:error, :not_found} = take_lock(ctx, project_id: other.project.id)
+      assert Coordination.active_locks("not-a-uuid", ctx.project.id) == []
+      assert Coordination.active_locks(ctx.tenant.id, "not-a-uuid") == []
+      assert Coordination.active_locks(ctx.tenant.id, nil) == []
     end
 
-    test "a role >= :user bypasses the membership gate" do
+    test "an expired lock is not surfaced, and the sweeper deletes it" do
       ctx = setup_member()
-      sibling = fixture(:project, %{tenant_id: ctx.tenant.id})
+      assert {:ok, lock, :created} = take_lock(ctx)
 
-      assert {:ok, _post, :created} = take_lock(ctx, project_id: sibling.id, role: :user)
-    end
-  end
-
-  # Review #451 (medium): the ownership guarantee is per-AGENT, not per-session —
-  # `session_id` is caller-supplied and `active_locks/3` publishes it. This test
-  # pins the ACTUAL behaviour (the docs/tool descriptions were narrowed to match);
-  # the pre-existing negative case used "sess-zzz", a session that never existed,
-  # so it never exercised a real sibling session.
-  describe "release scope (agent-scoped, NOT session-scoped)" do
-    test "a REAL sibling session under the same agent key can release the peer's lock" do
-      ctx = setup_member()
-
-      assert {:ok, held, :created} = take_lock(ctx, session_id: "sess-a")
-
-      # Session B discovers A's session id straight from the published read.
-      assert [surfaced] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
-      assert surfaced.session_id == "sess-a"
-
-      assert {:ok, released} = unlock(ctx, surfaced.session_id)
-      assert released.id == held.id
-      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
-    end
-
-    test "a DIFFERENT agent in the same tenant still cannot release it" do
-      ctx = setup_member()
-      agent_b = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
-      make_member(ctx.tenant, ctx.project, agent_b)
-
-      assert {:ok, _held, :created} = take_lock(ctx, session_id: "sess-a")
-
-      assert {:error, :not_found} =
-               Coordination.unlock_file(ctx.tenant.id, agent_b, ctx.project.id, @target,
-                 session_id: "sess-a"
-               )
-
-      assert [_still_held] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
-    end
-  end
-
-  # Review #451 (medium x2): locks are the highest-churn write on the bus, so they
-  # get a BOUNDED share of `recent_page/3` and a per-holder fairness budget on the
-  # pinned read — otherwise one noisy locker crowds out both real coordination posts
-  # and every peer's lock.
-  describe "crowding bounds" do
-    test "recent_page admits only the newest few locks, so real posts keep their budget" do
-      ctx = setup_member()
-
-      for i <- 1..12 do
-        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/f#{i}.ex")
-      end
-
-      for i <- 1..12 do
-        assert {:ok, _post, :created} =
-                 Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
-                   project_id: ctx.project.id,
-                   body: "genuine coordination post #{i}",
-                   audit: audit()
-                 })
-      end
-
-      page = Coordination.recent(ctx.tenant.id, ctx.project.id, limit: 25)
-      {locks, plain} = Enum.split_with(page, &String.starts_with?(&1.key || "", "claim:"))
-
-      assert length(locks) <= 5
-      # Every non-lock post still fits the page — none was crowded out.
-      assert length(plain) == 12
-    end
-
-    test "the pinned lock read caps ONE AGENT so peers stay visible" do
-      ctx = setup_member()
-      quiet_agent = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
-      make_member(ctx.tenant, ctx.project, quiet_agent)
-
-      # The quiet peer locks FIRST, so a pure newest-first truncation would evict it.
-      assert {:ok, peer_lock, :created} =
-               take_lock(ctx, agent_id: quiet_agent, session_id: "sess-quiet", target: "lib/q.ex")
-
-      for i <- 1..25 do
-        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/noisy#{i}.ex")
-      end
-
-      {locks, overflow?, holders_truncated?} =
-        Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 21)
-
-      noisy = Enum.filter(locks, &(&1.agent_id == ctx.agent_id))
-
-      assert length(noisy) == 20
-      assert peer_lock.id in Enum.map(locks, & &1.id)
-
-      # Review #451: the fairness filter runs INSIDE the scope, so its drops are
-      # structurally invisible to the page-cap `overflow` signal. The page here is
-      # exactly `limit` rows — `overflow?` is false — yet five LIVE locks were
-      # dropped, so the distinct flag is the only honest signal.
-      refute overflow?
-      assert holders_truncated?
-    end
-
-    test "the per-agent fairness cap is NOT escapable by rotating the caller-supplied session_id" do
-      ctx = setup_member()
-      quiet_agent = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
-      make_member(ctx.tenant, ctx.project, quiet_agent)
-
-      assert {:ok, peer_lock, :created} =
-               take_lock(ctx, agent_id: quiet_agent, session_id: "sess-quiet", target: "lib/q.ex")
-
-      # A fresh session_id per write: under a (agent, session) partition every row
-      # would land in its own partition of size 1 and the bound would never bind.
-      for i <- 1..25 do
-        assert {:ok, _lock, :created} =
-                 take_lock(ctx, session_id: "rotating-#{i}", target: "lib/noisy#{i}.ex")
-      end
-
-      {locks, _overflow?, holders_truncated?} =
-        Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 21)
-
-      assert Enum.count(locks, &(&1.agent_id == ctx.agent_id)) == 20
-      assert peer_lock.id in Enum.map(locks, & &1.id)
-      assert holders_truncated?
-    end
-  end
-
-  describe "audit" do
-    test "lock and unlock each write an audit entry naming the file target" do
-      ctx = setup_member()
-
-      assert {:ok, post, :created} = take_lock(ctx)
-      assert audit_actions(ctx.tenant.id, post.id) == ["posted"]
-
-      assert {:ok, _refreshed, :updated} = take_lock(ctx)
-      assert audit_actions(ctx.tenant.id, post.id) == ["posted", "upserted"]
-
-      # Review #451: the release action is DISTINCT from the "deleted" action the
-      # US-39.7 secret-redaction path uses, so routine lock churn cannot dilute
-      # that security signal.
-      assert {:ok, _deleted} = unlock(ctx, "sess-a")
-      assert audit_actions(ctx.tenant.id, post.id) == ["posted", "upserted", "soft_lock_released"]
-
-      metadata =
-        AdminRepo.all(
-          from(a in AuditLog,
-            where: a.tenant_id == ^ctx.tenant.id and a.entity_id == ^post.id,
-            select: a.metadata
-          )
+      {1, _} =
+        AdminRepo.update_all(from(l in ChannelLock, where: l.id == ^lock.id),
+          set: [expires_at: DateTime.add(DateTime.utc_now(), -60, :second)]
         )
 
-      assert Enum.all?(metadata, &(Map.get(&1, "soft_lock_target") == @target))
+      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
+      assert [_row] = lock_rows(ctx.tenant.id, ctx.project.id)
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{}})
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
     end
   end
 
-  # --- review #451 regressions ---
-
   describe "target path normalization" do
-    test "different spellings of one path collapse to ONE slot" do
+    test "different spellings of one path collapse to ONE slot, for lock and unlock" do
       ctx = setup_member()
 
-      assert {:ok, post, :created} = take_lock(ctx, target: "lib/foo.ex")
+      assert {:ok, lock, :created} = take_lock(ctx, target: "lib/foo.ex")
 
       for spelling <- ["./lib/foo.ex", "lib//foo.ex", "/lib/foo.ex", "lib/./foo.ex"] do
         assert {:ok, same, :updated} = take_lock(ctx, target: spelling)
-        assert same.id == post.id
+        assert same.id == lock.id
       end
 
-      assert [%ChannelPost{key: "claim:lib/foo.ex"}] = lock_rows(ctx.tenant.id, ctx.project.id)
-      assert length(Coordination.active_locks(ctx.tenant.id, ctx.project.id)) == 1
+      assert [%ChannelLock{target: "lib/foo.ex"}] = lock_rows(ctx.tenant.id, ctx.project.id)
 
-      # The inverse holds for release: a differently-spelled path addresses the
-      # SAME slot, so the lock is releasable however the caller spells it.
       assert {:ok, _released} = unlock(ctx, "sess-a", target: "./lib//foo.ex")
       assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
     end
@@ -647,181 +498,80 @@ defmodule Loopctl.CoordinationSoftLockTest do
     end
   end
 
-  describe "legacy claim:-keyed rows are not published as live locks" do
-    test "a 30-day-retention claim: post is invisible to the lock read" do
+  describe "the message path has no lock branch (TC-52.21.6)" do
+    test "channel_recent returns the post only, with no lock fields" do
       ctx = setup_member()
+      assert {:ok, _lock, :created} = take_lock(ctx)
 
-      {:ok, legacy} =
-        AdminRepo.insert(%ChannelPost{
-          tenant_id: ctx.tenant.id,
-          project_id: ctx.project.id,
-          agent_id: ctx.agent_id,
-          session_id: "legacy",
-          key: "claim:story-812",
-          body: "a plain keyed post written before the namespace was reserved",
-          expires_at: DateTime.add(DateTime.utc_now(), 30 * 86_400, :second)
-        })
-
-      # It exists...
-      assert legacy.id in Enum.map(lock_rows(ctx.tenant.id, ctx.project.id), & &1.id)
-      # ...but no lock read will call it a live advisory file lock.
-      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
-      refute Coordination.soft_lock_row?(legacy)
-
-      # A genuine lock IS one.
-      assert {:ok, real, :created} = take_lock(ctx)
-      assert Coordination.soft_lock_row?(real)
-    end
-
-    test "a lock refreshed long after it was taken is still marked a lock" do
-      now = DateTime.utc_now()
-
-      # A refresh is a keyed upsert that PRESERVES inserted_at while extending the
-      # lease, so the discriminator anchors on updated_at — anchoring on inserted_at
-      # would stop marking exactly the long-running edits the marker matters for.
-      refreshed = %{
-        key: "claim:lib/foo.ex",
-        inserted_at: DateTime.add(now, -3000, :second),
-        updated_at: now,
-        expires_at: DateTime.add(now, 900, :second)
-      }
-
-      assert Coordination.soft_lock_row?(refreshed)
-
-      legacy = %{
-        key: "claim:story-812",
-        inserted_at: now,
-        updated_at: now,
-        expires_at: DateTime.add(now, 30 * 86_400, :second)
-      }
-
-      refute Coordination.soft_lock_row?(legacy)
-    end
-
-    test "the reserved namespace is enforced by BOTH writers, not one call site" do
-      ctx = setup_member()
-
-      assert {:error, :unprocessable_entity, message} =
+      assert {:ok, post, :created} =
                Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
                  project_id: ctx.project.id,
-                 key: "claim:story-812",
-                 session_id: "sess-a",
-                 body: "ordinary post",
+                 body: "an ordinary coordination post",
                  audit: audit()
                })
 
-      assert message =~ "reserved"
+      assert {[row], false, nil} = Coordination.recent_page(ctx.tenant.id, ctx.project.id, [])
+      assert row.id == post.id
+      refute Map.has_key?(row, :lock)
+      refute Map.has_key?(row, :lock_target)
+    end
 
-      assert {:error, :unprocessable_entity, ^message} =
-               Coordination.create_post(ctx.tenant.id, ctx.project.id, ctx.agent_id, %{
+    test "the deleted lock helpers are gone" do
+      Code.ensure_loaded!(Coordination)
+
+      refute function_exported?(Coordination, :soft_lock_row?, 1)
+      refute function_exported?(Coordination, :lock_key_prefix, 0)
+    end
+
+    test "an ordinary post keyed claim: is an ordinary 30-day post, not a lock" do
+      ctx = setup_member()
+      before = DateTime.utc_now()
+
+      assert {:ok, post, :created} =
+               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+                 project_id: ctx.project.id,
+                 body: "working state",
                  key: "claim:story-812",
+                 session_id: "sess-a",
+                 audit: audit()
+               })
+
+      assert DateTime.diff(post.expires_at, before) > 29 * 24 * 3600
+
+      assert {:ok, _created} =
+               Coordination.create_post(ctx.tenant.id, ctx.project.id, ctx.agent_id, %{
+                 key: "claim:story-813",
                  session_id: "sess-a",
                  body: "ordinary post"
                })
-    end
-  end
 
-  describe "quarantined lock rows" do
-    test "a quarantined lock can NOT be hard-deleted through the release path" do
-      ctx = setup_member()
-      assert {:ok, post, :created} = take_lock(ctx)
-
-      {:ok, _quarantined} =
-        post
-        |> ChannelPost.quarantine_changeset([:body], DateTime.utc_now())
-        |> AdminRepo.update()
-
-      # The benign `soft_lock_released` label must not become a second delete path
-      # for a security-flagged row (the operator's only reviewable artifact).
-      assert {:error, :not_found} = unlock(ctx, "sess-a")
-      assert AdminRepo.get(ChannelPost, post.id)
-
-      # ...and it is not published as a live lock either.
       assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
-    end
-
-    test "releasing a quarantined lock restores its OWN lease, not 30-day retention" do
-      ctx = setup_member()
-      assert {:ok, post, :created} = take_lock(ctx)
-
-      {:ok, quarantined} =
-        post
-        |> ChannelPost.quarantine_changeset([:body], DateTime.utc_now())
-        |> AdminRepo.update()
-
-      {:ok, released} =
-        quarantined
-        |> ChannelPost.release_changeset(DateTime.utc_now(), Coordination.retention_days())
-        |> AdminRepo.update()
-
-      ceiling =
-        DateTime.add(released.inserted_at, Coordination.max_lock_ttl_seconds(), :second)
-
-      assert DateTime.compare(released.expires_at, ceiling) != :gt
-    end
-
-    test "the schema's mirrored soft-lock constants match the context's" do
-      # `ChannelPost` duplicates these to avoid a cyclic dependency; this is the
-      # assertion that keeps the copies honest.
-      assert Coordination.lock_key_prefix() == "claim:"
-      assert Coordination.max_lock_ttl_seconds() == 3600
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
     end
   end
 
-  describe "channel_recent lock share cap" do
-    test "cursor pages do NOT re-apply the cap, so a walk is not capped per page" do
-      ctx = setup_member()
+  describe "tenant isolation (TC-52.21.9)" do
+    test "another tenant can neither read nor release tenant A's lock" do
+      a = setup_member()
+      b = setup_member()
 
-      for i <- 1..12 do
-        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/f#{i}.ex")
-      end
+      assert {:ok, a_lock, :created} = take_lock(a, target: "lib/a.ex", session_id: "s1")
 
-      # With a page smaller than the cap, the walk reaches every lock: the cap is
-      # applied only to the entry page, and cursor pages are exempt (before the fix
-      # the cap re-applied per page against that page's own window, permanently
-      # skipping every lock ranked past @max_recent_locks on EVERY page).
-      seen = drain_history(ctx, nil, [])
+      assert Coordination.active_locks_page(b.tenant.id, a.project.id, []) == {[], false, false}
 
-      assert length(Enum.filter(seen, &String.starts_with?(&1.key || "", "claim:"))) == 12
+      assert {:error, :not_found} =
+               Coordination.unlock_file(b.tenant.id, b.agent_id, a.project.id, "lib/a.ex",
+                 session_id: "s1"
+               )
+
+      # Tenant A's own agent id under tenant B's tenant id is no key either.
+      assert {:error, :not_found} =
+               Coordination.unlock_file(b.tenant.id, a.agent_id, a.project.id, "lib/a.ex",
+                 session_id: "s1"
+               )
+
+      assert [%ChannelLock{id: id}] = lock_rows(a.tenant.id, a.project.id)
+      assert id == a_lock.id
     end
-
-    test "the pinned read is the complete lock set when the preview caps them" do
-      ctx = setup_member()
-
-      for i <- 1..12 do
-        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/f#{i}.ex")
-      end
-
-      # DOCUMENTED exception on this read: the recency preview admits at most
-      # @max_recent_locks locks and suppressed locks do not move `has_more`, so a
-      # consumer that needs lock visibility must call the dedicated pinned read.
-      {page, has_more, _cursor} =
-        Coordination.recent_page(ctx.tenant.id, ctx.project.id, limit: 25)
-
-      assert length(Enum.filter(page, &String.starts_with?(&1.key || "", "claim:"))) == 5
-      refute has_more
-
-      assert length(Coordination.active_locks(ctx.tenant.id, ctx.project.id)) == 12
-    end
-  end
-
-  defp drain_history(ctx, cursor, acc) do
-    {rows, _has_more, next} =
-      Coordination.recent_page(ctx.tenant.id, ctx.project.id, limit: 3, cursor: cursor)
-
-    acc = acc ++ rows
-
-    if next, do: drain_history(ctx, next, acc), else: acc
-  end
-
-  defp unlock(ctx, session_id, opts \\ []) do
-    Coordination.unlock_file(
-      ctx.tenant.id,
-      ctx.agent_id,
-      ctx.project.id,
-      Keyword.get(opts, :target, @target),
-      session_id: session_id,
-      audit: audit()
-    )
   end
 end

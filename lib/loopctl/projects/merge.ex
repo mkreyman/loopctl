@@ -19,7 +19,7 @@ defmodule Loopctl.Projects.Merge do
   ## Conflicts
 
   A per-project unique key held by both projects (a story number, an epic number, a claim
-  ref, a channel post's keyed slot, ...) cannot be merged blindly: one row would have to be
+  ref, a channel post's keyed slot, a soft-lock's slot, ...) cannot be merged blindly: one row would have to be
   dropped or renumbered, and either is a decision about data the caller owns. The merge reads
   every such key first and refuses with the full list, writing nothing. `unique_keys/0` is the
   list, bound to the schema by the same test.
@@ -53,7 +53,8 @@ defmodule Loopctl.Projects.Merge do
   alias Loopctl.TokenUsage.Budget, as: TokenBudget
 
   @project_tables ~w(
-    agent_run_outcomes article_access_events articles channel_claims channel_posts corpora
+    agent_run_outcomes article_access_events articles channel_claims channel_locks channel_posts
+    corpora
     egress_blocked_decisions egress_scope_markings epics intake_records intake_sources memories
     reply_drafts session_memories skills spec_tuning_drafts stories
     token_usage_reports ui_test_runs webhooks
@@ -63,6 +64,12 @@ defmodule Loopctl.Projects.Merge do
   # (tenant_id, project_id) and the index's own predicate (`%{a}` is the table alias).
   @unique_keys [
     %{index: "channel_claims_ref_uidx", table: "channel_claims", columns: ~w(ref), where: nil},
+    %{
+      index: "channel_locks_slot_uidx",
+      table: "channel_locks",
+      columns: ~w(agent_id session_id target),
+      where: nil
+    },
     %{
       index: "channel_posts_idempotency_uidx",
       table: "channel_posts",

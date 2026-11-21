@@ -8,20 +8,21 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   Anything worth keeping longer is already graduated to Knowledge, so hard-deleting
   expired rows loses nothing. This worker deletes rows past `expires_at`.
 
-  ## Two documented exceptions to the uniform window
+  **Quarantined posts** (issue #499) are the one exception to the uniform window: their
+  `expires_at` is EXTENDED to at least the operator review window, so the evidence
+  outlives the alert.
 
-    * **US-40.4 advisory file soft-locks** (`claim:`-keyed posts) carry a SHORT,
-      caller-influenced, server-clamped TTL of 60..3600s — `Loopctl.Coordination`'s
-      `lock_file/5` is the one write path where `expires_at` is caller-influenced at
-      all. This is now the bus's dominant churn source: a lock is taken and released
-      per file edit per session and expires within the hour, so the steady-state
-      volume of EXPIRED rows this worker sees is orders of magnitude above the
-      pre-40.4 baseline. Tune `@batch_size` and the `:sweep_stalled` grace/capacity
-      knobs below against THAT rate, not against 30-day post expiry.
-    * **Quarantined posts** (issue #499) have `expires_at` EXTENDED to at least the
-      operator review window, so the evidence outlives the alert. Scheduled via the Oban Cron plugin in
-  `Loopctl.ObanConfig.plugins/0` (every 5 minutes), following the existing
-  cleanup-worker convention (see `Loopctl.Workers.SessionMemoryPruneWorker`).
+  ## Expired advisory soft-locks
+
+  The same run also deletes expired rows of `channel_locks` (`Loopctl.Coordination.ChannelLock`,
+  US-52.21), the US-40.4 advisory file soft-locks, whose server-clamped TTL is 60..3600 s.
+  They are the bus's dominant churn source: a lock is taken and released per file edit per
+  session and expires within the hour. The lock delete is a SECOND bounded batch of at most
+  the same `limit`, so one run deletes at most `limit` posts plus `limit` locks.
+
+  Scheduled via the Oban Cron plugin in `Loopctl.ObanConfig.plugins/0` (every 5 minutes),
+  following the existing cleanup-worker convention (see
+  `Loopctl.Workers.SessionMemoryPruneWorker`).
 
   Expiry is a uniform, tenant-independent predicate (`expires_at < now()`), so the
   delete runs once across all tenants on the BYPASSRLS `Loopctl.AdminRepo` — never
@@ -46,7 +47,8 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   three distinct failure shapes:
 
   1. **Ran and succeeded** — `Loopctl.TelemetryEvents.channel_post_swept/0` is
-     emitted on EVERY successful run, INCLUDING a zero-delete no-op. Emitting only on
+     emitted on EVERY successful run, INCLUDING a zero-delete no-op, with the measurements
+     `deleted` (posts) and `locks_deleted` (soft-locks). Emitting only on
      a non-zero delete (the pre-#498 behavior) cannot distinguish "nothing to do" from
      "never ran".
   2. **Ran and failed** — a raise/DB error is caught, logged at `error`, emitted as
@@ -89,6 +91,7 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.TelemetryEvents
 
@@ -111,7 +114,7 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   @spec perform(Oban.Job.t()) :: :ok
   def perform(%Oban.Job{args: args}) do
     limit = batch_limit(args)
-    observed(limit, fn -> sweep_batch(limit) end)
+    observed(limit, fn -> {sweep_batch(ChannelPost, limit), sweep_batch(ChannelLock, limit)} end)
   end
 
   @doc false
@@ -119,20 +122,32 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   # BOTH failure shapes are exercisable by a test with a plain function (a repo double
   # would be needed otherwise, and a genuine pool `exit` is not reproducible under the
   # Ecto sandbox). `perform/1` calls this with the real sweep; it is not a public API.
-  @spec observed(pos_integer(), (-> non_neg_integer())) :: :ok
+  # The sweep returns `{posts_deleted, locks_deleted}`, or a bare post count.
+  @spec observed(
+          pos_integer(),
+          (-> non_neg_integer() | {non_neg_integer(), non_neg_integer()})
+        ) :: :ok
   def observed(limit, sweep) when is_function(sweep, 0) do
-    count = sweep.()
+    {count, locks} =
+      case sweep.() do
+        {posts, locks} -> {posts, locks}
+        posts -> {posts, 0}
+      end
 
     # Always-on success signal, INCLUDING count == 0: "swept, nothing to do" and
     # "never ran" must be distinguishable from the outside.
     :telemetry.execute(
       TelemetryEvents.channel_post_swept(),
-      %{deleted: count},
+      %{deleted: count, locks_deleted: locks},
       %{limit: limit}
     )
 
     if count > 0 do
       Logger.info("ChannelPostSweeper deleted #{count} expired channel posts")
+    end
+
+    if locks > 0 do
+      Logger.info("ChannelPostSweeper deleted #{locks} expired channel locks")
     end
 
     :ok
@@ -171,15 +186,16 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
     )
   end
 
-  # One bounded batch: select the expired ids (bounded by `limit`), then delete them.
+  # One bounded batch of `schema` (`ChannelPost` or `ChannelLock`, both carrying
+  # `expires_at`): select the expired ids (bounded by `limit`), then delete them.
   # Returns the number of rows deleted (0 when nothing is expired).
-  defp sweep_batch(limit) do
+  defp sweep_batch(schema, limit) do
     now = DateTime.utc_now()
 
     ids =
-      ChannelPost
-      |> where([p], p.expires_at < ^now)
-      |> select([p], p.id)
+      schema
+      |> where([r], r.expires_at < ^now)
+      |> select([r], r.id)
       |> limit(^limit)
       |> AdminRepo.all()
 
@@ -189,8 +205,8 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
 
       batch_ids ->
         {count, _} =
-          ChannelPost
-          |> where([p], p.id in ^batch_ids)
+          schema
+          |> where([r], r.id in ^batch_ids)
           |> AdminRepo.delete_all()
 
         count

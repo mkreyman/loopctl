@@ -28,6 +28,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Changes.Event, as: ChangeEvent
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriageVerdictRecord
@@ -1685,6 +1686,29 @@ defmodule Loopctl.Fixtures do
       claimed_at: claimed_at,
       lease_expires_at: lease_expires_at,
       done_at: Map.get(attrs, :done_at)
+    })
+  end
+
+  # US-52.21: an advisory soft-lock row, inserted DIRECTLY on AdminRepo (bypassing the
+  # membership gate and the TTL clamp) so sweeper, merge and isolation tests can seed a
+  # lock with any `expires_at`. Auto-creates tenant/project/agent when not supplied.
+  # Override any of `:target`, `:session_id`, `:host`, `:note`, `:expires_at`.
+  def fixture(:channel_lock, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id = Map.get(attrs, :tenant_id) || fixture(:tenant).id
+    project_id = Map.get(attrs, :project_id) || fixture(:project, %{tenant_id: tenant_id}).id
+    agent_id = Map.get(attrs, :agent_id) || fixture(:agent, %{tenant_id: tenant_id}).id
+
+    AdminRepo.insert!(%ChannelLock{
+      tenant_id: tenant_id,
+      project_id: project_id,
+      agent_id: agent_id,
+      session_id: Map.get(attrs, :session_id, "s1"),
+      host: Map.get(attrs, :host),
+      target: Map.get(attrs, :target, "lib/f#{System.unique_integer([:positive])}.ex"),
+      note: Map.get(attrs, :note),
+      expires_at: Map.get(attrs, :expires_at, DateTime.add(DateTime.utc_now(), 900, :second))
     })
   end
 

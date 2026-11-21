@@ -649,25 +649,27 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
     );
   });
 
-  // Review #451: the reserved namespace is a behavior change on an EXISTING tool —
-  // an agent already posting key: "claim:story-812" must be forewarned in the tool
-  // it actually calls, not only in the new lock tools.
-  test("channel_post warns that the claim: key namespace is reserved", () => {
+  // US-52.21: a lock lives in channel_locks, so the claim: key is no longer reserved on
+  // the post path; channel_post must say a post is never a lock, and must not still
+  // promise a 422 the server no longer gives.
+  test("channel_post says a post is never a file lock", () => {
     assert.match(
       INDEX_SRC,
-      /name: "channel_post",[\s\S]*?RESERVED KEY NAMESPACE: keys beginning with 'claim:'[\s\S]*?REJECTED here with a 422/,
-      "channel_post must document the reserved claim: namespace",
+      /name: "channel_post",[\s\S]*?A post is never a file lock, whatever its key: use channel_lock/,
+      "channel_post must point at channel_lock",
     );
+    assert.doesNotMatch(INDEX_SRC, /RESERVED KEY NAMESPACE/);
   });
 
-  // Review #451: locks ride channel_recent but are capped there and do not move
-  // has_more, so the read must not be cited as evidence that a file is free.
-  test("channel_recent warns that its lock view is capped", () => {
+  // US-52.21: locks are not on channel_recent at all, so the read must not be cited as
+  // evidence that a file is free.
+  test("channel_recent says locks are not on this read", () => {
     assert.match(
       INDEX_SRC,
-      /name: "channel_recent",[\s\S]*?LOCK VISIBILITY CAVEAT[\s\S]*?call channel_locks/,
-      "channel_recent must carry the lock-visibility caveat",
+      /name: "channel_recent",[\s\S]*?LOCKS ARE NOT ON THIS READ[\s\S]*?call channel_locks/,
+      "channel_recent must send a lock check to channel_locks",
     );
+    assert.doesNotMatch(INDEX_SRC, /lock:true \/ lock_target/);
   });
 
   test("channelLock POSTs /channel/locks on the AGENT key", () => {

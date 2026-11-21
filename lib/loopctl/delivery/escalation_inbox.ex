@@ -648,9 +648,6 @@ defmodule Loopctl.Delivery.EscalationInbox do
           do: :already_posted,
           else: {:error, project_id, changeset_errors(changeset)}
 
-      {:error, :unprocessable_entity, message} ->
-        {:error, project_id, message}
-
       {:error, reason} ->
         {:error, project_id, reason}
     end

@@ -367,9 +367,6 @@ defmodule Loopctl.Delivery.EscalationHandoffs do
       {:error, %Ecto.Changeset{errors: errors}} ->
         if slot_taken?(errors), do: :already, else: {:error, {key, Keyword.keys(errors)}}
 
-      {:error, :unprocessable_entity, message} ->
-        {:error, {key, message}}
-
       {:error, reason} ->
         {:error, {key, reason}}
     end

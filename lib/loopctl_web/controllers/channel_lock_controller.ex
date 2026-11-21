@@ -21,9 +21,16 @@ defmodule LoopctlWeb.ChannelLockController do
 
   `/api/v1/channel/claims` (`LoopctlWeb.ChannelClaimController`, US-40.B1) is the
   EXACTLY-ONCE handoff claim, backed by the `channel_claims` unique index. This
-  controller is the advisory, non-exclusive soft-lock built on `channel_posts`.
-  They share nothing but a key-prefix convention — do not conflate them, and never
+  controller is the advisory, non-exclusive soft-lock stored in `channel_locks`
+  (`Loopctl.Coordination.ChannelLock`, US-52.21). Do not conflate them, and never
   cite this surface as the handoff-claim primitive.
+
+  ## Response shape
+
+  The JSON fields are the ones these endpoints answered with while a lock was a
+  `channel_posts` row: `key` (`"claim:" <> target`), `refs` (one file ref) and
+  `body_preview` are derived from the lock row by `ChannelLock.key/1`,
+  `ChannelLock.refs/1` and `ChannelLock.body/1`.
 
   ## Trust posture (owner decision #331 — same as channel posts and claims)
 
@@ -35,7 +42,7 @@ defmodule LoopctlWeb.ChannelLockController do
 
   ## What the release scope actually enforces (review #451)
 
-  A release is addressed by `(tenant_id, project_id, agent_id, session_id, key)`.
+  A release is addressed by `(tenant_id, project_id, agent_id, session_id, target)`.
   `tenant_id` and `agent_id` are server-stamped and are real trust boundaries;
   **`session_id` is caller-supplied and is NOT**, and `GET /channel/locks` publishes
   every live lock's `session_id`. Two sessions sharing ONE agent key are therefore
@@ -57,7 +64,7 @@ defmodule LoopctlWeb.ChannelLockController do
   key-derived `tenant_id` + the requested `project_id` only, so any agent in the
   tenant may read any of that tenant's channels' locks (an oracle-safe empty list
   for a nonexistent/cross-tenant project, never a 404). The US-40.D3 membership gate
-  applies to the WRITE path (`Coordination.post/4`), not to this read.
+  applies to the WRITE path (`Coordination.lock_file/5`), not to this read.
   """
 
   use LoopctlWeb, :controller
@@ -65,6 +72,7 @@ defmodule LoopctlWeb.ChannelLockController do
   require Logger
 
   alias Loopctl.Coordination
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
@@ -149,9 +157,14 @@ defmodule LoopctlWeb.ChannelLockController do
              session_id: params["session_id"],
              audit: AuditContext.from_conn(conn)
            ) do
-        {:ok, post} -> json(conn, %{released: true, lock: %{id: post.id, key: post.key}})
-        {:error, :not_found} -> {:error, :not_found}
-        {:error, :audit_write_failed} -> {:error, :audit_write_failed}
+        {:ok, lock} ->
+          json(conn, %{released: true, lock: %{id: lock.id, key: ChannelLock.key(lock)}})
+
+        {:error, :not_found} ->
+          {:error, :not_found}
+
+        {:error, :audit_write_failed} ->
+          {:error, :audit_write_failed}
       end
     end)
   end
@@ -186,36 +199,30 @@ defmodule LoopctlWeb.ChannelLockController do
     })
   end
 
-  defp lock_json(lock) do
-    %{
-      id: lock.id,
-      target: lock.target,
-      key: lock.key,
-      agent_id: lock.agent_id,
-      session_id: lock.session_id,
-      host: lock.host,
-      refs: lock.refs,
-      body_preview: lock.body_preview,
-      truncated: lock.truncated,
-      expires_at: lock.expires_at,
-      inserted_at: lock.inserted_at,
-      updated_at: lock.updated_at
-    }
+  # The note rides as `body_preview`, bounded by the same 512-byte preview rule a
+  # channel post's body uses (`Coordination.finalize_preview/1`), so a peer session
+  # never reads more of it than it read before.
+  defp lock_json(%ChannelLock{} = lock) do
+    %{body_preview: body_preview, truncated: truncated} =
+      Coordination.finalize_preview(%{body_preview: ChannelLock.body(lock)})
+
+    lock
+    |> lock_write_json()
+    |> Map.merge(%{body_preview: body_preview, truncated: truncated})
   end
 
   # --- write outcome → HTTP ---
 
-  defp render_lock(conn, {:ok, post, :created}, _tenant_id, _agent_id, _params) do
+  defp render_lock(conn, {:ok, lock, :created}, _tenant_id, _agent_id, _params) do
     conn
     |> put_status(:created)
-    |> json(%{lock: lock_write_json(post), created: true, meta: lock_meta(post)})
+    |> json(%{lock: lock_write_json(lock), created: true, meta: lock_meta(lock)})
   end
 
-  defp render_lock(conn, {:ok, post, outcome}, _tenant_id, _agent_id, _params)
-       when outcome in [:updated, :deduplicated] do
+  defp render_lock(conn, {:ok, lock, :updated}, _tenant_id, _agent_id, _params) do
     conn
     |> put_status(:ok)
-    |> json(%{lock: lock_write_json(post), created: false, meta: lock_meta(post)})
+    |> json(%{lock: lock_write_json(lock), created: false, meta: lock_meta(lock)})
   end
 
   defp render_lock(_conn, {:error, :invalid_target}, _tenant_id, _agent_id, _params) do
@@ -240,47 +247,36 @@ defmodule LoopctlWeb.ChannelLockController do
     agent_identity_fault(conn, tenant_id, agent_id, params["project_id"])
   end
 
-  defp render_lock(_conn, {:error, :unprocessable_entity, _message} = err, _t, _a, _p), do: err
-
-  defp render_lock(_conn, {:error, :conflict} = err, _t, _a, _p), do: err
-
-  defp render_lock(_conn, {:error, :supersede_target_not_found}, _t, _a, _p) do
-    {:error, :unprocessable_entity, @ownership_error_message}
-  end
-
   defp render_lock(_conn, {:error, %Ecto.Changeset{} = changeset}, _t, _a, _p) do
     {:error, changeset}
   end
 
-  defp lock_write_json(post) do
+  defp lock_write_json(%ChannelLock{} = lock) do
     %{
-      id: post.id,
-      target: String.replace_prefix(post.key || "", Coordination.lock_key_prefix(), ""),
-      key: post.key,
-      agent_id: post.agent_id,
-      session_id: post.session_id,
-      host: post.host,
-      refs: post.refs,
-      expires_at: post.expires_at,
-      inserted_at: post.inserted_at,
-      updated_at: post.updated_at
+      id: lock.id,
+      target: lock.target,
+      key: ChannelLock.key(lock),
+      agent_id: lock.agent_id,
+      session_id: lock.session_id,
+      host: lock.host,
+      refs: ChannelLock.refs(lock),
+      expires_at: lock.expires_at,
+      inserted_at: lock.inserted_at,
+      updated_at: lock.updated_at
     }
   end
 
-  defp lock_meta(post) do
+  defp lock_meta(lock) do
     %{
       # ADVISORY is part of the contract, not a docstring: a client must never
       # infer exclusivity from a 201.
       advisory: true,
       blocking: false,
-      expires_at: post.expires_at
-      # No `session_id_source`: unlike an ordinary post, a lock can NEVER be rescued
-      # by `maybe_surrogate_session/1` — a session-less lock write is rejected up
-      # front (see @missing_session_message), so the marker is always absent here.
+      expires_at: lock.expires_at
     }
   end
 
-  # A lock always requires an attributed agent identity (channel_posts.agent_id is
+  # A lock always requires an attributed agent identity (channel_locks.agent_id is
   # NOT NULL). A key with no agent identity gets a 403 before any row is touched —
   # mirrors ChannelPostController.create/2 and ChannelClaimController.
   defp with_agent(conn, fun) do

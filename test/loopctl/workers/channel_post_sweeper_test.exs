@@ -3,9 +3,11 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
   setup :verify_on_exit!
 
+  import Ecto.Query
   import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ChannelPostSweeper
@@ -48,6 +50,10 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
       expires_at: DateTime.add(DateTime.utc_now(), offset_seconds, :second)
     }
     |> AdminRepo.insert!()
+  end
+
+  defp lock_count(tenant_id) do
+    AdminRepo.aggregate(from(l in ChannelLock, where: l.tenant_id == ^tenant_id), :count)
   end
 
   defp setup_context do
@@ -131,6 +137,55 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
       assert is_nil(AdminRepo.get(ChannelPost, expired_a.id))
       refute is_nil(AdminRepo.get(ChannelPost, live_b.id))
+    end
+  end
+
+  # US-52.21 / TC-52.21.7: the same run reaps expired channel_locks.
+  describe "perform/1 — expired soft-locks (TC-52.21.7)" do
+    test "deletes an expired lock and keeps a live one" do
+      %{tenant: tenant, project: project, agent: agent} = setup_context()
+      attrs = %{tenant_id: tenant.id, project_id: project.id, agent_id: agent.id}
+
+      expired =
+        fixture(:channel_lock, Map.put(attrs, :expires_at, DateTime.add(DateTime.utc_now(), -1)))
+
+      live = fixture(:channel_lock, attrs)
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{}})
+
+      assert is_nil(AdminRepo.get(ChannelLock, expired.id))
+      refute is_nil(AdminRepo.get(ChannelLock, live.id))
+    end
+
+    test "the lock delete is bounded by the same limit, and telemetry carries locks_deleted" do
+      %{tenant: tenant, project: project, agent: agent} = setup_context()
+      attach_sweep_telemetry(2)
+      past = DateTime.add(DateTime.utc_now(), -60)
+
+      for _ <- 1..3 do
+        fixture(:channel_lock, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          agent_id: agent.id,
+          expires_at: past
+        })
+      end
+
+      insert_post(tenant, project, agent, -60)
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 2}})
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 1, locks_deleted: 2}, _}
+      assert lock_count(tenant.id) == 1
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 2}})
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 0, locks_deleted: 1}, _}
+      assert lock_count(tenant.id) == 0
+    end
+
+    test "observed/2 accepts a bare post count as zero locks" do
+      attach_sweep_telemetry(19)
+      assert :ok = ChannelPostSweeper.observed(19, fn -> 3 end)
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 3, locks_deleted: 0}, _}
     end
   end
 

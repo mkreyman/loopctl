@@ -664,20 +664,6 @@ defmodule LoopctlWeb.ChannelPostController do
       superseded_by: row.superseded_by,
       inserted_at: row.inserted_at,
       updated_at: row.updated_at,
-      # US-40.4 / AC-40.4.2 (review #451): an advisory FILE soft-lock must be
-      # DISTINCT on this read, not merely present under a `claim:`-prefixed key that
-      # every consumer would have to re-derive. `lock` is the marker, `lock_target`
-      # is the file, and `expires_at` is the liveness a renderer needs for
-      # "claimed: <file> by <agent/host>, <age>" — and to tell a LIVE lock from an
-      # expired-but-unswept one. The `claim:` key namespace is reserved server-side
-      # (both `Coordination.post/4` and `Coordination.create_post/4` 422 an ordinary
-      # post that tries to use it), but the reservation is forward-looking, so the
-      # marker uses `Coordination.soft_lock_row?/1` — prefix AND the soft-lock TTL
-      # ceiling — not a bare prefix test: a LEGACY `claim:`-keyed post predating the
-      # reservation carries 30-day retention and must not be mislabeled a live file
-      # lock (review #451).
-      lock: Coordination.soft_lock_row?(row),
-      lock_target: lock_target(row),
       expires_at: row.expires_at
     }
 
@@ -689,11 +675,6 @@ defmodule LoopctlWeb.ChannelPostController do
     else
       base
     end
-  end
-
-  defp lock_target(row) do
-    if Coordination.soft_lock_row?(row),
-      do: String.replace_prefix(row.key, Coordination.lock_key_prefix(), "")
   end
 
   # Resolve the `?cursor=` param (US-40.C2) to a `{:ok, position_or_nil}` for
@@ -860,9 +841,8 @@ defmodule LoopctlWeb.ChannelPostController do
   # (`channel_post_json/1`) with the verbatim `body` in place of the bounded
   # `body_preview` + `truncated` pair. It deliberately mirrors the narrowed read
   # model rather than the wider write-echo struct shape — `tenant_id`/`project_id`
-  # are omitted so the read path never re-widens what the list read narrowed. The
-  # US-40.4 lock marker trio rides here too, so a drill-in on a lock is as
-  # self-describing as its list row. See the `show/2` docstring for the rationale.
+  # are omitted so the read path never re-widens what the list read narrowed. See the
+  # `show/2` docstring for the rationale.
   defp channel_post_full_json(post) do
     %{
       id: post.id,
@@ -877,8 +857,6 @@ defmodule LoopctlWeb.ChannelPostController do
       superseded_by: post.superseded_by,
       inserted_at: post.inserted_at,
       updated_at: post.updated_at,
-      lock: Coordination.soft_lock_row?(post),
-      lock_target: lock_target(post),
       expires_at: post.expires_at
     }
   end

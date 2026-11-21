@@ -6,6 +6,18 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Advisory soft-locks move to their own table; `channel_recent` rows lose `lock` and
+  `lock_target` (US-52.21).** A file soft-lock is now a `channel_locks` row, not a
+  `claim:`-keyed `channel_posts` row. Migration `20261121100000` creates the table (RLS
+  enabled), copies every live lock into it, deletes every `claim:`-keyed post and drops
+  `channel_posts_soft_lock_idx`; it needs no manual step. Breaking for a client that reads
+  `GET /api/v1/channel/posts` (MCP `channel_recent`) or a single post: rows no longer carry
+  `lock` or `lock_target`, and locks are no longer on that read at all; read
+  `GET /api/v1/channel/locks` (`channel_locks`). The `claim:` key prefix is no longer
+  reserved, so a post keyed `claim:...` is accepted as an ordinary 30-day post instead of
+  `422`. The three `/api/v1/channel/locks` endpoints answer with the same JSON as before.
+  `ChannelPostSweeper` also deletes expired locks, at most its batch limit per run, and its
+  `channel_post_swept` telemetry gains a `locks_deleted` measurement.
 - **A runner merge never closes an issue (2026-11-21, set 11, runner 0.1.2).** Before merging,
   the runner rewrites the closing keywords (`Closes #15`, `Fixes`, `Resolves`, ...) of the pull
   request's title and body to `Refs`, edits the body on the pull request when that changed it,

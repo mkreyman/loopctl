@@ -92,6 +92,12 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
       assert body["lock"]["key"] == "claim:#{@target}"
       assert body["lock"]["agent_id"] == agent.id
       assert body["lock"]["refs"] == [%{"type" => "file", "value" => @target}]
+
+      # US-52.21 (AC-52.21.4): the write echo keeps its pre-52.21 field set.
+      assert body["lock"] |> Map.keys() |> Enum.sort() ==
+               ~w(agent_id expires_at host id inserted_at key refs session_id target updated_at)
+
+      assert body |> Map.keys() |> Enum.sort() == ~w(created lock meta)
       # ADVISORY is part of the response contract — a client must never infer
       # exclusivity from a 201.
       assert body["meta"]["advisory"] == true
@@ -118,9 +124,9 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
       assert listing["locks"] == []
     end
 
-    # Review #451 (AC-40.4.2): a lock must be DISTINCT on channel_recent, not just
-    # present under a key a consumer has to re-parse.
-    test "the lock is marked DISTINCTLY on channel_recent (lock / lock_target / expires_at)" do
+    # US-52.21 (TC-52.21.6): a lock lives in channel_locks, so channel_recent carries
+    # the post only, and no row has a lock / lock_target field.
+    test "channel_recent carries no lock and no lock / lock_target fields" do
       %{project: project, raw: raw} = setup_member()
 
       lock =
@@ -132,13 +138,14 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
         })
         |> json_response(201)
 
-      raw
-      |> post_json("/api/v1/channel/posts", %{
-        "project_id" => project.id,
-        "body" => "an ordinary coordination post",
-        "session_id" => "sess-a"
-      })
-      |> json_response(201)
+      post =
+        raw
+        |> post_json("/api/v1/channel/posts", %{
+          "project_id" => project.id,
+          "body" => "an ordinary coordination post",
+          "session_id" => "sess-a"
+        })
+        |> json_response(201)
 
       rows =
         authed_conn(raw)
@@ -146,33 +153,26 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
         |> json_response(200)
         |> Map.fetch!("data")
 
-      lock_row = Enum.find(rows, &(&1["id"] == lock["lock"]["id"]))
-      assert lock_row["lock"] == true
-      assert lock_row["lock_target"] == @target
-      assert lock_row["expires_at"]
-
-      plain_row = Enum.find(rows, &(&1["id"] != lock["lock"]["id"]))
-      assert plain_row["lock"] == false
-      assert plain_row["lock_target"] == nil
+      assert [row] = rows
+      assert row["id"] == post["post"]["id"]
+      refute row["id"] == lock["lock"]["id"]
+      refute Map.has_key?(row, "lock")
+      refute Map.has_key?(row, "lock_target")
     end
 
-    # Review #451 (high): `claim:` is a RESERVED namespace on the generic post
-    # path — otherwise an ordinary keyed post silently got a 900s TTL and appeared
-    # as a bogus file lock.
-    test "an ordinary post using the reserved claim: key prefix -> 422" do
+    # US-52.21: the `claim:` prefix is no longer reserved on the post path. A post
+    # keyed `claim:` is an ordinary post and never surfaces as a lock.
+    test "an ordinary post keyed claim: -> 201, and it is not a lock" do
       %{project: project, raw: raw} = setup_member()
 
-      body =
-        raw
-        |> post_json("/api/v1/channel/posts", %{
-          "project_id" => project.id,
-          "body" => "ordinary keyed working state",
-          "key" => "claim:story-812",
-          "session_id" => "sess-a"
-        })
-        |> json_response(422)
-
-      assert body["error"]["message"] =~ "reserved"
+      raw
+      |> post_json("/api/v1/channel/posts", %{
+        "project_id" => project.id,
+        "body" => "ordinary keyed working state",
+        "key" => "claim:story-812",
+        "session_id" => "sess-a"
+      })
+      |> json_response(201)
 
       listing =
         authed_conn(raw)
@@ -400,6 +400,13 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
         |> json_response(200)
 
       assert [lock] = body["locks"]
+
+      # US-52.21 (AC-52.21.4): the listing row keeps its pre-52.21 field set.
+      assert lock |> Map.keys() |> Enum.sort() ==
+               ~w(agent_id body_preview expires_at host id inserted_at key refs session_id target truncated updated_at)
+
+      assert lock["refs"] == [%{"type" => "file", "value" => @target}]
+      assert lock["body_preview"] =~ "advisory soft-lock: editing #{@target}"
       assert lock["target"] == @target
       assert lock["key"] == "claim:#{@target}"
       assert lock["agent_id"] == agent.id
@@ -436,6 +443,40 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
       # (the page cap) cannot see its drops. Publishing `overflow: false` alone
       # would present a page that dropped 5 LIVE locks as the complete set.
       assert body["meta"]["count"] == 20
+      assert body["meta"]["overflow"] == false
+      assert body["meta"]["holders_truncated"] == true
+    end
+
+    # US-52.21 / TC-52.21.4: 25 locks from one agent and 3 from another answer 23 rows.
+    test "25 locks from one agent and 3 from another -> 23 rows, holders_truncated" do
+      %{tenant: tenant, project: project, raw: raw} = setup_member()
+      {quiet_raw, _key, quiet} = member_agent_key(tenant, project)
+
+      for i <- 1..25 do
+        post_json(raw, @path, %{
+          "project_id" => project.id,
+          "target" => "lib/n#{i}.ex",
+          "session_id" => "sess-a"
+        })
+        |> json_response(201)
+      end
+
+      for i <- 1..3 do
+        post_json(quiet_raw, @path, %{
+          "project_id" => project.id,
+          "target" => "lib/q#{i}.ex",
+          "session_id" => "sess-q"
+        })
+        |> json_response(201)
+      end
+
+      body =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id})
+        |> json_response(200)
+
+      assert body["meta"]["count"] == 23
+      assert Enum.count(body["locks"], &(&1["agent_id"] == quiet.id)) == 3
       assert body["meta"]["overflow"] == false
       assert body["meta"]["holders_truncated"] == true
     end

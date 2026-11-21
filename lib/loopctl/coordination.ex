@@ -31,6 +31,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Auth.Role
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Coordination.ChannelCursor
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge
@@ -80,40 +81,16 @@ defmodule Loopctl.Coordination do
   # US-40.4 ADVISORY FILE SOFT-LOCKS — deliberately NOT the exactly-once handoff
   # claim above. A soft-lock is a HINT ("I'm editing lib/foo.ex") surfaced on the
   # channel; it NEVER blocks anyone and TWO sessions may hold one on the same file
-  # (AC-40.4.4). It is built entirely on `channel_posts` (no new table): a keyed
-  # post under the `claim:<target>` key convention with a SHORT, caller-influenced,
-  # SERVER-CLAMPED TTL.
+  # (AC-40.4.4). Since US-52.21 a lock is a row of its own table, `channel_locks`
+  # (`Loopctl.Coordination.ChannelLock`), never a channel post: a hint is not a
+  # message, and `channel_posts` is the message store.
   #
   # NAMING (load-bearing): `claim/5`, `release/5` and `done/5` are the exactly-once
   # HANDOFF claim (US-40.B1, `channel_claims`). The soft-lock is `lock_file/5` /
   # `unlock_file/5` / `active_locks/3` precisely so the two primitives can never be
-  # conflated — the key PREFIX is the only thing they share, and only because the
-  # story fixed that convention before the handoff claim existed as a table.
-  @lock_key_prefix "claim:"
+  # conflated.
 
-  # The SQL `LIKE` pattern for the lock namespace. It MUST stay a compile-time
-  # LITERAL in every query (review #451): Postgres only matches a partial index when
-  # it can PROVE the query predicate implies the index predicate, and that proof is
-  # Const-based — it cannot reason about a bind parameter. Written as `^(prefix <>
-  # "%")` the predicate renders `key LIKE $n` and
-  # `channel_posts_soft_lock_idx` (predicate `key LIKE 'claim:%'`) is never chosen,
-  # so the index ships dead and every lock read falls back to scan-and-filter. The
-  # US-40.C1 handoff read gets this right with a literal; so must this one.
-  @lock_key_like "claim:%"
-
-  # Compile-time tie: the literal above can never drift from the prefix.
-  if @lock_key_like != @lock_key_prefix <> "%" do
-    raise "@lock_key_like must be @lock_key_prefix <> \"%\""
-  end
-
-  # The 422 a caller gets for posting into the RESERVED soft-lock key namespace via
-  # the generic write path. Names the remedy explicitly: the lock endpoint owns the
-  # prefix, and an ordinary keyed slot must pick a different name.
-  @reserved_key_prefix_message "key prefix \"#{@lock_key_prefix}\" is reserved for advisory file soft-locks; use POST /api/v1/channel/locks (channel_lock) to take one, or choose a different key for an ordinary post"
-
-  # The soft-lock TTL clamp (AC-40.4.1). This is the ONE place `expires_at` is
-  # caller-influenced — every other post is fixed at `now + @retention_days` — so
-  # the bounds are a STATED INVARIANT, not a soft default:
+  # The soft-lock TTL clamp (AC-40.4.1), a STATED INVARIANT rather than a soft default:
   #
   #   * floor 60s — below a minute the lock expires before a peer's next channel
   #     read and buys nothing;
@@ -121,31 +98,14 @@ defmodule Loopctl.Coordination do
   #     that took it. A crashed/killed session's lock self-expires within the hour
   #     via `expires_at` (reads filter it out IMMEDIATELY; `ChannelPostSweeper`
   #     reaps the row), so no dead session can sit on a file indefinitely.
-  #
-  # The override applies ONLY on the INTERNAL soft-lock write path — `lock_file/5`
-  # stamps a private marker (`@soft_lock_ttl_attr`) into the attrs map, and
-  # `resolve_expires_at/1` routes on THAT, never on the caller-chosen `key`. A
-  # request body therefore cannot reach the short TTL at all: an ordinary post can
-  # neither shorten (evade the audit/read window) nor lengthen channel retention.
-  # (Review #451: routing on the `claim:` key prefix silently cut ANY caller-keyed
-  # post named `claim:...` from 30 days to 900s — the invariant above was false.)
   @min_lock_ttl_seconds 60
   @max_lock_ttl_seconds 3600
   @default_lock_ttl_seconds 900
 
-  # The PRIVATE attrs marker that makes a write a soft-lock. Never cast, never
-  # derived from a request body — `lock_file/5` is the only writer, and `post/4`
-  # REJECTS a caller-supplied `claim:`-prefixed key that lacks it (the prefix is a
-  # reserved namespace, so `key LIKE 'claim:%'` remains a sound lock predicate for
-  # every read).
-  @soft_lock_ttl_attr :__soft_lock_ttl_seconds__
-
   # The audit action a soft-lock RELEASE is recorded under (review #451). Deliberately
   # NOT the `deleted` action `delete_post/5` uses: that one is the US-39.7 secret
-  # REDACTION path an operator watches (and whose audit failure deliberately rolls the
-  # DELETE back so a leaked credential is never falsely reported gone). Routine lock
-  # churn — roughly one release per file edit per session — must not land in the same
-  # bucket and dilute that signal.
+  # REDACTION path an operator watches. Routine lock churn — roughly one release per
+  # file edit per session — must not land in the same bucket and dilute that signal.
   @soft_lock_release_action "soft_lock_released"
 
   # Hard safety cap on ONE page of the pinned active-lock read. Locks are short-lived
@@ -182,16 +142,6 @@ defmodule Loopctl.Coordination do
   # since the budget is per PAGE of an advisory hint read and the complete set is
   # reachable via a larger `:limit` and the `holders_truncated` signal.
   @max_locks_per_holder 20
-
-  # Bounded SHARE of one `recent_page/3` page that advisory locks may occupy (review
-  # #451). Locks ride the ordinary post path so AC-40.4.2's `channel_recent` surfacing
-  # holds, but they are the highest-churn write on the bus (refreshed while editing,
-  # and each refresh bumps `updated_at`, which RE-FLOATS them in the `since` delta
-  # ordering). Without a cap a handful of refreshing sessions would crowd genuine
-  # coordination posts and handoffs out of the 25-row window. Only the NEWEST few
-  # locks are admitted to a page; the complete live set is the dedicated pinned read
-  # (`active_locks_page/3` / `GET /api/v1/channel/locks`).
-  @max_recent_locks 5
 
   # Read-bound convention (US-39.3): the `channel_recent` endpoint defaults to 25
   # rows and CLAMPS a larger `?limit=` to 100 (not a 400) — see AC-39.3.3. These
@@ -406,21 +356,15 @@ defmodule Loopctl.Coordination do
 
   Returns `{:ok, %ChannelPost{}}`, `{:error, %Ecto.Changeset{}}` (size/shape
   bound violation, a secret-denylist hit, or a session-key slot collision — the
-  caller learns the content did not land), `{:error, :not_found}` when the
-  project or agent does not belong to the tenant, or
-  `{:error, :unprocessable_entity, message}` when `key` is in the RESERVED
-  `#{@lock_key_prefix}` soft-lock namespace. That last check is the SAME
-  `reserved_key_prefix_check/1` `post/4` runs (review #451): the namespace guarantee
-  every lock read depends on must be enforced by every writer, not by one call site.
+  caller learns the content did not land), or `{:error, :not_found}` when the
+  project or agent does not belong to the tenant.
   """
   @spec create_post(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
           {:ok, ChannelPost.t()}
           | {:error, Ecto.Changeset.t()}
           | {:error, :not_found}
-          | {:error, :unprocessable_entity, String.t()}
   def create_post(tenant_id, project_id, agent_id, attrs) do
-    with :ok <- reserved_key_prefix_check(attrs),
-         {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- Agents.get_agent(tenant_id, agent_id) do
       %ChannelPost{
         tenant_id: tenant_id,
@@ -684,8 +628,7 @@ defmodule Loopctl.Coordination do
     # Folding the check into the transaction would not close the window (READ
     # COMMITTED still lets a concurrent unclaim commit between the two statements)
     # and would only add coupling — so it stays a pre-flight guard.
-    with :ok <- reserved_key_prefix_check(attrs),
-         {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
          {:ok, supersedes} <-
@@ -710,15 +653,9 @@ defmodule Loopctl.Coordination do
           tenant_id: tenant_id,
           project_id: project_id,
           agent_id: agent_id,
-          # US-40.4: fixed at `now + @retention_days` for EVERY post except an
-          # advisory soft-lock — identified by the PRIVATE `@soft_lock_ttl_attr`
-          # marker that only `lock_file/5` stamps, never by the caller-chosen key —
-          # whose TTL is caller-influenced and server-clamped.
-          # `expires_at` is set on the STRUCT and never cast from
-          # attrs, so no request body can reach it directly; and because the keyed
-          # upsert FULL-REPLACES `expires_at` with `EXCLUDED.expires_at`, a
-          # re-lock from the same slot refreshes the short TTL automatically.
-          expires_at: resolve_expires_at(attrs)
+          # Fixed at `now + @retention_days` for EVERY post, set on the STRUCT and
+          # never cast from attrs, so no request body can reach it.
+          expires_at: default_expires_at()
         }
         |> ChannelPost.create_changeset(attrs)
         |> put_provenance_changes(attrs)
@@ -1017,11 +954,11 @@ defmodule Loopctl.Coordination do
   @doc """
   Takes (or REFRESHES) an ADVISORY soft-lock on a file `target` — US-40.4.
 
-  This posts a normal channel post carrying the `"#{@lock_key_prefix}<target>"` key
-  convention, a `refs` entry `[%{"type" => "file", "value" => target}]`, and a
-  SHORT server-clamped TTL, through the SAME `post/4` write path every other post
-  uses — so it inherits the project-membership gate, the secret denylist, the audit
-  write, and the keyed-slot upsert without a second copy of any of them.
+  Since US-52.21 the lock is a row of `channel_locks` (`ChannelLock`), never a channel
+  post. The write runs the same gates a channel post does: the project and agent
+  ownership checks, the shared US-40.D3 `project_writable_by_agent/4` membership gate,
+  the secret denylist (over the target, note, session id and host), and an audit entry
+  in the same transaction as the write.
 
   ## Advisory — it NEVER blocks (AC-40.4.1 / AC-40.4.4)
 
@@ -1032,105 +969,152 @@ defmodule Loopctl.Coordination do
 
   ## Slot identity, refresh and release
 
-  A lock occupies the caller's HARDENED 5-column slot
-  `(tenant_id, project_id, agent_id, session_id, key)` — the
-  `channel_posts_session_key_uidx` rebuilt in migration
-  `20260718000000_harden_channel_posts_slot_and_ordering` (the server-stamped
-  `agent_id` is part of the slot key; it is NOT the old 4-column form). So the SAME
-  session re-locking the same target UPSERTS in place (one row, refreshed TTL),
-  while a different session/agent gets its own row.
+  A lock occupies the slot `(tenant_id, project_id, agent_id, session_id, target)`,
+  held by the unique index `channel_locks_slot_uidx`. The SAME session re-locking the
+  same target UPSERTS in place (one row, refreshed TTL and note, `host` and
+  `inserted_at` kept), while a different session/agent gets its own row.
 
   `:session_id` is therefore load-bearing and **REQUIRED** — a lock write without one
-  is rejected with `{:error, :missing_session}` (review #451). It deliberately does
-  NOT fall through to `post/4`'s `maybe_surrogate_session/1`: a `srvgen-<uuid>`
-  surrogate is minted fresh on EVERY write, so a surrogate lock is neither
-  refreshable (each re-lock of the same file lands a NEW row instead of upserting in
-  place) nor releasable by slot — an unreleasable row per lock attempt, at up to the
-  120/min write cap, against the 100-row pinned read. Bounded by TTL, but not
-  harmless. The MCP proxy and every documented client supply a session id; a client
-  that genuinely cannot must post an ordinary keyed note instead.
+  is rejected with `{:error, :missing_session}` (review #451): a lock with no session
+  could be neither refreshed in place nor released by slot.
 
-  ## TTL clamp (the ONE caller-influenced `expires_at`)
+  ## TTL clamp
 
   `:ttl_seconds` is clamped to `[#{@min_lock_ttl_seconds}, #{@max_lock_ttl_seconds}]`
   seconds (default `#{@default_lock_ttl_seconds}`); anything absent or non-numeric
-  falls back to the default. See `lock_ttl_seconds/1`. The clamped value rides into
-  `post/4` on a PRIVATE marker key, never on `:key` — see `resolve_expires_at/1`.
+  falls back to the default. See `lock_ttl_seconds/1`. `expires_at` is set on the
+  struct, never cast.
 
   `opts`: `:role` (the VERIFIED key role — membership bypass only), `:ttl_seconds`,
-  `:session_id` (required), `:host`, `:body` (an optional human note replacing the
-  default one-liner), `:audit`.
+  `:session_id` (required), `:host`, `:body` (an optional note replacing the default
+  one-liner), `:audit`.
 
-  Returns `post/4`'s result (`{:ok, post, :created | :updated}` and its error
-  shapes), plus `{:error, :invalid_target}` for a blank/oversized/non-binary target
-  and `{:error, :missing_session}` for a blank/absent `:session_id`.
+  Returns `{:ok, %ChannelLock{}, :created | :updated}`, `{:error, :invalid_target}` for a
+  blank/oversized/non-binary target, `{:error, :missing_session}` for a blank/absent
+  `:session_id`, `{:error, :not_found}` for a missing, cross-tenant or non-member
+  project, `{:error, :agent_not_found}` for an agent outside the tenant, and
+  `{:error, %Ecto.Changeset{}}` for a bound, NUL-byte or credential-shape rejection.
   """
   @spec lock_file(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
-          {:ok, ChannelPost.t(), :created | :updated | :deduplicated}
+          {:ok, ChannelLock.t(), :created | :updated}
           | {:error, :invalid_target}
           | {:error, :missing_session}
           | {:error, :not_found}
           | {:error, :agent_not_found}
-          | {:error, :conflict}
-          | {:error, :supersede_target_not_found}
-          | {:error, :unprocessable_entity, String.t()}
           | {:error, Ecto.Changeset.t()}
   def lock_file(tenant_id, agent_id, project_id, target, opts \\ []) do
     session_id = Keyword.get(opts, :session_id)
+    role = Keyword.get(opts, :role, :agent)
 
     with {:ok, normalized} <- normalize_lock_target(target),
-         :ok <- require_lock_session(session_id) do
-      attrs =
-        %{
+         :ok <- require_lock_session(session_id),
+         {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+         {:ok, _agent} <- agent_owned(tenant_id, agent_id),
+         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role) do
+      changeset =
+        %ChannelLock{
+          tenant_id: tenant_id,
           project_id: project_id,
-          body: lock_body(normalized, Keyword.get(opts, :body)),
-          key: lock_key(normalized),
-          # US-40.A1 reshaped `refs` from a fixed-key map into a bounded LIST of
-          # `%{"type", "value", "label"?}` items — the story's `refs.file = target`
-          # predates that. The file target rides as a typed ref ITEM.
-          refs: [%{"type" => "file", "value" => normalized}],
-          session_id: session_id,
-          host: Keyword.get(opts, :host),
-          audit: lock_audit(Keyword.get(opts, :audit, []), normalized)
+          agent_id: agent_id,
+          expires_at:
+            DateTime.add(
+              DateTime.utc_now(),
+              lock_ttl_seconds(Keyword.get(opts, :ttl_seconds)),
+              :second
+            )
         }
-        # The PRIVATE soft-lock marker: its PRESENCE (never the key prefix) is what
-        # earns the short clamped TTL, and it is also what clears the reserved-prefix
-        # guard in `post/4`. It is never cast into the changeset.
-        |> Map.put(@soft_lock_ttl_attr, Keyword.get(opts, :ttl_seconds))
+        |> ChannelLock.changeset(%{
+          target: normalized,
+          note: Keyword.get(opts, :body),
+          session_id: session_id,
+          host: Keyword.get(opts, :host)
+        })
 
-      post(tenant_id, agent_id, Keyword.get(opts, :role, :agent), attrs)
+      run_lock(tenant_id, changeset, lock_audit(Keyword.get(opts, :audit, []), normalized))
     end
   end
 
   # A soft-lock without a client session id would be neither refreshable nor
-  # releasable by slot (see the `lock_file/5` docstring) — reject it instead of
-  # minting an unreleasable surrogate row.
+  # releasable by slot (see the `lock_file/5` docstring) — reject it.
   defp require_lock_session(session_id) do
     if present_string?(session_id), do: :ok, else: {:error, :missing_session}
+  end
+
+  # Upsert + audit in one transaction. Created vs refreshed is read from the PERSISTED
+  # row: a fresh insert stamps `inserted_at` and `updated_at` to one instant, and the
+  # DO UPDATE refreshes `updated_at` only (the same rule `post_outcome/1` uses).
+  defp run_lock(tenant_id, changeset, audit) do
+    multi =
+      Multi.new()
+      |> Multi.insert(:lock, changeset,
+        on_conflict: lock_slot_on_conflict(),
+        conflict_target: [:tenant_id, :project_id, :agent_id, :session_id, :target],
+        returning: true
+      )
+      |> Audit.log_in_multi(:audit, fn %{lock: lock} ->
+        lock_audit_attrs(tenant_id, lock, lock_outcome_action(lock), audit, %{})
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{lock: lock}} ->
+        {:ok, lock, lock_outcome(lock)}
+
+      {:error, :lock, %Ecto.Changeset{} = failed, _changes} ->
+        ChannelPost.emit_secret_blocked_events(failed)
+        {:error, failed}
+
+      {:error, _step, %Ecto.Changeset{} = failed, _changes} ->
+        {:error, failed}
+    end
+  end
+
+  # The refreshable payload of a lock slot: its note and lease. `host`, `session_id`,
+  # `target` and `inserted_at` are kept from the first insert.
+  defp lock_slot_on_conflict do
+    from(l in ChannelLock,
+      update: [
+        set: [
+          note: fragment("EXCLUDED.note"),
+          expires_at: fragment("EXCLUDED.expires_at"),
+          updated_at: fragment("EXCLUDED.updated_at")
+        ]
+      ]
+    )
+  end
+
+  defp lock_outcome(%ChannelLock{inserted_at: ts, updated_at: ts}), do: :created
+  defp lock_outcome(%ChannelLock{}), do: :updated
+
+  defp lock_outcome_action(lock) do
+    if lock_outcome(lock) == :created, do: "posted", else: "upserted"
+  end
+
+  defp lock_audit_attrs(tenant_id, lock, action, audit, extra_metadata) do
+    %{
+      tenant_id: tenant_id,
+      project_id: lock.project_id,
+      entity_type: "channel_lock",
+      entity_id: lock.id,
+      action: action,
+      actor_type: Keyword.get(audit, :actor_type, "api_key"),
+      actor_id: Keyword.get(audit, :actor_id),
+      actor_label: Keyword.get(audit, :actor_label),
+      metadata: audit |> Keyword.get(:metadata, %{}) |> Map.merge(extra_metadata)
+    }
   end
 
   @doc """
   RELEASES the caller's OWN advisory soft-lock on `target` — US-40.4 (AC-40.4.3).
 
-  ## Why a real DELETE by slot (and not an upsert-to-already-expired)
-
-  AC-40.4.3 admits either; this ships the DELETE. `delete_post/5` deletes by post
-  ID only, so the minimal addition is a delete addressed by the same hardened
-  5-column slot key the lock occupies. The rejected alternative — re-posting the
-  slot with `expires_at` in the past — leaves a LIVE row behind that only the sweep
-  eventually reaps, and that row still counts toward the keyed-slot uniqueness and
-  toward every `has_more`/preview read's page budget. A released lock should simply
-  be gone; the DELETE is also what makes an immediate re-lock by the same session a
-  clean `:created` rather than a resurrection of a tombstone.
-
-  A lock ALSO self-expires via its short TTL (reads filter `expires_at > now`
-  independently of the sweep, and `Loopctl.Workers.ChannelPostSweeper` reaps the
-  row), so a crashed session can never hold a file indefinitely even if it never
-  calls this.
+  Deletes the caller's `(agent_id, session_id, target)` slot row of `channel_locks`, so
+  an immediate re-lock by the same session is a clean `:created`. A lock ALSO
+  self-expires via its short TTL (reads filter `expires_at > now` independently of the
+  sweep, and `Loopctl.Workers.ChannelPostSweeper` reaps the row), so a crashed session
+  can never hold a file indefinitely even if it never calls this.
 
   ## Scope of the ownership guarantee (read this before citing it — review #451)
 
-  Addressed by the slot `(tenant_id, project_id, agent_id, session_id, key)`. Of
+  Addressed by the slot `(tenant_id, project_id, agent_id, session_id, target)`. Of
   those, `tenant_id` and `agent_id` are SERVER-STAMPED from the verified key and are
   therefore genuine trust boundaries: no caller can release across tenants, and no
   agent can release another agent's lock.
@@ -1140,76 +1124,83 @@ defmodule Loopctl.Coordination do
   SHARING ONE AGENT KEY are not isolated from each other: either can read the other's
   `session_id` from the lock listing and then release (or, via `lock_file/5`,
   overwrite) that lock. The enforced guarantee is therefore **"scoped to your AGENT,
-  not to your session"** — the same author-scoped model as `delete_post/5`. That is
-  acceptable for advisory hint data (same tenant, same agent identity, nothing
-  custody-bearing rides on it), but do NOT document or rely on it as per-session
-  isolation.
+  not to your session"**. That is acceptable for advisory hint data, but do NOT
+  document or rely on it as per-session isolation.
 
   ## Oracle-safety
 
   A nonexistent lock, ANOTHER AGENT's lock, a lock held by a DIFFERENT session id
   than the one supplied, a cross-tenant/cross-project lock, a missing session id,
-  and a malformed target ALL return a byte-identical `{:error, :not_found}`: no
-  existence oracle (the same posture as `delete_post/5` and `release/5`).
+  and a malformed target ALL return a byte-identical `{:error, :not_found}`.
 
-  The delete and its audit entry run in ONE transaction (`run_delete/5`), recorded
-  under the DISTINCT action `#{@soft_lock_release_action}` — never the `deleted`
-  action the US-39.7 secret-redaction path uses, so routine lock churn cannot dilute
-  that security signal.
+  The delete and its audit entry run in ONE transaction, recorded under the DISTINCT
+  action `#{@soft_lock_release_action}` — never the `deleted` action the US-39.7
+  secret-redaction path uses, so routine lock churn cannot dilute that security signal.
 
   `opts`: `:session_id` (required — see `lock_file/5`), `:audit`.
   """
   @spec unlock_file(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
-          {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
+          {:ok, ChannelLock.t()} | {:error, :not_found | :audit_write_failed}
   def unlock_file(tenant_id, agent_id, project_id, target, opts \\ []) do
     with {:ok, normalized} <- normalize_lock_target(target),
-         %ChannelPost{} = post <-
+         %ChannelLock{} = lock <-
            fetch_owned_lock(
              tenant_id,
              agent_id,
              project_id,
              Keyword.get(opts, :session_id),
-             lock_key(normalized)
+             normalized
            ) do
-      run_delete(
+      release_lock(
         tenant_id,
         agent_id,
-        post,
-        lock_audit(Keyword.get(opts, :audit, []), normalized),
-        @soft_lock_release_action
+        lock,
+        lock_audit(Keyword.get(opts, :audit, []), normalized)
       )
     else
       _ -> {:error, :not_found}
     end
   end
 
+  defp release_lock(tenant_id, agent_id, lock, audit) do
+    multi =
+      Multi.new()
+      |> Multi.delete(:lock, lock)
+      |> Audit.log_in_multi(:audit, fn %{lock: deleted} ->
+        lock_audit_attrs(tenant_id, deleted, @soft_lock_release_action, audit, %{
+          "lock_agent_id" => deleted.agent_id,
+          "released_by_agent_id" => agent_id
+        })
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{lock: lock}} -> {:ok, lock}
+      {:error, :audit, %Ecto.Changeset{}, _changes} -> {:error, :audit_write_failed}
+    end
+  rescue
+    # A concurrent release or the sweep deleted the row between the unlocked read and
+    # the DELETE: it is gone, which is what a nonexistent lock answers.
+    Ecto.StaleEntryError -> {:error, :not_found}
+  end
+
   @doc """
   The PINNED active advisory-lock read for a channel — US-40.4 (AC-40.4.2).
 
-  A DEDICATED read rather than a flag on `recent_page/3`: an active lock must be
-  visible BEFORE a session edits a file, and the newest-N recency preview can
-  truncate it away on a busy channel. Same rationale (and same left-anchored
-  `key LIKE` prefix approach) as `directed_handoffs_page/3` — there is deliberately
-  NO `kind` column on `channel_posts`.
+  A DEDICATED read: an active lock must be visible BEFORE a session edits a file, and
+  `channel_recent` carries no locks at all (US-52.21).
 
   Surfaces every live lock, UP TO the page cap and the per-agent fairness cap —
   both of which are reported by `active_locks_page/3` (`overflowed?` /
   `holders_truncated?`), so a truncated page is never presented as a complete one.
-  A live lock is: unexpired (`expires_at > now`, independent of the
-  sweep — so an expired lock disappears IMMEDIATELY, TC-40.4.2), inside the soft-lock
-  TTL ceiling (see `live_locks_scope/3`), not quarantined,
-  not superseded. Rows are NOT deduplicated by key: two sessions holding a lock on
-  the same file is a legitimate advisory state and BOTH must be surfaced
-  (AC-40.4.4) — deduping would hide exactly the collision the caller is looking for.
+  A live lock is a `channel_locks` row with `expires_at > now`, independent of the
+  sweep — so an expired lock disappears IMMEDIATELY (TC-40.4.2). Rows are NOT
+  deduplicated by target: two sessions holding a lock on the same file is a legitimate
+  advisory state and BOTH must be surfaced (AC-40.4.4).
 
-  Each row is a `select_preview/1` projection (bounded, TOAST-safe body preview)
-  plus `:target` (the key with the `#{@lock_key_prefix}` prefix stripped) and
-  `:expires_at`, so a consumer can render "claimed: <file> by <agent/host>, <age>".
-  Newest lock first.
-
-  Returns `[preview()]`; a malformed tenant/project id yields `[]` (never a raise).
+  Returns `[%ChannelLock{}]`, newest lock first; a malformed tenant/project id yields
+  `[]` (never a raise).
   """
-  @spec active_locks(term(), term(), keyword()) :: [map()]
+  @spec active_locks(term(), term(), keyword()) :: [ChannelLock.t()]
   def active_locks(tenant_id, project_id, opts \\ []) do
     {locks, _overflowed?, _holders_truncated?} = active_locks_page(tenant_id, project_id, opts)
     locks
@@ -1217,7 +1208,7 @@ defmodule Loopctl.Coordination do
 
   @doc """
   The same read as `active_locks/3`, additionally reporting BOTH ways the set can be
-  truncated. Returns `{[preview()], overflowed?, holders_truncated?}`.
+  truncated. Returns `{[%ChannelLock{}], overflowed?, holders_truncated?}`.
 
     * `overflowed?` — the PAGE CAP dropped rows. Detected without a second query by
       fetching `limit + 1` rows. `:limit` defaults to
@@ -1225,13 +1216,10 @@ defmodule Loopctl.Coordination do
     * `holders_truncated?` — the per-agent FAIRNESS cap dropped rows. This is a
       SEPARATE signal on purpose (review #451): the fairness filter runs INSIDE the
       scope, before the `limit + 1` over-fetch, so rows it removes are structurally
-      invisible to `overflowed?`. Reporting only `overflowed?` would publish
-      `overflow: false` on a page that had silently dropped live locks — precisely
-      the "you may edit, nobody holds this file" answer this read must never give
-      wrongly. Costs one cheap aggregate over the same indexed scope.
+      invisible to `overflowed?`. Costs one cheap aggregate over the same scope.
 
-  A caller that sees EITHER flag must treat the page as incomplete (raise `:limit`,
-  or read the channel directly) rather than as "these are all the live locks".
+  A caller that sees EITHER flag must treat the page as incomplete (raise `:limit`)
+  rather than as "these are all the live locks".
 
   ## Per-agent FAIRNESS (review #451)
 
@@ -1243,23 +1231,23 @@ defmodule Loopctl.Coordination do
   partition is the SERVER-STAMPED `agent_id` only: partitioning on the
   caller-supplied `session_id` too would let a caller rotating session ids escape the
   bound entirely.
+
+  The read is tenant-scoped only, not membership-gated, and oracle-safe: a
+  cross-tenant or nonexistent project reads as an empty set.
   """
-  @spec active_locks_page(term(), term(), keyword()) :: {[map()], boolean(), boolean()}
+  @spec active_locks_page(term(), term(), keyword()) ::
+          {[ChannelLock.t()], boolean(), boolean()}
   def active_locks_page(tenant_id, project_id, opts \\ []) do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
-      now = DateTime.utc_now()
       limit = opts |> Keyword.get(:limit) |> clamp_active_locks_limit()
-      base = live_locks_scope(tenant_id, project_id, now)
+      base = live_locks_scope(tenant_id, project_id, DateTime.utc_now())
 
       rows =
         base
-        |> where([p], p.id in subquery(fair_lock_ids(base)))
-        |> order_by([p], desc: p.inserted_at, desc: p.seq)
+        |> where([l], l.id in subquery(fair_lock_ids(base)))
+        |> order_by([l], desc: l.inserted_at, desc: l.id)
         |> limit(^(limit + 1))
-        |> select_preview()
         |> AdminRepo.all()
-        |> Enum.map(&finalize_preview/1)
-        |> Enum.map(&Map.put(&1, :target, lock_target(&1.key)))
 
       {Enum.take(rows, limit), length(rows) > limit, holders_truncated?(base)}
     else
@@ -1269,27 +1257,10 @@ defmodule Loopctl.Coordination do
 
   # The live-lock predicate, shared by the page read and its fairness pre-filter so
   # the two can never drift.
-  #
-  # `@lock_key_like` is a LITERAL (never `^param`) so the partial index
-  # `channel_posts_soft_lock_idx` is provably implied and actually chosen.
-  #
-  # The UPPER bound on `expires_at` is the read-side enforcement of the TTL ceiling
-  # (review #451). A genuine soft-lock is clamped to <= @max_lock_ttl_seconds at
-  # write, so it always satisfies it; a row that does NOT is not a live lock, and
-  # publishing it as one would be a lie of up to 30 days. Two real classes land there:
-  # a LEGACY `claim:`-keyed ordinary post written before the namespace was reserved
-  # (uniform 30-day retention), and a soft-lock that was quarantined and then RELEASED
-  # (`ChannelPost.release_changeset/3` restores `inserted_at + retention_days`, which
-  # for a lock is far looser than its own lease).
   defp live_locks_scope(tenant_id, project_id, now) do
-    horizon = DateTime.add(now, @max_lock_ttl_seconds, :second)
-
-    ChannelPost
-    |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
-    |> where([p], like(p.key, @lock_key_like))
-    |> where([p], p.expires_at > ^now and p.expires_at <= ^horizon)
-    |> where([p], is_nil(p.quarantined_at))
-    |> where([p], is_nil(p.superseded_by))
+    ChannelLock
+    |> where([l], l.tenant_id == ^tenant_id and l.project_id == ^project_id)
+    |> where([l], l.expires_at > ^now)
   end
 
   # The ids of the newest @max_locks_per_holder locks PER AGENT (see the attribute
@@ -1298,12 +1269,12 @@ defmodule Loopctl.Coordination do
   defp fair_lock_ids(base) do
     ranked =
       base
-      |> select([p], %{
-        id: p.id,
+      |> select([l], %{
+        id: l.id,
         holder_rank:
           over(row_number(),
-            partition_by: [p.agent_id],
-            order_by: [desc: p.inserted_at, desc: p.seq]
+            partition_by: [l.agent_id],
+            order_by: [desc: l.inserted_at, desc: l.id]
           )
       })
 
@@ -1315,9 +1286,9 @@ defmodule Loopctl.Coordination do
   # removed before the page cap could see them.
   defp holders_truncated?(base) do
     base
-    |> group_by([p], p.agent_id)
-    |> having([p], count(p.id) > ^@max_locks_per_holder)
-    |> select([p], 1)
+    |> group_by([l], l.agent_id)
+    |> having([l], count(l.id) > ^@max_locks_per_holder)
+    |> select([l], 1)
     |> limit(1)
     |> AdminRepo.all()
     |> Kernel.!=([])
@@ -1344,49 +1315,9 @@ defmodule Loopctl.Coordination do
 
   def lock_ttl_seconds(_), do: @default_lock_ttl_seconds
 
-  @doc "The advisory soft-lock key prefix (`#{@lock_key_prefix}`) — the ONLY routing signal (no `kind` column)."
-  @spec lock_key_prefix() :: String.t()
-  def lock_key_prefix, do: @lock_key_prefix
-
-  @doc "The soft-lock TTL ceiling in seconds (#{@max_lock_ttl_seconds}) — the single source of truth for every lock liveness bound."
+  @doc "The soft-lock TTL ceiling in seconds (#{@max_lock_ttl_seconds})."
   @spec max_lock_ttl_seconds() :: pos_integer()
   def max_lock_ttl_seconds, do: @max_lock_ttl_seconds
-
-  @doc """
-  Is this READ-MODEL ROW an advisory soft-lock? — the discriminator every consumer
-  must use instead of a bare key-prefix test (review #451).
-
-  The `#{@lock_key_prefix}` namespace is reserved server-side going forward, but the
-  prefix ALONE is not sufficient evidence for a row that already exists: a legacy
-  post keyed `#{@lock_key_prefix}...` (written before the reservation) carries the
-  uniform 30-day retention, and so does a soft-lock that was quarantined and then
-  released. Both would be mislabeled as live file locks. A genuine lock's lease is
-  clamped to at most #{@max_lock_ttl_seconds}s at EVERY write, so
-  `expires_at <= updated_at + #{@max_lock_ttl_seconds}s` is the bound that
-  distinguishes them.
-
-  The bound is against `updated_at`, NOT `inserted_at`: a refresh is a keyed upsert
-  that deliberately PRESERVES `inserted_at` while extending the lease, so a lock
-  refreshed 50 minutes after it was first taken legitimately has
-  `expires_at > inserted_at + #{@max_lock_ttl_seconds}s` — anchoring on `inserted_at`
-  would silently stop marking exactly the long-running edits the marker matters most
-  for. (`live_locks_scope/3` anchors its SQL bound on `now` instead, which every
-  refreshed lock also satisfies.)
-  """
-  @spec soft_lock_row?(map()) :: boolean()
-  def soft_lock_row?(%{key: key, expires_at: %DateTime{} = expires_at} = row) do
-    case Map.get(row, :updated_at) do
-      %DateTime{} = updated_at ->
-        soft_lock_key?(key) and
-          DateTime.compare(expires_at, DateTime.add(updated_at, @max_lock_ttl_seconds, :second)) !=
-            :gt
-
-      _ ->
-        false
-    end
-  end
-
-  def soft_lock_row?(_row), do: false
 
   @doc "The default page size `active_locks/3` applies, shared with the endpoint's `meta.limit`."
   @spec default_active_locks_limit() :: pos_integer()
@@ -1406,31 +1337,17 @@ defmodule Loopctl.Coordination do
 
   def clamp_active_locks_limit(_), do: @default_active_locks_limit
 
-  # The lock's slot key. `lock_target/1` is its inverse for the read model.
-  defp lock_key(target), do: @lock_key_prefix <> target
-
-  defp lock_target(key) when is_binary(key),
-    do: String.replace_prefix(key, @lock_key_prefix, "")
-
-  defp lock_target(_), do: nil
-
-  # A soft-lock target must be a present binary that keeps the derived key within
-  # the `channel_posts.key` bound (200 bytes). A blank / oversized / non-binary
-  # target is rejected up front with a DISTINCT error so the endpoint can 422 with
-  # an honest message, rather than surfacing a confusing key-length changeset error.
-  @max_lock_target_bytes 200 - byte_size(@lock_key_prefix)
-
-  # The target is also PATH-NORMALIZED (review #451). The slot identity IS the
-  # derived key, so without normalization `lib/foo.ex`, `./lib/foo.ex`,
-  # `lib//foo.ex` and `/lib/foo.ex` are four DIFFERENT slots on the same file: two
-  # sessions editing it with different spellings each take a lock and each sees the
-  # other's as an unrelated target — the collision avoidance the story exists to
-  # provide silently never fires — while one session that spells the path
-  # differently across refreshes leaks an extra un-refreshable row per spelling
-  # instead of upserting in place. Normalizing makes slot identity match the thing
-  # being protected: drop `.` and empty segments (so `./a`, `a//b` and `a/./b`
-  # collapse) and RELATIVIZE a leading `/` rather than rejecting it (an absolute
-  # path is a legitimate spelling of the same repo file from a different cwd). `..`
+  # A soft-lock target must be a present binary of at most
+  # `ChannelLock.target_max_length/0` bytes. A blank / oversized / non-binary target is
+  # rejected up front with a DISTINCT error so the endpoint can 422 with an honest
+  # message, rather than surfacing a confusing changeset error.
+  #
+  # The target is also PATH-NORMALIZED (review #451). The slot identity includes the
+  # target, so without normalization `lib/foo.ex`, `./lib/foo.ex`, `lib//foo.ex` and
+  # `/lib/foo.ex` are four DIFFERENT slots on the same file: two sessions editing it
+  # with different spellings each take a lock and each sees the other's as an
+  # unrelated target. Normalizing drops `.` and empty segments (so `./a`, `a//b` and
+  # `a/./b` collapse) and RELATIVIZES a leading `/` rather than rejecting it. `..`
   # segments are left alone — resolving them without a repo root would be a guess,
   # and the target is advisory display data, never a filesystem operation.
   defp normalize_lock_target(target) when is_binary(target) do
@@ -1443,98 +1360,38 @@ defmodule Loopctl.Coordination do
 
     cond do
       normalized == "" -> {:error, :invalid_target}
-      byte_size(normalized) > @max_lock_target_bytes -> {:error, :invalid_target}
+      byte_size(normalized) > ChannelLock.target_max_length() -> {:error, :invalid_target}
       true -> {:ok, normalized}
     end
   end
 
   defp normalize_lock_target(_target), do: {:error, :invalid_target}
 
-  # The default lock body. Deliberately terse and self-describing: it lands on the
-  # shared channel and is injected into peer sessions as untrusted DATA, so it says
-  # what the lock IS (advisory) rather than issuing an instruction.
-  defp lock_body(target, note) do
-    if is_binary(note) and String.trim(note) != "" do
-      String.trim(note)
-    else
-      "advisory soft-lock: editing #{target} (advisory only — it does not block you)"
-    end
-  end
-
   # Carry the lock target into the audit metadata for BOTH lock and unlock so the
-  # trail names the file, not just the post id.
+  # trail names the file, not just the row id.
   defp lock_audit(audit, target) do
     metadata = audit |> Keyword.get(:metadata, %{}) |> Map.put("soft_lock_target", target)
     Keyword.put(audit, :metadata, metadata)
   end
 
-  # Fetch the caller's OWN lock by the HARDENED 5-column slot key — the delete-by-slot
-  # path AC-40.4.3 calls for (`delete_post/5` addresses by post id only). The index
-  # `channel_posts_session_key_uidx` makes this at most one row. Every miss (foreign
-  # tenant/project/agent/session, malformed id, blank session) returns nil so the
-  # caller collapses to one byte-identical `{:error, :not_found}`.
-  #
-  # QUARANTINED rows are excluded (review #451), matching `live_locks_scope/3`. Two
-  # reasons: (1) a release is a HARD DELETE recorded under the benign
-  # `#{@soft_lock_release_action}` action, so without this an author could destroy a
-  # post the secret-denylist rescan flagged — the operator's only reviewable artifact
-  # — under a routine-churn label instead of the `deleted` redaction action operators
-  # watch; (2) read/write consistency — no lock read will show a quarantined row, so
-  # no lock write may address one. `delete_post/5` remains the explicit (and
-  # explicitly-labeled) redaction path.
-  defp fetch_owned_lock(tenant_id, agent_id, project_id, session_id, key) do
+  # Fetch the caller's OWN lock by its slot — at most one row under
+  # `channel_locks_slot_uidx`. Every miss (foreign tenant/project/agent/session,
+  # malformed id, blank session) returns nil so the caller collapses to one
+  # byte-identical `{:error, :not_found}`.
+  defp fetch_owned_lock(tenant_id, agent_id, project_id, session_id, target) do
     if valid_uuid?(tenant_id) and valid_uuid?(agent_id) and valid_uuid?(project_id) and
          present_string?(session_id) do
-      ChannelPost
+      ChannelLock
       |> where(
-        [p],
-        p.tenant_id == ^tenant_id and p.project_id == ^project_id and
-          p.agent_id == ^agent_id and p.session_id == ^session_id and p.key == ^key
+        [l],
+        l.tenant_id == ^tenant_id and l.project_id == ^project_id and
+          l.agent_id == ^agent_id and l.session_id == ^session_id and l.target == ^target
       )
-      |> where([p], is_nil(p.quarantined_at))
       |> AdminRepo.one()
     else
       nil
     end
   end
-
-  # US-40.4: the SINGLE place `expires_at` is caller-influenced. Routing is on the
-  # PRIVATE `@soft_lock_ttl_attr` marker that only `lock_file/5` stamps — NOT on the
-  # caller-chosen `key`. Every other post keeps the uniform `now + @retention_days`
-  # retention, so no request body can shorten or extend channel retention (review
-  # #451: the earlier key-prefix routing made that stated invariant false — a
-  # perfectly ordinary post keyed `claim:story-812` was silently cut to 900s).
-  defp resolve_expires_at(attrs) do
-    case Map.fetch(attrs, @soft_lock_ttl_attr) do
-      {:ok, ttl} -> DateTime.add(DateTime.utc_now(), lock_ttl_seconds(ttl), :second)
-      :error -> default_expires_at()
-    end
-  end
-
-  # The `claim:` key namespace is RESERVED for advisory soft-locks (review #451).
-  # Every lock read routes on `key LIKE 'claim:%'` alone — there is no `kind` column
-  # — so a caller-keyed post in that namespace would masquerade as a live file lock
-  # in `active_locks_page/3` and in `channel_recent`'s lock marker. Rejecting it here
-  # (rather than silently reinterpreting it, as the first cut did) keeps the prefix a
-  # sound predicate and tells the caller exactly what to do instead. Enforced by
-  # BOTH writers (`post/4` and `create_post/4`), so the namespace is not guaranteed by
-  # a single call site.
-  #
-  # The reservation is forward-looking only, so it is NOT the whole defense: rows
-  # written BEFORE it (the `claim:` key convention predates this branch) carry the
-  # uniform 30-day retention and would otherwise be published as live file locks for
-  # up to 30 days. Every lock read therefore ALSO carries the TTL-ceiling bound (see
-  # `live_locks_scope/3` and `soft_lock_row?/1`), which no such row can satisfy.
-  defp reserved_key_prefix_check(attrs) do
-    if soft_lock_key?(Map.get(attrs, :key)) and not Map.has_key?(attrs, @soft_lock_ttl_attr) do
-      {:error, :unprocessable_entity, @reserved_key_prefix_message}
-    else
-      :ok
-    end
-  end
-
-  defp soft_lock_key?(key) when is_binary(key), do: String.starts_with?(key, @lock_key_prefix)
-  defp soft_lock_key?(_key), do: false
 
   @doc "The retention window, in days, a DONE claim is kept before the sweep reaps it."
   @spec claim_done_retention_days() :: pos_integer()
@@ -3001,9 +2858,9 @@ defmodule Loopctl.Coordination do
   # Delete + audit in ONE transaction so the removal survives in the trail even
   # though the row is hard-deleted (AC-39.7.3). The DELETING agent is the audit
   # actor (from `audit`); the post's original author is captured in metadata.
-  # `action` is the audit action the delete is recorded under. It defaults to the
-  # US-39.7 redaction action ("deleted"); `unlock_file/5` overrides it so routine
-  # soft-lock churn is a DISTINCT, separately-greppable event (review #451).
+  # `action` is the audit action the delete is recorded under; every caller uses the
+  # US-39.7 redaction action ("deleted"). A soft-lock release is not a post delete
+  # (`unlock_file/5` audits its own `soft_lock_released` entry on `channel_locks`).
   defp run_delete(tenant_id, agent_id, post, audit, action \\ "deleted") do
     multi =
       Multi.new()
@@ -3523,33 +3380,18 @@ defmodule Loopctl.Coordination do
       the applied `:limit`. Detected by fetching `limit + 1` rows and checking for
       the overflow row (no extra COUNT query), so the endpoint surfaces an HONEST
       truncation signal rather than leaving consumers to infer it from
-      `count == limit`. ONE STATED EXCEPTION (review #451): advisory soft-locks are
-      capped at #{@max_recent_locks} rows per page by `apply_lock_share_cap/4` in the
-      newest and delta reads, and suppressed locks do NOT contribute to `has_more` —
-      so on a channel with many live locks this read can return `has_more: false`
-      while further live LOCK rows exist. That is deliberate (locks are the bus's
-      highest-churn write and this is a recency preview), and it is why
-      **a consumer that relies on lock visibility MUST read `active_locks_page/3` /
-      `GET /api/v1/channel/locks`** — the dedicated pinned read — rather than
-      inferring the live lock set from this one. Non-lock rows are unaffected: for
-      them `has_more` is exact. TRUNCATION-DRAIN RULE (delta mode): because delta orders
+      `count == limit`. This read carries no advisory locks (US-52.21): they live in
+      `channel_locks`, read through `active_locks_page/3` /
+      `GET /api/v1/channel/locks`. TRUNCATION-DRAIN RULE (delta mode): because delta orders
       GREATEST(inserted_at, updated_at) DESC, an overflowing window truncates the
       OLDEST-touched matching rows. A consumer MUST NOT advance its `since` watermark
       while `has_more` is true — the newest-first truncation means advancing steps
       PAST the dropped older rows permanently (a lost-write gap). Instead, drain the
       backlog via the HISTORY read (`cursor:` walked to exhaustion), which returns
-      every live NON-LOCK row including the truncated ones, then advance
-      `since` only once a delta read returns `has_more == false`. **The drain
-      guarantee covers non-lock rows only** (review #451): the entry page of a walk
-      carries no cursor, so the lock share cap applies to it and can drop live locks
-      that the subsequent (uncapped — see `apply_lock_share_cap/4`) cursor pages
-      cannot recover, because a dropped lock may sort ABOVE the entry page's cursor.
-      That is accepted rather than papered over: locks are advisory hint data with a
-      <= 1h lease and a DEDICATED complete read (`active_locks_page/3` /
-      `GET /api/v1/channel/locks`), which is what a consumer relying on lock
-      visibility must call. (Delta mode emits no `next_cursor`, so
-      the drain is the keyset/history read — not a delta continuation. See
-      `@commit_lag_epsilon_seconds`.)
+      every live row including the truncated ones, then advance
+      `since` only once a delta read returns `has_more == false`. (Delta mode emits no
+      `next_cursor`, so the drain is the keyset/history read — not a delta
+      continuation. See `@commit_lag_epsilon_seconds`.)
     * `next_cursor` — the `(inserted_at, seq)` keyset position of the LAST returned
       row when more history remains, else `nil`. This is a HISTORY-paging construct:
       it is returned only for the HISTORY read (no `:since` delta window). The
@@ -3618,7 +3460,6 @@ defmodule Loopctl.Coordination do
 
       rows =
         base
-        |> apply_lock_share_cap(base, since, cursor)
         |> order_recent(since)
         |> select_preview()
         |> limit(^(limit + 1))
@@ -3631,67 +3472,6 @@ defmodule Loopctl.Coordination do
     else
       {[], false, nil}
     end
-  end
-
-  # Bound the SHARE of one `recent_page/3` page that advisory soft-locks may occupy
-  # (review #451). Locks stay on this read — AC-40.4.2 requires `channel_recent` to
-  # surface them, and `channel_post_json/1` marks them distinctly — but they are the
-  # bus's highest-churn write: a lock is refreshed while editing, each refresh bumps
-  # `updated_at`, and the `since` DELTA ordering ranks by
-  # `GREATEST(inserted_at, updated_at)`, so a refreshing fleet would repeatedly
-  # re-float its locks to the top of the 25-row window and crowd out genuine
-  # coordination posts and handoffs. Only the NEWEST @max_recent_locks locks in the
-  # same filtered scope (same `since` window, same ordering) are admitted; the
-  # complete live set is the dedicated pinned read (`active_locks_page/3`), which is
-  # what a lock-visibility consumer must call — suppressed locks do NOT move
-  # `has_more` here (stated on `recent_page/3`).
-  #
-  # Non-lock rows are never dropped — a lock displaced from this page simply frees a
-  # slot for a real post. `coalesce(key, '')` keeps KEYLESS posts (NULL `key`)
-  # admitted: a bare `NOT (NULL LIKE ...)` is NULL, i.e. filtered OUT, which would
-  # silently drop every plain append-only message.
-  #
-  # NOT APPLIED IN HISTORY (`cursor:`) MODE (review #451). The cap is a RECENCY-
-  # PREVIEW concern — it exists so churn cannot crowd the newest-N window — while a
-  # cursor walk is a deliberate backward page through history, which the cap was
-  # actively CORRUPTING: `newest_lock_ids` is computed against `base`, which already
-  # carries `apply_cursor/2`, so the cap re-applied per cursor page against that
-  # page's own window — a lock ranked 6th in page N's window was excluded from page N
-  # AND sat above page N+1's strict `< cursor` seek, i.e. skipped permanently on
-  # EVERY page. Exempting cursor mode removes that per-page re-application entirely.
-  #
-  # It does NOT make the walk lock-complete, and `recent_page/3`'s docstring says so
-  # plainly: the ENTRY page of a walk carries no cursor, so the cap applies there and
-  # a lock it drops may sort above the entry page's cursor. Locks are advisory hint
-  # data with a <= 1h lease and a DEDICATED complete read — a consumer that needs the
-  # live lock set calls `active_locks_page/3`, never this one.
-  #
-  # The lock predicate carries the SAME TTL ceiling `live_locks_scope/3` uses, so a
-  # legacy `claim:`-keyed ordinary post (30-day retention, written before the
-  # namespace was reserved) is treated as the ordinary post it is and never suppressed
-  # from the recency preview. `@lock_key_like` stays a LITERAL so the partial index
-  # is usable.
-  defp apply_lock_share_cap(query, _base, _since, cursor) when not is_nil(cursor), do: query
-
-  defp apply_lock_share_cap(query, base, since, _cursor) do
-    newest_lock_ids =
-      base
-      |> where(
-        [p],
-        like(p.key, @lock_key_like) and
-          p.expires_at <= datetime_add(p.updated_at, ^@max_lock_ttl_seconds, "second")
-      )
-      |> order_recent(since)
-      |> limit(@max_recent_locks)
-      |> select([p], p.id)
-
-    where(
-      query,
-      [p],
-      not (like(coalesce(p.key, ""), @lock_key_like) and
-             p.expires_at <= datetime_add(p.updated_at, ^@max_lock_ttl_seconds, "second")) or
-        p.id in subquery(newest_lock_ids)
-    )
   end
 
   @doc """
@@ -4017,10 +3797,8 @@ defmodule Loopctl.Coordination do
       superseded_by: p.superseded_by,
       inserted_at: p.inserted_at,
       updated_at: p.updated_at,
-      # Projected for EVERY preview read (review #451): without it a `channel_recent`
-      # consumer cannot tell a LIVE advisory lock from an expired-but-unswept one,
-      # nor render its remaining liveness — the distinctness AC-40.4.2 asks for. The
-      # pinned lock read consumes the same field rather than merging its own copy.
+      # Projected for EVERY preview read so a consumer can tell a live post from an
+      # expired-but-unswept one.
       expires_at: p.expires_at,
       # CHARACTER-bounded over-fetch (see @preview_probe_chars) — NOT byte-bounded.
       body_preview: fragment("substring(? for ?)", p.body, ^@preview_probe_chars)

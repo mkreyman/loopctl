@@ -10,6 +10,7 @@ defmodule Loopctl.Projects.MergeTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Coordination.ChannelLock
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Intake.Source
   alias Loopctl.Projects
@@ -220,6 +221,34 @@ defmodule Loopctl.Projects.MergeTest do
 
       assert {:error, {:merge_conflicts, [%{table: "token_budgets"}]}} =
                Merge.merge_into(t.id, a.id, b.id)
+    end
+
+    # US-52.21 / TC-52.21.8: locks move with the project, and one lock slot held in
+    # both projects is a conflict.
+    test "a soft-lock moves; the same lock slot in both projects conflicts" do
+      t = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: t.id})
+      a = fixture(:project, %{tenant_id: t.id})
+      b = fixture(:project, %{tenant_id: t.id})
+      slot = %{tenant_id: t.id, agent_id: agent.id, session_id: "s1", target: "lib/x.ex"}
+
+      moved = fixture(:channel_lock, Map.merge(slot, %{project_id: a.id, target: "lib/y.ex"}))
+
+      assert {:ok, %{counts: %{"channel_locks" => 1}}} = Merge.merge_into(t.id, a.id, b.id)
+      assert project_of(ChannelLock, moved.id) == b.id
+
+      c = fixture(:project, %{tenant_id: t.id})
+      d = fixture(:project, %{tenant_id: t.id})
+      held = fixture(:channel_lock, Map.put(slot, :project_id, c.id))
+      fixture(:channel_lock, Map.put(slot, :project_id, d.id))
+
+      assert {:ok, %{dry_run: true, conflicts: [%{table: "channel_locks"}]}} =
+               Merge.merge_into(t.id, c.id, d.id, dry_run: true)
+
+      assert {:error, {:merge_conflicts, [%{table: "channel_locks"}]}} =
+               Merge.merge_into(t.id, c.id, d.id)
+
+      assert project_of(ChannelLock, held.id) == c.id
     end
 
     test "a repeat merge moves rows written to the archived source since" do
