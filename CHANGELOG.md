@@ -489,7 +489,8 @@ All notable changes to loopctl are documented here.
   max 200, `after` cursor) with `current`, the newest note per section, on the first page.
   Only the story's current holder, or an orchestrator, user or superadmin key, writes one:
   another session is `409 held_by_other_holder`, and an agent on an item nobody holds is
-  `409 not_holder`. A repeated `idempotency_key` returns the first note. MCP tools
+  `409 not_holder`. A writer repeating its own `idempotency_key` gets its first note back;
+  another writer reusing that key is `409 idempotency_key_reused`. MCP tools
   `work_item_note` and `work_item_notes`. New table `story_notes` (RLS enabled).
 
 - **A session end reports its turns and the work it left behind (2026-11-07, US-48.11,

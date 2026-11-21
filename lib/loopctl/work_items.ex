@@ -62,10 +62,12 @@ defmodule Loopctl.WorkItems do
   read it; without it the story is read under `FOR SHARE`, so no release can commit between
   the holder check and the write.
 
-  Returns `{:ok, note}` (the FIRST note when `idempotency_key` repeats, with no second note
-  and no second event), `{:error, %Ecto.Changeset{}}`, `{:error, {:held_by_other_holder,
-  holder_id}}`, `{:error, :not_holder}` (an agent-role caller on an item nobody holds) or
-  `{:error, :not_found}` (no such story in this tenant).
+  Returns `{:ok, note}` (the FIRST note when its own writer repeats `idempotency_key`, with
+  no second note and no second event), `{:error, %Ecto.Changeset{}}`, `{:error,
+  {:held_by_other_holder, holder_id}}`, `{:error, :not_holder}` (an agent-role caller on an
+  item nobody holds), `{:error, :idempotency_key_reused}` (a caller allowed to write, reusing
+  a key another writer's note already carries) or `{:error, :not_found}` (no such story in
+  this tenant).
   """
   @spec write_note(Ecto.UUID.t(), Ecto.UUID.t(), map(), author(), keyword()) ::
           {:ok, Note.t()}
@@ -73,6 +75,7 @@ defmodule Loopctl.WorkItems do
              Ecto.Changeset.t()
              | {:held_by_other_holder, Ecto.UUID.t()}
              | :not_holder
+             | :idempotency_key_reused
              | :not_found}
   def write_note(tenant_id, story_id, attrs, author, opts \\ []) do
     changeset = Note.create_changeset(%Note{}, attrs)
@@ -81,7 +84,8 @@ defmodule Loopctl.WorkItems do
       key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
       # The writer's own retry is answered even after the item changed hands; anyone else
-      # repeating that key goes through may_write/2 and is refused like any other write.
+      # repeating that key goes through may_write/2 first, so a caller who may not write is
+      # refused for that, and one who may is told the key is another writer's.
       case existing_note(tenant_id, story_id, key) do
         %Note{} = note -> own_replay(note, tenant_id, story_id, changeset, author, opts)
         nil -> insert_note(tenant_id, story_id, changeset, author, opts)
@@ -118,7 +122,7 @@ defmodule Loopctl.WorkItems do
     |> case do
       # A concurrent write with the same key won the unique index: answer its note.
       {:error, :replayed} ->
-        {:ok, existing_note(tenant_id, story_id, key)}
+        tenant_id |> existing_note(story_id, key) |> replay(author)
 
       result ->
         result
@@ -215,9 +219,16 @@ defmodule Loopctl.WorkItems do
 
   defp replay_or_append(tenant_id, story, changeset, author, key) do
     case existing_note(tenant_id, story.id, key) do
-      %Note{} = note -> {:ok, note}
+      %Note{} = note -> replay(note, author)
       nil -> append(tenant_id, story, changeset, author)
     end
+  end
+
+  # An idempotency key names ONE writer's write. Another writer reusing it (the item's next
+  # holder, an orchestrator) is told so, rather than answered a note it did not write while
+  # its own is dropped.
+  defp replay(%Note{} = note, author) do
+    if written_by?(note, author), do: {:ok, note}, else: {:error, :idempotency_key_reused}
   end
 
   defp existing_note(_tenant_id, _story_id, nil), do: nil

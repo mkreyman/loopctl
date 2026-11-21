@@ -114,6 +114,25 @@ describe("holder session", () => {
     assert.equal(session.agentKey(), "holder-key");
   });
 
+  test("a refused register is final: no timer, nothing sent again", async () => {
+    for (const status of [403, 404, 409]) {
+      const { session, calls, timers } = harness({ answers: [{ error: true, status }] });
+      await session.start();
+      assert.equal(timers.length, 0, `a ${status} refusal arms no retry`);
+      assert.equal(calls.length, 1);
+    }
+  });
+
+  test("a heartbeat whose re-register is refused stops ticking", async () => {
+    const { session, timers } = harness({
+      answers: [registered, { error: true, status: 401 }, { error: true, status: 403 }],
+    });
+    await session.start();
+    await session.heartbeat();
+    assert.equal(timers[0].cleared, true);
+    assert.equal(session.agentKey(), "plain");
+  });
+
   test("a heartbeat in flight when the session ends never registers it again", async () => {
     let answerHeartbeat;
     const inFlight = new Promise((resolve) => {

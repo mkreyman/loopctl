@@ -74,6 +74,17 @@ defmodule LoopctlWeb.WorkItemNoteControllerTest do
     assert json_response(write(orch_key, ctx.story.id, %{section: "decision", body: "ok"}), 201)
   end
 
+  test "an orchestrator reusing the holder's idempotency_key is 409 idempotency_key_reused",
+       ctx do
+    params = %{section: "plan", body: "do x", idempotency_key: "plan"}
+    assert json_response(write(ctx.h1.raw_key, ctx.story.id, params), 201)
+
+    {orch_key, _} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: :orchestrator})
+    error = json_response(write(orch_key, ctx.story.id, %{params | body: "mine"}), 409)
+
+    assert error["error"]["code"] == "idempotency_key_reused"
+  end
+
   test "a bad section or an oversized body is 422", ctx do
     assert json_response(write(ctx.h1.raw_key, ctx.story.id, %{section: "diary", body: "b"}), 422)
 

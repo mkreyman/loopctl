@@ -421,6 +421,21 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-52.17: a note whose idempotency_key another writer's note on this story already carries.
+  def call(conn, {:error, :idempotency_key_reused}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "idempotency_key_reused",
+        message:
+          "Another writer's note on this story already carries this idempotency_key; " <>
+            "nothing was written. Send a key of your own."
+      }
+    })
+  end
+
   def call(conn, {:error, :not_claimant}) do
     conn
     |> put_status(:conflict)

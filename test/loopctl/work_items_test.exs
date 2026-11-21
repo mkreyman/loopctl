@@ -320,6 +320,36 @@ defmodule Loopctl.WorkItemsTest do
       assert note_count(story.tenant_id, story.id) == 1
     end
 
+    test "the item's next holder reusing the key is told so, and its note is not dropped silently",
+         %{agent: agent, story: story, author: author} do
+      attrs = %{"section" => "plan", "body" => "first", "idempotency_key" => "plan"}
+      {:ok, _first} = WorkItems.write_note(story.tenant_id, story.id, attrs, author)
+
+      next = holder(agent.tenant_id, agent.id, "session-next-holder")
+
+      {1, _} =
+        AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+          set: [assigned_holder_id: next]
+        )
+
+      next_author = %{api_key_id: Ecto.UUID.generate(), role: :agent, holder_id: next}
+
+      assert {:error, :idempotency_key_reused} =
+               WorkItems.write_note(
+                 story.tenant_id,
+                 story.id,
+                 %{attrs | "body" => "b"},
+                 next_author
+               )
+
+      orchestrator = %{api_key_id: Ecto.UUID.generate(), role: :orchestrator, holder_id: nil}
+
+      assert {:error, :idempotency_key_reused} =
+               WorkItems.write_note(story.tenant_id, story.id, attrs, orchestrator)
+
+      assert note_count(story.tenant_id, story.id) == 1
+    end
+
     test "a note row already holding the key is answered even if its event is missing",
          %{story: story, author: author} do
       # The race the unique index settles: another write committed the note first.

@@ -339,6 +339,9 @@ defmodule Loopctl.WorkItems.Open do
       where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
       where: s.assigned_holder_id == ^holder_id and s.agent_status in [:assigned, :implementing],
       where: is_nil(st.branch) and st.stage not in ^@closed_stages,
+      # One lock order for every open, so two opens by one holder for two branches (two
+      # advisory keys) cannot take these row locks in opposite orders and deadlock.
+      order_by: [asc: s.id],
       limit: 2,
       select: {s.id, st.id}
     )

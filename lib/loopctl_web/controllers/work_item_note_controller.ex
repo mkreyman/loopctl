@@ -63,8 +63,9 @@ defmodule LoopctlWeb.WorkItemNoteController do
       404 => {"No such story in this tenant", "application/json", Schemas.ErrorResponse},
       409 =>
         {"`held_by_other_holder`: another session holds the story. `not_holder`: nobody " <>
-           "holds it, so only an orchestrator+ key may write.", "application/json",
-         Schemas.ErrorResponse},
+           "holds it, so only an orchestrator+ key may write. `idempotency_key_reused`: " <>
+           "another writer's note already carries this key; nothing was written.",
+         "application/json", Schemas.ErrorResponse},
       422 =>
         {"Unknown section, empty or oversized body, or a body that looks like a credential",
          "application/json", Schemas.ErrorResponse},

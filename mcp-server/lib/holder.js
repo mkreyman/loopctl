@@ -17,8 +17,11 @@
  * holder while it is live. A heartbeat refused 409 holder_lease_expired (US-52.19) ended the
  * holder and released its claims, so the register makes a NEW holder, and the lapse is
  * logged to stderr. A network error leaves the credential in place for the next tick. A
- * register that fails (at startup, or after a refused heartbeat) arms the timer anyway, so
- * the session keeps trying and registers once loopctl answers (AC-52.13.4).
+ * register that fails TRANSIENTLY (no answer, a timeout, 429 or 5xx, at startup or after a
+ * refused heartbeat) arms the timer anyway, so the session registers once loopctl answers
+ * (US-52.13's partition answer). A refusal (any other 4xx: an older server's 404, 403
+ * custody_tier_required, 403 holder_mint_forbidden, 409 session_id_held) is final for the
+ * process: it stays on LOOPCTL_AGENT_KEY and never asks again.
  *
  * An end is final for every call already in flight: each register and heartbeat remembers
  * the generation it started in, and one that lands after an end adopts nothing, so a
@@ -55,6 +58,12 @@ const GONE = new Set([401, 404, 409]);
 // (HOLDER_HEARTBEAT_SECONDS' default), so an unregistered session retries no faster than a
 // registered one beats.
 const DEFAULT_HEARTBEAT_SECONDS = 60;
+
+/** A failed call worth retrying: no answer at all, rate limited, or a server error. */
+function transient(result) {
+  const status = result && result.status;
+  return !result || !status || status === 429 || status >= 500;
+}
 
 /** The `error.code` of a refusal body, parsed or raw. */
 function errorCode(body) {
@@ -161,9 +170,12 @@ export function createHolderSession(deps) {
       if (result.credential && result.credential.raw_key) credential = result.credential.raw_key;
       ended = false;
       arm(result.heartbeat_seconds);
-    } else if (timer === null) {
-      // Not registered: keep ticking, and the next tick registers again.
-      arm(DEFAULT_HEARTBEAT_SECONDS);
+    } else if (transient(result)) {
+      // Not registered for a reason that passes: keep ticking, the next tick registers again.
+      if (timer === null) arm(DEFAULT_HEARTBEAT_SECONDS);
+    } else {
+      // Refused: a timer left from an earlier holder would ask again every tick.
+      stopTimer();
     }
 
     return beat(result);

@@ -8748,7 +8748,8 @@ const TOOLS = [
       "it, 404 for a story that is not this tenant's. 422 for an unknown section, an empty " +
       "body, a body over 16384 bytes, or a body that looks like a credential (every holder " +
       "reads notes). Pass `idempotency_key` to make a retry after a lost response return the " +
-      "first note and write nothing.",
+      "first note and write nothing; the key is the WRITER's, so a key another writer's note " +
+      "on this story already carries is 409 idempotency_key_reused and writes nothing.",
     inputSchema: {
       type: "object",
       properties: {
