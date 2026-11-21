@@ -24,6 +24,7 @@ import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { createBranchItemOpener, openWorkItem } from "./lib/branch-item.js";
 import { createHolderSession } from "./lib/holder.js";
+import { resolveDefaultKey } from "./lib/default-key.js";
 import { listWorkItemNotes, writeWorkItemNote } from "./lib/work-items.js";
 import { execFile, execFileSync } from "node:child_process";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -185,19 +186,11 @@ function getBaseUrl() {
 }
 
 /**
- * Resolve which API key to use for a request.
- *
- * Priority:
- *  1. LOOPCTL_API_KEY (global override — if set, always used)
- *  2. keyOverride passed by the tool function (role-specific key)
- *  3. LOOPCTL_ORCH_KEY (safe default for reads)
+ * Resolve which API key to use for a request: the order is `resolveDefaultKey`'s
+ * (`lib/default-key.js`), ending with this session's agent key.
  */
 function resolveKey(keyOverride) {
-  return (
-    process.env.LOOPCTL_API_KEY ||
-    keyOverride ||
-    process.env.LOOPCTL_ORCH_KEY
-  );
+  return resolveDefaultKey({ env: process.env, keyOverride, agentKey });
 }
 
 // US-52.13: this process's session holder. Every request that used to send
@@ -283,8 +276,8 @@ async function apiCall(
 ) {
   const url = `${getBaseUrl()}${path}`;
   // `exactKey` sends `keyOverride` VERBATIM instead of consulting `resolveKey`
-  // (defined above), whose priority is LOOPCTL_API_KEY > keyOverride >
-  // LOOPCTL_ORCH_KEY — so without it a global LOOPCTL_API_KEY displaces the key a
+  // (defined above, order in `lib/default-key.js`), where LOOPCTL_API_KEY comes
+  // before the override — so without it a global LOOPCTL_API_KEY displaces the key a
   // tool names. Two families pass it, for two different reasons:
   //
   //   - USER-ROLE-PINNED tools pass LOOPCTL_USER_KEY with `exactKey: true`
@@ -3600,10 +3593,10 @@ async function placeDispatch(args) {
 }
 
 async function storyStage(args) {
-  // THE AGENT KEY IS EXPLICIT, like every other agent-facing tool here: `resolveKey` reads
-  // LOOPCTL_API_KEY, then an override, then LOOPCTL_ORCH_KEY — never LOOPCTL_AGENT_KEY. A
-  // session refused `stale_stage` is running on an agent key, and this read is what tells it
-  // where the row actually is, so on an agent-key-only config it has to work.
+  // THE AGENT KEY IS EXPLICIT, like every other agent-facing tool here: as the override it
+  // comes before LOOPCTL_ORCH_KEY in `resolveKey`'s order (`lib/default-key.js`). A session
+  // refused `stale_stage` is running on an agent key, and this read is what tells it where the
+  // row actually is.
   const key = agentKey();
 
   return toContent(
@@ -3614,11 +3607,9 @@ async function storyStage(args) {
 }
 
 // US-47.7: a READ, `role: :agent` with the hierarchy, so any role's key clears the gate and
-// nothing is pinned. LOOPCTL_AGENT_KEY is passed as this tool's own key for the reason
-// storyStage gives above — `resolveKey` never reads it by name, and a session on an
-// agent-key-only config is exactly the one asking which change its story is bound to. It is an
-// OVERRIDE, not `exactKey`, so `resolveKey`'s order holds: LOOPCTL_API_KEY when set, else
-// LOOPCTL_AGENT_KEY, else LOOPCTL_ORCH_KEY.
+// nothing is pinned. The agent key is passed as this tool's own key for the reason storyStage
+// gives above. It is an OVERRIDE, not `exactKey`, so `resolveKey`'s order holds
+// (`lib/default-key.js`): LOOPCTL_API_KEY when set, else the agent key.
 async function changeBindingGet(args) {
   const key = agentKey();
 

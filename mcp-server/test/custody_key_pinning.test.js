@@ -1,9 +1,8 @@
 /**
  * Key selection for the `exact_role: :orchestrator` custody verbs.
  *
- * WHAT THE PINNING IS FOR. `resolveKey` in `index.js` reads
- * `LOOPCTL_API_KEY || keyOverride || LOOPCTL_ORCH_KEY`, so the global override wins over the
- * key a tool names. An operator who set LOOPCTL_ORCH_KEY specifically for these verbs, and a
+ * WHAT THE PINNING IS FOR. `resolveKey` in `index.js` reads LOOPCTL_API_KEY before the tool's
+ * override (`lib/default-key.js`), so the global override wins over the key a tool names. An operator who set LOOPCTL_ORCH_KEY specifically for these verbs, and a
  * LOOPCTL_API_KEY of some other role for everything else, had the orchestrator key silently
  * discarded on exactly the calls they set it for. `exactKey` honours it.
  *

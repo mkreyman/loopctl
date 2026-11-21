@@ -95,15 +95,12 @@ first and answers with `code: "insufficient_role"` and `required_roles: ["orches
 which names the problem correctly.
 
 `report_story` and `review_complete` are NOT in this table: their gates take a role RANGE
-(`exact_role: [:agent, :orchestrator]` and `[:orchestrator, :user]`), so the
-`LOOPCTL_API_KEY` fallback is what makes the common agent configuration work — that is
-`LOOPCTL_API_KEY` set to an agent key. **`LOOPCTL_AGENT_KEY` alone is not that configuration
-for these two**: the priority above never consults `LOOPCTL_AGENT_KEY` by name, only a tool's
-own key, and `report_story` and `review_complete` both name `LOOPCTL_ORCH_KEY` as theirs — so
-with only `LOOPCTL_AGENT_KEY` set they answer "No API key configured" before reaching their
-gate. Most agent-facing tools do name `LOOPCTL_AGENT_KEY` as their own key and so do work
-under it alone; these two are the exception, and `story_stage` reads it explicitly for the
-same reason. The conditional pin in the first row is that same reasoning applied to the
+(`exact_role: [:agent, :orchestrator]` and `[:orchestrator, :user]`), so they are not pinned
+and take the default order (`lib/default-key.js`): `LOOPCTL_API_KEY`, then their own key
+(`LOOPCTL_ORCH_KEY`), then the session's agent key (its holder credential once registered,
+else `LOOPCTL_AGENT_KEY`). With only `LOOPCTL_AGENT_KEY` set they therefore send the agent key
+and loopctl's gate decides: `report_story` accepts an agent key, `review_complete` refuses it
+403. The conditional pin in the first row is that same reasoning applied to the
 single-role gates.
 
 ## First-time setup — provision your BYO LLM keys

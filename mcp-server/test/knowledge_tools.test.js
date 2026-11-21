@@ -25,12 +25,13 @@ function getBaseUrl() {
   return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
 }
 
+// The shipped order, not a copy of it (the session's agent key is LOOPCTL_AGENT_KEY here).
 function resolveKey(keyOverride) {
-  return (
-    process.env.LOOPCTL_API_KEY ||
-    keyOverride ||
-    process.env.LOOPCTL_ORCH_KEY
-  );
+  return resolveDefaultKey({
+    env: process.env,
+    keyOverride,
+    agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+  });
 }
 
 async function apiCall(method, path, body, keyOverride) {
@@ -750,6 +751,7 @@ describe("TC-25.3.8: README Wiki Attribution section", () => {
 
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { resolveDefaultKey } from "../lib/default-key.js";
 
 async function knowledgeOkfExport({ project_id, out_dir }) {
   const basePath = project_id
