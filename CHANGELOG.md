@@ -6,6 +6,17 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A claim names its holder, and another session's claim is refused (2026-11-21,
+  US-52.14).** A story claimed with a holder credential records `stories.assigned_holder_id`
+  (shown on the story), and `claim`, `start`, `renew-claim`, `request-review` and `unclaim`
+  answer every other caller, including another session with the same agent key and a key
+  with no holder, `409 held_by_other_holder` with `error.holder_id`, `holder_kind` and
+  `holder_host`. The holder claiming again gets `200` with the claim unchanged (no new epoch
+  or audit row). Channel claims record `claimant_holder_id`: a peer session of the same agent
+  now gets `409 already_claimed` where it used to get `200 already_held`, and `404` on
+  `done`/`release` whatever `session_id` it sends. Claims made before this release, or by a
+  key with no holder, keep the agent-id checks. Migration `20261121030000` adds the two
+  nullable columns; no backfill, no manual step.
 - **Every session is a holder (2026-11-21, US-52.13).** New `POST /api/v1/holders`,
   `POST /api/v1/holders/:id/heartbeat` and `POST /api/v1/holders/:id/end` (MCP tools
   `holder_register`, `holder_heartbeat`, `holder_end`). A session registers with its agent's

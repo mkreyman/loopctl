@@ -178,6 +178,8 @@ defmodule LoopctlWeb.BulkOperationsController do
     audit_opts =
       Keyword.merge(AuditContext.from_conn(conn), CustodyLineage.chg_root_opts(api_key))
 
+    audit_opts = Keyword.put(audit_opts, :holder_id, api_key.holder_id)
+
     case BulkOperations.bulk_claim(tenant_id, story_ids, agent_id, audit_opts) do
       {:ok, results} ->
         respond_with_results(conn, results)

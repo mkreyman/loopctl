@@ -73,6 +73,11 @@ defmodule LoopctlWeb.StoryStatusController do
             ]
 
   # The request-body shape of `claim_epoch`, shared by start, report and renew-claim.
+  # US-52.14: the 409 every claimant verb answers on a story another session holds.
+  @held_by_other_holder "`held_by_other_holder` (another session holds the story, even one " <>
+                          "with the caller's agent; `error.holder_id`, `holder_kind` and " <>
+                          "`holder_host` name it)"
+
   @claim_epoch_schema %OpenApiSpex.Schema{
     type: :integer,
     minimum: 0,
@@ -146,8 +151,12 @@ defmodule LoopctlWeb.StoryStatusController do
            "stage is `escalated`, `done` or `failed`, so it is not available to agents. An " <>
            "escalated story is claimable again only once a human resolves it to `queued` " <>
            "(POST /stories/:id/stage/resolve); a done or failed one never is. Or " <>
-           "`chg_root_review_only` (" <> Messages.chg_root_review_only() <> ")",
-         "application/json", Schemas.ErrorResponse},
+           "`chg_root_review_only` (" <>
+           Messages.chg_root_review_only() <>
+           "), or " <>
+           @held_by_other_holder <>
+           ". The session holding it claiming again gets 200 " <>
+           "with the claim unchanged.", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
         {"The claim's capability could not be minted; nothing was claimed. Retryable only " <>
@@ -192,7 +201,8 @@ defmodule LoopctlWeb.StoryStatusController do
       400 =>
         {"claim_epoch is not a non-negative integer", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition, or stale_claim_epoch", "application/json", Schemas.ErrorResponse},
+        {"Invalid transition, stale_claim_epoch, or " <> @held_by_other_holder,
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
         {"The tenant's audit signing key is unavailable, so the capability could not be " <>
@@ -213,7 +223,9 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Review requested", "application/json", Schemas.StoryStatusResponse},
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Story not in implementing status", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Story not in implementing status, or " <> @held_by_other_holder, "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -318,7 +330,9 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Invalid transition, or " <> @held_by_other_holder, "application/json",
+         Schemas.ErrorResponse},
       422 =>
         {"The release's story-row write or its audit entry was rejected. Nothing was " <>
            "released and the story is unchanged.", "application/json", Schemas.ErrorResponse},
@@ -365,8 +379,8 @@ defmodule LoopctlWeb.StoryStatusController do
       400 => {"claim_epoch missing or malformed", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"stale_claim_epoch, not_claimant or lease_cap_reached", "application/json",
-         Schemas.ErrorResponse},
+        {"stale_claim_epoch, not_claimant, lease_cap_reached, or " <> @held_by_other_holder,
+         "application/json", Schemas.ErrorResponse},
       422 => {"not_claimed", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -427,7 +441,7 @@ defmodule LoopctlWeb.StoryStatusController do
 
     opts =
       AuditContext.from_conn(conn)
-      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.merge(agent_id: api_key.agent_id, holder_id: api_key.holder_id)
       |> Keyword.merge(custody_identity(api_key))
       |> Keyword.merge(CustodyLineage.chg_root_opts(api_key))
 
@@ -480,7 +494,7 @@ defmodule LoopctlWeb.StoryStatusController do
 
     opts =
       AuditContext.from_conn(conn)
-      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.merge(agent_id: api_key.agent_id, holder_id: api_key.holder_id)
       |> Keyword.merge(custody_identity(api_key))
       |> Keyword.put(:cap_id, capability_param(params))
 
@@ -507,6 +521,9 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, reason} when is_forwarded_start_error(reason) ->
         {:error, reason}
 
+      {:error, {:held_by_other_holder, _holder_id}} = error ->
+        error
+
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}
 
@@ -527,7 +544,12 @@ defmodule LoopctlWeb.StoryStatusController do
   def request_review(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
+
+    opts =
+      Keyword.merge(AuditContext.from_conn(conn),
+        agent_id: api_key.agent_id,
+        holder_id: api_key.holder_id
+      )
 
     case Progress.request_review(tenant_id, story_id, opts) do
       {:ok, story} ->
@@ -536,6 +558,9 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
+
+      {:error, {:held_by_other_holder, _holder_id}} = error ->
+        error
 
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}
@@ -652,6 +677,7 @@ defmodule LoopctlWeb.StoryStatusController do
     opts =
       Keyword.merge(AuditContext.from_conn(conn),
         agent_id: api_key.agent_id,
+        holder_id: api_key.holder_id,
         actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
       )
 
@@ -665,6 +691,9 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_assigned_to_you} ->
         {:error, :forbidden}
+
+      {:error, {:held_by_other_holder, _holder_id}} = error ->
+        error
 
       {:error, :invalid_transition} ->
         {:error, :conflict}
@@ -694,7 +723,7 @@ defmodule LoopctlWeb.StoryStatusController do
 
     opts =
       AuditContext.from_conn(conn)
-      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.merge(agent_id: api_key.agent_id, holder_id: api_key.holder_id)
 
     with {:ok, epoch} when is_integer(epoch) <- claim_epoch_param(params, :required),
          {:ok, story} <-

@@ -257,6 +257,37 @@ defmodule Loopctl.Progress.ClaimLockTest do
     assert won.claim_epoch == 1
   end
 
+  # US-52.14 (AC-52.14.5): two SESSIONS of one agent. The loser re-reads the winner's row
+  # under the lock and is told which holder won, not `invalid_transition`.
+  test "concurrent claim by two holders of one agent: one wins, the other names the winner" do
+    %{tenant: tenant, story: story, agent_a: agent} = contracted_story_with_two_agents()
+
+    [h1, h2] =
+      for session <- ["s1", "s2"] do
+        attrs = %{"kind" => "interactive", "session_id" => session, "host" => "minis"}
+        {:ok, %{holder: holder}} = Loopctl.Holders.register(tenant.id, agent.id, attrs)
+        holder.id
+      end
+
+    tasks =
+      for holder_id <- [h1, h2] do
+        Task.async(fn ->
+          :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
+          Progress.claim_story(tenant.id, story.id, agent_id: agent.id, holder_id: holder_id)
+        end)
+      end
+
+    results = Enum.map(tasks, &Task.await(&1, 5_000))
+
+    assert [{:ok, won}] = Enum.filter(results, &match?({:ok, _}, &1))
+
+    assert [{:error, {:held_by_other_holder, winner}}] =
+             Enum.reject(results, &match?({:ok, _}, &1))
+
+    assert winner == won.assigned_holder_id
+    assert AdminRepo.get!(Story, story.id).assigned_holder_id == winner
+  end
+
   test "a halt committing while a reclaim runs wins: the reclaim waits on the tenant row and refuses" do
     %{tenant: tenant, story: story, agent_a: agent_a} = contracted_story_with_two_agents()
     {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent_a.id)

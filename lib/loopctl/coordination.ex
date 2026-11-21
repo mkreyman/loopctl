@@ -1669,6 +1669,8 @@ defmodule Loopctl.Coordination do
         tenant_id: tenant_id,
         project_id: project_id,
         claimant_agent_id: agent_id,
+        # US-52.14: the verified key's holder, set by the controller, never a param.
+        claimant_holder_id: Keyword.get(opts, :holder_id),
         claimed_at: now,
         lease_expires_at: DateTime.add(now, lease_seconds, :second)
       }
@@ -1735,7 +1737,8 @@ defmodule Loopctl.Coordination do
     now = DateTime.utc_now()
 
     with {:ok, opts} <- validate_caller_session(tenant_id, project_id, agent_id, opts),
-         %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+         %ChannelClaim{} = owned <-
+           fetch_owned_claim(tenant_id, agent_id, project_id, ref, Keyword.get(opts, :holder_id)) do
       finish_done(tenant_id, project_id, agent_id, owned, now, audit, opts)
     else
       nil -> {:error, :not_found}
@@ -1811,7 +1814,8 @@ defmodule Loopctl.Coordination do
     {audit, opts} = split_claim_opts(audit, opts)
 
     with {:ok, opts} <- validate_caller_session(tenant_id, project_id, agent_id, opts),
-         %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+         %ChannelClaim{} = owned <-
+           fetch_owned_claim(tenant_id, agent_id, project_id, ref, Keyword.get(opts, :holder_id)) do
       finish_release(tenant_id, project_id, agent_id, owned, audit, opts)
     else
       nil -> {:error, :not_found}
@@ -2293,7 +2297,16 @@ defmodule Loopctl.Coordination do
   # WELL-FORMED (`valid_ref?/1`) before it is compared against a stored `text` value —
   # a NUL byte reaching this query raises 22021 (a 500) on `done`/`release`, and no
   # changeset runs on those paths to catch it first.
-  defp fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+  #
+  # US-52.14: a claim a holder made is the owner's only when the caller IS that holder, so a
+  # peer session of the same agent gets the same `nil`; a claim with no holder stays
+  # agent-scoped. The holder comes from the verified key, never from `claimed_by_session`.
+  defp claim_holder_predicate(nil), do: dynamic([c], is_nil(c.claimant_holder_id))
+
+  defp claim_holder_predicate(holder_id),
+    do: dynamic([c], is_nil(c.claimant_holder_id) or c.claimant_holder_id == ^holder_id)
+
+  defp fetch_owned_claim(tenant_id, agent_id, project_id, ref, holder_id) do
     if valid_uuid?(tenant_id) and valid_uuid?(agent_id) and valid_uuid?(project_id) and
          valid_ref?(ref) do
       ChannelClaim
@@ -2302,6 +2315,7 @@ defmodule Loopctl.Coordination do
         c.tenant_id == ^tenant_id and c.project_id == ^project_id and
           c.claimant_agent_id == ^agent_id and c.ref == ^ref
       )
+      |> where(^claim_holder_predicate(holder_id))
       |> AdminRepo.one()
     else
       nil
@@ -2335,7 +2349,14 @@ defmodule Loopctl.Coordination do
       {:error, :claim, %Ecto.Changeset{} = changeset, _changes} ->
         if already_claimed?(changeset) do
           ref = Ecto.Changeset.get_field(changeset, :ref)
-          resolve_claim_collision(tenant_id, project_id, agent_id, ref)
+
+          resolve_claim_collision(
+            tenant_id,
+            project_id,
+            agent_id,
+            ref,
+            Ecto.Changeset.get_field(changeset, :claimant_holder_id)
+          )
         else
           {:error, changeset}
         end
@@ -2386,12 +2407,20 @@ defmodule Loopctl.Coordination do
   # this read runs AFTER the failed insert only to CLASSIFY the loser, never to decide
   # whether to insert. A rare concurrent release between the insert and this read
   # yields a nil lookup -> a safe 409 (the caller retries), never a dropped handoff.
-  defp resolve_claim_collision(tenant_id, project_id, agent_id, ref) do
+  #
+  # US-52.14: "held by this caller" now also means the same holder (or both have none). A
+  # different holder of the same agent falls to the peer branch below, so a peer session is
+  # told `already_claimed` instead of being handed the claim as its own.
+  defp resolve_claim_collision(tenant_id, project_id, agent_id, ref, holder_id) do
     now = DateTime.utc_now()
 
     case fetch_claim_by_ref(tenant_id, project_id, ref) do
-      %ChannelClaim{claimant_agent_id: ^agent_id, done_at: nil, lease_expires_at: lease} =
-          existing ->
+      %ChannelClaim{
+        claimant_agent_id: ^agent_id,
+        claimant_holder_id: ^holder_id,
+        done_at: nil,
+        lease_expires_at: lease
+      } = existing ->
         if DateTime.compare(lease, now) == :gt do
           # NOT a bare {:ok, _}: this branch is ALSO what a peer session's live claim
           # comes back as when the fleet shares one agent_id, so the caller must be

@@ -89,8 +89,11 @@ defmodule Loopctl.Repo.Migrations.CreateHolders do
     END $$;
     """)
 
+    # NO ACTION, not RESTRICT: a tenant delete cascades to BOTH tables in one statement, and
+    # RESTRICT is checked the moment a holder row goes, before its keys may have; NO ACTION is
+    # checked at the end of the statement. A holder is never deleted on its own (it is ENDED).
     alter table(:api_keys) do
-      add :holder_id, references(:holders, type: :binary_id, on_delete: :restrict)
+      add :holder_id, references(:holders, type: :binary_id, on_delete: :nothing)
     end
 
     drop index(:api_keys, [:tenant_id, :agent_id, :role], name: :api_keys_one_role_per_agent_idx)

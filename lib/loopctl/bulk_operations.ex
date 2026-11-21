@@ -77,7 +77,7 @@ defmodule Loopctl.BulkOperations do
         process_claims(
           sorted_ids,
           locked_stories,
-          %{held: held, blocked: blocked},
+          %{held: held, blocked: blocked, holder_id: Keyword.get(opts, :holder_id)},
           agent_id,
           tenant_id,
           actor_id,
@@ -415,7 +415,7 @@ defmodule Loopctl.BulkOperations do
 
   defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
     with :ok <- validate_claim_preconditions(story, batch_reads),
-         {:ok, updated} <- apply_claim(story, agent_id) do
+         {:ok, updated} <- apply_claim(story, agent_id, batch_reads.holder_id) do
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
       %{story_id: story.id, status: "success"}
@@ -586,7 +586,7 @@ defmodule Loopctl.BulkOperations do
   # Private: Apply Operations
   # ===================================================================
 
-  defp apply_claim(story, agent_id) do
+  defp apply_claim(story, agent_id, holder_id) do
     now = DateTime.utc_now()
 
     # The same lease and epoch Progress.claim_story/3 writes (#803), so a bulk claim is
@@ -594,7 +594,12 @@ defmodule Loopctl.BulkOperations do
     story
     |> Ecto.Changeset.change(
       Map.merge(
-        %{agent_status: :assigned, assigned_agent_id: agent_id, assigned_at: now},
+        %{
+          agent_status: :assigned,
+          assigned_agent_id: agent_id,
+          assigned_holder_id: holder_id,
+          assigned_at: now
+        },
         Progress.claim_lease_change(story, now)
       )
     )

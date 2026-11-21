@@ -197,6 +197,21 @@ defmodule Loopctl.HoldersTest do
     end
   end
 
+  describe "tenant delete" do
+    test "takes the tenant's holders and their credentials with it", %{
+      tenant: tenant,
+      agent: agent
+    } do
+      {:ok, reg} = Holders.register(tenant.id, agent.id, attrs("s1"))
+
+      assert {1, _} =
+               AdminRepo.delete_all(from(t in Loopctl.Tenants.Tenant, where: t.id == ^tenant.id))
+
+      refute AdminRepo.get(Holder, reg.holder.id)
+      refute AdminRepo.get(ApiKey, reg.api_key.id)
+    end
+  end
+
   describe "tenant isolation" do
     test "tenant B cannot read or act on tenant A's holder", %{tenant: tenant, agent: agent} do
       {:ok, reg} = Holders.register(tenant.id, agent.id, attrs("s1"))

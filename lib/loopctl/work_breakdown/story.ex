@@ -56,6 +56,7 @@ defmodule Loopctl.WorkBreakdown.Story do
              :intake_record_id,
              :claimed_until,
              :claim_epoch,
+             :assigned_holder_id,
              :claim_lease_cap,
              :review_requested_at,
              :inserted_at,
@@ -129,6 +130,11 @@ defmodule Loopctl.WorkBreakdown.Story do
     # could re-arm a zombie, and one that could set the lease could pin a claim forever.
     field :claimed_until, :utc_datetime_usec
     field :claim_epoch, :integer, default: 0
+    # US-52.14: the session (`Loopctl.Holders.Holder`) holding the claim, from the claiming
+    # key's `holder_id`. Same rule: only `Progress`/`BulkOperations` write it, never a cast,
+    # and every release clears it (`Progress.claim_release_change/1`). NULL on a claim made
+    # without a holder, which keeps the agent-id checks.
+    field :assigned_holder_id, :binary_id
     # #879 (US-44.5): the latest instant `claimed_until` may ever reach, for a claim taken
     # FOR A RUNNER DISPATCH (`Progress.claim_story/3`'s `lease_until:`, passed only by
     # `Loopctl.Delivery.Placement`) — and the dispatch's `deadline_at`, which the runner stops
