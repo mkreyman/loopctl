@@ -6,7 +6,7 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
-- **A release no longer cuts off sessions one MCP version behind (2026-11-21).** The
+- **A release no longer cuts off sessions one MCP version behind (2026-11-21, set 8).** The
   MCP component's minimum is back to 3.19.1, the first version that reports itself, so a
   session started on 3.19.1 to 3.21.0 is served again instead of `426
   incompatible_client_version`. `mix loopctl.release_set --bump` now keeps every minimum;

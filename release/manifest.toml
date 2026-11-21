@@ -3,7 +3,7 @@
 # file; `mix loopctl.release_set --check` fails when one differs, and `--bump` moves the set.
 # Written by `mix loopctl.release_set --bump`; edit by hand only to change a minimum.
 
-set = 7
+set = 8
 
 [components.server]
 version = "1.0.0"
