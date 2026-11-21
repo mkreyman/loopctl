@@ -73,7 +73,7 @@ If yes, the change is wrong.
 Enforced in `lib/loopctl/progress.ex`. The three gates are NOT one implementation, but ALL THREE now
 compare dispatch lineage and all three fail closed on a story with no custody provenance. The
 caller's lineage is always resolved SERVER-SIDE from the authenticating key
-(`Dispatches.lineage_for_api_key/2`, `dispatches.ex:852-859`) — never read from the request body.
+(`Dispatches.lineage_for_api_key/2`, `dispatches.ex:880-887`) — never read from the request body.
 
 - **verify** — `validate_not_self_verify/4`. `nil` orchestrator identity is untrusted; a custody-orphaned story fails closed with
   `:missing_assigned_agent` ("nil is never permissive"); then the CALLER's lineage vs the
@@ -98,8 +98,11 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   (`verify_recorded_separation/2`) when BOTH `implementer_dispatch_id` and
   `verifier_dispatch_id` are set, decided by `verify_lineage_separated/4`.
   An EMPTY lineage on either side (what an unloadable dispatch yields,
-  `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
-  equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
+  `get_dispatch_lineage/2`) fails **CLOSED**, and an identity check runs IN ADDITION to the
+  lineage comparison rather than being short-circuited by it (`verify_identity_separated/2`):
+  when the story's `assigned_holder_id` and the verifier dispatch's holder are both present, the
+  HOLDERS are compared (same holder blocks; different holders pass under one shared agent,
+  US-52.15), and otherwise the `assigned_agent_id` equality refusal applies.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
   `progress.ex:755-802`); that write is result-checked, and a failure flags `verifier_needed` plus a
   `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:1108`) instead of

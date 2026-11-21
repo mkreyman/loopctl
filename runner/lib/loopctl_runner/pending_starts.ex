@@ -16,12 +16,45 @@ defmodule LoopctlRunner.PendingStarts do
   @spec dir(String.t()) :: String.t()
   def dir(runs_dir), do: Path.join(runs_dir, ".pending")
 
-  @doc "Records `dispatch` as pending, atomically (write-then-rename)."
-  @spec write(String.t(), map()) :: :ok | {:error, term()}
-  def write(runs_dir, %{"dispatch_id" => id} = dispatch) do
+  # The session id the accept named (contract 1.35.0, US-52.15), kept in the file beside the
+  # dispatch and never inside it: a pending dispatch is re-validated against `RunnerDispatch`
+  # on restore, and a key that schema does not declare would fail it.
+  @session_key "__runner_session_id"
+
+  @doc """
+  Records `dispatch` as pending, atomically (write-then-rename), with the `session_id` its
+  accept named. `:keep` (the default) keeps the one already on disk, for a rewrite that only
+  moves the dispatch's deadline.
+  """
+  @spec write(String.t(), map(), String.t() | :keep) :: :ok | {:error, term()}
+  def write(runs_dir, %{"dispatch_id" => id} = dispatch, session_id \\ :keep) do
     with {:ok, path} <- path(runs_dir, id),
          :ok <- File.mkdir_p(dir(runs_dir)) do
-      AtomicFile.write(path, JSON.encode!(dispatch))
+      session_id = if session_id == :keep, do: session_on_disk(path), else: session_id
+      AtomicFile.write(path, JSON.encode!(put_session(dispatch, session_id)))
+    end
+  end
+
+  @doc "Every pending dispatch on disk, each with the session id its accept named, or `nil`."
+  @spec all_with_sessions(String.t()) :: [{map(), String.t() | nil}]
+  def all_with_sessions(runs_dir) do
+    for file <- read_all(runs_dir) do
+      {session_id, dispatch} = Map.pop(file, @session_key)
+      {dispatch, session_id}
+    end
+  end
+
+  defp put_session(dispatch, session_id) when is_binary(session_id),
+    do: Map.put(dispatch, @session_key, session_id)
+
+  defp put_session(dispatch, _none), do: dispatch
+
+  defp session_on_disk(path) do
+    with {:ok, raw} <- File.read(path),
+         {:ok, %{@session_key => session_id}} when is_binary(session_id) <- JSON.decode(raw) do
+      session_id
+    else
+      _ -> nil
     end
   end
 
@@ -35,6 +68,10 @@ defmodule LoopctlRunner.PendingStarts do
   @doc "Every pending dispatch on disk. A file that does not decode is logged and skipped."
   @spec all(String.t()) :: [map()]
   def all(runs_dir) do
+    runs_dir |> read_all() |> Enum.map(&Map.delete(&1, @session_key))
+  end
+
+  defp read_all(runs_dir) do
     runs_dir
     |> dir()
     |> Path.join("*.json")

@@ -50,6 +50,34 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
     AdminRepo.get!(Dispatch, dispatch_id)
   end
 
+  describe "perform/1 — a runner session's holder (US-52.15)" do
+    test "an expired session dispatch's live holder lapses; a live dispatch's holder stays" do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+      lease = DateTime.add(DateTime.utc_now(), 600, :second)
+      session = %{host: "x1", lease_until: lease}
+
+      {:ok, %{dispatch: expired, holder: lapsing}} =
+        Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: agent.id},
+          runner_session: session
+        )
+
+      {:ok, %{dispatch: _live, holder: staying}} =
+        Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: agent.id},
+          runner_session: session
+        )
+
+      force(expired.id, expires_at: DateTime.add(DateTime.utc_now(), -120, :second))
+
+      assert :ok = RevokeExpiredDispatchesWorker.perform(%Oban.Job{args: %{}})
+
+      assert %{ended_reason: :lapsed, ended_at: %DateTime{}} =
+               AdminRepo.get!(Loopctl.Holders.Holder, lapsing.id)
+
+      assert %{ended_at: nil} = AdminRepo.get!(Loopctl.Holders.Holder, staying.id)
+    end
+  end
+
   describe "perform/1 — revoke sweep" do
     test "revokes expired non-revoked dispatches and cascades to their api_keys, leaving active ones untouched" do
       # Two tenants — the sweep is cross-tenant by design, so it must revoke based

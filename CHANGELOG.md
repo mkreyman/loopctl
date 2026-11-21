@@ -6,6 +6,22 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A runner session is a holder, and verify separates holders (2026-11-21, US-52.15).** A
+  placement now mints its session dispatch together with a `runner_session` holder (host =
+  the runner's name), and the claim names it (`assigned_holder_id`). The holder ends when the
+  runner reports `session_ended`, when the placement is undone or its dispatch revoked, and
+  lapses when the dispatch expires. Runner contract 1.35.0: an `accepted` dispatch reply may
+  carry `session_id` (at most 200 bytes) and `worktree` (at most 1024 bytes), written onto the
+  holder; a refusal carrying either is `invalid_payload`, and a 1.34.0 accept is recorded as
+  before. loopctl-runner sends both and launches `claude` with that `--session-id`. Verify
+  compares HOLDERS, not agents, when the story and the verifier dispatch both have one: the
+  same holder is `409 self_verify_blocked`, different holders pass under one shared agent;
+  either side without a holder keeps the agent-id check. Migration `20261121040000` adds the
+  nullable `holders.runner_dispatch_id`; no backfill, no manual step. Deploy loopctl before
+  the runners: a runner on 1.35.0 sends fields a 1.34.0 server refuses. Each session's key now
+  carries its holder, which puts it outside the agent's one-key-per-role slot: a runner takes
+  as many concurrent placements as its `max_sessions`, where before the second placement for
+  the same agent was refused `agent already has an active key with this role`.
 - **A claim names its holder, and another session's claim is refused (2026-11-21,
   US-52.14).** A story claimed with a holder credential records `stories.assigned_holder_id`
   (shown on the story), and `claim`, `start`, `renew-claim`, `request-review` and `unclaim`

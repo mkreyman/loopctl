@@ -571,7 +571,7 @@
       "type": "object"
     },
     "RunnerDispatchReply": {
-      "description": "The runner's answer to one `dispatch`, pushed as the `dispatch_reply` event. `reason` is REQUIRED when `decision` is `refused` and forbidden when it is `accepted`; `detail` is required when `reason` is `other` and allowed only on a refusal. The server applies the first reply, answers an identical repeat `ok`, and refuses a different one with `already_replied`.",
+      "description": "The runner's answer to one `dispatch`, pushed as the `dispatch_reply` event. `reason` is REQUIRED when `decision` is `refused` and forbidden when it is `accepted`; `detail` is required when `reason` is `other` and allowed only on a refusal. `session_id` and `worktree` (since 1.35.0) are allowed only on an accept: the id the runner will start the session with and the directory it runs in, recorded on the session's holder. The server applies the first reply, answers an identical repeat `ok`, and refuses a different one with `already_replied`.",
       "properties": {
         "claim_epoch": {
           "description": "The `claim_epoch` of the dispatch being answered, echoed.",
@@ -608,6 +608,18 @@
             "kind_not_supported",
             "other"
           ],
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Since 1.35.0, accept only: the id the runner starts the session with (Claude Code's `--session-id`), at most 200 bytes.",
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        "worktree": {
+          "description": "Since 1.35.0, accept only: the directory the session runs in, at most 1024 bytes. Optional: a scratch kind may name none.",
+          "maxLength": 1024,
+          "minLength": 1,
           "type": "string"
         }
       },
@@ -3297,5 +3309,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.34.0"
+  "x-contract-version": "1.35.0"
 }

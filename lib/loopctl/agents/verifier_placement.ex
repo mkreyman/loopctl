@@ -259,7 +259,18 @@ defmodule Loopctl.Agents.VerifierPlacement do
       expires_in_seconds: expiry(ctx.budgets.wall_clock_seconds)
     }
 
-    case Dispatches.create_dispatch(tenant_id, attrs, actor_lineage: ctx.caller.lineage) do
+    # The verify session is a holder on its runner (US-52.15), which is what lets verify
+    # separate it from the implementer's session when both run under one agent.
+    runner_session = %{
+      host: runner.name,
+      lease_until:
+        DateTime.add(DateTime.utc_now(), expiry(ctx.budgets.wall_clock_seconds), :second)
+    }
+
+    case Dispatches.create_dispatch(tenant_id, attrs,
+           actor_lineage: ctx.caller.lineage,
+           runner_session: runner_session
+         ) do
       # The raw key is dropped here, deliberately: nothing outside loopctl ever holds B's key.
       {:ok, %{dispatch: dispatch}} -> {:ok, dispatch}
       {:error, reason} -> {:error, reason}

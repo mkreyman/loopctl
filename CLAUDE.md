@@ -169,9 +169,14 @@ in order:
    when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set, decided by
    `verify_lineage_separated/4`: an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:952-956`) blocks, and the
-   `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
-   short-circuited by it.
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:980-984`) blocks, and an
+   IDENTITY check is evaluated IN ADDITION to the lineage comparison, never short-circuited by
+   it (`verify_identity_separated/2`). Every fleet session shares one agent, so when the story
+   names its implementing holder (`assigned_holder_id`) AND the verifier dispatch has a holder
+   (`Holders.holder_for_dispatch/2`, read server-side from the dispatch row), the HOLDERS are
+   compared: the same holder is `self_verify_blocked`, and different holders pass even under
+   one agent (US-52.15). Either side without a holder keeps the `assigned_agent_id` equality
+   refusal.
 5. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories and for every
    story that lacks a verifier dispatch.
 
@@ -643,7 +648,7 @@ no schema here sets `additionalProperties: false`. **846.6**, `PATCH /api/v1/sto
 (`router.ex:477`) had been served for months with no tool, so a session could file a story and
 not correct it. **846.7**, a tool that merged, went green and deployed and was still uncallable,
 because it ships as an npm package and MCP binds its tool list at session start. And **PR #862**,
-`Dispatches.revoke/3` (`dispatches.ex:617`) — then a context function with no route at all, so
+`Dispatches.revoke/3` (`dispatches.ex:640`) — then a context function with no route at all, so
 the one call that unsticks a parked dispatch key was reachable only from `iex`. #862 gave it
 both, which is why this entry reads in the past tense while the four above it do not.
 

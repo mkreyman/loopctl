@@ -19,6 +19,7 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.HeavyRead
+  alias Loopctl.Holders
   alias Loopctl.Intake.Source
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants
@@ -58,7 +59,8 @@ defmodule Loopctl.Dispatches do
   `{:ok, %{dispatch: Dispatch.t(), raw_key: String.t()}}` or `{:error, reason}`
   """
   @spec create_dispatch(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, %{dispatch: Dispatch.t(), raw_key: String.t()}} | {:error, term()}
+          {:ok, %{dispatch: Dispatch.t(), raw_key: String.t(), holder: Holders.Holder.t() | nil}}
+          | {:error, term()}
   def create_dispatch(tenant_id, attrs, opts \\ []) do
     parsed = parse_dispatch_attrs(attrs)
     # The parent rule is this function's own and never an input: only
@@ -142,7 +144,8 @@ defmodule Loopctl.Dispatches do
   `opts`: `:actor_lineage` for the audit entry.
   """
   @spec mint_chg_reviewer(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, %{dispatch: Dispatch.t(), raw_key: String.t()}} | {:error, term()}
+          {:ok, %{dispatch: Dispatch.t(), raw_key: String.t(), holder: Holders.Holder.t() | nil}}
+          | {:error, term()}
   def mint_chg_reviewer(tenant_id, root_id, agent_id, opts \\ [])
       when is_binary(tenant_id) and is_binary(root_id) and is_binary(agent_id) do
     parsed =
@@ -345,8 +348,29 @@ defmodule Loopctl.Dispatches do
         })
         |> AdminRepo.insert()
       end)
-      |> Multi.run(:mint_key, fn _repo, %{create_dispatch: dispatch} ->
-        mint_and_link_key(tenant_id, dispatch, agent_id, expires_at)
+      # US-52.15: a runner placement's session is a holder, created here so the key below is
+      # born carrying its `holder_id` and a mint that fails leaves no holder row. Only a
+      # SERVER caller can ask for one: `:runner_session` is an option, never an attribute, so
+      # no request params map can bind a key to a holder.
+      |> Multi.run(:holder, fn _repo, %{create_dispatch: dispatch} ->
+        case Keyword.get(opts, :runner_session) do
+          nil ->
+            {:ok, nil}
+
+          %{host: host, lease_until: lease_until} = session ->
+            Holders.insert_runner_session(tenant_id, %{
+              agent_id: agent_id,
+              dispatch_id: dispatch.id,
+              # The id the runner's messages name: a verify placement pushes the row's own
+              # id, an implement placement the id its caller gave the dispatch.
+              runner_dispatch_id: Map.get(session, :runner_dispatch_id, dispatch.id),
+              host: host,
+              lease_until: lease_until
+            })
+        end
+      end)
+      |> Multi.run(:mint_key, fn _repo, %{create_dispatch: dispatch, holder: holder} ->
+        mint_and_link_key(tenant_id, dispatch, agent_id, expires_at, holder && holder.id)
       end)
       |> Multi.run(:audit, fn _repo, %{mint_key: %{dispatch: dispatch}} ->
         actor_lineage = Keyword.get(opts, :actor_lineage, [])
@@ -395,8 +419,8 @@ defmodule Loopctl.Dispatches do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{mint_key: %{raw_key: raw_key, dispatch: dispatch}}} ->
-        {:ok, %{dispatch: dispatch, raw_key: raw_key}}
+      {:ok, %{mint_key: %{raw_key: raw_key, dispatch: dispatch}, holder: holder}} ->
+        {:ok, %{dispatch: dispatch, raw_key: raw_key, holder: holder}}
 
       {:error, :resolve_lineage, reason, _} ->
         {:error, reason}
@@ -655,6 +679,11 @@ defmodule Loopctl.Dispatches do
         else
           {:ok, []}
         end
+      end)
+      # US-52.15: a revoked session dispatch's holder ends with it, so every undo of a placement
+      # (and every other revoke) leaves no live holder without a session.
+      |> Multi.run(:end_holders, fn _repo, _ ->
+        {:ok, Holders.end_for_dispatches(tenant_id, dispatch_ids, now, :ended)}
       end)
       |> Multi.run(:audit, fn _repo, %{revoke_dispatches: count} ->
         audit_revocation(tenant_id, dispatch_id, count, now, opts)
@@ -1171,7 +1200,7 @@ defmodule Loopctl.Dispatches do
     )
   end
 
-  defp mint_and_link_key(tenant_id, dispatch, agent_id, expires_at) do
+  defp mint_and_link_key(tenant_id, dispatch, agent_id, expires_at, holder_id) do
     key_attrs = %{
       tenant_id: tenant_id,
       name: "dispatch-#{dispatch.id}",
@@ -1180,7 +1209,7 @@ defmodule Loopctl.Dispatches do
       expires_at: expires_at
     }
 
-    with {:ok, {raw_key, api_key}} <- Auth.generate_api_key(key_attrs),
+    with {:ok, {raw_key, api_key}} <- Auth.generate_api_key(key_attrs, holder_id: holder_id),
          {:ok, updated} <-
            dispatch
            |> Dispatch.changeset(%{api_key_id: api_key.id})

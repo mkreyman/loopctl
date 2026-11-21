@@ -51,8 +51,9 @@ defmodule Loopctl.Auth do
     `:http` uses `ApiKey.http_create_changeset/2`, which structurally rejects
     `:superadmin`. The public HTTP controller passes `changeset: :http`.
   - `:holder_id` — the holder (session) this key is the credential of (US-52.13). An OPTION,
-    never an attr, because `holder_id` is never cast: only `Loopctl.Holders` mints a holder's
-    credential, and it names the holder it just created or resolved.
+    never an attr, because `holder_id` is never cast: only `Loopctl.Holders` and
+    `Loopctl.Dispatches.create_dispatch/3` (a runner session's key, US-52.15) mint a holder's
+    credential, and each names the holder it just created or resolved.
   """
   @spec generate_api_key(map(), keyword()) ::
           {:ok, {String.t(), ApiKey.t()}} | {:error, Ecto.Changeset.t()}

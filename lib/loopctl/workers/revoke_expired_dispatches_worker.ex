@@ -15,6 +15,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Holders
   alias Loopctl.Intake.Source
 
   @impl Oban.Worker
@@ -89,6 +90,8 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
       AdminRepo.transaction(fn ->
         d_count =
           Enum.reduce(by_tenant, 0, fn {tenant_id, dispatch_ids}, acc ->
+            # A runner session's holder lapses with its dispatch (US-52.15).
+            _ = Holders.end_for_dispatches(tenant_id, dispatch_ids, now, :lapsed)
             acc + Dispatches.revoke_dispatch_rows(tenant_id, dispatch_ids, now)
           end)
 

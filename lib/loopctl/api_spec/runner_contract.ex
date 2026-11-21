@@ -71,6 +71,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.32.0) CHG SELECTION REPLAY ON A VERIFY VERDICT (Epic 51, US-51.5). `x-connection.agent_result_schemas["verify@1"]` gains an OPTIONAL `selection_replay` object: `corpus` (at most 30 entries of `{sha, base_count, head_count, dropped}`, `dropped` at most 3 test names the base selected and the head did not) and an optional `miss` `{sha, covered}` (at most 50 names of the gate's failed tests the head selects at the finding's commit), every name at most 200 characters. loopctl's merge precondition reads it from the verifier's own recorded verdict to clear a chg selection change only when selection widened; nothing else reads it. Purely additive: a verdict without it is unchanged. RE-VENDOR only for a verify template that runs chg's replay | | | | |
   | (1.33.0) A LOOP ISSUE'S FINDING, AS LOOPCTL RECORDED IT (Epic 51, US-51.7). `RunnerTriage` gains an OPTIONAL `loop_finding` (`finding_id`, `kind`, `fingerprint` at most 512 characters, `occurrences`, `fix_attempts`, and `evidence`: at most 16 `{key, value}` string entries, key at most 64 characters, value at most 200), present when the issue was filed by loopctl's chg feedback loop. It is read from loopctl's own finding record, never from the issue text; `evidence` comes from chg gate runs over repository code and is data, to be fenced. It is omitted when the whole triage object would not fit its byte cap with it, so the record is sent exactly as before. `RunnerTriage` is not `additionalProperties: false`, so every deployed runner accepts it. `RunnerVerify` gains an OPTIONAL `loop_finding` `{sha, failures}` (at most 50 names of at most 200 characters) on a story that fixes a chg `selection_miss`: the commit chg's gate failed at and the tests it failed there, which `selection_replay.miss` must cover. `RunnerVerify` IS `additionalProperties: false`, so loopctl sends this field only to a runner that JOINED declaring 1.33.0 or later and takes it off the dispatch for any other. RE-VENDOR, and declare 1.33.0 on join, to receive a verify `loop_finding` | | | | |
   | (1.34.0) THE RUNNER'S OWN VERSION, JUDGED AGAINST THE RELEASE SET (Epic 52, US-52.8). `RunnerJoin` gains an OPTIONAL `runner_version` (semver): the runner's application version. loopctl compares it with the `runner` component of the release set it was built from (`release/manifest.toml`, US-52.7) and refuses a join below that component's `minimum`, or one sending none while the minimum is a version, with the new PERMANENT reason `incompatible_client_version`, carrying `component`, `sent` and `minimum`; a runner must stop on it rather than rejoin, since only an upgrade changes the answer. A version above the set's is admitted, so runners may roll before or after the server. While the set's runner minimum is `"unreported"`, a join without the field is admitted exactly as before. The join's ok reply gains `release_set`, the set number. `GET /api/v1/runners/pool` shows each connection's `runner_version`. A join property `RunnerJoin` does not declare is still admitted and dropped. RE-VENDOR, and send `runner_version`, before the set's runner minimum becomes a version | | | | |
+  | (1.35.0) A RUNNER SESSION IS A HOLDER (Epic 52, US-52.15). Every placement now makes its session a `runner_session` holder (host = the runner's enrolled name, session id `dispatch:<dispatch_id>` until named), and verify separates holders instead of agents. `RunnerDispatchReply` gains OPTIONAL `session_id` (at most 200 bytes) and `worktree` (at most 1024 bytes), allowed on an accept only and refused on a refusal: the id the runner will start Claude Code with and the directory it runs in. loopctl writes both onto the session's holder. A `session_ended` now also ends that holder (once; a replay changes nothing). Purely additive: an accept without them is recorded as before and the holder keeps its placeholder id. RE-VENDOR, and send both, so a holder names the session's transcript | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -434,7 +435,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.34.0"
+  @version "1.35.0"
 
   # The first version whose runner understands a `merge` push (US-48.17). A runner that joined
   # declaring an older one is never sent one: it would ignore the event, and the story would
@@ -2685,6 +2686,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                         max_turns_exceeds_limit token_budget_exceeds_limit
                         kind_not_supported other)
     @max_detail_length 500
+    # US-52.15 (1.35.0): what an accept says about the session it will start. Bytes, judged in
+    # `cast_dispatch_reply/1`; the schema's maxLength is the same number in characters, which
+    # a byte bound always satisfies.
+    @max_session_id_bytes 200
+    @max_worktree_bytes 1024
+
+    @doc "The longest `session_id` an accept may carry, in bytes."
+    @spec max_session_id_bytes() :: pos_integer()
+    def max_session_id_bytes, do: @max_session_id_bytes
+
+    @doc "The longest `worktree` an accept may carry, in bytes."
+    @spec max_worktree_bytes() :: pos_integer()
+    def max_worktree_bytes, do: @max_worktree_bytes
 
     @doc "Every refusal reason a runner may give."
     @spec refusal_reasons() :: [String.t()]
@@ -2701,8 +2715,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "The runner's answer to one `dispatch`, pushed as the `dispatch_reply` event. " <>
             "`reason` is REQUIRED when `decision` is `refused` and forbidden when it is " <>
             "`accepted`; `detail` is required when `reason` is `other` and allowed only on a " <>
-            "refusal. The server applies the first reply, answers an identical repeat `ok`, " <>
-            "and refuses a different one with `already_replied`.",
+            "refusal. `session_id` and `worktree` (since 1.35.0) are allowed only on an " <>
+            "accept: the id the runner will start the session with and the directory it " <>
+            "runs in, recorded on the session's holder. The server applies the first reply, " <>
+            "answers an identical repeat `ok`, and refuses a different one with " <>
+            "`already_replied`.",
         type: :object,
         required: [:dispatch_id, :claim_epoch, :decision],
         properties: %{
@@ -2714,7 +2731,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           },
           decision: %Schema{type: :string, enum: ["accepted", "refused"]},
           reason: %Schema{type: :string, enum: @refusal_reasons},
-          detail: %Schema{type: :string, minLength: 1, maxLength: @max_detail_length}
+          detail: %Schema{type: :string, minLength: 1, maxLength: @max_detail_length},
+          session_id: %Schema{
+            type: :string,
+            minLength: 1,
+            maxLength: @max_session_id_bytes,
+            description:
+              "Since 1.35.0, accept only: the id the runner starts the session with " <>
+                "(Claude Code's `--session-id`), at most #{@max_session_id_bytes} bytes."
+          },
+          worktree: %Schema{
+            type: :string,
+            minLength: 1,
+            maxLength: @max_worktree_bytes,
+            description:
+              "Since 1.35.0, accept only: the directory the session runs in, at most " <>
+                "#{@max_worktree_bytes} bytes. Optional: a scratch kind may name none."
+          }
         }
       },
       struct?: false
@@ -4248,17 +4281,41 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   end
 
   defp reply_shape_errors(%{decision: "accepted"} = reply) do
-    for key <- [:reason, :detail],
-        Map.has_key?(reply, key),
-        do: "#{key} is only allowed when decision is refused"
+    refusal_only =
+      for key <- [:reason, :detail],
+          Map.has_key?(reply, key),
+          do: "#{key} is only allowed when decision is refused"
+
+    refusal_only ++
+      byte_cap_errors(reply, :session_id, RunnerDispatchReply.max_session_id_bytes()) ++
+      byte_cap_errors(reply, :worktree, RunnerDispatchReply.max_worktree_bytes())
   end
 
-  defp reply_shape_errors(%{decision: "refused", reason: "other"} = reply) do
+  defp reply_shape_errors(%{decision: "refused"} = reply) do
+    accept_only =
+      for key <- [:session_id, :worktree],
+          Map.has_key?(reply, key),
+          do: "#{key} is only allowed when decision is accepted"
+
+    accept_only ++ refusal_shape_errors(reply)
+  end
+
+  defp refusal_shape_errors(%{reason: "other"} = reply) do
     if Map.has_key?(reply, :detail), do: [], else: ["detail is required when reason is other"]
   end
 
-  defp reply_shape_errors(%{decision: "refused", reason: _}), do: []
-  defp reply_shape_errors(%{decision: "refused"}), do: ["reason is required when refused"]
+  defp refusal_shape_errors(%{reason: _}), do: []
+  defp refusal_shape_errors(_reply), do: ["reason is required when refused"]
+
+  defp byte_cap_errors(reply, key, max) do
+    case Map.get(reply, key) do
+      value when is_binary(value) and byte_size(value) > max ->
+        ["#{key} is at most #{max} bytes"]
+
+      _ ->
+        []
+    end
+  end
 
   @doc """
   Validates a `trace` batch. Returns the declared fields only, with atom keys, or

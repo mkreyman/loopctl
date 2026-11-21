@@ -29,6 +29,8 @@ defmodule Loopctl.Holders.Holder do
     field :host, :string
     field :worktree, :string
     field :dispatch_id, :binary_id
+    # The wire dispatch id a runner session's accept and session_ended name (US-52.15).
+    field :runner_dispatch_id, :binary_id
     field :last_seen_at, :utc_datetime_usec
     field :lease_until, :utc_datetime_usec
     field :ended_at, :utc_datetime_usec

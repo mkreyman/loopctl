@@ -318,7 +318,7 @@ defmodule LoopctlRunner.Session do
     trace = Keyword.fetch!(opts, :trace)
     run_dir = Keyword.fetch!(opts, :run_dir)
     worktree = Keyword.fetch!(opts, :worktree)
-    session_id = Keyword.get_lazy(opts, :session_id, &uuid4/0)
+    session_id = Keyword.get(opts, :session_id) || uuid4()
     # Built, and checked, BEFORE anything is written outside the run directory: `checked/2`
     # raises here, and a grant armed ahead of it would leak on every refused argv.
     checked_argv = argv(story, session_id, opts)

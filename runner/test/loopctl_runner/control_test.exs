@@ -1411,13 +1411,23 @@ defmodule LoopctlRunner.ControlTest do
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
-      assert reply == %{"dispatch_id" => id, "claim_epoch" => 3, "decision" => "accepted"}
 
       worktree =
         LoopctlRunner.Worktree.path_for(
           Path.join(ctx.root, "repo"),
           DispatchRun.story_id(dispatch["story_id"])
         )
+
+      # Contract 1.35.0 (US-52.15): the accept names the session it will start and its tree.
+      assert %{
+               "dispatch_id" => ^id,
+               "claim_epoch" => 3,
+               "decision" => "accepted",
+               "session_id" => session_id,
+               "worktree" => ^worktree
+             } = reply
+
+      assert LoopctlRunner.Uuid.valid?(session_id)
 
       assert next_stage() == %{
                "dispatch_id" => id,
@@ -1451,6 +1461,10 @@ defmodule LoopctlRunner.ControlTest do
 
       assert argv =~
                "<<<UNTRUSTED story.title>>>\nAdd a greeting\n<<<END UNTRUSTED story.title>>>"
+
+      # TC-52.15.5: the session was launched with the id its accept named.
+      assert argv =~ "--session-id\n#{session_id}\n"
+      assert state["session_id"] == session_id
 
       runs_done(pid)
       refute_receive {:test_loopctl, {:stage, _}}, 300
@@ -3405,17 +3419,22 @@ defmodule LoopctlRunner.ControlTest do
     test "a fresh Control resends a pending accept and starts the run on ok", ctx do
       test = self()
       dispatch = story_dispatch()
-      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+      session_id = LoopctlRunner.Session.uuid4()
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch, session_id)
 
       {pid, _topic} = accepting_control(ctx, "stream", %{}, run: counting_run(test))
 
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
 
-      assert reply == %{
-               "dispatch_id" => dispatch["dispatch_id"],
+      # The resent accept names the session the first one did (US-52.15).
+      assert %{
+               "dispatch_id" => dispatch_id,
                "claim_epoch" => 3,
-               "decision" => "accepted"
-             }
+               "decision" => "accepted",
+               "session_id" => ^session_id
+             } = reply
+
+      assert dispatch_id == dispatch["dispatch_id"]
 
       assert_receive {:run_started, story_id}, 5_000
       assert story_id == DispatchRun.story_id(dispatch["story_id"])
@@ -3926,8 +3945,10 @@ defmodule LoopctlRunner.ControlTest do
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
       assert_receive {:test_loopctl, {:dispatch_reply, first}}, 5_000
-      assert_receive {:test_loopctl, {:dispatch_reply, ^first}}, 5_000
+      assert_receive {:test_loopctl, {:dispatch_reply, again}}, 5_000
       assert first["decision"] == "accepted"
+      # The repeat is the same decision without the session fields the first accept named.
+      assert again == Map.drop(first, ["session_id", "worktree"])
 
       assert_receive {:run_started, _}, 5_000
       runs_done(pid)

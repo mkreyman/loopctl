@@ -35,6 +35,8 @@ defmodule Loopctl.Holders do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -210,6 +212,163 @@ defmodule Loopctl.Holders do
       end
     end)
     |> after_commit()
+  end
+
+  # --- runner sessions (US-52.15) ---
+
+  @doc """
+  Creates the holder of a runner session as part of minting its dispatch: kind
+  `:runner_session`, the runner's agent, `host` = the runner row's name (the one host loopctl
+  attests rather than takes from the session), `dispatch_id`, the placeholder session id
+  `"dispatch:<dispatch_id>"` until the runner's accept names the real one, and `lease_until`
+  the dispatch's cap.
+
+  Runs inside the caller's `AdminRepo` transaction (`Loopctl.Dispatches.create_dispatch/3`'s
+  Multi), so a mint that fails leaves no holder row. No session ever calls this: a session
+  cannot register as `:runner_session` (`register/4` refuses the kind).
+  """
+  @spec insert_runner_session(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Holder.t()} | {:error, Ecto.Changeset.t()}
+  def insert_runner_session(tenant_id, attrs, opts \\ []) do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+
+    %Holder{
+      tenant_id: tenant_id,
+      agent_id: Map.fetch!(attrs, :agent_id),
+      dispatch_id: Map.fetch!(attrs, :dispatch_id),
+      runner_dispatch_id: Map.fetch!(attrs, :runner_dispatch_id),
+      kind: :runner_session,
+      last_seen_at: now,
+      lease_until: Map.fetch!(attrs, :lease_until)
+    }
+    |> Ecto.Changeset.change(
+      session_id: "dispatch:#{Map.fetch!(attrs, :dispatch_id)}",
+      host: Map.fetch!(attrs, :host)
+    )
+    |> Ecto.Changeset.validate_required([:session_id, :host])
+    |> Ecto.Changeset.validate_length(:host, min: 1, max: 255)
+    |> AdminRepo.insert()
+    |> case do
+      {:ok, holder} ->
+        audit!(holder, "registered", %{"dispatch_id" => holder.dispatch_id}, opts)
+        {:ok, holder}
+
+      error ->
+        error
+    end
+  end
+
+  @doc """
+  The holder a dispatch's session is, or `nil`: a dispatch minted before US-52.15, or by any
+  path other than a runner placement, has none. Tenant-scoped on `AdminRepo`.
+  """
+  @spec holder_for_dispatch(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: Holder.t() | nil
+  def holder_for_dispatch(_tenant_id, nil), do: nil
+
+  def holder_for_dispatch(tenant_id, dispatch_id) do
+    from(h in Holder,
+      where: h.tenant_id == ^tenant_id and h.dispatch_id == ^dispatch_id,
+      order_by: [desc: h.inserted_at],
+      limit: 1
+    )
+    |> AdminRepo.one()
+  end
+
+  @doc """
+  Records what a runner's accept says about the session it is about to start (contract
+  1.35.0): its `session_id` and `worktree`, and the moment it was seen. Writes only a LIVE
+  holder, so an accept resent after the session ended changes nothing; a resent accept with
+  the same values writes the same values. An accept that names neither still moves
+  `last_seen_at`. `:ok` when the dispatch has no live holder.
+
+  Keyed by the WIRE dispatch id the accept names (`runner_dispatch_id`), never by the
+  session's `dispatches` row.
+  """
+  @spec record_runner_accept(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) :: :ok
+  def record_runner_accept(tenant_id, runner_dispatch_id, fields, opts \\ []) do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+
+    set =
+      [last_seen_at: now, updated_at: now] ++
+        for {key, value} <- [session_id: fields[:session_id], worktree: fields[:worktree]],
+            is_binary(value),
+            do: {key, value}
+
+    live =
+      from(h in Holder,
+        where:
+          h.tenant_id == ^tenant_id and h.runner_dispatch_id == ^runner_dispatch_id and
+            is_nil(h.ended_at)
+      )
+
+    # Its own transaction, so a conflict rolls back only this write (a savepoint inside a
+    # caller's transaction) and the fallback below can still run.
+    try do
+      AdminRepo.transaction(fn -> AdminRepo.update_all(live, set: set) end)
+    rescue
+      # Another live holder of the runner's agent already holds that session id
+      # (`holders_live_session_uidx`): the runner named an id that is not this session's. Keep
+      # the placeholder, record the sighting, and never crash the runner's channel over it.
+      e in Postgrex.Error ->
+        if e.postgres[:code] != :unique_violation, do: reraise(e, __STACKTRACE__)
+
+        Logger.warning(
+          "runner accept for dispatch #{runner_dispatch_id} named a session id another live holder " <>
+            "holds; kept the placeholder"
+        )
+
+        AdminRepo.update_all(live, set: [last_seen_at: now, updated_at: now])
+    end
+
+    :ok
+  end
+
+  @doc """
+  Ends the holder of a runner session whose session ended (`session_ended`): `ended_at` set,
+  its credential revoked, one `ended` audit row. A holder already ended, or a dispatch with no
+  holder, changes nothing, so a replayed report writes nothing twice. Keyed by the wire
+  dispatch id `session_ended` names (`runner_dispatch_id`).
+  """
+  @spec end_runner_session(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Holder.t() | nil} | {:error, term()}
+  def end_runner_session(tenant_id, runner_dispatch_id, opts \\ []) do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+
+    AdminRepo.transaction(fn ->
+      from(h in Holder,
+        where:
+          h.tenant_id == ^tenant_id and h.runner_dispatch_id == ^runner_dispatch_id and
+            is_nil(h.ended_at),
+        lock: "FOR UPDATE"
+      )
+      |> AdminRepo.all()
+      |> Enum.reduce({nil, []}, fn holder, {_last, hashes} ->
+        {ended, more} = end_live_holder(holder, :ended, now, opts)
+        {ended, hashes ++ more}
+      end)
+    end)
+    |> after_commit()
+  end
+
+  @doc """
+  Ends, inside the caller's transaction, every live holder of `dispatch_ids` in `tenant_id`:
+  the undo of a placement and every other revoke of a session dispatch
+  (`Loopctl.Dispatches.revoke/3`), and a dispatch's expiry (`reason: :lapsed`). The
+  dispatches' keys are the holders' credentials, and the revoke that calls this revokes them,
+  so this writes the holder rows only. Returns how many it ended.
+  """
+  @spec end_for_dispatches(Ecto.UUID.t(), [Ecto.UUID.t()], DateTime.t(), :ended | :lapsed) ::
+          non_neg_integer()
+  def end_for_dispatches(_tenant_id, [], _now, _reason), do: 0
+
+  def end_for_dispatches(tenant_id, dispatch_ids, now, reason) do
+    {count, _} =
+      from(h in Holder,
+        where: h.tenant_id == ^tenant_id and h.dispatch_id in ^dispatch_ids and is_nil(h.ended_at)
+      )
+      |> AdminRepo.update_all(set: [ended_at: now, ended_reason: reason, updated_at: now])
+
+    count
   end
 
   # --- register ---

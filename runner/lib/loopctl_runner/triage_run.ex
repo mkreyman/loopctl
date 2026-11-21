@@ -1161,7 +1161,8 @@ defmodule LoopctlRunner.TriageRun do
       )
 
   defp session(config, prompt, {repo_name, path, tree}, run_dir, run_id, trace, seq, opts) do
-    session_id = Session.uuid4()
+    # The id the accept named to loopctl (contract 1.35.0), so the holder names this transcript.
+    session_id = Keyword.get(opts, :session_id) || Session.uuid4()
     wall_clock_s = wall_clock_s(config, opts)
     max_turns = max_turns(config, opts)
 

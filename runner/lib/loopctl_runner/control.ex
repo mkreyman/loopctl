@@ -319,11 +319,13 @@ defmodule LoopctlRunner.Control do
     Run,
     Runs,
     RunState,
+    Session,
     Story,
     Templates,
     TraceShip,
     TriageDispatch,
     TriageRun,
+    Worktree,
     WorktreeLock
   }
 
@@ -1973,6 +1975,8 @@ defmodule LoopctlRunner.Control do
     Runs.in_flight(a.config.runs_dir, mine) + map_size(a.runs) + map_size(a.pending_starts)
   end
 
+  # A repeat of an accept already given carries no session fields: loopctl judges a repeat on its
+  # decision alone, and the first accept already named the session.
   defp accepted_reply(dispatch),
     do: %{
       "dispatch_id" => dispatch["dispatch_id"],
@@ -1980,11 +1984,28 @@ defmodule LoopctlRunner.Control do
       "decision" => "accepted"
     }
 
+  # The FIRST accept names the session it will start (contract 1.35.0, US-52.15): the uuid
+  # generated here, which `start_pending/2` launches Claude Code with as `--session-id`, so
+  # loopctl's holder for this dispatch carries the session's transcript id, and the worktree an
+  # implement run will cut. A scratch kind runs in a directory the run makes, so it names none.
+  defp accepted_reply(dispatch, work, session_id) do
+    dispatch
+    |> accepted_reply()
+    |> Map.put("session_id", session_id)
+    |> put_worktree(work)
+  end
+
+  defp put_worktree(reply, %{kind: "implement", story: story}),
+    do: Map.put(reply, "worktree", Worktree.path_for(story.repo_path, story.id))
+
+  defp put_worktree(reply, _work), do: reply
+
   # Accepting sends the accept and records a pending start; the run starts only once loopctl has
   # recorded the accept (settle_reply/3). A session started on an accept loopctl then refused
   # would run with no way to stop it, reporting stages and a trace nobody takes.
   defp accept_dispatch(socket, dispatch, work) do
-    reply = accepted_reply(dispatch)
+    session_id = Session.uuid4()
+    reply = accepted_reply(dispatch, work, session_id)
     :ok = Contract.validate("RunnerDispatchReply", reply)
 
     Logger.info(
@@ -1993,7 +2014,7 @@ defmodule LoopctlRunner.Control do
     )
 
     socket
-    |> register_pending(dispatch, work)
+    |> register_pending(dispatch, work, session_id)
     |> push_dispatch_reply(reply, dispatch["story_id"])
   end
 
@@ -2013,15 +2034,20 @@ defmodule LoopctlRunner.Control do
   defp subject_id(subject), do: subject["record_id"]
 
   # The pending start is kept in memory and on disk (PendingStarts), so a restart resumes it.
-  defp register_pending(socket, dispatch, work) do
+  defp register_pending(socket, dispatch, work, session_id) do
     a = socket.assigns
     id = dispatch["dispatch_id"]
     binding = DispatchRun.binding(dispatch)
     target = a.name || self()
     on_stage = fn event -> notify_control(target, {:run_stage, binding, event}) end
-    pending = %{dispatch: dispatch, work: work, opts: [binding: binding, on_stage: on_stage]}
 
-    with {:error, reason} <- PendingStarts.write(a.config.runs_dir, dispatch) do
+    pending = %{
+      dispatch: dispatch,
+      work: work,
+      opts: [binding: binding, on_stage: on_stage, session_id: session_id]
+    }
+
+    with {:error, reason} <- PendingStarts.write(a.config.runs_dir, dispatch, session_id) do
       Logger.error(
         "could not record the pending start of dispatch #{id} on disk (#{inspect(reason)}); " <>
           "a restart before it starts would forget it",
@@ -2066,16 +2092,21 @@ defmodule LoopctlRunner.Control do
   defp restore_pending_starts(socket, bound) do
     a = socket.assigns
 
-    Enum.reduce(PendingStarts.all(a.config.runs_dir), socket, fn dispatch, socket ->
+    Enum.reduce(PendingStarts.all_with_sessions(a.config.runs_dir), socket, fn {dispatch,
+                                                                                session_id},
+                                                                               socket ->
       id = dispatch["dispatch_id"]
 
       case rebuild_work(socket.assigns, dispatch) do
         {:ok, work} ->
           Logger.info("resending the accept of pending dispatch #{id}", dispatch_id: id)
-          entry = {accepted_reply(dispatch), dispatch["story_id"], true}
+          # The session id the first accept named, so the run starts as the session loopctl
+          # was told about; a file written before 1.35.0 has none, and gets one now.
+          session_id = session_id || Session.uuid4()
+          entry = {accepted_reply(dispatch, work, session_id), dispatch["story_id"], true}
 
           socket
-          |> register_pending(dispatch, work)
+          |> register_pending(dispatch, work, session_id)
           |> assign(reply_backlog: socket.assigns.reply_backlog ++ [entry])
 
         {:error, kind, why} ->
@@ -2416,7 +2447,9 @@ defmodule LoopctlRunner.Control do
                 deadline_at: work.deadline_at,
                 # A tuning run's critic: where its eval set lives, and a test's fake CLI. Read
                 # only by a spec_tuner@1 run (`TriageRun`).
-                critic: critic
+                critic: critic,
+                # The session id this dispatch's accept named (contract 1.35.0).
+                session_id: Keyword.get(opts, :session_id)
               )
 
             notify_control(

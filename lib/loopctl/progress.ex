@@ -30,6 +30,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
+  alias Loopctl.Holders
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
   alias Loopctl.Tenants
@@ -4556,6 +4557,26 @@ defmodule Loopctl.Progress do
 
       Dispatches.lineage_shares_prefix?(impl, verifier) ->
         {:error, :self_verify_blocked}
+
+      true ->
+        verify_identity_separated(story, orchestrator_agent_id)
+    end
+  end
+
+  # US-52.15: every fleet session shares one agent, so agent equality says nothing about
+  # sessions. When the story names its implementing holder AND the verifier dispatch has one,
+  # the HOLDERS are compared instead: the same holder is self-verify, different holders pass
+  # even under one agent. Either side without a holder (a claim or a verifier minted before
+  # holders) keeps the agent-id equality refusal. The verifier's holder is read from its
+  # dispatch row server-side, never from the request.
+  defp verify_identity_separated(story, orchestrator_agent_id) do
+    verifier_holder = Holders.holder_for_dispatch(story.tenant_id, story.verifier_dispatch_id)
+
+    cond do
+      not is_nil(story.assigned_holder_id) and not is_nil(verifier_holder) ->
+        if story.assigned_holder_id == verifier_holder.id,
+          do: {:error, :self_verify_blocked},
+          else: {:ok, story}
 
       not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id ->
         {:error, :self_verify_blocked}
