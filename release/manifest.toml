@@ -37,7 +37,7 @@ source = "chg/cli/Cargo.toml"
 
 [components.mcp]
 version = "3.21.1"
-minimum = "3.21.0"
+minimum = "3.19.1"
 source = "mcp-server/package.json"
 
 [retired]
