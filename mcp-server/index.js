@@ -24,6 +24,7 @@ import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { createBranchItemOpener, openWorkItem } from "./lib/branch-item.js";
 import { createHolderSession } from "./lib/holder.js";
+import { resolveDefaultKey } from "./lib/default-key.js";
 import { listWorkItemNotes, writeWorkItemNote } from "./lib/work-items.js";
 import { execFile, execFileSync } from "node:child_process";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -193,11 +194,7 @@ function getBaseUrl() {
  *  3. LOOPCTL_ORCH_KEY (safe default for reads)
  */
 function resolveKey(keyOverride) {
-  return (
-    process.env.LOOPCTL_API_KEY ||
-    keyOverride ||
-    process.env.LOOPCTL_ORCH_KEY
-  );
+  return resolveDefaultKey({ env: process.env, keyOverride, agentKey });
 }
 
 // US-52.13: this process's session holder. Every request that used to send

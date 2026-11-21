@@ -6,6 +6,12 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **An MCP session with only an agent key can read (2026-11-21, MCP 3.21.1).** A tool that
+  pins no key (`list_stories`, `get_story` and every other default-key call) now falls back,
+  after `LOOPCTL_API_KEY` and `LOOPCTL_ORCH_KEY`, to the session's agent key: its holder
+  credential once registered, else `LOOPCTL_AGENT_KEY`. Before, such a session got "No API
+  key configured" even though that message named `LOOPCTL_AGENT_KEY`. loopctl still decides
+  what the key's role may do.
 - **A story read names the session that holds it (2026-11-20, US-52.20).** Every story in
   `GET /api/v1/stories` and `GET /api/v1/stories/:id` now carries `assigned_holder_id`,
   `claim_epoch` and `claimed_until`; the single-story read also carries `assigned_holder`
