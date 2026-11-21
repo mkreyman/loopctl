@@ -8,8 +8,8 @@ defmodule Mix.Tasks.Loopctl.ReleaseSet do
       mix loopctl.release_set --bump    # next set when a component changed
 
   `--check` is a step of `mix precommit` and of ci.yml's lint job. `--bump` increments
-  `set` and, for each component whose source version differs, sets its minimum to its
-  previous version and its version to the source's; with nothing different it prints
+  `set` and, for each component whose source version differs, sets its version to the
+  source's and leaves its minimum (raising a minimum is a hand edit); with nothing different it prints
   `no component changed` and leaves the file untouched. `--root DIR` reads the manifest and
   the sources under DIR (the default is the current directory).
   """

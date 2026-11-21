@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A release no longer cuts off sessions one MCP version behind (2026-11-21, set 8).** The
+  MCP component's minimum is back to 3.19.1, the first version that reports itself, so a
+  session started on 3.19.1 to 3.21.0 is served again instead of `426
+  incompatible_client_version`. `mix loopctl.release_set --bump` now keeps every minimum;
+  it used to raise each changed component's minimum to its previous version, which refused
+  every session older than that the moment the server deployed, because a session binds its
+  MCP server at start. Raise a minimum by hand, in `release/manifest.toml`, when an older
+  client genuinely cannot work.
 - **An MCP session with only an agent key can read (2026-11-21, MCP 3.21.1).** A tool that
   pins no key (`list_stories`, `get_story` and every other default-key call) now falls back,
   after `LOOPCTL_API_KEY` and `LOOPCTL_ORCH_KEY`, to the session's agent key: its holder

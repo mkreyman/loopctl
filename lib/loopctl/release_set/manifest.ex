@@ -184,14 +184,17 @@ defmodule Loopctl.ReleaseSet.Manifest do
   end
 
   @doc """
-  The next set: `set` + 1, and for each drifted component its minimum becomes its previous
-  version and its version the source's. Every other component keeps both values.
+  The next set: `set` + 1, and each drifted component's version becomes the source's. No
+  minimum moves: loopctl refuses a client below its component's minimum (426), and a session
+  binds its MCP server at start, so raising the minimum on every bump cut off every session
+  one release behind the moment the server deployed (set 7, 2026-11-21). Raising a minimum is
+  a hand edit, made when an older client genuinely cannot work.
   """
   @spec bump(t(), [{String.t(), String.t(), String.t()}]) :: t()
   def bump(manifest, drifted) do
     components =
-      Enum.reduce(drifted, manifest.components, fn {name, previous, current}, acc ->
-        Map.update!(acc, name, &%{&1 | minimum: previous, version: current})
+      Enum.reduce(drifted, manifest.components, fn {name, _previous, current}, acc ->
+        Map.update!(acc, name, &%{&1 | version: current})
       end)
 
     %{manifest | set: manifest.set + 1, components: components}

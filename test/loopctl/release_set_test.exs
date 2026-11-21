@@ -167,7 +167,8 @@ defmodule Loopctl.ReleaseSetTest do
 
       assert next.set == set
       assert next.components["runner"].version == "9.9.9"
-      assert next.components["runner"].minimum == before.components["runner"].version
+      # A bump never raises a minimum: that refuses every client one release behind (426).
+      assert next.components["runner"].minimum == before.components["runner"].minimum
       assert Map.delete(next.components, "runner") == Map.delete(before.components, "runner")
       assert Task.check(root) == :ok
     end
