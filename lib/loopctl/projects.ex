@@ -14,6 +14,7 @@ defmodule Loopctl.Projects do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Intake.Source
   alias Loopctl.Projects.Project
   alias Loopctl.Projects.RepoUrl
   alias Loopctl.Tenants.Tenant
@@ -341,7 +342,11 @@ defmodule Loopctl.Projects do
   - `{:error, changeset}` on validation failure
   """
   @spec update_project(Ecto.UUID.t(), Project.t(), map(), keyword()) ::
-          {:ok, Project.t()} | {:error, Ecto.Changeset.t() | {:repo_has_project, Ecto.UUID.t()}}
+          {:ok, Project.t()}
+          | {:error,
+             Ecto.Changeset.t()
+             | {:repo_has_project, Ecto.UUID.t()}
+             | {:repo_held_by_source, Ecto.UUID.t(), String.t()}}
   def update_project(tenant_id, %Project{} = project, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -352,6 +357,7 @@ defmodule Loopctl.Projects do
 
     multi =
       Multi.new()
+      |> Multi.run(:sources_agree, fn _repo, _changes -> sources_agree(tenant_id, changeset) end)
       |> Multi.run(:repo_free, fn _repo, _changes -> repo_free(tenant_id, changeset) end)
       |> Multi.update(:project, changeset)
       |> Audit.log_in_multi(:audit, fn %{project: updated} ->
@@ -381,7 +387,7 @@ defmodule Loopctl.Projects do
       {:ok, %{project: updated}} ->
         {:ok, updated}
 
-      {:error, :repo_free, refusal, _changes} ->
+      {:error, step, refusal, _changes} when step in [:sources_agree, :repo_free] ->
         {:error, refusal}
 
       {:error, :project, changeset, _changes} ->
@@ -551,6 +557,45 @@ defmodule Loopctl.Projects do
 
   defp exclude_id(query, nil), do: query
   defp exclude_id(query, id), do: where(query, [p], p.id != ^id)
+
+  # A live `pr`/`chg` intake source routes ONE repo's escalations to its project's channel, and
+  # `resolve_project({repo_url})` is how a session in that repo finds the channel. Re-pointing or
+  # clearing `repo_url` under such a source would leave the source posting where nobody in its
+  # repo looks, so a change of `repo_key` is refused while any live source names another repo
+  # (#1082). Revoke the source first. A `ledger` source binds no repo, so it never blocks.
+  #
+  # The project row is locked before the sources are read: `Intake.prepare_project/2` takes the
+  # same lock before it enrols a source, so an enrolment and this update serialise and cannot
+  # split the repo between them. An update that leaves `repo_key` as it was writes no repo
+  # column, so it needs neither the lock nor the check.
+  defp sources_agree(tenant_id, changeset) do
+    project_id = changeset.data.id
+    key = Ecto.Changeset.get_field(changeset, :repo_key)
+
+    if key == changeset.data.repo_key do
+      {:ok, :unchanged}
+    else
+      from(p in Project,
+        where: p.tenant_id == ^tenant_id and p.id == ^project_id,
+        lock: "FOR UPDATE",
+        select: p.id
+      )
+      |> AdminRepo.one()
+
+      from(s in Source,
+        where:
+          s.tenant_id == ^tenant_id and s.project_id == ^project_id and is_nil(s.revoked_at) and
+            s.mode in [:pr, :chg],
+        order_by: [asc: s.inserted_at, asc: s.id]
+      )
+      |> AdminRepo.all()
+      |> Enum.find(&(RepoUrl.key(&1.repo_full_name) != key))
+      |> case do
+        nil -> {:ok, :agree}
+        source -> {:error, {:repo_held_by_source, source.id, source.repo_full_name}}
+      end
+    end
+  end
 
   # The pre-check that names the holder. Only an ACTIVE result can collide, so an archived
   # row (an edit of an archived project) is never refused; the index decides a race this

@@ -4422,7 +4422,7 @@ const TOOLS = [
     name: "update_project",
     description:
       "UPDATE a project's fields (PATCH /api/v1/projects/:id): name, slug, repo_url, description, tech_stack, mission, metadata. Send only what changes; a field left out is left alone, and a call naming none is refused locally. A slug change renames the project's channel (kb scope or work project); when no name is sent and the name equaled the old slug, the name follows. A kb name different from its slug is 422, and a slug another project holds (archived included) is 422. Status is not settable here (archive with delete_project, restore with restore_project). Setting repo_url makes resolve_project({repo_url}) and SessionStart find the project. Sent with LOOPCTL_ORCH_KEY verbatim, else LOOPCTL_USER_KEY, else the default key. Refusals: 403 insufficient_role below orchestrator role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant, 422 for an invalid field. " +
-      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too).",
+      "A repo has one project: a repo_url another active project of the tenant already holds is refused 409 repo_already_has_project, and error.existing_project_id names the project to use instead (resolve_project({repo_url}) finds it too). A repo_url change, clearing included, is refused 409 repo_held_by_intake_source while a live pr or chg intake source on the project names another repo; error.intake_source_id names it, and intake_source_revoke frees the project.",
     inputSchema: {
       type: "object",
       properties: {
